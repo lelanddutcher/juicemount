@@ -1,7 +1,8 @@
 # JuiceMount5 Architecture Document
 
 **Last updated:** 2026-03-31
-**Module:** `github.com/juicemount/jm5`
+**Repo:** `github.com/lelanddutcher/juicemount` (private)
+**Module:** `github.com/lelanddutcher/juicemount`
 **Go version:** 1.26.1
 
 ---
