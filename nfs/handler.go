@@ -1,0 +1,929 @@
+package nfs
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"io/fs"
+	"net"
+	"os"
+	"path"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/go-git/go-billy/v5"
+	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
+
+	"github.com/lelanddutcher/juicemount/cache"
+	"github.com/lelanddutcher/juicemount/metadata"
+)
+
+// JuiceMountHandler implements the go-nfs Handler interface, serving
+// metadata from SQLite and proxying file I/O to JuiceFS FUSE.
+type JuiceMountHandler struct {
+	store       *metadata.Store
+	fusePath    string // path to hidden JuiceFS FUSE mount
+	cacheReader *cache.Reader
+	fdPool      *FDPool
+	readahead   *ReadaheadManager
+	memBuf      *MemoryBuffer
+	redisClient *metadata.RedisClient // for publishing events
+
+	// Synthetic inode counter for locally-created entries (atomic)
+	inodeCounter atomic.Uint64
+
+	// Write size tracking: path → latest known size (for WCC accuracy)
+	writeSizeMu sync.Mutex
+	writeSizes  map[string]int64
+
+	// READDIRPLUS cookie tracking
+	verifierMu sync.Mutex
+	verifiers  map[string]verifierData
+
+	// Directory prefetch tracking — prevents redundant prefetches
+	prefetchMu   sync.Mutex
+	prefetched   map[string]time.Time
+	prefetchSem  chan struct{} // limits concurrent prefetch goroutines
+
+	// Verifier cleanup lifecycle
+	verifierStop chan struct{}
+}
+
+type verifierData struct {
+	verifier   uint64
+	entries    []os.FileInfo
+	lastAccess time.Time
+}
+
+func NewHandler(store *metadata.Store, fusePath string) *JuiceMountHandler {
+	fdPool := NewFDPool()
+	h := &JuiceMountHandler{
+		store:        store,
+		fusePath:     fusePath,
+		fdPool:       fdPool,
+		readahead:    NewReadaheadManager(fusePath, fdPool),
+		memBuf:       NewMemoryBuffer(DefaultMemBufThreshold, DefaultMemBufBudget),
+		writeSizes:   make(map[string]int64),
+		verifiers:    make(map[string]verifierData),
+		prefetched:   make(map[string]time.Time),
+		prefetchSem:  make(chan struct{}, 4), // max 4 concurrent prefetches
+		verifierStop: make(chan struct{}),
+	}
+	go h.verifierCleanupLoop(60*time.Second, 5*time.Minute)
+	return h
+}
+
+// SetCacheReader attaches a direct SSD cache reader for bypassing FUSE on cached reads.
+func (h *JuiceMountHandler) SetCacheReader(cr *cache.Reader) {
+	h.cacheReader = cr
+}
+
+// SetRedisClient attaches a Redis client for publishing metadata events.
+func (h *JuiceMountHandler) SetRedisClient(rc *metadata.RedisClient) {
+	h.redisClient = rc
+}
+
+// nextSyntheticInode returns a unique inode for locally-created entries.
+// Uses high bit set to distinguish from JuiceFS inodes.
+func (h *JuiceMountHandler) nextSyntheticInode() uint64 {
+	return h.inodeCounter.Add(1) | (1 << 63)
+}
+
+// trackWriteSize records the current written size for a file path.
+func (h *JuiceMountHandler) trackWriteSize(path string, size int64) {
+	h.writeSizeMu.Lock()
+	h.writeSizes[path] = size
+	h.writeSizeMu.Unlock()
+}
+
+// prefetchChildren scans a directory on FUSE and caches all children into SQLite.
+// This runs in the background so that subsequent Stat() calls are instant.
+// Also spawns bounded sub-prefetches for immediate subdirectories (one level)
+// for Finder's "expanding disclosure triangle" pattern.
+func (h *JuiceMountHandler) prefetchChildren(dirname string) {
+	h.prefetchMu.Lock()
+	if t, ok := h.prefetched[dirname]; ok && time.Since(t) < 30*time.Second {
+		h.prefetchMu.Unlock()
+		return // recently prefetched
+	}
+	h.prefetched[dirname] = time.Now()
+	h.prefetchMu.Unlock()
+
+	fusePath := path.Join(h.fusePath, dirname)
+	if dirname == "." {
+		fusePath = h.fusePath
+	}
+
+	dirEntries, err := os.ReadDir(fusePath)
+	if err != nil {
+		return
+	}
+
+	toInsert := make([]*metadata.Entry, 0, len(dirEntries))
+	var subdirs []string
+	for _, de := range dirEntries {
+		info, err := de.Info()
+		if err != nil {
+			continue
+		}
+		var inode uint64
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			inode = st.Ino
+		} else {
+			inode = h.nextSyntheticInode()
+		}
+		childPath := path.Join(dirname, info.Name())
+		if dirname == "." {
+			childPath = info.Name()
+		}
+
+		// Only insert if not already cached
+		if h.store.LookupByPath(childPath) == nil {
+			entry := metadata.MakeEntry(childPath, info.IsDir(), info.Size(), info.ModTime(), inode)
+			toInsert = append(toInsert, entry)
+		}
+
+		// Track subdirectories for one-level-deep prefetch
+		if info.IsDir() {
+			subdirs = append(subdirs, childPath)
+		}
+	}
+
+	if len(toInsert) > 0 {
+		h.store.BulkInsert(toInsert, 500)
+	}
+
+	// Prefetch one level of subdirectories, bounded by the semaphore.
+	// Non-blocking acquire — if all workers are busy, skip that subdir.
+	for _, sub := range subdirs {
+		h.prefetchMu.Lock()
+		_, already := h.prefetched[sub]
+		h.prefetchMu.Unlock()
+		if already {
+			continue
+		}
+		select {
+		case h.prefetchSem <- struct{}{}:
+			go func(dir string) {
+				defer func() { <-h.prefetchSem }()
+				h.prefetchChildren(dir)
+			}(sub)
+		default:
+			// all workers busy, skip
+		}
+	}
+}
+
+// publishEvent sends a metadata event via Redis SUBSCRIBE if a client is configured.
+func (h *JuiceMountHandler) publishEvent(evt metadata.MetadataEvent) {
+	if h.redisClient == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		h.redisClient.PublishEvent(ctx, evt)
+	}()
+}
+
+// verifierCleanupLoop periodically removes stale verifier and prefetch entries.
+func (h *JuiceMountHandler) verifierCleanupLoop(interval, ttl time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			h.evictStaleVerifiers(ttl)
+			h.evictStalePrefetched(2 * time.Minute)
+		case <-h.verifierStop:
+			return
+		}
+	}
+}
+
+// evictStalePrefetched removes prefetch tracking entries older than ttl.
+func (h *JuiceMountHandler) evictStalePrefetched(ttl time.Duration) {
+	cutoff := time.Now().Add(-ttl)
+	h.prefetchMu.Lock()
+	for k, t := range h.prefetched {
+		if t.Before(cutoff) {
+			delete(h.prefetched, k)
+		}
+	}
+	h.prefetchMu.Unlock()
+}
+
+// evictStaleVerifiers removes verifier entries whose lastAccess is older than ttl.
+func (h *JuiceMountHandler) evictStaleVerifiers(ttl time.Duration) {
+	cutoff := time.Now().Add(-ttl)
+	h.verifierMu.Lock()
+	for k, vd := range h.verifiers {
+		if vd.lastAccess.Before(cutoff) {
+			delete(h.verifiers, k)
+		}
+	}
+	h.verifierMu.Unlock()
+}
+
+// Stop cleans up handler resources.
+func (h *JuiceMountHandler) StopHandler() {
+	if h.verifierStop != nil {
+		close(h.verifierStop)
+	}
+	if h.readahead != nil {
+		h.readahead.Stop()
+	}
+	if h.memBuf != nil {
+		h.memBuf.Stop()
+	}
+	if h.fdPool != nil {
+		h.fdPool.Stop()
+	}
+}
+
+// Mount handles the NFS MOUNT RPC.
+func (h *JuiceMountHandler) Mount(ctx context.Context, conn net.Conn, req nfslib.MountRequest) (status nfslib.MountStatus, hndl billy.Filesystem, auths []nfslib.AuthFlavor) {
+	return nfslib.MountStatusOk, &juiceFS{handler: h}, []nfslib.AuthFlavor{nfslib.AuthFlavorNull}
+}
+
+// Change returns the change interface (for write ops).
+func (h *JuiceMountHandler) Change(fs billy.Filesystem) billy.Change {
+	return &juiceChange{handler: h}
+}
+
+// FSStat fills in filesystem statistics.
+func (h *JuiceMountHandler) FSStat(ctx context.Context, f billy.Filesystem, stat *nfslib.FSStat) error {
+	stat.TotalSize = 1 << 40  // 1TB
+	stat.FreeSize = 1 << 39   // 512GB
+	stat.AvailableSize = 1 << 39
+	stat.TotalFiles = 1 << 20
+	stat.FreeFiles = 1 << 19
+	stat.AvailableFiles = 1 << 19
+	stat.CacheHint = 0
+	return nil
+}
+
+// ToHandle converts a path to an NFS file handle.
+// Uses deterministic 8-byte inode-based handles.
+func (h *JuiceMountHandler) ToHandle(f billy.Filesystem, path []string) []byte {
+	fullPath := strings.Join(path, "/")
+
+	// Root directory
+	if fullPath == "" || fullPath == "." {
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, 1)
+		return buf
+	}
+
+	// Look up inode from metadata store
+	e := h.store.LookupByPath(fullPath)
+	if e != nil {
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, e.Inode)
+		return buf
+	}
+
+	// Fallback: entry not in cache yet (just created, or FUSE-only).
+	// Generate a deterministic handle AND insert a cache entry so that
+	// FromHandle can resolve it. Without this, the handle is unresolvable
+	// and the client gets NFSStatusStale on subsequent operations.
+	hash := fnv.New64a()
+	hash.Write([]byte(fullPath))
+	inode := hash.Sum64() | (1 << 63) // high bit set = synthetic
+
+	// Insert a minimal cache entry so FromHandle works
+	entry := metadata.MakeEntry(fullPath, false, 0, time.Now(), inode)
+	h.store.InsertToCache(entry)
+	go h.store.Insert(entry) // persist async
+
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, inode)
+	return buf
+}
+
+// FromHandle resolves an NFS file handle back to a filesystem and path.
+func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []string, error) {
+	if len(handle) != 8 {
+		return nil, nil, fmt.Errorf("invalid handle length: %d", len(handle))
+	}
+
+	inode := binary.BigEndian.Uint64(handle)
+
+	// Root directory
+	if inode == 1 {
+		return &juiceFS{handler: h}, []string{}, nil
+	}
+
+	// Look up by inode
+	e := h.store.LookupByInode(inode)
+	if e == nil {
+		return nil, nil, &nfslib.NFSStatusError{NFSStatus: nfslib.NFSStatusStale}
+	}
+
+	parts := splitPath(e.Path)
+	return &juiceFS{handler: h}, parts, nil
+}
+
+func (h *JuiceMountHandler) InvalidateHandle(f billy.Filesystem, handle []byte) error {
+	return nil // deterministic handles never go stale
+}
+
+func (h *JuiceMountHandler) HandleLimit() int {
+	return 10000 // deterministic handles have no real limit; large value
+	// ensures READDIRPLUS batches many entries per response
+}
+
+// CachingHandler methods for READDIRPLUS
+func (h *JuiceMountHandler) VerifierFor(path string, contents []os.FileInfo) uint64 {
+	hash := fnv.New64a()
+	hash.Write([]byte(path))
+	for _, fi := range contents {
+		hash.Write([]byte(fi.Name()))
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, uint64(fi.ModTime().Unix()))
+		hash.Write(b)
+	}
+	v := hash.Sum64()
+
+	h.verifierMu.Lock()
+	h.verifiers[path] = verifierData{verifier: v, entries: contents, lastAccess: time.Now()}
+	h.verifierMu.Unlock()
+
+	return v
+}
+
+func (h *JuiceMountHandler) DataForVerifier(path string, verifier uint64) []os.FileInfo {
+	h.verifierMu.Lock()
+	defer h.verifierMu.Unlock()
+	if vd, ok := h.verifiers[path]; ok && vd.verifier == verifier {
+		vd.lastAccess = time.Now()
+		h.verifiers[path] = vd
+		return vd.entries
+	}
+	return nil
+}
+
+// splitPath splits "a/b/c" into ["a", "b", "c"]
+func splitPath(p string) []string {
+	p = strings.TrimPrefix(p, "/")
+	if p == "" || p == "." {
+		return []string{}
+	}
+	return strings.Split(p, "/")
+}
+
+// juiceFS implements billy.Filesystem, serving metadata from SQLite
+// and proxying file I/O to the JuiceFS FUSE mount.
+type juiceFS struct {
+	handler *JuiceMountHandler
+}
+
+func (jfs *juiceFS) fullPath(filename string) string {
+	return path.Join(jfs.handler.fusePath, filename)
+}
+
+func (jfs *juiceFS) entryToFileInfo(e *metadata.Entry) os.FileInfo {
+	return e.FileInfo()
+}
+
+func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
+	if filename == "" || filename == "." || filename == "/" {
+		return &rootDirInfo{}, nil
+	}
+	filename = strings.TrimPrefix(filename, "/")
+
+	// Fast rejection for macOS resource fork and metadata patterns.
+	// These never exist on JuiceFS and would otherwise fall through to
+	// a slow FUSE stat. This eliminates ~1/3 of LOOKUPs from Finder.
+	base := path.Base(filename)
+	if strings.HasPrefix(base, "._") ||
+		base == ".DS_Store" ||
+		base == ".Spotlight-V100" ||
+		base == ".Trashes" ||
+		base == ".fseventsd" ||
+		base == ".TemporaryItems" ||
+		base == ".VolumeIcon.icns" ||
+		base == "Icon\r" {
+		return nil, os.ErrNotExist
+	}
+
+	// Check if there's a tracked write size (in-flight write)
+	jfs.handler.writeSizeMu.Lock()
+	writeSize, hasWriteSize := jfs.handler.writeSizes[filename]
+	jfs.handler.writeSizeMu.Unlock()
+
+	e := jfs.handler.store.LookupByPath(filename)
+	if e != nil {
+		// If we have a tracked write size that's larger, use it
+		if hasWriteSize && writeSize > e.Size {
+			clone := *e
+			clone.Size = writeSize
+			clone.Mtime = time.Now()
+			return clone.FileInfo(), nil
+		}
+		return e.FileInfo(), nil
+	}
+
+	// Fallback: stat the file on FUSE directly and cache it
+	fusePath := jfs.fullPath(filename)
+	info, err := os.Stat(fusePath)
+	if err != nil {
+		return nil, os.ErrNotExist
+	}
+
+	// Cache this stat result into SQLite so we don't fall back again
+	var inode uint64
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		inode = st.Ino
+	} else {
+		inode = jfs.handler.nextSyntheticInode()
+	}
+	entry := metadata.MakeEntry(filename, info.IsDir(), info.Size(), info.ModTime(), inode)
+	go jfs.handler.store.Insert(entry)
+
+	// Override with tracked write size if available
+	if hasWriteSize && writeSize > info.Size() {
+		return &writeSizeInfo{FileInfo: info, size: writeSize}, nil
+	}
+	return info, nil
+}
+
+// writeSizeInfo wraps FileInfo to override the size with tracked write data.
+type writeSizeInfo struct {
+	os.FileInfo
+	size int64
+}
+
+func (w *writeSizeInfo) Size() int64 { return w.size }
+
+func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
+	return jfs.Stat(filename)
+}
+
+func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
+	if dirname == "" || dirname == "." || dirname == "/" {
+		dirname = "."
+	} else {
+		dirname = strings.TrimPrefix(dirname, "/")
+	}
+
+	children, err := jfs.handler.store.ListChildren(dirname)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(children) > 0 {
+		infos := make([]os.FileInfo, 0, len(children))
+		for _, e := range children {
+			// Skip macOS metadata files that Stat() would reject
+			base := e.Name
+			if strings.HasPrefix(base, "._") ||
+				base == ".DS_Store" ||
+				base == ".Spotlight-V100" ||
+				base == ".Trashes" ||
+				base == ".fseventsd" ||
+				base == ".TemporaryItems" {
+				continue
+			}
+			infos = append(infos, e.FileInfo())
+		}
+		sort.Slice(infos, func(i, j int) bool {
+			return infos[i].Name() < infos[j].Name()
+		})
+		// Proactively prefetch subdirectories' children in background
+		// so Finder's subsequent navigation is instant
+		go jfs.handler.prefetchChildren(dirname)
+		return infos, nil
+	}
+
+	// Fallback: read directly from FUSE and cache into SQLite
+	fusePath := jfs.fullPath(dirname)
+	dirEntries, err := os.ReadDir(fusePath)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]os.FileInfo, 0, len(dirEntries))
+	toInsert := make([]*metadata.Entry, 0, len(dirEntries))
+	for _, de := range dirEntries {
+		info, err := de.Info()
+		if err != nil {
+			continue
+		}
+		infos = append(infos, info)
+
+		// Extract real inode from FUSE stat
+		var inode uint64
+		if st, ok := info.Sys().(*syscall.Stat_t); ok {
+			inode = st.Ino
+		} else {
+			inode = jfs.handler.nextSyntheticInode()
+		}
+		childPath := path.Join(dirname, info.Name())
+		if dirname == "." {
+			childPath = info.Name()
+		}
+		entry := metadata.MakeEntry(childPath, info.IsDir(), info.Size(), info.ModTime(), inode)
+		toInsert = append(toInsert, entry)
+	}
+
+	// Bulk-insert into SQLite synchronously so subsequent Stat() calls
+	// from Finder (which follow immediately after READDIR) hit the cache
+	if len(toInsert) > 0 {
+		jfs.handler.store.BulkInsert(toInsert, 500)
+	}
+
+	return infos, nil
+}
+
+// File operations — proxy to JuiceFS FUSE
+func (jfs *juiceFS) Open(filename string) (billy.File, error) {
+	return jfs.OpenFile(filename, os.O_RDONLY, 0)
+}
+
+func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
+	filename = strings.TrimPrefix(filename, "/")
+
+	// Look up the entry to get inode and size for cache reads
+	e := jfs.handler.store.LookupByPath(filename)
+
+	// Detect write intent
+	isWrite := flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0
+
+	// For read-only opens, try to use fd pool + cache reader
+	if !isWrite && e != nil {
+		fusePath := jfs.fullPath(filename)
+		fd, err := jfs.handler.fdPool.Get(fusePath)
+		if err != nil {
+			return nil, err
+		}
+		return &cachedFile{
+			name:        filename,
+			fuseFD:      fd,
+			fusePath:    fusePath,
+			fdPool:      jfs.handler.fdPool,
+			cacheReader: jfs.handler.cacheReader,
+			readahead:   jfs.handler.readahead,
+			memBuf:      jfs.handler.memBuf,
+			inode:       e.Inode,
+			fileSize:    e.Size,
+		}, nil
+	}
+
+	// For writes, use fd pool to avoid re-opening on every NFS WRITE RPC.
+	// The go-nfs library calls OpenFile→Write→Close on every WRITE RPC,
+	// so pooling the fd saves an open() + close() syscall per RPC.
+	fullPath := jfs.fullPath(filename)
+
+	if isWrite {
+		fd, err := jfs.handler.fdPool.GetWrite(fullPath, flag, perm)
+		if err != nil {
+			return nil, err
+		}
+		inode := uint64(0)
+		if e != nil {
+			inode = e.Inode
+		} else {
+			inode = jfs.handler.nextSyntheticInode()
+		}
+		entry := &metadata.Entry{Path: filename, Inode: inode}
+		return &writeFile{
+			File:    fd,
+			name:    filename,
+			handler: jfs.handler,
+			entry:   entry,
+			fdPool:  jfs.handler.fdPool,
+			fusePath: fullPath,
+		}, nil
+	}
+
+	f, err := os.OpenFile(fullPath, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return &billyFile{File: f, name: filename}, nil
+}
+
+func (jfs *juiceFS) Create(filename string) (billy.File, error) {
+	filename = strings.TrimPrefix(filename, "/")
+
+	// Create on FUSE
+	fullPath := jfs.fullPath(filename)
+	f, err := os.Create(fullPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Insert into SQLite immediately with local_only flag
+	now := time.Now()
+	e := metadata.MakeEntry(filename, false, 0, now, jfs.handler.nextSyntheticInode())
+	e.LocalOnly = true
+	jfs.handler.store.Insert(e)
+
+	return &writeFile{
+		File:    f,
+		name:    filename,
+		handler: jfs.handler,
+		entry:   e,
+	}, nil
+}
+
+func (jfs *juiceFS) Rename(oldpath, newpath string) error {
+	oldpath = strings.TrimPrefix(oldpath, "/")
+	newpath = strings.TrimPrefix(newpath, "/")
+
+	// Execute on FUSE
+	if err := os.Rename(jfs.fullPath(oldpath), jfs.fullPath(newpath)); err != nil {
+		return err
+	}
+
+	// Invalidate memory buffer for old path
+	if jfs.handler.memBuf != nil {
+		jfs.handler.memBuf.Invalidate(oldpath)
+	}
+
+	// Update in-memory cache FIRST (instant visibility for NFS stats).
+	// SQLite writes happen async — they may be blocked by BulkInsert,
+	// but the in-memory cache ensures NFS LOOKUP/GETATTR work immediately.
+	oldEntry := jfs.handler.store.LookupByPath(oldpath)
+	jfs.handler.store.DeleteFromCache(oldpath)
+	if oldEntry != nil {
+		newEntry := metadata.MakeEntry(newpath, oldEntry.IsDir, oldEntry.Size, oldEntry.Mtime, oldEntry.Inode)
+		jfs.handler.store.InsertToCache(newEntry)
+
+		// SQLite update async (won't block NFS)
+		go func() {
+			jfs.handler.store.Delete(oldpath)
+			jfs.handler.store.Insert(newEntry)
+		}()
+
+		// Publish rename event
+		jfs.handler.publishEvent(metadata.MetadataEvent{
+			Op: "rename", Path: newpath, OldPath: oldpath,
+			Size: oldEntry.Size, Mtime: oldEntry.Mtime.Unix(),
+			Inode: oldEntry.Inode, IsDir: oldEntry.IsDir,
+		})
+	} else {
+		// No cached entry — still do the SQLite ops async
+		go func() {
+			jfs.handler.store.Delete(oldpath)
+			// Stat from FUSE to get the new entry's info
+			info, err := os.Stat(jfs.fullPath(newpath))
+			if err == nil {
+				var inode uint64
+				if st, ok := info.Sys().(*syscall.Stat_t); ok {
+					inode = st.Ino
+				} else {
+					inode = jfs.handler.nextSyntheticInode()
+				}
+				e := metadata.MakeEntry(newpath, info.IsDir(), info.Size(), info.ModTime(), inode)
+				jfs.handler.store.Insert(e)
+			}
+		}()
+	}
+	return nil
+}
+
+func (jfs *juiceFS) Remove(filename string) error {
+	filename = strings.TrimPrefix(filename, "/")
+
+	// Invalidate memory buffer
+	if jfs.handler.memBuf != nil {
+		jfs.handler.memBuf.Invalidate(filename)
+	}
+
+	// Delete from SQLite first (immediate visibility)
+	e := jfs.handler.store.LookupByPath(filename)
+	jfs.handler.store.Delete(filename)
+
+	// Delete on FUSE synchronously — returning success before the file is
+	// actually removed causes stale-handle confusion on subsequent operations.
+	os.Remove(jfs.fullPath(filename))
+
+	// Publish delete event
+	if e != nil {
+		jfs.handler.publishEvent(metadata.MetadataEvent{
+			Op: "delete", Path: filename, Inode: e.Inode,
+		})
+	}
+	return nil
+}
+
+func (jfs *juiceFS) MkdirAll(dirname string, perm os.FileMode) error {
+	dirname = strings.TrimPrefix(dirname, "/")
+
+	// Create on FUSE
+	if err := os.MkdirAll(jfs.fullPath(dirname), perm); err != nil {
+		return err
+	}
+
+	// Insert into in-memory cache FIRST (instant visibility for NFS stats)
+	now := time.Now()
+	e := metadata.MakeEntry(dirname, true, 0, now, jfs.handler.nextSyntheticInode())
+	e.LocalOnly = true
+	jfs.handler.store.InsertToCache(e)
+
+	// SQLite write async (won't block NFS even if BulkInsert holds the lock)
+	go jfs.handler.store.Insert(e)
+
+	jfs.handler.publishEvent(metadata.MetadataEvent{
+		Op: "create", Path: dirname, Mtime: now.Unix(),
+		Inode: e.Inode, IsDir: true,
+	})
+	return nil
+}
+
+// Remaining billy.Filesystem stubs
+func (jfs *juiceFS) Join(elem ...string) string          { return path.Join(elem...) }
+func (jfs *juiceFS) TempFile(dir, prefix string) (billy.File, error) { return nil, fmt.Errorf("not implemented") }
+func (jfs *juiceFS) Symlink(target, link string) error     { return fmt.Errorf("not supported") }
+func (jfs *juiceFS) Readlink(link string) (string, error) { return "", fmt.Errorf("not supported") }
+func (jfs *juiceFS) Chroot(p string) (billy.Filesystem, error) { return nil, fmt.Errorf("not supported") }
+func (jfs *juiceFS) Root() string { return "/" }
+
+// juiceChange implements billy.Change for write operations.
+type juiceChange struct {
+	handler *JuiceMountHandler
+}
+
+func (jc *juiceChange) Chmod(name string, mode os.FileMode) error              { return nil }
+func (jc *juiceChange) Chown(name string, uid, gid int) error                  { return nil }
+func (jc *juiceChange) Lchown(name string, uid, gid int) error                 { return nil }
+func (jc *juiceChange) Chtimes(name string, atime, mtime time.Time) error      { return nil }
+
+// cachedFile implements billy.File with two-tier read path:
+// 1. Direct SSD pread (bypasses FUSE) — if cache reader is available and block is cached
+// 2. JuiceFS FUSE pread (fallback) — populates SSD cache for future reads
+type cachedFile struct {
+	name        string
+	fuseFD      *os.File
+	fusePath    string
+	fdPool      *FDPool
+	cacheReader *cache.Reader
+	readahead   *ReadaheadManager
+	memBuf      *MemoryBuffer
+	inode       uint64
+	fileSize    int64
+	closed      bool
+}
+
+func (f *cachedFile) Name() string { return f.name }
+
+func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
+	// Priority 1: Memory buffer (zero-syscall, for small files like .prproj, LUTs)
+	if f.memBuf != nil {
+		n, hit := f.memBuf.ReadAt(f.name, p, off, f.fileSize, f.fusePath)
+		if hit {
+			if f.readahead != nil {
+				f.readahead.OnRead(f.inode, off, n, f.name)
+			}
+			return n, nil
+		}
+	}
+
+	// Priority 2: Direct SSD cache read (bypasses FUSE)
+	if f.cacheReader != nil {
+		n, err := f.cacheReader.ReadBlock(context.Background(), f.inode, off, p)
+		if err == nil && n > 0 {
+			if f.readahead != nil {
+				f.readahead.OnRead(f.inode, off, n, f.name)
+			}
+			return n, nil
+		}
+	}
+
+	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time)
+	n, err := f.fuseFD.ReadAt(p, off)
+	if n > 0 && f.readahead != nil {
+		f.readahead.OnRead(f.inode, off, n, f.name)
+	}
+	return n, err
+}
+
+func (f *cachedFile) Read(p []byte) (int, error)    { return f.fuseFD.Read(p) }
+func (f *cachedFile) Write(p []byte) (int, error)   { return f.fuseFD.Write(p) }
+func (f *cachedFile) Seek(offset int64, whence int) (int64, error) { return f.fuseFD.Seek(offset, whence) }
+func (f *cachedFile) Lock() error                    { return nil }
+func (f *cachedFile) Unlock() error                  { return nil }
+func (f *cachedFile) Truncate(size int64) error      { return f.fuseFD.Truncate(size) }
+
+func (f *cachedFile) Close() error {
+	if f.closed {
+		return nil
+	}
+	f.closed = true
+	f.fdPool.Release(f.fusePath)
+	return nil
+}
+
+// writeFile wraps os.File for write operations, tracking written size
+// and updating SQLite on close. Uses fd pool to avoid re-opening on every RPC.
+type writeFile struct {
+	*os.File
+	name       string
+	handler    *JuiceMountHandler
+	entry      *metadata.Entry
+	writtenEnd int64 // highest byte position written
+	fdPool     *FDPool
+	fusePath   string
+}
+
+func (f *writeFile) Name() string  { return f.name }
+func (f *writeFile) Lock() error   { return nil }
+func (f *writeFile) Unlock() error { return nil }
+
+func (f *writeFile) Write(p []byte) (int, error) {
+	n, err := f.File.Write(p)
+	if n > 0 {
+		pos, _ := f.File.Seek(0, io.SeekCurrent)
+		if pos > f.writtenEnd {
+			f.writtenEnd = pos
+			f.handler.trackWriteSize(f.name, pos)
+		}
+	}
+	return n, err
+}
+
+func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
+	n, err := f.File.WriteAt(p, off)
+	if n > 0 {
+		end := off + int64(n)
+		if end > f.writtenEnd {
+			f.writtenEnd = end
+			f.handler.trackWriteSize(f.name, end)
+		}
+	}
+	return n, err
+}
+
+func (f *writeFile) Close() error {
+	finalSize := f.writtenEnd
+	// Do NOT Sync() here — the go-nfs library calls OpenFile+Write+Close on
+	// every WRITE RPC, so syncing here would flush to MinIO on every RPC.
+	// Instead, rely on JuiceFS's writeback buffer and its own flush timing.
+	// Release fd back to pool instead of closing (avoids reopen on next RPC).
+	if f.fdPool != nil {
+		f.fdPool.Release(f.fusePath)
+	} else {
+		f.File.Close()
+	}
+
+	// Invalidate memory buffer so subsequent reads see fresh data
+	if f.handler.memBuf != nil {
+		f.handler.memBuf.Invalidate(f.name)
+	}
+
+	// Clean up write size tracking to prevent memory leak
+	f.handler.writeSizeMu.Lock()
+	delete(f.handler.writeSizes, f.name)
+	f.handler.writeSizeMu.Unlock()
+
+	// Update SQLite with final size
+	now := time.Now()
+	if finalSize > 0 {
+		f.handler.store.UpdateSize(f.name, finalSize, now)
+	}
+
+	// Publish create/update event (async)
+	f.handler.publishEvent(metadata.MetadataEvent{
+		Op: "create", Path: f.name,
+		Size: finalSize, Mtime: now.Unix(),
+		Inode: f.entry.Inode,
+	})
+	return nil
+}
+
+// billyFile wraps os.File to implement billy.File (for writes / non-cached opens).
+type billyFile struct {
+	*os.File
+	name string
+}
+
+func (f *billyFile) Name() string { return f.name }
+func (f *billyFile) Lock() error  { return nil }
+func (f *billyFile) Unlock() error { return nil }
+func (f *billyFile) Truncate(size int64) error { return f.File.Truncate(size) }
+
+// rootDirInfo is the FileInfo for the root directory.
+// Sys() returns a *syscall.Stat_t with the current user's UID/GID so that
+// Finder doesn't show the red "no access" badge on the mount root.
+type rootDirInfo struct{}
+
+func (r *rootDirInfo) Name() string      { return "" }
+func (r *rootDirInfo) Size() int64       { return 0 }
+func (r *rootDirInfo) Mode() fs.FileMode { return fs.ModeDir | 0755 }
+func (r *rootDirInfo) ModTime() time.Time { return time.Now() }
+func (r *rootDirInfo) IsDir() bool       { return true }
+func (r *rootDirInfo) Sys() any {
+	return &syscall.Stat_t{
+		Ino:   1,
+		Uid:   uint32(os.Getuid()),
+		Gid:   uint32(os.Getgid()),
+		Nlink: 2,
+	}
+}

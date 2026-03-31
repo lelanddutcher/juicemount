@@ -1,0 +1,18 @@
+{
+  "_comment": "Baseline timings. Updated by TestBenchmarkSuite_UpdateBaselines.",
+  "_updated": "2026-03-25",
+  "cold_run_ms": 600,
+  "concurrent_reads_4x_ms": 1000,
+  "deep_tree_walk_ms": 2806.4,
+  "finder_dir_open_10": 18.23,
+  "finder_dir_open_100": 120.46,
+  "finder_dir_open_1000": 2115.93,
+  "random_read_64k_ms": 3.63,
+  "sequential_read_mbps": 10.1,
+  "stat_p50_ms": 0.393,
+  "stat_p95_ms": 0.86,
+  "stat_p99_ms": 1.299,
+  "warm_run_ms": 550,
+  "write_large_10m_ms": 39.4,
+  "write_small_50x1k_ms": 452
+}

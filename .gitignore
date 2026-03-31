@@ -1,0 +1,34 @@
+# Binaries
+jm5
+*.a
+*.dylib
+*.so
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+/tmp/
+*.log
+
+# Build output
+/build/*.a
+/build/*.h
+
+# SQLite databases (local state, not code)
+*.db
+*.db-wal
+*.db-shm
+
+# Credentials / infrastructure docs (not code)
+credentials.md
+
+# Claude Code
+.claude/

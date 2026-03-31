@@ -1,0 +1,1029 @@
+# JuiceMount5 Architecture Document
+
+**Last updated:** 2026-03-31
+**Module:** `github.com/juicemount/jm5`
+**Go version:** 1.26.1
+
+---
+
+## 1. System Overview
+
+JuiceMount5 (JM5) is a userspace NFS v3 loopback server for macOS that presents a
+JuiceFS FUSE volume to Finder with near-local performance. The core problem it
+solves: macOS Finder issues tens of thousands of `stat()` / `LOOKUP` / `GETATTR`
+calls when opening a directory, and each one through JuiceFS FUSE costs 1-60 ms
+due to the kernel/userspace boundary crossings. JM5 interposes a Go-based NFS
+server on `127.0.0.1:11049` that serves metadata from a local SQLite cache and
+proxies file I/O to the hidden JuiceFS FUSE mount only when necessary.
+
+The result: directory opens that took 3-10 seconds through raw FUSE now complete
+in 15-120 ms via the NFS loopback.
+
+### What it is
+
+- A Go NFS v3 server (fork of `willscott/go-nfs`) listening on localhost
+- macOS `mount_nfs` mounts it at `/Volumes/zpool`
+- All metadata served from SQLite + in-memory maps (sub-millisecond)
+- File data flows through JuiceFS FUSE, optionally bypassed by direct SSD cache reads
+- Redis pub/sub keeps metadata in sync across machines
+
+### What it is NOT
+
+- Not a full NFS server -- no AUTH, no locking (uses `nolocks,locallocks`)
+- Not a replacement for JuiceFS -- JuiceFS does the actual cloud storage
+- Not multi-tenant -- single user, single mount, localhost only
+
+---
+
+## 2. Architecture Diagram
+
+```
++--------------------------------------------------------------------+
+|  macOS Finder / Applications (Final Cut, Premiere, DaVinci, etc.)  |
++----------------------------+---------------------------------------+
+                             |
+                     NFS v3 over TCP
+                     127.0.0.1:11049
+                     (TCP_NODELAY, 4MB socket buffers)
+                             |
++----------------------------v---------------------------------------+
+|                     JuiceMount5 NFS Server                         |
+|                     (cmd/jm5/main.go)                              |
+|                                                                    |
+|  +------------------+   +-------------------+   +---------------+  |
+|  | NFS Handler      |   | Metadata Store    |   | SSD Cache     |  |
+|  | (nfs/handler.go) |   | (metadata/)       |   | Reader        |  |
+|  |                  |   |                   |   | (cache/)      |  |
+|  | - Stat/Lookup    |   | SQLite DB (WAL)   |   |               |  |
+|  | - ReadDir        |   | +pathCache (map)  |   | Direct pread  |  |
+|  | - Read/Write     |   | +inodeCache (map) |   | on SSD blocks |  |
+|  | - Create/Rename  |   |                   |   | (bypasses     |  |
+|  | - FD Pool        |   | ~147K entries     |   |  FUSE)        |  |
+|  | - Readahead      |   +--------+----------+   +-------+-------+  |
+|  | - MemoryBuffer   |            |                       |          |
+|  +--------+---------+            |                       |          |
+|           |                      |                       |          |
+|           |  FUSE stat/read      |  Redis sync           |  Redis   |
+|           |  (fallback only)     |                       |  chunk   |
+|           v                      v                       v  mapping |
+|  +--------+---------+   +-------+----------+   +--------+-------+  |
+|  | JuiceFS FUSE     |   | Redis Client     |   | Redis          |  |
+|  | mount            |   | (metadata/       |   | (chunk->slice  |  |
+|  | ~/.juicemount/   |   |  redis.go)       |   |  lookups for   |  |
+|  |  fuse-internal   |   |                  |   |  cache reader) |  |
+|  +--------+---------+   | - SUBSCRIBE loop |   +----------------+  |
+|           |              | - Reconcile loop |                       |
+|           |              | - Lua tree pull  |                       |
+|           v              +--------+---------+                       |
+|  +--------+---------+            |                                  |
+|  | Health Monitor   |            |                                  |
+|  | + NetWatcher     |            |                                  |
+|  | (health/)        |            |                                  |
+|  +------------------+            |                                  |
++----------------------------------+----------------------------------+
+                                   |
+                    +--------------+--------------+
+                    |                             |
+           +-------v--------+          +---------v--------+
+           | Redis Server   |          | MinIO Server     |
+           | 192.168.0.210  |          | 192.168.0.212    |
+           | :6379 (DB 1)   |          | :9000            |
+           |                |          |                  |
+           | JuiceFS meta   |          | JuiceFS data     |
+           | d* keys (dirs) |          | bucket: "zpool"  |
+           | i* keys (attrs)|          |                  |
+           | c* keys (chunks|          |                  |
+           +----------------+          +------------------+
+```
+
+---
+
+## 3. Go Packages and Responsibilities
+
+### `cmd/jm5/` -- CLI entry point
+**File:** `cmd/jm5/main.go`
+
+Startup sequence:
+0. Mounts JuiceFS FUSE at `~/.juicemount/fuse-internal` (hidden from user) via `health.FUSEManager`; starts background FUSE health monitor (10s tick, auto-remount on crash)
+1. Opens SQLite metadata store (`metadata.Open`)
+2. Connects to Redis, runs initial Lua-based metadata sync (`rc.SyncOnce`)
+3. Starts background Redis SUBSCRIBE + reconciliation loops (`rc.Start`)
+4. Detects and initializes SSD cache reader (`cache.DetectCacheDir`)
+5. Creates and starts the NFS server (`nfs.NewServer`, `srv.Start`)
+6. Attaches cache reader and Redis client to the NFS handler
+7. Starts NetWatcher (1s poll interval) with Redis reconnect callback
+8. Starts HealthMonitor (10s tick) for Redis, MinIO, FUSE checks
+9. Mounts NFS via `sudo mount_nfs` at `/Volumes/zpool` (the only user-visible volume)
+10. Waits for SIGINT/SIGTERM
+
+Shutdown sequence (explicit, ordered):
+1. Unmount NFS (`/Volumes/zpool`)
+2. Stop NFS server (close listener)
+3. Stop handler resources (fd pool, membuf, readahead)
+4. Stop network watcher + health monitor
+5. Stop cache reader
+6. Stop Redis client
+7. Close SQLite
+8. Unmount JuiceFS FUSE
+
+**Mount options:**
+```
+port=11049,mountport=11049,soft,intr,timeo=300,retrans=5,
+nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,
+actimeo=3600,vers=3,tcp
+```
+
+Key flags: `rsize/wsize=1MB` for throughput, `actimeo=3600` to maximize macOS
+attribute caching (1 hour), `soft,intr` so hung NFS doesn't freeze Finder.
+
+### `nfs/` -- NFS handler and file I/O
+**Files:** `handler.go`, `server.go`, `fdpool.go`, `readahead.go`, `membuf.go`
+
+This is the core package. It implements the `go-nfs` Handler interface:
+
+- **`JuiceMountHandler`** -- Top-level handler. Implements `Mount()`,
+  `FromHandle()`, `ToHandle()`, `FSStat()`, `Change()`, `VerifierFor()`,
+  `DataForVerifier()`, `HandleLimit()`.
+
+- **`juiceFS`** -- Implements `billy.Filesystem`. All NFS file operations
+  (Stat, ReadDir, Open, Create, Rename, Remove, MkdirAll) go through this.
+  Metadata operations hit SQLite/pathCache first; FUSE is a fallback only.
+
+- **`juiceChange`** -- Implements `billy.Change`. All attribute-change ops
+  (Chmod, Chown, Chtimes) are no-ops since JuiceFS handles permissions.
+
+- **`cachedFile`** -- Read-path file wrapper with three-tier priority:
+  1. MemoryBuffer (zero-syscall, heap-resident for files <128MB)
+  2. SSD cache reader (direct pread, bypasses FUSE)
+  3. JuiceFS FUSE pread (fallback, populates SSD cache)
+
+- **`writeFile`** -- Write-path file wrapper. Tracks `writtenEnd` for size
+  reporting, publishes metadata events on close, skips `Sync()` to rely on
+  JuiceFS writeback.
+
+- **`FDPool`** -- Pools open file descriptors to avoid the 60ms cost of
+  opening files on JuiceFS FUSE. Entries auto-evict after 2 minutes idle.
+  Supports both read (`Get`) and write (`GetWrite`) fd acquisition.
+
+- **`ReadaheadManager`** -- Detects sequential read patterns (3 consecutive
+  sequential reads on the same inode) and prefetches 32MB ahead (8 x 4MB
+  blocks) in background goroutines (max 4 concurrent). Warms the JuiceFS
+  SSD cache for upcoming reads.
+
+- **`MemoryBuffer`** -- Caches entire files <128MB in Go heap for
+  zero-syscall reads. 2GB total budget. Good for .prproj, .cube, .xmp,
+  .fcpxml files. Async loading on first access; evicts after 2 min idle.
+
+- **`Server`** -- TCP listener wrapper. Sets TCP_NODELAY + TCP keepalive
+  (30s) on accept, sets 4MB SO_SNDBUF/SO_RCVBUF. Handler is served
+  directly (no CachingHandler wrapper -- JuiceMountHandler implements
+  deterministic inode-based handles and READDIRPLUS verifiers natively).
+
+### `metadata/` -- SQLite store and Redis sync
+**Files:** `store.go`, `redis.go`, `types.go`
+
+- **`Store`** -- SQLite-backed metadata store with triple in-memory caches:
+  `pathCache map[string]*Entry`, `inodeCache map[uint64]*Entry`, and
+  `childrenIdx map[string]map[string]*Entry` (parent -> children).
+  All lookups (`LookupByPath`, `LookupByInode`, `ListChildren`) hit the
+  in-memory maps -- never blocked by SQLite transactions.
+  `ListChildren` is O(children) via the childrenIdx, not O(total entries).
+
+  SQLite schema:
+  ```sql
+  CREATE TABLE entries (
+      path        TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      parent_path TEXT NOT NULL,
+      is_dir      INTEGER NOT NULL,
+      size        INTEGER NOT NULL,
+      mtime       INTEGER NOT NULL,
+      inode       INTEGER NOT NULL,
+      mode        INTEGER NOT NULL,
+      local_only  INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX idx_parent ON entries(parent_path);
+  CREATE INDEX idx_inode ON entries(inode);
+  CREATE INDEX idx_name ON entries(name COLLATE NOCASE);
+  ```
+
+  Pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, `cache_size=-8000`,
+  `busy_timeout=30000`. MaxOpenConns=8.
+
+  Key methods:
+  - `InsertToCache` / `DeleteFromCache` -- in-memory only, instant, never
+    blocked. Used by rename/mkdir/SUBSCRIBE to provide immediate NFS visibility.
+  - `BulkInsert(entries, batchSize)` -- batched SQLite writes. Uses 500-entry
+    batches to limit write-lock hold time.
+  - `ListChildren` -- reads from pathCache (iterates map), not SQLite.
+
+- **`RedisClient`** -- Two-mechanism sync:
+  1. **SUBSCRIBE** (`juicemount:metadata` channel) -- <100ms propagation for
+     real-time create/update/delete/rename events between JuiceMount clients.
+  2. **Batch reconciliation** -- Periodic (30s default) full tree pull via Lua
+     script, catches anything SUBSCRIBE missed.
+
+  The Lua script (`luaScript`) SCANs all `d*` keys (JuiceFS directory entries),
+  builds an inode-to-path reverse map, resolves full paths, and fetches inode
+  attributes (`i{inode}`) for mtime and size. Returns entries as
+  `"fileType:mtime:fileSize:inode:relative/path"` strings.
+
+  Reconciliation includes: bulk insert of all Redis entries (500/batch),
+  clearing `local_only` flags, pruning entries that no longer exist in Redis.
+
+  Reconnect: exponential backoff on failure (30s -> 1m -> 2m -> 5m max).
+  `TriggerSync()` for immediate sync after network changes.
+
+- **`Entry`** -- Metadata struct with `PreSerializedGetAttr []byte` field for
+  caching the XDR-encoded GETATTR response (88 bytes). Invalidated when size
+  or mtime changes.
+
+- **`MetadataEvent`** -- JSON struct for Redis pub/sub: `{op, path, size, mtime, inode, is_dir, old_path}`.
+
+### `cache/` -- SSD direct cache reader
+**File:** `reader.go`
+
+Reads JuiceFS cache blocks directly from the local SSD, bypassing the FUSE
+mount entirely for cached data. Flow:
+
+1. Given an inode and file offset, compute chunk index and offset within chunk
+2. Fetch chunk-to-slice mapping from Redis (`c{inode}_{chunkIndex}` list) --
+   cached locally in `sliceCache`
+3. Find which slice covers the offset, compute block index within slice
+4. Build cache file path: `~/.juicefs/cache/{uuid}/raw/chunks/0/{sliceID/1000}/{sliceID}_{blockIndex}_{blockSize}`
+5. Direct `pread()` from the cache block file
+
+Block size: 4MB (matches JuiceFS default). Chunk size: 64MB.
+FDs are pooled with 5-minute TTL. Slice cache is invalidated on file modification.
+
+Auto-detection: `DetectCacheDir()` scans `~/.juicefs/cache/*/raw/chunks/` for
+valid cache directories. Requires JuiceFS 1.3.x.
+
+### `health/` -- Health monitoring and network detection
+**Files:** `monitor.go`, `netwatch.go`
+
+- **`HealthMonitor`** -- Checks Redis (PING), MinIO (`/minio/health/live`),
+  FUSE (stat), NFS (stat mount point) every 10 seconds. Tracks connection
+  state transitions (connected/disconnected/reconnecting). Suppresses FUSE
+  errors during network grace period (5s after interface change).
+
+- **`NetWatcher`** -- Polls system network interfaces every 1 second. Detects
+  when the "active" interface changes (e.g., WiFi to 10GbE to Tailscale).
+  Priority: en1-en9 (Ethernet) > en0 (WiFi) > utun* (Tailscale) > bridge > other.
+  On change, fires callbacks -- the main callback triggers Redis reconnect
+  and immediate metadata sync.
+
+### `bridge/` -- C bridge for Swift integration
+**File:** `bridge/cbridge.go`
+
+CGo-based bridge that compiles to a C archive (`.a`) for embedding in a macOS
+Swift app. Exports:
+
+- `NFSServerStart(configJSON)` -- starts the full stack from a JSON config
+- `NFSServerStop()` -- graceful shutdown
+- `NFSServerIsRunning()` -- health check
+- `NFSServerStats()` -- JSON stats (entry count, sync timing, health)
+- `NFSServerSyncNow()` -- triggers immediate reconciliation
+- `NFSServerFreeString(s)` -- frees C strings allocated by Go
+
+The Swift app passes config as JSON: `{redis_url, fuse_path, mount_point, listen_addr, db_path}`.
+
+### `internal/nfs/` -- Forked go-nfs library
+**Files:** `conn.go`, `file.go`, `nfs_onwrite.go`, `nfs_ongetattr.go`, `nfs_oncreate.go`, `nfs_onreaddirplus.go`
+
+This is a vendored fork of `willscott/go-nfs` with JM5-specific optimizations
+(all marked with `[JM5]` comments):
+
+- **`conn.go`** -- Connection handling:
+  - `responseBufferPool` (sync.Pool) eliminates per-RPC buffer allocations
+  - TCP_NODELAY set on each connection
+  - 64-slot write serializer channel (up from 1) for response batching
+  - 1MB buffered writer matching NFS rsize
+  - Batch-drain: collects all queued responses before TCP flush
+  - Sequential RPC dispatch (macOS NFS client doesn't pipeline)
+  - RPC performance counters (total, slow >5ms, very slow >50ms)
+
+- **`nfs_ongetattr.go`** -- GETATTR handler:
+  - Fast path: if Entry has `PreSerializedGetAttr` bytes, writes them directly
+    (skips all XDR reflection/encoding)
+  - Slow path: computes FileAttribute, encodes via XDR using pooled buffer,
+    then caches the 88-byte result on the Entry for next time
+
+- **`nfs_onwrite.go`** -- WRITE handler:
+  - Skips pre-op stat (WCC pre_op_attr is optional per RFC 1813 section 2.6)
+  - Always reports `unstable` stability regardless of client request
+  - Post-op stat uses only post_op_attr (no full WCC)
+
+- **`nfs_oncreate.go`** -- CREATE handler:
+  - Handles exclusive create mode (used by macOS for atomic creates) by treating
+    it as unchecked create. Reads and discards the createverf3 verifier.
+    This eliminates the "exclusive mode not supported" error that caused macOS
+    to retry with unchecked mode, adding latency.
+
+- **`nfs_onreaddirplus.go`** -- READDIRPLUS handler:
+  - Standard implementation with cookie-based pagination
+  - Entity limit capped at `HandleLimit() / 2` entries per response
+
+- **`file.go`** -- FileAttribute and helper types:
+  - `PreSerializeGetAttrBody()` -- Hand-coded big-endian encoding of the
+    88-byte GETATTR response (NFSStatusOk + fattr3) without any XDR library.
+  - `ToFileAttribute()` -- Converts `os.FileInfo` to NFS fattr3.
+  - WCC helpers (`WriteWcc`, `WritePostOpAttrs`)
+
+---
+
+## 4. Key Data Flows
+
+### Read Path (NFS READ RPC)
+
+```
+Finder READ(handle, offset, count)
+  |
+  v
+FromHandle(handle) --> LookupByInode(inode) --> Entry with path
+  |
+  v
+OpenFile(path, O_RDONLY)
+  |
+  +--> FDPool.Get(fusePath)        // reuse pooled fd (avoids 60ms open)
+  |
+  v
+cachedFile.ReadAt(buf, offset)
+  |
+  +--> [1] MemoryBuffer.ReadAt()   // zero-syscall if file is buffered
+  |    (files < 128MB, in Go heap)
+  |
+  +--> [2] CacheReader.ReadBlock() // direct SSD pread (bypasses FUSE)
+  |    (chunk/slice lookup via Redis, then pread on cache block file)
+  |
+  +--> [3] fuseFD.ReadAt()         // JuiceFS FUSE read (populates SSD cache)
+  |
+  v
+ReadaheadManager.OnRead()          // track sequential pattern, may trigger prefetch
+  |
+  v
+NFS response (data + post_op_attr)
+```
+
+### Write Path (NFS WRITE RPC)
+
+```
+Finder WRITE(handle, offset, data, stability)
+  |
+  v
+FromHandle(handle) --> Entry with path
+  |
+  v
+OpenFile(path, O_RDWR) via FDPool.GetWrite()  // reuse pooled write fd
+  |
+  v
+Seek to offset, Write data
+  |
+  v
+writeFile.Write() --> trackWriteSize(path, newEnd)  // immediate size tracking
+  |
+  v
+writeFile.Close()
+  +--> FDPool.Release() (fd stays open for reuse, NO Sync)
+  +--> store.UpdateSize(path, finalSize, now)
+  +--> publishEvent({op:"create", path, size, mtime, inode})
+  |
+  v
+NFS response:
+  - status = OK
+  - WCC: pre_op_attr=nil, post_op_attr from Stat
+  - stability = unstable (always, regardless of client request)
+  - verifier = server ID
+```
+
+### Stat / GETATTR Path
+
+```
+Finder GETATTR(handle)
+  |
+  v
+FromHandle(handle) --> LookupByInode(inode) --> Entry
+  |
+  v
+Lstat(path) --> juiceFS.Stat(path)
+  |
+  +--> Fast rejection: ._*, .DS_Store, .Spotlight-V100, etc. --> ErrNotExist
+  |
+  +--> Check writeSizes map for in-flight write size override
+  |
+  +--> LookupByPath(path) --> pathCache hit?
+  |    YES: return Entry.FileInfo() (with write size override if larger)
+  |    NO:  fall through to FUSE
+  |
+  +--> os.Stat(fusePath)  // FUSE fallback
+  |    Cache result into SQLite (async)
+  |
+  v
+onGetAttr():
+  +--> Fast path: Entry.PreSerializedGetAttr != nil?
+  |    YES: w.Write(preSerializedBytes) -- 88 bytes, zero XDR encoding
+  |    NO:  Encode FileAttribute via XDR, cache bytes on Entry
+```
+
+### LOOKUP Path
+
+```
+Finder LOOKUP(dir_handle, name)
+  |
+  v
+FromHandle(dir_handle) --> parent path
+  |
+  v
+Stat(parent + "/" + name)  --> same flow as GETATTR above
+  |
+  v
+ToHandle(fs, childPath) --> 8-byte handle from inode
+  |
+  v
+NFS response (handle + post_op_attr)
+```
+
+### Directory Listing (READDIRPLUS)
+
+```
+Finder READDIRPLUS(dir_handle, cookie, verifier, dirCount, maxCount)
+  |
+  v
+FromHandle(dir_handle) --> dir path
+  |
+  v
+ReadDir(dirname) on juiceFS:
+  |
+  +--> ListChildren(dirname) from pathCache
+  |    Has entries? YES: return cached + trigger background prefetch
+  |    NO: fall through to FUSE
+  |
+  +--> os.ReadDir(fusePath)  // FUSE fallback
+  |    BulkInsert all entries into SQLite (synchronous, 500/batch)
+  |    Return entries
+  |
+  v
+prefetchChildren(dirname) -- background goroutine:
+  +--> os.ReadDir(fusePath) for this directory
+  +--> BulkInsert new entries (skip already-cached)
+  +--> For each subdirectory, recursively prefetch (one level deep)
+  +--> Max 4 concurrent prefetch goroutines via semaphore
+  +--> Debounce: skip if prefetched within 30 seconds
+  |
+  v
+READDIRPLUS response:
+  - "." and ".." entries with attributes
+  - Each child: fileID, name, cookie, fattr3, NFS handle
+  - EOF flag
+  - Paginated by cookie + maxCount
+```
+
+### Rename / Create
+
+```
+Rename(oldpath, newpath):
+  1. os.Rename(fusePath/old, fusePath/new)     // FUSE rename
+  2. DeleteFromCache(oldpath)                   // immediate in-memory removal
+  3. InsertToCache(newEntry)                    // immediate in-memory insert
+  4. async: store.Delete(old) + store.Insert(new)  // SQLite (may be slow)
+  5. publishEvent({op:"rename", path:new, old_path:old})
+
+Create(filename):
+  1. os.Create(fusePath/filename)               // FUSE create
+  2. store.Insert(entry with local_only=true)    // SQLite + cache immediately
+  3. Return writeFile wrapper
+
+MkdirAll(dirname):
+  1. os.MkdirAll(fusePath/dirname)              // FUSE mkdir
+  2. InsertToCache(entry with local_only=true)   // immediate in-memory
+  3. async: store.Insert(entry)                  // SQLite write
+  4. publishEvent({op:"create", path:dirname, is_dir:true})
+```
+
+---
+
+## 5. Performance Optimizations
+
+### 5.1 SQLite Metadata Cache (~147K entries, in-memory pathCache)
+
+All NFS metadata operations (GETATTR, LOOKUP, READDIR) read from in-memory
+Go maps (`pathCache`, `inodeCache`) -- never from SQLite queries. SQLite is
+only used for persistence across restarts and as the write-behind store.
+
+Dual cache architecture:
+- `pathCache map[string]*Entry` -- keyed by relative path (e.g., "Film Projects/GMTM/clip.mov")
+- `inodeCache map[uint64]*Entry` -- keyed by JuiceFS inode number
+
+On startup, `rebuildCaches()` loads all SQLite rows into both maps. All
+subsequent operations update both maps in-memory first, then write to SQLite
+(often asynchronously).
+
+### 5.2 SSD Direct Cache Reader (bypasses FUSE for cached blocks)
+
+The `cache.Reader` reads JuiceFS's local SSD cache blocks directly via
+`pread()` system calls, completely bypassing the FUSE kernel/userspace
+boundary. This eliminates two context switches per read for cached data.
+
+Flow: inode + offset -> chunk index -> Redis lookup for slice mapping ->
+compute block file path -> direct `pread()` on SSD.
+
+Slice mapping is cached locally (`sliceCache map[string][]SliceInfo`).
+File descriptors are pooled with 5-minute TTL.
+
+### 5.3 FD Pool (reuses file descriptors)
+
+Opening a file on JuiceFS FUSE costs ~60ms. The `FDPool` keeps file
+descriptors open and reuses them across NFS RPCs. This is critical because
+`go-nfs` calls `OpenFile -> Write -> Close` on every WRITE RPC.
+
+- 2-minute idle timeout before eviction
+- 30-second eviction check interval
+- Separate `Get` (read) and `GetWrite` (write with flags) methods
+- Reference counting prevents closing fds with active users
+
+### 5.4 Pre-serialized GETATTR Responses
+
+GETATTR is the hottest NFS RPC (Finder calls it constantly). The first
+GETATTR for an entry goes through normal XDR encoding. The resulting 88-byte
+response body (`NFSStatusOk` + `fattr3`) is cached on the `Entry` struct as
+`PreSerializedGetAttr`. Subsequent GETATTRs for the same entry just copy
+these 88 bytes -- zero reflection, zero XDR encoding.
+
+Invalidation: `PreSerializedGetAttr` is set to nil when `UpdateSize()` is
+called (size or mtime changed).
+
+### 5.5 Response Buffer Pool
+
+`sync.Pool` of `bytes.Buffer` objects (initial cap 4KB) used for every NFS
+RPC response. Eliminates one allocation + GC pressure per RPC. Buffers
+larger than 64KB are not returned to the pool to avoid memory bloat from
+large READ responses.
+
+### 5.6 TCP_NODELAY
+
+Set on both the listener (via `noDelayListener`) and each accepted connection.
+Without it, Nagle's algorithm adds ~40ms delay on small NFS responses like
+GETATTR. Socket buffers set to 4MB (`SO_SNDBUF`, `SO_RCVBUF`).
+
+The `serializeWrites` goroutine handles coalescing: it batch-drains all
+queued responses before flushing the 1MB buffered writer, reducing the
+number of TCP write syscalls.
+
+### 5.7 Fast `._*` Rejection
+
+macOS Finder probes for resource forks (`._filename`), `.DS_Store`,
+`.Spotlight-V100`, `.Trashes`, `.fseventsd`, `.TemporaryItems`,
+`.VolumeIcon.icns`, and `Icon\r` on every directory open. These never exist
+on JuiceFS. The Stat handler returns `os.ErrNotExist` immediately for these
+patterns, eliminating ~1/3 of all LOOKUPs from hitting FUSE.
+
+### 5.8 READDIR-Triggered Prefetch
+
+When `ReadDir` returns entries from cache, a background goroutine
+(`prefetchChildren`) scans the directory on FUSE and inserts any uncached
+children into SQLite. It also recursively prefetches one level of
+subdirectories for Finder's "expanding disclosure triangle" navigation
+pattern.
+
+- Max 4 concurrent prefetch goroutines (semaphore)
+- 30-second debounce per directory
+- 500-entry BulkInsert batches
+
+### 5.9 Write Optimizations
+
+- **No Sync on Close:** `writeFile.Close()` does NOT call `fsync()`. The
+  go-nfs library calls `OpenFile+Write+Close` on every WRITE RPC, so syncing
+  would flush to MinIO on every RPC. Instead, relies on JuiceFS's writeback
+  buffer.
+- **Unstable stability:** Always reports `unstable` write stability regardless
+  of client request, avoiding forced flushes.
+- **WCC skip:** WRITE handler skips pre-op stat (only sends post_op_attr).
+  WCC pre_op_attr is optional per RFC 1813 section 2.6.
+- **FD pool for writes:** Same file descriptor reused across WRITE RPCs for
+  the same file.
+- **Size tracking:** `writeSizes map[string]int64` tracks the latest written
+  position so that GETATTR/STAT during a write returns the correct file size
+  without waiting for FUSE to propagate.
+
+### 5.10 Readahead for Sequential Reads
+
+`ReadaheadManager` detects sequential read patterns (3 consecutive sequential
+reads on the same inode) and triggers background prefetch:
+- Prefetches 32MB ahead (8 x 4MB blocks)
+- Reads go through JuiceFS FUSE, which populates the SSD cache
+- Max 4 concurrent readahead goroutines
+- Tracker entries expire after 30 seconds
+
+### 5.11 Memory Buffer for Small Files
+
+`MemoryBuffer` caches entire files in Go heap for zero-syscall reads:
+- Threshold: files up to 128MB
+- Total budget: 2GB
+- Async loading on first access (caller uses FUSE for that read)
+- Eviction: 2-minute idle TTL, 30-second eviction interval
+- Good for: .prproj, .cube, .3dl, .xmp, .fcpxml
+- Bad for: media files (too large, sequential one-pass reads)
+
+### 5.12 Connection-Level Optimizations
+
+- **Sequential RPC dispatch:** macOS NFS client does not pipeline RPCs on a
+  single TCP connection, so concurrent dispatch adds overhead with no benefit.
+- **64-slot write channel:** Response channel buffered to 64 (up from 1) for
+  batching during burst traffic.
+- **1MB write buffer:** Buffered writer size matches NFS rsize for optimal
+  TCP segment coalescing.
+
+---
+
+## 6. Connection Resilience
+
+### NetWatcher
+
+Polls system network interfaces every 1 second. Detects when the "active"
+interface changes (e.g., switching from WiFi to 10GbE Ethernet, or losing
+connectivity). Priority ordering: Ethernet (en1-9) > WiFi (en0) >
+Tailscale (utun*) > Bridge > Other.
+
+On interface change:
+1. Fires registered callbacks
+2. Main callback: `rc.Reconnect()` -> closes old Redis client, creates new one
+3. On successful reconnect: `rc.TriggerSync()` -> immediate reconciliation
+4. On failed reconnect: reconcile loop retries with exponential backoff
+
+### Redis Reconnect
+
+`RedisClient.Reconnect()`:
+1. Closes old `redis.Client` (ignores errors -- may already be broken)
+2. Creates new client with same address
+3. PINGs to verify connectivity
+4. Updates connection state tracking
+
+### Grace Periods
+
+`HealthMonitor` has a 5-second grace period after network changes. During
+this period, FUSE stat failures are suppressed (marked healthy with
+"suppressed (network grace period)" message) to avoid false alarms while
+connections re-establish.
+
+### Reconciliation Backoff
+
+On failed reconciliation:
+- Base interval: 30 seconds
+- Exponential backoff: 30s, 60s, 2m, 4m, 5m (max)
+- On recovery: logs "reconciliation recovered after N failures", resets
+  interval to 30s
+- `syncNowCh` allows immediate sync triggering (e.g., after network change)
+
+---
+
+## 7. The SQLITE_BUSY Fix
+
+### Problem
+
+During batch reconciliation, `BulkInsert` held a write transaction that could
+block for seconds (inserting ~147K entries). During that time, any NFS
+operation that triggered a SQLite write (Rename, MkdirAll, SUBSCRIBE event
+insert) would get `SQLITE_BUSY` errors, causing Finder operations to fail.
+
+### Solution: Cache-First Writes
+
+All mutating NFS operations (Rename, MkdirAll, Create) now follow the pattern:
+1. **In-memory cache first** (`InsertToCache` / `DeleteFromCache`) -- instant,
+   never blocked by SQLite
+2. **FUSE operation** (the actual filesystem mutation)
+3. **SQLite write async** (`go store.Insert(...)`) -- may be delayed if
+   BulkInsert is running, but NFS operations work because pathCache is updated
+
+### Smaller BulkInsert Batches
+
+`BulkInsert` batch size reduced from unlimited to **500 entries per
+transaction**. This means the write lock is held for ~10-50ms per batch
+instead of seconds for the full 147K-entry insert. Between batches, other
+SQLite writers can execute.
+
+### Retry Logic
+
+`RedisClient.retryInsert()` retries with exponential backoff:
+- 5 attempts max
+- Delays: 50ms, 100ms, 200ms, 400ms, 800ms
+- Only retries on `SQLITE_BUSY` errors
+
+### ListChildren from Cache
+
+`Store.ListChildren()` iterates `pathCache` (in-memory map) instead of
+querying SQLite. This means directory listings are never blocked by
+concurrent BulkInsert transactions.
+
+---
+
+## 8. Redis Pub/Sub Architecture
+
+### SUBSCRIBE for Real-Time Events
+
+Channel: `juicemount:metadata`
+
+Event format (JSON):
+```json
+{
+  "op": "create|update|rename|delete",
+  "path": "relative/path/to/file",
+  "size": 12345,
+  "mtime": 1711300000,
+  "inode": 67890,
+  "is_dir": false,
+  "old_path": "old/path"
+}
+```
+
+The `subscribeLoop` runs continuously, reconnecting with 2-second delay on
+connection loss. Each received event is applied via `applyEvent()`:
+- `create`/`update`: InsertToCache (immediate) + retryInsert to SQLite
+- `delete`: DeleteFromCache (immediate) + Delete from SQLite
+- `rename`: Delete old + InsertToCache new (immediate) + retryInsert
+
+Events are published by JuiceMount NFS operations:
+- `writeFile.Close()` -> create event
+- `juiceFS.Rename()` -> rename event
+- `juiceFS.Remove()` -> delete event
+- `juiceFS.MkdirAll()` -> create event (is_dir=true)
+
+### Lua Script for Batch Reconciliation
+
+The Lua script runs server-side on Redis (atomic, no round-trips):
+
+1. `SCAN` all `d*` keys (JuiceFS directory entries) with `COUNT 1000`
+2. For each directory entry, extract child inode (9-byte value: 1 byte file
+   type + 4 bytes padding + 4 bytes inode)
+3. Build reverse map: `inode -> parent_inode + name`
+4. Resolve full paths by walking the reverse map up to inode 1 (root)
+5. For each resolved entry, `GET i{inode}` for attributes (mtime at offset 24,
+   size at offset 52, both uint64 big-endian)
+6. Return array of `"fileType:mtime:size:inode:path"` strings
+
+The reconciliation then:
+1. Parses all entries from Lua output
+2. BulkInserts into SQLite (500/batch)
+3. Clears `local_only` flags for entries now confirmed in Redis
+4. Prunes entries that exist in SQLite but not in Redis (and aren't local_only)
+
+---
+
+## 9. Benchmark Suite
+
+**File:** `test/benchmark_suite_test.go`
+**Baselines:** `test/benchmark_baselines.json`
+
+### What It Tests
+
+| # | Benchmark | Description | Metric |
+|---|-----------|-------------|--------|
+| 1 | Finder Directory Open | ReadDir + Stat all entries for dirs of ~10, ~100, ~1000+ entries | ms (avg of 5 iterations) |
+| 2 | Stat Latency | p50/p95/p99 of 200 stat calls on warm cache | ms |
+| 3 | Sequential Read | Read a 10MB file start to finish (256KB buffer) | MB/s |
+| 4 | Random Read / Scrubbing | 50 random 64KB reads at random offsets (simulates video scrubbing) | ms/read |
+| 5 | Write Small Files | 50 x 1KB files (project file save pattern) | total ms |
+| 6 | Write Large File | Single 10MB file (256KB write chunks) | total ms |
+| 7 | Create + Rename | 20 mkdir+rename cycles with concurrent background FS activity (SQLITE_BUSY stress test) | ms/cycle |
+| 8 | Deep Tree Walk | `filepath.Walk` to depth 4 under "Film Projects/GMTM" | total ms |
+| 9 | Concurrent Reads | 4 goroutines each reading a 1MB file | total ms |
+| 10 | Cold vs Warm | Same ReadDir+Stat twice (first = cold, second = warm) | ms each |
+
+### Regression Detection
+
+Threshold: 20% slower than baseline (ratio > 1.20 for latency metrics, or
+ratio > 1.20 for throughput). Test fails if any benchmark regresses.
+
+### How to Run
+
+```bash
+# Run the benchmark suite (requires NFS mount at /Volumes/zpool)
+cd /Users/LelandDutcher/Developer/JuiceMount5
+go test -v -run TestBenchmarkSuite ./test/ -timeout 10m
+
+# Update baselines after a performance improvement
+UPDATE_BASELINES=1 go test -v -run TestBenchmarkSuite_UpdateBaselines ./test/ -timeout 10m
+```
+
+### Current Baselines (2026-03-25)
+
+```json
+{
+  "cold_run_ms": 600,
+  "concurrent_reads_4x_ms": 1000,
+  "deep_tree_walk_ms": 2806.4,
+  "finder_dir_open_10": 18.23,
+  "finder_dir_open_100": 120.46,
+  "finder_dir_open_1000": 2115.93,
+  "random_read_64k_ms": 3.63,
+  "sequential_read_mbps": 10.1,
+  "stat_p50_ms": 0.393,
+  "stat_p95_ms": 0.86,
+  "stat_p99_ms": 1.299,
+  "warm_run_ms": 550,
+  "write_large_10m_ms": 39.4,
+  "write_small_50x1k_ms": 452
+}
+```
+
+---
+
+## 10. Server Infrastructure
+
+| Component | Address | Purpose |
+|-----------|---------|---------|
+| Redis | `192.168.0.210:6379` (DB 1) | JuiceFS metadata (d*, i*, c* keys) + pub/sub |
+| MinIO | `192.168.0.212:9000` | JuiceFS data storage (S3-compatible) |
+| JuiceFS volume | "zpool" | The JuiceFS filesystem |
+| FUSE mount | `~/.juicemount/fuse-internal` | Hidden JuiceFS FUSE mount (not user-facing) |
+| NFS server | `127.0.0.1:11049` | Loopback NFS server |
+| NFS mount | `/Volumes/zpool` | User-facing mount point |
+| SQLite DB | `~/.juicemount/metadata.db` | Local metadata cache |
+| SSD cache | `~/.juicefs/cache/{uuid}/raw/chunks/` | JuiceFS local block cache |
+
+---
+
+## 11. Known Issues and Future Work
+
+### go-nfs Fork Opportunities
+
+The `internal/nfs/` package is a vendored fork of `willscott/go-nfs`. Current
+modifications are marked with `[JM5]` comments. Potential upstream contributions
+or deeper fork changes:
+
+- **READDIRPLUS maxcount estimation** -- Current estimation uses a fixed 512
+  bytes per entry. Could be more accurate to avoid under/over-filling responses.
+- **Fragment reconstruction** -- `conn.go` logs a warning for multi-fragment
+  requests but doesn't implement reassembly. Not needed for macOS client but
+  would improve protocol compliance.
+
+### Finder Cold Directory Timing
+
+First access to a directory not in SQLite cache requires FUSE ReadDir + sync
+BulkInsert. For directories with 1000+ entries, this can take 2+ seconds.
+The prefetch system mitigates this for navigated-to directories but doesn't
+help with the initial cold access from a completely fresh start.
+
+Possible improvements:
+- Background full-tree prefetch on startup (after initial Redis sync)
+- Lazy READDIRPLUS that returns partial results while prefetch completes
+
+### Exclusive Create Cosmetic Errors
+
+The `onCreate` handler treats exclusive creates as unchecked creates. While
+functionally correct (the file is created successfully), it means:
+- The createverf3 verifier is read and discarded
+- If the file already exists, we don't check the verifier to determine if
+  this is a retry of the same create
+
+This is cosmetically incorrect per RFC 1813 but has no practical impact since
+macOS retries handle this case.
+
+### Write Durability Window
+
+Since `writeFile.Close()` does not call `fsync()` and always reports
+`unstable` stability, there is a durability window between when the NFS
+client considers a write "done" and when JuiceFS actually flushes to MinIO.
+This is acceptable for the video editing workload (projects auto-save
+frequently, and the JuiceFS writeback buffer handles durability) but would
+not be appropriate for a database workload.
+
+### Memory Pressure
+
+With the MemoryBuffer (2GB budget), FDPool, and SQLite in-memory caches
+(147K entries x ~200 bytes each = ~30MB), JM5 can use 2-3GB of RAM. The
+MemoryBuffer budget should be configurable and perhaps auto-adjusted based
+on system memory pressure.
+
+---
+
+## 12. Testing
+
+### Test Packages
+
+| Package | File | What it tests |
+|---------|------|---------------|
+| `metadata` | `store_test.go` | SQLite CRUD, BulkInsert, cache coherence, concurrent access |
+| `metadata` | `redis_test.go` | Redis connect, Lua sync, SUBSCRIBE event application, reconnect |
+| `cache` | `reader_test.go` | SSD cache block reading, slice mapping, cache miss handling |
+| `nfs` | `server_test.go` | Server start/stop, listener setup, handler initialization |
+| `nfs` | `connect_test.go` | NFS mount/unmount, basic file operations through NFS |
+| `nfs` | `read_test.go` | Read path: cached reads, FUSE fallback, readahead triggering |
+| `nfs` | `write_test.go` | Write path: size tracking, fd pool, metadata updates |
+| `nfs` | `readahead_test.go` | Sequential detection, prefetch triggering, concurrent limits |
+| `nfs` | `membuf_test.go` | Memory buffer: load, evict, concurrent access, budget limits |
+| `health` | `monitor_test.go` | Health check cycle, state transitions, grace period |
+| `health` | `netwatch_test.go` | Interface detection, change callbacks, grace period |
+| `test` | `benchmark_suite_test.go` | Full performance regression suite (10 benchmarks) |
+| `test` | `e2e_test.go` | End-to-end: start server, mount, file ops, unmount |
+| `test` | `workflow_test.go` | Real-world workflows: Finder operations, concurrent access |
+| `test` | `finder_perf_test.go` | Finder-specific performance patterns |
+
+### How to Run
+
+```bash
+# Unit tests (no network or mount required)
+go test ./metadata/ ./cache/ ./nfs/ ./health/
+
+# Integration tests (requires Redis at 192.168.0.210:6379)
+go test -v ./metadata/ -run TestRedis
+
+# NFS mount tests (requires running JuiceMount5 + sudo access)
+go test -v ./nfs/ -run TestConnect
+
+# End-to-end tests (starts server, mounts, runs operations)
+go test -v ./test/ -run TestE2E -timeout 5m
+
+# Full benchmark suite
+go test -v ./test/ -run TestBenchmarkSuite -timeout 10m
+```
+
+### Sudoers Setup for Mount Tests
+
+The NFS mount/unmount commands require `sudo`. For CI or automated testing:
+
+```
+# /etc/sudoers.d/juicemount
+%staff ALL=(ALL) NOPASSWD: /sbin/mount_nfs
+%staff ALL=(ALL) NOPASSWD: /sbin/umount
+%staff ALL=(ALL) NOPASSWD: /bin/mkdir -p /Volumes/zpool
+```
+
+---
+
+## 13. Build and Run Instructions
+
+### Prerequisites
+
+- Go 1.26+
+- JuiceFS 1.3.x (`/opt/homebrew/bin/juicefs`)
+- Redis server at 192.168.0.210:6379
+- MinIO server at 192.168.0.212:9000
+- JuiceFS volume "zpool" already created and mountable
+- macOS (for NFS mount_nfs and Finder integration)
+
+### Build
+
+```bash
+cd /Users/LelandDutcher/Developer/JuiceMount5
+
+# Build the CLI
+go build -o jm5 ./cmd/jm5/
+
+# Build the C bridge (for Swift app)
+cd bridge
+go build -buildmode=c-archive -o libjm5.a ./cbridge.go
+```
+
+### Run
+
+```bash
+# Start JuiceFS FUSE mount first (hidden, internal)
+juicefs mount redis://192.168.0.210:6379/1 ~/.juicemount/fuse-internal \
+  --cache-dir ~/.juicefs/cache \
+  --cache-size 102400 \
+  --buffer-size 1024 \
+  --prefetch 3 \
+  --writeback
+
+# Start JuiceMount5
+./jm5 \
+  --redis redis://192.168.0.210:6379/1 \
+  --fuse-path ~/.juicemount/fuse-internal \
+  --mount /Volumes/zpool \
+  --listen 127.0.0.1:11049
+
+# Or with custom paths
+./jm5 \
+  --redis redis://192.168.0.210:6379/1 \
+  --fuse-path /path/to/fuse \
+  --mount /Volumes/myvolume \
+  --listen 127.0.0.1:12345 \
+  --db /path/to/metadata.db
+
+# Start without mounting (for testing)
+./jm5 --no-mount
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--redis` | `redis://192.168.0.210:6379/1` | Redis URL |
+| `--fuse-path` | `~/.juicemount/fuse-internal` | JuiceFS FUSE mount path |
+| `--mount` | `/Volumes/zpool` | NFS mount point |
+| `--listen` | `127.0.0.1:11049` | NFS server listen address |
+| `--db` | `~/.juicemount/metadata.db` | SQLite database path |
+| `--no-mount` | `false` | Start server without mounting |
+
+### Verify
+
+```bash
+# Check mount
+mount | grep zpool
+
+# List files
+ls /Volumes/zpool/
+
+# Check metadata count
+sqlite3 ~/.juicemount/metadata.db "SELECT COUNT(*) FROM entries;"
+```
