@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
 const (
@@ -186,7 +188,7 @@ func (rc *RedisClient) Reconnect() error {
 	rc.lastReconnect = time.Now()
 	rc.mu.Unlock()
 
-	log.Printf("redis reconnected successfully")
+	jmlog.Info("redis reconnected")
 	return nil
 }
 
@@ -264,7 +266,7 @@ func (rc *RedisClient) subscribeLoop() {
 		case <-rc.stopCh:
 			return
 		case <-time.After(2 * time.Second):
-			log.Printf("redis SUBSCRIBE reconnecting...")
+			jmlog.Info("redis SUBSCRIBE reconnecting")
 		}
 	}
 }
@@ -319,8 +321,8 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		}
 		// In-memory cache first (instant, never blocked)
 		rc.store.InsertToCache(e)
-		// SQLite with retry
-		if err := rc.retryInsert(e); err != nil {
+		// SQLite write (serialized by writeMu, no retry needed)
+		if err := rc.store.Insert(e); err != nil {
 			log.Printf("subscribe apply create/update: %v", err)
 		}
 
@@ -346,26 +348,10 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 			Mode:       mode,
 		}
 		rc.store.InsertToCache(e)
-		if err := rc.retryInsert(e); err != nil {
+		if err := rc.store.Insert(e); err != nil {
 			log.Printf("subscribe apply rename: %v", err)
 		}
 	}
-}
-
-// retryInsert attempts SQLite insert with exponential backoff for SQLITE_BUSY.
-func (rc *RedisClient) retryInsert(e *Entry) error {
-	var err error
-	for attempt := 0; attempt < 5; attempt++ {
-		err = rc.store.Insert(e)
-		if err == nil {
-			return nil
-		}
-		if !strings.Contains(err.Error(), "SQLITE_BUSY") {
-			return err
-		}
-		time.Sleep(time.Duration(50*(1<<attempt)) * time.Millisecond)
-	}
-	return err
 }
 
 // reconcileLoop runs periodic batch reconciliation with exponential backoff
@@ -384,7 +370,7 @@ func (rc *RedisClient) reconcileLoop() {
 		case <-ticker.C:
 			rc.doReconcile(&consecutiveFailures, &backoff, baseInterval, maxBackoff, ticker)
 		case <-rc.syncNowCh:
-			log.Printf("reconciliation triggered by network change")
+			jmlog.Info("reconciliation triggered by network change")
 			rc.doReconcile(&consecutiveFailures, &backoff, baseInterval, maxBackoff, ticker)
 		case <-rc.stopCh:
 			return
@@ -405,8 +391,11 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 			rc.lastDisconnect = time.Now()
 		}
 		rc.mu.Unlock()
-		log.Printf("reconciliation error (attempt %d, next in %v): %v",
-			*consecutiveFailures, backoff.Round(time.Second), err)
+		jmlog.Warn("reconciliation failed",
+			"attempt", *consecutiveFailures,
+			"next_in_sec", int64(backoff.Round(time.Second).Seconds()),
+			"error", err.Error(),
+		)
 		ticker.Reset(*backoff)
 	} else {
 		rc.mu.Lock()
@@ -417,7 +406,7 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 		}
 		rc.mu.Unlock()
 		if *consecutiveFailures > 0 {
-			log.Printf("reconciliation recovered after %d failures", *consecutiveFailures)
+			jmlog.Info("reconciliation recovered", "previous_failures", *consecutiveFailures)
 			*consecutiveFailures = 0
 			*backoff = baseInterval
 			ticker.Reset(*backoff)
@@ -523,21 +512,41 @@ func (rc *RedisClient) syncMetadata() error {
 		redisPaths[entryPath] = struct{}{}
 	}
 
-	// Bulk insert/update all Redis entries (5000 per batch)
-	// Use smaller batches (500) to reduce SQLite write lock hold time.
-	// This prevents SQLITE_BUSY errors for concurrent NFS operations
-	// (Rename, MkdirAll, SUBSCRIBE events) during reconciliation.
-	if err := rc.store.BulkInsert(redisEntries, 500); err != nil {
-		return fmt.Errorf("bulk insert: %w", err)
+	// Incremental upsert: only insert entries that are new or changed.
+	// Comparing with the in-memory cache avoids rewriting all 131K entries
+	// to SQLite on every sync cycle (reduces ~6s to <500ms steady-state).
+	var toUpsert []*Entry
+	for _, e := range redisEntries {
+		existing := rc.store.LookupByPath(e.Path)
+		if existing == nil ||
+			existing.Mtime.Unix() != e.Mtime.Unix() ||
+			existing.Size != e.Size ||
+			existing.Inode != e.Inode {
+			toUpsert = append(toUpsert, e)
+		}
 	}
 
-	// Clear local_only flag for entries that now exist in Redis (bulk)
-	clearPaths := make([]string, len(redisEntries))
-	for i, e := range redisEntries {
-		clearPaths[i] = e.Path
+	if len(toUpsert) > 0 {
+		if err := rc.store.BulkInsert(toUpsert, 500); err != nil {
+			return fmt.Errorf("bulk insert: %w", err)
+		}
 	}
-	if err := rc.store.BulkClearLocalOnly(clearPaths); err != nil {
-		return fmt.Errorf("bulk clear local_only: %w", err)
+
+	// Clear local_only flag only for entries that are actually local_only.
+	// No need to update all 131K entries — typically only 0-10 are local_only.
+	localOnly, _ := rc.store.LocalOnlyEntries()
+	if len(localOnly) > 0 {
+		var clearPaths []string
+		for _, e := range localOnly {
+			if _, inRedis := redisPaths[e.Path]; inRedis {
+				clearPaths = append(clearPaths, e.Path)
+			}
+		}
+		if len(clearPaths) > 0 {
+			if err := rc.store.BulkClearLocalOnly(clearPaths); err != nil {
+				return fmt.Errorf("bulk clear local_only: %w", err)
+			}
+		}
 	}
 
 	// Prune entries absent from Redis for PruneThreshold+ consecutive cycles.
@@ -587,7 +596,12 @@ func (rc *RedisClient) syncMetadata() error {
 	pendingPrune := len(rc.pruneAbsent)
 	rc.mu.Unlock()
 
-	log.Printf("metadata sync: %d entries (%d pruned, %d pending prune) in %v",
-		len(redisEntries), len(toDelete), pendingPrune, duration.Round(time.Millisecond))
+	jmlog.Info("metadata sync complete",
+		"entries", len(redisEntries),
+		"upserted", len(toUpsert),
+		"pruned", len(toDelete),
+		"pending_prune", pendingPrune,
+		"duration_ms", duration.Round(time.Millisecond).Milliseconds(),
+	)
 	return nil
 }

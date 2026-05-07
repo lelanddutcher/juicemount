@@ -197,6 +197,20 @@ func (s *Store) UpdateStatus(path string, status Status, bytesCached int64, errM
 	return err
 }
 
+// IsPinnedReady checks whether a single path is in the registry with
+// status Ready. Hot-path-friendly — uses the path primary key.
+// Called on every NFS OpenFile when offline mode is on.
+func (s *Store) IsPinnedReady(path string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var statusInt int
+	err := s.db.QueryRow(`SELECT status FROM pinned_files WHERE path = ?`, path).Scan(&statusInt)
+	if err != nil {
+		return false
+	}
+	return Status(statusInt) == StatusReady
+}
+
 // Pending returns up to limit entries waiting for prefetch.
 func (s *Store) Pending(limit int) ([]Entry, error) {
 	return s.queryStatus(StatusPending, limit)

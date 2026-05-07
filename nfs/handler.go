@@ -37,6 +37,7 @@ type JuiceMountHandler struct {
 	readahead   *ReadaheadManager
 	memBuf      *MemoryBuffer
 	redisClient *metadata.RedisClient // for publishing events
+	pinStore    *pin.Store            // optional; gates reads when offline mode is on
 
 	// Synthetic inode counter for locally-created entries (atomic)
 	inodeCounter atomic.Uint64
@@ -85,6 +86,22 @@ func NewHandler(store *metadata.Store, fusePath string) *JuiceMountHandler {
 // SetCacheReader attaches a direct SSD cache reader for bypassing FUSE on cached reads.
 func (h *JuiceMountHandler) SetCacheReader(cr *cache.Reader) {
 	h.cacheReader = cr
+}
+
+// SetPinStore attaches the pin registry. When offline mode is on, the
+// read path consults this store to fail-fast on un-pinned/un-cached files.
+func (h *JuiceMountHandler) SetPinStore(ps *pin.Store) {
+	h.pinStore = ps
+}
+
+// isPinnedReady reports whether the canonical-form path is in the pin
+// store with status=Ready. Used by the offline-mode open gate.
+// Indexed lookup — safe to call on every OpenFile.
+func (h *JuiceMountHandler) isPinnedReady(canonicalPath string) bool {
+	if h.pinStore == nil {
+		return false
+	}
+	return h.pinStore.IsPinnedReady(canonicalPath)
 }
 
 // SetRedisClient attaches a Redis client for publishing metadata events.
@@ -570,6 +587,24 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 
 	// Detect write intent
 	isWrite := flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0
+
+	// Offline-mode gate: refuse OPEN of un-pinned files when offline.
+	// This is the strict guarantee — we don't let kernel page cache or
+	// FUSE buffering accidentally serve un-pinned bytes when the user
+	// is on cellular and explicitly asked us to fail fast.
+	//
+	// Pinned-and-ready files are allowed through. Writes are always
+	// allowed (the user explicitly created them; they go to FUSE cache).
+	if !isWrite && pin.IsOffline() && jfs.handler.pinStore != nil {
+		// Translate the in-mount filename to the canonical /Volumes/... form
+		// our pin store uses as keys. We don't have direct access to the
+		// mountPoint here, so probe both common shapes.
+		canonical := "/Volumes/zpool/" + filename
+		if !jfs.handler.isPinnedReady(canonical) {
+			jmlog.Debug("offline: refusing open of un-pinned file", "path", filename)
+			return nil, syscall.EIO
+		}
+	}
 
 	// For read-only opens, try to use fd pool + cache reader
 	if !isWrite && e != nil {

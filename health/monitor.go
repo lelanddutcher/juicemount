@@ -5,7 +5,6 @@ package health
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,6 +14,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
 // Config holds the endpoints and paths that the monitor checks.
@@ -95,7 +96,31 @@ type HealthMonitor struct {
 	status        HealthStatus
 	cancel        context.CancelFunc
 	done          chan struct{}
+
+	// NFS auto-remount state. Guarded by mu.
+	remountFn       func() error // optional: called to remount the NFS volume
+	nfsStaleStreak  int          // consecutive failed NFS checks
+	lastRemountAt   time.Time    // last successful remount time
 }
+
+// Tunables for NFS auto-remount. Exposed as vars so tests can override.
+var (
+	// NFSStaleThreshold is the number of consecutive failed NFS health
+	// checks (10s apart) before triggering a remount.
+	NFSStaleThreshold = 3
+
+	// NFSRemountCooldown is the minimum time between auto-remount
+	// attempts. Prevents flapping if the underlying issue is persistent.
+	NFSRemountCooldown = 60 * time.Second
+
+	// NFSStatTimeout bounds an os.Stat() probe of the NFS mount point.
+	// If the syscall hangs longer than this, the mount is considered stale.
+	NFSStatTimeout = 5 * time.Second
+
+	// forceUnmountFn is the function used to force-unmount a stale mount.
+	// Replaceable so tests can avoid invoking `sudo`.
+	forceUnmountFn = forceUnmount
+)
 
 // New creates a HealthMonitor for the given configuration.
 func New(cfg Config) *HealthMonitor {
@@ -160,6 +185,19 @@ func (m *HealthMonitor) SetStatsProvider(fn func() MemoryStats) {
 	m.statsProvider = fn
 }
 
+// EnableNFSRemount registers a callback that re-runs the NFS mount
+// command. When set, the monitor will automatically force-unmount and
+// remount when the NFS mount point becomes stale (RPC hangs, Stat
+// timeout, etc.). Auto-remount is gated by NFSStaleThreshold
+// consecutive failures and NFSRemountCooldown between attempts.
+//
+// Pass nil to disable auto-remount.
+func (m *HealthMonitor) EnableNFSRemount(fn func() error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.remountFn = fn
+}
+
 // Status returns a snapshot of the current health state.
 func (m *HealthMonitor) Status() HealthStatus {
 	m.mu.RLock()
@@ -190,8 +228,11 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 	if !fuseStatus.Healthy && m.InGracePeriod() {
 		fuseStatus.Healthy = true
 		fuseStatus.Message = "suppressed (network grace period)"
-		log.Printf("[health] FUSE error suppressed during network grace period")
+		jmlog.Debug("fuse error suppressed during network grace period")
 	}
+
+	// Track NFS staleness streaks and trigger auto-remount when needed.
+	m.handleNFSAutoRemount(nfsStatus.Healthy)
 
 	// Derive connection states
 	redisConnState := connStateFor(prev.RedisConnState, prev.Redis.Healthy, redisStatus.Healthy)
@@ -246,11 +287,75 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 
 	if prev.Overall != next.Overall {
 		if next.Overall {
-			log.Println("[health] system recovered — all components healthy")
+			jmlog.Info("system recovered — all components healthy")
 		} else {
-			log.Println("[health] system degraded — one or more components unhealthy")
+			jmlog.Warn("system degraded — one or more components unhealthy")
 		}
 	}
+}
+
+// handleNFSAutoRemount tracks consecutive NFS health failures and, once
+// the threshold is crossed (and cooldown allows), invokes a force-
+// unmount + remount sequence. It is a no-op when no remount callback
+// is registered or when the mount point is not configured.
+func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
+	m.mu.Lock()
+	remountFn := m.remountFn
+	mountPoint := m.cfg.NFSMountPoint
+	if remountFn == nil || mountPoint == "" {
+		m.nfsStaleStreak = 0
+		m.mu.Unlock()
+		return
+	}
+	if healthy {
+		m.nfsStaleStreak = 0
+		m.mu.Unlock()
+		return
+	}
+	m.nfsStaleStreak++
+	streak := m.nfsStaleStreak
+	if streak < NFSStaleThreshold {
+		m.mu.Unlock()
+		return
+	}
+	if !m.lastRemountAt.IsZero() && time.Since(m.lastRemountAt) < NFSRemountCooldown {
+		jmlog.Debug("nfs auto-remount suppressed by cooldown",
+			"streak", streak,
+			"since_last_sec", int64(time.Since(m.lastRemountAt).Seconds()),
+		)
+		m.mu.Unlock()
+		return
+	}
+	// Reset streak; record attempt so cooldown holds even on failure.
+	m.nfsStaleStreak = 0
+	m.lastRemountAt = time.Now()
+	m.mu.Unlock()
+
+	jmlog.Warn("nfs mount stale, attempting auto-remount",
+		"mount_point", mountPoint,
+		"consecutive_failures", streak,
+	)
+	if err := forceUnmountFn(mountPoint); err != nil {
+		jmlog.Warn("nfs force-unmount failed (continuing to remount anyway)",
+			"mount_point", mountPoint, "error", err.Error())
+	}
+	if err := remountFn(); err != nil {
+		jmlog.Error("nfs auto-remount failed",
+			"mount_point", mountPoint, "error", err.Error())
+		return
+	}
+	jmlog.Info("nfs auto-remount succeeded", "mount_point", mountPoint)
+}
+
+// forceUnmount runs `umount -f` on the given mount point. Errors here
+// are non-fatal: the subsequent mount attempt is the actual recovery.
+func forceUnmount(mountPoint string) error {
+	cmd := exec.Command("sudo", "umount", "-f", mountPoint)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("umount -f %s: %v: %s", mountPoint, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // connStateFor derives the connection state from previous state and health transitions.
@@ -270,9 +375,12 @@ func connStateFor(prevState ConnState, wasHealthy, isHealthy bool) ConnState {
 
 func (m *HealthMonitor) logTransition(name string, prev, next ComponentStatus) {
 	if prev.Healthy && !next.Healthy {
-		log.Printf("[health] %s: healthy → unhealthy: %s", name, next.Message)
+		jmlog.Warn("component degraded",
+			"component", name,
+			"reason", next.Message,
+		)
 	} else if !prev.Healthy && next.Healthy && prev.LastCheck != (time.Time{}) {
-		log.Printf("[health] %s: unhealthy → healthy", name)
+		jmlog.Info("component recovered", "component", name)
 	}
 }
 
@@ -282,7 +390,7 @@ func (m *HealthMonitor) checkRedis(ctx context.Context) ComponentStatus {
 	now := time.Now()
 	err := m.rdb.Ping(ctx).Err()
 	if err != nil {
-		log.Printf("[health] Redis ping failed: %v — continuing with cached metadata", err)
+		jmlog.Debug("redis ping failed", "error", err.Error())
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("ping failed: %v", err)}
 	}
 	return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
@@ -290,17 +398,20 @@ func (m *HealthMonitor) checkRedis(ctx context.Context) ComponentStatus {
 
 func (m *HealthMonitor) checkMinIO() ComponentStatus {
 	now := time.Now()
+	if m.cfg.MinIOURL == "" {
+		return ComponentStatus{Healthy: true, LastCheck: now, Message: "not configured"}
+	}
 	url := m.cfg.MinIOURL + "/minio/health/live"
 	resp, err := m.http.Get(url)
 	if err != nil {
-		log.Printf("[health] MinIO health check failed: %v", err)
+		jmlog.Debug("minio health check failed", "error", err.Error())
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("request failed: %v", err)}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		msg := fmt.Sprintf("unexpected status %d", resp.StatusCode)
-		log.Printf("[health] MinIO health check failed: %s", msg)
+		jmlog.Debug("minio health check failed", "status", resp.StatusCode)
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: msg}
 	}
 	return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
@@ -312,14 +423,14 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 	// Check 1: directory exists
 	info, err := os.Stat(m.cfg.FUSEPath)
 	if err != nil || !info.IsDir() {
-		log.Printf("[health] FUSE mount not found at %s", m.cfg.FUSEPath)
+		jmlog.Debug("fuse mount missing", "path", m.cfg.FUSEPath)
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stat failed: %v", err)}
 	}
 
 	// Check 2: mount is actually a FUSE filesystem (appears in mount table)
 	out, _ := exec.Command("mount").Output()
 	if !strings.Contains(string(out), m.cfg.FUSEPath) {
-		log.Printf("[health] FUSE mount at %s is not in mount table (unmounted)", m.cfg.FUSEPath)
+		jmlog.Debug("fuse mount not in mount table", "path", m.cfg.FUSEPath)
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted (directory exists but no FUSE)"}
 	}
 
@@ -332,25 +443,45 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 	select {
 	case err := <-done:
 		if err != nil {
-			log.Printf("[health] FUSE mount at %s is not readable: %v", m.cfg.FUSEPath, err)
+			jmlog.Debug("fuse readdir failed", "path", m.cfg.FUSEPath, "error", err.Error())
 			return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("readdir failed: %v", err)}
 		}
 		return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 	case <-time.After(5 * time.Second):
-		log.Printf("[health] FUSE mount at %s is unresponsive (stale)", m.cfg.FUSEPath)
+		jmlog.Warn("fuse mount unresponsive (stale)", "path", m.cfg.FUSEPath)
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "unresponsive (stale mount)"}
 	}
 }
 
+// checkNFS verifies the NFS mount is responsive. A simple os.Stat() can
+// hang indefinitely on a stale mount, so we time-bound the call: any
+// stat call that does not return within NFSStatTimeout is treated as a
+// stale-mount signal (the same condition that produces the Finder
+// spinning beach ball).
 func (m *HealthMonitor) checkNFS() ComponentStatus {
 	now := time.Now()
 	if m.cfg.NFSMountPoint == "" {
 		return ComponentStatus{Healthy: true, LastCheck: now, Message: "not configured"}
 	}
-	_, err := os.Stat(m.cfg.NFSMountPoint)
-	if err != nil {
-		log.Printf("[health] NFS mount stale at %s: %v", m.cfg.NFSMountPoint, err)
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stale: %v", err)}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := os.Stat(m.cfg.NFSMountPoint)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			jmlog.Debug("nfs stat failed", "mount_point", m.cfg.NFSMountPoint, "error", err.Error())
+			return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stale: %v", err)}
+		}
+		return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
+	case <-time.After(NFSStatTimeout):
+		jmlog.Warn("nfs mount unresponsive (stat timed out)",
+			"mount_point", m.cfg.NFSMountPoint,
+			"timeout_ms", NFSStatTimeout.Milliseconds(),
+		)
+		return ComponentStatus{Healthy: false, LastCheck: now, Message: "unresponsive (stat timeout)"}
 	}
-	return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 }
