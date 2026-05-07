@@ -261,6 +261,30 @@ func (s *Store) Stale(ttl time.Duration, limit int) ([]Entry, error) {
 	return scanEntries(rows)
 }
 
+// AllPinnedForRepair returns every entry the user has pinned that we
+// might want to re-prefetch — Ready, Prefetching, AND Failed. Pending is
+// excluded (the worker pool is already going to pick it up). The verify
+// flow uses this to re-attempt files that errored on a previous run
+// (commonly: FUSE was momentarily unmounted right after a restart, every
+// open() returned ENOENT, all the entries got marked Failed, and the
+// user has no obvious way to retry them short of unpinning and re-pinning).
+func (s *Store) AllPinnedForRepair(limit int) ([]Entry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root
+		FROM pinned_files
+		WHERE status IN (?, ?, ?)
+		ORDER BY last_prefetched ASC
+		LIMIT ?`,
+		int(StatusReady), int(StatusPrefetching), int(StatusFailed), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEntries(rows)
+}
+
 func (s *Store) queryStatus(status Status, limit int) ([]Entry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

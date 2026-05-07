@@ -73,37 +73,111 @@ struct MenuPopoverView: View {
         }) ?? diskFreeGB
     }
 
-    /// One-line view: "Cache disk: 38 GB free · 283 GB reclaimable"
-    /// with a Reclaim button when there's enough purgeable to be worth it.
+    /// "Cache disk: 38 GB free · 283 GB reclaimable" with a Reclaim button.
+    /// Plus an inline pressure banner when JuiceFS is about to stop caching
+    /// or has already stopped — the actual operational thresholds, not a
+    /// vague "pinned > free" signal.
     private var diskSpaceRow: some View {
         let purgeable = max(0, diskImportantGB - diskFreeGB)
-        return HStack(spacing: 6) {
-            Image(systemName: "internaldrive")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text("\(String(format: "%.0f", diskFreeGB)) GB free")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            if purgeable >= 5 {
-                Text("· \(String(format: "%.0f", purgeable)) GB reclaimable")
+        let pinnedGB = Double(cacheStatus.aggregate.TotalBytes) / 1e9
+
+        // JuiceFS is launched with --free-space-ratio 0.01 — it skips cache
+        // writes when free < 1% of total disk. Surface that operational
+        // reality, not theoretical concerns.
+        let freeRatio = diskTotalGB > 0 ? diskFreeGB / diskTotalGB : 1.0
+        let cacheOff = freeRatio < 0.01     // hard cutoff: JuiceFS already refusing
+        let cacheCutoffSoon = freeRatio < 0.03 && !cacheOff
+        let pinnedExceedsTotal = diskTotalGB > 0 && pinnedGB > diskTotalGB
+
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "internaldrive")
                     .font(.caption2)
-                    .foregroundStyle(.orange)
-                Spacer()
-                Button {
-                    triggerReclaim()
-                } label: {
-                    if reclaimBusy {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Text("Reclaim").font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("\(String(format: "%.0f", diskFreeGB)) GB free")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if purgeable >= 5 {
+                    Text("· \(String(format: "%.0f", purgeable)) GB reclaimable")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                    Spacer()
+                    Button {
+                        triggerReclaim()
+                    } label: {
+                        if reclaimBusy {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Reclaim").font(.caption2)
+                        }
                     }
+                    .controlSize(.mini)
+                    .disabled(reclaimBusy)
+                    .help("Thin Time Machine local snapshots and other purgeable space so JuiceFS can use it for cache.")
+                } else {
+                    Spacer()
                 }
-                .controlSize(.mini)
-                .disabled(reclaimBusy)
-                .help("Thin Time Machine local snapshots and other purgeable space so JuiceFS can use it for cache.")
-            } else {
-                Spacer()
             }
+
+            // Banner only for actionable, real pressure. Three specific
+            // states; nothing else generates noise.
+            if cacheOff {
+                pressureBanner(
+                    color: .red,
+                    text: "Disk under 1% free — JuiceFS has stopped caching. Reads fall back to network until you free space (try Reclaim)."
+                )
+            } else if cacheCutoffSoon {
+                pressureBanner(
+                    color: .orange,
+                    text: "Disk under 3% free — JuiceFS will stop caching at 1% free. Reclaim or unpin large folders to keep caching alive."
+                )
+            } else if pinnedExceedsTotal {
+                pressureBanner(
+                    color: .red,
+                    text: String(format:
+                        "Pinned set %.0f GB exceeds disk capacity %.0f GB. Some files will never fully cache.",
+                        pinnedGB, diskTotalGB)
+                )
+            }
+        }
+    }
+
+    private func pressureBanner(color: Color, text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(color)
+            Text(text)
+                .font(.caption2)
+                .foregroundStyle(color)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// Calls /verify-pins on the local control plane. Fire-and-forget; the
+    /// server returns immediately after enqueueing. Progress is observable
+    /// via the live cache stats in the popover (pending counter rising,
+    /// then ticking down as workers complete each file).
+    private func triggerVerifyPins() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let url = URL(string: "http://127.0.0.1:11050/verify-pins")!
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            URLSession.shared.dataTask(with: req) { data, _, err in
+                if let err = err {
+                    NSLog("[JuiceMount] verify-pins failed: %@",
+                          err.localizedDescription)
+                    return
+                }
+                guard let data = data,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { return }
+                let n = obj["reenqueued"] as? Int ?? 0
+                let total = obj["total_pinned"] as? Int ?? 0
+                NSLog("[JuiceMount] verify-pins: re-enqueued %d / %d files", n, total)
+                DispatchQueue.main.async { refreshCacheStatus() }
+            }.resume()
         }
     }
 
@@ -473,12 +547,21 @@ struct MenuPopoverView: View {
                 action: onSearch
             )
 
-            // Sync now (only when running)
+            // Sync now (only when running). Triggers BOTH a metadata
+            // reconciliation (Redis → SQLite) AND a pin-coverage verify
+            // (re-enqueue every pinned-Ready file; the prefetcher reads
+            // each through FUSE, which JuiceFS serves from local cache
+            // when present and re-fetches from backend when missing).
+            // The latter is the answer to "is my cache actually holding
+            // what I pinned?"
             ActionButton(
                 title: "Sync Now",
                 systemImage: "arrow.triangle.2.circlepath",
                 disabled: !isRunningLike,
-                action: { server.syncNow() }
+                action: {
+                    server.syncNow()
+                    triggerVerifyPins()
+                }
             )
 
             ActionButton(

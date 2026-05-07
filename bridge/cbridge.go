@@ -277,6 +277,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/cache-status": handleCacheStatusHTTP,
 			"/offline":      handleOfflineHTTP,
 			"/reclaim":      handleReclaimHTTP,
+			"/verify-pins":  handleVerifyPinsHTTP,
 		}
 		if err := ms.Start(); err != nil {
 			jmlog.Warn("metrics server failed to start",
@@ -895,6 +896,40 @@ func handleCacheStatusHTTP(w http.ResponseWriter, r *http.Request) {
 	defer NFSServerFreeString(cstr)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(C.GoString(cstr)))
+}
+
+// handleVerifyPinsHTTP re-enqueues every pinned-Ready file for prefetch.
+// Use this when you suspect cache eviction has hollowed out files that
+// the pin store still claims are Ready (which is exactly what happens
+// when --cache-size < total pinned bytes). Idempotent — running it on a
+// fully-cached set is fast (kernel-cache reads, no S3).
+func handleVerifyPinsHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if globalPrefetcher == nil {
+		w.WriteHeader(503)
+		fmt.Fprint(w, `{"ok":false,"error":"prefetcher not running"}`)
+		return
+	}
+	report, err := globalPrefetcher.VerifyAndRepair(r.Context())
+	if err != nil {
+		w.WriteHeader(500)
+		fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+		return
+	}
+	jmlog.Info("pin coverage verify",
+		"total_pinned", report.TotalPinned,
+		"reenqueued", report.Reenqueued,
+		"queue_overflow", report.QueueOverflow,
+		"bytes_gb", fmt.Sprintf("%.1f", float64(report.Bytes)/(1<<30)))
+	data, _ := json.Marshal(map[string]any{
+		"ok":              true,
+		"total_pinned":    report.TotalPinned,
+		"reenqueued":      report.Reenqueued,
+		"queue_overflow":  report.QueueOverflow,
+		"bytes_gb":        float64(report.Bytes) / (1 << 30),
+		"note":            report.Note,
+	})
+	w.Write(data)
 }
 
 // handleReclaimHTTP triggers tmutil thinlocalsnapshots / 0 4 — frees Time
