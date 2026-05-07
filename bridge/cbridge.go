@@ -152,9 +152,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			}
 			fm.StartMonitor()
 			globalFUSE = fm
+			// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
+			// the *effective* config from the mount, not the user input —
+			// otherwise the user reads "100 GiB" and is confused why the
+			// daemon was actually launched with 800 GiB.
 			jmlog.Info("juicefs FUSE mounted",
 				"path", cfg.FUSEPath,
-				"cache_size_mb", cfg.CacheSize,
+				"effective_cache_size_mb", fm.EffectiveCacheSize(),
 				"free_space_ratio", "0.01")
 		}
 	}
