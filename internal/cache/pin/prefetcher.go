@@ -20,9 +20,11 @@ import (
 // the side effect we care about is the read travelling through JuiceFS's
 // download + cache pipeline.
 type Prefetcher struct {
-	store    *Store
-	fusePath string // root of the FUSE mount, e.g. ~/.juicemount/fuse-internal
-	workers  int
+	store      *Store
+	fusePath   string // root of the FUSE mount, e.g. ~/.juicemount/fuse-internal
+	mountPoint string // user-facing mount, e.g. /Volumes/zpool — used to strip
+	//                   the prefix from canonical pin keys back to FUSE-relative
+	workers int
 
 	jobs   chan jobReq
 	stopCh chan struct{}
@@ -40,16 +42,22 @@ type jobReq struct {
 }
 
 // NewPrefetcher constructs a worker pool. workers <= 0 picks a sensible default.
-func NewPrefetcher(store *Store, fusePath string, workers int) *Prefetcher {
+//
+// mountPoint is the user-facing path (e.g. "/Volumes/zpool") that pin store
+// keys are anchored to. The prefetcher strips this prefix to translate keys
+// back to FUSE-relative paths. Empty string falls back to the legacy default
+// for backward compatibility.
+func NewPrefetcher(store *Store, fusePath, mountPoint string, workers int) *Prefetcher {
 	if workers <= 0 {
 		workers = 4 // good default: parallel enough to saturate WAN, not so many as to thrash
 	}
 	p := &Prefetcher{
-		store:    store,
-		fusePath: fusePath,
-		workers:  workers,
-		jobs:     make(chan jobReq, 256),
-		stopCh:   make(chan struct{}),
+		store:      store,
+		fusePath:   fusePath,
+		mountPoint: mountPoint,
+		workers:    workers,
+		jobs:       make(chan jobReq, 256),
+		stopCh:     make(chan struct{}),
 	}
 	for i := 0; i < workers; i++ {
 		p.wg.Add(1)
@@ -166,7 +174,7 @@ func (p *Prefetcher) workerLoop() {
 // prefetch reads the file through FUSE, discarding the bytes. Updates the
 // store with the result.
 func (p *Prefetcher) prefetch(e Entry) error {
-	full := filepath.Join(p.fusePath, stripVolumePrefix(e.Path))
+	full := filepath.Join(p.fusePath, p.stripMountPrefix(e.Path))
 
 	currentName := full
 	p.currentFile.Store(&currentName)
@@ -222,8 +230,33 @@ func (p *Prefetcher) LiveStats() LiveStats {
 	}
 }
 
-// stripVolumePrefix turns "/Volumes/zpool/foo/bar" into "foo/bar"
-// so we can join it with the FUSE mount root.
+// stripMountPrefix turns canonical pin-store paths (anchored to the user's
+// mount point) into FUSE-relative paths. For the default "/Volumes/zpool":
+//
+//   "/Volumes/zpool/foo/bar" → "foo/bar"
+//   "/Volumes/zpool"         → ""
+//   "/other/path"            → "/other/path" (no-op fallback)
+func (p *Prefetcher) stripMountPrefix(path string) string {
+	mp := p.mountPoint
+	if mp == "" {
+		mp = "/Volumes/zpool"
+	}
+	for len(mp) > 1 && mp[len(mp)-1] == '/' {
+		mp = mp[:len(mp)-1]
+	}
+	if path == mp {
+		return ""
+	}
+	withSlash := mp + "/"
+	if len(path) > len(withSlash) && path[:len(withSlash)] == withSlash {
+		return path[len(withSlash):]
+	}
+	return path
+}
+
+// stripVolumePrefix is the legacy helper retained for the existing test.
+// New code should use Prefetcher.stripMountPrefix which respects the
+// configured mount point.
 func stripVolumePrefix(path string) string {
 	const vol = "/Volumes/zpool/"
 	if len(path) > len(vol) && path[:len(vol)] == vol {

@@ -37,22 +37,25 @@ const (
 )
 
 var (
-	mu       sync.RWMutex
-	logger   *slog.Logger
-	logFile  *os.File
-	leveler  *slog.LevelVar
-	rotating atomic.Bool // guards against re-entrant rotation in Write()
+	mu      sync.RWMutex
+	logger  *slog.Logger
+	logFile *os.File
+	leveler *slog.LevelVar
 )
 
 // rotatingFile wraps an *os.File and rotates by size on Write().
 // The wrapper is safe under the per-handler mu in slog (slog serializes
 // writes to a single io.Writer), but we still gate with rotating.CAS
 // because rotation itself calls Write paths internally.
+//
+// rotating is per-instance so that re-Init() (which constructs a new
+// rotatingFile) doesn't share state with any dangling old instance.
 type rotatingFile struct {
-	mu      sync.Mutex
-	path    string
-	f       *os.File
-	written int64
+	mu       sync.Mutex
+	path     string
+	f        *os.File
+	written  int64
+	rotating atomic.Bool
 }
 
 func newRotatingFile(path string) (*rotatingFile, error) {
@@ -74,7 +77,7 @@ func newRotatingFile(path string) (*rotatingFile, error) {
 func (rf *rotatingFile) Write(p []byte) (int, error) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.written+int64(len(p)) > rotateMaxBytes && !rotating.Load() {
+	if rf.written+int64(len(p)) > rotateMaxBytes && !rf.rotating.Load() {
 		_ = rf.rotateLocked()
 	}
 	n, err := rf.f.Write(p)
@@ -85,10 +88,10 @@ func (rf *rotatingFile) Write(p []byte) (int, error) {
 // rotateLocked rolls juicemount.log → .1, .1 → .2, ... up to rotateMaxBackup.
 // Caller must hold rf.mu.
 func (rf *rotatingFile) rotateLocked() error {
-	if !rotating.CompareAndSwap(false, true) {
+	if !rf.rotating.CompareAndSwap(false, true) {
 		return nil
 	}
-	defer rotating.Store(false)
+	defer rf.rotating.Store(false)
 
 	if rf.f != nil {
 		_ = rf.f.Close()

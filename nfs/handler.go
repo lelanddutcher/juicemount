@@ -636,15 +636,17 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	// gate below AND to skip the read-time offline EIO on pinned files
 	// (JuiceFS LRU serves from local SSD; no backend round-trip needed).
 	var isPinned bool
+	var canonical string
 	if !isWrite && jfs.handler.pinStore != nil {
-		isPinned = jfs.handler.isPinnedReady(jfs.handler.canonicalize(filename))
+		canonical = jfs.handler.canonicalize(filename)
+		isPinned = jfs.handler.isPinnedReady(canonical)
 	}
 
 	if !isWrite && pin.IsOffline() && jfs.handler.pinStore != nil {
 		if !isPinned {
 			jmlog.Debug("offline: refusing open of un-pinned file",
 				"in_mount", filename,
-				"canonical", jfs.handler.canonicalize(filename))
+				"canonical", canonical)
 			return nil, syscall.EIO
 		}
 	}
@@ -706,7 +708,11 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	if err != nil {
 		return nil, err
 	}
-	return &billyFile{File: f, name: filename}, nil
+	// Carry forward the same pin snapshot we computed at the top of OpenFile.
+	// Writes don't gate (writes are always allowed); reads through this
+	// branch (e == nil, no metadata cache) pick up the same offline policy
+	// as the cachedFile branch.
+	return &billyFile{File: f, name: filename, pinned: isPinned}, nil
 }
 
 func (jfs *juiceFS) Create(filename string) (billy.File, error) {
@@ -1031,15 +1037,38 @@ func (f *writeFile) Close() error {
 }
 
 // billyFile wraps os.File to implement billy.File (for writes / non-cached opens).
+//
+// pinned is captured at OpenFile time, same semantics as cachedFile.pinned —
+// a per-open snapshot used to gate the read-time offline check. Without it,
+// a file opened during a brief online window and then read after offline
+// flips on would bypass the gate and stall on FUSE → backend.
 type billyFile struct {
 	*os.File
-	name string
+	name   string
+	pinned bool
 }
 
 func (f *billyFile) Name() string { return f.name }
 func (f *billyFile) Lock() error  { return nil }
 func (f *billyFile) Unlock() error { return nil }
 func (f *billyFile) Truncate(size int64) error { return f.File.Truncate(size) }
+
+// Read overrides *os.File.Read to enforce the read-time offline gate on
+// un-pinned files. Pinned files fall through to FUSE/JuiceFS LRU as usual.
+func (f *billyFile) Read(p []byte) (int, error) {
+	if pin.IsOffline() && !f.pinned {
+		return 0, syscall.EIO
+	}
+	return f.File.Read(p)
+}
+
+// ReadAt is the hot path for NFS READ RPCs (which always carry an offset).
+func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
+	if pin.IsOffline() && !f.pinned {
+		return 0, syscall.EIO
+	}
+	return f.File.ReadAt(p, off)
+}
 
 // rootDirInfo is the FileInfo for the root directory.
 // Sys() returns a *syscall.Stat_t with the current user's UID/GID so that

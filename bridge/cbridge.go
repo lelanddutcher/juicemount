@@ -152,8 +152,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	}
 	globalStore = store
 
-	// Connect to Redis
-	rc, err := metadata.NewRedisClient(cfg.RedisURL, store)
+	// Connect to Redis with bounded retry. Network can be flaky — wifi/cell
+	// handoffs, sleeping NAS, brief router restart. Without this, a 1s blip
+	// at launch leaves the user staring at "redis: connect: no route to host"
+	// even though the NAS comes back 3 seconds later.
+	//
+	// Retry schedule: 1s, 2s, 4s, 8s, 16s = 5 attempts, ~31s total worst case.
+	rc, err := connectRedisWithRetry(cfg.RedisURL, store, 5)
 	if err != nil {
 		store.Close()
 		return C.CString(fmt.Sprintf("error: redis: %v", err))
@@ -201,7 +206,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	pinDBPath := pinStorePath(cfg.DBPath)
 	if ps, err := pin.Open(pinDBPath); err == nil {
 		globalPinStore = ps
-		globalPrefetcher = pin.NewPrefetcher(ps, cfg.FUSEPath, 4)
+		globalPrefetcher = pin.NewPrefetcher(ps, cfg.FUSEPath, cfg.MountPoint, 4)
 		// Long-running daemons that drain the queue and re-warm pinned files.
 		// They terminate when globalPrefetcher.Stop() is called in shutdown.
 		go globalPrefetcher.PullPending(globalPinCtx(), 100)
@@ -881,6 +886,41 @@ func handleOfflineHTTP(w http.ResponseWriter, r *http.Request) {
 	defer NFSServerFreeString(cstr)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(C.GoString(cstr)))
+}
+
+// connectRedisWithRetry wraps metadata.NewRedisClient with exponential
+// backoff. Returns the connected client, or the LAST error if all attempts
+// fail. The first attempt happens immediately; subsequent attempts wait
+// 2^(attempt-1) seconds.
+//
+// We intentionally cap the number of attempts rather than retrying forever:
+// if the user's NAS is genuinely unreachable, they should see the failure
+// quickly enough to act on it (move closer, fix network, plug back in)
+// rather than stare at a frozen popover.
+func connectRedisWithRetry(redisURL string, store *metadata.Store, maxAttempts int) (*metadata.RedisClient, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		rc, err := metadata.NewRedisClient(redisURL, store)
+		if err == nil {
+			if attempt > 1 {
+				jmlog.Info("redis connect recovered",
+					"attempt", attempt, "max_attempts", maxAttempts)
+			}
+			return rc, nil
+		}
+		lastErr = err
+		if attempt >= maxAttempts {
+			break
+		}
+		backoff := time.Duration(1<<uint(attempt-1)) * time.Second // 1, 2, 4, 8, 16
+		jmlog.Warn("redis connect failed, retrying",
+			"attempt", attempt,
+			"max_attempts", maxAttempts,
+			"backoff_sec", int(backoff.Seconds()),
+			"error", err.Error())
+		time.Sleep(backoff)
+	}
+	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 
 func main() {} // required for c-archive build
