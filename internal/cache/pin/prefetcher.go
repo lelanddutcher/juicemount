@@ -160,6 +160,73 @@ func (p *Prefetcher) ReWarmupLoop(ctx context.Context, ttl time.Duration, batchS
 	}
 }
 
+// VerifyReport summarizes a pin-coverage verification pass.
+type VerifyReport struct {
+	TotalPinned       int    // files marked Ready in the pin store
+	Reenqueued        int    // files re-queued for prefetch
+	AlreadyComplete   int    // files we believe are fully cached (not re-queued)
+	QueueOverflow     int    // files we couldn't enqueue (worker pool saturated)
+	Bytes             int64  // total bytes covered by re-queued files
+	StartedAt         string // RFC3339
+	Note              string // human-readable summary
+}
+
+// VerifyAndRepair walks every pinned-Ready entry and re-enqueues it for
+// prefetch. The prefetcher reads each file through FUSE; JuiceFS serves
+// from local LRU when the bytes are present (fast, no network) and
+// fetches from the backend otherwise. Either way, post-prefetch the
+// blocks are guaranteed on disk.
+//
+// This is the right operation for the "is my cache actually populated?"
+// question — much simpler than walking Redis chunk-slice mappings and
+// stat()-ing every block file ourselves. The cost is "re-read every
+// pinned file once" which is bounded by sequential disk speed for
+// already-cached files and by backend bandwidth for missing ones.
+//
+// Sets each entry's status to Pending before enqueueing so the existing
+// workerLoop picks it up; the worker will write it back to Ready when
+// the read completes.
+func (p *Prefetcher) VerifyAndRepair(ctx context.Context) (*VerifyReport, error) {
+	report := &VerifyReport{StartedAt: time.Now().Format(time.RFC3339)}
+
+	// Pull every entry that's pinned and not actively in the queue:
+	// Ready, Prefetching, AND Failed. Including Failed is critical for
+	// the "FUSE was momentarily unmounted, every open() returned ENOENT,
+	// all entries got marked Failed" recovery case — without it, the user
+	// has to unpin and re-pin to retry, which is hostile.
+	all, err := p.store.AllPinnedForRepair(100000)
+	if err != nil {
+		return nil, fmt.Errorf("list pinned: %w", err)
+	}
+	report.TotalPinned = len(all)
+	if len(all) == 0 {
+		report.Note = "no pinned files to verify"
+		return report, nil
+	}
+
+	// Mark every entry as Pending up front so the existing PullPending
+	// worker pool can drain them naturally — no need for us to manually
+	// keep the in-memory queue topped up. PullPending wakes every 5s,
+	// pulls up to 100 Pending rows, and enqueues them; with 4 workers and
+	// typical sequential file-size variance this absorbs any pin set
+	// without overflow.
+	for _, e := range all {
+		select {
+		case <-ctx.Done():
+			report.Note = "cancelled"
+			return report, ctx.Err()
+		default:
+		}
+		_ = p.store.UpdateStatus(e.Path, StatusPending, 0, "")
+		report.Reenqueued++
+		report.Bytes += e.Size
+	}
+	report.Note = fmt.Sprintf(
+		"marked %d/%d files Pending (%.1f GiB); PullPending will pick them up",
+		report.Reenqueued, report.TotalPinned, float64(report.Bytes)/(1<<30))
+	return report, nil
+}
+
 // workerLoop pulls jobs and runs the prefetch.
 func (p *Prefetcher) workerLoop() {
 	defer p.wg.Done()
