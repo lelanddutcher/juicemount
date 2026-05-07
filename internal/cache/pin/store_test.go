@@ -261,6 +261,35 @@ func TestOfflineModeToggle(t *testing.T) {
 	}
 }
 
+// TestStripMountPrefix exercises the prefetcher's per-instance mount-prefix
+// strip. The hardcoded "/Volumes/zpool" assumption was a latent bug — once
+// the gate started using the configured mount point at OpenFile time,
+// pin keys under a non-default mount would canonicalize correctly but the
+// prefetcher would fail to map them back to FUSE-relative paths. This test
+// locks in the new method-based behavior.
+func TestStripMountPrefix(t *testing.T) {
+	cases := []struct {
+		mount string
+		in    string
+		want  string
+	}{
+		{"/Volumes/zpool", "/Volumes/zpool/foo/bar", "foo/bar"},
+		{"/Volumes/zpool", "/Volumes/zpool", ""},
+		{"/Volumes/zpool/", "/Volumes/zpool/foo", "foo"}, // trailing slash tolerated
+		{"/Volumes/storage", "/Volumes/storage/clip.mov", "clip.mov"},
+		{"/Volumes/storage", "/Volumes/zpool/foo", "/Volumes/zpool/foo"}, // mismatch passthrough
+		{"", "/Volumes/zpool/foo", "foo"}, // empty falls back to legacy default
+	}
+	for _, tc := range cases {
+		p := &Prefetcher{mountPoint: tc.mount}
+		got := p.stripMountPrefix(tc.in)
+		if got != tc.want {
+			t.Errorf("stripMountPrefix(mount=%q, %q) = %q, want %q",
+				tc.mount, tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestStripVolumePrefix(t *testing.T) {
 	cases := map[string]string{
 		"/Volumes/zpool/Foo/bar.mov": "Foo/bar.mov",
