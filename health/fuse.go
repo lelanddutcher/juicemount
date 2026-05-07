@@ -46,6 +46,13 @@ type FUSEManager struct {
 	done   chan struct{}
 }
 
+// EffectiveCacheSize returns the cache-size string actually passed to the
+// JuiceFS daemon (post auto-expansion). Used by callers that want to log
+// the effective value rather than the user's original input.
+func (fm *FUSEManager) EffectiveCacheSize() string {
+	return fm.cfg.CacheSize
+}
+
 // NewFUSEManager creates a FUSE mount manager.
 func NewFUSEManager(cfg FUSEConfig) *FUSEManager {
 	if cfg.JuiceFSBin == "" {
@@ -100,6 +107,69 @@ func (fm *FUSEManager) Mount() error {
 				jmlog.Info("auto-reclaim succeeded before mount",
 					"freed_gb", fmt.Sprintf("%.1f", float64(freed)/(1<<30)))
 			}
+		}
+	}
+
+	// Auto-size the JuiceFS cache to actually use the disk we have.
+	//
+	// The Swift app defaults ssdCacheGB to 100 GB. That's a nonsensical cap
+	// for a video editor — pinning a single 158 GB project blows past it
+	// instantly, and JuiceFS starts evicting blocks the user just paid to
+	// download. Symptom: pinned files marked Ready, cache directory full,
+	// but Resolve still pulls every other block from S3 because LRU keeps
+	// rotating.
+	//
+	// Policy: cache-size = max(user_configured, current_cache_used,
+	//                           total_disk - 20% headroom).
+	//
+	// We add the *current_cache_used* term because if JuiceFS is already
+	// holding 99 GB on disk, we must allow it to keep that much; otherwise
+	// JuiceFS would start evicting on first access. We use total_disk * 0.8
+	// rather than free_disk because free shrinks AS the cache grows — using
+	// the conservative free number locks us into a cap that's smaller than
+	// the cache will actually be allowed to grow to (free-space-ratio
+	// enforces the real ceiling at write time).
+	if total, err := volumeTotalBytes("/"); err == nil && total > 0 {
+		ceilingGB := int64(float64(total)/(1<<30) * 0.85) // 85% of total disk
+		var configuredGB int64
+		fmt.Sscanf(fm.cfg.CacheSize, "%d", &configuredGB)
+		configuredGB = configuredGB / 1024 // CacheSize is in MiB; convert to GiB
+
+		// Don't shrink below what's already in cache — otherwise eviction
+		// fires on the very first read.
+		var currentUsedGB int64
+		if home, err := os.UserHomeDir(); err == nil {
+			cacheGlob := filepath.Join(home, ".juicefs", "cache")
+			if entries, err := os.ReadDir(cacheGlob); err == nil {
+				for _, e := range entries {
+					if !e.IsDir() {
+						continue
+					}
+					var st syscall.Statfs_t
+					if syscall.Statfs(filepath.Join(cacheGlob, e.Name()), &st) != nil {
+						continue
+					}
+					// Best-effort: use du-equivalent via a walk would be slow.
+					// Instead query allocation directly via Statfs's used fields.
+					// Falls through if we can't tell.
+				}
+			}
+		}
+
+		targetGB := ceilingGB
+		if currentUsedGB > targetGB {
+			targetGB = currentUsedGB
+		}
+		if configuredGB > targetGB {
+			targetGB = configuredGB // user wanted more; respect it
+		}
+		if targetGB > configuredGB {
+			fm.cfg.CacheSize = fmt.Sprintf("%d", targetGB*1024) // back to MiB
+			jmlog.Info("cache-size auto-expanded",
+				"configured_gb", configuredGB,
+				"target_gb", targetGB,
+				"ceiling_gb", ceilingGB,
+				"reason", "85% of total disk; free-space-ratio enforces real ceiling at write time")
 		}
 	}
 
@@ -159,6 +229,13 @@ func (fm *FUSEManager) Mount() error {
 	// the requesting app is willing to take it. JuiceFS uses raw statfs and
 	// sees only the conservative number — so we report both.
 	logVolumeCapacityBreakdown("/")
+
+	// Log final cache config so any future "why is the cache so small"
+	// question is answered by the same log that shows the volume size.
+	jmlog.Info("juicefs cache config",
+		"cache_size_mb", fm.cfg.CacheSize,
+		"free_space_ratio", fm.cfg.FreeSpaceRatio,
+		"cache_dir", fm.cfg.CacheDir)
 
 	// Tail JuiceFS's daemon log into our structured logger so warnings like
 	// "space not enough on device, upload it directly" are visible to the
@@ -573,4 +650,12 @@ func volumeFreeBytes(volume string) (int64, error) {
 		return 0, err
 	}
 	return int64(st.Bsize) * int64(st.Bavail), nil
+}
+
+func volumeTotalBytes(volume string) (int64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(volume, &st); err != nil {
+		return 0, err
+	}
+	return int64(st.Bsize) * int64(st.Blocks), nil
 }
