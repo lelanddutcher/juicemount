@@ -272,6 +272,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/unpin":        handleUnpinHTTP,
 			"/cache-status": handleCacheStatusHTTP,
 			"/offline":      handleOfflineHTTP,
+			"/reclaim":      handleReclaimHTTP,
 		}
 		if err := ms.Start(); err != nil {
 			jmlog.Warn("metrics server failed to start",
@@ -890,6 +891,21 @@ func handleCacheStatusHTTP(w http.ResponseWriter, r *http.Request) {
 	defer NFSServerFreeString(cstr)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(C.GoString(cstr)))
+}
+
+// handleReclaimHTTP triggers tmutil thinlocalsnapshots / 0 4 — frees Time
+// Machine local snapshots and other purgeable space so JuiceFS can use it
+// for cache. POST or GET; no body. Returns JSON with bytes freed.
+func handleReclaimHTTP(w http.ResponseWriter, r *http.Request) {
+	freed, err := health.ReclaimPurgeableSpace("/", 0)
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		w.WriteHeader(500)
+		fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+		return
+	}
+	fmt.Fprintf(w, `{"ok":true,"freed_bytes":%d,"freed_gb":%.2f}`,
+		freed, float64(freed)/(1<<30))
 }
 
 func handleOfflineHTTP(w http.ResponseWriter, r *http.Request) {
