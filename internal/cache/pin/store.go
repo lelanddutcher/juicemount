@@ -197,18 +197,43 @@ func (s *Store) UpdateStatus(path string, status Status, bytesCached int64, errM
 	return err
 }
 
-// IsPinnedReady checks whether a single path is in the registry with
-// status Ready. Hot-path-friendly — uses the path primary key.
-// Called on every NFS OpenFile when offline mode is on.
+// IsPinnedReady checks whether a single path is "good enough" to be
+// served while offline mode is on. A path qualifies if either:
+//
+//   1. status = Ready, OR
+//   2. status = Prefetching AND bytes_cached >= size — i.e. the prefetcher
+//      has finished pulling bytes but hasn't flipped the status row yet.
+//      This eliminates a small (~1s) window where a fully-cached file
+//      would otherwise be refused after the user toggles offline ON.
+//
+// Hot-path-friendly — uses the path primary key. Called on every NFS
+// OpenFile when offline mode is on.
+//
+// Note: Pending files are intentionally refused — the user explicitly
+// asked for fail-fast, and Pending means we know we don't have the bytes.
+// Promoting Pending here would re-introduce the very freeze (FUSE →
+// backend → timeout) the offline gate exists to prevent.
 func (s *Store) IsPinnedReady(path string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var statusInt int
-	err := s.db.QueryRow(`SELECT status FROM pinned_files WHERE path = ?`, path).Scan(&statusInt)
+	var size, bytesCached int64
+	err := s.db.QueryRow(
+		`SELECT status, size, bytes_cached FROM pinned_files WHERE path = ?`,
+		path,
+	).Scan(&statusInt, &size, &bytesCached)
 	if err != nil {
 		return false
 	}
-	return Status(statusInt) == StatusReady
+	st := Status(statusInt)
+	if st == StatusReady {
+		return true
+	}
+	// Late-Ready window: prefetcher has the bytes but hasn't updated status yet.
+	if st == StatusPrefetching && size > 0 && bytesCached >= size {
+		return true
+	}
+	return false
 }
 
 // Pending returns up to limit entries waiting for prefetch.

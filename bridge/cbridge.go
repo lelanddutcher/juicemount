@@ -207,8 +207,10 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		go globalPrefetcher.PullPending(globalPinCtx(), 100)
 		go globalPrefetcher.ReWarmupLoop(globalPinCtx(), 6*time.Hour, 50)
 		// Wire the pin store into the NFS handler so the offline-mode
-		// open gate can fail-fast on un-pinned reads.
-		srv.Handler().SetPinStore(ps)
+		// open gate can fail-fast on un-pinned reads. The mount point is
+		// the prefix the gate uses to canonicalize in-mount filenames into
+		// the absolute paths the pin store keys on.
+		srv.Handler().SetPinStore(ps, cfg.MountPoint)
 		jmlog.Info("pin store ready", "path", pinDBPath, "workers", 4)
 	} else {
 		jmlog.Warn("pin store open failed (offline-pin disabled)", "error", err.Error())

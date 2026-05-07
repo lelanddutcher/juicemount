@@ -32,6 +32,7 @@ import (
 type JuiceMountHandler struct {
 	store       *metadata.Store
 	fusePath    string // path to hidden JuiceFS FUSE mount
+	mountPoint  string // user-facing NFS mount (e.g. /Volumes/zpool); used to canonicalize pin keys
 	cacheReader *cache.Reader
 	fdPool      *FDPool
 	readahead   *ReadaheadManager
@@ -88,10 +89,46 @@ func (h *JuiceMountHandler) SetCacheReader(cr *cache.Reader) {
 	h.cacheReader = cr
 }
 
-// SetPinStore attaches the pin registry. When offline mode is on, the
-// read path consults this store to fail-fast on un-pinned/un-cached files.
-func (h *JuiceMountHandler) SetPinStore(ps *pin.Store) {
+// SetPinStore attaches the pin registry and the user-facing mount point that
+// the pin keys are anchored to. When offline mode is on, the read path
+// consults this store to fail-fast on un-pinned/un-cached files.
+//
+// mountPoint is the path the user mounts to (e.g. "/Volumes/zpool"). It is
+// used as the prefix when canonicalizing in-mount filenames into the
+// absolute paths the pin store keys on.
+func (h *JuiceMountHandler) SetPinStore(ps *pin.Store, mountPoint string) {
 	h.pinStore = ps
+	h.mountPoint = mountPoint
+}
+
+// canonicalize converts an in-mount relative path (the form go-nfs hands us
+// in OpenFile) into the absolute path that the pin store keys on. It is
+// tolerant of the various shapes filenames arrive in:
+//
+//   - "Film Projects/foo.mov"     → "/Volumes/zpool/Film Projects/foo.mov"
+//   - "/Film Projects/foo.mov"    → "/Volumes/zpool/Film Projects/foo.mov"
+//   - "/Volumes/zpool/foo.mov"    → "/Volumes/zpool/foo.mov" (already absolute)
+//
+// Falls back to the legacy hardcoded prefix when no mount point is set.
+func (h *JuiceMountHandler) canonicalize(filename string) string {
+	mp := h.mountPoint
+	if mp == "" {
+		mp = "/Volumes/zpool"
+	}
+	// Strip any trailing slash on the mount point for clean concat.
+	for len(mp) > 1 && mp[len(mp)-1] == '/' {
+		mp = mp[:len(mp)-1]
+	}
+	// If the filename is already absolute and under the mount, it's already canonical.
+	if len(filename) > 0 && filename[0] == '/' {
+		// already-absolute under mount?
+		if len(filename) >= len(mp) && filename[:len(mp)] == mp {
+			return filename
+		}
+		// leading-slash relative — strip it and concat
+		return mp + filename
+	}
+	return mp + "/" + filename
 }
 
 // isPinnedReady reports whether the canonical-form path is in the pin
@@ -595,13 +632,19 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	//
 	// Pinned-and-ready files are allowed through. Writes are always
 	// allowed (the user explicitly created them; they go to FUSE cache).
+	// Compute pinned-ness once per open. We use this both for the offline
+	// gate below AND to skip the read-time offline EIO on pinned files
+	// (JuiceFS LRU serves from local SSD; no backend round-trip needed).
+	var isPinned bool
+	if !isWrite && jfs.handler.pinStore != nil {
+		isPinned = jfs.handler.isPinnedReady(jfs.handler.canonicalize(filename))
+	}
+
 	if !isWrite && pin.IsOffline() && jfs.handler.pinStore != nil {
-		// Translate the in-mount filename to the canonical /Volumes/... form
-		// our pin store uses as keys. We don't have direct access to the
-		// mountPoint here, so probe both common shapes.
-		canonical := "/Volumes/zpool/" + filename
-		if !jfs.handler.isPinnedReady(canonical) {
-			jmlog.Debug("offline: refusing open of un-pinned file", "path", filename)
+		if !isPinned {
+			jmlog.Debug("offline: refusing open of un-pinned file",
+				"in_mount", filename,
+				"canonical", jfs.handler.canonicalize(filename))
 			return nil, syscall.EIO
 		}
 	}
@@ -628,6 +671,7 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			memBuf:      jfs.handler.memBuf,
 			inode:       e.Inode,
 			fileSize:    e.Size,
+			pinned:      isPinned,
 		}, nil
 	}
 
@@ -826,6 +870,13 @@ type cachedFile struct {
 	inode       uint64
 	fileSize    int64
 	closed      bool
+
+	// Decided at OpenFile time: whether this file passed the pin check.
+	// Pinned files are allowed to fall through to FUSE during offline mode
+	// (JuiceFS serves from its local LRU; no backend round-trip).
+	// Un-pinned files never reach this struct in offline mode (open-time
+	// gate refuses them before we construct the cachedFile).
+	pinned bool
 }
 
 func (f *cachedFile) Name() string { return f.name }
@@ -856,11 +907,20 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	// Offline mode short-circuit: if the user has flipped to offline, we
-	// don't fall through to FUSE. JuiceFS would otherwise try to GET the
-	// missing block from S3, which on cellular can take 30+ seconds and
-	// will tarpit the NLE waiting for the read. Return EIO immediately so
-	// the NLE shows "media offline" instead of beachballing.
-	if pin.IsOffline() {
+	// don't fall through to FUSE for un-pinned files. JuiceFS would
+	// otherwise try to GET the missing block from S3, which on cellular
+	// can take 30+ seconds and will tarpit the NLE waiting for the read.
+	// Return EIO immediately so the NLE shows "media offline" instead of
+	// beachballing.
+	//
+	// PINNED files are exempt: JuiceFS already has their bytes in its
+	// local LRU cache (the prefetcher pulled them at pin time), so a FUSE
+	// read is fully local and safe even on cellular. Without this exemption
+	// the read-time gate would refuse pinned files whose blocks happen to
+	// not be in our SSD cache reader (different cache layer than JuiceFS),
+	// re-introducing the very "media offline" UX cliff the offline-pin
+	// feature exists to prevent.
+	if pin.IsOffline() && !f.pinned {
 		return 0, syscall.EIO
 	}
 

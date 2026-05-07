@@ -85,6 +85,21 @@ public final class Preferences {
         return "\(NSHomeDirectory())/.juicemount/fuse-internal"
     }
 
+    /// Default log file: ~/Library/Logs/JuiceMount/juicemount.log
+    /// (rotated by the Go side; see jmlog.openWithRotation).
+    public static func defaultLogPath() -> String {
+        let logsDir: URL = {
+            if let lib = FileManager.default.urls(
+                for: .libraryDirectory, in: .userDomainMask).first {
+                return lib.appendingPathComponent("Logs/JuiceMount", isDirectory: true)
+            }
+            return URL(fileURLWithPath: "\(NSHomeDirectory())/Library/Logs/JuiceMount")
+        }()
+        try? FileManager.default.createDirectory(
+            at: logsDir, withIntermediateDirectories: true)
+        return logsDir.appendingPathComponent("juicemount.log").path
+    }
+
     public func toServerConfig() -> NFSBridge.ServerConfig {
         NFSBridge.ServerConfig(
             redisURL: redisURL,
@@ -93,7 +108,9 @@ public final class Preferences {
             listenAddr: nfsListenAddr,
             dbPath: dbPath,
             cacheSize: String(ssdCacheGB * 1024), // GB → MB
-            metricsAddr: metricsAddr
+            metricsAddr: metricsAddr,
+            logFile: Self.defaultLogPath(),
+            logLevel: "info"
         )
     }
 
