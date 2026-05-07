@@ -5,6 +5,7 @@
 package health
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"os"
@@ -12,7 +13,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
 // FUSEConfig holds JuiceFS mount configuration.
@@ -20,8 +24,17 @@ type FUSEConfig struct {
 	RedisURL   string // e.g. "redis://192.168.0.210:6379/1"
 	MountPoint string // e.g. ~/.juicemount/fuse-internal
 	CacheDir   string // e.g. ~/.juicefs/cache (empty = JuiceFS default)
-	CacheSize  string // e.g. "100G" (empty = JuiceFS default)
+	CacheSize  string // e.g. "100000" in MiB (empty = JuiceFS default ~100 GiB)
 	JuiceFSBin string // e.g. /opt/homebrew/bin/juicefs (auto-detected if empty)
+
+	// FreeSpaceRatio is the fraction of cache-volume free space JuiceFS keeps
+	// reserved (won't cache when below). Default in JuiceFS is 0.1 (10%) which
+	// is hostile to video editors who fill their disks with media — once they
+	// drop under 90 GB free on a 1 TB disk, the cache silently disables and
+	// every read goes straight to S3 with no warning.
+	//
+	// Empty = pass nothing (JuiceFS default applies). "0.01" = keep 1% free.
+	FreeSpaceRatio string
 }
 
 // FUSEManager manages the JuiceFS FUSE mount lifecycle.
@@ -87,6 +100,9 @@ func (fm *FUSEManager) Mount() error {
 	if fm.cfg.CacheSize != "" {
 		args = append(args, "--cache-size", fm.cfg.CacheSize)
 	}
+	if fm.cfg.FreeSpaceRatio != "" {
+		args = append(args, "--free-space-ratio", fm.cfg.FreeSpaceRatio)
+	}
 
 	log.Printf("[fuse] mounting JuiceFS: %s %s", fm.cfg.JuiceFSBin, strings.Join(args, " "))
 
@@ -108,7 +124,157 @@ func (fm *FUSEManager) Mount() error {
 	// Suppress Spotlight indexing on the hidden FUSE mount
 	os.WriteFile(fm.cfg.MountPoint+"/.metadata_never_index", nil, 0644)
 
+	// Up-front disk-space sanity check. If the cache volume is so full that
+	// JuiceFS will refuse to cache, we want the user to KNOW now — before
+	// they try to play media and wonder why everything is slow.
+	if msg := checkCacheVolumeHealth(fm.cfg); msg != "" {
+		jmlog.Warn("juicefs cache health concern", "detail", msg)
+	}
+
+	// Tail JuiceFS's daemon log into our structured logger so warnings like
+	// "space not enough on device, upload it directly" are visible to the
+	// user instead of buried in ~/.juicefs/juicefs.log.
+	go tailJuiceFSLog()
+
 	return nil
+}
+
+// checkCacheVolumeHealth returns a non-empty warning string if the volume
+// hosting the cache directory is in a state where JuiceFS will silently
+// stop caching (free space below ratio threshold, or directory unwritable).
+func checkCacheVolumeHealth(cfg FUSEConfig) string {
+	cacheDir := cfg.CacheDir
+	if cacheDir == "" {
+		// JuiceFS default: ~/.juicefs/cache
+		home, _ := os.UserHomeDir()
+		cacheDir = filepath.Join(home, ".juicefs", "cache")
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(cacheDir, &stat); err != nil {
+		// Try the parent if cacheDir doesn't exist yet
+		if err := syscall.Statfs(filepath.Dir(cacheDir), &stat); err != nil {
+			return fmt.Sprintf("cannot stat cache dir %s: %v", cacheDir, err)
+		}
+	}
+	totalBytes := uint64(stat.Bsize) * stat.Blocks
+	freeBytes := uint64(stat.Bsize) * stat.Bavail
+	if totalBytes == 0 {
+		return ""
+	}
+	freeRatio := float64(freeBytes) / float64(totalBytes)
+	threshold := 0.01
+	if cfg.FreeSpaceRatio != "" {
+		// Parse our configured ratio as a number — we want to know if the
+		// disk is below it. Crude parsing on purpose: invalid → use default.
+		var r float64
+		_, err := fmt.Sscanf(cfg.FreeSpaceRatio, "%f", &r)
+		if err == nil && r > 0 && r < 1 {
+			threshold = r
+		}
+	}
+	if freeRatio < threshold {
+		return fmt.Sprintf(
+			"cache volume %s is %.1f%% free (%.1f GiB), below the %.1f%% threshold "+
+				"— JuiceFS will skip caching and read every block from S3. "+
+				"Free up disk space or pass a smaller --free-space-ratio.",
+			cacheDir, freeRatio*100, float64(freeBytes)/(1<<30),
+			threshold*100)
+	}
+	return ""
+}
+
+// tailJuiceFSLog watches the JuiceFS daemon log file for new lines and
+// promotes WARNING / ERROR records into jmlog so the user can see them in
+// the same JSON stream as everything else. Aggregates the chatty
+// "space not enough" message — emit once per minute with a count instead
+// of flooding the log with thousands of identical entries.
+func tailJuiceFSLog() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	logPath := filepath.Join(home, ".juicefs", "juicefs.log")
+	// Wait for the file to appear (juicefs daemon may not have created it yet)
+	for i := 0; i < 30; i++ {
+		if _, err := os.Stat(logPath); err == nil {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	f, err := os.Open(logPath)
+	if err != nil {
+		jmlog.Debug("juicefs log tail: open failed", "path", logPath, "error", err.Error())
+		return
+	}
+	defer f.Close()
+	// Seek to end so we don't replay history.
+	if _, err := f.Seek(0, 2); err != nil {
+		return
+	}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+
+	type aggKey struct{ pattern string }
+	type aggState struct {
+		count    int
+		firstAt  time.Time
+		lastFlush time.Time
+	}
+	agg := map[aggKey]*aggState{}
+	const flushEvery = 60 * time.Second
+	flushAgg := func() {
+		now := time.Now()
+		for k, st := range agg {
+			if st.count > 0 && now.Sub(st.lastFlush) >= flushEvery {
+				jmlog.Warn("juicefs warning (aggregated)",
+					"pattern", k.pattern,
+					"count_in_window_sec", int(flushEvery.Seconds()),
+					"count", st.count,
+					"since", st.firstAt.Format(time.RFC3339))
+				st.count = 0
+				st.lastFlush = now
+			}
+		}
+	}
+
+	for {
+		for scanner.Scan() {
+			line := scanner.Text()
+			// Two interesting tokens: <WARNING> and <ERROR>
+			isWarn := strings.Contains(line, "<WARNING>:")
+			isErr := strings.Contains(line, "<ERROR>:")
+			if !isWarn && !isErr {
+				continue
+			}
+			// Aggregate the disk-full pattern; surface others immediately.
+			if strings.Contains(line, "space not enough on device") {
+				k := aggKey{"space not enough on device, upload directly"}
+				st := agg[k]
+				if st == nil {
+					st = &aggState{firstAt: time.Now(), lastFlush: time.Now()}
+					agg[k] = st
+				}
+				st.count++
+				continue
+			}
+			level := jmlog.LevelWarn
+			if isErr {
+				level = jmlog.LevelError
+			}
+			if level == jmlog.LevelError {
+				jmlog.Error("juicefs", "raw", line)
+			} else {
+				jmlog.Warn("juicefs", "raw", line)
+			}
+		}
+		flushAgg()
+		// scanner exited — file may have rotated or be at EOF; sleep + retry.
+		if err := scanner.Err(); err != nil {
+			jmlog.Debug("juicefs log tail: scanner error", "error", err.Error())
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // StartMonitor begins a background goroutine that checks mount health
