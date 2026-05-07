@@ -18,6 +18,9 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 
 	"github.com/lelanddutcher/juicemount/cache"
@@ -420,6 +423,19 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 
 	e := jfs.handler.store.LookupByPath(filename)
 	if e != nil {
+		// For non-directory entries, verify the file still exists on FUSE.
+		// Stale cache entries (from failed copies or deleted files) cause
+		// Finder to report "already exists" for files that don't exist.
+		if !e.IsDir {
+			fusePath := jfs.fullPath(filename)
+			if _, err := os.Lstat(fusePath); os.IsNotExist(err) {
+				jmlog.Warn("purging phantom file (stale cache)", "path", filename)
+				jfs.handler.store.DeleteFromCache(filename)
+				go jfs.handler.store.Delete(filename)
+				return nil, os.ErrNotExist
+			}
+		}
+
 		// If we have a tracked write size that's larger, use it
 		if hasWriteSize && writeSize > e.Size {
 			clone := *e
@@ -560,6 +576,11 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 		fusePath := jfs.fullPath(filename)
 		fd, err := jfs.handler.fdPool.Get(fusePath)
 		if err != nil {
+			if os.IsNotExist(err) {
+				jmlog.Warn("purging phantom entry on open", "path", filename)
+				jfs.handler.store.DeleteFromCache(filename)
+				go jfs.handler.store.Delete(filename)
+			}
 			return nil, err
 		}
 		return &cachedFile{
@@ -782,6 +803,7 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 			if f.readahead != nil {
 				f.readahead.OnRead(f.inode, off, n, f.name)
 			}
+			metrics.Default().AddBytesRead(int64(n))
 			return n, nil
 		}
 	}
@@ -793,14 +815,27 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 			if f.readahead != nil {
 				f.readahead.OnRead(f.inode, off, n, f.name)
 			}
+			metrics.Default().AddBytesRead(int64(n))
 			return n, nil
 		}
+	}
+
+	// Offline mode short-circuit: if the user has flipped to offline, we
+	// don't fall through to FUSE. JuiceFS would otherwise try to GET the
+	// missing block from S3, which on cellular can take 30+ seconds and
+	// will tarpit the NLE waiting for the read. Return EIO immediately so
+	// the NLE shows "media offline" instead of beachballing.
+	if pin.IsOffline() {
+		return 0, syscall.EIO
 	}
 
 	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time)
 	n, err := f.fuseFD.ReadAt(p, off)
 	if n > 0 && f.readahead != nil {
 		f.readahead.OnRead(f.inode, off, n, f.name)
+	}
+	if n > 0 {
+		metrics.Default().AddBytesRead(int64(n))
 	}
 	return n, err
 }
@@ -845,6 +880,7 @@ func (f *writeFile) Write(p []byte) (int, error) {
 			f.writtenEnd = pos
 			f.handler.trackWriteSize(f.name, pos)
 		}
+		metrics.Default().AddBytesWritten(int64(n))
 	}
 	return n, err
 }
@@ -857,6 +893,7 @@ func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
 			f.writtenEnd = end
 			f.handler.trackWriteSize(f.name, end)
 		}
+		metrics.Default().AddBytesWritten(int64(n))
 	}
 	return n, err
 }
