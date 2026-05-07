@@ -54,7 +54,39 @@ var (
 	// [JM5] Write coalescing metrics
 	tcpFlushCount   atomic.Int64 // number of TCP flush syscalls
 	tcpBatchedCount atomic.Int64 // number of responses batched (>1 per flush)
+
+	// [JM5] Optional observer hook for the metrics package. Kept as an
+	// atomic.Value of an ObserverFunc so the package can be imported by
+	// internal/metrics without a circular dependency.
+	observer atomic.Value // ObserverFunc
 )
+
+// ObserverFunc is invoked once per RPC after the handler returns.
+// proc is the NFS procedure number (0..21 for NFSv3); program is the
+// RPC program ID (100003 for nfs, 100005 for mount). Implementations
+// must be non-blocking and goroutine-safe.
+type ObserverFunc func(program uint32, proc uint32, elapsed time.Duration, err error)
+
+// SetObserver registers a callback for per-RPC timing. Pass nil to
+// disable. The previous observer (if any) is replaced.
+func SetObserver(fn ObserverFunc) {
+	if fn == nil {
+		observer.Store(ObserverFunc(nil))
+		return
+	}
+	observer.Store(fn)
+}
+
+func currentObserver() ObserverFunc {
+	v := observer.Load()
+	if v == nil {
+		return nil
+	}
+	if fn, ok := v.(ObserverFunc); ok {
+		return fn
+	}
+	return nil
+}
 
 // RPCStats returns the current RPC performance counters.
 func RPCStats() (total, slow, flushes, batched int64) {
@@ -143,6 +175,11 @@ func (c *conn) serve(ctx context.Context) {
 			if elapsed > 50*time.Millisecond {
 				Log.Warnf("slow RPC: %v took %v", w.req, elapsed)
 			}
+		}
+
+		// [JM5] External observer hook (used by internal/metrics).
+		if obs := currentObserver(); obs != nil {
+			obs(w.req.Header.Prog, w.req.Header.Proc, elapsed, err)
 		}
 
 		if err != nil {

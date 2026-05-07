@@ -17,6 +17,7 @@ struct JuiceMountApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var menuBarController: MenuBarController!
+    let finderService = FinderService()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Run as a status bar app (no dock icon, no main window)
@@ -30,6 +31,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if server.preferences.showSearchHotkey {
             registerSearchHotkey()
         }
+
+        // Register Finder right-click → Services → "JuiceMount: Pin for Offline".
+        // After this, NSRegisterServicesProvider tells macOS where to dispatch
+        // the service messages declared in Info.plist's NSServices array.
+        // The user may need to enable the service once in System Settings →
+        // Keyboard → Keyboard Shortcuts → Services on first run.
+        NSApp.servicesProvider = finderService
+        NSUpdateDynamicServices()
 
         // Auto-start the server on launch — saves the user a click.
         // If they want to manually control start/stop, they can quit and

@@ -58,8 +58,24 @@ struct MenuPopoverView: View {
                 offlineToggle
             }
 
+            // Pin Folder button — always visible. Pops a native NSOpenPanel
+            // rooted in the JuiceMount volume.
+            HStack(spacing: 6) {
+                Button {
+                    pickFolderToPin()
+                } label: {
+                    Label("Pin Folder for Offline…", systemImage: "pin.circle.fill")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(.orange)
+                .help("Pre-cache a folder for offline use. Or right-click a folder in Finder → Services → Pin for Offline (after enabling once in System Settings → Keyboard → Keyboard Shortcuts → Services).")
+                Spacer()
+            }
+
             if cacheStatus.aggregate.TotalFiles == 0 && cacheStatus.live.FilesPrefetched == 0 {
-                Text("No pinned files. Use the CLI: `juicemount pin <path>`")
+                Text("Nothing pinned yet. Pick a folder above, or right-click in Finder → Services → Pin for Offline.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             } else {
@@ -74,6 +90,54 @@ struct MenuPopoverView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+
+    /// Opens a folder picker rooted at the JuiceMount mount and pins the
+    /// chosen directories. Pin work runs on a background queue so the
+    /// popover doesn't freeze.
+    private func pickFolderToPin() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.directoryURL = URL(fileURLWithPath: server.preferences.mountPoint)
+        panel.message = "Select folder(s) to pre-cache for offline use."
+        panel.prompt = "Pin"
+
+        guard panel.runModal() == .OK else { return }
+        let urls = panel.urls
+        guard !urls.isEmpty else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            for url in urls {
+                do {
+                    let result = try NFSBridge.pin(url.path)
+                    DispatchQueue.main.async {
+                        refreshCacheStatus()
+                        if let err = result.error, !err.isEmpty {
+                            showAlert(title: "Pin failed",
+                                      message: "\(url.lastPathComponent): \(err)")
+                        } else {
+                            // Brief notification — don't be too noisy
+                            NSLog("[JuiceMount] Pinned \(result.files_pinned) files under \(url.lastPathComponent)")
+                        }
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        showAlert(title: "Pin failed",
+                                  message: error.localizedDescription)
+                    }
+                }
+            }
+        }
+    }
+
+    private func showAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.runModal()
     }
 
     private var offlineToggle: some View {

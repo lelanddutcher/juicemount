@@ -2,11 +2,11 @@ package nfs
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"syscall"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 
 	"github.com/lelanddutcher/juicemount/metadata"
@@ -45,7 +45,10 @@ func (s *Server) Start() error {
 	}
 	s.listener = &noDelayListener{Listener: l}
 
-	log.Printf("nfs: listening on %s (TCP_NODELAY enabled)", s.config.ListenAddr)
+	jmlog.Info("nfs server listening",
+		"addr", s.config.ListenAddr,
+		"tcp_nodelay", true,
+	)
 
 	// [JM5] Serve the handler directly — JuiceMountHandler implements
 	// deterministic inode-based ToHandle/FromHandle plus VerifierFor/
@@ -56,7 +59,7 @@ func (s *Server) Start() error {
 	// Start serving in background
 	go func() {
 		if err := nfslib.Serve(s.listener, s.handler); err != nil {
-			log.Printf("nfs: server error: %v", err)
+			jmlog.Error("nfs server stopped with error", "error", err.Error())
 		}
 	}()
 
