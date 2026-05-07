@@ -197,6 +197,56 @@ func TestStatusString(t *testing.T) {
 	}
 }
 
+// TestIsPinnedReadyWindow exercises the four states the offline-mode open
+// gate has to handle:
+//   - Pending: known-not-cached → must refuse (otherwise we re-introduce
+//     the FUSE-to-backend stall the gate exists to prevent)
+//   - Prefetching with bytes_cached < size: in flight → refuse
+//   - Prefetching with bytes_cached >= size: late-Ready window → allow
+//   - Ready: full hit → allow
+func TestIsPinnedReadyWindow(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.Pin("/Volumes/zpool/a.mov", 1000, "/Volumes/zpool"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default state after Pin() is Pending — gate must refuse.
+	if s.IsPinnedReady("/Volumes/zpool/a.mov") {
+		t.Error("Pending file should not be considered ready")
+	}
+
+	// Mid-prefetch: 50% cached, status Prefetching → still refuse.
+	_ = s.UpdateStatus("/Volumes/zpool/a.mov", StatusPrefetching, 500, "")
+	if s.IsPinnedReady("/Volumes/zpool/a.mov") {
+		t.Error("half-cached Prefetching should not be considered ready")
+	}
+
+	// Late-Ready: 100% cached but status row not yet updated.
+	// This is the race the offline-toggle would otherwise hit.
+	_ = s.UpdateStatus("/Volumes/zpool/a.mov", StatusPrefetching, 1000, "")
+	if !s.IsPinnedReady("/Volumes/zpool/a.mov") {
+		t.Error("fully-cached Prefetching should be allowed (late-Ready window)")
+	}
+
+	// Final state.
+	_ = s.UpdateStatus("/Volumes/zpool/a.mov", StatusReady, 1000, "")
+	if !s.IsPinnedReady("/Volumes/zpool/a.mov") {
+		t.Error("Ready file should always be allowed")
+	}
+
+	// Failed → refuse.
+	_ = s.UpdateStatus("/Volumes/zpool/a.mov", StatusFailed, 0, "backend error")
+	if s.IsPinnedReady("/Volumes/zpool/a.mov") {
+		t.Error("Failed file should not be allowed")
+	}
+
+	// Unknown path → refuse.
+	if s.IsPinnedReady("/Volumes/zpool/never-pinned.mov") {
+		t.Error("unknown path should not be allowed")
+	}
+}
+
 func TestOfflineModeToggle(t *testing.T) {
 	if IsOffline() {
 		t.Error("default should be online")

@@ -13,6 +13,8 @@ public enum NFSBridge {
         public var dbPath: String
         public var cacheSize: String
         public var metricsAddr: String
+        public var logFile: String
+        public var logLevel: String
 
         enum CodingKeys: String, CodingKey {
             case redisURL = "redis_url"
@@ -22,6 +24,8 @@ public enum NFSBridge {
             case dbPath = "db_path"
             case cacheSize = "cache_size"
             case metricsAddr = "metrics_addr"
+            case logFile = "log_file"
+            case logLevel = "log_level"
         }
 
         public init(
@@ -31,7 +35,9 @@ public enum NFSBridge {
             listenAddr: String = "127.0.0.1:11049",
             dbPath: String,
             cacheSize: String = "100000",
-            metricsAddr: String = "127.0.0.1:11050"
+            metricsAddr: String = "127.0.0.1:11050",
+            logFile: String = "",
+            logLevel: String = "info"
         ) {
             self.redisURL = redisURL
             self.fusePath = fusePath
@@ -40,6 +46,8 @@ public enum NFSBridge {
             self.dbPath = dbPath
             self.cacheSize = cacheSize
             self.metricsAddr = metricsAddr
+            self.logFile = logFile
+            self.logLevel = logLevel
         }
     }
 

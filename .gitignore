@@ -21,6 +21,8 @@ jm5
 # Build output
 /build/*.a
 /build/*.h
+/build/JuiceMount.app/
+app/JuiceMount/.build/
 
 # SQLite databases (local state, not code)
 *.db
