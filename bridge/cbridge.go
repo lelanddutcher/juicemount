@@ -129,9 +129,22 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		if globalFUSE != nil && fuseLooksHealthy(cfg.FUSEPath) {
 			jmlog.Info("juicefs FUSE already mounted, reusing", "path", cfg.FUSEPath)
 		} else {
+			// Forward the user's configured cache size to JuiceFS. Without this,
+			// JuiceFS uses an unspecified default and (worse) the user's
+			// preferred cap is silently ignored — see the regression in the
+			// CLI→GUI port where the menu-bar app was passing cache_size in
+			// the JSON config but cbridge never forwarded it.
+			//
+			// FreeSpaceRatio = 0.01 (1%) instead of JuiceFS's default 0.1.
+			// Video editors fill their disks; the default makes the cache
+			// silently disable below 10% free, sending every read straight
+			// to S3 with no warning. 1% is the sweet spot for our use case
+			// — the disk is the cache.
 			fm := health.NewFUSEManager(health.FUSEConfig{
-				RedisURL:   cfg.RedisURL,
-				MountPoint: cfg.FUSEPath,
+				RedisURL:       cfg.RedisURL,
+				MountPoint:     cfg.FUSEPath,
+				CacheSize:      cfg.CacheSize,
+				FreeSpaceRatio: "0.01",
 			})
 			if err := fm.Mount(); err != nil {
 				jmlog.Error("juicefs FUSE mount failed", "error", err.Error())
@@ -139,7 +152,10 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			}
 			fm.StartMonitor()
 			globalFUSE = fm
-			jmlog.Info("juicefs FUSE mounted", "path", cfg.FUSEPath)
+			jmlog.Info("juicefs FUSE mounted",
+				"path", cfg.FUSEPath,
+				"cache_size_mb", cfg.CacheSize,
+				"free_space_ratio", "0.01")
 		}
 	}
 
