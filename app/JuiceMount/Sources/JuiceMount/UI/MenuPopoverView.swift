@@ -12,6 +12,10 @@ struct MenuPopoverView: View {
     @State private var cacheStatus = NFSBridge.CacheStatus()
     @State private var cacheTimer: Timer?
     @State private var offlineToggleBusy = false
+    @State private var diskFreeGB: Double = 0
+    @State private var diskImportantGB: Double = 0
+    @State private var diskTotalGB: Double = 0
+    @State private var reclaimBusy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -30,8 +34,12 @@ struct MenuPopoverView: View {
         .background(.ultraThinMaterial)
         .onAppear {
             refreshCacheStatus()
+            refreshDiskSpace()
             cacheTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
-                Task { @MainActor in refreshCacheStatus() }
+                Task { @MainActor in
+                    refreshCacheStatus()
+                    refreshDiskSpace()
+                }
             }
         }
         .onDisappear {
@@ -42,6 +50,95 @@ struct MenuPopoverView: View {
 
     private func refreshCacheStatus() {
         cacheStatus = NFSBridge.cacheStatus()
+    }
+
+    /// Reads the system's view of disk space — both `volumeAvailableCapacityKey`
+    /// (what statfs sees) and `volumeAvailableCapacityForImportantUsageKey`
+    /// (what the system would free for an important request, including
+    /// purgeable Time Machine snapshots and system caches). The gap between
+    /// these is what the "Reclaim" button can recover.
+    private func refreshDiskSpace() {
+        let url = URL(fileURLWithPath: "/")
+        let keys: Set<URLResourceKey> = [
+            .volumeAvailableCapacityKey,
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeTotalCapacityKey,
+        ]
+        guard let v = try? url.resourceValues(forKeys: keys) else { return }
+        let toGB: (Int?) -> Double = { ($0.map { Double($0) / 1e9 }) ?? 0 }
+        diskFreeGB = toGB(v.volumeAvailableCapacity)
+        diskTotalGB = toGB(v.volumeTotalCapacity)
+        diskImportantGB = (v.volumeAvailableCapacityForImportantUsage.map {
+            Double($0) / 1e9
+        }) ?? diskFreeGB
+    }
+
+    /// One-line view: "Cache disk: 38 GB free · 283 GB reclaimable"
+    /// with a Reclaim button when there's enough purgeable to be worth it.
+    private var diskSpaceRow: some View {
+        let purgeable = max(0, diskImportantGB - diskFreeGB)
+        return HStack(spacing: 6) {
+            Image(systemName: "internaldrive")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("\(String(format: "%.0f", diskFreeGB)) GB free")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if purgeable >= 5 {
+                Text("· \(String(format: "%.0f", purgeable)) GB reclaimable")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                Spacer()
+                Button {
+                    triggerReclaim()
+                } label: {
+                    if reclaimBusy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("Reclaim").font(.caption2)
+                    }
+                }
+                .controlSize(.mini)
+                .disabled(reclaimBusy)
+                .help("Thin Time Machine local snapshots and other purgeable space so JuiceFS can use it for cache.")
+            } else {
+                Spacer()
+            }
+        }
+    }
+
+    private func triggerReclaim() {
+        reclaimBusy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let url = URL(string: "http://127.0.0.1:11050/reclaim")!
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            let sem = DispatchSemaphore(value: 0)
+            var freedGB: Double = 0
+            var errMsg: String?
+            URLSession.shared.dataTask(with: req) { data, _, err in
+                defer { sem.signal() }
+                if let err = err { errMsg = err.localizedDescription; return }
+                guard let data = data,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { return }
+                if let f = obj["freed_gb"] as? Double { freedGB = f }
+                if let e = obj["error"] as? String { errMsg = e }
+            }.resume()
+            sem.wait()
+            DispatchQueue.main.async {
+                reclaimBusy = false
+                refreshDiskSpace()
+                if let errMsg = errMsg {
+                    showAlert(title: "Reclaim failed", message: errMsg)
+                } else if freedGB < 0.1 {
+                    showAlert(title: "Nothing to reclaim",
+                              message: "macOS reports purgeable space, but tmutil couldn't free any. The reclaimable space may be in iCloud Drive or system caches that the system manages on its own under disk pressure.")
+                } else {
+                    NSLog("[JuiceMount] Reclaimed %.1f GB", freedGB)
+                }
+            }
+        }
     }
 
     // MARK: - Cache section (offline-pin prototype)
@@ -73,6 +170,8 @@ struct MenuPopoverView: View {
                 .help("Pre-cache a folder for offline use. Or right-click a folder in Finder → Services → Pin for Offline (after enabling once in System Settings → Keyboard → Keyboard Shortcuts → Services).")
                 Spacer()
             }
+
+            diskSpaceRow
 
             if cacheStatus.aggregate.TotalFiles == 0 && cacheStatus.live.FilesPrefetched == 0 {
                 Text("Nothing pinned yet. Pick a folder above, or right-click in Finder → Services → Pin for Offline.")
