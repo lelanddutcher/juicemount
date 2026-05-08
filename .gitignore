@@ -1,5 +1,8 @@
 # Binaries
-jm5
+# (Don't use a bare `jm5` pattern — that matches cmd/jm5/main.go too,
+# silently un-tracking the headless CLI source. Anchor to repo root.)
+/jm5
+/juicemount
 *.a
 *.dylib
 *.so
