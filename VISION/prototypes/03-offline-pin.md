@@ -1,8 +1,43 @@
 # Prototype 03 — Offline Pin (Power-User Pre-Cache + Offline Mode)
 
-> **Branch:** `prototype/offline-pin`
-> **Status:** Working end-to-end. CLI + cbridge + menu bar UI + read-path integration. FinderSync extension deferred.
+> **Branch:** `prototype/offline-pin` (initial scaffold) → `production-hardening` (8 follow-up commits)
+> **Status (2026-05-08):** ✅ **production-hardened.** Survived a 97%-full-disk + cellular + Resolve-playback regression session and 8 rounds of fixes. See `CHANGELOG.md` 2026-05-07 / 2026-05-08 entry for the full list. The prototype-quality demo of the May 7 build is now genuinely operational.
+> **FinderSync extension:** still deferred. Replaced by macOS Services right-click ("JuiceMount: Pin for Offline"), which gives the same UX entry point with much less complexity (no separate `.appex` bundle, no App Group entitlements).
 > **Source spec:** Built in response to: "I often need to pre-cache lots of files before I go to a lower bandwidth connection, such as cellular. Basically, getting all my projects and such downloaded to the mount, before I, go Hypothetically 'offline', just like a Dropbox type of setup."
+
+## What landed beyond the prototype scope (production-hardening branch, 2026-05-08)
+
+The May 7 prototype proved the architecture. The production-hardening work fixed everything that broke when a real video editor put real workloads through it. Highlights:
+
+- **Open-time offline gate** in `nfs/handler.go OpenFile` — fails un-pinned reads in ~6 ms instead of waiting for the 14 s NFS-retry timeout that the read-time-only gate produced. Critical for cellular: the NLE sees "media offline" immediately rather than beachballing.
+- **`f.pinned` snapshot** captured at OpenFile time — without this, the read-time gate refused pinned files when our SSD cache reader missed (a separate cache layer from JuiceFS LRU).
+- **`billyFile` offline-guard gap** plugged (caught by independent code review).
+- **`canonicalize(filename)` helper** on the NFS handler with 7-case test coverage. Replaces the hardcoded `/Volumes/zpool/` constant with a mount-point-aware version.
+- **`Prefetcher.stripMountPrefix()`** mirror on the prefetcher side.
+- **`Prefetcher.VerifyAndRepair()`** — the answer to "is my pinned data actually on disk?" — walks every Ready/Prefetching/Failed entry and marks them Pending. The existing `PullPending` worker drains the queue at its own pace, avoiding the 256-slot ring-buffer overflow problem.
+- **Cold-start retry on Redis** (1+2+4+8+16 s exponential backoff) — survives wifi/cellular handoffs at launch.
+- **`Pending → Ready` race fix** in `IsPinnedReady` — late-Ready window allows `StatusPrefetching` with `bytes_cached >= size`.
+
+## What landed that wasn't on the original spec
+
+These came from **the user's actual machine** during regression testing. Real-world deployments surfaced problems theoretical demos don't:
+
+- **JuiceFS daemon launched without `--cache-size`** — GUI shim was dropping the user's `ssdCacheGB` preference. Plumbed through, then auto-expanded to 85% of total disk.
+- **JuiceFS `--free-space-ratio 0.1` (default)** silently disables cache writes when the volume drops below 10% free. Dropped to 0.01 — the disk IS the cache.
+- **APFS purgeable space** — macOS hides hundreds of GB behind Time Machine local snapshots and iCloud cached content. New `health.ReclaimPurgeableSpace()` shells out to `tmutil thinlocalsnapshots` at mount time. Freed 210 GB on the user's machine in one shot.
+- **JuiceFS daemon log captured** into our structured log via a `tailJuiceFSLog()` goroutine; chatty patterns aggregated.
+- **Disk-pressure UI banner** with three real states (free < 1%, free < 3%, pinned > total disk) — answers the "where does the user know caching stopped" question directly.
+- **Sync Now triggers verify-and-repair** in addition to metadata reconciliation.
+
+## Verified live perf (snapshot at end of session)
+
+- 200 MiB sequential read on a fully-cached pinned file: **431 MB/s, 4.6 MB of network traffic** (Redis chunk-mapping lookups only).
+- 100 MiB sequential read offline-mode: **215+ MB/s** sustained (FUSE → JuiceFS LRU).
+- Random-seek reads on cached media (50 MB blocks): 16–481 MB/s depending on hit rate.
+- Unpinned offline read fail-fast: **4–67 ms** (was 14 s before open-time gate).
+- 0 RPC errors over 20 s of active Resolve playback during regression session.
+
+These numbers are demo-script-quality — `VISION/demo-script.md` should be updated to use them in the "show, don't tell" segments.
 
 ## What this prototype delivers
 

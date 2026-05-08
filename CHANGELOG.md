@@ -1,5 +1,190 @@
 # JuiceMount6 Changelog
 
+## 2026-05-07 / 2026-05-08 — Production-Hardening Branch (Phase 3 ship)
+
+Eight commits on the `production-hardening` branch turning the prototype-quality menu-bar app into something a video editor can put real cellular sessions through. The headline features were already in earlier prototypes; this work is what made them survive contact with a 97%-full disk, an unreachable NAS at launch, and a pinned-set bigger than the configured cache.
+
+### Offline mode + pin store (prototype 03 → production)
+
+- `internal/cache/pin/` SQLite-backed pin registry with statuses Pending / Prefetching / Ready / Failed / Unpinned, indexed primary-key lookup via `IsPinnedReady(path)` (hot path on every NFS OpenFile when offline mode is on).
+- 4-worker bounded prefetcher pool reading through FUSE in 1 MB chunks. JuiceFS LRU caches each block as it streams.
+- `Prefetcher.PullPending(ctx, batchSize)` long-running daemon that drains Pending rows into the worker queue every 5s. Avoids the queue-overflow problem (256-slot ring) when the user pins large sets at once.
+- `Prefetcher.ReWarmupLoop(ctx, ttl, batchSize)` periodic re-warmer (every 15 min, files older than 6 hours).
+- `Prefetcher.VerifyAndRepair(ctx)` walks every Ready / Prefetching / Failed entry and marks them Pending so PullPending re-feeds the worker pool. The recovery path for "FUSE was momentarily unmounted at restart, every open() returned ENOENT, all 329 entries got marked Failed."
+- Atomic `pin.IsOffline()` flag, set via `pin.SetOffline(bool)`. Read on every OpenFile and ReadAt; lock-free.
+- **Open-time gate** in `nfs/handler.go` `OpenFile`: refuses un-pinned reads in offline mode in ~6 ms (vs. the 14-second NFS-retry timeout the read-time-only gate produced earlier).
+- **Read-time gate** in `cachedFile.ReadAt`: only refuses reads on un-pinned files; pinned files fall through to FUSE/JuiceFS LRU at multi-GB/s.
+- `Prefetcher.stripMountPrefix(path)` translates canonical pin keys back to FUSE-relative paths using the configured `mountPoint`, replacing the hardcoded `/Volumes/zpool/` constant.
+- `JuiceMountHandler.canonicalize(filename)` translates in-mount filenames to canonical pin-store keys, handling plain-relative, leading-slash-relative, already-absolute, and trailing-slash-on-mount-point cases. Replaces the hardcoded `/Volumes/zpool/` + filename concat.
+
+### macOS Services right-click + Pin Folder UI
+
+- `app/JuiceMount/Sources/JuiceMount/Core/FinderService.swift` `@MainActor` class implementing `pinForOffline` and `toggleOfflineMode` via `@objc` methods, registered as `NSApp.servicesProvider`.
+- `Info.plist` `NSServices` array declares both services with `public.file-url` send types. After enabling once in System Settings → Keyboard → Keyboard Shortcuts → Services, "JuiceMount: Pin for Offline" appears in Finder right-click → Services.
+- `MenuPopoverView` Pin Folder button with native `NSOpenPanel` rooted at the mount point. Multiple-folder selection. Pin work runs on a background queue.
+
+### JuiceFS cache config (the hardest-fought regression fix)
+
+- **`--cache-size` plumbing.** GUI shim (`bridge/cbridge.go`) was constructing `FUSEManager` without forwarding `cfg.CacheSize`, so the user's `ssdCacheGB` preference was silently ignored. CLI (`cmd/jm5/main.go`) had been passing `100000` (100 GiB) all along.
+- **`--free-space-ratio 0.01`.** JuiceFS default is 0.1 (refuse to cache when disk drops below 10% free). On a 97%-full video-editor's laptop, that meant every read went straight to S3. Lowered to 1% — the disk IS the cache.
+- **`--cache-size` auto-expansion.** `FUSEManager.Mount()` now sizes the cache to 85% of total disk (with the user's configured value as a *floor*, not a ceiling). On a 926 GiB MacBook this expands a 100 GiB configured cache to 787 GiB, headroom enough for any realistic pinned set. Free-space-ratio still enforces the upper bound at write time.
+- **`tailJuiceFSLog()`** goroutine watches `~/.juicefs/juicefs.log` and promotes WARNING/ERROR lines into `jmlog`. The chatty "space not enough on device" pattern is aggregated (one summary per 60 s with a count) so a flooded daemon log doesn't drown our log, but the user CAN see when the JuiceFS daemon is unhappy.
+- **`checkCacheVolumeHealth()`** runs at mount time, emits a `jmlog.Warn` if the volume's free ratio is below the configured threshold.
+
+### APFS purgeable-space reclamation
+
+- `health.ReclaimPurgeableSpace(volume, targetBytes)` shells out to `tmutil thinlocalsnapshots <vol> <amount> 4` (urgency 4 = thin as much as possible). Measures freed bytes via statfs before/after.
+- **Auto-reclaim before mount.** `FUSEManager.Mount()` checks free space; if below 50 GB it calls `ReclaimPurgeableSpace`. On the user's machine this freed 210.5 GB (49 GB → 260 GB free) by thinning a single Time Machine local snapshot.
+- HTTP `POST /reclaim` endpoint on the control plane returns `{ok, freed_bytes, freed_gb}`.
+- Swift popover shows a one-line "X GB free · Y GB reclaimable" with a Reclaim button when there's ≥ 5 GB reclaimable. Disk numbers are read via Foundation's `URLResourceKey.volumeAvailableCapacityForImportantUsageKey` — the only public macOS API that reports purgeable-aware capacity correctly.
+- Disk-pressure banner in popover with three real states:
+  - free < 1% of total → red, "JuiceFS has stopped caching"
+  - free < 3% of total → orange, "JuiceFS will stop caching at 1% free"
+  - pinned set > total disk capacity → red, "Pinned set exceeds disk capacity"
+
+### Logging + control plane
+
+- `internal/jmlog/jmlog.go` `rotatingFile` wrapper: 16 MB × 5 generations = 80 MB cap. Per-instance rotation flag (was package-level — re-Init bug). Auto-mkdir.
+- `Preferences.defaultLogPath()` → `~/Library/Logs/JuiceMount/juicemount.log`. Swift app forwards `logFile` and `logLevel` to cbridge.
+- HTTP control plane on the metrics port (11050):
+  - `GET /metrics` — Prometheus-style counters
+  - `GET /cache-status` — pin aggregate, per-root totals, live prefetch stats, offline mode flag
+  - `POST /pin?path=...` — register a path/folder for offline pinning
+  - `POST /unpin?path=...` — remove from registry
+  - `GET /offline?on=1|0` — toggle offline mode
+  - `POST /reclaim` — thin Time Machine local snapshots
+  - `POST /verify-pins` — re-verify all pinned coverage by marking everything Pending
+
+### Resilience
+
+- `connectRedisWithRetry()` wraps `metadata.NewRedisClient` with exponential backoff (1 s, 2 s, 4 s, 8 s, 16 s = 5 attempts ≈ 31 s worst case). Survives wifi/cellular handoffs at launch. Logs each retry; emits "redis connect recovered" on success.
+- Sync Now button now triggers BOTH metadata sync AND `verify-pins`. The user's mental model — "press Sync to make sure everything's current" — actually does what they expect.
+
+### NLE project parsers (deferred, not wired into menu UI yet)
+
+- `internal/nle/parser.go`, `premiere.go`, `resolve.go`, `fcpx.go` — extract media references from `.prproj` (gzipped XML), `.drp` (zip + SQLite), `.fcpxml`. 13/13 unit tests pass. Smoke-tested on a real Tampa Restaurants Premiere project. CLI exposed as `juicemount prefetch-project <file>` but no UI button yet.
+
+### Tests added
+
+- `internal/jmlog/TestRotation` — locks in 16 MB × 5 generations cap.
+- `nfs/canonicalize_test.go` — 7 cases: plain, leading slash, absolute under mount, trailing slash on mount, non-default mount, empty fallback, root file.
+- `nfs/billyfile_offline_test.go` — 4 states: online unpinned, offline unpinned, offline pinned, ReadAt and Read variants.
+- `internal/cache/pin/TestIsPinnedReadyWindow` — 6 transition states including the late-Ready window where status is still Prefetching but bytes_cached >= size.
+- `internal/cache/pin/TestStripMountPrefix` — 6 cases for the prefetcher's path translation.
+
+### Bug fixes worth flagging
+
+- **`OpenFile` open-time gate added.** Previously offline mode only refused reads at `cachedFile.ReadAt` time; small reads (<= 1 MB) succeeded silently because they'd hit the kernel page cache or memory buffer first. A 137 MB file took 14 seconds to fail. Open-time gate now fires in ~6 ms regardless of read size.
+- **`cachedFile.pinned` snapshot** captured at OpenFile time. Without this, the read-time offline gate refused pinned files when the SSD cache reader missed (a separate cache layer from JuiceFS LRU), even though FUSE could have served the bytes locally.
+- **`billyFile` offline-guard gap** (caught by independent code review). billyFile is the read path for files not yet in the SQLite metadata cache (fresh directory traversal). It had no read-time offline gate. Fixed: `billyFile.Read` and `billyFile.ReadAt` now both check `pin.IsOffline() && !f.pinned`.
+
+### Verified live (snapshot at end of session)
+
+- Pinned set: 331 files, 159 GB. All Ready after Sync triggers a verify-and-repair cycle.
+- 200 MiB sequential read on a pinned file: **431 MB/s, 4.6 MB of network traffic** (Redis chunk-mapping lookups only — no bulk S3 fetches).
+- Random-seek reads on pinned media: 50 MB blocks at 16–481 MB/s depending on cache hit rate.
+- Pinned-offline reads: 215+ MB/s sustained (FUSE → JuiceFS LRU).
+- Unpinned-offline reads: 4–67 ms fail-fast EIO (was 14 s pre-fix on a 137 MB file).
+
+### Branch state
+
+8 commits on `production-hardening`, parented on `prototype/offline-pin`. Squash-merge candidate to `main` once cellular soak test confirms no regressions.
+
+```
+9a1f229 feat(verify): Sync now also re-verifies pinned coverage; surface cache pressure
+983b795 fix(cache): auto-expand --cache-size; user's 100 GiB cap was evicting all reads
+56c2f6c feat(cache): reclaim APFS purgeable space for JuiceFS cache
+21da8ee fix(cache): restore JuiceFS local caching — biggest GUI regression
+f96ba16 production-hardening: address review findings + cold-start retry
+a6db0c3 production-hardening: logging, path canonicalization, offline gate fixes
+0c72399 prototype: baseline offline-pin + production hardening branch
+c177cab prototype 03: offline-pin (power-user pre-cache + offline mode)
+```
+
+---
+
+## 2026-05-07 — Phase 2 Menu Bar App + Phase 3 Observability
+
+### Phase 2 — Native macOS Menu Bar App
+
+JuiceMount now ships as a proper macOS menu bar application built in SwiftUI 6.2 with a Go c-archive backend. No more CLI-only operation.
+
+**Architecture:**
+- `app/JuiceMount/` — Swift Package with executable target
+- `app/JuiceMount/Sources/JuiceMountCore/` — C interop layer that imports the Go-generated `libnfsd.h`
+- `bridge/cbridge.go` — Go c-archive exports: `NFSServerStart`, `NFSServerStop`, `NFSServerIsRunning`, `NFSServerStats`, `NFSServerSyncNow`, `NFSServerSearch`, `NFSServerFreeString`
+- All NFSBridge calls dispatched to a background queue so the UI never blocks
+
+**Menu bar UI** (`MenuBarController` + `MenuPopoverView`):
+- SF Symbol-based status icon with state-driven badge: idle, starting, running, syncing, degraded, disconnected, error
+- Polished popover with header, volume info (entries count, last sync), per-backend health (Redis/MinIO/FUSE), and action buttons
+- AppKit `NSStatusItem` for native feel; popover content is pure SwiftUI
+
+**Search window** (`SearchWindowView`):
+- Type-as-you-search with 150ms debounce and parent-path scope picker
+- Native `Table` view with name/path/size columns and color-coded file-type icons
+- **Spacebar opens `QLPreviewPanel`** for native Quick Look preview — the workflow you wanted for finding sound effects/footage by name and previewing instantly
+- Enter / double-click reveals selection in Finder
+- Drag to NLE (Premiere/Resolve/FCPX) supported via standard NSURL drag
+- Result limit configurable: 50/100/250/1000
+
+**Preferences window** (`PreferencesWindowView`):
+- 4 tabs: General, Server, Cache, Advanced
+- Persists to `UserDefaults`; volume name, mount point, Redis URL, NFS listen addr, SSD cache size, memory buffer budget, reconcile interval
+- "Start at Login" via `SMAppService.mainApp` (macOS 13+)
+- "Reset Local Metadata Cache" maintenance action
+
+**Global hotkey** (`HotkeyManager`):
+- ⌘⇧F opens search window from any app
+- Carbon Event Manager (no Accessibility permission required)
+- Toggleable in Preferences
+
+**Build & deploy:**
+- `scripts/build-app.sh` — full pipeline (Go c-archive → Swift build → `.app` bundle assembly → ad-hoc codesign)
+- `scripts/build-cli.sh` — CLI-only build with entitlement codesigning
+- `scripts/install.sh` — install to `/Applications`, optionally enable LaunchAgent
+- `scripts/com.juicemount.agent.plist` — LaunchAgent for auto-start with crash-only relaunch
+
+### Phase 1.4 — Codesigning
+
+CLI binary is now codesigned with `com.apple.security.network.client` + `com.apple.security.network.server` entitlements via `scripts/build-cli.sh`. Eliminates the `ssh localhost` workaround needed to bypass macOS's 10GbE network filter.
+
+### Phase 3 — Production Hardening (in progress)
+
+Started during the same session by a background agent:
+
+- **Structured logging** (`internal/jmlog`): replaces `log.Printf` with `log/slog` JSON handler. Levels: Debug/Info/Warn/Error. Optional file output via `--log-file`.
+- **Per-RPC latency histograms** (`internal/metrics`): GETATTR, LOOKUP, READ, WRITE, READDIR, READDIRPLUS, CREATE, REMOVE, RENAME timed individually. Counters for total RPCs, errors, bytes.
+- **/metrics endpoint**: small zero-deps HTTP server bound to `127.0.0.1:11050`. JSON output with p50/p95/p99 percentiles.
+- **NFS auto-remount on stale mount**: Health monitor detects stale FUSE/NFS mounts via 5s `Stat()` timeout, gates remount on 3 consecutive failures + 60s cooldown.
+
+### Files Added
+
+| Path | Purpose |
+|------|---------|
+| `app/JuiceMount/Package.swift` | Swift Package definition |
+| `app/JuiceMount/Sources/JuiceMountCore/include/JuiceMountCore.h` | C bridge header |
+| `app/JuiceMount/Sources/JuiceMount/App.swift` | App entry point |
+| `app/JuiceMount/Sources/JuiceMount/Core/NFSBridge.swift` | Idiomatic Swift wrapper around c-archive |
+| `app/JuiceMount/Sources/JuiceMount/Core/ServerController.swift` | `@Observable` lifecycle controller |
+| `app/JuiceMount/Sources/JuiceMount/Core/Preferences.swift` | UserDefaults-backed prefs |
+| `app/JuiceMount/Sources/JuiceMount/Core/HotkeyManager.swift` | Global ⌘⇧F hotkey |
+| `app/JuiceMount/Sources/JuiceMount/Core/LoginItemManager.swift` | SMAppService start-at-login |
+| `app/JuiceMount/Sources/JuiceMount/UI/MenuBarController.swift` | NSStatusItem + popover host |
+| `app/JuiceMount/Sources/JuiceMount/UI/MenuPopoverView.swift` | Menu popover SwiftUI view |
+| `app/JuiceMount/Sources/JuiceMount/UI/SearchWindowView.swift` | Search window with QuickLook |
+| `app/JuiceMount/Sources/JuiceMount/UI/QuickLookCoordinator.swift` | QLPreviewPanel bridge |
+| `app/JuiceMount/Sources/JuiceMount/UI/PreferencesWindowView.swift` | Preferences tabs |
+| `app/JuiceMount/Resources/Info.plist` | Bundle Info.plist (LSUIElement, sandbox keys) |
+| `scripts/build-app.sh` | Full build pipeline |
+| `scripts/build-cli.sh` | CLI-only build with codesigning |
+| `scripts/install.sh` | Install to /Applications + LaunchAgent |
+| `scripts/com.juicemount.agent.plist` | LaunchAgent definition |
+| `internal/jmlog/` | Structured logging package (Phase 3) |
+| `internal/metrics/` | Latency histograms + /metrics HTTP server (Phase 3) |
+
+---
+
 ## 2026-03-31 — Code Audit & Full-Stack Overhaul
 
 ### Summary
