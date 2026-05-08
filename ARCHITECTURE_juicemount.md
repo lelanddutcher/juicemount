@@ -1,9 +1,10 @@
-# JuiceMount5 Architecture Document
+# JuiceMount Architecture Document
 
-**Last updated:** 2026-03-31
+**Last updated:** 2026-05-08 (production-hardening branch)
 **Repo:** `github.com/lelanddutcher/juicemount` (private)
 **Module:** `github.com/lelanddutcher/juicemount`
 **Go version:** 1.26.1
+**Active branch:** `production-hardening`
 
 ---
 
@@ -843,7 +844,179 @@ UPDATE_BASELINES=1 go test -v -run TestBenchmarkSuite_UpdateBaselines ./test/ -t
 
 ---
 
-## 11. Known Issues and Future Work
+## 11. Pin Store, Prefetcher, and Offline Mode (added 2026-05-08)
+
+This section documents the offline-pinning subsystem layered on top of the original
+JM5 architecture in §1–§10. It's the difference between "JuiceMount works on a wired
+LAN" and "JuiceMount works on cellular while you're flying" — and it's where the
+production-hardening branch concentrated its effort.
+
+### 11.1 Components
+
+```
+                          User toggles offline
+                                    │
+                                    ▼
+                          ┌─────────────────────┐
+                          │  pin.SetOffline(b)  │ atomic.Int32, lock-free
+                          └─────────────────────┘
+                                    ▲
+                                    │ read on every NFS OpenFile / ReadAt
+                                    │
+┌──────────────────────────┐   ┌────┴───────┐   ┌──────────────────┐
+│  pin.Store (SQLite)      │←──│ NFS handler│   │  pin.Prefetcher  │
+│  - 1 row per pinned path │   │ open-time  │   │  - 4 workers     │
+│  - status: Pending /     │   │ + read-time│   │  - 1 MB chunks   │
+│    Prefetching / Ready / │   │ gates      │   │  - PullPending   │
+│    Failed / Unpinned     │   │            │   │  - ReWarmupLoop  │
+│  - bytes_cached          │   │            │   │  - VerifyAndRepair│
+│  - last_prefetched       │   │            │   │                  │
+│  - pin_root              │   │            │   │                  │
+└──────────────────────────┘   └────────────┘   └──────────────────┘
+        ▲                                                  │
+        │ UpdateStatus on each prefetch completion         │
+        └──────────────────────────────────────────────────┘
+                            ▲                 │
+                            │                 │ os.Open + Read in 1 MB chunks
+                            │                 ▼
+                  ┌─────────┴──────────────────────────┐
+                  │ JuiceFS FUSE (~/.juicemount/       │
+                  │ fuse-internal/) — JuiceFS LRU      │
+                  │ caches blocks at                   │
+                  │ ~/.juicefs/cache/{uuid}/raw/chunks │
+                  └────────────────────────────────────┘
+```
+
+### 11.2 Pin store (`internal/cache/pin/store.go`)
+
+SQLite-backed registry, separate DB from the main metadata store (avoids WAL
+contention).
+
+| Status | Int | Meaning |
+|--------|-----|---------|
+| Unknown | 0 | Sentinel for invalid reads |
+| Pending | 1 | User pinned, prefetcher hasn't picked it up |
+| Prefetching | 2 | Worker is reading the file through FUSE |
+| Ready | 3 | Bytes confirmed cached |
+| Failed | 4 | Last prefetch attempt errored (last_error column has details) |
+| Unpinned | 5 | User removed; eligible for eviction (currently unused — Unpin DELETEs the row instead) |
+
+Key operations:
+- `Pin(path, size, root)` — INSERT OR IGNORE; idempotent.
+- `Unpin(path)` / `UnpinByRoot(root)` — DELETE.
+- `IsPinnedReady(path)` — hot-path indexed lookup; returns true for `Ready` OR `Prefetching` with `bytes_cached >= size` (the "late-Ready window"). Called on every NFS OpenFile when offline mode is on.
+- `Pending(limit)` — entries waiting for prefetch.
+- `Stale(ttl, limit)` — Ready entries with `last_prefetched < now - ttl`. Used by ReWarmupLoop.
+- `AllPinnedForRepair(limit)` — Ready + Prefetching + Failed entries. Used by VerifyAndRepair to recover from transient errors.
+
+### 11.3 Prefetcher (`internal/cache/pin/prefetcher.go`)
+
+Bounded worker pool; 4 workers by default. Each worker pulls from `chan jobReq`, opens the file via the FUSE mount, reads in 1 MB chunks discarding the bytes. The side-effect we want is the read traveling through JuiceFS's download + cache pipeline.
+
+Three long-running daemons run in goroutines:
+- `PullPending(ctx, batchSize)` — every 5 s, pulls up to `batchSize` Pending rows and Enqueues them. This is what drains the queue when VerifyAndRepair marks 300+ files Pending at once (avoids overflowing the 256-slot ring buffer).
+- `ReWarmupLoop(ctx, ttl, batchSize)` — every 15 minutes, re-reads files with `last_prefetched > 6 hours` ago. Prevents JuiceFS LRU eviction from rotating pinned content out.
+- (The 4 worker goroutines.)
+
+Path translation: `Prefetcher.stripMountPrefix(canonicalPath)` turns canonical pin keys (e.g. `/Volumes/zpool/foo/bar.mov`) into FUSE-relative paths (`foo/bar.mov`) so the worker can `os.Open(filepath.Join(p.fusePath, relative))`.
+
+### 11.4 NFS handler integration (`nfs/handler.go`)
+
+Two gates layered on top of the existing read path:
+
+**Open-time gate** (in `OpenFile`):
+```go
+if !isWrite && pin.IsOffline() && jfs.handler.pinStore != nil {
+    canonical := jfs.handler.canonicalize(filename)
+    if !jfs.handler.isPinnedReady(canonical) {
+        return nil, syscall.EIO
+    }
+}
+```
+Fails un-pinned reads in ~6 ms. Without this, small reads hit the kernel page
+cache or memory buffer first, and a 137 MB read could take 14 s to fail at the
+read-time gate (NFS retry timeout).
+
+**Read-time gate** (in `cachedFile.ReadAt`):
+```go
+if pin.IsOffline() && !f.pinned {
+    return 0, syscall.EIO
+}
+```
+The `f.pinned` bool is captured at OpenFile time from the same `IsPinnedReady`
+check. Critical: pinned files must NOT be EIO'd here, because Priority 2 (SSD
+cache reader) and Priority 3 (FUSE/JuiceFS LRU) are separate cache layers; a
+miss at Priority 2 doesn't mean the bytes are gone — they may still be in
+JuiceFS's local LRU and serve at multi-GB/s.
+
+The same gate is replicated on `billyFile` (the read path for files not yet in
+the SQLite metadata cache — happens routinely during fresh directory traversal).
+
+`canonicalize(filename)` handles:
+- plain relative (`Film Projects/foo.mov` → `/Volumes/zpool/Film Projects/foo.mov`)
+- leading-slash relative (`/Film Projects/foo.mov` → same)
+- already-absolute under mount (`/Volumes/zpool/...` → unchanged)
+- trailing slash on mount point (tolerated)
+- empty mount point falls back to legacy default
+
+Tests in `nfs/canonicalize_test.go`.
+
+### 11.5 JuiceFS daemon configuration (`health/fuse.go`)
+
+What the menu-bar app launches:
+```
+juicefs mount redis://192.168.0.210:6379/1 ~/.juicemount/fuse-internal \
+  -d --no-usage-report --writeback --buffer-size 1024 --prefetch 3 \
+  -o nobrowse --cache-size <auto> --free-space-ratio 0.01
+```
+
+`--cache-size` is **auto-expanded** at mount time:
+```
+target_gb = max(user_configured_gb, 0.85 * total_disk_gb)
+```
+So a 100 GiB user preference on a 1 TiB disk becomes 850 GiB. The user-configured value is treated as a floor, not a ceiling. The real upper bound is enforced by `--free-space-ratio 0.01` at write time — JuiceFS stops caching when free disk drops below 1%.
+
+Why default `--free-space-ratio` (0.1) was a problem: video editors fill their disks. Below 10% free, JuiceFS silently disables cache writes and uploads every block straight to S3. This was the user's reported "tons of network traffic on a file that should be cached" symptom.
+
+### 11.6 APFS purgeable-space reclamation
+
+macOS APFS hides hundreds of GB behind "purgeable" — Time Machine local snapshots, iCloud cached content, system caches. `df` doesn't show it; `URLResourceKey.volumeAvailableCapacityForImportantUsageKey` does.
+
+`health.ReclaimPurgeableSpace(volume, targetBytes)` shells out to `tmutil thinlocalsnapshots <vol> <amount> 4` and returns freed bytes. Auto-called at mount time when free < 50 GB. Manual trigger via popover Reclaim button or `POST /reclaim`.
+
+Real-world test: freed 210 GB on the user's machine in one shot by thinning a single Time Machine local snapshot.
+
+### 11.7 HTTP control plane (`bridge/cbridge.go`)
+
+Routes registered on the metrics server (port 11050):
+
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/metrics` | GET | Prometheus-style RPC counters + latencies |
+| `/cache-status` | GET | Pin aggregate + per-root stats + live prefetch + offline flag |
+| `/pin?path=...` | POST | Register path/folder for pinning |
+| `/unpin?path=...` | POST | Remove from registry |
+| `/offline?on=1\|0` | GET | Toggle offline mode |
+| `/reclaim` | POST | Thin Time Machine local snapshots |
+| `/verify-pins` | POST | Re-verify all pinned coverage by marking everything Pending |
+
+Used by:
+- The Swift menu-bar app (popover refresh polling, button actions)
+- `cmd/juicemount` control-client CLI (for scripting)
+- Any external orchestration
+
+### 11.8 Logging (`internal/jmlog/jmlog.go`)
+
+Structured JSON via stdlib `log/slog`. Output fanned to stderr AND a size-rotated file:
+- Path: `~/Library/Logs/JuiceMount/juicemount.log`
+- Rotation: 16 MB per file × 5 generations = 80 MB cap
+- Per-instance rotation flag (lock-free atomic)
+
+Plus a goroutine that tails `~/.juicefs/juicefs.log` and promotes WARNING/ERROR records into our log. The chatty "space not enough on device" pattern is aggregated (one summary per 60 s with a count).
+
+---
+
+## 12. Known Issues and Future Work
 
 ### go-nfs Fork Opportunities
 
@@ -897,7 +1070,7 @@ on system memory pressure.
 
 ---
 
-## 12. Testing
+## 13. Testing
 
 ### Test Packages
 
@@ -912,12 +1085,17 @@ on system memory pressure.
 | `nfs` | `write_test.go` | Write path: size tracking, fd pool, metadata updates |
 | `nfs` | `readahead_test.go` | Sequential detection, prefetch triggering, concurrent limits |
 | `nfs` | `membuf_test.go` | Memory buffer: load, evict, concurrent access, budget limits |
+| `nfs` | `canonicalize_test.go` | Pin path translation: 7 cases (relative, absolute, trailing slash, custom mount, fallback) |
+| `nfs` | `billyfile_offline_test.go` | Offline gate on the no-metadata read path: 4 states |
 | `health` | `monitor_test.go` | Health check cycle, state transitions, grace period |
 | `health` | `netwatch_test.go` | Interface detection, change callbacks, grace period |
-| `test` | `benchmark_suite_test.go` | Full performance regression suite (10 benchmarks) |
-| `test` | `e2e_test.go` | End-to-end: start server, mount, file ops, unmount |
-| `test` | `workflow_test.go` | Real-world workflows: Finder operations, concurrent access |
-| `test` | `finder_perf_test.go` | Finder-specific performance patterns |
+| `internal/cache/pin` | `store_test.go` | Pin registry CRUD, status transitions, IsPinnedReady late-window |
+| `internal/jmlog` | `jmlog_test.go` | Log rotation cap, level parse, structured attr handling |
+| `internal/nle` | `parser_test.go` | NLE project parsers: Premiere, Resolve, FCPX media-reference extraction |
+| `test` | `benchmark_suite_test.go` | Full performance regression suite (10 benchmarks) — dated 2026-03-31, predates pin/offline subsystems |
+| `test` | `e2e_test.go` | End-to-end: start server, mount, file ops, unmount — same |
+| `test` | `workflow_test.go` | Real-world workflows: Finder operations, concurrent access — same |
+| `test` | `finder_perf_test.go` | Finder-specific performance patterns — same |
 
 ### How to Run
 
@@ -951,7 +1129,7 @@ The NFS mount/unmount commands require `sudo`. For CI or automated testing:
 
 ---
 
-## 13. Build and Run Instructions
+## 14. Build and Run Instructions
 
 ### Prerequisites
 
