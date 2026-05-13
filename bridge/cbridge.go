@@ -214,7 +214,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	cacheDir := cache.DetectCacheDir()
 	if cacheDir != "" {
 		addr, db, _ := metadata.ParseRedisURL(cfg.RedisURL)
-		rdb := redis.NewClient(&redis.Options{Addr: addr, DB: db})
+		// Explicit timeouts so a Redis hiccup can't park cache.Reader.getSlices
+		// on a default-timeout LRange — that call happens on every cache-miss
+		// read and a 30s stall there cascades through every concurrent NFS
+		// RPC under the current per-connection sequential dispatch. Matches
+		// the timeouts on the metadata client.
+		rdb := redis.NewClient(&redis.Options{
+			Addr:         addr,
+			DB:           db,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 5 * time.Second,
+			DialTimeout:  5 * time.Second,
+		})
 		globalRDB = rdb
 		cr := cache.NewReader(cacheDir, cache.DefaultBlockSize, rdb)
 		if err := cr.Verify(); err == nil {

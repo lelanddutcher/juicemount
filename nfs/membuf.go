@@ -20,6 +20,12 @@ const (
 
 	// Chunk size for async loading.
 	memBufChunkSize = 4 * 1024 * 1024 // 4MB (matches JuiceFS block size)
+
+	// Max time a concurrent reader will wait for an in-flight loadFile to
+	// complete before falling through to the SSD-direct cache reader. A
+	// wedged FUSE would otherwise park every reader of the same file
+	// forever on the entry.ready channel.
+	memBufLoadTimeout = 5 * time.Second
 )
 
 // MemoryBuffer caches small files entirely in Go heap for zero-syscall reads.
@@ -81,8 +87,24 @@ func (mb *MemoryBuffer) Get(path string, fileSize int64, fusePath string) []byte
 	if exists {
 		if entry.loading {
 			mb.mu.Unlock()
-			// Wait for loading to complete
-			<-entry.ready
+			// Wait for loading to complete, but bound it. A wedged FUSE
+			// (MinIO unreachable, JuiceFS hung) would otherwise park every
+			// subsequent reader of the same file forever on this receive,
+			// cascading the loadFile goroutine's stall to every concurrent
+			// NFS RPC touching this path. On timeout we return nil so the
+			// caller falls through to the SSD-direct cacheReader (different
+			// code path — reads JuiceFS chunk files via Redis slice lookup,
+			// no FUSE involvement). If THAT also misses, the caller hits
+			// the FUSE fd pool, where the stall is per-RPC rather than
+			// cascading-shared.
+			select {
+			case <-entry.ready:
+				// load finished — fall through
+			case <-time.After(memBufLoadTimeout):
+				return nil
+			case <-mb.stopCh:
+				return nil
+			}
 			mb.mu.Lock()
 			entry = mb.entries[path]
 			if entry == nil {
