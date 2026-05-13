@@ -215,6 +215,63 @@ struct MenuPopoverView: View {
         }
     }
 
+    // MARK: - Diagnostics export
+
+    /// Shows an NSSavePanel suggesting a timestamped filename on the
+    /// Desktop. On accept, runs DiagnosticsExporter off the main thread
+    /// and reports success/failure via NSAlert. The save panel itself
+    /// runs modal on the main thread (standard AppKit pattern); only
+    /// the gathering work is dispatched away.
+    private func exportDiagnostics() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = DiagnosticsExporter.suggestedFilename()
+        panel.title = "Export JuiceMount Diagnostics"
+        panel.message = "Save a zipped bundle of logs, metrics, and system state for support."
+        // Suggest Desktop. If unavailable (sandbox edge cases) the panel
+        // falls back to its default location, which is fine.
+        if let desktop = FileManager.default
+            .urls(for: .desktopDirectory, in: .userDomainMask)
+            .first
+        {
+            panel.directoryURL = desktop
+        }
+        panel.allowedContentTypes = [.zip]
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            return
+        }
+
+        // Off-main: shell-outs (pluginkit, fileproviderctl, ditto) plus
+        // a couple of HTTP fetches can take several seconds. Don't freeze
+        // the popover.
+        Task.detached(priority: .userInitiated) {
+            let exporter = DiagnosticsExporter()
+            do {
+                try await exporter.export(to: destination)
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "Diagnostics exported"
+                    alert.informativeText = "Saved to \(destination.path)"
+                    alert.alertStyle = .informational
+                    alert.addButton(withTitle: "Reveal in Finder")
+                    alert.addButton(withTitle: "OK")
+                    if alert.runModal() == .alertFirstButtonReturn {
+                        NSWorkspace.shared.activateFileViewerSelecting([destination])
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "Export failed"
+                    alert.informativeText = error.localizedDescription
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
     // MARK: - Cache section (offline-pin prototype)
 
     private var cacheSection: some View {
@@ -247,6 +304,8 @@ struct MenuPopoverView: View {
 
             diskSpaceRow
 
+            selfTestRow
+
             if cacheStatus.aggregate.TotalFiles == 0 && cacheStatus.live.FilesPrefetched == 0 {
                 Text("Nothing pinned yet. Pick a folder above, or right-click in Finder → Services → Pin for Offline.")
                     .font(.caption2)
@@ -263,6 +322,56 @@ struct MenuPopoverView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+
+    /// Single-line self-test indicator (Phase A2). Shows e.g.
+    /// "Self-test: 247 MB/s" with a status-colored dot. The button on the
+    /// right re-runs the probe via POST /self-test. Hidden until the first
+    /// result lands, so we don't show a stale "—" before the server's
+    /// post-start probe completes.
+    @ViewBuilder
+    private var selfTestRow: some View {
+        if let result = server.selfTest {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(selfTestColor(result.status))
+                    .frame(width: 8, height: 8)
+                if result.status == "error" {
+                    Text("Self-test: error")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if result.mb_per_sec > 0 {
+                    Text("Self-test: \(String(format: "%.0f", result.mb_per_sec)) MB/s")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Self-test: pending")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    server.refreshSelfTest(force: true, delayMs: 0)
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .help(result.hint.isEmpty
+                      ? "Re-run the 10 MB read self-test."
+                      : "\(result.hint)\n\nClick to re-run.")
+            }
+        }
+    }
+
+    private func selfTestColor(_ status: String) -> Color {
+        switch status {
+        case "green":  return .green
+        case "yellow": return .yellow
+        case "red":    return .red
+        case "error":  return .orange
+        default:       return .gray
+        }
     }
 
     /// Opens a folder picker rooted at the JuiceMount mount and pins the
@@ -569,6 +678,15 @@ struct MenuPopoverView: View {
                 systemImage: "gear",
                 shortcut: "⌘,",
                 action: onPreferences
+            )
+
+            // Phase B observability: bundle logs, control-plane snapshots,
+            // and system state into a zip the user can attach to a bug
+            // report. Save dialog runs modal; export runs off-main.
+            ActionButton(
+                title: "Export Diagnostics…",
+                systemImage: "tray.and.arrow.up",
+                action: { exportDiagnostics() }
             )
 
             ActionButton(

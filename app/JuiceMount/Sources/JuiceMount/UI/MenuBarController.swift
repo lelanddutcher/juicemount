@@ -43,7 +43,10 @@ final class MenuBarController: NSObject {
 
     private func configureStatusItem() {
         if let button = statusItem.button {
-            button.image = renderIcon(for: server.state)
+            button.image = renderIcon(for: server.state, selfTest: server.selfTest)
+            // Initial state: no self-test result yet, so the icon is a plain
+            // template. The state-observation timer will recompute this each
+            // tick and toggle template mode off if a colored dot needs to show.
             button.image?.isTemplate = true
             button.action = #selector(togglePopover(_:))
             button.target = self
@@ -70,17 +73,30 @@ final class MenuBarController: NSObject {
         stateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                self.statusItem.button?.image = self.renderIcon(for: self.server.state)
-                self.statusItem.button?.image?.isTemplate = true
+                self.statusItem.button?.image = self.renderIcon(
+                    for: self.server.state,
+                    selfTest: self.server.selfTest
+                )
+                // When the self-test is yellow/red we want the dot to render in
+                // its own color rather than the menu-bar template tint, so we
+                // disable template mode in that case. Pure-template mode (no
+                // dot) lets macOS invert the icon for dark menu bars as usual.
+                let attention = self.server.selfTest?.isAttentionWorthy ?? false
+                self.statusItem.button?.image?.isTemplate = !attention
             }
         }
     }
 
     // MARK: - Icon rendering
 
-    /// Build a small status icon using SF Symbols. We use a template image so macOS
-    /// inverts it for dark menu bars automatically.
-    private func renderIcon(for state: ServerController.ServerState) -> NSImage? {
+    /// Build a small status icon using SF Symbols, optionally overlaying a
+    /// colored dot in the lower-right when the self-test result is non-green.
+    /// The base image is a template; when a dot is drawn we composite a
+    /// non-template image and disable template mode on the result.
+    private func renderIcon(
+        for state: ServerController.ServerState,
+        selfTest: NFSBridge.SelfTestResult?
+    ) -> NSImage? {
         // Compose: a base "drop" or "externaldrive" icon plus a small status badge color.
         // Apple's SF Symbol "externaldrive.connected.to.line.below" is perfect for "mounted volume"
         let baseSymbol: String = {
@@ -94,9 +110,51 @@ final class MenuBarController: NSObject {
         }()
 
         let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
-        let image = NSImage(systemSymbolName: baseSymbol, accessibilityDescription: state.displayLabel)?
-            .withSymbolConfiguration(config)
-        return image
+        guard let base = NSImage(systemSymbolName: baseSymbol, accessibilityDescription: state.displayLabel)?
+            .withSymbolConfiguration(config) else {
+            return nil
+        }
+
+        // No dot needed for green / unknown — return the plain template image.
+        guard let dotColor = selfTestDotColor(for: selfTest) else {
+            return base
+        }
+
+        // Composite a small dot in the lower-right corner. Pad the canvas a few
+        // px so the dot doesn't get clipped by the menu-bar item bounds.
+        let baseSize = base.size
+        let canvas = NSImage(size: NSSize(width: baseSize.width + 2, height: baseSize.height + 2))
+        canvas.lockFocus()
+        defer { canvas.unlockFocus() }
+
+        // Draw base centered.
+        base.draw(in: NSRect(x: 1, y: 1, width: baseSize.width, height: baseSize.height),
+                  from: .zero, operation: .sourceOver, fraction: 1.0)
+
+        // Draw status dot — small enough to be subtle (5pt diameter) and offset
+        // into the lower-right.
+        let dotDiameter: CGFloat = 5
+        let dotRect = NSRect(
+            x: canvas.size.width - dotDiameter - 0.5,
+            y: 0.5,
+            width: dotDiameter,
+            height: dotDiameter
+        )
+        dotColor.setFill()
+        NSBezierPath(ovalIn: dotRect).fill()
+        return canvas
+    }
+
+    /// Returns the dot color to render for a given self-test result, or nil
+    /// when no dot should be drawn (green or no result yet).
+    private func selfTestDotColor(for result: NFSBridge.SelfTestResult?) -> NSColor? {
+        guard let result, result.isAttentionWorthy else { return nil }
+        switch result.status {
+        case "yellow": return NSColor.systemYellow
+        case "red":    return NSColor.systemRed
+        case "error":  return NSColor.systemOrange
+        default:       return nil
+        }
     }
 
     // MARK: - Actions

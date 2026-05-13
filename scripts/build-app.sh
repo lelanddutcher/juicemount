@@ -107,13 +107,96 @@ echo "    Bundle: $APP_DIR"
 echo ""
 echo "==> [4/4] Codesigning..."
 ENT_FILE="$PROJECT_ROOT/entitlements.plist"
-if [ -f "$ENT_FILE" ]; then
-    codesign --force --deep --sign - --entitlements "$ENT_FILE" --options runtime "$APP_DIR" 2>&1 | head -5 || \
-        codesign --force --deep --sign - "$APP_DIR" 2>&1 | head -5
+[ -f "$ENT_FILE" ] || ENT_FILE=""
+
+# Pick a signing identity. Order of preference:
+#   1. JM_SIGN_IDENTITY env var (cert hash or full name in quotes)
+#   2. Any "Developer ID Application" cert in the user's keychain
+#   3. Fall back to ad-hoc with a warning (daily-dev path).
+YELLOW=$'\033[33m'
+RESET=$'\033[0m'
+
+SIGN_IDENTITY=""
+SIGN_IDENTITY_LABEL=""
+if [ -n "${JM_SIGN_IDENTITY:-}" ]; then
+    SIGN_IDENTITY="$JM_SIGN_IDENTITY"
+    SIGN_IDENTITY_LABEL="$JM_SIGN_IDENTITY"
+    echo "    Signing with JM_SIGN_IDENTITY: $SIGN_IDENTITY_LABEL"
+elif command -v security >/dev/null 2>&1; then
+    # Parse `security find-identity` output. Each match looks like:
+    #   1) ABCDEF0123... "Developer ID Application: Jane Doe (TEAMID12)"
+    # Pull the first matching cert's quoted human-readable name.
+    DEVID_LINE="$(security find-identity -p codesigning -v 2>/dev/null | grep "Developer ID Application" | head -1 || true)"
+    if [ -n "$DEVID_LINE" ]; then
+        # Strip everything up to the first quote and the trailing quote.
+        SIGN_IDENTITY="$(printf '%s\n' "$DEVID_LINE" | sed -E 's/^[^"]*"([^"]+)".*$/\1/')"
+        SIGN_IDENTITY_LABEL="$SIGN_IDENTITY"
+        DEVID_COUNT="$(security find-identity -p codesigning -v 2>/dev/null | grep -c "Developer ID Application" || true)"
+        if [ "${DEVID_COUNT:-0}" -gt 1 ]; then
+            echo "    ${YELLOW}NOTE: ${DEVID_COUNT} Developer ID Application certs found; using first match.${RESET}"
+            echo "    ${YELLOW}      Set JM_SIGN_IDENTITY=\"<full cert name or SHA1>\" to pick a specific one.${RESET}"
+        fi
+        echo "    Signing with Developer ID: $SIGN_IDENTITY_LABEL"
+    else
+        SIGN_IDENTITY="-"
+        SIGN_IDENTITY_LABEL="ad-hoc"
+        echo "    ${YELLOW}WARNING: no Developer ID Application cert found; signing ad-hoc (not distributable)${RESET}"
+    fi
 else
-    codesign --force --deep --sign - "$APP_DIR"
+    SIGN_IDENTITY="-"
+    SIGN_IDENTITY_LABEL="ad-hoc"
+    echo "    ${YELLOW}WARNING: 'security' command not found; signing ad-hoc (not distributable)${RESET}"
 fi
+
+# Build the codesign argv. `--timestamp` is required for notarization but only
+# works with a real identity (ad-hoc rejects it).
+CS_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime)
+if [ "$SIGN_IDENTITY" != "-" ]; then
+    CS_ARGS+=(--timestamp)
+fi
+if [ -n "$ENT_FILE" ]; then
+    CS_ARGS+=(--entitlements "$ENT_FILE")
+fi
+
+codesign "${CS_ARGS[@]}" "$APP_DIR"
 codesign --verify --verbose=2 "$APP_DIR" 2>&1 | head -3 || true
+
+# Notarization, gated. Skipped on:
+#   - JM_QUICK=1  (dev iteration; notarization is slow, 1-5 minutes)
+#   - ad-hoc signature (Apple rejects ad-hoc submissions)
+#   - missing notary credential profile
+NOTARIZED="no"
+STAPLED="skipped"
+if [ -n "${JM_QUICK:-}" ]; then
+    echo "    INFO: quick build (JM_QUICK=1) — skipping notarization"
+elif [ "$SIGN_IDENTITY" = "-" ]; then
+    echo "    INFO: ad-hoc signature — skipping notarization (not eligible)"
+else
+    NOTARY_PROFILE="${JM_NOTARY_PROFILE:-JuiceMount}"
+    if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+        echo ""
+        echo "==> Notarizing with profile: $NOTARY_PROFILE"
+        NOTARY_ZIP="$BUILD_DIR/JuiceMount-notarize.zip"
+        ditto -c -k --keepParent "$APP_DIR" "$NOTARY_ZIP"
+        if xcrun notarytool submit "$NOTARY_ZIP" --keychain-profile "$NOTARY_PROFILE" --wait; then
+            NOTARIZED="yes"
+            echo "==> Stapling notarization ticket"
+            if xcrun stapler staple "$APP_DIR" && xcrun stapler validate "$APP_DIR"; then
+                STAPLED="yes"
+            else
+                STAPLED="no"
+                echo "    ${YELLOW}WARNING: stapling failed; the notarization ticket exists at Apple but is not embedded in the app.${RESET}"
+            fi
+        else
+            echo "    ${YELLOW}WARNING: notarization failed (see output above). App will work locally but Gatekeeper will warn on other Macs.${RESET}"
+        fi
+        rm -f "$NOTARY_ZIP"
+    else
+        echo "    INFO: no notary profile '$NOTARY_PROFILE' found in keychain — skipping notarization."
+        echo "          To set up: xcrun notarytool store-credentials JuiceMount \\"
+        echo "                       --apple-id <email> --team-id <team> --password <app-specific-password>"
+    fi
+fi
 
 # Guard: refuse to ship a build that contains a FileProvider extension.
 #
@@ -141,6 +224,20 @@ fi
 
 echo ""
 echo "==> Build complete"
-echo "    App:  $APP_DIR"
-echo "    Run:  open $APP_DIR"
-echo "    Or:   $APP_BIN_DIR/JuiceMount"
+echo "    App:        $APP_DIR"
+echo "    Identity:   ${SIGN_IDENTITY_LABEL:-unknown}"
+echo "    Notarized:  $NOTARIZED"
+echo "    Staple:     $STAPLED"
+echo "    Run:        open $APP_DIR"
+echo "    Or:         $APP_BIN_DIR/JuiceMount"
+
+# Distribution-readiness hint.
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    echo ""
+    echo "    ${YELLOW}NOTE: this is an ad-hoc build. It runs locally but other Macs will reject it.${RESET}"
+    echo "    ${YELLOW}      See docs/signing.md for how to set up a Developer ID + notary profile.${RESET}"
+elif [ "$NOTARIZED" != "yes" ] && [ -z "${JM_QUICK:-}" ]; then
+    echo ""
+    echo "    ${YELLOW}NOTE: build is signed but not notarized. Gatekeeper on other Macs may warn.${RESET}"
+    echo "    ${YELLOW}      See docs/signing.md for notary profile setup.${RESET}"
+fi
