@@ -302,3 +302,39 @@ failure mode is closed.
 
 Next iteration: Fix #3 — `globalMu` snapshot-then-release in `NFSServerStats`,
 `NFSServerIsRunning`, `NFSServerCacheStatus`, `NFSServerShutdown`.
+
+---
+
+## Iteration 3 — 2026-05-13 ~03:31
+
+**Implemented Fix #3** — snapshot-then-release `globalMu` in every slow cgo
+export.
+
+Commit `a5a42e5`. File: `bridge/cbridge.go`.
+
+Before: 8 cgo exports used `globalMu.Lock(); defer globalMu.Unlock()` and
+then did slow work (Redis EVAL, FTS query, directory walks, NFS server
+drain, osascript admin prompt) with the lock held. Stats / IsRunning
+calls from the menu-bar poller queued behind whichever export was in
+flight. SwiftUI MainActor blocked on cgo. UI froze.
+
+After: every slow export takes the lock just long enough to copy pointer
+globals into locals, releases, and does the slow work on the snapshots.
+The lock is now held for microseconds, not seconds-to-minutes.
+
+Refactored: `NFSServerStats`, `NFSServerIsRunning`, `NFSServerCacheStatus`,
+`NFSServerSyncNow`, `NFSServerSearch`, `NFSServerPin`, `NFSServerUnpin`,
+`NFSServerShutdown`, `stopServerLocked` (internal).
+
+Only `NFSServerStart` still defer-holds the lock (singleton init, must
+serialize concurrent Starts).
+
+Result: the "click menu-bar icon → app freezes" pattern is now closed
+from three independent angles:
+- Fix #1: self-test no longer hangs on NFS-loopback wedge
+- Fix #2: monitor lock can't park on a wedged `mount` syscall
+- Fix #3: menu-bar pollers can't park on `globalMu` held by any slow op
+
+Next iteration: Fix #4 — chunk `BulkInsert` to release `writeMu` between
+batches + add `busy_timeout` PRAGMA to pin store. Also start running
+unit tests under race detector to surface any remaining contention.
