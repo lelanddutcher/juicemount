@@ -66,6 +66,29 @@ type verifierData struct {
 	lastAccess time.Time
 }
 
+// lstatNotExistWithTimeout runs os.Lstat in a goroutine bounded by the
+// given timeout. Returns (isNotExist, ok) where ok=false means the Lstat
+// took longer than the timeout and the caller should fall back to a
+// conservative path. On timeout the spawned goroutine is leaked; it
+// will terminate naturally when the underlying FUSE syscall returns.
+// That's preferable to blocking the request goroutine forever.
+func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok bool) {
+	type result struct {
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		_, err := os.Lstat(p)
+		ch <- result{err: err}
+	}()
+	select {
+	case r := <-ch:
+		return os.IsNotExist(r.err), true
+	case <-time.After(timeout):
+		return false, false
+	}
+}
+
 func NewHandler(store *metadata.Store, fusePath string) *JuiceMountHandler {
 	fdPool := NewFDPool()
 	h := &JuiceMountHandler{
@@ -480,14 +503,27 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 		// For non-directory entries, verify the file still exists on FUSE.
 		// Stale cache entries (from failed copies or deleted files) cause
 		// Finder to report "already exists" for files that don't exist.
+		//
+		// Bounded: a wedged FUSE daemon (MinIO unreachable, JuiceFS hung,
+		// SSD I/O stalled) would otherwise park this syscall forever and,
+		// under the current per-connection sequential RPC dispatch, freeze
+		// every other RPC on that connection — which is Finder's only NFS
+		// connection. 2 s is well above a healthy FUSE stat (~µs) and well
+		// below the threshold where Finder starts showing a beachball.
+		// On timeout we conservatively keep the cache entry (assume the
+		// file still exists) rather than block.
 		if !e.IsDir {
 			fusePath := jfs.fullPath(filename)
-			if _, err := os.Lstat(fusePath); os.IsNotExist(err) {
+			isNotExist, ok := lstatNotExistWithTimeout(fusePath, 2*time.Second)
+			if ok && isNotExist {
 				jmlog.Warn("purging phantom file (stale cache)", "path", filename)
 				jfs.handler.store.DeleteFromCache(filename)
 				go jfs.handler.store.Delete(filename)
 				return nil, os.ErrNotExist
 			}
+			// !ok means the Lstat timed out — FUSE is degraded. Treat the
+			// cache entry as authoritative for now; the stale entry (if
+			// any) will be cleaned up on a future stat once FUSE recovers.
 		}
 
 		// If we have a tracked write size that's larger, use it
