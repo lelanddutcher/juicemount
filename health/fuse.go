@@ -6,6 +6,7 @@ package health
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -198,11 +199,20 @@ func (fm *FUSEManager) Mount() error {
 
 	log.Printf("[fuse] mounting JuiceFS: %s %s", fm.cfg.JuiceFSBin, strings.Join(args, " "))
 
-	cmd := exec.Command(fm.cfg.JuiceFSBin, args...)
+	// `juicefs mount -d` daemonizes and returns quickly in the happy path,
+	// but can hang on certain backend failures (e.g. unreachable Redis
+	// during Lua init). Bounded at 30 s so a stuck launch can't park the
+	// caller forever.
+	launchCtx, launchCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer launchCancel()
+	cmd := exec.CommandContext(launchCtx, fm.cfg.JuiceFSBin, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
+		if launchCtx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("juicefs mount: timed out after 30s (backend unreachable?)")
+		}
 		return fmt.Errorf("juicefs mount: %w", err)
 	}
 
@@ -408,11 +418,28 @@ func (fm *FUSEManager) IsMounted() bool {
 }
 
 // isMountedLocked checks if the FUSE mount is live. Must be called with fm.mu held.
+//
+// CRITICAL: `mount` (which calls `getfsstat()`) hangs in the kernel if the
+// mount table contains a wedged entry (server gone, kernel mount retained).
+// Without the context timeout, this function — called every 10 s by the
+// monitor loop under fm.mu — wedges the FUSEManager lock forever, parking
+// every other caller (Stop, IsMounted, Mount) behind it. That was the
+// "click menu → app freezes" pattern.
 func (fm *FUSEManager) isMountedLocked() bool {
 	// Check 1: appears in macOS mount table as a FUSE mount.
-	// Do this FIRST (never hangs) before touching the mount point filesystem.
-	out, err := exec.Command("mount").Output()
+	// Hard-bounded at 5 s. On timeout, treat as "unknown" (return false) so
+	// the monitor loop doesn't pin fm.mu forever. The cost of a false
+	// negative is a respawn attempt the user will see in the log; the cost
+	// of hanging is the entire UI.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "mount").Output()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			jmlog.Warn("mount table query timed out — likely a wedged mount entry blocking getfsstat",
+				"mount_point", fm.cfg.MountPoint,
+				"hint", "treating as not-mounted; reboot or `sudo umount -f -t nfs` may be needed")
+		}
 		return false
 	}
 	if !strings.Contains(string(out), fm.cfg.MountPoint) {
@@ -431,9 +458,29 @@ func (fm *FUSEManager) isMountedLocked() bool {
 		return ok
 	case <-time.After(5 * time.Second):
 		log.Printf("[fuse] mount at %s is unresponsive (stale), force unmounting", fm.cfg.MountPoint)
-		// Force unmount the dead FUSE — don't leave it hanging
-		exec.Command("umount", "-f", fm.cfg.MountPoint).Start()
+		// Force unmount the dead FUSE — don't leave it hanging. Bounded
+		// (15 s) and reaped so a hung umount can't leak processes.
+		go runBoundedCommand(15*time.Second, "umount", "-f", fm.cfg.MountPoint)
 		return false
+	}
+}
+
+// runBoundedCommand fires a shell command with a hard time limit and reaps
+// the process. Logs on timeout. Used for fire-and-forget cleanup work that
+// previously called `.Start()` without ever calling `.Wait()` — leaking
+// zombies and silently failing.
+func runBoundedCommand(timeout time.Duration, name string, args ...string) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := exec.CommandContext(ctx, name, args...).Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			jmlog.Warn("bounded command timed out",
+				"cmd", name, "args", strings.Join(args, " "),
+				"timeout_sec", int(timeout.Seconds()))
+		} else {
+			jmlog.Debug("bounded command failed",
+				"cmd", name, "args", strings.Join(args, " "), "error", err.Error())
+		}
 	}
 }
 
@@ -450,21 +497,25 @@ func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
 }
 
 // unmountLocked forcibly unmounts the FUSE mount. Must be called with fm.mu held.
-// Uses non-blocking commands to avoid hanging on dead FUSE mounts.
+// Every shell-out is time-bounded so a wedged kernel state can't pin fm.mu.
 func (fm *FUSEManager) unmountLocked() {
 	// Kill any lingering JuiceFS mount processes for this mount point first.
-	// This is critical: a dead FUSE process leaves a kernel mount that hangs
-	// on any fs operation. Killing the process lets the kernel release the mount.
-	procs, _ := exec.Command("pgrep", "-f", "juicefs mount.*"+filepath.Base(fm.cfg.MountPoint)).Output()
+	// Killing the process lets the kernel release the mount.
+	pgrepCtx, pgrepCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	procs, _ := exec.CommandContext(pgrepCtx, "pgrep", "-f", "juicefs mount.*"+filepath.Base(fm.cfg.MountPoint)).Output()
+	pgrepCancel()
 	for _, line := range strings.Split(strings.TrimSpace(string(procs)), "\n") {
 		if line != "" {
-			exec.Command("kill", "-9", line).Run()
+			killCtx, killCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = exec.CommandContext(killCtx, "kill", "-9", line).Run()
+			killCancel()
 		}
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Non-blocking unmount attempts (Start, not Run — won't hang on dead FUSE)
-	exec.Command("umount", "-f", fm.cfg.MountPoint).Start()
+	// Bounded force-unmount. runBoundedCommand reaps the process so we don't
+	// leak zombies the way the prior .Start()-without-.Wait() pattern did.
+	runBoundedCommand(15*time.Second, "umount", "-f", fm.cfg.MountPoint)
 	time.Sleep(500 * time.Millisecond)
 }
 
@@ -623,7 +674,12 @@ func ReclaimPurgeableSpace(volume string, targetBytes int64) (freedBytes int64, 
 	} else {
 		amount = fmt.Sprintf("%d", int64(1)<<40) // 1 TiB
 	}
-	cmd := exec.Command("tmutil", "thinlocalsnapshots", volume, amount, "4")
+	// tmutil can occasionally take a while to walk + delete snapshots; cap
+	// at 90 s. If it doesn't return by then, we return what we measured —
+	// the user can retry via the Reclaim button.
+	tmCtx, tmCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer tmCancel()
+	cmd := exec.CommandContext(tmCtx, "tmutil", "thinlocalsnapshots", volume, amount, "4")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("tmutil thinlocalsnapshots: %w (output: %s)",

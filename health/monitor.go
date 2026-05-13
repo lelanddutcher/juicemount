@@ -349,10 +349,21 @@ func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
 
 // forceUnmount runs `umount -f` on the given mount point. Errors here
 // are non-fatal: the subsequent mount attempt is the actual recovery.
+//
+// Bounded at 20 s. `sudo umount -f` can hang on a truly-wedged kernel
+// mount (the original `umount` syscall enters uninterruptible D state on
+// some failure modes). Without a context, the runChecks goroutine that
+// called this would never tick again, and the health-monitor loop would
+// be functionally dead.
 func forceUnmount(mountPoint string) error {
-	cmd := exec.Command("sudo", "umount", "-f", mountPoint)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sudo", "umount", "-f", mountPoint)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("umount -f %s: timed out after 20s (kernel mount likely wedged)", mountPoint)
+		}
 		return fmt.Errorf("umount -f %s: %v: %s", mountPoint, err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -420,15 +431,42 @@ func (m *HealthMonitor) checkMinIO() ComponentStatus {
 func (m *HealthMonitor) checkFUSE() ComponentStatus {
 	now := time.Now()
 
-	// Check 1: directory exists
-	info, err := os.Stat(m.cfg.FUSEPath)
-	if err != nil || !info.IsDir() {
-		jmlog.Debug("fuse mount missing", "path", m.cfg.FUSEPath)
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stat failed: %v", err)}
+	// Check 1: directory exists, AND stat doesn't hang.
+	// A bare os.Stat on a wedged FUSE path enters uninterruptible kernel
+	// wait. Wrap in the same goroutine+timeout pattern used below for
+	// readdir.
+	statDone := make(chan struct {
+		info os.FileInfo
+		err  error
+	}, 1)
+	go func() {
+		info, err := os.Stat(m.cfg.FUSEPath)
+		statDone <- struct {
+			info os.FileInfo
+			err  error
+		}{info, err}
+	}()
+	select {
+	case r := <-statDone:
+		if r.err != nil || !r.info.IsDir() {
+			jmlog.Debug("fuse mount missing", "path", m.cfg.FUSEPath)
+			return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stat failed: %v", r.err)}
+		}
+	case <-time.After(5 * time.Second):
+		jmlog.Warn("fuse stat timed out (path likely wedged)", "path", m.cfg.FUSEPath)
+		return ComponentStatus{Healthy: false, LastCheck: now, Message: "stat timed out (wedged FUSE mount)"}
 	}
 
-	// Check 2: mount is actually a FUSE filesystem (appears in mount table)
-	out, _ := exec.Command("mount").Output()
+	// Check 2: mount is actually a FUSE filesystem (appears in mount table).
+	// `mount` (getfsstat) can hang in the kernel if the table contains a
+	// wedged entry; bound it.
+	mountCtx, mountCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer mountCancel()
+	out, _ := exec.CommandContext(mountCtx, "mount").Output()
+	if mountCtx.Err() == context.DeadlineExceeded {
+		jmlog.Warn("mount table query timed out in checkFUSE", "path", m.cfg.FUSEPath)
+		return ComponentStatus{Healthy: false, LastCheck: now, Message: "mount table query timed out"}
+	}
 	if !strings.Contains(string(out), m.cfg.FUSEPath) {
 		jmlog.Debug("fuse mount not in mount table", "path", m.cfg.FUSEPath)
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted (directory exists but no FUSE)"}
