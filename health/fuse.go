@@ -550,9 +550,13 @@ func (fm *FUSEManager) unmountLocked() {
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Bounded force-unmount. runBoundedCommand reaps the process so we don't
-	// leak zombies the way the prior .Start()-without-.Wait() pattern did.
-	runBoundedCommand(15*time.Second, "umount", "-f", fm.cfg.MountPoint)
+	// Bounded force-unmount, fired async. runBoundedCommand reaps the
+	// process so we don't leak zombies the way the prior
+	// .Start()-without-.Wait() pattern did. CRITICAL: must be `go`'d
+	// rather than synchronous — unmountLocked is called with fm.mu held,
+	// and a synchronous 15 s wait here regresses the very class of bug
+	// this branch is hardening against. Found by code review post-fix.
+	go runBoundedCommand(15*time.Second, "umount", "-f", fm.cfg.MountPoint)
 	time.Sleep(500 * time.Millisecond)
 }
 
