@@ -372,7 +372,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// block the Swift Start completion handler (a slow probe shouldn't gate
 	// the UI flipping to "running"). Results land in selfTestLast and Swift
 	// reads them via GET /self-test on its post-start refresh.
-	go runAndStoreSelfTest()
+	//
+	// Delayed by 10 s after Start so the initial SyncOnce's BulkInsert (which
+	// holds metadata.Store.writeMu for the duration of the cache-rebuild fold,
+	// ~seconds on a 100K+ entry sync) has time to complete. Without the delay,
+	// the self-test's ListChildren walk stalls behind writeMu and the probe
+	// goroutine wedges for tens of seconds during the exact window the user
+	// is most likely to click the menu bar.
+	go func() {
+		time.Sleep(10 * time.Second)
+		runAndStoreSelfTest()
+	}()
 
 	return C.CString(srv.Addr())
 }
@@ -1322,22 +1332,44 @@ const selfTestSize = 10 * 1024 * 1024
 // cleans up. The read happens via the user-visible mount path (i.e. the NFS
 // loopback mount), not the FUSE path — that's what the user's apps see, so
 // that's what we measure.
+// runSelfTest performs the 10 MiB read probe. Routes the read through the
+// FUSE mount path (`~/.juicemount/fuse-internal/...`) rather than the NFS
+// loopback (`/Volumes/zpool/...`) to avoid an in-process deadlock:
+//
+//   - The NFS path goes kernel-NFS-client → our jmlibnfs server → handler.
+//   - The handler reads the same `metadata.Store` that the initial `SyncOnce`
+//     holds `writeMu` on for ~seconds during its `BulkInsert` + `RebuildFTS`.
+//   - If Swift is synchronously waiting on `/self-test` (via the menu-bar
+//     poller) and the read parks behind `writeMu`, the menu-bar hangs.
+//
+// FUSE-direct bypasses all of that. JuiceFS still backs the read, the cache
+// reader still serves cached blocks, but the path is local-process kernel
+// FUSE — no loopback through our own RPC machinery.
+//
+// Also bounded with a wall-clock deadline so a slow FUSE / dead JuiceFS
+// daemon can't wedge the probe goroutine indefinitely.
 func runSelfTest() SelfTestResult {
 	globalMu.Lock()
 	mountPath := globalMountPath
+	fusePath := globalFUSEPath
 	store := globalStore
 	globalMu.Unlock()
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	if mountPath == "" {
+	if fusePath == "" {
 		return SelfTestResult{
 			Status: "error",
-			Hint:   "self-test skipped: NFS mount not active",
+			Hint:   "self-test skipped: FUSE mount not active",
 			RanAt:  now,
 		}
 	}
 
-	target, cleanup, err := pickSelfTestTarget(store, mountPath)
+	// Overall deadline: 30 s. Even a slow backend should finish a 10 MiB
+	// FUSE read inside this window; if not, the mount is unhealthy and the
+	// probe correctly reports an error rather than hanging forever.
+	probeDeadline := time.Now().Add(30 * time.Second)
+
+	target, cleanup, err := pickSelfTestTarget(store, mountPath, fusePath, probeDeadline)
 	if err != nil {
 		return SelfTestResult{
 			Status: "error",
@@ -1349,11 +1381,33 @@ func runSelfTest() SelfTestResult {
 		defer cleanup()
 	}
 
-	f, err := os.Open(target)
-	if err != nil {
+	// Open with deadline guarded by a goroutine + select. A bare os.Open on
+	// a wedged FUSE path can hang in kernel forever.
+	type openResult struct {
+		f   *os.File
+		err error
+	}
+	openCh := make(chan openResult, 1)
+	go func() {
+		f, err := os.Open(target)
+		openCh <- openResult{f, err}
+	}()
+	var f *os.File
+	select {
+	case res := <-openCh:
+		if res.err != nil {
+			return SelfTestResult{
+				Status: "error",
+				Hint:   "self-test open failed: " + res.err.Error(),
+				RanAt:  now,
+				Target: target,
+			}
+		}
+		f = res.f
+	case <-time.After(time.Until(probeDeadline)):
 		return SelfTestResult{
 			Status: "error",
-			Hint:   "self-test open failed: " + err.Error(),
+			Hint:   "self-test open timed out (FUSE/JuiceFS unresponsive)",
 			RanAt:  now,
 			Target: target,
 		}
@@ -1364,6 +1418,16 @@ func runSelfTest() SelfTestResult {
 	var total int64
 	start := time.Now()
 	for total < selfTestSize {
+		if time.Now().After(probeDeadline) {
+			return SelfTestResult{
+				ElapsedMs: time.Since(start).Milliseconds(),
+				BytesRead: total,
+				Status:    "error",
+				Hint:      "self-test read exceeded 30 s wall-clock deadline",
+				RanAt:     now,
+				Target:    target,
+			}
+		}
 		n, readErr := f.Read(buf)
 		if n > 0 {
 			total += int64(n)
@@ -1405,17 +1469,24 @@ func runSelfTest() SelfTestResult {
 // mount and returns a cleanup callback that removes it.
 //
 // Translation note: store paths are mount-relative (e.g. "/foo/bar.mov"), so
-// we prefix with mountPath. If store is nil for any reason (early-start race),
+// we prefix with fusePath (NOT mountPath — see runSelfTest doc for the
+// loopback rationale). If store is nil for any reason (early-start race),
 // we skip straight to the temp-file path.
-func pickSelfTestTarget(store *metadata.Store, mountPath string) (string, func(), error) {
+//
+// `mountPath` is unused for I/O but kept in the signature for future
+// per-mount probe logic. `deadline` bounds the BFS by wall-clock so a
+// concurrent BulkInsert (holding writeMu, blocking ListChildren) can't
+// wedge the probe.
+func pickSelfTestTarget(store *metadata.Store, mountPath, fusePath string, deadline time.Time) (string, func(), error) {
+	_ = mountPath // intentionally unused
 	if store != nil {
-		if p := largeFileFromStore(store, mountPath, selfTestSize); p != "" {
+		if p := largeFileFromStore(store, fusePath, selfTestSize, deadline); p != "" {
 			return p, nil, nil
 		}
 	}
-	// Fallback: create a 10 MB temp file in the mount. We use a hidden name
-	// so it doesn't pollute Finder listings if the run crashes before cleanup.
-	tmpPath := filepath.Join(mountPath, ".juicemount-selftest.tmp")
+	// Fallback: create a 10 MB temp file via the FUSE path. Hidden name so
+	// a crashed run doesn't pollute Finder listings.
+	tmpPath := filepath.Join(fusePath, ".juicemount-selftest.tmp")
 	if err := writeRandomFile(tmpPath, selfTestSize); err != nil {
 		return "", nil, fmt.Errorf("write probe file: %w", err)
 	}
@@ -1423,15 +1494,23 @@ func pickSelfTestTarget(store *metadata.Store, mountPath string) (string, func()
 	return tmpPath, cleanup, nil
 }
 
-// largeFileFromStore returns a real-world target path (absolute, under mountPath)
-// for a regular file at least minSize bytes long. Walks the directory tree in
-// the store breadth-first, capped to bound work on large filesystems.
-func largeFileFromStore(store *metadata.Store, mountPath string, minSize int64) string {
+// largeFileFromStore returns an absolute path under fusePath for a regular
+// file at least minSize bytes long. Walks the directory tree in the store
+// breadth-first, bounded by both visit count AND wall-clock deadline so
+// contention on the store can't pin the probe.
+func largeFileFromStore(store *metadata.Store, fusePath string, minSize int64, deadline time.Time) string {
 	type qItem struct{ path string }
 	queue := []qItem{{path: ""}} // root in store's coordinates
 	const maxVisits = 5000
 	visits := 0
 	for len(queue) > 0 && visits < maxVisits {
+		// Wall-clock guard. If a concurrent BulkInsert is holding writeMu
+		// and our ListChildren calls are queuing behind it, give up early
+		// rather than wedge the probe goroutine. Returns empty → temp-file
+		// fallback path runs next.
+		if time.Now().After(deadline) {
+			return ""
+		}
 		head := queue[0]
 		queue = queue[1:]
 		visits++
@@ -1449,7 +1528,7 @@ func largeFileFromStore(store *metadata.Store, mountPath string, minSize int64) 
 				if strings.HasSuffix(e.Path, ".juicemount-selftest.tmp") {
 					continue
 				}
-				return filepath.Join(mountPath, e.Path)
+				return filepath.Join(fusePath, e.Path)
 			}
 		}
 	}
