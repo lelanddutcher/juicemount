@@ -9,7 +9,11 @@ struct MenuPopoverView: View {
     let onPreferences: () -> Void
     let onQuit: () -> Void
 
-    @State private var cacheStatus = NFSBridge.CacheStatus()
+    /// Computed mirror of `server.cacheStatus` — kept under the original
+    /// name so the rest of this view's bindings stay untouched. The
+    /// underlying cgo call now runs on `ServerController.workQueue`
+    /// (see `ServerController.refreshCacheStatus`), never on MainActor.
+    private var cacheStatus: NFSBridge.CacheStatus { server.cacheStatus }
     @State private var cacheTimer: Timer?
     @State private var offlineToggleBusy = false
     @State private var diskFreeGB: Double = 0
@@ -49,7 +53,10 @@ struct MenuPopoverView: View {
     }
 
     private func refreshCacheStatus() {
-        cacheStatus = NFSBridge.cacheStatus()
+        // Dispatches the cgo call to ServerController.workQueue and hops
+        // back to MainActor to publish. The view rerenders via the
+        // @Bindable server reference.
+        server.refreshCacheStatus()
     }
 
     /// Reads the system's view of disk space — both `volumeAvailableCapacityKey`
@@ -488,9 +495,13 @@ struct MenuPopoverView: View {
         Toggle(isOn: Binding(
             get: { cacheStatus.offline_mode },
             set: { newValue in
+                // ServerController.setOffline dispatches both the
+                // NFSServerSetOffline cgo call and the follow-up
+                // cacheStatus refresh to workQueue. The toggle's
+                // visual state updates when cacheStatus republishes
+                // on MainActor.
                 offlineToggleBusy = true
-                NFSBridge.setOffline(newValue)
-                refreshCacheStatus()
+                server.setOffline(newValue)
                 offlineToggleBusy = false
             }
         )) {

@@ -22,6 +22,13 @@ public final class ServerController {
     public private(set) var stats: NFSBridge.Stats = .zero
     public private(set) var lastError: String?
 
+    /// Latest cache status (pin coverage + offline flag). Refreshed off
+    /// MainActor from `refreshCacheStatus()` so the popover never calls
+    /// the cgo `NFSServerCacheStatus()` symbol from the UI thread —
+    /// every 2 s blocking-on-cgo from MainActor was a freeze waiting to
+    /// happen if any future regression parks a Go-side lock.
+    public private(set) var cacheStatus: NFSBridge.CacheStatus = NFSBridge.CacheStatus()
+
     /// Latest result of the post-mount read self-test (Phase A2). Nil before
     /// the server runs its first probe; refreshed automatically after
     /// `start()` completes and again whenever the user invokes Sync Now.
@@ -144,6 +151,31 @@ public final class ServerController {
                     // Same idea — let the next poll tick determine real state
                     self?.state = .running
                 }
+            }
+        }
+    }
+
+    /// Fetch cache status from Go and publish on MainActor. The cgo call
+    /// happens on `workQueue`, never on the UI thread. Safe to call at any
+    /// cadence (e.g. the popover's 2 s timer).
+    public func refreshCacheStatus() {
+        workQueue.async { [weak self] in
+            let s = NFSBridge.cacheStatus()
+            Task { @MainActor in
+                self?.cacheStatus = s
+            }
+        }
+    }
+
+    /// Toggle the Go-side offline flag, then refresh cache status. Both
+    /// cgo calls run on `workQueue` so the UI toggle doesn't freeze the
+    /// popover under contention.
+    public func setOffline(_ on: Bool) {
+        workQueue.async { [weak self] in
+            NFSBridge.setOffline(on)
+            let s = NFSBridge.cacheStatus()
+            Task { @MainActor in
+                self?.cacheStatus = s
             }
         }
     }
