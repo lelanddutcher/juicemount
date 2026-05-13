@@ -454,3 +454,51 @@ Commit `0316096`. File: `health/fuse.go`.
 Six commits closing the hang/crash failure modes. Production build refreshed
 at the end of iteration 4 (`build/JuiceMount.app` ready for morning launch
 once the kernel mount table is cleared).
+
+---
+
+## Iteration 5 — code-reviewer findings + fixes
+
+The code-reviewer sub-agent (spawned at the top of iteration 5) returned
+with **3 HIGH severity issues** in tonight's four root-cause commits.
+All landed in commit `21db111`.
+
+**HIGH #1 — `unmountLocked`'s `runBoundedCommand` was synchronous.**
+Iteration 2 swapped fire-and-forget `.Start()` for the reaping
+`runBoundedCommand` — but called it synchronously in a path that runs
+with `fm.mu` held. A 15 s umount would park `fm.mu`, re-introducing the
+exact failure mode iteration 2 was closing. Fix: prefix with `go`.
+This was the worst of the three — would have manifested as a 15-second
+UI freeze whenever the FUSE mount needed a forced unmount.
+
+**HIGH #2 — `stopServerLocked` didn't nil `globalPinStore` /
+`globalPrefetcher`.** Subsequent Start re-runs `pin.Open(...)` and
+overwrites the global without closing the previous SQLite handle.
+Connection + WAL file lock leak per Stop/Start cycle. Fix: snapshot +
+nil + `Close()` them alongside the other globals. Prefetcher `.Stop()`
+also called so worker goroutines exit cleanly.
+
+**HIGH #3 — `BulkInsert` silently dropped `RebuildFTS` errors.** The
+comment said "log but don't fail" but no log call was present. Fix:
+actual `log.Printf` so a drifted search index becomes visible.
+
+Two LOW findings deferred (goroutine leak on os.Open timeout, duplicate
+doc comment in runSelfTest) — neither user-visible, not worth iteration
+budget tonight.
+
+## Tonight's final tally
+
+| # | Commit | Fix |
+|---|---|---|
+| 1 | `1121bae` | NFS timeo 300→10, retrans 5→2, Force Eject, ordered shutdown |
+| 2 | `1d73c7d` | FUSE-direct self-test (no NFS loopback wedge) |
+| 3 | `a12bd8c` | All `health/` shell-outs bounded with CommandContext |
+| 4 | `a5a42e5` | `globalMu` snapshot-then-release in every slow cgo export |
+| 5 | `adf70b8` | Chunked `BulkInsert` + pin store `busy_timeout` |
+| 6 | `0316096` | `tailJuiceFSLog` stopCh + `FUSEManager.Stop` bounded |
+| 7 | `21db111` | Code-review followups: 3 HIGH bugs in #2–#5 closed |
+
+7 commits across the night. The "click menu-bar icon → app freezes →
+mount wedges → Finder unrecoverable" cascade has been broken in
+multiple independent places. Production build refreshed at end of this
+iteration.
