@@ -502,3 +502,83 @@ budget tonight.
 mount wedges → Finder unrecoverable" cascade has been broken in
 multiple independent places. Production build refreshed at end of this
 iteration.
+
+---
+
+## Iteration 6 — 2026-05-13 ~05:15
+
+**Swift-side MainActor audit.** Spawned a code-reviewer sub-agent
+(no source modification, pure review) to audit the Swift side for
+blocking-on-MainActor patterns. Now that the Go side won't park
+under contention, the next obvious freeze vector is SwiftUI code
+that calls cgo synchronously on the UI thread.
+
+### Findings
+
+**HIGH #1 — Popover 2 s timer ran `NFSServerCacheStatus()` on MainActor.**
+`MenuPopoverView.swift:38-44` had `Timer.scheduledTimer { _ in Task { @MainActor in refreshCacheStatus() } }`
+where `refreshCacheStatus()` called the cgo entry directly. Same for
+the `onAppear` initial fetch.
+
+**HIGH #2 — Offline toggle setter called cgo on MainActor.**
+`MenuPopoverView.swift:487-505`. The `Toggle`'s `Binding.set` closure
+synchronously invoked `NFSServerSetOffline()` then `NFSServerCacheStatus()`.
+`offlineToggleBusy` flag was set true/false around it but neither call
+was actually async, so the flag never reflected work.
+
+**LOW** — `forceEjectMount` path (`MenuPopoverView.swift:226-280`) is
+already structured correctly: AppKit modal on main, URLSession + 120 s
+semaphore wait on `DispatchQueue.global`, result alert hopped back to
+main. No change needed.
+
+**LOW** — `NFSBridge.selfTest()` uses `DispatchSemaphore.wait()` but
+its sole caller (`ServerController.refreshSelfTest`) dispatches off
+main first. Footgun-shaped API; not user-visible today.
+
+### Fixes landed
+
+Commit `e603eab`. Files: `ServerController.swift`, `MenuPopoverView.swift`.
+
+- Added `@Observable var cacheStatus` on `ServerController`. Refreshed
+  by new `refreshCacheStatus()` method which dispatches the cgo call
+  to the existing `workQueue` and republishes on MainActor.
+- Added `setOffline(_ on: Bool)` on `ServerController` that runs both
+  the `NFSServerSetOffline` cgo call and the follow-up cache-status
+  refresh on `workQueue`.
+- `MenuPopoverView` now reads `server.cacheStatus` via a computed
+  mirror under the original local name (`private var cacheStatus: ...`)
+  so the rest of the view's bindings are untouched. Timer and `onAppear`
+  both call the controller's off-main method instead of the cgo entry.
+- Offline toggle setter now calls `server.setOffline(newValue)` — fully
+  off-main; UI reverts to whatever cacheStatus republishes.
+
+Bonus commit `0a7f767` (also iteration 6): drop `rc.mu` around the
+131K-entry `pruneAbsent` iteration in `syncMetadata`. Lock-held
+iteration was wasted serialization for the Stats poller (Agent 2's
+item from iteration 4's "next directions"). Lock now scopes only the
+`lastSyncDuration`/`lastSyncTime` updates at the end.
+
+## Tonight's final tally (iteration 6)
+
+| # | Commit | Fix |
+|---|---|---|
+| 1 | `1121bae` | NFS timeo 300→10, retrans 5→2, Force Eject, ordered shutdown |
+| 2 | `1d73c7d` | FUSE-direct self-test (no NFS loopback wedge) |
+| 3 | `a12bd8c` | All `health/` shell-outs bounded with CommandContext |
+| 4 | `a5a42e5` | `globalMu` snapshot-then-release in every slow cgo export |
+| 5 | `adf70b8` | Chunked `BulkInsert` + pin store `busy_timeout` |
+| 6 | `0316096` | `tailJuiceFSLog` stopCh + `FUSEManager.Stop` bounded |
+| 7 | `21db111` | Code-review followups: 3 HIGH bugs in #2–#5 closed |
+| 8 | `0a7f767` | `rc.mu` dropped around `pruneAbsent` iteration |
+| 9 | `e603eab` | Swift popover: cacheStatus + setOffline off MainActor |
+
+9 commits. The original symptom class — click freezes, Finder hangs,
+mount wedges — now has independent fixes against:
+- kernel-NFS loopback wedge (#2)
+- monitor-loop syscall parking under `fm.mu` (#3)
+- cgo serialization under `globalMu` (#4)
+- metadata writeMu serialization across full syncs (#5)
+- redis-side `mu` serialization across full syncs (#8)
+- SwiftUI MainActor cgo blocking (#9)
+
+Production build refreshed at end of this iteration.
