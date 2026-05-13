@@ -160,6 +160,56 @@ public enum NFSBridge {
         NFSServerIsOffline() != 0
     }
 
+    // MARK: - Self-test (A2)
+    //
+    // Phase A production-hardening: a 10 MB read measured against the live
+    // mount, classified into green (>=200 MB/s), yellow (50–200 MB/s), or
+    // red (<50 MB/s). Served by Go over HTTP on the metrics port so we don't
+    // need to add a new C symbol for it.
+
+    public struct SelfTestResult: Codable, Equatable {
+        public var elapsed_ms: Int64 = 0
+        public var bytes_read: Int64 = 0
+        public var mb_per_sec: Double = 0
+        public var status: String = ""     // "green" | "yellow" | "red" | "error"
+        public var hint: String = ""
+        public var ran_at: String = ""     // RFC3339
+        public var target: String = ""
+
+        /// True when the result represents something the user might care to
+        /// see surfaced on the icon (anything not green, including errors).
+        public var isAttentionWorthy: Bool {
+            !(status == "green" || status.isEmpty)
+        }
+    }
+
+    /// Fetch the self-test result from the local metrics server. Pass
+    /// `force: true` to rerun the probe; otherwise the cached result is
+    /// returned. Blocking — call from a background queue.
+    ///
+    /// The metrics server listens on 127.0.0.1:11050 by default; we read the
+    /// configured address to avoid hard-coding (the Swift ServerConfig allows
+    /// overriding `metrics_addr`).
+    public static func selfTest(force: Bool = false, metricsAddr: String = "127.0.0.1:11050") -> SelfTestResult? {
+        guard let url = URL(string: "http://\(metricsAddr)/self-test") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = force ? "POST" : "GET"
+        // The probe itself blocks up to ~200 ms on a healthy mount; allow
+        // headroom for slow paths (a red mount measuring at 5 MB/s still
+        // needs ~2 s).
+        req.timeoutInterval = 30
+
+        let sem = DispatchSemaphore(value: 0)
+        var result: SelfTestResult?
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            result = try? JSONDecoder().decode(SelfTestResult.self, from: data)
+        }.resume()
+        sem.wait()
+        return result
+    }
+
     public struct SearchResult: Codable, Identifiable, Hashable {
         public var path: String
         public var name: String

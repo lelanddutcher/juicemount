@@ -22,6 +22,11 @@ public final class ServerController {
     public private(set) var stats: NFSBridge.Stats = .zero
     public private(set) var lastError: String?
 
+    /// Latest result of the post-mount read self-test (Phase A2). Nil before
+    /// the server runs its first probe; refreshed automatically after
+    /// `start()` completes and again whenever the user invokes Sync Now.
+    public private(set) var selfTest: NFSBridge.SelfTestResult?
+
     public var preferences: Preferences
 
     private let log = Logger(subsystem: "com.juicemount.app", category: "ServerController")
@@ -52,6 +57,12 @@ public final class ServerController {
                     self.state = .running
                     self.lastError = nil
                     self.startPolling()
+                    // Phase A2: pull the post-mount self-test result. The Go
+                    // side runs the probe in a background goroutine at start,
+                    // so a short delay lets the first run land in the cache
+                    // before we fetch. If it's not ready yet, GET /self-test
+                    // will run it synchronously on demand anyway.
+                    self.refreshSelfTest(force: false, delayMs: 1500)
                 }
             } catch {
                 Task { @MainActor in
@@ -118,6 +129,10 @@ public final class ServerController {
                     // have happened during the sync.
                     self?.state = .running
                     self?.refreshStats()
+                    // Re-run the self-test in the background — Sync Now is the
+                    // user's "is everything OK?" lever, so updating the probe
+                    // result is the right thing to do.
+                    self?.refreshSelfTest(force: true, delayMs: 0)
                 }
             } catch {
                 Task { @MainActor in
@@ -125,6 +140,23 @@ public final class ServerController {
                     // Same idea — let the next poll tick determine real state
                     self?.state = .running
                 }
+            }
+        }
+    }
+
+    /// Pulls the self-test result from the Go metrics endpoint and publishes
+    /// it on the main actor. `force` issues a POST (rerun) instead of GET.
+    /// `delayMs` lets the caller wait for an asynchronous first-run to land
+    /// in the Go cache before fetching.
+    public func refreshSelfTest(force: Bool = false, delayMs: Int = 0) {
+        let addr = preferences.metricsAddr
+        workQueue.async { [weak self] in
+            if delayMs > 0 {
+                Thread.sleep(forTimeInterval: Double(delayMs) / 1000.0)
+            }
+            let result = NFSBridge.selfTest(force: force, metricsAddr: addr)
+            Task { @MainActor in
+                self?.selfTest = result
             }
         }
     }

@@ -6,11 +6,15 @@ package main
 import "C"
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -110,6 +114,20 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		Level:   jmlog.ParseLevel(cfg.LogLevel),
 	}); err != nil {
 		return C.CString(fmt.Sprintf("error: init logger: %v", err))
+	}
+
+	// A1 — Pre-mount conflict probe. Inspect the kernel mount table for any
+	// foreign owner at the FUSE path or the NFS mount point BEFORE we call
+	// juicefs or mount_nfs. The downstream code's "already mounted, reuse"
+	// branches deliberately don't distinguish foreign mounts from our own —
+	// without this, starting on top of an unrelated disk image mounted at
+	// /Volumes/zpool would happily expose that disk via NFS, or worse,
+	// blow up later with confusing errors. Refuse early with a clear hint
+	// the user can act on. (Mounts we placed are passed through; the existing
+	// reuse logic below handles them.)
+	if errMsg := preMountConflictCheck(cfg.FUSEPath, cfg.MountPoint); errMsg != "" {
+		jmlog.Error("pre-mount conflict refused", "detail", errMsg)
+		return C.CString("error: " + errMsg)
 	}
 
 	// Mount JuiceFS FUSE if not already mounted. This is what the standalone
@@ -278,6 +296,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/offline":      handleOfflineHTTP,
 			"/reclaim":      handleReclaimHTTP,
 			"/verify-pins":  handleVerifyPinsHTTP,
+			// A2 — post-mount self-test. GET returns cached result; POST reruns.
+			"/self-test": handleSelfTestHTTP,
+			// Phase B observability: net/http/pprof routes for live
+			// goroutine/heap/cpu/trace dumps. pprof.Index serves
+			// /debug/pprof/goroutine, /debug/pprof/heap, etc. via the
+			// trailing-slash handler plus ?debug=1 query.
+			"/debug/pprof/":        pprof.Index,
+			"/debug/pprof/cmdline": pprof.Cmdline,
+			"/debug/pprof/profile": pprof.Profile,
+			"/debug/pprof/symbol":  pprof.Symbol,
+			"/debug/pprof/trace":   pprof.Trace,
 		}
 		if err := ms.Start(); err != nil {
 			jmlog.Warn("metrics server failed to start",
@@ -333,6 +362,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			Reason:     reason,
 		}
 	})
+
+	// A2 — kick off the post-mount self-test in the background so it doesn't
+	// block the Swift Start completion handler (a slow probe shouldn't gate
+	// the UI flipping to "running"). Results land in selfTestLast and Swift
+	// reads them via GET /self-test on its post-start refresh.
+	go runAndStoreSelfTest()
 
 	return C.CString(srv.Addr())
 }
@@ -651,6 +686,110 @@ func isMounted(path string) bool {
 		return false
 	}
 	return strings.Contains(string(out), " "+path+" ")
+}
+
+// mountAt parses `mount` output and returns the current owner of the given
+// mount point, if any.
+//
+// macOS `mount` output line format is "source on /path (type, opts...)".
+// We return:
+//   - source: e.g. "JuiceFS:zpool" or "127.0.0.1:11049"
+//   - kind:   the parenthesized type token, e.g. "macfuse", "nfs"
+//   - found:  true if a line for `path` was located
+//
+// On parse failure, found is false.
+func mountAt(path string) (source string, kind string, found bool) {
+	out, err := exec.Command("mount").Output()
+	if err != nil {
+		return "", "", false
+	}
+	// Walk every line; match on " on <path> (" so partial-prefix paths
+	// (e.g. "/Volumes/zpool" vs "/Volumes/zpool2") don't false-positive.
+	needle := " on " + path + " ("
+	for _, line := range strings.Split(string(out), "\n") {
+		idx := strings.Index(line, needle)
+		if idx < 0 {
+			continue
+		}
+		source = strings.TrimSpace(line[:idx])
+		// Type token is between the first "(" after needle and the next "," or ")"
+		rest := line[idx+len(needle)-1:] // include the leading "(" so we re-find it
+		op := strings.Index(rest, "(")
+		if op >= 0 {
+			tail := rest[op+1:]
+			end := strings.IndexAny(tail, ",)")
+			if end > 0 {
+				kind = strings.TrimSpace(tail[:end])
+			}
+		}
+		return source, kind, true
+	}
+	return "", "", false
+}
+
+// isOurFUSEMount reports whether the existing mount at `path` looks like a
+// JuiceFS FUSE mount we (or a previous instance of us) put there. The source
+// reported by macOS for a JuiceFS-on-macfuse mount is "JuiceFS:<volname>"
+// (e.g. "JuiceFS:zpool") with type "macfuse".
+func isOurFUSEMount(source, kind string) bool {
+	if !strings.HasPrefix(source, "JuiceFS:") {
+		return false
+	}
+	// kind is best-effort; if we can't parse it, accept on source alone
+	// (older macOS versions report the fs type differently).
+	if kind == "" {
+		return true
+	}
+	return strings.Contains(kind, "fuse") || strings.Contains(kind, "macfuse")
+}
+
+// isOurNFSMount reports whether the existing mount at `path` looks like an
+// NFS mount whose server is the loopback address we serve on.
+func isOurNFSMount(source, kind string) bool {
+	if !strings.HasPrefix(source, "127.0.0.1") && !strings.HasPrefix(source, "localhost") {
+		return false
+	}
+	// kind should be "nfs"; tolerate empty/unknown.
+	if kind != "" && !strings.Contains(kind, "nfs") {
+		return false
+	}
+	return true
+}
+
+// preMountConflictCheck inspects the kernel mount table for any foreign mount
+// at the FUSE path or the NFS mount point. If a foreign mount is found, returns
+// a JSON-encoded error string that includes which path, who owns it, and a
+// suggested resolution. Returns "" if both paths are clear (or already owned
+// by us — which the existing soft-stop reuse logic will pick up downstream).
+func preMountConflictCheck(fusePath, mountPoint string) string {
+	if fusePath != "" {
+		if src, kind, found := mountAt(fusePath); found {
+			if !isOurFUSEMount(src, kind) {
+				return formatMountConflictError(fusePath, src, kind,
+					"Unmount it manually (`diskutil unmount "+fusePath+"` or `umount "+fusePath+"`), then start JuiceMount again.")
+			}
+		}
+	}
+	if mountPoint != "" {
+		if src, kind, found := mountAt(mountPoint); found {
+			if !isOurNFSMount(src, kind) {
+				return formatMountConflictError(mountPoint, src, kind,
+					"Unmount the other volume (`diskutil unmount "+mountPoint+"`) or pick a different mount point in Preferences, then try again.")
+			}
+		}
+	}
+	return ""
+}
+
+// formatMountConflictError builds the human-readable error string Swift will
+// surface in the popover's lastError field.
+func formatMountConflictError(path, source, kind, hint string) string {
+	if kind == "" {
+		kind = "unknown"
+	}
+	return fmt.Sprintf(
+		"mount conflict at %s: foreign mount in place (source=%q, type=%s). %s",
+		path, source, kind, hint)
 }
 
 // fuseLooksHealthy returns true if the given path appears in the kernel
@@ -1017,6 +1156,258 @@ func connectRedisWithRetry(redisURL string, store *metadata.Store, maxAttempts i
 		time.Sleep(backoff)
 	}
 	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// ----------------------------------------------------------------------------
+// A2 — Post-mount self-test
+// ----------------------------------------------------------------------------
+//
+// A 10 MB read measured against the live mount, intended to catch the
+// "everything is up and we're handing out reads but they're abysmally slow"
+// failure mode. Runs once automatically after start (post initial sync) and
+// is rerunnable via POST /self-test. GET /self-test returns the cached
+// result. Swift overlays a non-green icon dot whenever the result is yellow
+// or red so the user sees the alert without opening the popover.
+
+// SelfTestResult is the JSON shape served at /self-test and consumed by Swift.
+type SelfTestResult struct {
+	ElapsedMs int64   `json:"elapsed_ms"`
+	BytesRead int64   `json:"bytes_read"`
+	MBPerSec  float64 `json:"mb_per_sec"`
+	Status    string  `json:"status"` // "green" | "yellow" | "red" | "error"
+	Hint      string  `json:"hint"`
+	RanAt     string  `json:"ran_at"` // RFC3339; empty until first run
+	Target    string  `json:"target"` // path that was read; "" on error
+}
+
+var (
+	selfTestMu   sync.Mutex
+	selfTestLast SelfTestResult
+)
+
+// selfTestSize is the read size for the probe — 10 MB matches the planning
+// doc. Big enough to traverse multiple JuiceFS cache blocks and exercise
+// readahead; small enough that even a 50 MB/s "red" mount still finishes
+// in 0.2 s.
+const selfTestSize = 10 * 1024 * 1024
+
+// runSelfTest performs one 10 MB read self-test against the live NFS mount.
+// Picks a target file from the SQLite metadata store if one exists that is
+// >= 10 MB, otherwise writes a temp file in the mount, reads it back, and
+// cleans up. The read happens via the user-visible mount path (i.e. the NFS
+// loopback mount), not the FUSE path — that's what the user's apps see, so
+// that's what we measure.
+func runSelfTest() SelfTestResult {
+	globalMu.Lock()
+	mountPath := globalMountPath
+	store := globalStore
+	globalMu.Unlock()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if mountPath == "" {
+		return SelfTestResult{
+			Status: "error",
+			Hint:   "self-test skipped: NFS mount not active",
+			RanAt:  now,
+		}
+	}
+
+	target, cleanup, err := pickSelfTestTarget(store, mountPath)
+	if err != nil {
+		return SelfTestResult{
+			Status: "error",
+			Hint:   "self-test could not pick target: " + err.Error(),
+			RanAt:  now,
+		}
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	f, err := os.Open(target)
+	if err != nil {
+		return SelfTestResult{
+			Status: "error",
+			Hint:   "self-test open failed: " + err.Error(),
+			RanAt:  now,
+			Target: target,
+		}
+	}
+	defer f.Close()
+
+	buf := make([]byte, 256*1024) // 256 KiB read chunks; cheaper than one 10 MB alloc
+	var total int64
+	start := time.Now()
+	for total < selfTestSize {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			total += int64(n)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return SelfTestResult{
+				ElapsedMs: time.Since(start).Milliseconds(),
+				BytesRead: total,
+				Status:    "error",
+				Hint:      "self-test read failed: " + readErr.Error(),
+				RanAt:     now,
+				Target:    target,
+			}
+		}
+	}
+	elapsed := time.Since(start)
+
+	mbps := 0.0
+	if elapsed > 0 {
+		mbps = (float64(total) / (1024 * 1024)) / elapsed.Seconds()
+	}
+	status, hint := classifySelfTest(mbps)
+	return SelfTestResult{
+		ElapsedMs: elapsed.Milliseconds(),
+		BytesRead: total,
+		MBPerSec:  mbps,
+		Status:    status,
+		Hint:      hint,
+		RanAt:     now,
+		Target:    target,
+	}
+}
+
+// pickSelfTestTarget finds a file >= selfTestSize via the metadata store. If
+// none exists yet (fresh mount, empty bucket), it writes a temp file in the
+// mount and returns a cleanup callback that removes it.
+//
+// Translation note: store paths are mount-relative (e.g. "/foo/bar.mov"), so
+// we prefix with mountPath. If store is nil for any reason (early-start race),
+// we skip straight to the temp-file path.
+func pickSelfTestTarget(store *metadata.Store, mountPath string) (string, func(), error) {
+	if store != nil {
+		if p := largeFileFromStore(store, mountPath, selfTestSize); p != "" {
+			return p, nil, nil
+		}
+	}
+	// Fallback: create a 10 MB temp file in the mount. We use a hidden name
+	// so it doesn't pollute Finder listings if the run crashes before cleanup.
+	tmpPath := filepath.Join(mountPath, ".juicemount-selftest.tmp")
+	if err := writeRandomFile(tmpPath, selfTestSize); err != nil {
+		return "", nil, fmt.Errorf("write probe file: %w", err)
+	}
+	cleanup := func() { _ = os.Remove(tmpPath) }
+	return tmpPath, cleanup, nil
+}
+
+// largeFileFromStore returns a real-world target path (absolute, under mountPath)
+// for a regular file at least minSize bytes long. Walks the directory tree in
+// the store breadth-first, capped to bound work on large filesystems.
+func largeFileFromStore(store *metadata.Store, mountPath string, minSize int64) string {
+	type qItem struct{ path string }
+	queue := []qItem{{path: ""}} // root in store's coordinates
+	const maxVisits = 5000
+	visits := 0
+	for len(queue) > 0 && visits < maxVisits {
+		head := queue[0]
+		queue = queue[1:]
+		visits++
+		children, err := store.ListChildren(head.path)
+		if err != nil || len(children) == 0 {
+			continue
+		}
+		for _, e := range children {
+			if e.IsDir {
+				queue = append(queue, qItem{path: e.Path})
+				continue
+			}
+			if e.Size >= minSize {
+				// Skip our own probe file if it's still around from a crash.
+				if strings.HasSuffix(e.Path, ".juicemount-selftest.tmp") {
+					continue
+				}
+				return filepath.Join(mountPath, e.Path)
+			}
+		}
+	}
+	return ""
+}
+
+// writeRandomFile creates a file of the given size in the given path, filling
+// it with random bytes (so JuiceFS can't dedup it away from a cold cache).
+func writeRandomFile(path string, size int64) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// Use 256 KiB chunks of random data to avoid blowing memory.
+	const chunk = 256 * 1024
+	buf := make([]byte, chunk)
+	var written int64
+	for written < size {
+		if _, err := rand.Read(buf); err != nil {
+			return err
+		}
+		n := int64(chunk)
+		if size-written < n {
+			n = size - written
+		}
+		if _, err := f.Write(buf[:n]); err != nil {
+			return err
+		}
+		written += n
+	}
+	return f.Sync()
+}
+
+// classifySelfTest maps a measured MB/s to a status badge + actionable hint.
+// Thresholds match the planning doc: >=200 green, 50-200 yellow, <50 red.
+func classifySelfTest(mbps float64) (status, hint string) {
+	switch {
+	case mbps >= 200:
+		return "green", fmt.Sprintf("Self-test: %.0f MB/s — healthy.", mbps)
+	case mbps >= 50:
+		return "yellow", fmt.Sprintf(
+			"Self-test: %.0f MB/s — slower than expected. Likely cache miss or warm-up; rerun after a few seconds of activity.",
+			mbps)
+	default:
+		return "red", fmt.Sprintf(
+			"Self-test: %.0f MB/s — read path is degraded. Check FUSE health, cache disk space, and network to backend.",
+			mbps)
+	}
+}
+
+// runAndStoreSelfTest is the thread-safe wrapper that updates the cached
+// result for the /self-test endpoint.
+func runAndStoreSelfTest() SelfTestResult {
+	r := runSelfTest()
+	selfTestMu.Lock()
+	selfTestLast = r
+	selfTestMu.Unlock()
+	jmlog.Info("self-test complete",
+		"status", r.Status,
+		"mb_per_sec", fmt.Sprintf("%.1f", r.MBPerSec),
+		"elapsed_ms", r.ElapsedMs,
+		"target", r.Target)
+	return r
+}
+
+// handleSelfTestHTTP serves GET (cached) and POST (rerun) on /self-test.
+func handleSelfTestHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var out SelfTestResult
+	if r.Method == http.MethodPost {
+		out = runAndStoreSelfTest()
+	} else {
+		selfTestMu.Lock()
+		out = selfTestLast
+		selfTestMu.Unlock()
+		if out.RanAt == "" {
+			// No run yet — kick one off synchronously so the first GET is
+			// useful instead of returning an empty payload.
+			out = runAndStoreSelfTest()
+		}
+	}
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func main() {} // required for c-archive build

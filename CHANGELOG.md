@@ -1,5 +1,34 @@
 # JuiceMount6 Changelog
 
+## 2026-05-13 — Phase A+B+C: production safeguards landed in parallel
+
+Three agents working in parallel landed the next batch of production-readiness
+work the day after the FileProvider ghost incident. Diff: 622 lines across
+8 files; no unit-test regressions.
+
+### Phase A — self-defense against environmental conflicts
+
+- **Pre-mount conflict probe** (`bridge/cbridge.go:128`, `preMountConflictCheck` + `mountAt` helpers). Before the juicefs and NFS mounts run, walk the kernel mount table; if a foreign mount already owns the FUSE or NFS path, refuse to mount and surface a clear error string to Swift (including the source, type, and a `diskutil unmount` hint). Our own mounts (`JuiceFS:*` at FUSE path, `127.0.0.1:*` at NFS path) pass through and the existing soft-Stop reuse logic kicks in. Catches the "another FileProvider claimed /Volumes/zpool" failure mode at launch instead of in production.
+- **Post-mount self-test** (`bridge/cbridge.go` `runSelfTest`/`SelfTestResult`, HTTP `GET /self-test` + `POST /self-test`). 10 MB read against the live NFS mount, classified green (≥200 MB/s) / yellow (50–200 MB/s) / red (<50 MB/s). Target selection: walks SQLite for any file ≥10 MB; falls back to a tmp file in the mount if none. Auto-runs once at server start, rerunnable via POST. Swift integration: `NFSBridge.SelfTestResult` + `selfTest(force:)` API; `ServerController.refreshSelfTest`; `MenuBarController` overlays a 5-pt colored dot in the icon's lower-right when self-test is yellow/red/error; `MenuPopoverView` `selfTestRow` shows "Self-test: 247 MB/s ✓" in the cache section.
+
+### Phase B — observability
+
+- **`/debug/pprof/*` endpoints** on the existing metrics server (port 11050). Five routes: `/`, `/cmdline`, `/profile`, `/symbol`, `/trace`. Live goroutine/heap/CPU/trace inspection without a separate listener. Would have saved hours of stack-archaeology during the 2026-05-12 incident.
+- **Export Diagnostics button** in the menu-bar popover (`app/JuiceMount/Sources/JuiceMount/Core/DiagnosticsExporter.swift`, new). Bundles a 10-file zip onto the user's Desktop: tail of `juicemount.log` (5 MiB) and `juicefs.log` (1 MiB); current `/metrics` and `/cache-status` snapshots; `pluginkit -m`, `fileproviderctl dump` (first 200 lines), `df -h`, `mount`, `nfsstat -m`, plus a `system.txt` with macOS version, app version, anonymized hostname, and pid map. Cross-volume safe (copy+remove fallback), timeout-bounded subprocesses, deadlock-safe pipe draining on dispatch queues. `errors.txt` only when something fails — never crashes the export.
+
+### Phase C1 — Developer ID signing + notarization
+
+- **`scripts/build-app.sh` codesigning rewrite**. Auto-detects a Developer ID Application cert via `security find-identity`; falls back to ad-hoc with a yellow WARNING on the dev path. Env vars: `JM_SIGN_IDENTITY` (override cert), `JM_NOTARY_PROFILE` (default `JuiceMount`), `JM_QUICK=1` (skip notarization). Builds with `--timestamp --options runtime` when signing real, omits `--timestamp` on ad-hoc (Apple rejects it). Build footer now prints `Identity / Notarized / Staple` lines.
+- **Notarization gated**. Only fires when: `JM_QUICK` unset, identity is not ad-hoc, AND a notary keychain profile is reachable. Uses `xcrun notarytool submit --wait` → `stapler staple` → `stapler validate`. Failures degrade to a WARNING (dev iteration never breaks).
+- **`docs/signing.md`** (new) — first-time-setup walkthrough: how to create the Developer ID Application cert in Xcode, how to store the notarization credential profile (`xcrun notarytool store-credentials`), what each env var controls, verification commands (`spctl`, `stapler validate`), common errors, and a back-reference to `docs/no-fileprovider.md`.
+
+### Coordination notes
+
+- All three agents were briefed to work on non-overlapping file sections; merge was conflict-free.
+- `bridge/cbridge.go` grew 391 lines (mostly Phase A's self-test + conflict probe logic).
+- `MenuPopoverView.swift` grew 66 lines (Phase A self-test row + Phase B Export button).
+- Pre-existing test failures in `nfs/` E2E tests confirmed environmental (need a live FUSE+Redis backend); unit packages `internal/jmlog`, `internal/cache/pin`, `cache`, `metadata` all green.
+
 ## 2026-05-07 / 2026-05-08 — Production-Hardening Branch (Phase 3 ship)
 
 Eight commits on the `production-hardening` branch turning the prototype-quality menu-bar app into something a video editor can put real cellular sessions through. The headline features were already in earlier prototypes; this work is what made them survive contact with a 97%-full disk, an unreachable NAS at launch, and a pinned-set bigger than the configured cache.
