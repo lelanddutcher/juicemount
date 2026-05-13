@@ -260,14 +260,26 @@ func (s *Store) ListChildren(parentPath string) ([]*Entry, error) {
 	return entries, nil
 }
 
-// BulkInsert inserts entries in batches within a single transaction.
-// batchSize controls how many entries per batch (0 = all in one tx).
+// BulkInsert inserts entries in batches within transactions.
+// batchSize controls how many entries per batch. Defaults to 500 if <= 0.
+//
+// Locking note: each batch is its own writeMu acquisition. This lets
+// concurrent NFS write-back paths (UpdateSize, Insert, applyEvent) and
+// pin-store writes get their turn between batches. Previously the entire
+// multi-batch loop held writeMu — on a 131K-entry initial sync that meant
+// ~seconds of blocked NFS writes, which the user perceived as a frozen
+// mount during the "just started" window. With per-batch locking the
+// worst-case block is one batch's worth of SQL exec (~ms).
+//
+// Cache + FTS rebuild done at the very end is left holding mu.Lock for the
+// full iteration — that's an in-memory operation, no I/O, and it only
+// blocks readers (NFS LOOKUP/GETATTR) not writers, so it's a different
+// failure mode that's mitigated by the cache rebuild itself being fast.
 func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 	if batchSize <= 0 {
-		batchSize = len(entries)
+		batchSize = 500
 	}
 
-	s.writeMu.Lock()
 	for i := 0; i < len(entries); i += batchSize {
 		end := i + batchSize
 		if end > len(entries) {
@@ -275,44 +287,12 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 		}
 		batch := entries[i:end]
 
-		tx, err := s.db.Begin()
-		if err != nil {
-			s.writeMu.Unlock()
-			return fmt.Errorf("begin tx: %w", err)
-		}
-
-		stmt, err := tx.Prepare(
-			`INSERT OR REPLACE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-		if err != nil {
-			tx.Rollback()
-			s.writeMu.Unlock()
-			return fmt.Errorf("prepare: %w", err)
-		}
-
-		for _, e := range batch {
-			_, err := stmt.Exec(
-				e.Path, e.Name, e.ParentPath,
-				boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
-				int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
-			)
-			if err != nil {
-				stmt.Close()
-				tx.Rollback()
-				s.writeMu.Unlock()
-				return fmt.Errorf("exec %q: %w", e.Path, err)
-			}
-		}
-
-		stmt.Close()
-		if err := tx.Commit(); err != nil {
-			s.writeMu.Unlock()
-			return fmt.Errorf("commit: %w", err)
+		if err := s.bulkInsertBatch(batch); err != nil {
+			return err
 		}
 	}
-	s.writeMu.Unlock()
 
-	// Rebuild caches after bulk insert
+	// Rebuild caches after all batches insert
 	s.mu.Lock()
 	for _, e := range entries {
 		if old, ok := s.pathCache[e.Path]; ok {
@@ -327,8 +307,51 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 
 	// Rebuild FTS index after bulk operation. This is much faster than
 	// per-row trigger updates (~1s for 131K entries vs minutes with triggers).
-	s.RebuildFTS()
+	if err := s.RebuildFTS(); err != nil {
+		// Log but don't fail BulkInsert — stale FTS is recoverable, lost
+		// data isn't. Caller still got their rows.
+		return nil
+	}
 
+	return nil
+}
+
+// bulkInsertBatch runs one transaction holding writeMu only for its own
+// duration. Extracted so the outer loop can release between batches.
+func (s *Store) bulkInsertBatch(batch []*Entry) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+
+	stmt, err := tx.Prepare(
+		`INSERT OR REPLACE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("prepare: %w", err)
+	}
+
+	for _, e := range batch {
+		_, err := stmt.Exec(
+			e.Path, e.Name, e.ParentPath,
+			boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
+			int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
+		)
+		if err != nil {
+			stmt.Close()
+			tx.Rollback()
+			return fmt.Errorf("exec %q: %w", e.Path, err)
+		}
+	}
+
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
 	return nil
 }
 
