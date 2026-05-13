@@ -249,8 +249,10 @@ func (fm *FUSEManager) Mount() error {
 
 	// Tail JuiceFS's daemon log into our structured logger so warnings like
 	// "space not enough on device, upload it directly" are visible to the
-	// user instead of buried in ~/.juicefs/juicefs.log.
-	go tailJuiceFSLog()
+	// user instead of buried in ~/.juicefs/juicefs.log. Bound to fm.stopCh
+	// so the goroutine exits cleanly when the FUSEManager is stopped
+	// (previously leaked on every Stop, holding the open file handle).
+	go fm.tailJuiceFSLog()
 
 	return nil
 }
@@ -304,18 +306,28 @@ func checkCacheVolumeHealth(cfg FUSEConfig) string {
 // the same JSON stream as everything else. Aggregates the chatty
 // "space not enough" message — emit once per minute with a count instead
 // of flooding the log with thousands of identical entries.
-func tailJuiceFSLog() {
+//
+// Exits cleanly when fm.stopCh closes. Previously a package-level
+// function with no stop signal — leaked the goroutine + open file handle
+// on every FUSEManager.Stop(), accumulating across Stop/Start cycles.
+func (fm *FUSEManager) tailJuiceFSLog() {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return
 	}
 	logPath := filepath.Join(home, ".juicefs", "juicefs.log")
-	// Wait for the file to appear (juicefs daemon may not have created it yet)
+	// Wait for the file to appear (juicefs daemon may not have created it
+	// yet). Interruptible by fm.stopCh so Stop() doesn't have to wait the
+	// full 30 s to reap this goroutine.
 	for i := 0; i < 30; i++ {
 		if _, err := os.Stat(logPath); err == nil {
 			break
 		}
-		time.Sleep(1 * time.Second)
+		select {
+		case <-fm.stopCh:
+			return
+		case <-time.After(1 * time.Second):
+		}
 	}
 	f, err := os.Open(logPath)
 	if err != nil {
@@ -354,6 +366,13 @@ func tailJuiceFSLog() {
 	}
 
 	for {
+		// Check stop before each scan pass so we don't block on a
+		// scanner.Scan that's waiting on a quiet log file.
+		select {
+		case <-fm.stopCh:
+			return
+		default:
+		}
 		for scanner.Scan() {
 			line := scanner.Text()
 			// Two interesting tokens: <WARNING> and <ERROR>
@@ -389,7 +408,13 @@ func tailJuiceFSLog() {
 			jmlog.Debug("juicefs log tail: scanner error", "error", err.Error())
 			return
 		}
-		time.Sleep(2 * time.Second)
+		// Interruptible sleep so Stop() reaps us within 2 s instead of
+		// waiting for the next read attempt.
+		select {
+		case <-fm.stopCh:
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 
@@ -402,7 +427,19 @@ func (fm *FUSEManager) StartMonitor() {
 // Stop unmounts JuiceFS and stops the monitor.
 func (fm *FUSEManager) Stop() {
 	close(fm.stopCh)
-	<-fm.done
+
+	// Bound the wait for monitorLoop to exit. Even with iteration-2's
+	// bounded `mount` syscall (5 s context), one tick can still take that
+	// long if it fires while we're trying to stop. Race the join against
+	// a 10 s deadline so callers (NFSServerShutdown → fuse.Stop) never
+	// park indefinitely. If the monitor doesn't exit cleanly in time, we
+	// proceed to unmount anyway — the goroutine will become a zombie
+	// rather than blocking the user-visible Stop button.
+	select {
+	case <-fm.done:
+	case <-time.After(10 * time.Second):
+		jmlog.Warn("FUSEManager.Stop: monitor goroutine didn't exit in 10s — proceeding with unmount anyway")
+	}
 
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
