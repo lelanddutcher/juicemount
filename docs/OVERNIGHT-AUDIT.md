@@ -274,3 +274,31 @@ not `/Volumes/zpool`. Single biggest win, smallest blast radius.
 batches. Also add `busy_timeout` PRAGMA to `pin.Store`.
 
 **Iteration 6:** Cleanup & final build & summary. Push notification to user.
+
+---
+
+## Iteration 2 — 2026-05-13 ~03:02
+
+**Implemented Fix #2** — wrap every shell-out + bare `os.Stat` in `health/`
+with `exec.CommandContext` deadlines or goroutine+timeout pattern.
+
+Commit `a12bd8c`. Files: `health/fuse.go`, `health/monitor.go`.
+
+Bounded (all newly):
+- `isMountedLocked()` `mount` → 5 s
+- `unmountLocked()` `pgrep` → 2 s, `kill -9` → 2 s, `umount -f` → 15 s (via `runBoundedCommand`)
+- `FUSEManager.Mount()` `juicefs mount -d` daemon launch → 30 s
+- `ReclaimPurgeableSpace()` `tmutil` → 90 s
+- `forceUnmount()` `sudo umount -f` → 20 s
+- `checkFUSE()` `os.Stat` → 5 s (goroutine+timeout), `mount` → 5 s
+
+Also added `runBoundedCommand` helper that reaps the child process,
+replacing the prior `.Start()`-without-`.Wait()` pattern that leaked
+zombies on every monitor tick.
+
+Result: zero unbounded `exec.Command` calls remain in `health/`. The
+"click menu → monitor lock parked on a wedged mount syscall → app hangs"
+failure mode is closed.
+
+Next iteration: Fix #3 — `globalMu` snapshot-then-release in `NFSServerStats`,
+`NFSServerIsRunning`, `NFSServerCacheStatus`, `NFSServerShutdown`.
