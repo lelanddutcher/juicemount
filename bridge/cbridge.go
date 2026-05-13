@@ -433,7 +433,12 @@ func stopServerLocked() {
 	// tear-down doesn't see partially-released state.
 	metrics.Default().SetHealthProvider(nil)
 
-	// Snapshot + nil under the lock.
+	// Snapshot + nil under the lock. Includes globalPinStore and
+	// globalPrefetcher (added on review feedback) — previously these
+	// stayed live across Stop, but the NEXT Start re-runs
+	// `pin.Open(pinDBPath)` and overwrites the global without closing the
+	// previous SQLite handle, leaking a connection + WAL file lock on
+	// every Stop/Start cycle.
 	globalMu.Lock()
 	metricsSrv := globalMetrics
 	monitor := globalMonitor
@@ -442,6 +447,8 @@ func stopServerLocked() {
 	rc := globalRC
 	store := globalStore
 	rdb := globalRDB
+	pinStore := globalPinStore
+	prefetcher := globalPrefetcher
 	globalMetrics = nil
 	globalMonitor = nil
 	globalServer = nil
@@ -449,6 +456,8 @@ func stopServerLocked() {
 	globalRC = nil
 	globalStore = nil
 	globalRDB = nil
+	globalPinStore = nil
+	globalPrefetcher = nil
 	globalMu.Unlock()
 
 	// Now run the slow shutdown work on the snapshots, no lock held.
@@ -470,6 +479,12 @@ func stopServerLocked() {
 	}
 	if rc != nil {
 		rc.Stop()
+	}
+	if prefetcher != nil {
+		prefetcher.Stop()
+	}
+	if pinStore != nil {
+		pinStore.Close()
 	}
 	if store != nil {
 		store.Close()

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/fs"
+	"log"
 	"path"
 	"sort"
 	"strings"
@@ -308,9 +309,11 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 	// Rebuild FTS index after bulk operation. This is much faster than
 	// per-row trigger updates (~1s for 131K entries vs minutes with triggers).
 	if err := s.RebuildFTS(); err != nil {
-		// Log but don't fail BulkInsert — stale FTS is recoverable, lost
-		// data isn't. Caller still got their rows.
-		return nil
+		// Stale FTS is recoverable, lost data isn't — the caller's rows
+		// are already committed by the batch loop above. Log loudly so
+		// the user (or a future debugger) can see the search index drifted
+		// from the row store.
+		log.Printf("[metadata] BulkInsert: RebuildFTS failed: %v", err)
 	}
 
 	return nil
