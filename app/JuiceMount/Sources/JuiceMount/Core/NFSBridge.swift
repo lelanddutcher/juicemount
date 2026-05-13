@@ -178,8 +178,11 @@ public enum NFSBridge {
 
         /// True when the result represents something the user might care to
         /// see surfaced on the icon (anything not green, including errors).
+        /// "pending" (no run yet — placeholder served while Go's background
+        /// goroutine is still running its first probe) is NOT attention-worthy;
+        /// it's a transient state, not a real problem.
         public var isAttentionWorthy: Bool {
-            !(status == "green" || status.isEmpty)
+            !(status == "green" || status.isEmpty || status == "pending")
         }
     }
 

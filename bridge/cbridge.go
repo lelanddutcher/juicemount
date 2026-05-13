@@ -6,6 +6,7 @@ package main
 import "C"
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -296,6 +297,10 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/offline":      handleOfflineHTTP,
 			"/reclaim":      handleReclaimHTTP,
 			"/verify-pins":  handleVerifyPinsHTTP,
+			// In-app rescue when the kernel mount table is wedged. Runs the
+			// privileged `umount -f -t nfs` via AppleScript; user enters
+			// their admin password once. Returns JSON with the result.
+			"/force-eject": handleForceEjectHTTP,
 			// A2 — post-mount self-test. GET returns cached result; POST reruns.
 			"/self-test": handleSelfTestHTTP,
 			// Phase B observability: net/http/pprof routes for live
@@ -447,29 +452,58 @@ func stopServerLocked() {
 	// hit a closed fd.
 }
 
-// NFSServerShutdown is a *hard* stop: soft-stop the server, then
-// unmount NFS and FUSE. Use this on app Quit.
+// NFSServerShutdown is a *hard* stop: unmount NFS, then tear down the
+// server, then unmount FUSE. Use this on app Quit and on user-initiated
+// Stop.
+//
+// Order is critical and reverses the previous behavior:
+//
+//  1. Unmount NFS FIRST while the server is still alive and responding.
+//     A live server can fulfill the kernel's flush/getattr calls during
+//     the unmount handshake. If we kill the server first, the kernel's
+//     mount table entry becomes orphaned — every subsequent stat() on
+//     that path waits the full NFS timeout (3 s with the new
+//     timeo=10,retrans=2 settings, was 150 s before that change) before
+//     returning EIO. Finder, doing /Volumes/ enumeration on launch, would
+//     visibly hang on each orphan.
+//
+//  2. Only after the unmount is *confirmed* gone, kill the NFS server.
+//
+//  3. If the unmount fails, we still kill the server (the user clicked
+//     Stop, they want it gone) — but we log a loud ERROR so the user
+//     knows the mount entry is wedged and a reboot may be needed. With
+//     timeo=10,retrans=2 the wedge is annoying-not-catastrophic; with
+//     the old timeo=300,retrans=5 settings, a wedge required reboot.
 //
 //export NFSServerShutdown
 func NFSServerShutdown() {
 	globalMu.Lock()
 	defer globalMu.Unlock()
 
-	// Unmount NFS first so Finder doesn't error after we tear down the server.
+	// Step 1: unmount NFS while server is still alive (kernel handshake works).
+	nfsCleaned := true
 	if globalMountPath != "" {
-		unmountNFS(globalMountPath)
-		globalMountPath = ""
+		nfsCleaned = unmountNFS(globalMountPath)
+		if nfsCleaned {
+			globalMountPath = ""
+		} else {
+			jmlog.Error("nfs unmount FAILED during shutdown",
+				"mount_point", globalMountPath,
+				"hint", "killing server anyway; kernel may have a wedged mount entry until reboot or `sudo umount -f -t nfs`")
+		}
 	}
 
+	// Step 2: tear down server + cache + monitor + metrics + Redis sub.
 	stopServerLocked()
 
-	// Unmount JuiceFS FUSE last — everything above relied on it.
+	// Step 3: unmount FUSE. Same time-bounded best-effort.
 	if globalFUSE != nil {
 		globalFUSE.Stop()
 		globalFUSE = nil
 	}
 	globalFUSEPath = ""
 
+	_ = nfsCleaned // currently observable only via logs; future caller may want a return value
 	jmlog.Close()
 }
 
@@ -618,8 +652,27 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 		return fmt.Errorf("%s is already mounted (umount it first)", mountPoint)
 	}
 
+	// Timeout policy. Tuned for a localhost NFS server (us). The kernel
+	// client's timeo is in 0.1-second units, so timeo=10 means 1 s initial
+	// timeout; retrans=2 means at most 2 retries before returning EIO to
+	// the calling syscall. Worst-case dead-server detection: ~3 s.
+	//
+	// Why this matters: with the previous timeo=300,retrans=5 settings,
+	// when the JuiceMount user-space server died but the kernel mount
+	// table still had /Volumes/zpool registered, every stat() that landed
+	// on that path would wait 150 s before returning EIO. Finder, on
+	// launch, enumerates /Volumes/ to populate the sidebar — that
+	// enumeration includes a stat per mount, so Finder would hang for
+	// 150 s+. Force-quitting Finder didn't help because the relaunched
+	// process repeated the same enumeration. The user perceived "Finder
+	// won't launch."
+	//
+	// The tradeoff: real backend hiccups now surface as EIO after ~3 s
+	// instead of after ~150 s. For our localhost-only NFS path, that's
+	// the right policy — a 3 s blip is annoying, a 150 s blip looks
+	// indistinguishable from a system hang.
 	opts := fmt.Sprintf(
-		"port=%s,mountport=%s,soft,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
+		"port=%s,mountport=%s,soft,intr,timeo=10,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
 		port, port)
 
 	// Build the shell command: mkdir + mount_nfs
@@ -641,43 +694,73 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 	return nil
 }
 
-// unmountNFS removes the NFS mount when the server stops.
-// Best-effort: failure is logged but doesn't prevent shutdown.
+// unmountNFS removes the NFS mount.
+//
+// Each strategy is bounded by a context timeout so a hung NFS operation
+// (kernel stuck talking to a dead server) doesn't wedge our shutdown path
+// for minutes. If every strategy fails, we log loudly and return false —
+// the caller (NFSServerShutdown) decides whether to kill the server
+// anyway.
 //
 // Strategy (cheapest first):
-//   1. `diskutil unmount` — works without sudo for user-owned volumes and
-//      doesn't pop a password prompt. Succeeds in the common case.
+//   1. `diskutil unmount` — works without sudo, doesn't pop a password
+//      prompt. Succeeds in the common case.
 //   2. `diskutil unmount force` — non-interactive force; still no sudo.
-//   3. AppleScript `umount` with administrator privileges — last resort
-//      when diskutil refuses (e.g. busy mount). Prompts for password.
-func unmountNFS(mountPoint string) {
+//   3. `umount -f -t nfs` via AppleScript with administrator privileges —
+//      the only thing that can dislodge a truly wedged kernel mount entry.
+//      Prompts for password.
+//
+// Returns true iff the mount is gone by the time we return.
+func unmountNFS(mountPoint string) bool {
 	if mountPoint == "" || !isMounted(mountPoint) {
-		return
+		return true
 	}
-	// Try diskutil unmount first (no admin prompt)
-	if err := exec.Command("diskutil", "unmount", mountPoint).Run(); err == nil {
-		if !isMounted(mountPoint) {
-			jmlog.Info("nfs unmounted (diskutil)", "mount_point", mountPoint)
-			return
+	tryUnmount := func(name string, timeout time.Duration, argv ...string) bool {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
+		if err != nil {
+			jmlog.Debug("nfs unmount attempt failed",
+				"method", name, "mount_point", mountPoint, "error", err.Error())
+			return false
 		}
-	}
-	// Try forced diskutil unmount (still no admin prompt)
-	if err := exec.Command("diskutil", "unmount", "force", mountPoint).Run(); err == nil {
 		if !isMounted(mountPoint) {
-			jmlog.Info("nfs unmounted (diskutil force)", "mount_point", mountPoint)
-			return
+			jmlog.Info("nfs unmounted", "method", name, "mount_point", mountPoint)
+			return true
 		}
+		return false
 	}
-	// Last resort: AppleScript with admin privileges. Prompts the user.
-	jmlog.Warn("nfs unmount fell back to admin-privileged umount",
+
+	if tryUnmount("diskutil", 5*time.Second, "diskutil", "unmount", mountPoint) {
+		return true
+	}
+	if tryUnmount("diskutil-force", 5*time.Second, "diskutil", "unmount", "force", mountPoint) {
+		return true
+	}
+	// Last resort: AppleScript-prompted privileged umount -f -t nfs.
+	// `-f` forces unmount of unresponsive mounts; `-t nfs` scopes to NFS
+	// so we can never accidentally unmount something else if the mount
+	// path happened to be racy.
+	jmlog.Warn("nfs unmount falling back to admin-privileged umount -f -t nfs",
 		"mount_point", mountPoint,
-		"reason", "diskutil unmount could not release the mount; mount may be busy")
+		"reason", "diskutil could not release the mount; trying forced kernel-level unmount")
 	osaScript := fmt.Sprintf(
-		`do shell script %q with administrator privileges with prompt "JuiceMount is stopping and needs to unmount %s"`,
-		fmt.Sprintf("umount %q", mountPoint),
+		`do shell script %q with administrator privileges with prompt "JuiceMount is stopping and needs to force-unmount %s"`,
+		fmt.Sprintf("umount -f -t nfs %q", mountPoint),
 		mountPoint,
 	)
-	exec.Command("osascript", "-e", osaScript).Run()
+	osaCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(osaCtx, "osascript", "-e", osaScript).Run(); err == nil {
+		if !isMounted(mountPoint) {
+			jmlog.Info("nfs unmounted", "method", "admin-umount-f", "mount_point", mountPoint)
+			return true
+		}
+	}
+	jmlog.Error("nfs unmount FAILED — mount is wedged",
+		"mount_point", mountPoint,
+		"hint", "the kernel mount table still references this mount; a reboot or `sudo umount -f -t nfs` from a fresh terminal may be required")
+	return false
 }
 
 func isMounted(path string) bool {
@@ -1099,6 +1182,48 @@ func handleVerifyPinsHTTP(w http.ResponseWriter, r *http.Request) {
 // handleReclaimHTTP triggers tmutil thinlocalsnapshots / 0 4 — frees Time
 // Machine local snapshots and other purgeable space so JuiceFS can use it
 // for cache. POST or GET; no body. Returns JSON with bytes freed.
+// handleForceEjectHTTP runs the privileged force-unmount path on demand.
+// In-app rescue for the case where Stop failed (or never ran) and the
+// kernel mount table has a wedged `/Volumes/zpool` entry that's making
+// Finder hang. Pops the macOS admin password prompt once.
+//
+// Returns JSON: {"ok": bool, "mount_point": "...", "error": "..."}
+//
+// Idempotent: safe to call even when nothing is mounted.
+func handleForceEjectHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	mp := r.URL.Query().Get("path")
+	if mp == "" {
+		// Default to the configured mount; survives soft-stop because
+		// globalMountPath is retained across Stop/Start cycles for exactly
+		// this kind of recovery.
+		globalMu.Lock()
+		mp = globalMountPath
+		globalMu.Unlock()
+		if mp == "" {
+			mp = "/Volumes/zpool"
+		}
+	}
+	if !isMounted(mp) {
+		fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_clean":true}`, mp)
+		return
+	}
+	ok := unmountNFS(mp)
+	if ok {
+		// Clear the remembered mount path so future Start doesn't try to
+		// "reuse" a path that's no longer mounted.
+		globalMu.Lock()
+		if globalMountPath == mp {
+			globalMountPath = ""
+		}
+		globalMu.Unlock()
+		fmt.Fprintf(w, `{"ok":true,"mount_point":%q}`, mp)
+		return
+	}
+	w.WriteHeader(500)
+	fmt.Fprintf(w, `{"ok":false,"mount_point":%q,"error":"unmount failed; mount may be wedged in kernel — reboot or 'sudo umount -f -t nfs %s' from a fresh terminal"}`, mp, mp)
+}
+
 func handleReclaimHTTP(w http.ResponseWriter, r *http.Request) {
 	freed, err := health.ReclaimPurgeableSpace("/", 0)
 	w.Header().Set("Content-Type", "application/json")
@@ -1392,6 +1517,13 @@ func runAndStoreSelfTest() SelfTestResult {
 }
 
 // handleSelfTestHTTP serves GET (cached) and POST (rerun) on /self-test.
+//
+// GET is intentionally non-blocking: if no run has happened yet, return a
+// "pending" placeholder rather than running synchronously. Synchronous runs
+// inside HTTP handlers serialize with other operations on the localhost NFS
+// mount and make the entire mount appear unresponsive while the 10 MB read
+// is in flight. POST still runs synchronously — the user explicitly asked
+// for a rerun by POSTing.
 func handleSelfTestHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	var out SelfTestResult
@@ -1402,9 +1534,10 @@ func handleSelfTestHTTP(w http.ResponseWriter, r *http.Request) {
 		out = selfTestLast
 		selfTestMu.Unlock()
 		if out.RanAt == "" {
-			// No run yet — kick one off synchronously so the first GET is
-			// useful instead of returning an empty payload.
-			out = runAndStoreSelfTest()
+			out = SelfTestResult{
+				Status: "pending",
+				Hint:   "Self-test has not finished its first run yet. Try again in a few seconds.",
+			}
 		}
 	}
 	_ = json.NewEncoder(w).Encode(out)
