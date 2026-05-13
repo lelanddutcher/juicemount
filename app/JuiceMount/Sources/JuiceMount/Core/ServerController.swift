@@ -129,10 +129,14 @@ public final class ServerController {
                     // have happened during the sync.
                     self?.state = .running
                     self?.refreshStats()
-                    // Re-run the self-test in the background — Sync Now is the
-                    // user's "is everything OK?" lever, so updating the probe
-                    // result is the right thing to do.
-                    self?.refreshSelfTest(force: true, delayMs: 0)
+                    // Intentionally NOT triggering refreshSelfTest here. Sync
+                    // Now is supposed to be a lightweight metadata refresh.
+                    // Auto-running a 10 MB read on the localhost NFS mount
+                    // serializes with other mount ops and made the mount
+                    // appear frozen during sync. Self-test runs once at
+                    // launch (Go-side background goroutine) and rerunnable
+                    // only via explicit user action (planned future button)
+                    // or `curl -X POST http://127.0.0.1:11050/self-test`.
                 }
             } catch {
                 Task { @MainActor in

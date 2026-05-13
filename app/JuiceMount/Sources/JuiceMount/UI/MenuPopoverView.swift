@@ -217,6 +217,68 @@ struct MenuPopoverView: View {
 
     // MARK: - Diagnostics export
 
+    /// In-app rescue: force-unmount the NFS volume via the privileged
+    /// `umount -f -t nfs` path. Used when the kernel mount table has a
+    /// wedged entry (server died, kernel still has the mount registered,
+    /// every stat() hangs). Confirms first so it can't be accidental,
+    /// then POSTs /force-eject on the control plane which triggers the
+    /// AppleScript-with-admin path.
+    private func forceEjectMount() {
+        let alert = NSAlert()
+        alert.messageText = "Force Eject JuiceMount?"
+        alert.informativeText = """
+            This will unmount /Volumes/zpool using a privileged kernel-level \
+            unmount. macOS will prompt for your administrator password.
+
+            Use this only if Stop didn't work or Finder is hanging on the \
+            mount. Any file currently open from the mount will see an \
+            "input/output error."
+            """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Force Eject")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let url = URL(string: "http://127.0.0.1:11050/force-eject") else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            // Long timeout — the AppleScript admin prompt may sit waiting
+            // for the user to enter their password before the underlying
+            // umount even runs.
+            req.timeoutInterval = 120
+
+            let sem = DispatchSemaphore(value: 0)
+            var ok = false
+            var errMsg: String?
+            URLSession.shared.dataTask(with: req) { data, _, err in
+                defer { sem.signal() }
+                if let err = err { errMsg = err.localizedDescription; return }
+                guard let data = data,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { errMsg = "Empty or invalid response from /force-eject"; return }
+                ok = (obj["ok"] as? Bool) ?? false
+                if !ok { errMsg = (obj["error"] as? String) ?? "Unknown error" }
+            }.resume()
+            sem.wait()
+
+            DispatchQueue.main.async {
+                if ok {
+                    let done = NSAlert()
+                    done.messageText = "Mount Ejected"
+                    done.informativeText = "/Volumes/zpool is no longer in the kernel mount table. Finder should now be responsive."
+                    done.runModal()
+                } else {
+                    showAlert(
+                        title: "Force Eject Failed",
+                        message: (errMsg ?? "Unknown error")
+                            + "\n\nA reboot, or `sudo umount -f -t nfs /Volumes/zpool` from a fresh terminal, will clear the wedge."
+                    )
+                }
+            }
+        }
+    }
+
     /// Shows an NSSavePanel suggesting a timestamped filename on the
     /// Desktop. On accept, runs DiagnosticsExporter off the main thread
     /// and reports success/failure via NSAlert. The save panel itself
@@ -687,6 +749,18 @@ struct MenuPopoverView: View {
                 title: "Export Diagnostics…",
                 systemImage: "tray.and.arrow.up",
                 action: { exportDiagnostics() }
+            )
+
+            // In-app rescue when the kernel mount table is wedged.
+            // Runs `umount -f -t nfs <path>` via AppleScript-with-admin,
+            // which is the only thing that can dislodge an NFS mount whose
+            // server has died. Hidden behind a clear confirmation so the
+            // user doesn't accidentally trigger it.
+            ActionButton(
+                title: "Force Eject Mount",
+                systemImage: "eject.circle",
+                tint: .orange,
+                action: { forceEjectMount() }
             )
 
             ActionButton(
