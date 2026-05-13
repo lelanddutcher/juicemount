@@ -557,8 +557,16 @@ func (rc *RedisClient) syncMetadata() error {
 		return fmt.Errorf("all paths: %w", err)
 	}
 
-	rc.mu.Lock()
-	// Increment absence counter for paths not in Redis; clear for paths that returned.
+	// pruneAbsent is single-writer (only syncMetadata mutates it, and
+	// syncMetadata is single-flighted via syncNowCh + the periodic loop).
+	// External readers (Stats pollers, etc.) take rc.mu.RLock for OTHER
+	// fields (lastSyncDuration, lastSyncTime, etc.) — they never touch
+	// pruneAbsent. So holding rc.mu around the 131K-entry iteration was
+	// unnecessary serialization that made Stats pollers wait tens of
+	// milliseconds per sync. Dropped.
+	//
+	// If a second writer of pruneAbsent ever appears, this must take the
+	// lock again. The map type itself isn't goroutine-safe.
 	for p := range existingPaths {
 		if _, inRedis := redisPaths[p]; !inRedis {
 			rc.pruneAbsent[p]++
@@ -580,7 +588,6 @@ func (rc *RedisClient) syncMetadata() error {
 			delete(rc.pruneAbsent, p)
 		}
 	}
-	rc.mu.Unlock()
 
 	if len(toDelete) > 0 {
 		if err := rc.store.DeletePaths(toDelete); err != nil {
