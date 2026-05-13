@@ -414,3 +414,43 @@ e. Audit Swift side for blocking-on-MainActor patterns. The Go side is
 
 Iteration 5 plan: spawn the code-reviewer agent on tonight's commits
 (item d) + land items a + b as small defensive fixes.
+
+---
+
+## Iteration 5 — 2026-05-13 ~04:39
+
+**Spawned code-reviewer sub-agent** on tonight's four root-cause commits
+(`1d73c7d`, `a12bd8c`, `a5a42e5`, `adf70b8`) to second-guess the design.
+Still running in background; results will be processed in iteration 6.
+
+**Landed defensive fixes (items a + b from iteration 4's plan):**
+
+Commit `0316096`. File: `health/fuse.go`.
+
+- `tailJuiceFSLog` now a method on FUSEManager that listens to
+  `fm.stopCh` in three places (the wait-for-file loop, the
+  scanner-restart loop pre-check, and the sleep between restarts).
+  Previously leaked the goroutine + open file handle on every
+  FUSEManager.Stop().
+
+- `FUSEManager.Stop()` bounds the `<-fm.done` join with a 10 s race.
+  Previously a bare blocking receive; if monitorLoop was mid-syscall
+  it could park the user-visible Stop button for the full syscall
+  duration. Now if the monitor doesn't exit in 10 s, we log a warning
+  and proceed with unmount anyway (goroutine becomes a zombie, user's
+  click returns).
+
+## Tonight's running tally
+
+| # | Commit | Fix |
+|---|---|---|
+| 1 | `1121bae` | NFS timeo 300→10, retrans 5→2, Force Eject, ordered shutdown |
+| 2 | `1d73c7d` | FUSE-direct self-test (no NFS loopback wedge) |
+| 3 | `a12bd8c` | All `health/` shell-outs bounded with CommandContext |
+| 4 | `a5a42e5` | `globalMu` snapshot-then-release in every slow cgo export |
+| 5 | `adf70b8` | Chunked `BulkInsert` + pin store `busy_timeout` |
+| 6 | `0316096` | `tailJuiceFSLog` stopCh + `FUSEManager.Stop` bounded |
+
+Six commits closing the hang/crash failure modes. Production build refreshed
+at the end of iteration 4 (`build/JuiceMount.app` ready for morning launch
+once the kernel mount table is cleared).
