@@ -212,16 +212,25 @@ public enum NFSBridge {
         }
     }
 
-    /// Soft stop: tears down the NFS server, sync loop, cache, monitor,
-    /// and metrics, but leaves the FUSE and NFS mounts in place. The next
-    /// `start(...)` will reuse those mounts and avoid a password prompt.
+    /// User-visible Stop: tears everything down AND unmounts FUSE + NFS.
+    /// This matches user expectations — "Stop" means the mount is gone.
+    ///
+    /// NFS unmount goes through `diskutil unmount` first (no admin prompt
+    /// in the common case), falling back to a privileged umount only if
+    /// the mount is genuinely busy.
     public static func stop() {
+        NFSServerShutdown()
+    }
+
+    /// Soft stop for the internal Restart path. Leaves FUSE + NFS mounted
+    /// so the subsequent Start avoids re-mounting. Never call this from a
+    /// user-initiated Stop — the user expects the mount to disappear.
+    public static func softStop() {
         NFSServerStop()
     }
 
-    /// Hard stop: soft stop, then unmount NFS and FUSE. Use on app Quit.
-    /// Triggers two admin-password prompts (one per unmount), so don't
-    /// call this on a routine Stop.
+    /// Hard stop (alias for `stop()`). Kept for callers that want to be
+    /// explicit about intent (e.g. applicationWillTerminate).
     public static func shutdown() {
         NFSServerShutdown()
     }

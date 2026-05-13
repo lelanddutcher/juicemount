@@ -64,7 +64,7 @@ public final class ServerController {
     }
 
     public func stop(completion: (@MainActor () -> Void)? = nil) {
-        log.info("Stopping server")
+        log.info("Stopping server (full unmount)")
         pollTask?.cancel()
         pollTask = nil
         workQueue.async { [weak self] in
@@ -77,11 +77,29 @@ public final class ServerController {
         }
     }
 
-    /// Restart with a proper completion handoff — waits for stop to fully
-    /// complete before kicking off start. Replaces the previous fixed-delay
-    /// implementation that could race under load.
+    /// Internal soft-stop used by `restart()`. Leaves FUSE + NFS mounted so
+    /// the subsequent start is fast and prompt-free. Not exposed in the UI
+    /// — the user-facing Stop button uses the hard `stop()` above.
+    private func softStop(completion: (@MainActor () -> Void)? = nil) {
+        log.info("Soft-stopping server (mounts preserved)")
+        pollTask?.cancel()
+        pollTask = nil
+        workQueue.async { [weak self] in
+            NFSBridge.softStop()
+            Task { @MainActor in
+                self?.state = .idle
+                self?.stats = .zero
+                completion?()
+            }
+        }
+    }
+
+    /// Restart with a proper completion handoff — waits for soft-stop to
+    /// fully complete before kicking off start. Restart uses softStop so
+    /// FUSE/NFS stay up between the teardown and the new start, avoiding
+    /// a password prompt the user didn't ask for.
     public func restart() {
-        stop { [weak self] in
+        softStop { [weak self] in
             self?.start()
         }
     }
