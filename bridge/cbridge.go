@@ -411,47 +411,71 @@ func labelFor(healthy bool, msg string) string {
 //
 //export NFSServerStop
 func NFSServerStop() {
-	globalMu.Lock()
-	defer globalMu.Unlock()
-
 	stopServerLocked()
 }
 
 // stopServerLocked tears down everything except the FUSE/NFS mounts.
-// Caller must hold globalMu.
+//
+// Locking: this function takes globalMu BRIEFLY to swap globals into
+// locals (atomically nil-ing the publicly-observable state), then
+// releases the lock and calls .Stop() / .Close() on the snapshots
+// without holding it. The .Stop() methods can each take seconds (NFS
+// server waits for in-flight RPCs to drain; HealthMonitor cancels its
+// context and joins probe goroutines); holding globalMu across them
+// would make every concurrent Stats / IsRunning / CacheStatus call from
+// the menu-bar poller park behind the teardown.
+//
+// The name is historical — it used to require the caller to hold the
+// lock. Both call sites (NFSServerStop, NFSServerShutdown) have been
+// adjusted accordingly.
 func stopServerLocked() {
 	// Detach the /health closure first so a probe arriving during
 	// tear-down doesn't see partially-released state.
 	metrics.Default().SetHealthProvider(nil)
 
-	if globalMetrics != nil {
-		globalMetrics.Stop()
-		globalMetrics = nil
+	// Snapshot + nil under the lock.
+	globalMu.Lock()
+	metricsSrv := globalMetrics
+	monitor := globalMonitor
+	server := globalServer
+	cache := globalCache
+	rc := globalRC
+	store := globalStore
+	rdb := globalRDB
+	globalMetrics = nil
+	globalMonitor = nil
+	globalServer = nil
+	globalCache = nil
+	globalRC = nil
+	globalStore = nil
+	globalRDB = nil
+	globalMu.Unlock()
+
+	// Now run the slow shutdown work on the snapshots, no lock held.
+	// During this window, Stats / IsRunning / CacheStatus correctly
+	// report "Running: false" — we already nil'd the publicly-visible
+	// state, so the answer is honest, not a lie.
+	if metricsSrv != nil {
+		metricsSrv.Stop()
 	}
-	if globalMonitor != nil {
-		globalMonitor.Stop()
-		globalMonitor = nil
+	if monitor != nil {
+		monitor.Stop()
 	}
-	if globalServer != nil {
-		globalServer.Handler().StopHandler()
-		globalServer.Stop()
-		globalServer = nil
+	if server != nil {
+		server.Handler().StopHandler()
+		server.Stop()
 	}
-	if globalCache != nil {
-		globalCache.Stop()
-		globalCache = nil
+	if cache != nil {
+		cache.Stop()
 	}
-	if globalRC != nil {
-		globalRC.Stop()
-		globalRC = nil
+	if rc != nil {
+		rc.Stop()
 	}
-	if globalStore != nil {
-		globalStore.Close()
-		globalStore = nil
+	if store != nil {
+		store.Close()
 	}
-	if globalRDB != nil {
-		globalRDB.Close()
-		globalRDB = nil
+	if rdb != nil {
+		rdb.Close()
 	}
 
 	// Detach the RPC observer so the next start cleanly re-registers.
@@ -487,41 +511,69 @@ func stopServerLocked() {
 //
 //export NFSServerShutdown
 func NFSServerShutdown() {
+	// CRITICAL: do NOT hold globalMu across the slow unmount paths. Each
+	// can take seconds-to-minutes (osascript admin prompt, kernel umount
+	// retries). Menu-bar pollers calling Stats / IsRunning every 2 s would
+	// stack up behind a held globalMu and freeze the UI for the full
+	// duration of shutdown.
+	//
+	// Pattern:
+	//   1. Lock briefly, snapshot pointers, mark globals as "shutting down"
+	//      (by setting them to nil), release lock.
+	//   2. Stats / IsRunning called concurrently from this point see
+	//      "Running: false" — correct (we're shutting down).
+	//   3. Run slow unmount work WITHOUT the lock.
+	//   4. Re-acquire briefly to call stopServerLocked which expects the
+	//      lock held; it operates on the snapshotted pointers.
 	globalMu.Lock()
-	defer globalMu.Unlock()
+	mountPath := globalMountPath
+	fuse := globalFUSE
+	// Mark "shutting down" by nil-ing the publicly-observable fields. The
+	// snapshotted pointers stay valid for the unmount work below.
+	globalMountPath = ""
+	globalFUSE = nil
+	globalFUSEPath = ""
+	globalMu.Unlock()
 
-	// Step 1: unmount NFS while server is still alive (kernel handshake works).
+	// Step 1: unmount NFS while the server is still alive (handler can
+	// satisfy any kernel flush/getattr during the unmount handshake). No
+	// lock held — Stats during this window correctly reports "shutting
+	// down" via Running:false.
 	nfsCleaned := true
-	if globalMountPath != "" {
-		nfsCleaned = unmountNFS(globalMountPath)
-		if nfsCleaned {
-			globalMountPath = ""
-		} else {
+	if mountPath != "" {
+		nfsCleaned = unmountNFS(mountPath)
+		if !nfsCleaned {
 			jmlog.Error("nfs unmount FAILED during shutdown",
-				"mount_point", globalMountPath,
+				"mount_point", mountPath,
 				"hint", "killing server anyway; kernel may have a wedged mount entry until reboot or `sudo umount -f -t nfs`")
 		}
 	}
 
 	// Step 2: tear down server + cache + monitor + metrics + Redis sub.
+	// stopServerLocked takes globalMu briefly to nil the globals, then
+	// runs the slow .Stop() calls without the lock held.
 	stopServerLocked()
 
-	// Step 3: unmount FUSE. Same time-bounded best-effort.
-	if globalFUSE != nil {
-		globalFUSE.Stop()
-		globalFUSE = nil
+	// Step 3: unmount FUSE. Health.FUSEManager.Stop() now bounded (see
+	// iteration 2 commits). No lock held.
+	if fuse != nil {
+		fuse.Stop()
 	}
-	globalFUSEPath = ""
 
-	_ = nfsCleaned // currently observable only via logs; future caller may want a return value
+	_ = nfsCleaned // currently observable only via logs
 	jmlog.Close()
 }
 
 //export NFSServerIsRunning
 func NFSServerIsRunning() C.int {
+	// Snapshot-then-release. Holding globalMu across the read meant any
+	// in-flight Shutdown (which holds globalMu for up to ~70 s during the
+	// osascript admin prompt for unmount) would park IsRunning calls from
+	// the menu-bar poller — blocking the UI's idle render loop.
 	globalMu.Lock()
-	defer globalMu.Unlock()
-	if globalServer != nil {
+	running := globalServer != nil
+	globalMu.Unlock()
+	if running {
 		return 1
 	}
 	return 0
@@ -541,21 +593,38 @@ type StatsResult struct {
 
 //export NFSServerStats
 func NFSServerStats() *C.char {
+	// Snapshot all globals under the lock, release IMMEDIATELY, then call
+	// methods on the snapshots without holding globalMu. Each method we
+	// call (RC.LastSyncDuration, server.Addr, monitor.Status) has its own
+	// internal locking and can take milliseconds-to-seconds under load.
+	// Holding globalMu across them meant a single slow Stats call would
+	// block every other export — most importantly, Shutdown couldn't
+	// proceed and IsRunning calls from the menu bar poller would queue
+	// behind it. The menu freeze.
+	//
+	// Snapshots can briefly outlive their globals (e.g. mid-Shutdown), but
+	// the underlying objects are not yet finalized when their pointers are
+	// nil'd — they're still alive until their .Stop() returns and Go GCs
+	// them. So calling a method on a snapshot post-nil is safe; it returns
+	// a stale-but-coherent reading. The next poll cycle 2 s later picks up
+	// the cleared state.
 	globalMu.Lock()
-	defer globalMu.Unlock()
+	server := globalServer
+	rc := globalRC
+	monitor := globalMonitor
+	globalMu.Unlock()
 
-	stats := StatsResult{Running: globalServer != nil}
-
-	if globalRC != nil {
-		stats.LastSyncMs = globalRC.LastSyncDuration().Milliseconds()
-		stats.LastSyncTime = globalRC.LastSyncTime().Format(time.RFC3339)
-		stats.EntryCount = globalRC.LastSyncEntries()
+	stats := StatsResult{Running: server != nil}
+	if rc != nil {
+		stats.LastSyncMs = rc.LastSyncDuration().Milliseconds()
+		stats.LastSyncTime = rc.LastSyncTime().Format(time.RFC3339)
+		stats.EntryCount = rc.LastSyncEntries()
 	}
-	if globalServer != nil {
-		stats.ServerAddr = globalServer.Addr()
+	if server != nil {
+		stats.ServerAddr = server.Addr()
 	}
-	if globalMonitor != nil {
-		status := globalMonitor.Status()
+	if monitor != nil {
+		status := monitor.Status()
 		stats.HealthRedis = status.Redis.Healthy
 		stats.HealthMinIO = status.MinIO.Healthy
 		stats.HealthFUSE = status.FUSE.Healthy
@@ -583,14 +652,20 @@ func NFSServerMetrics() *C.char {
 // SyncNow triggers an immediate metadata reconciliation.
 //export NFSServerSyncNow
 func NFSServerSyncNow() *C.char {
+	// Snapshot RC under the lock, release, then run the (slow) SyncOnce
+	// without holding globalMu. SyncOnce does a Redis Lua EVAL bounded by
+	// 120 s — holding globalMu across that window would freeze every other
+	// export, including the menu-bar poller's Stats calls. The user's
+	// "Sync Now froze the app" report was directly this bug.
 	globalMu.Lock()
-	defer globalMu.Unlock()
+	rc := globalRC
+	globalMu.Unlock()
 
-	if globalRC == nil {
+	if rc == nil {
 		return C.CString("error: not running")
 	}
 
-	if err := globalRC.SyncOnce(); err != nil {
+	if err := rc.SyncOnce(); err != nil {
 		return C.CString(fmt.Sprintf("error: %v", err))
 	}
 	return C.CString("ok")
@@ -613,10 +688,15 @@ type SearchResult struct {
 // Returns JSON array of SearchResult, or "error: ..." on failure.
 //export NFSServerSearch
 func NFSServerSearch(query *C.char, limit C.int, parentPath *C.char) *C.char {
+	// Snapshot store under the lock; release; run the FTS query without
+	// the lock. Search reads the SQLite FTS5 index which can take tens of
+	// milliseconds on a 100K+ entry corpus — holding globalMu for that
+	// duration would block the popover's poller.
 	globalMu.Lock()
-	defer globalMu.Unlock()
+	store := globalStore
+	globalMu.Unlock()
 
-	if globalStore == nil {
+	if store == nil {
 		return C.CString("error: not running")
 	}
 
@@ -624,7 +704,7 @@ func NFSServerSearch(query *C.char, limit C.int, parentPath *C.char) *C.char {
 	pp := C.GoString(parentPath)
 	lim := int(limit)
 
-	results, err := globalStore.Search(q, lim, pp)
+	results, err := store.Search(q, lim, pp)
 	if err != nil {
 		return C.CString(fmt.Sprintf("error: %v", err))
 	}
@@ -990,24 +1070,29 @@ type PinResult struct {
 //
 //export NFSServerPin
 func NFSServerPin(rootPath *C.char) *C.char {
+	// Snapshot under the lock; the slow walk + DB inserts run unlocked.
+	// pin.CountFilesUnder walks a directory tree (can be seconds on a
+	// large project); PinMany does a multi-batch SQL transaction.
 	globalMu.Lock()
-	defer globalMu.Unlock()
-	if globalPinStore == nil {
+	pinStore := globalPinStore
+	mountPath := globalMountPath
+	fusePath := globalFUSEPath
+	globalMu.Unlock()
+
+	if pinStore == nil {
 		return jsonStr(PinResult{Error: "pin store not initialized"})
 	}
 	root := C.GoString(rootPath)
-	// Translate /Volumes/zpool/X to <fusePath>/X for the walk
-	walkPath := translateMountToFUSE(root, globalMountPath, globalFUSEPath)
+	walkPath := translateMountToFUSE(root, mountPath, fusePath)
 	entries, err := pin.CountFilesUnder(walkPath)
 	if err != nil {
 		return jsonStr(PinResult{Error: err.Error()})
 	}
-	// Translate FUSE paths back to /Volumes/zpool paths for storage
 	for i := range entries {
-		entries[i].Path = translateFUSEToMount(entries[i].Path, globalFUSEPath, globalMountPath)
+		entries[i].Path = translateFUSEToMount(entries[i].Path, fusePath, mountPath)
 		entries[i].PinRoot = root
 	}
-	if err := globalPinStore.PinMany(entries); err != nil {
+	if err := pinStore.PinMany(entries); err != nil {
 		return jsonStr(PinResult{Error: err.Error()})
 	}
 	var totalBytes int64
@@ -1022,11 +1107,13 @@ func NFSServerPin(rootPath *C.char) *C.char {
 //export NFSServerUnpin
 func NFSServerUnpin(rootPath *C.char) *C.char {
 	globalMu.Lock()
-	defer globalMu.Unlock()
-	if globalPinStore == nil {
+	pinStore := globalPinStore
+	globalMu.Unlock()
+
+	if pinStore == nil {
 		return jsonStr(PinResult{Error: "pin store not initialized"})
 	}
-	n, err := globalPinStore.Unpin(C.GoString(rootPath))
+	n, err := pinStore.Unpin(C.GoString(rootPath))
 	if err != nil {
 		return jsonStr(PinResult{Error: err.Error()})
 	}
@@ -1043,20 +1130,26 @@ type CacheStatus struct {
 
 //export NFSServerCacheStatus
 func NFSServerCacheStatus() *C.char {
+	// Snapshot-then-release (see NFSServerStats comment for rationale).
+	// CacheStatus is called every 2 s by the popover; cannot park behind
+	// other long-held globalMu callers.
 	globalMu.Lock()
-	defer globalMu.Unlock()
-	if globalPinStore == nil {
+	pinStore := globalPinStore
+	prefetcher := globalPrefetcher
+	globalMu.Unlock()
+
+	if pinStore == nil {
 		return jsonStr(CacheStatus{OfflineMode: pin.IsOffline()})
 	}
 	cs := CacheStatus{OfflineMode: pin.IsOffline()}
-	if a, err := globalPinStore.AggregateStats(); err == nil {
+	if a, err := pinStore.AggregateStats(); err == nil {
 		cs.Aggregate = a
 	}
-	if r, err := globalPinStore.PinRoots(); err == nil {
+	if r, err := pinStore.PinRoots(); err == nil {
 		cs.Roots = r
 	}
-	if globalPrefetcher != nil {
-		cs.LiveStats = globalPrefetcher.LiveStats()
+	if prefetcher != nil {
+		cs.LiveStats = prefetcher.LiveStats()
 	}
 	return jsonStr(cs)
 }
