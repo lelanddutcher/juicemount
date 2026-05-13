@@ -115,6 +115,30 @@ else
 fi
 codesign --verify --verbose=2 "$APP_DIR" 2>&1 | head -3 || true
 
+# Guard: refuse to ship a build that contains a FileProvider extension.
+#
+# Why: a Xcode-Debug build from an older JuiceMount project once registered
+# a FileProviderExtension domain with macOS. The registration persists in
+# fileproviderd's database FOREVER (even after the project is deleted),
+# silently routes /Volumes/zpool file access through file-coordination
+# arbitration, and pins filecoordinationd at 100%+ CPU. Recovery required
+# Finder's privileged XPC removeDomain to dislodge -- see
+# docs/no-fileprovider.md for the postmortem.
+#
+# JuiceMount serves files via NFS and FUSE. It does not need a FileProvider
+# extension. If somebody adds one (even an empty stub), this guard fires.
+if [ -d "$APP_DIR/Contents/PlugIns" ]; then
+    echo ""
+    echo "ERROR: build output contains $APP_DIR/Contents/PlugIns"
+    echo "  Bundled extensions (especially FileProviderExtension) silently"
+    echo "  register with macOS on first launch and can persist as ghost"
+    echo "  domains for the life of this Mac. See docs/no-fileprovider.md."
+    echo "  If a future architectural change genuinely needs an app extension,"
+    echo "  remove this guard intentionally and document the removeDomain"
+    echo "  lifecycle plan."
+    exit 1
+fi
+
 echo ""
 echo "==> Build complete"
 echo "    App:  $APP_DIR"

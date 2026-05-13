@@ -608,10 +608,35 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 
 // unmountNFS removes the NFS mount when the server stops.
 // Best-effort: failure is logged but doesn't prevent shutdown.
+//
+// Strategy (cheapest first):
+//   1. `diskutil unmount` — works without sudo for user-owned volumes and
+//      doesn't pop a password prompt. Succeeds in the common case.
+//   2. `diskutil unmount force` — non-interactive force; still no sudo.
+//   3. AppleScript `umount` with administrator privileges — last resort
+//      when diskutil refuses (e.g. busy mount). Prompts for password.
 func unmountNFS(mountPoint string) {
 	if mountPoint == "" || !isMounted(mountPoint) {
 		return
 	}
+	// Try diskutil unmount first (no admin prompt)
+	if err := exec.Command("diskutil", "unmount", mountPoint).Run(); err == nil {
+		if !isMounted(mountPoint) {
+			jmlog.Info("nfs unmounted (diskutil)", "mount_point", mountPoint)
+			return
+		}
+	}
+	// Try forced diskutil unmount (still no admin prompt)
+	if err := exec.Command("diskutil", "unmount", "force", mountPoint).Run(); err == nil {
+		if !isMounted(mountPoint) {
+			jmlog.Info("nfs unmounted (diskutil force)", "mount_point", mountPoint)
+			return
+		}
+	}
+	// Last resort: AppleScript with admin privileges. Prompts the user.
+	jmlog.Warn("nfs unmount fell back to admin-privileged umount",
+		"mount_point", mountPoint,
+		"reason", "diskutil unmount could not release the mount; mount may be busy")
 	osaScript := fmt.Sprintf(
 		`do shell script %q with administrator privileges with prompt "JuiceMount is stopping and needs to unmount %s"`,
 		fmt.Sprintf("umount %q", mountPoint),
