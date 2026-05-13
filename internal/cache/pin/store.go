@@ -89,7 +89,13 @@ func Open(dbPath string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	if _, err := db.Exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;`); err != nil {
+	// busy_timeout matches the metadata store. Without it, a concurrent
+	// IsPinnedReady on the hot offline-gate path returns "database is
+	// locked" the instant a Pin/UpdateStatus transaction begins. With
+	// 30 000 ms the reader waits for the writer to finish (typically
+	// <50 ms) instead of erroring up to the NFS handler, which returns
+	// EIO to the kernel and looks like "the mount is broken."
+	if _, err := db.Exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 30000;`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("set pragmas: %w", err)
 	}
