@@ -338,3 +338,79 @@ from three independent angles:
 Next iteration: Fix #4 — chunk `BulkInsert` to release `writeMu` between
 batches + add `busy_timeout` PRAGMA to pin store. Also start running
 unit tests under race detector to surface any remaining contention.
+
+---
+
+## Iteration 4 — 2026-05-13 ~04:05
+
+**Implemented Fix #4** — chunk `BulkInsert` writeMu acquisition + pin store
+busy_timeout.
+
+Commit `adf70b8`. Files: `metadata/store.go`, `internal/cache/pin/store.go`.
+
+- `BulkInsert` no longer holds `writeMu` across the entire multi-batch
+  loop. Each batch is its own acquisition (~ms hold). Concurrent NFS
+  write-backs (UpdateSize, applyEvent inserts) get their turn between
+  batches instead of waiting for the full sync to finish.
+- `pin.Store` opens with `busy_timeout = 30000` so the hot offline-gate
+  reader (`IsPinnedReady`) waits for in-flight writes (~50 ms) instead
+  of returning "database is locked" → EIO up to the NFS handler.
+
+**Race-detector test pass:**
+- `internal/cache/pin` ✓
+- `internal/jmlog` ✓
+- `cache` ✓
+- `metadata` non-Redis subset ✓ (Redis-backed integration tests are
+  ~25× slower under -race; can't be run in the overnight loop windows)
+
+**Fresh production build:** done. `build/JuiceMount.app` has all four
+fixes baked in (ad-hoc signed, JM_QUICK=1 — for distribution you'll
+need to set up Developer ID, see `docs/signing.md`).
+
+## State at end of iteration 4
+
+All four confirmed root causes addressed:
+
+| # | Mechanism | Commit |
+|---|---|---|
+| 1 | self-test re-enters own NFS server (loopback wedge) | `1d73c7d` |
+| 2 | `mount` shell-out hangs in kernel under `fm.mu` | `a12bd8c` |
+| 3 | `globalMu` held during slow ops → menu-bar freeze | `a5a42e5` |
+| 4 | `BulkInsert` holds `writeMu` for full multi-batch loop | `adf70b8` |
+
+Plus earlier today (commit `1121bae`): NFS timeo 300→10, retrans 5→2,
+Force Eject button, ordered shutdown.
+
+The "click menu-bar icon → app freezes → mount wedges → Finder can't
+launch" cascade has been broken in five independent places. If it
+still reproduces tomorrow, the failure mode is something we haven't
+audited yet — and the new audit will be cheap because the four obvious
+mechanisms are out of the way.
+
+## Next directions to consider in remaining iterations
+
+The four known root causes are closed. Remaining items from the
+agent reports plus my own enumeration of fragility:
+
+a. `tailJuiceFSLog` has no stop channel — leaks the goroutine + open
+   file handle on FUSEManager.Stop(). MEDIUM severity.
+
+b. `FUSEManager.Stop()` waits `<-fm.done` without timeout — if
+   monitorLoop is parked in a now-bounded `mount` syscall, this still
+   takes 5 s. Worth bounding the wait.
+
+c. `RedisClient.pruneAbsent` holds `RedisClient.mu` write lock during
+   the 131K-entry counter iteration — Agent 2's medium. Affects status
+   pollers reading `LastSyncDuration` etc. Less critical now that
+   Stats uses snapshot pattern.
+
+d. Spawn a code-reviewer sub-agent on the four commits tonight to
+   second-guess the design before user wakes. Catches any subtle bugs
+   I missed.
+
+e. Audit Swift side for blocking-on-MainActor patterns. The Go side is
+   now hardened; if SwiftUI code somehow blocks MainActor on a cgo
+   call, that's the next bottleneck.
+
+Iteration 5 plan: spawn the code-reviewer agent on tonight's commits
+(item d) + land items a + b as small defensive fixes.
