@@ -771,3 +771,95 @@ conn.go commit.
 10 commits. The dominant architectural finding (concurrent RPC
 dispatch) is documented above with a recommended implementation —
 ready to land tomorrow with your eyes on it.
+
+---
+
+## Iteration 8 — 2026-05-13 ~06:15
+
+**Audited the read-path cache layer.** Files reviewed:
+`cache/reader.go`, `internal/cache/pin/{prefetcher,offline}.go`,
+`nfs/membuf.go`, `nfs/readahead.go`, `nfs/fdpool.go`.
+
+### Verdict on hot-path lock discipline
+
+**Clean.** All three caches (Reader, MemoryBuffer, FDPool) follow the
+correct pattern: take lock, check map, release lock, perform syscall,
+re-take lock to insert. No blocking I/O happens under any mutex. The
+prefetcher uses a bounded N-worker pool draining a 256-slot channel
+— right architecture.
+
+### Two HIGH findings fixed (commit `93e9d8d`)
+
+**HIGH #1 — `MemoryBuffer.Get` cascade-freeze on wedged loadFile.**
+`nfs/membuf.go:85`. A second RPC for a mid-loading file dropped the
+mutex and blocked on `<-entry.ready` forever. If `loadFile` was stuck
+on a wedged FUSE read (MinIO unreachable, JuiceFS hung), every
+subsequent reader of the same file parked there indefinitely. Now
+bounded by `memBufLoadTimeout = 5s`. On timeout the caller returns
+nil, falling through to the SSD-direct `cacheReader.ReadBlock` (a
+separate code path that reads JuiceFS chunk files from local SSD via
+Redis slice lookup — no FUSE involvement). If that also misses, the
+caller hits the FUSE fd pool where the stall is per-RPC rather than
+cascading-shared.
+
+**HIGH #2 — Cache Redis client had no explicit timeouts.**
+`bridge/cbridge.go:217`. `cache.Reader.getSlices` does a Redis
+`LRange` on every cache-miss read. With no explicit `ReadTimeout`,
+the go-redis default applies and a Redis hiccup parks every concurrent
+NFS RPC. Now matches the metadata client pattern:
+`ReadTimeout=10s, WriteTimeout=5s, DialTimeout=5s`.
+
+### One LOW finding noted, not fixed
+
+`nfs/membuf.go:164` — `data := make([]byte, fileSize)` allocates the
+full file size on cache miss. The race window between budget reservation
+and population means concurrent misses for different files could each
+peak-allocate up to budget simultaneously. Not a freeze risk; bounded
+in practice by the small race window. Noted for future cleanup.
+
+### Read-path context propagation (deferred to morning)
+
+The audit also flagged that `cachedFile.ReadAt` calls
+`cacheReader.ReadBlock(context.Background(), ...)` — the actual NFS
+RPC's context never reaches the cache layer. Threading context through
+`billy.File.ReadAt` would require changing the third-party `billy`
+interface signature, which is a non-trivial change. The two timeouts
+above mitigate the worst symptom (cascade-freezes), so the context
+work can wait for your review tomorrow.
+
+## Tonight's final tally (iteration 8)
+
+| # | Commit | Fix |
+|---|---|---|
+| 1 | `1121bae` | NFS timeo 300→10, retrans 5→2, Force Eject, ordered shutdown |
+| 2 | `1d73c7d` | FUSE-direct self-test (no NFS loopback wedge) |
+| 3 | `a12bd8c` | All `health/` shell-outs bounded with CommandContext |
+| 4 | `a5a42e5` | `globalMu` snapshot-then-release in every slow cgo export |
+| 5 | `adf70b8` | Chunked `BulkInsert` + pin store `busy_timeout` |
+| 6 | `0316096` | `tailJuiceFSLog` stopCh + `FUSEManager.Stop` bounded |
+| 7 | `21db111` | Code-review followups: 3 HIGH bugs in #2–#5 closed |
+| 8 | `0a7f767` | `rc.mu` dropped around `pruneAbsent` iteration |
+| 9 | `e603eab` | Swift popover: cacheStatus + setOffline off MainActor |
+| 10 | `b1e9c6a` | Phantom-file Lstat bounded with 2 s timeout |
+| 11 | `93e9d8d` | membuf cascade-freeze bounded + cache Redis timeouts |
+
+11 commits. Lock discipline across the cache layer verified clean.
+The single largest remaining lever — concurrent per-connection RPC
+dispatch, designed and documented in iteration 7 — awaits your
+morning review.
+
+## Morning summary
+
+The build at `/Users/LelandDutcher/Developer/JuiceMount6/build/JuiceMount.app`
+includes all 11 fixes. Before launching:
+
+1. Confirm no wedged mount: `mount | grep -iE "juicefs|zpool"` should
+   be empty. If not, `sudo umount -f -t nfs /Volumes/zpool` (or reboot).
+2. Confirm no orphan processes: `pgrep -lf "juicefs|JuiceMount"` empty.
+3. Launch: `open build/JuiceMount.app`.
+
+If Finder still freezes under load tomorrow:
+- The next fix to land is concurrent RPC dispatch in
+  `internal/nfs/conn.go` (designed in iteration 7).
+- If that also doesn't fix it, the failure mode is novel and we
+  need fresh diagnostics.
