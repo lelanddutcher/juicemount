@@ -582,3 +582,192 @@ mount wedges — now has independent fixes against:
 - SwiftUI MainActor cgo blocking (#9)
 
 Production build refreshed at end of this iteration.
+
+---
+
+## Iteration 7 — 2026-05-13 ~05:42
+
+**Audited `nfs/handler.go` + `internal/nfs/conn.go`.** This is the
+request-serving path — the only major file untouched tonight.
+
+### Tonight's fix landed: phantom-file Lstat timeout (Finding 2)
+
+Commit `b1e9c6a`. File: `nfs/handler.go`.
+
+`juiceFS.Stat`'s cache-hit path used to verify non-directory entries
+via a bare `os.Lstat(fusePath)`. On a wedged FUSE daemon this blocks
+forever, and under the current single-threaded per-connection dispatch
+(see Finding 1 below) that single Stat freezes every other RPC on
+the same TCP connection — i.e. every Finder Stat / Lookup / Getattr.
+
+Now bounded with a 2 s goroutine+timeout pattern. On timeout we
+conservatively keep the cache entry rather than block; the stale
+entry (if any) gets cleaned up on a future stat once FUSE recovers.
+2 s is well above a healthy stat (microseconds) and well below
+Finder's beachball threshold.
+
+### Architectural finding deferred to morning review (Finding 1)
+
+**The audit identified the dominant freeze vector**, but it's invasive
+enough that I'm leaving it for your eyes rather than landing it
+unsupervised at 5:45am.
+
+#### What's wrong
+
+`internal/nfs/conn.go:143-193` — the per-connection serve loop reads
+a request, calls `c.handle(connCtx, w)` **synchronously**, then reads
+the next request. macOS NFS client uses one persistent TCP connection
+per mount. So every Read serializes all subsequent Lookups/Getattrs/
+Readdirs on that connection. A single slow file open (JuiceFS waiting
+on a MinIO GET) freezes Finder until it returns — even though tonight's
+fixes ensure the management plane stays responsive.
+
+The cross-connection `rpcSem` (cap 128) doesn't help within a single
+connection.
+
+#### Why I didn't land it tonight
+
+The fix is small but the blast radius is the hottest path in the
+server. Specifically:
+
+1. **Request body buffering required.** Handlers read from
+   `w.req.Body`, which is a `*io.LimitedReader` over the connection's
+   shared `bufio.Reader`. For concurrent dispatch the serve loop must
+   advance past the body before dispatching, so each goroutine gets
+   its own independent buffer (`bytes.Reader`). Change in
+   `readRequestHeader`.
+
+2. **Connection close races.** Currently `c.handle` returning an
+   error or `w.finish` returning an error causes `serve()` to return,
+   shutting down the connection. With concurrent dispatch, a child
+   goroutine's error needs to signal shutdown — either via
+   `c.Close()` (causing the next `readRequestHeader` to error) or
+   via a shared close channel.
+
+3. **drain() handles `*io.LimitedReader`** specifically and returns
+   `io.ErrUnexpectedEOF` for other types. Needs to handle
+   `*bytes.Reader` (no-op since body is pre-buffered).
+
+4. **Untested under load.** The integration tests need a Redis
+   instance; race-detector runs of nfs/ tests time out in 60 s
+   without Redis available locally tonight.
+
+#### Recommended design (when you wake)
+
+Smallest correct change to `internal/nfs/conn.go`:
+
+```go
+// In readRequestHeader, after reading the RPC header:
+remaining := r.N
+bodyBuf := make([]byte, remaining)
+if remaining > 0 {
+    if _, err := io.ReadFull(&r, bodyBuf); err != nil {
+        return nil, err
+    }
+}
+req.Body = bytes.NewReader(bodyBuf)
+```
+
+```go
+// In drain(), add:
+if _, ok := w.req.Body.(*bytes.Reader); ok {
+    return nil  // body fully buffered upstream
+}
+```
+
+```go
+// In serve(), replace the synchronous c.handle block with:
+if c.Server.rpcSem != nil {
+    select {
+    case c.Server.rpcSem <- struct{}{}:
+    case <-connCtx.Done():
+        return
+    }
+}
+go func(w *response) {
+    defer func() {
+        if c.Server.rpcSem != nil { <-c.Server.rpcSem }
+    }()
+    start := time.Now()
+    err := c.handle(connCtx, w)
+    elapsed := time.Since(start)
+    respErr := w.finish(connCtx)
+    rpcCount.Add(1)
+    if elapsed > 5*time.Millisecond {
+        slowRPCCount.Add(1)
+        if elapsed > 50*time.Millisecond {
+            Log.Warnf("slow RPC: %v took %v", w.req, elapsed)
+        }
+    }
+    if obs := currentObserver(); obs != nil {
+        obs(w.req.Header.Prog, w.req.Header.Proc, elapsed, err)
+    }
+    if err != nil { Log.Errorf("error handling req: %v", err) }
+    if respErr != nil {
+        Log.Errorf("error sending response: %v", respErr)
+        c.Close()
+    }
+}(w)
+```
+
+#### Safety analysis (verified concurrent-safe)
+
+- `c.writeSerializer` is a channel; multiple goroutines can send safely.
+- Each request's `*bytes.Buffer` (writer) comes from `responseBufferPool`,
+  single-goroutine access per request.
+- `atomic` counters (`rpcCount`, `slowRPCCount`, etc.) are safe.
+- `c.Server.handlerFor()` reads a dispatch table set once at init.
+- `c.Close()` is idempotent on `net.TCPConn`.
+
+#### How to validate the fix
+
+1. Build and launch.
+2. Open Finder to `/Volumes/zpool`.
+3. In Terminal: `cat /Volumes/zpool/<some-large-file> > /dev/null &`
+   (kicks off a slow Read).
+4. In Finder, navigate around — should stay responsive.
+5. Watch `pgrep -lf JuiceMount` and the metrics endpoint at
+   `http://127.0.0.1:11050/metrics` for elevated `rpc_count` /
+   `slow_rpc_count`.
+
+If Finder hangs during the Read, the fix didn't take effect (or
+something else regressed). Roll back with `git revert` of the
+conn.go commit.
+
+### Other handler findings (deferred — lower priority)
+
+- **Finding 3** (`MemoryBuffer.Get` blocks under `mb.mu` release/re-
+  acquire cycle): NOT a bug per se — the lock is dropped before the
+  wait. Only an issue because of Finding 1's serialized dispatch.
+  Fixing Finding 1 makes this a non-issue.
+
+- **Finding 4** (`ReadDir` calls `BulkInsert` synchronously): one-
+  liner to make async (`go jfs.handler.store.BulkInsert(...)`), but
+  has a tradeoff — subsequent Stat calls from Finder land on a cold
+  cache and fall through to FUSE stat. After iteration 4's
+  `writeMu` chunking, BulkInsert holds the lock for <50 ms per 500-
+  entry batch, so the current synchronous version is probably fine.
+
+- **Finding 6** (context not propagated to FUSE syscalls): correct
+  but low impact; the semaphore + Finding 2's per-call timeout cap
+  the damage. Worth threading `ctx` through the handler eventually
+  for cleanliness.
+
+## Tonight's final tally (iteration 7)
+
+| # | Commit | Fix |
+|---|---|---|
+| 1 | `1121bae` | NFS timeo 300→10, retrans 5→2, Force Eject, ordered shutdown |
+| 2 | `1d73c7d` | FUSE-direct self-test (no NFS loopback wedge) |
+| 3 | `a12bd8c` | All `health/` shell-outs bounded with CommandContext |
+| 4 | `a5a42e5` | `globalMu` snapshot-then-release in every slow cgo export |
+| 5 | `adf70b8` | Chunked `BulkInsert` + pin store `busy_timeout` |
+| 6 | `0316096` | `tailJuiceFSLog` stopCh + `FUSEManager.Stop` bounded |
+| 7 | `21db111` | Code-review followups: 3 HIGH bugs in #2–#5 closed |
+| 8 | `0a7f767` | `rc.mu` dropped around `pruneAbsent` iteration |
+| 9 | `e603eab` | Swift popover: cacheStatus + setOffline off MainActor |
+| 10 | `b1e9c6a` | Phantom-file Lstat bounded with 2 s timeout |
+
+10 commits. The dominant architectural finding (concurrent RPC
+dispatch) is documented above with a recommended implementation —
+ready to land tomorrow with your eyes on it.
