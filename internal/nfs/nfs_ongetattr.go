@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/metadata"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
@@ -22,6 +23,16 @@ func onGetAttr(ctx context.Context, w *response, userHandle Handler) error {
 	fullPath := fs.Join(path...)
 	info, err := fs.Lstat(fullPath)
 	if err != nil {
+		// [JM6 tier-1.7] Offline fail-fast: distinguish "media not
+		// available offline" from "file doesn't exist." Returning
+		// NFSStatusNoEnt would cause the macOS NFS client to invalidate
+		// its file handle cache for this path — after recovery the
+		// file wouldn't reappear in Finder without a remount.
+		// NFSStatusNXIO preserves the handle cache while still
+		// surfacing the failure to apps.
+		if pin.IsOfflineNotAvailable(err) {
+			return &NFSStatusError{NFSStatusNXIO, err}
+		}
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
 		}

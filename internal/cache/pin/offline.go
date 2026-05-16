@@ -1,10 +1,30 @@
 package pin
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// ErrOfflineNotAvailable signals that an NFS operation was refused
+// because offline mode is engaged and the requested path isn't
+// pinned-ready. The NFS handler returns this so the protocol layer
+// (internal/nfs/nfs_on{getattr,lookup,read}.go) can map it to
+// NFSStatusNXIO ("no such device or address") rather than the
+// default NFSStatusIO or NFSStatusNoEnt — the former is generic
+// "I/O error," the latter would invalidate the kernel's file handle
+// cache and require a remount for the file to reappear after the
+// network returns.
+var ErrOfflineNotAvailable = errors.New("media not available offline")
+
+// IsOfflineNotAvailable reports whether err is (or wraps)
+// ErrOfflineNotAvailable. Use in NFS protocol-layer error
+// translation to distinguish offline-refused from genuine I/O
+// failures.
+func IsOfflineNotAvailable(err error) bool {
+	return errors.Is(err, ErrOfflineNotAvailable)
+}
 
 // Offline mode is a process-wide toggle that the NFS read path consults
 // to decide whether to fall through to FUSE on a cache miss (online) or

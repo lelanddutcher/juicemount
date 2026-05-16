@@ -559,6 +559,34 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 		return e.FileInfo(), nil
 	}
 
+	// [JM6 tier-1.7] Offline fail-fast for un-pinned, un-cached files.
+	//
+	// We reach this fallback when SQLite metadata didn't know about
+	// the path. Falling through to os.Stat() on FUSE would query
+	// JuiceFS → Redis (the metadata authority). When we're offline,
+	// that query hangs or times out — bad UX for Finder.
+	//
+	// Refuse fast with pin.ErrOfflineNotAvailable. The NFS protocol
+	// layer (nfs_ongetattr.go / nfs_onlookup.go) maps the sentinel
+	// to NFSStatusNXIO. Why NXIO rather than NOENT: NOENT causes
+	// macOS to invalidate its file handle cache for the path; after
+	// recovery the file would NOT reappear without a remount. NXIO
+	// surfaces as "I/O error" to apps but preserves the handle cache,
+	// so post-recovery the next Stat succeeds and Finder shows the
+	// file again automatically.
+	//
+	// Pinned-and-ready files bypass this: by construction the pin
+	// store knows about them, the FUSE path serves from local cache
+	// without touching Redis.
+	if pin.IsOffline() && jfs.handler.pinStore != nil {
+		canonical := jfs.handler.canonicalize(filename)
+		if !jfs.handler.isPinnedReady(canonical) {
+			jmlog.Debug("offline: refusing stat of un-pinned, un-cached file",
+				"path", filename, "canonical", canonical)
+			return nil, pin.ErrOfflineNotAvailable
+		}
+	}
+
 	// Fallback: stat the file on FUSE directly and cache it
 	fusePath := jfs.fullPath(filename)
 	info, err := os.Stat(fusePath)
@@ -629,6 +657,19 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 		// so Finder's subsequent navigation is instant
 		go jfs.handler.prefetchChildren(dirname)
 		return infos, nil
+	}
+
+	// [JM6 tier-1.7] Offline fail-fast: an empty SQLite ListChildren
+	// result while offline likely means we just haven't synced this
+	// directory yet — Redis is unreachable. Falling through to
+	// os.ReadDir(fusePath) would query JuiceFS → Redis and hang or
+	// time out. Return empty fast. The next ReadDir after the network
+	// returns will populate via sync. Pinned content above this
+	// directory is unaffected (those entries are in SQLite already).
+	if pin.IsOffline() {
+		jmlog.Debug("offline: empty readdir (no synced entries available)",
+			"dirname", dirname)
+		return []os.FileInfo{}, nil
 	}
 
 	// Fallback: read directly from FUSE and cache into SQLite
@@ -706,7 +747,11 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			jmlog.Debug("offline: refusing open of un-pinned file",
 				"in_mount", filename,
 				"canonical", canonical)
-			return nil, syscall.EIO
+			// pin.ErrOfflineNotAvailable → NFS protocol layer maps to
+			// NFSStatusNXIO. See Stat fallback comment for the cache-
+			// preservation rationale (NXIO doesn't invalidate kernel
+			// file handles; NoEnt does).
+			return nil, pin.ErrOfflineNotAvailable
 		}
 	}
 
@@ -997,7 +1042,7 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	// re-introducing the very "media offline" UX cliff the offline-pin
 	// feature exists to prevent.
 	if pin.IsOffline() && !f.pinned {
-		return 0, syscall.EIO
+		return 0, pin.ErrOfflineNotAvailable
 	}
 
 	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time)
@@ -1127,7 +1172,7 @@ func (f *billyFile) Truncate(size int64) error { return f.File.Truncate(size) }
 // un-pinned files. Pinned files fall through to FUSE/JuiceFS LRU as usual.
 func (f *billyFile) Read(p []byte) (int, error) {
 	if pin.IsOffline() && !f.pinned {
-		return 0, syscall.EIO
+		return 0, pin.ErrOfflineNotAvailable
 	}
 	return f.File.Read(p)
 }
@@ -1135,7 +1180,7 @@ func (f *billyFile) Read(p []byte) (int, error) {
 // ReadAt is the hot path for NFS READ RPCs (which always carry an offset).
 func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 	if pin.IsOffline() && !f.pinned {
-		return 0, syscall.EIO
+		return 0, pin.ErrOfflineNotAvailable
 	}
 	return f.File.ReadAt(p, off)
 }
