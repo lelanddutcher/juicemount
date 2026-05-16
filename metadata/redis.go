@@ -3,14 +3,18 @@ package metadata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -426,9 +430,23 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 			rc.lastDisconnect = time.Now()
 		}
 		rc.mu.Unlock()
-		jmlog.Warn("reconciliation failed",
+		// [JM6] Classify network-path errors distinctly from backend
+		// errors. The 2026-05-16 incident exposed that every "Redis
+		// is degraded" log line was actually a Mac-side route-table
+		// failure ("no route to host"), not a backend process fault.
+		// Telling the user "Redis is degraded" when the actual cause
+		// is "your Wi-Fi blipped" makes the UI lie about cause and
+		// sets the user up to look at the wrong thing.
+		kind, friendly := classifyConnErr(err)
+		msg := "reconciliation failed"
+		if kind == errKindNetworkPath {
+			msg = "network path to backend lost"
+		}
+		jmlog.Warn(msg,
 			"attempt", *consecutiveFailures,
 			"next_in_sec", int64(backoff.Round(time.Second).Seconds()),
+			"kind", string(kind),
+			"reason", friendly,
 			"error", err.Error(),
 		)
 		ticker.Reset(*backoff)
@@ -447,6 +465,172 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 			ticker.Reset(*backoff)
 		}
 	}
+}
+
+// connErrKind classifies a connection-related error. Used to decide
+// whether a failure means "the user's machine can't reach the backend"
+// (network path) versus "we reached the backend but it rejected or
+// timed out our request" (backend). The distinction matters for what
+// to tell the user and which recovery story to engage:
+//
+//   - errKindNetworkPath: the network between this Mac and the backend
+//     is the problem. Engage offline mode automatically. Tell the user
+//     their connection is the issue, not the server.
+//
+//   - errKindBackend: we reached the backend but it failed us. The
+//     network is fine; the backend may be overloaded, restarting, or
+//     genuinely broken. Don't auto-engage offline (the user can still
+//     use the network for other things).
+//
+//   - errKindOther: ambiguous or app-state errors (closed clients,
+//     context cancellations). Don't engage offline mode based on these
+//     alone.
+// ConnErrKind classifies a connection-related error. Exported because
+// downstream items (network reachability monitor, offline-mode
+// auto-engage, NFS handler fail-fast, UI indicator) consume the
+// classification from separate packages.
+type ConnErrKind string
+
+const (
+	ErrKindNetworkPath ConnErrKind = "network_path"
+	ErrKindBackend     ConnErrKind = "backend"
+	ErrKindOther       ConnErrKind = "other"
+)
+
+// Internal aliases for the existing in-package call sites — keeps the
+// diff minimal while exposing exported names externally.
+type connErrKind = ConnErrKind
+
+const (
+	errKindNetworkPath = ErrKindNetworkPath
+	errKindBackend     = ErrKindBackend
+	errKindOther       = ErrKindOther
+)
+
+// classifyConnErr inspects a Go networking error and returns its kind
+// plus a friendly one-liner suitable for log/UI display.
+//
+// Classification rules (from observed real-world errors in JuiceMount
+// logs over 2026-05-13 to 2026-05-16):
+//
+//   - syscall.EHOSTUNREACH ("no route to host") → network path; the
+//     Mac's route table doesn't have a path to the destination IP.
+//     Common cause: Wi-Fi re-association, sleep/wake, network change.
+//   - syscall.ENETUNREACH ("network is unreachable") → network path.
+//   - DNS resolution failure (net.DNSError) → network path. The Mac
+//     can't even ask the DNS server.
+//   - net.OpError with "i/o timeout" during a Dial → network path
+//     (couldn't establish connection in time).
+//   - syscall.ECONNREFUSED ("connection refused") → backend. The
+//     network reached the host but nothing's listening on the port.
+//     Backend process is down.
+//   - "redis: client is closed" / context.Canceled → other (app
+//     state, not a real failure).
+//   - Anything else with a timeout → backend (we got through but the
+//     backend didn't respond in time).
+// ClassifyConnErr is the exported entry point. See classifyConnErr
+// for the implementation contract and behavior. Re-exported as a
+// thin wrapper so cross-package consumers (health/, pin/, nfs/) can
+// call without depending on internal helper names.
+func ClassifyConnErr(err error) (ConnErrKind, string) {
+	return classifyConnErr(err)
+}
+
+func classifyConnErr(err error) (connErrKind, string) {
+	if err == nil {
+		return errKindOther, "no error"
+	}
+	// Context cancellations and our own teardown look like errors but
+	// aren't network or backend faults. Cancellation = app teardown;
+	// deadline-exceeded = our caller imposed a deadline that fired,
+	// which is a property of OUR config, not a network fault.
+	if errors.Is(err, context.Canceled) {
+		return errKindOther, "request canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errKindOther, "operation deadline exceeded"
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "redis: client is closed") {
+		return errKindOther, "redis client closed (app shutdown or reconnect)"
+	}
+	// go-redis surfaces backend-side disconnect mid-command as io.EOF
+	// or io.ErrUnexpectedEOF wrapped in fmt.Errorf. Classify as
+	// backend — the network was fine; the backend closed the socket
+	// (restart, OOM kill, etc.). Common during graceful Redis upgrade.
+	if strings.Contains(msg, "EOF") {
+		return errKindBackend, "backend closed the connection (restart?)"
+	}
+	// go-redis connection-pool exhaustion is an app-state condition —
+	// neither network nor backend is necessarily at fault, but logs
+	// should explain it readably.
+	if strings.Contains(msg, "redis: connection pool exhausted") {
+		return errKindOther, "redis connection pool exhausted"
+	}
+
+	// Unwrap to a *net.OpError if present — gives us access to the
+	// underlying syscall errno and the operation name (dial/read/etc).
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		// DNS resolution failure surfaces inside net.OpError as a
+		// *net.DNSError.
+		var dnsErr *net.DNSError
+		if errors.As(opErr.Err, &dnsErr) {
+			if dnsErr.IsNotFound {
+				return errKindNetworkPath, "DNS: host not found"
+			}
+			return errKindNetworkPath, "DNS resolution failed"
+		}
+		// Syscall errno cases.
+		var syscallErr *os.SyscallError
+		if errors.As(opErr.Err, &syscallErr) {
+			var errno syscall.Errno
+			if errors.As(syscallErr.Err, &errno) {
+				switch errno {
+				case syscall.EHOSTUNREACH:
+					return errKindNetworkPath, "no route to host (network change?)"
+				case syscall.ENETUNREACH:
+					return errKindNetworkPath, "network unreachable"
+				case syscall.ETIMEDOUT:
+					if opErr.Op == "dial" {
+						return errKindNetworkPath, "connection attempt timed out"
+					}
+					return errKindBackend, "backend response timed out"
+				case syscall.ECONNREFUSED:
+					return errKindBackend, "connection refused (backend not listening)"
+				case syscall.ECONNRESET:
+					return errKindBackend, "connection reset by backend"
+				}
+			}
+		}
+		// net.OpError without a typed syscall — check for i/o timeout
+		// vs other transport-layer issues by string.
+		if opErr.Timeout() {
+			if opErr.Op == "dial" {
+				return errKindNetworkPath, "connection attempt timed out"
+			}
+			return errKindBackend, "backend response timed out"
+		}
+		return errKindOther, "transport error: " + opErr.Err.Error()
+	}
+
+	// String-based fallbacks for go-redis wrapped errors that don't
+	// unwrap cleanly to *net.OpError. Conservative — only classify
+	// what we've actually observed.
+	switch {
+	case strings.Contains(msg, "no route to host"):
+		return errKindNetworkPath, "no route to host (network change?)"
+	case strings.Contains(msg, "network is unreachable"):
+		return errKindNetworkPath, "network unreachable"
+	case strings.Contains(msg, "i/o timeout"):
+		// Without operation context we can't be certain; lean
+		// toward network for safety (auto-offline is the more
+		// conservative action when the cause is ambiguous).
+		return errKindNetworkPath, "i/o timeout"
+	case strings.Contains(msg, "connection refused"):
+		return errKindBackend, "connection refused (backend not listening)"
+	}
+	return errKindOther, msg
 }
 
 func min(a, b int) int {
