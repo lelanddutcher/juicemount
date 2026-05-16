@@ -15,7 +15,7 @@ Acceptance tests (from `docs/VISION.md`):
 
 | # | Test | Status |
 |---|---|---|
-| 1.1 | Concurrent per-connection NFS dispatch (Finder browses while a long Read is in flight) | ⚠ landed in `691f550`; needs real-Finder validation |
+| 1.1 | Concurrent per-connection NFS dispatch (Finder browses while a long Read is in flight) | ⚠ landed in `691f550`; **prior validation invalidated by `f944a82` build-staleness bug; needs re-validation against the fresh binary** |
 | 1.2 | No Finder freeze on any wedged backend | ⚠ partial — many vectors closed, full validation TBD |
 | 1.3 | Clean unmount in every state | ✓ likely (ordered shutdown + Force Eject landed) — needs real validation |
 | 1.4 | Crash-safe metadata (kill -9 → mountable in <5s) | ⚠ test tooling shipped in `5ec1a33`; real run pending |
@@ -196,3 +196,65 @@ load) since it now has data to chase — the 200-400ms stat p99 the
 stress harness surfaced. Likely involves enabling Go runtime traces
 or pprof during a stress run to identify where the latency is
 coming from. ~3-4 hour slice; may split if the root cause is deep.
+
+### Iteration 4 — 2026-05-16
+
+**Tier:** 1 (Stability).
+**Picked:** tier-1.2 — Finder responsiveness investigation under load.
+**Outcome:** uncovered a build-infrastructure bug that invalidates
+prior tier-1 validation. Shipped a fix to the build script; the
+intended latency investigation must be re-done in iteration 5 against
+a fresh binary.
+
+**What happened:**
+1. Ran stress harness for 60s against the live mount, captured CPU
+   pprof + goroutine dump.
+2. Found stat p50=505ms, p99=3.6s, max=6.3s, 33 client-side errors.
+3. CPU profile said os.Lstat dominated (75% cum). Goroutine dump
+   showed exactly one goroutine in conn.serve at the snapshot.
+4. Source has lstatNotExistWithTimeout (from b1e9c6a, 2026-05-13) AND
+   concurrent dispatch (from 691f550, this session). Neither was in
+   the binary's symbol table (`nm -a`).
+5. Root cause: SPM's incremental build doesn't detect content changes
+   in `libnfsd.a` passed via -L/-l. The Swift binary was re-linked
+   from a stale cache.
+6. The build script (`scripts/build-app.sh`) didn't `rm -rf
+   .build/<config>/JuiceMount` before re-running `swift build`. This
+   was a known issue from project memory but had never been added to
+   the script.
+
+**Shipped (`f944a82`):**
+- `scripts/build-app.sh`: removes `build/libnfsd.{a,h}` before the
+  Go build, and removes `.build/<config>/JuiceMount` before the Swift
+  build. Subsequent rebuild verified the new binary contains
+  lstatNotExist symbols (count 4 via `nm -a`).
+
+**Tier-1 acceptance tests affected:**
+- 1.1 (concurrent dispatch): the "<1s adjacent-Finder-op during 5GB
+  Read" result from iteration 1 was measured against the OLD binary,
+  which was running sequential dispatch. The fact that latencies
+  were still <1s suggests sequential dispatch is less catastrophic
+  than the overnight audit suspected (or that macOS NFS client
+  pipelined more than we thought). NEEDS RE-VALIDATION against the
+  fresh build.
+- 1.2 (Finder responsiveness): the 200-400ms stat numbers from
+  iteration 2 stress smoke were the OLD binary too. The 500ms p50 /
+  3.6s p99 from iteration 4's stress run was also the OLD binary.
+  Expected to drop substantially against the fresh build because
+  (a) concurrent dispatch is now actually live and (b) the Lstat
+  timeout caps individual stat blocking at 2s.
+
+**Validation pending — needs the user to:**
+1. Stop the current JuiceMount instance (PID 41860).
+2. `open build/JuiceMount.app` (fresh build, signed at 03:35-ish).
+3. Click Start in the menu bar.
+4. Re-run `cmd/jmstress` for 60s and report numbers.
+
+**Broken:** discovered that ALL builds in this session and the
+overnight loop may have shipped stale code to the user. Tier-1
+"shipped" markers should be treated as "code committed AND a freshly
+re-validated binary" only — not "code committed."
+
+**Next:** iteration 5 re-validates 1.1 and 1.2 against the fresh
+binary. Latency investigation is gated on knowing the actual current
+baseline.
