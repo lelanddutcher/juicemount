@@ -604,7 +604,7 @@ struct MenuPopoverView: View {
             statusDot
             VStack(alignment: .leading, spacing: 2) {
                 Text("JuiceMount").font(.headline)
-                Text(server.state.displayLabel)
+                Text(headerSubtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -612,6 +612,40 @@ struct MenuPopoverView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    /// Header subtitle. When offline-engaged, replaces the generic
+    /// state label with a clear "Offline · N pinned · disconnected
+    /// M:SS" string. The user-toggle and auto-engage cases use the
+    /// same shape but different reason text.
+    private var headerSubtitle: String {
+        let off = server.offlineState
+        if !off.offline {
+            return server.state.displayLabel
+        }
+        let pinned = server.cacheStatus.aggregate.ReadyFiles
+        if off.user_offline && !off.auto_offline {
+            return "Offline (you toggled it) · \(pinned) pinned available"
+        }
+        // Auto-engaged: show how long
+        let elapsed = formatOfflineElapsed(seconds: off.since_sec)
+        if elapsed.isEmpty {
+            return "Offline · \(pinned) pinned available"
+        }
+        return "Offline · \(pinned) pinned · disconnected \(elapsed)"
+    }
+
+    /// Formats N seconds as "M:SS" up to an hour, "H:MM:SS" beyond.
+    /// Empty when N==0 so callers can omit the suffix.
+    private func formatOfflineElapsed(seconds: Int64) -> String {
+        if seconds <= 0 { return "" }
+        let s = Int(seconds % 60)
+        let m = Int((seconds / 60) % 60)
+        let h = Int(seconds / 3600)
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, s)
+        }
+        return String(format: "%d:%02d", m, s)
     }
 
     private var statusDot: some View {
@@ -623,6 +657,13 @@ struct MenuPopoverView: View {
     }
 
     private var statusColor: Color {
+        // Offline trumps the state-driven color so the dot in the
+        // popover header agrees with the menu-bar icon. Otherwise the
+        // user sees a green dot in the popover and a blue dot in the
+        // menu bar at the same time, which is confusing.
+        if server.offlineState.offline {
+            return .blue
+        }
         switch server.state {
         case .idle:           return .gray
         case .starting:       return .blue

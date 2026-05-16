@@ -43,7 +43,9 @@ final class MenuBarController: NSObject {
 
     private func configureStatusItem() {
         if let button = statusItem.button {
-            button.image = renderIcon(for: server.state, selfTest: server.selfTest)
+            button.image = renderIcon(for: server.state,
+                                       selfTest: server.selfTest,
+                                       offlineState: server.offlineState)
             // Initial state: no self-test result yet, so the icon is a plain
             // template. The state-observation timer will recompute this each
             // tick and toggle template mode off if a colored dot needs to show.
@@ -75,14 +77,17 @@ final class MenuBarController: NSObject {
                 guard let self else { return }
                 self.statusItem.button?.image = self.renderIcon(
                     for: self.server.state,
-                    selfTest: self.server.selfTest
+                    selfTest: self.server.selfTest,
+                    offlineState: self.server.offlineState
                 )
-                // When the self-test is yellow/red we want the dot to render in
-                // its own color rather than the menu-bar template tint, so we
-                // disable template mode in that case. Pure-template mode (no
-                // dot) lets macOS invert the icon for dark menu bars as usual.
+                // Template-mode is OFF whenever ANY colored dot is
+                // drawn — offline blue (iter 5), self-test yellow/red,
+                // or self-test error orange. Otherwise template mode
+                // stays on so macOS inverts the icon for dark menu
+                // bars as usual.
+                let offlineDot = self.server.offlineState.offline
                 let attention = self.server.selfTest?.isAttentionWorthy ?? false
-                self.statusItem.button?.image?.isTemplate = !attention
+                self.statusItem.button?.image?.isTemplate = !(offlineDot || attention)
             }
         }
     }
@@ -95,7 +100,8 @@ final class MenuBarController: NSObject {
     /// non-template image and disable template mode on the result.
     private func renderIcon(
         for state: ServerController.ServerState,
-        selfTest: NFSBridge.SelfTestResult?
+        selfTest: NFSBridge.SelfTestResult?,
+        offlineState: NFSBridge.OfflineState
     ) -> NSImage? {
         // Compose: a base "drop" or "externaldrive" icon plus a small status badge color.
         // Apple's SF Symbol "externaldrive.connected.to.line.below" is perfect for "mounted volume"
@@ -115,8 +121,20 @@ final class MenuBarController: NSObject {
             return nil
         }
 
-        // No dot needed for green / unknown — return the plain template image.
-        guard let dotColor = selfTestDotColor(for: selfTest) else {
+        // Dot priority: offline (blue) > self-test attention (yellow/
+        // red/orange) > none. Offline trumps self-test color because
+        // when you're offline the self-test reading is necessarily
+        // stale or measuring local-cache-only behavior.
+        let dotColor: NSColor? = {
+            if offlineState.offline {
+                // Blue — distinct from the warning/error palette used
+                // by self-test. The VISION doc specifies blue for
+                // "offline, expected" so users learn it's not a fault.
+                return NSColor.systemBlue
+            }
+            return selfTestDotColor(for: selfTest)
+        }()
+        guard let dotColor else {
             return base
         }
 

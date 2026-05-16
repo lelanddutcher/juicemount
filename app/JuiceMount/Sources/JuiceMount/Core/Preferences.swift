@@ -42,6 +42,14 @@ public final class Preferences {
     public var showSearchHotkey: Bool {
         didSet { save() }
     }
+    /// Show macOS notifications when offline mode auto-engages or
+    /// recovers. Default off — `VISION.md` non-negotiable says no
+    /// notifications without opt-in, and user-attention budget is
+    /// precious. Users who care about offline events can flip this
+    /// in Preferences.
+    public var offlineNotificationsEnabled: Bool {
+        didSet { save() }
+    }
 
     public init(
         volumeName: String = "zpool",
@@ -55,7 +63,8 @@ public final class Preferences {
         memBufFileLimitMB: Int = 128,
         reconcileSeconds: Int = 30,
         startAtLogin: Bool = false,
-        showSearchHotkey: Bool = true
+        showSearchHotkey: Bool = true,
+        offlineNotificationsEnabled: Bool = false
     ) {
         self.volumeName = volumeName
         self.mountPoint = mountPoint
@@ -69,6 +78,7 @@ public final class Preferences {
         self.reconcileSeconds = reconcileSeconds
         self.startAtLogin = startAtLogin
         self.showSearchHotkey = showSearchHotkey
+        self.offlineNotificationsEnabled = offlineNotificationsEnabled
     }
 
     public static func defaultDBPath() -> String {
@@ -123,6 +133,7 @@ public final class Preferences {
         case volumeName, mountPoint, redisURL, nfsListenAddr, metricsAddr, dbPath
         case ssdCacheGB, memoryBufferMB, memBufFileLimitMB, reconcileSeconds
         case startAtLogin, showSearchHotkey
+        case offlineNotificationsEnabled
     }
 
     public static func load() -> Preferences {
@@ -139,7 +150,8 @@ public final class Preferences {
             memBufFileLimitMB: d.object(forKey: Key.memBufFileLimitMB.rawValue) as? Int ?? 128,
             reconcileSeconds:  d.object(forKey: Key.reconcileSeconds.rawValue) as? Int ?? 30,
             startAtLogin:      d.bool(forKey: Key.startAtLogin.rawValue),
-            showSearchHotkey:  d.object(forKey: Key.showSearchHotkey.rawValue) as? Bool ?? true
+            showSearchHotkey:  d.object(forKey: Key.showSearchHotkey.rawValue) as? Bool ?? true,
+            offlineNotificationsEnabled: d.bool(forKey: Key.offlineNotificationsEnabled.rawValue)
         )
     }
 
@@ -157,5 +169,6 @@ public final class Preferences {
         d.set(reconcileSeconds, forKey: Key.reconcileSeconds.rawValue)
         d.set(startAtLogin, forKey: Key.startAtLogin.rawValue)
         d.set(showSearchHotkey, forKey: Key.showSearchHotkey.rawValue)
+        d.set(offlineNotificationsEnabled, forKey: Key.offlineNotificationsEnabled.rawValue)
     }
 }
