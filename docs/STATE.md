@@ -22,8 +22,8 @@ Acceptance tests (from `docs/VISION.md`):
 | 1.5 | Recovery diagnostics (Export Diagnostics zip) | ✓ landed in Phase B |
 | 1.6 | Stress test harness (24h CI run) | ⚠ scaffold landed in `74a9739`; 24h soak run pending |
 | 1.7 | Walk-out: pinned files keep working when network drops | ✗ not built; see `docs/ROADMAP/tier-4-network-resilience.md` |
-| 1.8 | Auto-engage offline mode within 5s of route loss | ⚠ `fd267b9` reachability monitor live (~4s detection); item #3 will wire it to `pin.SetAutoOffline` |
-| 1.9 | Auto-recover offline mode within 30s of route return | ⚠ `fd267b9` reachability monitor recovers in 1 successful probe (<2s); item #3 wires the offline-mode flip |
+| 1.8 | Auto-engage offline mode within 5s of route loss | ⚠ wired in `10607ab` — reachability OnChange → `pin.SetAutoOffline(true, reason)`. Validation pending real network drop with mount up. |
+| 1.9 | Auto-recover offline mode within 30s of route return | ⚠ wired in `10607ab` — reachability OnChange recovery → `pin.SetAutoOffline(false, "")` + `rc.TriggerSync()`. Validation pending. |
 | 1.10 | Network errors classified as network (not "Redis degraded") | ✓ landed in `e8aa5cb`; validated 2026-05-16 15:27-15:30 — three real "no route to host" events all logged with new `network path to backend lost` / `kind: network_path` shape |
 
 **Tier-1 cannot be declared "production-ready" until all six pass.**
