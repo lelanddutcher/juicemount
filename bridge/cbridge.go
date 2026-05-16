@@ -226,9 +226,31 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			if reachable {
 				jmlog.Info("network path to backend recovered",
 					"target", reachAddr, "reason", reason)
+				// Lift the auto-offline flag. The user-intent flag
+				// (SetOffline) is untouched — if the user manually
+				// toggled offline, they stay offline.
+				pin.SetAutoOffline(false, "")
+				// Kick reconciliation immediately rather than waiting
+				// for the next periodic tick. The metadata authority
+				// is back; let downstream catch up fast.
+				//
+				// Shutdown safety: `rc` is the captured closure
+				// pointer to the RedisClient, never nilled (only
+				// globalRC is nilled). A late-arriving callback after
+				// rc.Stop() does a non-blocking send to syncNowCh —
+				// the channel isn't closed by Stop(), the reconcile
+				// loop has already exited so the buffered signal sits
+				// undrained, and the whole RedisClient eventually
+				// gets GC'd. No panic, no leak. Benign.
+				rc.TriggerSync()
 			} else {
 				jmlog.Warn("network path to backend lost",
 					"target", reachAddr, "reason", reason)
+				// Auto-engage offline mode. NFS handler (item #4)
+				// will read pin.IsOffline() in the read path and
+				// fail-fast un-pinned reads instead of letting them
+				// stall on kernel-NFS timeouts.
+				pin.SetAutoOffline(true, reason)
 			}
 		})
 		globalReach.Start()
@@ -1482,15 +1504,23 @@ func handleReclaimHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleOfflineHTTP(w http.ResponseWriter, r *http.Request) {
-	on := r.URL.Query().Get("on")
-	var v C.int
-	if on == "on" || on == "true" || on == "1" {
-		v = 1
-	}
-	cstr := NFSServerSetOffline(v)
-	defer NFSServerFreeString(cstr)
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(C.GoString(cstr)))
+	// If `on` is present, treat as a user-intent toggle (existing
+	// behavior — preserved for callers like the Swift offline switch).
+	// If absent, return the full OfflineState snapshot — gives the UI
+	// the data it needs to render auto-vs-user distinction and the
+	// human-readable reason without a second round trip.
+	if on := r.URL.Query().Get("on"); on != "" {
+		var v C.int
+		if on == "on" || on == "true" || on == "1" {
+			v = 1
+		}
+		cstr := NFSServerSetOffline(v)
+		defer NFSServerFreeString(cstr)
+		w.Write([]byte(C.GoString(cstr)))
+		return
+	}
+	_ = json.NewEncoder(w).Encode(pin.State())
 }
 
 // connectRedisWithRetry wraps metadata.NewRedisClient with exponential
