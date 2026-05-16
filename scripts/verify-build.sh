@@ -90,6 +90,7 @@ declare -a FIXES=(
     "internal/nfs.(\*conn).serve.gowrap1|Concurrent NFS dispatch goroutine in serve (691f550, 2026-05-16)"
     "RedisClient).RecentlyDegraded|Redis-health gate for phantom-purge + prune (bbc6bff, 2026-05-16)"
     "main.runWriteProbe|Write probe in self-test (8732f13, 2026-05-16)"
+    "metadata.classifyConnErr|Network-vs-backend error classifier (e8aa5cb, 2026-05-16)"
 )
 
 FAILURES=0
