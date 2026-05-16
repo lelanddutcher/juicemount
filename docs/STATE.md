@@ -377,3 +377,56 @@ re-validation. If not: I'll stop the loop after this iteration with
 a PushNotification — eight iterations of tooling on a stale binary
 is the point where continued autonomous work has negative marginal
 value.
+
+### Iteration 8 — 2026-05-16 — LOOP TERMINATED
+
+**Tier:** 1 (Stability).
+**Picked:** terminate. PID 41860 still running stale binary (verified
+via `scripts/verify-build.sh --running` from iter 7). Per the
+commitment in iter 7's STATE.md note, this iteration stops the loop
+rather than producing another round of tooling on a binary that
+hasn't been swapped.
+
+**Final action before stopping:** kicked off a 1h baseline soak in
+the background. When the user resumes the loop (presumably after
+restarting with the fresh binary), the comparison data is partially
+collected:
+
+  PID:    33513 (jmstress, detached via nohup + disown)
+  Output: /tmp/baseline-old-pid41860.jsonl
+  Stderr: /tmp/baseline-old-pid41860.stderr
+  Config: 3 finder + 1 nle workers, depth 5, 200 MiB min for NLE
+  Discovered: 10796 paths, 26 large files
+  Duration: 1h (terminates ~05:54 if uninterrupted)
+
+After the swap, run another jmstress 1h soak with the same flags,
+then `jmcompare /tmp/baseline-old-pid41860.jsonl new-soak.jsonl`.
+That diff is the canonical answer to "did the tier-1 fixes
+actually improve real-world behavior?"
+
+**Loop summary across iterations 1-8:**
+
+| Iter | Outcome | Commits |
+|------|---------|---------|
+| 1 | Concurrent NFS dispatch (tier-1.1) — code landed, NOT validated due to staleness | `691f550`, `99e6a12` |
+| 2 | Stress harness scaffold (tier-1.6) | `74a9739`, `3f32005` |
+| 3 | Crash-safety acceptance script (tier-1.4) | `5ec1a33`, `ab83389` |
+| 4 | Discovered build-staleness bug; fixed build script | `f944a82`, `11986e6` |
+| 5 | jmstress --json output (tier-1.6 extension) | `386ac52`, `efc117a` |
+| 6 | jmcompare soak-result differ (tier-1.6 extension) | `b5f75bb`, `13d0477` |
+| 7 | verify-build symbol checker (dev infra) | `3566bb7`, `4cfcb39` |
+| 8 | Loop terminated; 1h baseline soak running | this commit |
+
+**Real tier-1 status as of stop:**
+- 1.1: code landed, validation invalidated by staleness, needs re-run
+- 1.2: partial; full acceptance pending wedge-injection tooling
+- 1.3: depends on user manual testing
+- 1.4: tooling shipped; user-driven real run pending
+- 1.5: done
+- 1.6: scaffold + JSON + comparer + soak running; 24h acceptance run still pending
+
+**To resume:**
+1. Confirm fresh build is alive: `bash scripts/verify-build.sh --running`
+2. If stale: quit JuiceMount, `open build/JuiceMount.app`, click Start, re-verify
+3. Re-fire `/loop`. Iteration 9 will pick up wherever STATE.md points.
+4. Optional: check on the baseline soak — `tail -1 /tmp/baseline-old-pid41860.jsonl | jq` for the latest tick, or `pgrep -lf jmstress-bin`.
