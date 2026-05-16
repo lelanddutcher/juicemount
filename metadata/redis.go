@@ -602,9 +602,25 @@ func (rc *RedisClient) syncMetadata() error {
 	//
 	// If a second writer of pruneAbsent ever appears, this must take the
 	// lock again. The map type itself isn't goroutine-safe.
+	//
+	// Reconciliation-recovery handling: if Redis was unstable in the
+	// last 60s (i.e., we just recovered from a failure streak), the
+	// path set we read could be stale or partial — Redis itself may be
+	// catching up after coming back online, or the scan could be racing
+	// JuiceFS's own metadata rehydration. Bumping pruneAbsent counters
+	// on that partial view would mark genuinely-present files as
+	// progressing-toward-deletion. Skip the increment entirely on these
+	// recovery cycles; just clear counters for paths that ARE in Redis.
+	// The pruneThreshold counter ladder resumes fresh on the next stable
+	// cycle. This pairs with the phantom-purge gate in nfs/handler.go
+	// (commit bbc6bff) to give recovery a full pruneThreshold-cycle
+	// window before any destructive cache mutation can fire.
+	skipIncrement := rc.RecentlyDegraded(60 * time.Second)
 	for p := range existingPaths {
 		if _, inRedis := redisPaths[p]; !inRedis {
-			rc.pruneAbsent[p]++
+			if !skipIncrement {
+				rc.pruneAbsent[p]++
+			}
 		} else {
 			delete(rc.pruneAbsent, p)
 		}
