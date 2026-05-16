@@ -335,3 +335,45 @@ requires the user's hands.
 (if user restarts) or kicks off a long `jmstress --duration 4h --json
 --periodic-json 60s` baseline against the current binary as a
 backstop datapoint, then queues tier-1.3.
+
+### Iteration 7 — 2026-05-16
+
+**Tier:** 1 (Stability).
+**Picked:** still no restart. Built a small forward-looking dev tool
+that prevents recurrence of the iter-4 build-staleness incident.
+
+**Shipped (`3566bb7`):**
+- `scripts/verify-build.sh`: symbol-table inspector for a built
+  JuiceMount.app. Confirms every known fix in a sampling manifest
+  is present in the binary; `--running` also confirms the live
+  process is using that binary (inode-via-lsof, mtime fallback).
+  Each manifest entry pairs a non-inlinable symbol pattern with a
+  human description; consts and small inlined helpers can't be
+  detected this way and are documented as a known limitation.
+
+**Validated:** on-disk binary passes 3 fixes (lstatNotExistWithTimeout
++ closure + concurrent-dispatch gowrap1), exit 0. `--running`
+correctly flags PID 41860 as stale (start time predates fresh
+binary's mtime), exit 2. Matches the iter-4 failure mode exactly.
+
+**Why this matters:** iter 4 burned an entire iteration discovering
+the staleness bug after running pprof against the wrong binary. This
+script catches it in seconds. Future iterations that depend on a
+specific fix being live can prefix with `verify-build.sh --running`
+and abort cleanly if the fix isn't there.
+
+**Broken:** nothing.
+
+**Observation:** four iterations now (4–7) without a restart. PID
+41860 has been running since 02:09:48 today. The autonomous loop is
+now generating dev-tooling at a steady rate but actual tier-1
+acceptance numbers are still gated on the binary swap. Iteration 8
+should either re-validate (post-restart) or genuinely run out of
+tier-1.6-extension work — at which point the loop should stop
+rather than manufacturing make-work.
+
+**Next:** iteration 8 checks the restart state. If restarted: full
+re-validation. If not: I'll stop the loop after this iteration with
+a PushNotification — eight iterations of tooling on a stale binary
+is the point where continued autonomous work has negative marginal
+value.
