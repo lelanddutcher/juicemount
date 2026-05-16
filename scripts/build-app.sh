@@ -37,6 +37,11 @@ echo ""
 # 1. Build the Go c-archive
 echo "==> [1/4] Building Go c-archive (libnfsd.a)..."
 mkdir -p "$BUILD_DIR"
+# Force-rebuild the archive. Go's build cache is fine, but the output
+# file path itself can confuse SPM (step 2) when only the .a contents
+# changed under an unchanged mtime. Removing the .a/.h pair so the
+# subsequent build creates fresh inodes.
+rm -f "$BUILD_DIR/libnfsd.a" "$BUILD_DIR/libnfsd.h"
 CGO_ENABLED=1 go build \
     -buildmode=c-archive \
     -o "$BUILD_DIR/libnfsd.a" \
@@ -47,6 +52,16 @@ echo "    Built: $BUILD_DIR/libnfsd.a ($(du -h "$BUILD_DIR/libnfsd.a" | cut -f1)
 echo ""
 echo "==> [2/4] Building Swift app via SPM ($SWIFT_CONFIG)..."
 cd "$SWIFT_PKG"
+# Wipe SPM's incremental build cache for this package. Otherwise SPM
+# treats the previously-linked JuiceMount binary as up-to-date even
+# when libnfsd.a (which provides ALL of the Go symbols Swift links
+# against) has changed underneath it. Reproduced 2026-05-16: the
+# overnight Lstat-timeout fix and the concurrent-dispatch fix both
+# landed in libnfsd.a but were silently absent from the final binary
+# until this rm forced a relink. Symptoms were "code review and tests
+# pass but production behavior is stale." Painful to debug; cheap to
+# prevent.
+rm -rf "$SWIFT_PKG/.build/$SWIFT_CONFIG/JuiceMount"
 swift build -c "$SWIFT_CONFIG" \
     -Xlinker "-L$BUILD_DIR" \
     -Xlinker "-lnfsd" \
