@@ -160,6 +160,52 @@ public enum NFSBridge {
         NFSServerIsOffline() != 0
     }
 
+    // MARK: - Offline state (iter 5 — tier-1.7/1.8/1.9)
+    //
+    // Mirrors `pin.OfflineState` on the Go side. Two independent
+    // sources can engage offline mode: a manual user-intent toggle
+    // (`user_offline`) and the reachability monitor's auto-engage
+    // (`auto_offline`). The effective state is the OR. The `reason`
+    // and `since` fields are populated only for auto-engage and let
+    // the UI surface "disconnected for M:SS" without timestamp math.
+
+    public struct OfflineState: Codable, Equatable {
+        public var offline: Bool = false
+        public var user_offline: Bool = false
+        public var auto_offline: Bool = false
+        public var reason: String = ""
+        public var since: String = ""    // RFC3339 timestamp
+        public var since_sec: Int64 = 0
+
+        /// True when offline mode is engaged by automatic reachability
+        /// detection (vs. user toggle). The UI uses this to pick a
+        /// distinct color (blue) and message — distinguishes "offline
+        /// because the network dropped" from "offline because you
+        /// flipped the switch."
+        public var isAutoEngaged: Bool {
+            auto_offline && !user_offline
+        }
+    }
+
+    /// Fetch the offline state from the local metrics server. Blocking
+    /// — call from a background queue. Endpoint: `/offline` (GET, no
+    /// `?on=` param returns state JSON; `?on=true/false` is the toggle).
+    public static func offlineState(metricsAddr: String = "127.0.0.1:11050") -> OfflineState? {
+        guard let url = URL(string: "http://\(metricsAddr)/offline") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 2
+        let sem = DispatchSemaphore(value: 0)
+        var result: OfflineState?
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            result = try? JSONDecoder().decode(OfflineState.self, from: data)
+        }.resume()
+        sem.wait()
+        return result
+    }
+
     // MARK: - Self-test (A2)
     //
     // Phase A production-hardening: a 10 MB read measured against the live

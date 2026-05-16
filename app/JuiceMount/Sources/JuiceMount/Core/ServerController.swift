@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import os.log
+import UserNotifications
 
 /// Owns the JuiceMount server lifecycle and exposes its state to SwiftUI.
 /// All NFSBridge calls are dispatched to a background queue so the UI never blocks.
@@ -34,11 +35,28 @@ public final class ServerController {
     /// `start()` completes and again whenever the user invokes Sync Now.
     public private(set) var selfTest: NFSBridge.SelfTestResult?
 
+    /// Latest offline state (iter 5 of the offline-resilience plan).
+    /// Refreshed off MainActor by `refreshCacheStatus()` because the
+    /// HTTP GET /offline call is blocking. Two consumers care:
+    ///   - MenuBarController renders a distinct BLUE icon dot when
+    ///     auto-offline is engaged (not the yellow/red used for
+    ///     self-test attention-worthy states).
+    ///   - MenuPopoverView header surfaces "Offline · N pinned ·
+    ///     disconnected for M:SS" so the user understands WHY their
+    ///     un-pinned files are refused.
+    public private(set) var offlineState: NFSBridge.OfflineState = NFSBridge.OfflineState()
+
     public var preferences: Preferences
 
     private let log = Logger(subsystem: "com.juicemount.app", category: "ServerController")
     private let workQueue = DispatchQueue(label: "com.juicemount.work", qos: .userInitiated)
     private var pollTask: Task<Void, Never>?
+
+    /// True once the first offline-state fetch has completed. Used to
+    /// suppress the transition notification on the very first refresh
+    /// — without this, an app launch into a wake-from-sleep-offline
+    /// state would fire a banner the user didn't trigger.
+    private var hasCompletedInitialOfflineFetch = false
 
     public init(preferences: Preferences = Preferences.load()) {
         self.preferences = preferences
@@ -158,11 +176,44 @@ public final class ServerController {
     /// Fetch cache status from Go and publish on MainActor. The cgo call
     /// happens on `workQueue`, never on the UI thread. Safe to call at any
     /// cadence (e.g. the popover's 2 s timer).
+    ///
+    /// Also refreshes the offline state in the same dispatch — that's
+    /// what the UI consumes for the menu-bar blue dot and the popover
+    /// "Offline · …" header. Doing both in one workQueue tick keeps the
+    /// two values consistent on every render frame.
     public func refreshCacheStatus() {
+        let metricsAddr = preferences.metricsAddr
         workQueue.async { [weak self] in
             let s = NFSBridge.cacheStatus()
+            // Fetch offline state — if the metrics server is
+            // unreachable, the helper returns nil. Critically, we do
+            // NOT substitute the zero value here: that would make the
+            // UI report "online" exactly when the metrics path is
+            // broken — the opposite of the truth in many failure
+            // modes. Pass the optional through and let the MainActor
+            // side decide whether to apply or keep last-known state.
+            let o: NFSBridge.OfflineState? = NFSBridge.offlineState(metricsAddr: metricsAddr)
             Task { @MainActor in
-                self?.cacheStatus = s
+                guard let self else { return }
+                self.cacheStatus = s
+
+                if let o {
+                    let prevAuto = self.offlineState.auto_offline
+                    self.offlineState = o
+                    // Notification edges. Suppressed on the very first
+                    // fetch so an app launch into wake-from-sleep-
+                    // offline doesn't fire an unexpected banner.
+                    // Opt-in via preferences (VISION non-negotiable:
+                    // no notifications without opt-in).
+                    if self.hasCompletedInitialOfflineFetch &&
+                       prevAuto != o.auto_offline {
+                        self.notifyOfflineTransition(autoEngaged: o.auto_offline, reason: o.reason)
+                    }
+                    self.hasCompletedInitialOfflineFetch = true
+                }
+                // If o is nil: leave offlineState as-is (stale rather
+                // than misleadingly reset to "online"). Next successful
+                // fetch will reconverge.
             }
         }
     }
@@ -171,11 +222,50 @@ public final class ServerController {
     /// cgo calls run on `workQueue` so the UI toggle doesn't freeze the
     /// popover under contention.
     public func setOffline(_ on: Bool) {
+        let metricsAddr = preferences.metricsAddr
         workQueue.async { [weak self] in
             NFSBridge.setOffline(on)
             let s = NFSBridge.cacheStatus()
+            // See refreshCacheStatus for the nil-state rationale: keep
+            // stale rather than reset to "online" on metrics failure.
+            let o: NFSBridge.OfflineState? = NFSBridge.offlineState(metricsAddr: metricsAddr)
             Task { @MainActor in
                 self?.cacheStatus = s
+                if let o {
+                    self?.offlineState = o
+                }
+            }
+        }
+    }
+
+    /// Posts a user notification when auto-offline mode transitions.
+    /// Opt-in via `preferences.offlineNotificationsEnabled`; defaults
+    /// to false to honor the VISION "no telemetry without opt-in" rule
+    /// (notifications aren't telemetry but the user-attention budget
+    /// is precious — surface only when the user asked for it).
+    @MainActor
+    private func notifyOfflineTransition(autoEngaged: Bool, reason: String) {
+        guard preferences.offlineNotificationsEnabled else { return }
+        let content = UNMutableNotificationContent()
+        if autoEngaged {
+            content.title = "JuiceMount: offline mode engaged"
+            content.body = reason.isEmpty
+                ? "Network path to backend lost — pinned files still available."
+                : "\(reason) — pinned files still available."
+        } else {
+            content.title = "JuiceMount: back online"
+            content.body = "Network path to backend restored."
+        }
+        content.sound = nil // silent; this isn't an alarm
+        let req = UNNotificationRequest(
+            identifier: "com.juicemount.offline.transition",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(req) { err in
+            if let err {
+                Logger(subsystem: "com.juicemount.app", category: "Notify")
+                    .debug("offline-transition notification failed: \(err.localizedDescription)")
             }
         }
     }
