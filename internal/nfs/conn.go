@@ -151,45 +151,84 @@ func (c *conn) serve(ctx context.Context) {
 		}
 		Log.Tracef("request: %v", w.req)
 
-		// [JM5] Acquire cross-connection RPC semaphore.
-		// Limits total in-flight RPCs to prevent resource exhaustion
-		// under heavy concurrent load (Finder + Premiere + DaVinci).
+		// [JM6-concurrent] Acquire the cross-connection RPC semaphore
+		// in the serve loop (before dispatching). This back-pressures
+		// the read loop: if the global slot pool is exhausted we wait
+		// here rather than spawning unbounded goroutines. The select
+		// against connCtx.Done() lets us exit cleanly if the client
+		// disconnects while we're blocked on a full pool.
 		if c.Server.rpcSem != nil {
-			c.Server.rpcSem <- struct{}{}
-		}
-
-		// [JM5] Sequential dispatch with cancel isolation.
-		start := time.Now()
-		err = c.handle(connCtx, w)
-		elapsed := time.Since(start)
-		respErr := w.finish(connCtx)
-
-		// Release semaphore after RPC completes.
-		if c.Server.rpcSem != nil {
-			<-c.Server.rpcSem
-		}
-
-		rpcCount.Add(1)
-		if elapsed > 5*time.Millisecond {
-			slowRPCCount.Add(1)
-			if elapsed > 50*time.Millisecond {
-				Log.Warnf("slow RPC: %v took %v", w.req, elapsed)
+			select {
+			case c.Server.rpcSem <- struct{}{}:
+			case <-connCtx.Done():
+				return
 			}
 		}
 
-		// [JM5] External observer hook (used by internal/metrics).
-		if obs := currentObserver(); obs != nil {
-			obs(w.req.Header.Prog, w.req.Header.Proc, elapsed, err)
-		}
+		// [JM6-concurrent] Dispatch the handler in its own goroutine.
+		// Each goroutine reads from the request's bytes.Reader (set up
+		// by readRequestHeader), writes through the shared
+		// writeSerializer channel (safe for concurrent senders — Go
+		// channels are goroutine-safe), and releases its semaphore
+		// slot on completion. macOS NFS uses a single TCP connection
+		// per mount, so without this dispatch every slow Read would
+		// freeze every subsequent Lookup/Getattr on that connection —
+		// exactly the Finder-freeze symptom the overnight audit
+		// identified as the dominant architectural issue.
+		//
+		// Response ordering: NFS RPCs over TCP carry their own XID;
+		// clients demux by XID, not by arrival order. Concurrent
+		// dispatch is safe at the protocol level.
+		//
+		// On respErr (write failure) we close the connection from
+		// here. The serve loop's next readRequestHeader will then
+		// return an error and we exit cleanly. net.Conn.Close is
+		// idempotent so multiple goroutines closing is safe.
+		go func(w *response) {
+			defer func() {
+				// [JM6-concurrent] Recover from handler panics so a
+				// nil-deref or unanticipated XDR state in a single
+				// RPC doesn't crash the whole mount daemon. With
+				// sequential dispatch this was less of a concern —
+				// one bad handler call took down a long-frozen loop.
+				// With concurrent dispatch, any in-flight goroutine
+				// panicking would terminate the process AND every
+				// other in-flight RPC with it. Close the connection
+				// on panic so the client retries on a fresh socket.
+				if r := recover(); r != nil {
+					Log.Errorf("handler panic: %v", r)
+					c.Close()
+				}
+				if c.Server.rpcSem != nil {
+					<-c.Server.rpcSem
+				}
+			}()
 
-		if err != nil {
-			Log.Errorf("error handling req: %v", err)
-		}
-		if respErr != nil {
-			Log.Errorf("error sending response: %v", respErr)
-			c.Close()
-			return
-		}
+			start := time.Now()
+			err := c.handle(connCtx, w)
+			elapsed := time.Since(start)
+			respErr := w.finish(connCtx)
+
+			rpcCount.Add(1)
+			if elapsed > 5*time.Millisecond {
+				slowRPCCount.Add(1)
+				if elapsed > 50*time.Millisecond {
+					Log.Warnf("slow RPC: %v took %v", w.req, elapsed)
+				}
+			}
+
+			if obs := currentObserver(); obs != nil {
+				obs(w.req.Header.Prog, w.req.Header.Proc, elapsed, err)
+			}
+
+			if err != nil {
+				Log.Errorf("error handling req: %v", err)
+			}
+			if respErr != nil {
+				Log.Errorf("error sending response: %v", respErr)
+				c.Close()
+			}
+		}(w)
 	}
 }
 
@@ -395,11 +434,21 @@ func (w *response) Write(dat []byte) error {
 
 // drain reads the rest of the request frame if not consumed by the handler.
 func (w *response) drain(ctx context.Context) error {
+	// [JM6-concurrent] The request body is now buffered in a
+	// *bytes.Reader by readRequestHeader, so there's nothing to drain
+	// from the network — the handler either consumed the in-memory
+	// bytes or didn't, but the bufio.Reader on the connection is
+	// already positioned at the start of the next request frame.
+	if _, ok := w.req.Body.(*bytes.Reader); ok {
+		return nil
+	}
+	// Legacy path: some callers (older tests, non-conn paths) may
+	// still construct requests with a LimitedReader. Keep the drain
+	// logic working for them.
 	if reader, ok := w.req.Body.(*io.LimitedReader); ok {
 		if reader.N == 0 {
 			return nil
 		}
-		// todo: wrap body in a context reader.
 		_, err := io.CopyN(io.Discard, w.req.Body, reader.N)
 		if err == nil || err == io.EOF {
 			return nil
@@ -414,7 +463,10 @@ func (w *response) finish(ctx context.Context) error {
 	// writeSerializer consumer reads asynchronously.
 	data := make([]byte, w.writer.Len())
 	copy(data, w.writer.Bytes())
-	responseBufferPool.Put(w.writer)
+	// [JM6-concurrent] Use the capacity-guarded helper so a large READ
+	// response (up to ~16 MiB) doesn't pollute the pool with an
+	// oversized buffer that future small RPCs would inherit.
+	putResponseBuffer(w.writer)
 
 	select {
 	case w.conn.writeSerializer <- data:
@@ -442,14 +494,39 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 	if reqLen < 40 {
 		return nil, ErrInputInvalid
 	}
+	// [JM6-concurrent] Upper bound on frame size. NFSv3 max payload is
+	// 1 MiB (RFC 1813); 2 MiB ceiling leaves generous slack for RPC
+	// framing while preventing a malformed-fragment-header DoS from
+	// allocating multi-GB buffers on the LAN. A real macOS client
+	// will never send a frame this large; if we see one, the wire is
+	// corrupt or hostile.
+	const maxRPCFrameSize = 2 << 20
+	if reqLen > maxRPCFrameSize {
+		return nil, ErrInputInvalid
+	}
 
-	r := io.LimitedReader{R: reader, N: int64(reqLen)}
+	// [JM6-concurrent] Buffer the entire RPC frame so the bufio.Reader
+	// advances past this request before the serve loop dispatches it.
+	// This is the precondition for concurrent per-connection dispatch:
+	// the read loop owns the wire, each handler goroutine reads from
+	// its own in-memory bytes.Reader. Without this, handlers would
+	// race the next iteration's read on the shared bufio.Reader.
+	//
+	// Frame size is bounded by the NFS protocol: NFSv3 max write is
+	// 1 MiB plus RPC framing overhead, so reqLen here is at most ~1 MB
+	// in practice. The allocation cost is acceptable for the
+	// throughput win.
+	frameBuf := make([]byte, reqLen)
+	if _, err := io.ReadFull(reader, frameBuf); err != nil {
+		return nil, err
+	}
+	frameReader := bytes.NewReader(frameBuf)
 
-	xid, err := xdr.ReadUint32(&r)
+	xid, err := xdr.ReadUint32(frameReader)
 	if err != nil {
 		return nil, err
 	}
-	reqType, err := xdr.ReadUint32(&r)
+	reqType, err := xdr.ReadUint32(frameReader)
 	if err != nil {
 		return nil, err
 	}
@@ -460,9 +537,9 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 	req := request{
 		xid,
 		rpc.Header{},
-		&r,
+		frameReader,
 	}
-	if err = xdr.Read(&r, &req.Header); err != nil {
+	if err = xdr.Read(frameReader, &req.Header); err != nil {
 		return nil, err
 	}
 
