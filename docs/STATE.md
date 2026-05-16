@@ -24,7 +24,7 @@ Acceptance tests (from `docs/VISION.md`):
 | 1.7 | Walk-out: pinned files keep working when network drops | ✗ not built; see `docs/ROADMAP/tier-4-network-resilience.md` |
 | 1.8 | Auto-engage offline mode within 5s of route loss | ✗ not built |
 | 1.9 | Auto-recover offline mode within 30s of route return | ✗ not built |
-| 1.10 | Network errors classified as network (not "Redis degraded") | ✗ not built — the 2026-05-16 incident exposed our miscategorization |
+| 1.10 | Network errors classified as network (not "Redis degraded") | ⚠ landed in `e8aa5cb`; awaiting first natural reconcile-failure to confirm new log shape |
 
 **Tier-1 cannot be declared "production-ready" until all six pass.**
 Active iteration count toward the 7-day-real-load / 24h-stress-harness
