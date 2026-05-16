@@ -811,6 +811,47 @@ func NFSServerSearch(query *C.char, limit C.int, parentPath *C.char) *C.char {
 // mountNFSWithPrompt runs `mount_nfs` via osascript with admin privileges,
 // which triggers the standard macOS authentication prompt. The user enters
 // their password once; macOS caches the auth for the session.
+// runMountViaSudo attempts to mount via passwordless `sudo`. Probes
+// `sudo -n -- true` first to detect whether sudo is configured to run
+// without a password for this user (e.g. via /etc/sudoers.d). If the
+// probe fails, returns an error so the caller falls back to the
+// AppleScript admin-prompt path.
+//
+// The mount commands themselves stay scoped to /bin/mkdir + /sbin/mount_nfs
+// so a minimal sudoers entry suffices:
+//
+//     %admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /bin/mkdir
+//
+// Two separate sudo invocations (mkdir then mount_nfs) so each is a
+// single recognized command — wrapping in `sh -c "..."` would require
+// granting NOPASSWD on /bin/sh, which is the entire shell. Refuse to
+// expand the privileged blast radius.
+func runMountViaSudo(mountPoint, opts, host string) error {
+	// Cheap probe: does sudo run without prompting? `-n` returns non-zero
+	// if a password would be required. The "true" command always succeeds
+	// otherwise, so this isolates the auth question.
+	probe := exec.Command("sudo", "-n", "--", "true")
+	if err := probe.Run(); err != nil {
+		return fmt.Errorf("passwordless sudo unavailable: %w", err)
+	}
+
+	// 1. mkdir the mount point. Allowed by the same NOPASSWD rule.
+	if out, err := exec.Command("sudo", "-n", "/bin/mkdir", "-p", mountPoint).CombinedOutput(); err != nil {
+		return fmt.Errorf("sudo mkdir failed: %v\n%s", err, string(out))
+	}
+
+	// 2. mount_nfs. The -o args are the same string we'd otherwise
+	// shell-interpolate through osascript.
+	out, err := exec.Command("sudo", "-n",
+		"/sbin/mount_nfs", "-o", opts,
+		host+":/", mountPoint).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("sudo mount_nfs failed: %v\n%s", err, string(out))
+	}
+	jmlog.Info("nfs mounted via passwordless sudo", "mount_point", mountPoint)
+	return nil
+}
+
 func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 	host := "127.0.0.1"
 	port := "11049"
@@ -875,13 +916,42 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 		"port=%s,mountport=%s,soft,intr,timeo=10,retrans=2,nolocks,locallocks,rsize=262144,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
 		port, port)
 
+	// [JM6] Two-tier mount strategy.
+	//
+	//   Tier 1: passwordless sudo. If the user has set up a sudoers
+	//     entry allowing their account to run `mount_nfs` without a
+	//     password (typical dev workflow — one-time config), use that.
+	//     Detected by `sudo -n` returning success on a no-op probe.
+	//
+	//   Tier 2: AppleScript with administrator privileges. The
+	//     fallback — prompts the user for their admin password via
+	//     the standard macOS dialog. This is the path that bit
+	//     automated testing: every restart-cycle pops up a prompt
+	//     that blocks startup until the user acknowledges.
+	//
+	// Setup instructions for tier 1 (one-time, must be run with
+	// admin rights):
+	//
+	//     sudo visudo -f /etc/sudoers.d/juicemount-mount
+	//     # add this single line:
+	//     %admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /bin/mkdir
+	//     # or scope to a specific user:
+	//     # username ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /bin/mkdir
+	//
+	// With that in place, every subsequent JuiceMount launch mounts
+	// the NFS volume non-interactively. The same applies to the
+	// privileged unmount path (see unmountNFS).
+	if err := runMountViaSudo(mountPoint, opts, host); err == nil {
+		return nil
+	}
+
+	// Tier 2 fallback: AppleScript-with-admin prompt.
 	// Build the shell command: mkdir + mount_nfs
 	shellCmd := fmt.Sprintf(
 		"mkdir -p %q && mount_nfs -o %s %s:/ %q",
 		mountPoint, opts, host, mountPoint,
 	)
 
-	// AppleScript with admin privileges — produces the macOS password prompt
 	osaScript := fmt.Sprintf(
 		`do shell script %q with administrator privileges with prompt "JuiceMount needs to mount the NFS volume at %s"`,
 		shellCmd, mountPoint,
@@ -936,6 +1006,22 @@ func unmountNFS(mountPoint string) bool {
 	}
 	if tryUnmount("diskutil-force", 5*time.Second, "diskutil", "unmount", "force", mountPoint) {
 		return true
+	}
+	// [JM6] Two-tier escalation, matching the mount path. Tier 1:
+	// passwordless sudo if the user has the sudoers entry configured.
+	// Tier 2: AppleScript admin prompt (below). Skipping the prompt
+	// in dev workflows keeps automated test-cycles friction-free.
+	if probeErr := exec.Command("sudo", "-n", "--", "true").Run(); probeErr == nil {
+		if tryUnmount("sudo-umount-f-nfs", 15*time.Second,
+			"sudo", "-n", "/sbin/umount", "-f", "-t", "nfs", mountPoint) {
+			return true
+		}
+		if tryUnmount("sudo-umount-f", 15*time.Second,
+			"sudo", "-n", "/sbin/umount", "-f", mountPoint) {
+			return true
+		}
+		// Sudo paths failed — fall through to osascript-with-admin
+		// since maybe the sudoers rule doesn't cover unmount.
 	}
 	// Last resort: AppleScript-prompted privileged umount, escalating.
 	// `-f` forces unmount of unresponsive mounts. We try -t nfs first
