@@ -55,11 +55,21 @@ func main() {
 		largeFileMin   = flag.Int64("large-file-min-mb", 50, "minimum size (MiB) for NLE worker to pick a file")
 		metricsURL     = flag.String("metrics-url", "http://127.0.0.1:11050/metrics", "JuiceMount metrics endpoint for before/after delta")
 		seed           = flag.Int64("seed", time.Now().UnixNano(), "RNG seed for reproducibility")
+		jsonOut        = flag.Bool("json", false, "emit a single JSON summary on completion (stdout). Human-readable output goes to stderr in this mode.")
+		periodicJSON   = flag.Duration("periodic-json", 0, "if >0, emit a JSON snapshot of running stats every N (default 0 = only at end). Useful for soak runs where you want a timeseries to graph degradation over hours.")
 	)
 	flag.Parse()
 
 	rng := rand.New(rand.NewSource(*seed))
-	fmt.Printf("jmstress: mount=%s duration=%s finder=%d nle=%d backup=%d seed=%d\n",
+
+	// When --json is set, stdout is reserved for machine-parseable
+	// output and human-readable progress goes to stderr. Otherwise both
+	// go to stdout. This lets `jmstress --json | jq` work cleanly.
+	humanOut := os.Stdout
+	if *jsonOut {
+		humanOut = os.Stderr
+	}
+	fmt.Fprintf(humanOut, "jmstress: mount=%s duration=%s finder=%d nle=%d backup=%d seed=%d\n",
 		*mount, *duration, *finderWorkers, *nleWorkers, *backupWorkers, *seed)
 
 	// Sanity: confirm mount is reachable.
@@ -70,13 +80,13 @@ func main() {
 
 	// Discover the path pool once. Bounded depth so a huge tree doesn't
 	// stall startup. We also collect "large files" for the NLE worker.
-	fmt.Printf("discovering paths (depth %d)...\n", *discoveryDepth)
+	fmt.Fprintf(humanOut, "discovering paths (depth %d)...\n", *discoveryDepth)
 	t0 := time.Now()
 	pool, largeFiles, derr := discoverPool(*mount, *discoveryDepth, *largeFileMin*1024*1024)
 	if derr != nil {
 		fmt.Fprintf(os.Stderr, "discovery error: %v\n", derr)
 	}
-	fmt.Printf("discovery: %d dirs/files, %d large files (>%dMiB), took %s\n",
+	fmt.Fprintf(humanOut, "discovery: %d dirs/files, %d large files (>%dMiB), took %s\n",
 		len(pool), len(largeFiles), *largeFileMin, time.Since(t0).Round(time.Millisecond))
 
 	if len(pool) == 0 {
@@ -98,7 +108,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\nsignal received — winding down")
+		fmt.Fprintln(humanOut, "\nsignal received — winding down")
 		cancel()
 	}()
 
@@ -106,6 +116,37 @@ func main() {
 	finderStats := newWorkerStats("finder")
 	nleStats := newWorkerStats("nle")
 	backupStats := newWorkerStats("backup")
+
+	// Periodic JSON snapshots while the run is in flight. Stops when
+	// the context cancels. Snapshots are append-only on stdout when
+	// --json is set, so a 24h soak produces a parseable timeseries.
+	startTime := time.Now()
+	if *jsonOut && *periodicJSON > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(*periodicJSON)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-t.C:
+					snap := snapshot{
+						T:        now.Format(time.RFC3339Nano),
+						ElapsedS: now.Sub(startTime).Seconds(),
+						Type:     "tick",
+						Finder:   finderStats.exportSnapshot(),
+						NLE:      nleStats.exportSnapshot(),
+						Backup:   backupStats.exportSnapshot(),
+					}
+					if err := json.NewEncoder(os.Stdout).Encode(snap); err != nil {
+						fmt.Fprintf(os.Stderr, "json encode error: %v\n", err)
+					}
+				}
+			}
+		}()
+	}
 
 	for i := 0; i < *finderWorkers; i++ {
 		wg.Add(1)
@@ -131,14 +172,39 @@ func main() {
 
 	wg.Wait()
 
-	fmt.Println("\n=== results ===")
-	finderStats.report()
-	nleStats.report()
-	backupStats.report()
+	// Human-readable summary always renders (to humanOut: stdout normally,
+	// stderr in --json mode so it doesn't corrupt the JSON channel).
+	fmt.Fprintln(humanOut, "\n=== results ===")
+	finderStats.reportTo(humanOut)
+	nleStats.reportTo(humanOut)
+	backupStats.reportTo(humanOut)
 
 	// Metrics delta.
 	afterMetrics := fetchMetrics(*metricsURL)
-	reportMetricsDelta(beforeMetrics, afterMetrics)
+	reportMetricsDeltaTo(humanOut, beforeMetrics, afterMetrics)
+
+	// Final JSON summary on stdout when --json is set. This is the
+	// authoritative result for soak runs — periodic ticks are useful for
+	// graphing, but this is the row that says "did the run pass."
+	if *jsonOut {
+		summary := snapshot{
+			T:        time.Now().Format(time.RFC3339Nano),
+			ElapsedS: time.Since(startTime).Seconds(),
+			Type:     "final",
+			Finder:   finderStats.exportSnapshot(),
+			NLE:      nleStats.exportSnapshot(),
+			Backup:   backupStats.exportSnapshot(),
+			Metrics: &metricsDelta{
+				RPCTotalDelta:  fieldDelta(beforeMetrics, afterMetrics, "rpc_total"),
+				RPCErrorsDelta: fieldDelta(beforeMetrics, afterMetrics, "rpc_errors"),
+				BytesReadDelta: fieldDelta(beforeMetrics, afterMetrics, "bytes_read"),
+			},
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(summary); err != nil {
+			fmt.Fprintf(os.Stderr, "json encode error: %v\n", err)
+			os.Exit(1)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------
@@ -314,10 +380,14 @@ func (w *workerStats) record(op string, elapsed time.Duration, err error) {
 }
 
 func (w *workerStats) report() {
+	w.reportTo(os.Stdout)
+}
+
+func (w *workerStats) reportTo(out *os.File) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	errs := w.errors.Load()
-	fmt.Printf("\n[%s] errors=%d\n", w.name, errs)
+	fmt.Fprintf(out, "\n[%s] errors=%d\n", w.name, errs)
 	ops := make([]string, 0, len(w.samples))
 	for op := range w.samples {
 		ops = append(ops, op)
@@ -336,13 +406,117 @@ func (w *workerStats) report() {
 			}
 			return time.Duration(s[idx])
 		}
-		fmt.Printf("  %-8s n=%6d p50=%-9s p95=%-9s p99=%-9s max=%-9s\n",
+		fmt.Fprintf(out, "  %-8s n=%6d p50=%-9s p95=%-9s p99=%-9s max=%-9s\n",
 			op, len(s),
 			p(0.50).Round(time.Microsecond),
 			p(0.95).Round(time.Microsecond),
 			p(0.99).Round(time.Microsecond),
 			p(1.0).Round(time.Microsecond))
 	}
+}
+
+// exportSnapshot returns a serializable view of the worker's current
+// counters. Per-op samples are summarized as the same percentile shape
+// as the human report. Safe to call concurrently with record() — takes
+// w.mu and copies the samples slice before computing.
+func (w *workerStats) exportSnapshot() workerSnapshot {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := workerSnapshot{
+		Name:   w.name,
+		Errors: w.errors.Load(),
+		Ops:    make(map[string]opSnapshot, len(w.samples)),
+	}
+	for op, raw := range w.samples {
+		if len(raw) == 0 {
+			continue
+		}
+		s := append([]int64(nil), raw...)
+		sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+		p := func(q float64) int64 {
+			idx := int(float64(len(s)) * q)
+			if idx >= len(s) {
+				idx = len(s) - 1
+			}
+			return s[idx]
+		}
+		out.Ops[op] = opSnapshot{
+			N:        int64(len(s)),
+			P50Ns:    p(0.50),
+			P95Ns:    p(0.95),
+			P99Ns:    p(0.99),
+			MaxNs:    p(1.0),
+			MeanNs:   meanInt64(s),
+		}
+	}
+	return out
+}
+
+func meanInt64(s []int64) int64 {
+	if len(s) == 0 {
+		return 0
+	}
+	var sum int64
+	for _, v := range s {
+		sum += v
+	}
+	return sum / int64(len(s))
+}
+
+// snapshot is the JSON shape emitted on tick and at end of run. The
+// "type" field is "tick" for periodic snapshots and "final" for the
+// terminating summary. Soaks that need a timeseries will see many
+// ticks followed by one final. The schema is stable — additions are
+// additive; deletions require a new field.
+type snapshot struct {
+	T        string                 `json:"t"`         // RFC3339Nano timestamp
+	ElapsedS float64                `json:"elapsed_s"` // seconds since run start
+	Type     string                 `json:"type"`      // "tick" | "final"
+	Finder   workerSnapshot         `json:"finder"`
+	NLE      workerSnapshot         `json:"nle"`
+	Backup   workerSnapshot         `json:"backup"`
+	Metrics  *metricsDelta          `json:"metrics,omitempty"`
+}
+
+type workerSnapshot struct {
+	Name   string                  `json:"name"`
+	Errors int64                   `json:"errors"`
+	Ops    map[string]opSnapshot   `json:"ops"`
+}
+
+type opSnapshot struct {
+	N      int64 `json:"n"`
+	P50Ns  int64 `json:"p50_ns"`
+	P95Ns  int64 `json:"p95_ns"`
+	P99Ns  int64 `json:"p99_ns"`
+	MaxNs  int64 `json:"max_ns"`
+	MeanNs int64 `json:"mean_ns"`
+}
+
+type metricsDelta struct {
+	RPCTotalDelta  int64 `json:"rpc_total_delta"`
+	RPCErrorsDelta int64 `json:"rpc_errors_delta"`
+	BytesReadDelta int64 `json:"bytes_read_delta"`
+}
+
+func fieldDelta(before, after map[string]any, key string) int64 {
+	get := func(m map[string]any) int64 {
+		if m == nil {
+			return 0
+		}
+		v, ok := m[key]
+		if !ok {
+			return 0
+		}
+		switch x := v.(type) {
+		case float64:
+			return int64(x)
+		case int64:
+			return x
+		}
+		return 0
+	}
+	return get(after) - get(before)
 }
 
 // ---------------------------------------------------------------------
@@ -364,11 +538,15 @@ func fetchMetrics(url string) map[string]any {
 }
 
 func reportMetricsDelta(before, after map[string]any) {
+	reportMetricsDeltaTo(os.Stdout, before, after)
+}
+
+func reportMetricsDeltaTo(out *os.File, before, after map[string]any) {
 	if before == nil || after == nil {
-		fmt.Println("\n[metrics] endpoint unreachable; no delta")
+		fmt.Fprintln(out, "\n[metrics] endpoint unreachable; no delta")
 		return
 	}
-	fmt.Println("\n[metrics] (after - before)")
+	fmt.Fprintln(out, "\n[metrics] (after - before)")
 	getInt := func(m map[string]any, k string) int64 {
 		v, ok := m[k]
 		if !ok {
@@ -385,7 +563,7 @@ func reportMetricsDelta(before, after map[string]any) {
 	rpcDelta := getInt(after, "rpc_total") - getInt(before, "rpc_total")
 	errDelta := getInt(after, "rpc_errors") - getInt(before, "rpc_errors")
 	byteDelta := getInt(after, "bytes_read") - getInt(before, "bytes_read")
-	fmt.Printf("  rpc_total: +%d\n", rpcDelta)
-	fmt.Printf("  rpc_errors: +%d\n", errDelta)
-	fmt.Printf("  bytes_read: +%d (%.1f MiB)\n", byteDelta, float64(byteDelta)/(1<<20))
+	fmt.Fprintf(out, "  rpc_total: +%d\n", rpcDelta)
+	fmt.Fprintf(out, "  rpc_errors: +%d\n", errDelta)
+	fmt.Fprintf(out, "  bytes_read: +%d (%.1f MiB)\n", byteDelta, float64(byteDelta)/(1<<20))
 }
