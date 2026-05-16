@@ -853,26 +853,69 @@ func unmountNFS(mountPoint string) bool {
 	if tryUnmount("diskutil-force", 5*time.Second, "diskutil", "unmount", "force", mountPoint) {
 		return true
 	}
-	// Last resort: AppleScript-prompted privileged umount -f -t nfs.
-	// `-f` forces unmount of unresponsive mounts; `-t nfs` scopes to NFS
-	// so we can never accidentally unmount something else if the mount
-	// path happened to be racy.
-	jmlog.Warn("nfs unmount falling back to admin-privileged umount -f -t nfs",
-		"mount_point", mountPoint,
-		"reason", "diskutil could not release the mount; trying forced kernel-level unmount")
-	osaScript := fmt.Sprintf(
-		`do shell script %q with administrator privileges with prompt "JuiceMount is stopping and needs to force-unmount %s"`,
-		fmt.Sprintf("umount -f -t nfs %q", mountPoint),
-		mountPoint,
-	)
-	osaCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	if err := exec.CommandContext(osaCtx, "osascript", "-e", osaScript).Run(); err == nil {
-		if !isMounted(mountPoint) {
-			jmlog.Info("nfs unmounted", "method", "admin-umount-f", "mount_point", mountPoint)
-			return true
+	// Last resort: AppleScript-prompted privileged umount, escalating.
+	// `-f` forces unmount of unresponsive mounts. We try -t nfs first
+	// (scoped) and fall back to unscoped -f if the kernel still hasn't
+	// released after a beat.
+	//
+	// 2026-05-16 incident: overnight Redis flakes left the kernel NFS
+	// state wedged. At shutdown the first privileged attempt completed
+	// (osascript exit 0) but isMounted() still returned true a few ms
+	// later — the kernel lazy-releases mount table entries and we
+	// checked too eagerly. Adding a short post-umount sleep and a
+	// second attempt with broader scope recovers the case where the
+	// first call succeeded "modally" but hadn't propagated yet.
+	//
+	// We also raise the osascript timeout to 120s. The default 60s
+	// could expire before the user notices the password prompt when
+	// the app is in the middle of shutting down (dock activity is
+	// unusual, the menu bar icon may be removing itself). 120s is the
+	// macOS default for sudo-style admin prompts.
+	tryAdminUmount := func(label, command string, promptSuffix string) bool {
+		jmlog.Warn("nfs unmount falling back to admin-privileged umount",
+			"mount_point", mountPoint,
+			"method", label,
+			"command", command)
+		osaScript := fmt.Sprintf(
+			`do shell script %q with administrator privileges with prompt "JuiceMount needs to force-unmount %s%s"`,
+			command,
+			mountPoint,
+			promptSuffix,
+		)
+		osaCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		if err := exec.CommandContext(osaCtx, "osascript", "-e", osaScript).Run(); err != nil {
+			jmlog.Debug("admin osascript failed", "method", label, "error", err.Error())
+			return false
 		}
+		// Kernel sometimes needs a beat to actually release the mount
+		// table entry after umount returns. Poll a few times before
+		// giving up.
+		for i := 0; i < 5; i++ {
+			if !isMounted(mountPoint) {
+				jmlog.Info("nfs unmounted", "method", label, "mount_point", mountPoint, "settle_polls", i)
+				return true
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		return false
 	}
+
+	if tryAdminUmount("admin-umount-f-nfs",
+		fmt.Sprintf("umount -f -t nfs %q", mountPoint),
+		"") {
+		return true
+	}
+	// Second admin attempt: drop the -t nfs filter. Some wedged states
+	// don't dispatch on the type predicate the same way and the
+	// unscoped -f variant releases them. The mount path is still
+	// specific enough that we can't unmount the wrong thing.
+	if tryAdminUmount("admin-umount-f",
+		fmt.Sprintf("umount -f %q", mountPoint),
+		" (retry without type filter)") {
+		return true
+	}
+
 	jmlog.Error("nfs unmount FAILED — mount is wedged",
 		"mount_point", mountPoint,
 		"hint", "the kernel mount table still references this mount; a reboot or `sudo umount -f -t nfs` from a fresh terminal may be required")
