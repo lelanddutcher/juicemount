@@ -88,6 +88,8 @@ declare -a FIXES=(
     "lstatNotExistWithTimeout|Lstat timeout in juiceFS.Stat (b1e9c6a, 2026-05-13)"
     "lstatNotExistWithTimeout.func1|Lstat timeout helper closure (same commit)"
     "internal/nfs.(\*conn).serve.gowrap1|Concurrent NFS dispatch goroutine in serve (691f550, 2026-05-16)"
+    "RedisClient).RecentlyDegraded|Redis-health gate for phantom-purge + prune (bbc6bff, 2026-05-16)"
+    "main.runWriteProbe|Write probe in self-test (8732f13, 2026-05-16)"
 )
 
 FAILURES=0
