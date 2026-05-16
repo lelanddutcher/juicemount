@@ -18,7 +18,7 @@ Acceptance tests (from `docs/VISION.md`):
 | 1.1 | Concurrent per-connection NFS dispatch (Finder browses while a long Read is in flight) | ⚠ landed in `691f550`; needs real-Finder validation |
 | 1.2 | No Finder freeze on any wedged backend | ⚠ partial — many vectors closed, full validation TBD |
 | 1.3 | Clean unmount in every state | ✓ likely (ordered shutdown + Force Eject landed) — needs real validation |
-| 1.4 | Crash-safe metadata (kill -9 → mountable in <5s) | ⚠ not validated |
+| 1.4 | Crash-safe metadata (kill -9 → mountable in <5s) | ⚠ test tooling shipped in `5ec1a33`; real run pending |
 | 1.5 | Recovery diagnostics (Export Diagnostics zip) | ✓ landed in Phase B |
 | 1.6 | Stress test harness (24h CI run) | ⚠ scaffold landed in `74a9739`; 24h soak run pending |
 
@@ -43,9 +43,10 @@ clock starts only after every box is checked.
    leaks, wedges, or error accumulation. The 24h run itself is the
    acceptance test — once it passes cleanly, tier-1.6 is checked.
 
-3. **Crash-safety validation (tier-1.4)** — needs a reproducible test
-   that does `kill -9` on the running app + relaunches and measures
-   recovery time. Script under `scripts/`. ~1-2 hour slice.
+3. ~~**Crash-safety validation (tier-1.4)**~~ — `scripts/crash-recover-test.sh`
+   landed in `5ec1a33`. Dry-run default; `--real` actually does the
+   kill+relaunch with 5s budget assertion. Next step: user runs
+   `--real` against the dev mount when ready.
 
 4. **Full unmount validation (tier-1.3)** — manual matrix: stop
    mid-read, mid-write, mid-sync, with offline gate flipped, with
@@ -164,3 +165,34 @@ results land in a follow-up STATE.md entry.
 small slice — script that does `kill -9` + relaunch + measures
 recovery. ~1-2 hours. After that, iteration 4 kicks off the 24h soak
 in background and parallel-works on tier-1.2 latency analysis.
+
+### Iteration 3 — 2026-05-16
+
+**Tier:** 1 (Stability).
+**Picked:** tier-1.4 — crash-safety acceptance script.
+
+**Shipped (`5ec1a33`):**
+- `scripts/crash-recover-test.sh`: measures kill→reap, open→proc,
+  open→metrics, open→mount intervals against a configurable budget
+  (default 5s). Dry-run default to protect the live mount from
+  accidental kills.
+
+**Validated:** dry-run against live dev mount confirms preconditions,
+PID detection, and plan output. Real-run validation deferred — the
+user runs `--real` when they've got a non-critical mount window.
+
+**Deferred:** the real kill+relaunch run is the actual acceptance
+test. Tooling is the iteration deliverable; the data is the user's
+next action.
+
+**Broken:** nothing introduced. The script DID surface a real UX gap
+that wasn't in any acceptance test before: JuiceMount doesn't
+auto-Start the NFS server on app launch. The script warns about it
+explicitly rather than hanging silently. This belongs to tier-2 (app
+polish) as a "first-launch defaults" item.
+
+**Next:** iteration 4 picks tier-1.2 (Finder responsiveness under
+load) since it now has data to chase — the 200-400ms stat p99 the
+stress harness surfaced. Likely involves enabling Go runtime traces
+or pprof during a stress run to identify where the latency is
+coming from. ~3-4 hour slice; may split if the root cause is deep.
