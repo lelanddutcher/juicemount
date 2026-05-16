@@ -1475,6 +1475,17 @@ type SelfTestResult struct {
 	Hint      string  `json:"hint"`
 	RanAt     string  `json:"ran_at"` // RFC3339; empty until first run
 	Target    string  `json:"target"` // path that was read; "" on error
+
+	// Write probe: a 4 KiB create-write-fsync-delete cycle through the
+	// user-visible NFS mount path. If a write through NFS fails (as
+	// happened during the 2026-05-16 incident: backend issues left
+	// directories with stale handles that rejected writes), surfacing
+	// it in self-test means Swift can show a degraded status icon and
+	// the user notices BEFORE they try to copy a real project file
+	// and have it fail silently.
+	WriteOK    bool   `json:"write_ok"`
+	WriteMs    int64  `json:"write_ms"`
+	WriteHint  string `json:"write_hint,omitempty"`
 }
 
 var (
@@ -1615,6 +1626,21 @@ func runSelfTest() SelfTestResult {
 		mbps = (float64(total) / (1024 * 1024)) / elapsed.Seconds()
 	}
 	status, hint := classifySelfTest(mbps)
+
+	// Write probe: exercise the user-facing write path (NFS → handler →
+	// FUSE → JuiceFS → MinIO/Redis). Failures here are the 2026-05-16
+	// incident class: read paths can look fine while writes silently
+	// fail. If the write probe fails on an otherwise-green read, we
+	// downgrade overall status to "yellow" so Swift surfaces the
+	// degraded state.
+	writeOK, writeMs, writeHint := runWriteProbe(mountPath, 5*time.Second)
+	if !writeOK {
+		if status == "green" || status == "yellow" {
+			status = "yellow"
+			hint = "read OK; WRITE failed: " + writeHint
+		}
+	}
+
 	return SelfTestResult{
 		ElapsedMs: elapsed.Milliseconds(),
 		BytesRead: total,
@@ -1623,6 +1649,94 @@ func runSelfTest() SelfTestResult {
 		Hint:      hint,
 		RanAt:     now,
 		Target:    target,
+		WriteOK:   writeOK,
+		WriteMs:   writeMs,
+		WriteHint: writeHint,
+	}
+}
+
+// runWriteProbe creates a 4 KiB sentinel under the user-visible mount
+// path, writes random bytes, fsyncs, and deletes it. Each step is
+// individually bounded by the per-step budget; the whole probe is
+// bounded by overall to detect either a single step stalling or the
+// aggregate dragging on. Returns (ok, elapsed_ms, hint).
+//
+// We deliberately go through `mountPath` (the NFS-loopback path, e.g.
+// /Volumes/zpool-dev) rather than the FUSE-internal path, because the
+// failure modes that bit the user on 2026-05-16 only manifested on
+// the user-facing path (stale NFS handles in the kernel mount table,
+// handler-layer bugs). A FUSE-direct probe would have reported green
+// while the user couldn't copy a file.
+//
+// If mountPath is empty (mount hasn't come up yet), return ok=true
+// with an explanatory hint — the read probe will already have caught
+// the "FUSE not active" case.
+func runWriteProbe(mountPath string, overallBudget time.Duration) (ok bool, elapsedMs int64, hint string) {
+	if mountPath == "" {
+		return true, 0, "write probe skipped: mount path not configured"
+	}
+	start := time.Now()
+	deadline := start.Add(overallBudget)
+	sentinelPath := filepath.Join(mountPath, ".juicemount-writetest.tmp")
+	const sentinelSize = 4096
+
+	// Run the write probe in a goroutine so a stuck syscall (kernel NFS
+	// retry storm on a wedged mount, FUSE daemon hung) can be bounded
+	// without leaking the syscall on us — the goroutine continues until
+	// the kernel returns, but the probe returns to the caller.
+	type result struct {
+		ok   bool
+		hint string
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		// 1. Create + write.
+		buf := make([]byte, sentinelSize)
+		for i := range buf {
+			buf[i] = byte(i)
+		}
+		f, err := os.OpenFile(sentinelPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			resCh <- result{false, "create: " + err.Error()}
+			return
+		}
+		if _, err := f.Write(buf); err != nil {
+			_ = f.Close()
+			_ = os.Remove(sentinelPath)
+			resCh <- result{false, "write: " + err.Error()}
+			return
+		}
+		// 2. Fsync — verifies the bytes actually committed, not just
+		//    landed in client write cache. If the backend (MinIO or
+		//    Redis) is wedged, this is where it surfaces.
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			_ = os.Remove(sentinelPath)
+			resCh <- result{false, "fsync: " + err.Error()}
+			return
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(sentinelPath)
+			resCh <- result{false, "close: " + err.Error()}
+			return
+		}
+		// 3. Delete — exercises a different path (REMOVE → handler →
+		//    metadata.Store.Delete + JuiceFS unlink + Redis prune).
+		if err := os.Remove(sentinelPath); err != nil {
+			resCh <- result{false, "remove: " + err.Error()}
+			return
+		}
+		resCh <- result{true, ""}
+	}()
+
+	select {
+	case r := <-resCh:
+		elapsedMs = time.Since(start).Milliseconds()
+		return r.ok, elapsedMs, r.hint
+	case <-time.After(time.Until(deadline)):
+		// Probe goroutine leaked — it'll finish whenever the kernel
+		// returns. Acceptable cost.
+		return false, overallBudget.Milliseconds(), "write probe exceeded " + overallBudget.String() + " budget"
 	}
 }
 
