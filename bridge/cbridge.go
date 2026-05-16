@@ -827,12 +827,19 @@ func NFSServerSearch(query *C.char, limit C.int, parentPath *C.char) *C.char {
 // granting NOPASSWD on /bin/sh, which is the entire shell. Refuse to
 // expand the privileged blast radius.
 func runMountViaSudo(mountPoint, opts, host string) error {
-	// Cheap probe: does sudo run without prompting? `-n` returns non-zero
-	// if a password would be required. The "true" command always succeeds
-	// otherwise, so this isolates the auth question.
-	probe := exec.Command("sudo", "-n", "--", "true")
-	if err := probe.Run(); err != nil {
-		return fmt.Errorf("passwordless sudo unavailable: %w", err)
+	// Probe with one of the actually-allowed binaries — not a generic
+	// command. The recommended sudoers entry scopes NOPASSWD to
+	// /sbin/mount_nfs + /sbin/umount + /bin/mkdir, so a probe like
+	// `sudo -n -- true` would FAIL (requiring a password) even when
+	// the real mount call WOULD succeed. Use mount_nfs with no args —
+	// sudo either gates with a password (return error) or lets it
+	// through to mount_nfs which prints usage and exits non-zero.
+	// We don't care about mount_nfs's exit code here, only about
+	// sudo's: differentiate via stderr containing "password is required".
+	probe := exec.Command("sudo", "-n", "/sbin/mount_nfs")
+	probeOut, _ := probe.CombinedOutput()
+	if strings.Contains(string(probeOut), "password is required") {
+		return fmt.Errorf("passwordless sudo unavailable for /sbin/mount_nfs")
 	}
 
 	// 1. mkdir the mount point. Allowed by the same NOPASSWD rule.
@@ -1011,7 +1018,13 @@ func unmountNFS(mountPoint string) bool {
 	// passwordless sudo if the user has the sudoers entry configured.
 	// Tier 2: AppleScript admin prompt (below). Skipping the prompt
 	// in dev workflows keeps automated test-cycles friction-free.
-	if probeErr := exec.Command("sudo", "-n", "--", "true").Run(); probeErr == nil {
+	//
+	// Probe via a binary that's actually in the NOPASSWD list (sudoers
+	// usually scopes to specific binaries, so `sudo -n -- true` would
+	// fail even when the real umount would succeed).
+	umountProbe := exec.Command("sudo", "-n", "/sbin/umount")
+	umountProbeOut, _ := umountProbe.CombinedOutput()
+	if !strings.Contains(string(umountProbeOut), "password is required") {
 		if tryUnmount("sudo-umount-f-nfs", 15*time.Second,
 			"sudo", "-n", "/sbin/umount", "-f", "-t", "nfs", mountPoint) {
 			return true
