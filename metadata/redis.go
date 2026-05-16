@@ -152,6 +152,41 @@ func (rc *RedisClient) LastReconnect() time.Time {
 	return rc.lastReconnect
 }
 
+// RecentlyDegraded reports whether the Redis connection (and therefore
+// the metadata authority) is unhealthy right now OR was unhealthy
+// recently enough that downstream state may still be inconsistent.
+//
+// Use this to gate destructive cache mutations whose correctness depends
+// on Redis being authoritative. Specifically: the phantom-file purge
+// in the NFS handler deletes entries when FUSE returns ENOENT for a
+// path the SQLite cache thinks exists. If Redis was unavailable
+// recently, JuiceFS's view of the filesystem may have been wrong
+// during the outage (it can't fetch metadata it doesn't have cached
+// locally), and a single FUSE-says-missing observation is not
+// trustworthy. Gating purges on !RecentlyDegraded prevents the
+// "Redis blip → real files marked phantom → cache deletion → stale
+// NFS handles on reconnect" cascade observed 2026-05-16 ~06:14.
+//
+// cooldown is the window after a reconnect during which we still
+// consider the client degraded. Tuned for the typical metadata-sync
+// cycle (~30s) plus a safety margin.
+func (rc *RedisClient) RecentlyDegraded(cooldown time.Duration) bool {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	if !rc.connected {
+		return true
+	}
+	// Reconnected, but still inside cooldown.
+	if !rc.lastReconnect.IsZero() && !rc.lastDisconnect.IsZero() {
+		if rc.lastReconnect.After(rc.lastDisconnect) {
+			if time.Since(rc.lastReconnect) < cooldown {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Reconnect tears down and re-establishes the Redis connection.
 // Called when a network interface change is detected so that TCP connections
 // bound to the old interface are replaced with connections on the new one.

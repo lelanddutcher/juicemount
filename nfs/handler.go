@@ -513,17 +513,40 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 		// On timeout we conservatively keep the cache entry (assume the
 		// file still exists) rather than block.
 		if !e.IsDir {
-			fusePath := jfs.fullPath(filename)
-			isNotExist, ok := lstatNotExistWithTimeout(fusePath, 2*time.Second)
-			if ok && isNotExist {
-				jmlog.Warn("purging phantom file (stale cache)", "path", filename)
-				jfs.handler.store.DeleteFromCache(filename)
-				go jfs.handler.store.Delete(filename)
-				return nil, os.ErrNotExist
+			// Gate the phantom-file purge on metadata-authority health.
+			// 2026-05-16 incident: Redis at 192.168.0.210 was unreachable
+			// for ~30 min overnight. During the outage JuiceFS couldn't
+			// resolve its own metadata for some paths and FUSE returned
+			// ENOENT for files that genuinely exist. The phantom-purge
+			// path then deleted those cache entries; when Redis came
+			// back, the SQLite store was inconsistent with Redis, and
+			// NFS handles that had been issued before the purge pointed
+			// at a different inode — producing "Stale NFS file handle"
+			// errors on user attempts to write into affected directories.
+			//
+			// Fix: if Redis was disconnected or reconnected within the
+			// cooldown window, skip the purge. A single FUSE-says-gone
+			// observation isn't trustworthy when the metadata authority
+			// just blipped. The file may genuinely have been deleted —
+			// in which case the next stat after the cooldown will catch
+			// it — but the cost of being wrong here (stale handle that
+			// requires a remount to recover) is much higher than the
+			// cost of a few extra seconds of "this stale entry exists."
+			if jfs.handler.redisClient != nil && jfs.handler.redisClient.RecentlyDegraded(60*time.Second) {
+				// Treat the cache entry as authoritative. Skip purge.
+			} else {
+				fusePath := jfs.fullPath(filename)
+				isNotExist, ok := lstatNotExistWithTimeout(fusePath, 2*time.Second)
+				if ok && isNotExist {
+					jmlog.Warn("purging phantom file (stale cache)", "path", filename)
+					jfs.handler.store.DeleteFromCache(filename)
+					go jfs.handler.store.Delete(filename)
+					return nil, os.ErrNotExist
+				}
+				// !ok means the Lstat timed out — FUSE is degraded. Treat the
+				// cache entry as authoritative for now; the stale entry (if
+				// any) will be cleaned up on a future stat once FUSE recovers.
 			}
-			// !ok means the Lstat timed out — FUSE is degraded. Treat the
-			// cache entry as authoritative for now; the stale entry (if
-			// any) will be cleaned up on a future stat once FUSE recovers.
 		}
 
 		// If we have a tracked write size that's larger, use it
