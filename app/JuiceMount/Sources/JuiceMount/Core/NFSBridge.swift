@@ -176,6 +176,13 @@ public enum NFSBridge {
         public var ran_at: String = ""     // RFC3339
         public var target: String = ""
 
+        /// Write probe results — mirrors the Go-side fields added to expose
+        /// whether the user-visible write path is healthy. If `write_ok`
+        /// is false, the status above has been downgraded accordingly.
+        public var write_ok: Bool = true
+        public var write_ms: Int64 = 0
+        public var write_hint: String = ""
+
         /// True when the result represents something the user might care to
         /// see surfaced on the icon (anything not green, including errors).
         /// "pending" (no run yet — placeholder served while Go's background
