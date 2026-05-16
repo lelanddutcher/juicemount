@@ -955,6 +955,17 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 				f.readahead.OnRead(f.inode, off, n, f.name)
 			}
 			metrics.Default().AddBytesRead(int64(n))
+			// [JM6] Surface EOF when the buffered file ran out under us.
+			// memBuf returns (0, true) when off is past the buffered
+			// length; callers iterating in a short-read loop (e.g. the
+			// new subdivided onRead path) would otherwise re-issue at
+			// the same offset forever because they can't distinguish
+			// "end of file" from "transient zero-byte response". This
+			// path is reached for small files <= 32 KiB that bypass the
+			// upstream size-clamp in nfs_onread.go.
+			if n == 0 {
+				return 0, io.EOF
+			}
 			return n, nil
 		}
 	}
