@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/willscott/go-nfs-client/nfs/xdr"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 )
 
 type nfsReadArgs struct {
@@ -178,6 +180,12 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		}
 	}
 	if ioErr != nil {
+		// [JM6 tier-1.7] Offline fail-fast: distinguish offline-refusal
+		// from genuine I/O error. NFSStatusNXIO preserves the kernel's
+		// file handle cache for post-recovery; NFSStatusIO would not.
+		if pin.IsOfflineNotAvailable(ioErr) {
+			return &NFSStatusError{NFSStatusNXIO, ioErr}
+		}
 		return &NFSStatusError{NFSStatusIO, ioErr}
 	}
 	resp.Count = uint32(cnt)

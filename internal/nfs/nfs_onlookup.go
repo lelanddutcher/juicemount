@@ -7,6 +7,8 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 )
 
 func lookupSuccessResponse(handle []byte, entPath, dirPath []string, fs billy.Filesystem) ([]byte, error) {
@@ -72,6 +74,11 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 
 	reqPath := append(p, string(obj.Filename))
 	if _, err = fs.Lstat(fs.Join(reqPath...)); err != nil {
+		// [JM6 tier-1.7] See nfs_ongetattr.go comment — offline fail-
+		// fast must not invalidate the kernel's file handle cache.
+		if pin.IsOfflineNotAvailable(err) {
+			return &NFSStatusError{NFSStatusNXIO, err}
+		}
 		return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}
 	}
 
