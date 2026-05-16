@@ -906,6 +906,17 @@ func unmountNFS(mountPoint string) bool {
 		"") {
 		return true
 	}
+	// Pre-flight before the second admin attempt: maybe the first one
+	// succeeded but the kernel took longer than our 1 s settle window
+	// to release the mount-table entry. Recheck before re-prompting
+	// the user — prevents the "second password prompt" anti-UX when
+	// the unmount has actually already happened.
+	time.Sleep(500 * time.Millisecond)
+	if !isMounted(mountPoint) {
+		jmlog.Info("nfs unmounted (post-settle recheck)",
+			"method", "admin-umount-f-nfs", "mount_point", mountPoint)
+		return true
+	}
 	// Second admin attempt: drop the -t nfs filter. Some wedged states
 	// don't dispatch on the type predicate the same way and the
 	// unscoped -f variant releases them. The mount path is still
