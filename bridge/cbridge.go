@@ -787,8 +787,35 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 	// instead of after ~150 s. For our localhost-only NFS path, that's
 	// the right policy — a 3 s blip is annoying, a 150 s blip looks
 	// indistinguishable from a system hang.
+	// [JM6] rsize=262144 (256 KiB). Was 1048576 (1 MiB).
+	//
+	// 2026-05-16 cold-read instrumentation showed individual NFS READ
+	// RPCs for 1 MiB chunks taking up to 4 s when the underlying
+	// JuiceFS-over-MinIO path is slow (cold blocks, Redis flakes on
+	// the metadata backend). The kernel's per-operation budget with
+	// timeo=10,retrans=2 over TCP is ~7 s of cumulative wall-clock
+	// before the client returns EIO to the caller. A single slow 1
+	// MiB read can therefore exhaust the budget by itself, killing
+	// `cat`/`dd`/NLE-scrub on large cold files.
+	//
+	// Reducing rsize to 256 KiB means each kernel RPC asks for a
+	// quarter as much. The server's chunked-loop deadline (2 s, see
+	// internal/nfs/nfs_onread.go) was already subdividing 1 MiB
+	// requests into 256 KiB sub-reads internally; this just moves
+	// the subdivision out to the kernel-NFS layer where each RPC is
+	// independently budgeted. Net latency for a warm 1 MiB transfer
+	// is unchanged in practice — 4 kernel RPCs in flight under our
+	// concurrent dispatch get pipelined.
+	//
+	// The cost is more RPC overhead at high throughput. For 200 MiB
+	// at 250 MB/s that's 800 RPCs/sec instead of 200 RPCs/sec. Our
+	// concurrent-dispatch handler comfortably handles that load (>5
+	// kRPC/sec is fine).
+	//
+	// Write size stays at 1 MiB — writes are sequential and the
+	// failure mode there is different.
 	opts := fmt.Sprintf(
-		"port=%s,mountport=%s,soft,intr,timeo=10,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
+		"port=%s,mountport=%s,soft,intr,timeo=10,retrans=2,nolocks,locallocks,rsize=262144,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
 		port, port)
 
 	// Build the shell command: mkdir + mount_nfs
