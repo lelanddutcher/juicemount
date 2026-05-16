@@ -90,6 +90,24 @@ until every acceptance test in it passes for **7 consecutive days of real
 user load**, or **24 hours of synthetic stress-harness load** when no real
 users exist yet.
 
+Per-tier detail lives under `docs/ROADMAP/`. The summaries below are the
+canonical *what* per tier; each linked doc has the concrete acceptance
+tests, architecture notes, anti-patterns, and dependency map.
+
+- `docs/ROADMAP/tier-2-app-polish.md` — onboarding wizard, popover
+  redesign, self-explaining errors, Sparkle, a11y
+- `docs/ROADMAP/tier-3-server-packaging.md` — `docker compose up` stack,
+  `juicemount doctor`, backup sidecar, admin UI behind Caddy
+- `docs/ROADMAP/tier-4-network-resilience.md` — **includes the offline
+  resilience plan that partially blocks tier-1 advancement**; bandwidth
+  probing, per-project budgets, deferred indexing
+- `docs/ROADMAP/tier-5-finder-ux.md` — FinderSync badges, Services menu,
+  QuickLook, mdimport (NEVER FileProviderExtension)
+- `docs/ROADMAP/tier-6-search.md` — CoreML content tags, embeddings,
+  `.juiceproject` bundles, optional
+- `docs/ROADMAP/tier-7-collaboration.md` — live presence, soft locks,
+  activity feed, per-folder ACLs, optional
+
 ### Tier 1 — Stability (the table-stakes)
 
 | Feature | Acceptance test |
