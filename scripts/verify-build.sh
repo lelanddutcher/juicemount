@@ -93,6 +93,7 @@ declare -a FIXES=(
     "metadata.classifyConnErr|Network-vs-backend error classifier (e8aa5cb, 2026-05-16)"
     "health.(\*Reachability).probe|Reachability monitor (fd267b9, 2026-05-16)"
     "pin.SetAutoOffline|Auto-offline engage on network loss (10607ab, 2026-05-16)"
+    "pin.ErrOfflineNotAvailable|Offline fail-fast sentinel for handler (54b744b, 2026-05-16)"
 )
 
 FAILURES=0
