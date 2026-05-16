@@ -291,3 +291,47 @@ the harness against the fresh binary and updates tier-1.1/1.2 with
 real numbers. If they don't, iter 6 picks tier-1.3 manual-unmount
 matrix or starts a long-duration `--json` background soak against
 the current binary as a baseline before the swap.
+
+### Iteration 6 — 2026-05-16
+
+**Tier:** 1 (Stability).
+**Picked:** pivot again — PID 41860 (old binary) still running. Built
+the analytical companion to jmstress: a soak-result differ.
+
+**Shipped (`b5f75bb`):**
+- `cmd/jmcompare/main.go`: reads two `jmstress --json` output files
+  (before.jsonl, after.jsonl), reports per-worker, per-op latency
+  percentile deltas with explicit +/- percent changes. Threshold
+  gate via `--threshold-p99-regression-pct N` exits non-zero on
+  regression — suitable for CI gating "the new code doesn't make
+  Finder worse." Optional `--json` for machine-readable diff.
+
+**Validated:** smoke test on two 8s runs (same workload, different
+seeds) produced expected 4-column human report and correct
+threshold gate (exit 1 at 0.1% threshold; exit 0 in warn-only mode).
+
+**Why this matters:** the tier-1 acceptance workflow is now
+end-to-end actionable when the binary swap happens:
+  1. jmstress --json --duration 1h > old.jsonl  (current binary)
+  2. swap to fresh binary
+  3. jmstress --json --duration 1h > new.jsonl
+  4. jmcompare old.jsonl new.jsonl
+
+Before this iteration, step 4 was "eyeball two text reports."
+
+**Broken:** nothing.
+
+**Observation:** three iterations now (4, 5, 6) where the user fired
+/loop without restarting the mount. The pattern suggests they're
+letting the autonomous loop iterate while they work elsewhere, OR
+the dev mount swap requires a context window they haven't had.
+Iterations have been pivoting to non-restart-dependent work — which
+is finite. Eventually we run out of harness-extension ideas and
+must either (a) get the restart and proceed with tier-1.1/1.2
+re-validation, or (b) drop down to tier-1.3 manual matrix that
+requires the user's hands.
+
+**Next:** iteration 7 either re-runs validation against fresh binary
+(if user restarts) or kicks off a long `jmstress --duration 4h --json
+--periodic-json 60s` baseline against the current binary as a
+backstop datapoint, then queues tier-1.3.
