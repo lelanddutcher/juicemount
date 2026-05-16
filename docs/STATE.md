@@ -258,3 +258,36 @@ re-validated binary" only — not "code committed."
 **Next:** iteration 5 re-validates 1.1 and 1.2 against the fresh
 binary. Latency investigation is gated on knowing the actual current
 baseline.
+
+### Iteration 5 — 2026-05-16
+
+**Tier:** 1 (Stability).
+**Picked:** pivot — user hasn't restarted the mount with the fresh
+binary yet (PID 41860 still running from 02:09:48). Re-validation
+deferred. Used the iteration on a non-restart-dependent tier-1.6
+extension: machine-readable output for jmstress.
+
+**Shipped (`386ac52`):**
+- `cmd/jmstress`: added `--json` (emit a single JSON summary on
+  stdout, human output to stderr) and `--periodic-json N` (emit
+  "type":"tick" snapshots every N during the run, with a final
+  "type":"final" entry). Stable schema with mean/p50/p95/p99/max
+  per op, errors per worker, and a metrics delta on the final.
+
+**Validated:** 10s smoke with `--json --periodic-json 3s` produced 4
+valid JSON lines (3 ticks + 1 final). stat p50 = 357µs, p99 = 1.6ms
+on the shallow-discovery smoke — the iteration-4 outliers (505ms p50)
+were from deeper cold-backend traversal, not a regression.
+
+**Deferred:** the 24h soak that produces the actual tier-1.6
+acceptance data. Now actionable since the harness produces
+analyzable timeseries instead of a single summary blob.
+
+**Broken:** nothing.
+
+**Next:** iteration 6 status depends on what the user does between
+now and the next wake. If they restart the mount, iter 6 re-runs
+the harness against the fresh binary and updates tier-1.1/1.2 with
+real numbers. If they don't, iter 6 picks tier-1.3 manual-unmount
+matrix or starts a long-duration `--json` background soak against
+the current binary as a baseline before the swap.
