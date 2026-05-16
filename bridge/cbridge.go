@@ -63,6 +63,14 @@ var (
 	// Pin / offline / prefetch globals
 	globalPinStore   *pin.Store
 	globalPrefetcher *pin.Prefetcher
+
+	// [JM6 tier-1.7-1.10] Reachability monitor for offline-mode
+	// auto-engage. Runs independently of the health monitor: the
+	// health monitor reports backend component status (Redis/MinIO
+	// pings), this one tracks "is the route from this Mac to the
+	// metadata host alive at all." Items 3-5 of the offline-
+	// resilience plan consume its state and OnChange callback.
+	globalReach *health.Reachability
 )
 
 // ServerConfig is the JSON configuration passed from Swift.
@@ -203,6 +211,28 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		return C.CString(fmt.Sprintf("error: redis: %v", err))
 	}
 	globalRC = rc
+
+	// [JM6 tier-1.8/1.9] Reachability monitor against the metadata
+	// host. Probes a cheap TCP dial at 2s cadence; transitions
+	// reachable→unreachable after 2 consecutive failures (~4s
+	// detection — under the 5s tier-1.8 acceptance threshold).
+	// Items 3-5 will consume its OnChange callback to auto-engage
+	// offline mode, refuse un-pinned reads fast, and surface state
+	// in the UI. For now this is purely observational — it logs
+	// transitions but does not yet affect any other state.
+	if reachAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL); reachAddr != "" {
+		globalReach = health.NewReachability(reachAddr)
+		globalReach.OnChange(func(reachable bool, reason string) {
+			if reachable {
+				jmlog.Info("network path to backend recovered",
+					"target", reachAddr, "reason", reason)
+			} else {
+				jmlog.Warn("network path to backend lost",
+					"target", reachAddr, "reason", reason)
+			}
+		})
+		globalReach.Start()
+	}
 
 	// Initial sync
 	if err := rc.SyncOnce(); err != nil {
@@ -460,6 +490,7 @@ func stopServerLocked() {
 	rdb := globalRDB
 	pinStore := globalPinStore
 	prefetcher := globalPrefetcher
+	reach := globalReach
 	globalMetrics = nil
 	globalMonitor = nil
 	globalServer = nil
@@ -469,6 +500,7 @@ func stopServerLocked() {
 	globalRDB = nil
 	globalPinStore = nil
 	globalPrefetcher = nil
+	globalReach = nil
 	globalMu.Unlock()
 
 	// Now run the slow shutdown work on the snapshots, no lock held.
@@ -490,6 +522,9 @@ func stopServerLocked() {
 	}
 	if rc != nil {
 		rc.Stop()
+	}
+	if reach != nil {
+		reach.Stop()
 	}
 	if prefetcher != nil {
 		prefetcher.Stop()
