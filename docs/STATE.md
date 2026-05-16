@@ -20,7 +20,7 @@ Acceptance tests (from `docs/VISION.md`):
 | 1.3 | Clean unmount in every state | ✓ likely (ordered shutdown + Force Eject landed) — needs real validation |
 | 1.4 | Crash-safe metadata (kill -9 → mountable in <5s) | ⚠ not validated |
 | 1.5 | Recovery diagnostics (Export Diagnostics zip) | ✓ landed in Phase B |
-| 1.6 | Stress test harness (24h CI run) | ✗ not built |
+| 1.6 | Stress test harness (24h CI run) | ⚠ scaffold landed in `74a9739`; 24h soak run pending |
 
 **Tier-1 cannot be declared "production-ready" until all six pass.**
 Active iteration count toward the 7-day-real-load / 24h-stress-harness
@@ -36,12 +36,12 @@ clock starts only after every box is checked.
    running, then navigate Finder around adjacent folders; expected
    <1s response on every Lookup.
 
-2. **Stress test harness (tier-1.6)** — synthetic Finder-like workload
-   that runs for 24h, exercising the mount lifecycle, concurrent
-   reads, cache eviction, and offline-mode transitions. No existing
-   implementation. Likely a Go test under `internal/stress/` driving
-   the NFS server with parallel goroutines simulating Finder, an NLE,
-   and a backup process. ~4-6 hour slice.
+2. ~~**Stress test harness (tier-1.6)**~~ — scaffold landed in
+   `74a9739` as `cmd/jmstress`. Three workload mixes (finder/nle/backup),
+   per-worker latency reporting, metrics endpoint delta. Next step on
+   this item: run a 24h soak against the dev mount and check for
+   leaks, wedges, or error accumulation. The 24h run itself is the
+   acceptance test — once it passes cleanly, tier-1.6 is checked.
 
 3. **Crash-safety validation (tier-1.4)** — needs a reproducible test
    that does `kill -9` on the running app + relaunches and measures
@@ -125,3 +125,42 @@ not verified" state.
 acceptance requires 24h of synthetic load when no real users exist
 yet. Estimated 4-6 hour slice; may be split across multiple
 iterations.
+
+### Iteration 2 — 2026-05-16
+
+**Tier:** 1 (Stability).
+**Picked:** tier-1.6 — stress test harness scaffold.
+
+**Shipped (`74a9739`):**
+- `cmd/jmstress/main.go`: external Go load generator that drives a
+  mounted JuiceMount path with three workload mixes (finder/nle/backup),
+  per-worker p50/p95/p99/max latency distributions, error counts, and
+  a `/metrics` endpoint before/after delta. Graceful shutdown on
+  SIGINT.
+- Smoke-tested for 60s against live dev mount: 50K RPCs flowed, 0
+  errors, latencies match what manual testing showed (finder p99
+  ~250ms, occasional max-spikes to 1-2s on cold metadata).
+
+**Validated:** `go vet` clean, smoke run succeeds, no panics or
+deadlocks observed.
+
+**Deferred:** the actual 24h soak run is the next-up acceptance test
+for tier-1.6 — it's not in this iteration because a 24h soak isn't a
+"2–6 hour slice." Future iteration kicks it off in background;
+results land in a follow-up STATE.md entry.
+
+**Broken:** nothing.
+
+**Observations worth follow-up (not this iteration):**
+- Finder-stat p99 ~250ms and max-spikes to 1-2s are consistent across
+  manual tests and stress smoke. Concurrent dispatch fix eliminated
+  the multi-second freezes, but there's residual latency worth
+  understanding. Candidate causes: cold metadata Redis fetch,
+  `os.Stat` path-canonicalization overhead, macOS NFS client ATTR
+  refresh storms. Belongs to tier-1.2 (Finder responsiveness under
+  load) once tier-1.6 closes.
+
+**Next:** iteration 3 picks tier-1.4 (crash-safety validation) as a
+small slice — script that does `kill -9` + relaunch + measures
+recovery. ~1-2 hours. After that, iteration 4 kicks off the 24h soak
+in background and parallel-works on tier-1.2 latency analysis.
