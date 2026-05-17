@@ -362,8 +362,11 @@ struct MenuPopoverView: View {
                 reclaimBusy = false
                 refreshDiskSpace()
                 if let errMsg = errMsg {
-                    showAlert(title: "Reclaim failed", message: errMsg)
+                    presentRemediation(.reclaimFailed, rawError: errMsg)
                 } else if freedGB < 0.1 {
+                    // Informational, not an error — keep the lighter
+                    // showAlert for this case so we don't surface a
+                    // "Copy diagnostic" button on a no-op outcome.
                     showAlert(title: "Nothing to reclaim",
                               message: "macOS reports purgeable space, but tmutil couldn't free any. The reclaimable space may be in iCloud Drive or system caches that the system manages on its own under disk pressure.")
                 } else {
@@ -404,7 +407,7 @@ struct MenuPopoverView: View {
                 refreshDiskSpace()
                 refreshCacheStatus()
                 if let errMsg = errMsg {
-                    showAlert(title: "Clear cache failed", message: errMsg)
+                    presentRemediation(.clearCacheFailed, rawError: errMsg)
                 } else {
                     NSLog("[JuiceMount] Cleared %d chunks, freed %.1f GB; pinned content re-queueing",
                           filesRemoved, freedGB)
@@ -693,8 +696,9 @@ struct MenuPopoverView: View {
                     DispatchQueue.main.async {
                         refreshCacheStatus()
                         if let err = result.error, !err.isEmpty {
-                            showAlert(title: "Pin failed",
-                                      message: "\(url.lastPathComponent): \(err)")
+                            presentRemediation(.pinFailed,
+                                               rawError: err,
+                                               extraContext: "folder: \(url.lastPathComponent)")
                         } else {
                             // Brief notification — don't be too noisy
                             NSLog("[JuiceMount] Pinned \(result.files_pinned) files under \(url.lastPathComponent)")
@@ -702,8 +706,8 @@ struct MenuPopoverView: View {
                     }
                 } catch {
                     DispatchQueue.main.async {
-                        showAlert(title: "Pin failed",
-                                  message: error.localizedDescription)
+                        presentRemediation(.pinFailed,
+                                           rawError: error.localizedDescription)
                     }
                 }
             }
