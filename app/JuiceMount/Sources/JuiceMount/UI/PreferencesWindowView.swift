@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 
 struct PreferencesWindowView: View {
     @Bindable var preferences: Preferences
@@ -78,6 +79,26 @@ struct PreferencesWindowView: View {
                                 appDelegate.registerSearchHotkey()
                             } else {
                                 appDelegate.unregisterSearchHotkey()
+                            }
+                        }
+                    }
+                // C.4 (QA-10, 2026-05-17): opt-in notifications on
+                // auto-offline transitions. ServerController watches the
+                // auto_offline edge in /offline polling and calls
+                // UNUserNotificationCenter when this is enabled. We
+                // request authorization on the false→true edge — no
+                // point asking the system for permission until the user
+                // actually wants the notifications.
+                Toggle("Notify on auto-offline / recovery", isOn: $preferences.offlineNotificationsEnabled)
+                    .onChange(of: preferences.offlineNotificationsEnabled) { _, newValue in
+                        guard newValue else { return }
+                        UNUserNotificationCenter.current().requestAuthorization(
+                            options: [.alert, .sound]
+                        ) { granted, _ in
+                            if !granted {
+                                Task { @MainActor in
+                                    preferences.offlineNotificationsEnabled = false
+                                }
                             }
                         }
                     }

@@ -304,9 +304,46 @@ JuiceMount's doesn't, the bug is in our panel config, not the mount.
 
 ---
 
-### QA-10 (2026-05-17, user QA) — no notification when auto-offline engages
+### QA-10 (2026-05-17, user QA) — no notification when auto-offline engages — ✓ CLOSED 2026-05-17 (Loop C.4)
 
-**Observed:** mount degraded silently mid-session. Backend
+**Fix (Loop C.4, 2026-05-17 ~15:00):**
+
+Most of the wiring was already in place from a prior session: the
+reachability OnChange callback in `bridge/cbridge.go:246` calls
+`pin.SetAutoOffline()` on both edges; ServerController's
+`refreshCacheStatus()` polls `/offline` and detects the
+`auto_offline` edge by comparing to the prior poll; the
+`notifyOfflineTransition` helper at ServerController.swift:265 fires
+the `UNUserNotificationCenter` request with appropriate copy
+("offline mode engaged" / "back online"); the first-fetch is
+suppressed via `hasCompletedInitialOfflineFetch` so a launch into
+already-offline doesn't spam.
+
+What was missing — added in this slice:
+
+  1. A user-facing toggle in `PreferencesWindowView.swift` for
+     `preferences.offlineNotificationsEnabled` (the underlying
+     Preferences key already existed and defaulted to false per
+     the VISION "no telemetry without opt-in" rule).
+  2. `UNUserNotificationCenter.current().requestAuthorization(...)`
+     wired to fire when the toggle is enabled — no point asking the
+     system for permission until the user actually wants it. If the
+     user denies, the toggle reverts to off.
+
+**Adjacent scenarios (per Rule 3 — built only, runtime validation
+pending the backend coming back up):**
+  1. Toggle off (default): no notification fires on auto-offline
+     transition — matches existing behavior.
+  2. Toggle on, grant authorization: notification fires on both
+     false→true and true→false edges (engaged + recovered).
+  3. Toggle on, deny authorization: toggle reverts to off (no
+     silent half-broken state).
+  4. App relaunch with pref=on: prior auth grant persists; no
+     re-prompt needed.
+  5. First fetch after launch into offline state: suppressed via
+     `hasCompletedInitialOfflineFetch` — no unexpected banner.
+
+**Original observation:** mount degraded silently mid-session. Backend
 connection dropped, auto-offline engaged at 13:44:02. The fail-
 safe worked correctly, but the user had no idea until they opened
 the popover and saw the offline toggle was on. They were copying
