@@ -583,6 +583,21 @@ struct MenuPopoverView: View {
                     Text("\(root.ReadyFiles)/\(root.TotalFiles)")
                         .font(.caption2.monospaced())
                         .foregroundStyle(root.ReadyFiles == root.TotalFiles ? .green : .secondary)
+                    // Un-pin button — calls NFSServerUnpin via cgo,
+                    // refreshes cache-status afterward so the row vanishes.
+                    // No confirm dialog: un-pin is non-destructive (data
+                    // stays in cache until cache eviction or /cache-clear);
+                    // adding one would make the action friction-heavy.
+                    Button(action: { unpinRoot(root.Root) }) {
+                        Image(systemName: "minus.circle")
+                            .foregroundStyle(.secondary)
+                            .font(.caption2)
+                    }
+                    // .borderless preserves keyboard focus traversal so
+                    // tab-navigators can reach this control (vs .plain
+                    // which suppresses the focus ring entirely).
+                    .buttonStyle(.borderless)
+                    .help("Un-pin \(URL(fileURLWithPath: root.Root).lastPathComponent)")
                 }
             }
             if cacheStatus.roots.count > 3 {
@@ -590,6 +605,26 @@ struct MenuPopoverView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
+        }
+    }
+
+    /// Calls NFSBridge.unpin off the main thread to avoid blocking the
+    /// popover during the cgo round-trip, then refreshes cache-status
+    /// so the row vanishes from the list. Errors are logged but not
+    /// surfaced via dialog — un-pin not-found is non-fatal (the row
+    /// was already gone), and other errors are rare enough that the
+    /// NSLog trail is sufficient until a notifications system exists.
+    private func unpinRoot(_ path: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let result = try NFSBridge.unpin(path)
+                NSLog("[JuiceMount] Unpinned %d files under %@",
+                      result.files_pinned, path)
+            } catch {
+                NSLog("[JuiceMount] unpin failed for %@: %@",
+                      path, String(describing: error))
+            }
+            DispatchQueue.main.async { refreshCacheStatus() }
         }
     }
 
