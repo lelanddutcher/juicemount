@@ -166,3 +166,42 @@ goroutines). Less recommended path but real users will want it.
   is end-to-end testable.
 - Tier 4's bandwidth probe needs an endpoint to probe — `juicemount-
   server` should expose `/healthz` reachable from clients.
+
+## Iteration plan
+
+Tier-3 work is mostly fresh creation under a new `server/` directory.
+Each iteration delivers something deployable end-to-end so we don't
+ship half a stack.
+
+| # | Slice | Hours | Files |
+|---|---|---|---|
+| 3.A.1 | Minimal `server/docker-compose.yml` — MinIO + Redis + JuiceFS-init bind-mounted to a single `DATA_PATH` from `.env` | 4 | `server/docker-compose.yml`, `server/.env.example`, `server/README.md` |
+| 3.A.2 | Add the `juicemount-server` container — runs `cmd/juicemount` in -daemon-mode, exposes NFS on 2049 + admin API on 11050 | 5 | new `cmd/juicemount-server/main.go`, Dockerfile, compose entry |
+| 3.A.3 | Healthchecks on every service (compose `healthcheck:` blocks) — fail fast on bad config | 2 | docker-compose.yml |
+| 3.A.4 | Caddy front + admin-key auth header on every admin route | 3 | new `server/Caddyfile`, admin-key middleware in juicemount-server |
+| 3.B.1 | `cmd/jmdoctor` — single binary, prints OK/WARN/FAIL per component | 4 | new `cmd/jmdoctor/main.go` |
+| 3.B.2 | Wire jmdoctor into `docker compose exec juicemount-server jmdoctor` flow + cron-friendly exit code | 1 | Dockerfile + docs |
+| 3.C.1 | Backup sidecar: `mc mirror` to `JM_BACKUP_TARGET` on a cron schedule | 4 | new `server/backup/` dir, `backup-sidecar/Dockerfile` |
+| 3.C.2 | `juicefs dump` periodic for metadata-side restore | 2 | extend the sidecar |
+| 3.D.1 | Admin UI HTML/JS (static — connected clients, bytes I/O, cache fill, recent errors) | 6 | `server/admin-ui/` static assets, served by juicemount-server |
+| 3.D.2 | Admin UI talks to admin API via Bearer auth — works behind Caddy TLS | 2 | wire it through |
+| 3.E.1 | Signed single binary for non-Docker installs (Linux, supervisor pattern) | 6 | new `cmd/juicemount-allinone/main.go` |
+| 3.E.2 | Cross-compile + release pipeline (GoReleaser config) | 3 | `.goreleaser.yml` |
+
+Total: ~42 hours = ~5 working days.
+
+**First-iteration target**: cold-deploy on a fresh Ubuntu 24.04 VM
+from `git clone` to a Mac-mountable backend in under 10 minutes. If
+that works, every subsequent iteration builds on a proven foundation.
+
+## Signals to watch
+
+| Item | Signal proving it works |
+|---|---|
+| 3.A.1-2 | `docker compose up` exits with all services healthy within 30s on fresh box |
+| 3.A.3 | `docker compose ps` shows all services in `healthy` state; introducing bad config in `.env` produces a clear failure not a hang |
+| 3.A.4 | Curl to admin route without bearer → 401; with valid bearer → 200 |
+| 3.B | `docker compose exec ... jmdoctor` exits 0 in healthy state; exits non-zero when any component is down + names the failure |
+| 3.C | Backup target file appears at the configured `JM_BACKUP_TARGET` after a scheduled run; manual `juicefs load` from dump produces an identical metadata state |
+| 3.D | Admin UI loads at the `JM_HOSTNAME` URL behind TLS, shows current per-client byte counters |
+| 3.E | Single binary executes on a fresh Linux box with only `--config` flag, produces same component states as the docker stack |

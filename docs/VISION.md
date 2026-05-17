@@ -90,23 +90,33 @@ until every acceptance test in it passes for **7 consecutive days of real
 user load**, or **24 hours of synthetic stress-harness load** when no real
 users exist yet.
 
-Per-tier detail lives under `docs/ROADMAP/`. The summaries below are the
-canonical *what* per tier; each linked doc has the concrete acceptance
-tests, architecture notes, anti-patterns, and dependency map.
+Per-tier detail lives under `docs/ROADMAP/`. Each linked doc has the
+concrete acceptance tests, architecture notes, anti-patterns,
+dependency map, **iteration plan** (work decomposed into 2-6 hour
+slices the autonomous loop can consume), and **signals to watch**
+(telemetry/log markers confirming each step works).
 
+- `docs/ROADMAP/tier-1-stability.md` — table-stakes; never freeze
+  Finder, never wedge mounts, crash-safe metadata, 24h soak pass.
+  **Active blocking tier.**
 - `docs/ROADMAP/tier-2-app-polish.md` — onboarding wizard, popover
-  redesign, self-explaining errors, Sparkle, a11y
+  redesign, self-explaining errors, Sparkle, a11y. ~6 days of work.
 - `docs/ROADMAP/tier-3-server-packaging.md` — `docker compose up` stack,
-  `juicemount doctor`, backup sidecar, admin UI behind Caddy
-- `docs/ROADMAP/tier-4-network-resilience.md` — **includes the offline
-  resilience plan that partially blocks tier-1 advancement**; bandwidth
-  probing, per-project budgets, deferred indexing
+  `juicemount doctor`, backup sidecar, admin UI behind Caddy. ~5 days.
+- `docs/ROADMAP/tier-4-network-resilience.md` — the **tier-1-blocking
+  offline-resilience portion is already shipped and validated** (iter
+  1-5, commits in docs/STATE.md). Remaining tier-4-proper work:
+  bandwidth probing, per-project budgets, deferred indexing, write
+  queues. ~8 days.
 - `docs/ROADMAP/tier-5-finder-ux.md` — FinderSync badges, Services menu,
-  QuickLook, mdimport (NEVER FileProviderExtension)
+  QuickLook, mdimport (NEVER FileProviderExtension). ~5 days.
 - `docs/ROADMAP/tier-6-search.md` — CoreML content tags, embeddings,
-  `.juiceproject` bundles, optional
+  `.juiceproject` bundles. Optional. ~5 days.
 - `docs/ROADMAP/tier-7-collaboration.md` — live presence, soft locks,
-  activity feed, per-folder ACLs, optional
+  activity feed, per-folder ACLs. Optional, community-driven. ~5 days.
+
+Total from current state to full vision: ~34 working days for the
+required tiers (1-5) + ~10 if tiers 6 and 7 ship too.
 
 ### Tier 1 — Stability (the table-stakes)
 
@@ -240,29 +250,60 @@ We ship FinderSync; we never ship FileProvider.
 Pasted here for easy copy:
 
 ```
-/loop Drive JuiceMount toward production-ready per docs/VISION.md. Each
-iteration: open docs/STATE.md, pick the next unblocked item from the
-current active tier (tier-N blocks tier-N+1), scope to a 2–6 hour slice,
-ship it, append a STATE.md entry. Do not bundle themes.
+/loop Drive JuiceMount toward production-ready per docs/VISION.md.
+The vision is enumerated as seven tiered roadmap docs under
+docs/ROADMAP/tier-N-<theme>.md. Each tier doc contains: goal,
+acceptance tests, architecture, feature backlog, iteration plan
+(slices with hour estimates), and signals to watch.
 
-Active tier advances when every acceptance test in docs/VISION.md for
-the current tier passes for 7 consecutive days of real user load, or
-24h of synthetic stress-harness load when no real users yet.
+The active tier is the lowest-numbered tier whose acceptance tests
+are not all ✓ validated in docs/STATE.md. Tier-N blocks tier-N+1.
+At session start: read docs/STATE.md to identify the active tier,
+then read docs/ROADMAP/tier-N-*.md to load its iteration plan.
 
 PER-ITERATION CHECKLIST:
-1. Read docs/STATE.md → pick item
-2. If item touches competitor territory, consult docs/COMPETITIVE/<area>.md
-3. Decompose, build, validate with real Finder/VLC where applicable
-4. Spawn code-reviewer sub-agent on any commit touching request path,
-   mount lifecycle, or metadata store
-5. Update STATE.md: shipped, deferred, broken, next
-6. Commit rationale-first
-7. Self-pace next iteration
+1. Read docs/STATE.md → confirm active tier + last-shipped slice
+2. Read docs/ROADMAP/tier-N-*.md → pick the next unshipped slice
+   from its "Iteration plan" table (smallest unshipped row)
+3. Scope to that single slice — never bundle slices, never expand
+   into adjacent tiers' work
+4. If item touches competitor territory, consult
+   docs/COMPETITIVE/<area>.md
+5. Implement. Build (scripts/build-app.sh for app changes,
+   scripts/build-cli.sh for CLI/handler). Run touched-package
+   tests: `go vet ./...` + `go test -race ./<pkg>/...`
+6. Spawn code-reviewer sub-agent on any commit touching request
+   path, mount lifecycle, metadata store, or cache invariants
+7. Validate against the relevant "Signals to watch" row in the
+   tier doc — real Finder/VLC/NLE testing where applicable, not
+   synthetic-only
+8. Update docs/STATE.md: mark acceptance test ⚠ landed-needs-
+   validation or ✓ validated; append the slice ID + commit hash
+9. Commit rationale-first (why before what)
+10. Self-pace next iteration
 
-NON-NEGOTIABLES (per docs/VISION.md): no FileProviderExtension; no opt-out
-telemetry; no proprietary deps for self-hosters; no scope creep; risky
-work behind default-off flag; open-source-first.
+ADVANCEMENT RULE:
+Active tier advances to tier N+1 when every acceptance test in
+docs/ROADMAP/tier-N-*.md is ✓ validated in docs/STATE.md AND the
+tier has held green for 7 consecutive days of real user load
+(or 24h of stress-harness load when there is no real user load
+yet). Tier-6 and tier-7 are optional — only enter them if the user
+explicitly greenlights.
 
-STOP when docs/STATE.md reports tier-3 production-ready AND user
-greenlights tier-4 entry. PushNotification on stop.
+NON-NEGOTIABLES (per docs/VISION.md):
+- No FileProviderExtension, ever. The build-time guard in
+  scripts/build-app.sh enforces this; do not bypass it.
+- No telemetry without explicit opt-in.
+- No proprietary deps for self-hosters; every component runnable
+  on Linux with OSS only.
+- No bundled-PR scope creep; one theme per commit.
+- Risky work behind a default-off flag until validated on real
+  workloads.
+- Open-source-first; reproducible signed notarized releases with
+  rationale-first changelogs.
+
+STOP when docs/STATE.md reports tier-1 through tier-5 all ✓
+validated (the "required tiers" set per docs/VISION.md) OR when
+the user explicitly halts. PushNotification on stop with a one-line
+summary of the final tier state.
 ```
