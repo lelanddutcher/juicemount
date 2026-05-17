@@ -279,8 +279,21 @@ func (r *Reachability) applyResult(ok bool) {
 		r.callbacksMu.Lock()
 		callbacks := append([]ReachabilityCallback(nil), r.callbacks...)
 		r.callbacksMu.Unlock()
+		// QA-15 defense (2026-05-17): dispatch callbacks ASYNCHRONOUSLY.
+		// The ReachabilityCallback doc already specifies "MUST NOT block",
+		// but a misbehaving callback (e.g., one that does a Redis round
+		// trip without a deadline, or grabs a contended mutex) could park
+		// this probe loop indefinitely and prevent recovery transitions
+		// from ever firing. That is exactly the failure mode QA-15
+		// documented: 15 min stuck unreachable while external probes to
+		// the same target succeed. Wrapping each callback in `go` ensures
+		// a hung callback is at most a leaked goroutine — the probe loop
+		// itself stays alive and keeps observing real state.
+		//
+		// Transitions are infrequent (only on actual state change, not on
+		// every probe), so unbounded `go` is bounded in practice.
 		for _, cb := range callbacks {
-			cb(newState, reason)
+			go cb(newState, reason)
 		}
 	}
 }

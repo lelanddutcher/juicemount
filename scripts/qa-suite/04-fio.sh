@@ -11,6 +11,12 @@
 #   many-small     — create + read 8 KiB files (small-file behavior)
 #
 # All profiles target the mount path. Output JSON to artifacts/.
+#
+# Engine note: uses `psync` (synchronous pread/pwrite) not `posixaio`.
+# macOS's POSIX AIO (aio_read/aio_write) over NFS returns spurious EIO
+# at random offsets even on healthy mounts — known macOS-kernel issue,
+# not a JuiceMount bug. We want fio to exercise the synchronous
+# read/write paths that real applications use.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,7 +47,7 @@ run_fio() {
         --iodepth="$iodepth" \
         --numjobs="$numjobs" \
         --direct=0 \
-        --ioengine=posixaio \
+        --ioengine=psync \
         --group_reporting \
         --output-format=json \
         --output="$out" \

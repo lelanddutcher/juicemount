@@ -18,13 +18,13 @@
 # ---------------------------------------------------------------------------
 # Env defaults
 
-MOUNT="${MOUNT:-/Volumes/zpool-dev}"
-JM_METRICS_ADDR="${JM_METRICS_ADDR:-127.0.0.1:11050}"
-FUSE_INTERNAL="${FUSE_INTERNAL:-$HOME/.juicemount/fuse-internal}"
-ARTIFACTS_ROOT="${ARTIFACTS_ROOT:-/tmp/jm-qa-artifacts}"
-RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
-RUN_DIR="${ARTIFACTS_ROOT}/${RUN_ID}"
-TMPDIR_LOCAL="${TMPDIR_LOCAL:-/tmp}"
+export MOUNT="${MOUNT:-/Volumes/zpool-dev}"
+export JM_METRICS_ADDR="${JM_METRICS_ADDR:-127.0.0.1:11050}"
+export FUSE_INTERNAL="${FUSE_INTERNAL:-$HOME/.juicemount/fuse-internal}"
+export ARTIFACTS_ROOT="${ARTIFACTS_ROOT:-/tmp/jm-qa-artifacts}"
+export RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+export RUN_DIR="${ARTIFACTS_ROOT}/${RUN_ID}"
+export TMPDIR_LOCAL="${TMPDIR_LOCAL:-/tmp}"
 
 mkdir -p "$RUN_DIR" 2>/dev/null
 
