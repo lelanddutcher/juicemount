@@ -1,0 +1,106 @@
+# JuiceMount server-side stack (Tier 3, iter 1)
+#
+# `docker compose up -d` boots the three backing services:
+#   - minio        — S3-compatible object store on :9000 (S3 API) and :9001 (web)
+#   - redis        — JuiceFS metadata authority on :6379
+#   - juicefs-init — one-shot that formats the JuiceFS volume on first run
+#
+# This is the FOUNDATION. Tier-3 iter-2 adds the juicemount-server
+# container (the NFS export side) and a Caddy reverse-proxy. With
+# those, the stack matches the architecture diagram in
+# docs/ROADMAP/tier-3-server-packaging.md.
+#
+# Usage from a fresh Ubuntu / Synology / TrueNAS box:
+#
+#   cp .env.example .env
+#   $EDITOR .env                       # set MINIO_ROOT_PASSWORD, paths
+#   docker compose up -d
+#   docker compose logs juicefs-init   # confirms first-time format
+#
+# Acceptance: `docker compose ps` shows minio + redis healthy and
+# juicefs-init exited 0. Data persists across `docker compose down`
+# via the named volumes below.
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+    container_name: juicemount-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-juicemount}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set in .env}
+    ports:
+      - "${MINIO_S3_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - ${MINIO_DATA_DIR:-./data/minio}:/data
+    healthcheck:
+      # MinIO's documented liveness endpoint. 200 = healthy, anything
+      # else = restart by Docker's default policy.
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: juicemount-redis
+    restart: unless-stopped
+    # AOF persistence so JuiceFS metadata survives container restart.
+    # Without --appendonly yes a crash loses uncommitted RDB checkpoints
+    # and the JuiceFS volume needs a re-format from the user.
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ${REDIS_DATA_DIR:-./data/redis}:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  juicefs-init:
+    # One-shot container that formats the JuiceFS volume on first run.
+    # `juicefs format` is idempotent — already-formatted = no-op exit 0.
+    # depends_on with service_healthy means we wait for minio + redis
+    # to be reachable before attempting the format.
+    image: juicedata/mount:v1.2.3
+    container_name: juicemount-init
+    depends_on:
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-juicemount}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    # Bootstrap: create the bucket if absent, then format JuiceFS
+    # against it. mc is the MinIO client; juicefs format expects the
+    # bucket to already exist.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Wait an extra second so MinIO admin API is fully ready
+        # (healthcheck passes on /minio/health/live but admin can
+        # lag briefly).
+        sleep 2
+        # mc alias + bucket create (idempotent).
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing local/${JUICEFS_BUCKET:-zpool}
+        # Format JuiceFS. Idempotent on a re-run.
+        juicefs format \
+          --storage minio \
+          --bucket http://minio:9000/${JUICEFS_BUCKET:-zpool} \
+          --access-key "$$MINIO_ROOT_USER" \
+          --secret-key "$$MINIO_ROOT_PASSWORD" \
+          redis://redis:6379/1 \
+          ${JUICEFS_VOL_NAME:-zpool}
+    # No restart — we want this to exit 0 and stay exited.
+    restart: "no"
+
+volumes: {}

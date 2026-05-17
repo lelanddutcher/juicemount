@@ -1,0 +1,8 @@
+# Local config — contains MinIO root password, never commit.
+.env
+
+# Bind-mounted data dirs (default locations when MINIO_DATA_DIR /
+# REDIS_DATA_DIR aren't overridden in .env). Production hosts set
+# these to absolute paths outside the repo, so this only matters
+# for local-quickstart testing.
+data/

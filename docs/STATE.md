@@ -468,6 +468,15 @@ fixes likely cascade from one root cause.
 
 ---
 
+## Tier 3 — Server packaging (iter 1, partial)
+
+| # | Test | Status |
+|---|---|---|
+| 3.1 | Cold-deploy on Ubuntu Server 24.04 LTS | ⚠ iter 1 of N landed: `server/docker-compose.yml` + `.env.example` + `README.md` for the foundation (minio + redis + juicefs-init). Real cold-deploy timing pending — local Docker daemon was not running. Compose config validates cleanly via `docker compose config`. |
+| 3.2-3.7 | Synology / Configuration / Healthchecks / doctor / Backup / Upgrade | not started; depend on iter 2+ (juicemount-server container, Caddy, doctor command) |
+
+---
+
 ## Active tier: Tier 1 — Stability
 
 Acceptance tests (from `docs/VISION.md`):
