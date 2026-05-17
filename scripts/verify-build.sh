@@ -94,6 +94,8 @@ declare -a FIXES=(
     "health.(\*Reachability).probe|Reachability monitor (fd267b9, 2026-05-16)"
     "pin.SetAutoOffline|Auto-offline engage on network loss (10607ab, 2026-05-16)"
     "pin.ErrOfflineNotAvailable|Offline fail-fast sentinel for handler (54b744b, 2026-05-16)"
+    "main.handleStopHTTP|POST /stop admin endpoint (ba47621, 2026-05-17)"
+    "main.stopInProgress|/stop concurrent-POST gate (same commit)"
 )
 
 FAILURES=0
