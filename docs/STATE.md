@@ -129,7 +129,34 @@ JuiceFS chunk cache on disk. A "clear all" should hit both;
 "clear unpinned" should preserve pin-store contents. The UI hook
 goes in `app/JuiceMount/Sources/JuiceMount/UI/MenuPopoverView.swift`.
 
-### QA-4 (2026-05-17) — no un-pin UI in the popover
+### QA-4 (2026-05-17) — no un-pin UI in the popover — ⚠ landed-needs-validation 2026-05-17
+
+**Fix (Loop A.5, iter 19, 2026-05-17 ~03:15):** added a per-row
+"−" button to the pinned-folders list in MenuPopoverView. Calls
+NFSBridge.unpin off the main thread (matches existing
+triggerVerifyPins pattern), refreshes cache-status afterward so
+the row vanishes. No confirm dialog — un-pin is non-destructive
+(cache stays until eviction or future /cache-clear endpoint).
+
+Pin store's internal Unpin already cancels in-flight prefetch for
+the path (per pin.Store.Unpin implementation), so the "cancel
+prefetch" requirement is implicit.
+
+Button uses `.buttonStyle(.borderless)` to preserve keyboard focus
+traversal (vs .plain which suppresses it). Code-reviewer pass
+flagged this and one threading concern (global concurrent queue vs
+workQueue serial); the threading concern is deferred — matches
+existing pattern, and Go pin store is internally serialized via
+SQLite mutex so concurrent callers are safe.
+
+Validation pending: requires user to (a) quit + reopen JuiceMount
+on fresh binary, (b) verify the new "−" button appears next to
+each pinned root, (c) click it to confirm the row disappears + the
+ReadyFiles aggregate drops.
+
+---
+
+### QA-4 (original report, 2026-05-17) — no un-pin UI in the popover
 
 **Observed:** the pinned-folders list in the menu-bar popover
 shows what's pinned but has no way to un-pin. The `/unpin` HTTP
