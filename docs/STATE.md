@@ -380,6 +380,46 @@ Recommend (b)+(c) for the first ship. (a) is appealing but the
 "call stop first, then start" sequencing is exactly the recovery
 flow that goes wrong elsewhere in the codebase.
 
+### QA-13 (2026-05-17, user QA) — copies fail / truncate to 0 bytes (xattr-EPERM cascade) — ⚠ FIX LANDED
+
+**Observed (user, 2026-05-17 ~14:00):** Finder copy of
+`LAD37451.mov` to `/Volumes/zpool` failed with error code -36
+("can't be read or written"). Investigating, this turned out to
+be a much broader bug:
+
+  - `cp /tmp/file /Volumes/zpool/dst` → dst is 0 bytes, cp exit 0
+  - `cp -p` shows the smoking gun: "could not copy extended
+    attributes ... Operation not permitted"
+  - `xattr -w foo bar /Volumes/zpool/file` → errno 1 (EPERM)
+  - Direct writes via `dd if=/dev/urandom` work fine
+  - Same source copied directly to the FUSE-internal path works
+
+**Root cause:** the NFSv3 protocol has no native xattr support.
+macOS Finder and copyfile(3) handle this by writing an AppleDouble
+sidecar (`._filename`) to store the xattrs. The kernel's sidecar-
+create fallback is failing on this mount and returning EPERM to
+userspace. cp's copyfile then treats EPERM as a fatal error and
+rolls back the entire copy — leaving the dest at 0 bytes while
+still exit 0.
+
+**Fix (this commit):** added `noappledouble` to the NFS mount
+options in both `bridge/cbridge.go` (the app's mount call) and
+`cmd/jm5/main.go` (the CLI). This tells macOS to silently no-op
+xattr operations on this volume — copyfile/cp/Finder skip the
+sidecar dance entirely and writes succeed.
+
+**Acceptance test:** restart JuiceMount, `cp /tmp/big /Volumes/zpool/x`,
+verify dest size matches source AND md5 matches.
+
+**Why this wasn't caught earlier:** the existing write-probe in
+runWriteProbe writes a 4 KB file via direct fd write — it never
+exercises the copyfile(3) path that Finder and cp use. The probe
+was passing while users couldn't actually copy anything. Worth
+adding a Finder-equivalent probe (touch + setxattr + write +
+fsync) as a future tier-1 acceptance test row.
+
+---
+
 ### QA-12 (2026-05-17, user QA) — recently-cached-but-unpinned files unreadable when offline + FUSE down
 
 **Observed:** files copied to the mount "a few minutes ago" — so
