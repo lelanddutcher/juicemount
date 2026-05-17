@@ -1,0 +1,92 @@
+# JuiceMount edge proxy (tier-3 iter 3, B.5).
+#
+# Single TLS termination point in front of the stack. Routes:
+#
+#   /                → MinIO web console (port 9001 on the minio
+#                       service). The console handles its own auth
+#                       via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD.
+#
+#   /api/*           → juicemount-server admin API (port 11050).
+#                       Strips the /api prefix and forwards the rest.
+#                       Gated by an admin-key header check —
+#                       requests without X-JuiceMount-Admin-Key
+#                       matching ADMIN_KEY get 401.
+#
+# NFS (2049) is NOT proxied through Caddy. NFS is a stateful TCP
+# protocol that doesn't benefit from HTTP-layer routing; clients
+# connect directly to the host's 2049 port. Future iteration may add
+# stunnel / wireguard wrapping if NFS-over-internet becomes a real
+# use case, but on-LAN deployments don't need it.
+#
+# This file is templated by the docker-compose `caddy` service via
+# environment substitution (${JM_HOSTNAME}, ${ADMIN_KEY}).
+
+{
+    # Hard-fail on startup if ADMIN_KEY is unset (matches the
+    # minio/juicemount-server services' :? guards). Required to
+    # prevent a "default empty key works" footgun on first deploy.
+    auto_https off
+}
+
+# Unauthenticated health probe on plain HTTP — used by the docker-
+# compose healthcheck. Kept off the TLS path so the healthcheck
+# doesn't need to ignore cert errors.
+:80 {
+    handle /caddy-health {
+        respond "ok" 200
+    }
+    handle {
+        # Anything else on plain HTTP gets a 404 — no implicit redirect.
+        respond 404
+    }
+}
+
+{$JM_HOSTNAME:localhost}:443 {
+    # tls internal generates a self-signed cert good enough for
+    # local-quickstart on a LAN. Browsers will warn; that's
+    # expected for non-public hostnames. To switch to ACME / Let's
+    # Encrypt for a real DNS name:
+    #   1. Remove `auto_https off` from the global block above.
+    #   2. Replace `tls internal` with `tls your@email`.
+    # Both changes are required; `tls your@email` without removing
+    # auto_https off will fail at startup.
+    tls internal
+
+    # /api/* — JuiceMount admin endpoints. Admin-key gate.
+    @api {
+        path /api/*
+    }
+    handle @api {
+        @authorized {
+            # Caddy's `header` matcher does exact-string match on
+            # single values; no wildcard / prefix unless the value
+            # starts with `*`. So a request whose header is one
+            # byte off from ADMIN_KEY hits the 401 fallback below.
+            # Do not change this to add a wildcard — auth would
+            # silently accept any matching prefix.
+            header X-JuiceMount-Admin-Key {$ADMIN_KEY}
+        }
+        handle @authorized {
+            # Strip /api before forwarding so /api/health hits the
+            # backend's /health, /api/cache-status hits /cache-status,
+            # etc.
+            uri strip_prefix /api
+            reverse_proxy juicemount-server:11050
+        }
+        # Anything not authorized falls through to this 401.
+        handle {
+            respond "Unauthorized — set X-JuiceMount-Admin-Key header" 401
+        }
+    }
+
+    # Default: MinIO console.
+    handle {
+        reverse_proxy minio:9001
+    }
+
+    # Log to stdout so `docker compose logs caddy` shows requests.
+    log {
+        output stdout
+        format console
+    }
+}

@@ -8,10 +8,11 @@ to a mountable backend in under 10 minutes.
 This directory implements tier 3 of the JuiceMount roadmap. See
 `docs/ROADMAP/tier-3-server-packaging.md` for the full spec.
 
-## What's in this iteration (tier-3 iter 2)
+## What's in this iteration (tier-3 iter 3)
 
-The full headless stack. After this iteration, JuiceMount serves an
-NFS export from a Linux container — no Mac involvement required.
+The full headless stack with TLS termination and admin-key auth.
+After this iteration, JuiceMount serves an NFS export from a Linux
+container, and admin endpoints are behind https.
 
 | Service             | What it does                                | Port  |
 |---------------------|---------------------------------------------|-------|
@@ -19,9 +20,10 @@ NFS export from a Linux container — no Mac involvement required.
 | `redis`             | JuiceFS metadata authority                  | 6379  |
 | `juicefs-init`      | One-shot — formats the JuiceFS volume       | —     |
 | `juicemount-server` | NFS export + admin API                      | 2049, 11050 |
+| `caddy`             | TLS termination + admin-key auth gate       | 443, 80 |
 
-MinIO web console at port 9001 (`http://<host>:9001`, log in with
-`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` from your `.env`).
+MinIO web console at `https://<host>/` (proxied by Caddy; log in
+with `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` from your `.env`).
 
 **Mount the volume from any NFS client:**
 
@@ -107,11 +109,39 @@ to keep — there's no in-place migration story between formats.
 
 ## What this stack does NOT include yet
 
-- TLS termination + admin-key middleware (Caddy, iter 3)
 - `juicemount doctor` healthcheck CLI (iter 4)
 - Scheduled backups (`mc mirror` to remote bucket, iter 5)
 - Admin UI (iter 6)
 - Notarized / signed container images (iter 7)
+
+## TLS + admin-key auth (iter 3)
+
+Caddy fronts MinIO console + the JuiceMount admin API behind a
+single TLS port. Generate an admin key and add to `.env`:
+
+```sh
+echo "ADMIN_KEY=$(openssl rand -hex 32)" >> .env
+```
+
+After `docker compose up -d`:
+
+- `https://<host>/` → MinIO web console (self-signed cert by default;
+  set `JM_HOSTNAME` to a real DNS name and swap `tls internal` →
+  `tls your@email` in the Caddyfile to enable Let's Encrypt).
+- `https://<host>/api/*` → JuiceMount admin endpoints, but requires:
+  ```
+  X-JuiceMount-Admin-Key: <your ADMIN_KEY>
+  ```
+  Example:
+  ```sh
+  curl -sk -H "X-JuiceMount-Admin-Key: $(grep ADMIN_KEY .env | cut -d= -f2)" \
+       https://localhost/api/health
+  ```
+
+NFS (2049) is exposed directly, not through Caddy. NFS is a stateful
+TCP protocol and HTTP-layer routing doesn't help. On-LAN deployments
+should put NFS behind a host firewall; over-internet exposure would
+need stunnel or wireguard wrapping (future iteration).
 
 ## Security notes for production deployments
 
