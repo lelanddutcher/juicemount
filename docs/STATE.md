@@ -473,6 +473,7 @@ fixes likely cascade from one root cause.
 | # | Slice | Status |
 |---|---|---|
 | B.2 | Self-test dashboard in popover | ⚠ landed-needs-validation 2026-05-17: healthDotsRow shows 4 colored dots (R/M/F/N) + rolling MB/s, click-to-copy diagnostic |
+| B.3 | Self-explaining error dialogs | ⚠ landed-needs-validation 2026-05-17: new `RemediationAlert.swift` with category enum, Cause/Try this/Copy diagnostic dialog; 4 showAlert error sites converted (Pin/Reclaim/ClearCache + nested Pin failed) |
 
 ---
 
