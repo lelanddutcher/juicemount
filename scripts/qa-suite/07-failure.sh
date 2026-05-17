@@ -72,10 +72,11 @@ pool_slice "$TMPDIR_LOCAL/B-src-$$" 100
 ) &
 WP=$!
 sleep 1  # Let it get into the write
-# Trigger user-offline (the menubar app's "Go offline" toggle posts to /offline)
+# Trigger user-offline. The /offline contract is ?on=true|false as a query
+# param (verified against cbridge.go:handleOfflineHTTP) — POST with JSON
+# body is not supported; the GET-with-query form works for both directions.
 set +e
-curl -s --max-time 3 -X POST "http://${JM_METRICS_ADDR}/offline" \
-    -H "Content-Type: application/json" -d '{"offline":true}' >/dev/null
+curl -s --max-time 3 "http://${JM_METRICS_ADDR}/offline?on=true" >/dev/null
 set -e
 sleep 1
 # Whatever happens to the write, capture state
@@ -84,8 +85,7 @@ W_EXIT=$?
 B_SZ=$(sz "$TROOT/B-write.bin")
 log "write-during-offline-toggle: exit=$W_EXIT, dst size=$B_SZ"
 # Toggle back online
-curl -s --max-time 3 -X POST "http://${JM_METRICS_ADDR}/offline" \
-    -H "Content-Type: application/json" -d '{"offline":false}' >/dev/null 2>&1
+curl -s --max-time 3 "http://${JM_METRICS_ADDR}/offline?on=false" >/dev/null 2>&1
 sleep 2
 # The write either succeeded (offline was set AFTER write completed) or failed
 # fast (offline gate refused). Either is correct; what matters is no hang and

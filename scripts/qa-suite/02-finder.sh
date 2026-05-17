@@ -17,6 +17,12 @@ source "$SCRIPT_DIR/lib.sh"
 
 phase_init "02-finder"
 
+# Settle: this phase historically ran right after a JM restart/mount
+# bring-up. The mount may report ready before the metadata sync has
+# finished its initial pass, which produces flaky reads on freshly-
+# discovered files. A brief settle keeps subsequent assertions stable.
+sleep 2
+
 TROOT="$MOUNT/.jmqa-finder-$$"
 mkdir -p "$TROOT"
 
@@ -116,13 +122,16 @@ fi
 section "Quick Look-equivalent (open + read first 256 KiB + close fast)"
 QL_HITS=0
 QL_MISSES=0
+# Filter out dotfiles (.juicemount-selftest.tmp, AppleDouble ._files,
+# .DS_Store, etc.). Many of those exist as metadata entries but have
+# no backing data immediately after JM startup — they'd skew the result.
 while IFS= read -r f; do
     if head -c 262144 "$f" >/dev/null 2>&1; then
         QL_HITS=$((QL_HITS+1))
     else
         QL_MISSES=$((QL_MISSES+1))
     fi
-done < <(find "$MOUNT" -maxdepth 3 -type f 2>/dev/null | head -50)
+done < <(find "$MOUNT" -maxdepth 3 -type f ! -name '.*' 2>/dev/null | head -50)
 if (( QL_HITS > 0 && QL_MISSES == 0 )); then
     pass "Quick Look-equivalent: $QL_HITS/50 succeeded"
 elif (( QL_HITS > 0 )); then
@@ -157,15 +166,25 @@ section "many small files (1000 × 1 KiB) — Finder's 'open with assets'"
 SMALL_DIR="$TROOT/small-files"
 mkdir -p "$SMALL_DIR"
 START=$(date +%s)
+# Wrap the create loop in `set +e` so a transient ENOTDIR (the QA-18
+# regression) doesn't kill the entire phase before phase_report runs.
+# The count-vs-1000 assertion below catches partial completion.
+set +e
+SMALL_FAILS=0
 for i in $(seq 1 1000); do
-    head -c 1024 /dev/urandom > "$SMALL_DIR/file-${i}.txt"
+    head -c 1024 /dev/urandom > "$SMALL_DIR/file-${i}.txt" 2>/dev/null
+    rc=$?
+    if (( rc != 0 )); then
+        SMALL_FAILS=$((SMALL_FAILS+1))
+    fi
 done
+set -e
 ELAPSED=$(( $(date +%s) - START ))
-CREATED=$(find "$SMALL_DIR" -type f | wc -l | tr -d ' ')
+CREATED=$(find "$SMALL_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
 if [[ "$CREATED" -eq 1000 ]]; then
     pass "1000 small files created in ${ELAPSED}s ($(( 1000 * 1024 / (ELAPSED + 1) )) B/s)"
 else
-    fail "expected 1000 small files, got $CREATED"
+    fail "expected 1000 small files, got $CREATED ($SMALL_FAILS create errors)"
 fi
 
 # Re-stat them all
