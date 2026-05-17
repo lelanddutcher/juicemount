@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	redisURL  = "redis://192.168.0.210:6379/1"
-	fusePath  = "/Users/LelandDutcher/.juicemount/fuse-internal"
+	redisURL  = "redis://127.0.0.1:6379/1"
+	fusePath  = "/Users/USER/.juicemount/fuse-internal"
 	mountBase = "/tmp/jm5-e2e"
 )
 
@@ -87,8 +87,8 @@ func setupE2E(t *testing.T) *e2eEnv {
 
 	// Health monitor
 	mon := health.New(health.Config{
-		RedisURL:      "192.168.0.210:6379",
-		MinIOURL:      "http://192.168.0.212:9000",
+		RedisURL:      "127.0.0.1:6379",
+		MinIOURL:      "http://127.0.0.1:9000",
 		FUSEPath:      fusePath,
 		NFSMountPoint: "",
 	})

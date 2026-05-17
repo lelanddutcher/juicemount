@@ -77,7 +77,7 @@ Examples:
 
 | Today | After |
 |---|---|
-| `Operation timed out` | `Couldn't reach server at 192.168.0.210. Check your Wi-Fi or VPN. (Last successful: 2 min ago)` |
+| `Operation timed out` | `Couldn't reach server at 127.0.0.1. Check your Wi-Fi or VPN. (Last successful: 2 min ago)` |
 | `redis: client is closed` | `Server connection dropped mid-operation. JuiceMount will retry in 60 s. [Retry now]` |
 | `Stale NFS file handle` | `That file moved or was rebuilt while open. Close and reopen the file. (Affects: testing/)` |
 

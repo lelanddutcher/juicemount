@@ -11,7 +11,7 @@ marketing and becomes architecture.
 "Redis is fragile" framing:
 
 ```
-redis EVAL: dial tcp 192.168.0.210:6379: connect: no route to host
+redis EVAL: dial tcp 127.0.0.1:6379: connect: no route to host
 ```
 
 This is a **client-side network state error**, not a backend

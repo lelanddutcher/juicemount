@@ -51,7 +51,7 @@ The final `visudo -c` verifies syntax and refuses to apply a broken
 file. If it prints `parsed OK`, you're set.
 
 To scope the rule to your specific user instead of all admins,
-replace `%admin` with your username, e.g. `LelandDutcher`.
+replace `%admin` with your username (the output of `whoami`).
 
 ## Verifying it works
 

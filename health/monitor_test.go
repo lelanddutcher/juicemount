@@ -9,8 +9,8 @@ import (
 
 func TestMonitorStartStop(t *testing.T) {
 	cfg := Config{
-		RedisURL: "192.168.0.210:6379",
-		MinIOURL: "http://192.168.0.212:9000",
+		RedisURL: "127.0.0.1:6379",
+		MinIOURL: "http://127.0.0.1:9000",
 		FUSEPath: fusePath(t),
 	}
 	m := New(cfg)
@@ -23,8 +23,8 @@ func TestMonitorStartStop(t *testing.T) {
 
 func TestRedisHealthCheck(t *testing.T) {
 	cfg := Config{
-		RedisURL: "192.168.0.210:6379",
-		MinIOURL: "http://192.168.0.212:9000",
+		RedisURL: "127.0.0.1:6379",
+		MinIOURL: "http://127.0.0.1:9000",
 		FUSEPath: fusePath(t),
 	}
 	m := New(cfg)
@@ -43,8 +43,8 @@ func TestRedisHealthCheck(t *testing.T) {
 
 func TestMinIOHealthCheck(t *testing.T) {
 	cfg := Config{
-		RedisURL: "192.168.0.210:6379",
-		MinIOURL: "http://192.168.0.212:9000",
+		RedisURL: "127.0.0.1:6379",
+		MinIOURL: "http://127.0.0.1:9000",
 		FUSEPath: fusePath(t),
 	}
 	m := New(cfg)
@@ -62,8 +62,8 @@ func TestFUSEMountCheck(t *testing.T) {
 	fp := fusePath(t)
 
 	cfg := Config{
-		RedisURL: "192.168.0.210:6379",
-		MinIOURL: "http://192.168.0.212:9000",
+		RedisURL: "127.0.0.1:6379",
+		MinIOURL: "http://127.0.0.1:9000",
 		FUSEPath: fp,
 	}
 	m := New(cfg)
@@ -79,8 +79,8 @@ func TestFUSEMountCheck(t *testing.T) {
 
 func TestStatusReturnsCorrectState(t *testing.T) {
 	cfg := Config{
-		RedisURL: "192.168.0.210:6379",
-		MinIOURL: "http://192.168.0.212:9000",
+		RedisURL: "127.0.0.1:6379",
+		MinIOURL: "http://127.0.0.1:9000",
 		FUSEPath: fusePath(t),
 	}
 	m := New(cfg)

@@ -97,7 +97,7 @@ struct PreferencesWindowView: View {
         Form {
             Section {
                 LabeledContent("Redis URL") {
-                    TextField("redis://192.168.0.210:6379/1", text: $preferences.redisURL)
+                    TextField("redis://127.0.0.1:6379/1", text: $preferences.redisURL)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
                 }

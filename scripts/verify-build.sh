@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-APP_PATH="${APP_PATH:-/Users/LelandDutcher/Developer/JuiceMount6/build/JuiceMount.app}"
+APP_PATH="${APP_PATH:-$(cd "$(dirname "$0")/.." && pwd)/build/JuiceMount.app}"
 CHECK_RUNNING=0
 
 while [[ $# -gt 0 ]]; do

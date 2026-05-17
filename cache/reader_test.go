@@ -12,7 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const testRedisAddr = "192.168.0.210:6379"
+const testRedisAddr = "127.0.0.1:6379"
 
 func testRedisClient(t *testing.T) *redis.Client {
 	t.Helper()

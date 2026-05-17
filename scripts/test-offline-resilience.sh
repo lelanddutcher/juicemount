@@ -26,7 +26,7 @@
 # Usage:
 #
 #   scripts/test-offline-resilience.sh \
-#       [--target HOST:PORT]      \   default 192.168.0.210:6379 (from preferences)
+#       [--target HOST:PORT]      \   default 127.0.0.1:6379 (from preferences)
 #       [--mount PATH]            \   default /Volumes/zpool-dev
 #       [--metrics URL]           \   default http://127.0.0.1:11050
 #       [--pinned-file PATH]      \   if provided, also tests pinned-keeps-working
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 # --- defaults ---
-TARGET="${TARGET:-192.168.0.210:6379}"
+TARGET="${TARGET:-127.0.0.1:6379}"
 MOUNT="${MOUNT:-/Volumes/zpool-dev}"
 METRICS="${METRICS:-http://127.0.0.1:11050}"
 PINNED_FILE=""

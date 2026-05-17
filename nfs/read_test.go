@@ -33,7 +33,7 @@ func setupReadTestServer(t *testing.T) (*Server, *metadata.Store) {
 	// Set up cache reader
 	cacheDir := cache.DetectCacheDir()
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "192.168.0.210:6379",
+		Addr: "127.0.0.1:6379",
 		DB:   1,
 	})
 	t.Cleanup(func() { rdb.Close() })

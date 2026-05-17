@@ -29,7 +29,7 @@ set -euo pipefail
 
 # --- defaults ---
 DRY_RUN=1
-APP_PATH="${APP_PATH:-/Users/LelandDutcher/Developer/JuiceMount6/build/JuiceMount.app}"
+APP_PATH="${APP_PATH:-$(cd "$(dirname "$0")/.." && pwd)/build/JuiceMount.app}"
 MOUNT_PATH="${MOUNT_PATH:-/Volumes/zpool-dev}"
 METRICS_URL="${METRICS_URL:-http://127.0.0.1:11050/metrics}"
 BUDGET_SECONDS="${BUDGET_SECONDS:-5}"

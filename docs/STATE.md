@@ -1297,7 +1297,7 @@ real wedge-injection testing.
 **Shipped (commit pending):**
 - `scripts/wedge-tests/minio-down-mid-read.sh`: pfctl-based harness that
   starts a streaming `cat` of an auto-rotated 1GB+ probe file, mid-read
-  engages a pf block on the MinIO endpoint (default `192.168.0.212:9000`)
+  engages a pf block on the MinIO endpoint (default `127.0.0.1:9000`)
   via a dedicated sub-anchor (`com.apple/251.JuiceMountWedge`, distinct
   from the offline-resilience harness's 250 anchor), then in parallel
   measures (a) how long until the streaming read errors, (b) how long

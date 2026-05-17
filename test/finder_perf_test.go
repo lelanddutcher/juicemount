@@ -21,7 +21,7 @@ import (
 //
 // For each, we compare NFS (our server) vs direct FUSE (JuiceFS mount).
 
-const fuseMountPath = "/Users/LelandDutcher/.juicemount/fuse-internal"
+const fuseMountPath = "/Users/USER/.juicemount/fuse-internal"
 
 // findDirWithNEntries finds a directory with approximately n entries.
 func findDirWithNEntries(root string, target int, tolerance float64) (string, int) {

@@ -31,7 +31,7 @@
 # Usage:
 #
 #   scripts/wedge-tests/minio-down-mid-read.sh \
-#       [--target HOST:PORT]      \ default 192.168.0.212:9000
+#       [--target HOST:PORT]      \ default 127.0.0.1:9000
 #       [--mount PATH]            \ default /Volumes/zpool-dev
 #       [--probe-file PATH]       \ default: auto-discover a large .mov
 #       [--read-budget SECONDS]   \ default 2
@@ -55,7 +55,7 @@
 set -euo pipefail
 
 # --- defaults ---
-TARGET="${TARGET:-192.168.0.212:9000}"
+TARGET="${TARGET:-127.0.0.1:9000}"
 MOUNT="${MOUNT:-/Volumes/zpool-dev}"
 PROBE_FILE=""
 READ_ERROR_BUDGET=5     # acceptance bar from tier-1.2 ("errors within 5s")

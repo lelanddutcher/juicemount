@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	testRedisURL  = "redis://192.168.0.210:6379/1"
-	testFUSEPath  = "/Users/LelandDutcher/.juicemount/fuse-internal"
+	testRedisURL  = "redis://127.0.0.1:6379/1"
+	testFUSEPath  = "/Users/USER/.juicemount/fuse-internal"
 	testMountBase = "/tmp/jm5-test-mount"
 )
 

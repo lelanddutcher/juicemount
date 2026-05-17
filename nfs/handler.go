@@ -514,7 +514,7 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 		// file still exists) rather than block.
 		if !e.IsDir {
 			// Gate the phantom-file purge on metadata-authority health.
-			// 2026-05-16 incident: Redis at 192.168.0.210 was unreachable
+			// 2026-05-16 incident: Redis at 127.0.0.1 was unreachable
 			// for ~30 min overnight. During the outage JuiceFS couldn't
 			// resolve its own metadata for some paths and FUSE returned
 			// ENOENT for files that genuinely exist. The phantom-purge
