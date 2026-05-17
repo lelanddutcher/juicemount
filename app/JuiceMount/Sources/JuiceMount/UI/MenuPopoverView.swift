@@ -21,6 +21,14 @@ struct MenuPopoverView: View {
     @State private var diskTotalGB: Double = 0
     @State private var reclaimBusy = false
     @State private var cacheClearBusy = false
+    // Pin-progress rate readout (QA-1 perception fix). Tracks
+    // CachedBytes between cache-status refresh ticks so we can show
+    // "downloading at X MB/s" instead of a flat counter that looks
+    // stuck during a multi-GB pin. Reset whenever PendingFiles drops
+    // to zero so a stale rate doesn't linger.
+    @State private var prevCachedBytes: Int64 = 0
+    @State private var prevCachedAt: Date = .distantPast
+    @State private var pinRateMBps: Double = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -58,6 +66,49 @@ struct MenuPopoverView: View {
         // back to MainActor to publish. The view rerenders via the
         // @Bindable server reference.
         server.refreshCacheStatus()
+        updatePinRate()
+    }
+
+    /// Computes a rolling MB/s rate from successive CachedBytes
+    /// samples. Drops the rate to 0 when nothing is pending (no work
+    /// in flight) so we don't display a misleading "downloading"
+    /// number after a pin completes.
+    ///
+    /// Sampling happens at the cache-status refresh cadence (2s) —
+    /// faster polling would just produce noisier numbers. The user-
+    /// facing problem (popover looks stuck at 0 KB during a pin)
+    /// is solved by SHOWING the rate, not by sampling more often.
+    private func updatePinRate() {
+        let now = Date()
+        let cur = cacheStatus.aggregate.CachedBytes
+        let pending = cacheStatus.aggregate.PendingFiles
+
+        // If nothing pending and nothing changing, surface a clean
+        // zero so the row hides the rate readout.
+        if pending == 0 {
+            pinRateMBps = 0
+            prevCachedBytes = cur
+            prevCachedAt = now
+            return
+        }
+
+        // First sample after a pin starts: seed and wait for the
+        // next tick before computing a delta.
+        if prevCachedAt == .distantPast || cur < prevCachedBytes {
+            prevCachedBytes = cur
+            prevCachedAt = now
+            return
+        }
+
+        let elapsed = now.timeIntervalSince(prevCachedAt)
+        guard elapsed > 0.1 else { return }  // avoid divide-by-tiny
+
+        let deltaBytes = max(0, cur - prevCachedBytes)
+        let rateBps = Double(deltaBytes) / elapsed
+        pinRateMBps = rateBps / 1_048_576  // 1 MiB
+
+        prevCachedBytes = cur
+        prevCachedAt = now
     }
 
     /// Reads the system's view of disk space — both `volumeAvailableCapacityKey`
@@ -610,6 +661,15 @@ struct MenuPopoverView: View {
                 Text("\(cacheStatus.aggregate.TotalFiles) pinned")
                     .font(.caption.monospaced())
                 Spacer()
+                // Show the live download rate next to the byte counter
+                // while a pin is draining. Only when PendingFiles > 0
+                // AND we've measured a non-trivial rate (>= 0.5 MB/s)
+                // — avoids flicker on tiny tail-end transfers.
+                if cacheStatus.aggregate.PendingFiles > 0 && pinRateMBps >= 0.5 {
+                    Text(String(format: "%.0f MB/s", pinRateMBps))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.blue)
+                }
                 Text("\(formatBytes(cacheStatus.aggregate.CachedBytes)) / \(formatBytes(cacheStatus.aggregate.TotalBytes))")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
