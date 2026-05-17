@@ -61,6 +61,84 @@ acceptance test ("pinned files keep working when network drops") is
 unpinned case. The acceptance test may need to be tightened, AND
 the gate logic may need to be fixed.
 
+### QA-3 (2026-05-17) — no way to clear the cache
+
+**Observed:** no surface (UI button, /admin endpoint, CLI command)
+to evict cached files. Users who pin too aggressively or want to
+reset state have to `rm -rf ~/.juicefs/cache` manually.
+
+**Where to investigate:** add `/cache-clear` to the admin route
+table in `bridge/cbridge.go` (alongside `/reclaim` which already
+clears APFS purgeable space). Two layers to potentially target:
+JuiceMount's own `MemoryBuffer` + `cache.Reader` state, and the
+JuiceFS chunk cache on disk. A "clear all" should hit both;
+"clear unpinned" should preserve pin-store contents. The UI hook
+goes in `app/JuiceMount/Sources/JuiceMount/UI/MenuPopoverView.swift`.
+
+### QA-4 (2026-05-17) — no un-pin UI in the popover
+
+**Observed:** the pinned-folders list in the menu-bar popover
+shows what's pinned but has no way to un-pin. The `/unpin` HTTP
+endpoint exists (`bridge/cbridge.go`, handleUnpinHTTP) but isn't
+wired to any UI control.
+
+**Where to investigate:** add a per-row action (swipe-to-delete,
+right-click menu, or a trailing "−" button) on the pinned-folders
+list in `MenuPopoverView.swift` that calls POST /unpin. Same shape
+as the existing pin enqueue. Should also stop any in-flight
+prefetch for that path and free its cache footprint (the prefetcher
+needs a cancellation path — verify it has one before wiring this up).
+
+### QA-5 (2026-05-17) — "Sync Now" doesn't re-trigger pinned downloads
+
+**Observed:** clicking Sync Now should re-verify pinned coverage
+and restart any pending pin downloads. Instead, the pinned-local-
+bytes counter stays at 0 KB even though the user has pinned several
+hundred MB of content. Connects to QA-1 (which says pinning enqueue
+might not work at all).
+
+**Where to investigate:** the recent commit `9a1f229` "Sync now
+also re-verifies pinned coverage" wired this in. Check
+(a) that the Sync Now button in the popover is actually calling
+that new path, not just the old reconcile-loop trigger; (b) the
+re-verify logic in `internal/cache/pin/` actually re-enqueues
+missing chunks; (c) whether QA-1's root cause is the same — if
+pinning never enqueues in the first place, Sync Now's re-verify
+loop has nothing to recover from.
+
+### QA-6 (2026-05-17) — Pin folder dialog blocks directory navigation
+
+**Observed:** clicking "Pin folder for offline" opens a Finder-
+style picker, but clicking into subdirectories doesn't work. The
+picker is functionally unable to select anything but the top-level
+mount root, so pinning anything specific is impossible from the UI.
+
+**Where to investigate:** the picker code is likely an NSOpenPanel
+in `MenuPopoverView.swift` or a sibling. Things to check:
+(a) `canChooseDirectories=true` but no `canChooseFiles=false`
+override might be blocking double-click navigation; (b) the panel's
+allowed file types might be filtering out directory entries on the
+JuiceMount NFS volume; (c) the panel might need
+`resolvesAliases=false` for the JuiceFS-backed paths; (d) the panel
+might be running on the wrong queue and double-clicks aren't being
+delivered. Quick local repro: use any NSOpenPanel-based file picker
+in another app against /Volumes/zpool-dev — if those work and
+JuiceMount's doesn't, the bug is in our panel config, not the mount.
+
+---
+
+## Pattern: pin/offline subsystem needs a dedicated investigation
+
+QA-1, QA-2, QA-5, QA-6 all point at the pin/offline subsystem.
+Together they suggest pinning is end-to-end broken right now:
+can't pick a folder (QA-6), pinning doesn't download (QA-1),
+Sync Now doesn't recover (QA-5), and even cached content fails
+offline (QA-2). Recommend a dedicated investigation iteration —
+not piecemeal fixes — that traces a single end-to-end pin
+operation through the UI, the bridge, the pin store, the
+prefetcher, JuiceFS, and MinIO, with a logger at every hop. The
+fixes likely cascade from one root cause.
+
 ---
 
 ## Active tier: Tier 1 — Stability
