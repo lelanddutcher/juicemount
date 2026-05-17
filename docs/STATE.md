@@ -323,27 +323,62 @@ The user kept clicking around expecting things to "just work,"
 unaware that writes were diverging from the backend's view of
 truth.
 
-### QA-11 (2026-05-17, user QA) — Start button silent no-op in .degraded state
+### QA-11 (2026-05-17, user QA) — Start button silent no-op + no escape in .disconnected state
 
-**Observed:** with mount in degraded state (FUSE down, Redis
-unreachable, auto-offline engaged), clicking the Start button in
-the popover produces no feedback — no toast, no error dialog, no
-state change. User reported it twice as "Start does nothing."
+**Observed:** mount degraded mid-session. Clicking Start in the
+popover produced no feedback — no toast, no error, no state
+change. Worse, no Stop button was visible to fall back to.
+Functionally stuck; only escape was force-quit-and-relaunch.
 
-**Root cause:** `ServerController.start()` has
-`guard case .idle = state else { return }`. The current state is
-`.degraded` (NFS server still listening; FUSE/Redis sick), which
-is not `.idle`, so the guard silently returns.
+**Root cause (post-investigation, 2026-05-17 ~14:00):** the popover
+and ServerController disagree about `.disconnected`:
 
-**Fix path:** EITHER
-  (a) make Start tolerate .degraded by internally calling
-      `softStop` then `start` to fully re-init globals — risky
-      around the FUSE/juicefs respawn path; or
-  (b) disable the Start button visually when state ∉ .idle and
-      surface "Use Stop everything to fully reset" inline.
+```swift
+// MenuPopoverView.swift:1178 — popover treats .disconnected as
+// "show Start button"
+case .idle, .error, .disconnected:
+    ActionButton(title: "Start JuiceMount", action: { server.start() })
 
-(b) is the lower-risk slice. Ship it first; revisit (a) only if
-users complain about needing the extra click.
+// ServerController.swift:72 — start() only accepts .idle
+public func start() {
+    guard case .idle = state else { return }   // silent return
+}
+```
+
+Why the state was `.disconnected` and not `.degraded`: the polling
+code at ServerController.swift:370 matches `!s.healthFUSE` FIRST
+and sets `.disconnected`. Redis/MinIO unhealth only matter in the
+later else-ifs. So whenever FUSE goes down — exactly when the
+user needs to restart — the state ends up `.disconnected`, the
+popover shows Start, but Start can't actually execute.
+
+Worse: in `.disconnected` the popover's bottom-row switch
+(MenuPopoverView.swift:1177) shows ONLY the Start button. Neither
+Stop button is reachable. The user has no UI path back to `.idle`.
+
+**Fix path (pick ONE):**
+
+  (a) **Loosen the start guard** to accept `.disconnected` AND
+      `.error`. Implementation: in start(), if state == .disconnected
+      or .error, call `NFSBridge.stop()` synchronously first to
+      reset globals, then proceed with the start sequence.
+      Risk: the disconnect was caused by a backend/FUSE flap;
+      blindly trying to restart against the same flap will fail
+      again — but at least the user sees an actionable error
+      dialog (via RemediationAlert.startFailed) instead of silence.
+
+  (b) **Disable the Start button** when state ∉ .idle and surface
+      "Server is in <state> — quit the app to fully reset" inline.
+      No code change in start(); just popover wiring. Risk: zero;
+      cost: extra cognitive step for the user.
+
+  (c) **Show a Stop button** in .disconnected too. Pairs with (b).
+      Makes the recovery path "click Stop → wait → click Start"
+      visible from the UI. Probably the right combination.
+
+Recommend (b)+(c) for the first ship. (a) is appealing but the
+"call stop first, then start" sequencing is exactly the recovery
+flow that goes wrong elsewhere in the codebase.
 
 ### QA-12 (2026-05-17, user QA) — recently-cached-but-unpinned files unreadable when offline + FUSE down
 
