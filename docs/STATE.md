@@ -468,7 +468,15 @@ fixes likely cascade from one root cause.
 
 ---
 
-## Tier 3 — Server packaging (iter 1, partial)
+## Tier 2 — App polish (in progress)
+
+| # | Slice | Status |
+|---|---|---|
+| B.2 | Self-test dashboard in popover | ⚠ landed-needs-validation 2026-05-17: healthDotsRow shows 4 colored dots (R/M/F/N) + rolling MB/s, click-to-copy diagnostic |
+
+---
+
+## Tier 3 — Server packaging (iter 1+2, partial)
 
 | # | Test | Status |
 |---|---|---|

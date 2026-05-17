@@ -30,6 +30,22 @@ struct MenuPopoverView: View {
     @State private var prevCachedAt: Date = .distantPast
     @State private var pinRateMBps: Double = 0
     @State private var showStopEverythingConfirm = false
+    // Self-test dashboard (B.2). Health is fetched from /health on the
+    // same 2s tick as cache-status. Each component is "ok" or a reason
+    // string ("ping failed: …"); render as colored dots, full reason
+    // visible in tooltip + click-to-copy diagnostic.
+    @State private var healthRedis: String = ""
+    @State private var healthMinIO: String = ""
+    @State private var healthFUSE: String = ""
+    @State private var healthNFS: String = ""
+    @State private var healthFetchedAt: Date = .distantPast
+    // Throughput (B.2): rolling MB/s computed from /metrics bytes_read
+    // delta between cache-status polls. Distinct from pinRateMBps,
+    // which is pin-specific.
+    @State private var prevBytesRead: Int64 = 0
+    @State private var prevBytesReadAt: Date = .distantPast
+    @State private var readRateMBps: Double = 0
+    @State private var lastMetricsFetchedAt: Date = .distantPast
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -68,6 +84,86 @@ struct MenuPopoverView: View {
         // @Bindable server reference.
         server.refreshCacheStatus()
         updatePinRate()
+        refreshSelfTest()
+    }
+
+    /// B.2: pulls /health + /metrics on the same 2s cadence the
+    /// popover already uses for cache-status. Fire-and-forget; the
+    /// @State updates trigger view re-render via SwiftUI's normal
+    /// path. URLSession runs on its own queue so we don't block the
+    /// main thread or the cgo workQueue. Failures leave the previous
+    /// values intact rather than wiping to empty — same pattern the
+    /// juicemount-watch observer uses.
+    private func refreshSelfTest() {
+        DispatchQueue.global(qos: .utility).async {
+            // /health — 4 components
+            if let url = URL(string: "http://127.0.0.1:11050/health"),
+               let data = try? Data(contentsOf: url),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let comps = obj["components"] as? [String: String] {
+                let r = comps["redis"] ?? ""
+                let m = comps["minio"] ?? ""
+                let f = comps["fuse"] ?? ""
+                let n = comps["nfs"] ?? ""
+                DispatchQueue.main.async {
+                    healthRedis = r
+                    healthMinIO = m
+                    healthFUSE = f
+                    healthNFS = n
+                    healthFetchedAt = Date()
+                }
+            }
+            // /metrics — bytes_read delta → MB/s
+            if let url = URL(string: "http://127.0.0.1:11050/metrics"),
+               let data = try? Data(contentsOf: url),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let br = (obj["bytes_read"] as? Int64) ?? (obj["bytes_read"] as? Double).map({ Int64($0) }) {
+                let now = Date()
+                DispatchQueue.main.async {
+                    if prevBytesReadAt != .distantPast {
+                        let elapsed = now.timeIntervalSince(prevBytesReadAt)
+                        if elapsed > 0.1 {
+                            let delta = max(0, br - prevBytesRead)
+                            readRateMBps = Double(delta) / elapsed / 1_048_576
+                        }
+                    }
+                    prevBytesRead = br
+                    prevBytesReadAt = now
+                    lastMetricsFetchedAt = now
+                }
+            }
+        }
+    }
+
+    /// Maps a component's health-string ("ok" or a reason) to a dot
+    /// color. Anything starting with "ok" is green; explicit known
+    /// errors get red; anything else (e.g. "starting", "unknown") is
+    /// yellow.
+    private func healthDotColor(_ s: String) -> Color {
+        let trimmed = s.trimmingCharacters(in: .whitespaces).lowercased()
+        if trimmed.isEmpty { return .gray }
+        if trimmed.hasPrefix("ok") { return .green }
+        if trimmed.contains("failed") || trimmed.contains("error")
+            || trimmed.contains("no route") || trimmed.contains("refused")
+            || trimmed.contains("not mounted") {
+            return .red
+        }
+        return .yellow
+    }
+
+    /// Builds a single plain-text diagnostic snippet for the click-to-
+    /// copy action. One line per component plus the read rate so a
+    /// user filing an issue can paste it without screenshotting.
+    private func selfTestDiagnostic() -> String {
+        let ts = ISO8601DateFormatter().string(from: healthFetchedAt)
+        return """
+        JuiceMount self-test @ \(ts)
+          redis : \(healthRedis.isEmpty ? "(unknown)" : healthRedis)
+          minio : \(healthMinIO.isEmpty ? "(unknown)" : healthMinIO)
+          fuse  : \(healthFUSE.isEmpty ? "(unknown)" : healthFUSE)
+          nfs   : \(healthNFS.isEmpty ? "(unknown)" : healthNFS)
+          read  : \(String(format: "%.1f", readRateMBps)) MB/s (rolling)
+        """
     }
 
     /// Computes a rolling MB/s rate from successive CachedBytes
@@ -470,6 +566,13 @@ struct MenuPopoverView: View {
 
             selfTestRow
 
+            // B.2: 4-dot health glance + rolling read throughput.
+            // Click anywhere on the row → copies a plain-text
+            // diagnostic snippet to the clipboard. Each dot's color
+            // is driven by /health.components; tooltip carries the
+            // full reason string when degraded.
+            healthDotsRow
+
             if cacheStatus.aggregate.TotalFiles == 0 && cacheStatus.live.FilesPrefetched == 0 {
                 Text("Nothing pinned yet. Pick a folder above, or right-click in Finder → Services → Pin for Offline.")
                     .font(.caption2)
@@ -613,6 +716,52 @@ struct MenuPopoverView: View {
         alert.informativeText = message
         alert.alertStyle = .informational
         alert.runModal()
+    }
+
+    /// B.2: 4-dot health row + throughput readout. Hidden until the
+    /// first /health response lands so the user doesn't see stale
+    /// gray dots at app launch. Click anywhere on the row to copy
+    /// a plain-text diagnostic snippet to the clipboard — useful
+    /// for bug reports.
+    @ViewBuilder
+    private var healthDotsRow: some View {
+        if healthFetchedAt != .distantPast {
+            HStack(spacing: 8) {
+                healthDot(label: "R", reason: healthRedis, full: "Redis")
+                healthDot(label: "M", reason: healthMinIO, full: "MinIO")
+                healthDot(label: "F", reason: healthFUSE, full: "FUSE")
+                healthDot(label: "N", reason: healthNFS, full: "NFS")
+                Spacer()
+                if readRateMBps >= 0.1 {
+                    Text(String(format: "%.0f MB/s", readRateMBps))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(selfTestDiagnostic(), forType: .string)
+            }
+            .help("Click to copy diagnostic snippet")
+        }
+    }
+
+    /// Single labeled health dot. Label is a 1-char glyph for compact
+    /// row layout; `full` is the component name surfaced in the
+    /// hover tooltip alongside the reason string.
+    @ViewBuilder
+    private func healthDot(label: String, reason: String, full: String) -> some View {
+        HStack(spacing: 2) {
+            Circle()
+                .fill(healthDotColor(reason))
+                .frame(width: 8, height: 8)
+            Text(label)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+        }
+        .help("\(full): \(reason.isEmpty ? "(unknown)" : reason)")
     }
 
     @ViewBuilder
