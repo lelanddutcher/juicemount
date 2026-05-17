@@ -382,6 +382,55 @@ a PushNotification — eight iterations of tooling on a stale binary
 is the point where continued autonomous work has negative marginal
 value.
 
+### Iteration 14 — 2026-05-17
+
+**Tier:** 1 (Stability) — dev-infra slice that hardens future
+staleness detection.
+**Picked:** add iter-12 /stop endpoint to verify-build manifest.
+
+**Shipped (commit pending):**
+- `scripts/verify-build.sh`: added two new entries to the symbol-
+  table FIXES manifest:
+  - `main.handleStopHTTP` — the POST /stop handler function
+  - `main.stopInProgress` — the atomic.Bool gating concurrent /stops
+  Both symbols verified present in the current on-disk
+  build/JuiceMount.app via nm -a. Without these entries, future
+  iterations could ship a build that silently lost the /stop endpoint
+  (the same class of bug iter 4 discovered with the Lstat timeout).
+
+**Validated:** `bash scripts/verify-build.sh` reports 11 ✓ entries
+(up from 9), all green. `bash scripts/verify-build.sh --running`
+still correctly flags the live PID 42644 as stale (it predates the
+iter-12 build at mtime May 17 00:44:53).
+
+**Tier-1 status:** no acceptance-test changes; this is
+dev-infrastructure that makes future code-staleness incidents
+catchable in seconds, the same way iter-7 saved iter-4-class bugs.
+
+**Live mount status (unchanged from iter 13):** still stale,
+auto-offline still engaged, FUSE daemon still down. User restart
+needed; iter 13's NFS-shutdown harness + iter 12's /stop endpoint
+all wait on that.
+
+**Broken:** nothing.
+
+**Next:** iteration 15 picks one of:
+  - Wait for user binary swap + validate iter-13's NFS-shutdown
+    harness end-to-end (closes the last tier-1.2 gap).
+  - /shutdown endpoint (full teardown — stop + unmount FUSE + NFS).
+  - Tier-2 work (since tier-1 acceptance tests are almost all
+    landed-needs-validation rather than blocked-on-code).
+  - Tier-1.4 crash-recover-test --real (needs user-driven destructive
+    operation against the live mount).
+
+Several iterations now have been "ship code, blocked on user
+restart for runtime validation." Pivoting to tier-2 (UI/UX) work
+that doesn't depend on the mount state would unblock continued
+autonomous progress. Picking that for iter 15 unless the binary
+swaps before the next wake.
+
+---
+
 ### Iteration 13 — 2026-05-17
 
 **Tier:** 1 (Stability).
