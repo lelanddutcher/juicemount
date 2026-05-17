@@ -294,3 +294,42 @@ from minutes to seconds.
 - Tier 6's `.juiceproject` schema is consumed by tier 4's per-project
   warmup. Tier 4 can ship a partial version (manual pin) before
   tier 6 lands.
+
+## Iteration plan — tier-4-proper (after tier-1 closes)
+
+The tier-1-blocking section above shipped 2026-05-16 (commits in
+docs/STATE.md). What remains is the actual tier-4 work — the polished
+offline workflow built on the foundation.
+
+| # | Slice | Hours | Files |
+|---|---|---|---|
+| 4.A.1 | Bandwidth probe on launch: measure RTT + throughput to metadata host, store baseline per SSID | 5 | new `health/bandwidth.go` |
+| 4.A.2 | Cellular detection (interface type + CTCellularData), inform `pin.SetAutoOffline` rules | 3 | extend `health/network.go` |
+| 4.A.3 | Bandwidth display in popover ("Wi-Fi (180 MB/s)") | 2 | `MenuPopoverView.swift` |
+| 4.B.1 | `.juiceproject` YAML schema parser + per-project warm-budget store | 5 | new `internal/project/` |
+| 4.B.2 | Prefetcher consumes per-project budget (replaces global cache-size knob) | 4 | extend `internal/cache/pin/prefetcher.go` |
+| 4.B.3 | Project-open hook (double-click `.juiceproject` → set active project → trigger warmup) | 3 | Swift app + `URL scheme` registration |
+| 4.C.1 | Resumable warmup: persist per-file progress to pin store | 4 | extend `pin.Store` schema |
+| 4.C.2 | Per-project manifest in `~/Library/Application Support/JuiceMount/projects/` | 2 | new project-state package |
+| 4.C.3 | Resume-on-launch path | 2 | App.swift + ServerController |
+| 4.D.1 | Cellular-aware prompt-once-per-SSID | 3 | extend Preferences + notify path |
+| 4.E.1 | Deferred FTS indexing: mount returns instantly, FTS builds in background with progress | 6 | `metadata/store.go` + UI surface |
+| 4.E.2 | Indexing-progress percentage in popover | 2 | popover row |
+| 4.F.1 | Sparse first-mount: lazy `ListChildren` per directory (skip archived projects) | 5 | extend `nfs/handler.go` ReadDir |
+| 4.G.1 | Write queue local journal | 8 | new `internal/writequeue/` package |
+| 4.G.2 | Reconnect-replay with conflict-detection | 6 | extend `pin` + write-queue |
+| 4.G.3 | Merge-UI for conflicts (Swift sheet) | 4 | new `ConflictResolutionSheet.swift` |
+
+Total: ~64 hours = ~8 working days of tier-4-proper work.
+
+## Signals to watch — tier-4-proper
+
+| Item | Signal |
+|---|---|
+| 4.A | Popover shows network name + measured throughput; first-mount on cellular asks user before warmup |
+| 4.B | `.juiceproject` in a `git clone` → double-click → app pins listed paths, surfaces project in "Active Projects" tree within 10s |
+| 4.C | `kill -9` mid-warm; relaunch resumes at byte-boundary (verify via pin store row count) |
+| 4.D | `defaults read com.juicemount.app cellularPromptedSSIDs` lists each Wi-Fi the user has answered for |
+| 4.E | First mount on a 500K-file bucket: mount usable <5s; FTS background-build completes within 5min; search returns "indexing N/M" until ready |
+| 4.F | Mount on a backup-bucket with 50K archived files: `mount` returns <2s; `ls /Volumes/<name>` of unvisited dirs lazy-loads on first access |
+| 4.G | While offline: write to a pinned project, kill -9, reconnect, relaunch → write appears in upstream within 60s. With conflict: merge UI surfaces, no silent loss. |

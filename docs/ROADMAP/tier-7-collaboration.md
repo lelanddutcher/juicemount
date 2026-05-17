@@ -169,3 +169,31 @@ JuiceMount picks it up, the differentiation is "open-source +
 self-hostable + plays nice with NLE-native locks" — vs. Suite's
 "hosted + their own review tool." Order of business: 1-6 first, 7
 only if the user base demands it.
+
+## Iteration plan (deferred — community-driven if it happens)
+
+| # | Slice | Hours | Files |
+|---|---|---|---|
+| 7.A.1 | Redis pub/sub for presence keyed by file handle; SADD on Open, SREM on Close | 4 | extend `nfs/handler.go` + `metadata/redis.go` |
+| 7.A.2 | TTL-based liveness heartbeat (every 60s, expires at 5min on crash) | 3 | new goroutine in handler |
+| 7.A.3 | Swift popover: per-file presence indicator (avatar overlay on row) | 4 | popover redesign |
+| 7.B.1 | Per-path soft-lock store in Redis (SET NX EX 300) | 4 | extend handler open path |
+| 7.B.2 | Override-stale-lock UI button | 2 | popover action |
+| 7.C.1 | Activity stream in Redis (XADD, capped at 10K per project) | 3 | new event publisher |
+| 7.C.2 | Activity feed view in popover | 3 | new section |
+| 7.D.1 | ACL schema in metadata store + handler enforcement on every op | 6 | `metadata/store.go` + handler |
+| 7.D.2 | ACL admin UI (per-folder + per-editor table) | 5 | new admin pane |
+| 7.E.1 | Tier-7 + tier-4 write-queue integration: presence + lock checks before replay | 4 | extend `internal/writequeue/` |
+
+Total: ~38 hours. Genuinely optional; only ship if a real multi-team
+deployment demands it.
+
+## Signals to watch
+
+| Item | Signal |
+|---|---|
+| 7.A | Two editors open the same file → both see "in use by X" within 2s; one closes → the other sees release within 5s |
+| 7.B | Editor A opens `.prproj` write mode; editor B's open returns EAGAIN immediately. A closes; B's retry succeeds. Force-stop A leaves stale lock; B's UI exposes override button |
+| 7.C | Project activity feed shows last 20 events; filter by editor or op works |
+| 7.D | Editor with read-only ACL on `/Footage/` can stat + read but cannot write or delete; writes return EACCES |
+| 7.E | Offline write to a locked file: replay refuses; merge UI surfaces; no silent loss |

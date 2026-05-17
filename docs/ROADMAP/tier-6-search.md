@@ -150,3 +150,30 @@ Never default. Never silent.
 Don't build this until tiers 1–5 are production-ready. The order of
 business is: a file system that works reliably > a file system that
 also has great search. Search-with-an-unreliable-mount serves nobody.
+
+## Iteration plan (deferred — for future-self reference)
+
+| # | Slice | Hours | Files |
+|---|---|---|---|
+| 6.A.1 | CoreML CLIP model integration: load Apple's `ImageFeatures` via `Vision.framework`, embed thumbnails | 6 | new `internal/index/clip.go` (cgo to Vision) or Swift sidecar |
+| 6.A.2 | Embeddings table in metadata store + cosine-similarity query | 4 | extend `metadata/store.go` |
+| 6.A.3 | Drop-image-on-search-bar → embed → top-K search UI | 4 | extend `SearchWindowView.swift` |
+| 6.B.1 | `mediainfo` sidecar binary integration; per-file JSON parse on first stat | 5 | new `internal/index/mediainfo.go` |
+| 6.B.2 | EXIF/codec filters in search UI | 3 | search window |
+| 6.C.1 | Vision framework face/object detection on ingest | 5 | extend `internal/index/` |
+| 6.C.2 | Tag-confirmation UI (suggested → user-accept → searchable) | 4 | tag review pane |
+| 6.D.1 | `.juiceproject` YAML schema (parser, validator) — also consumed by tier 4 | 4 | new `internal/project/` |
+| 6.D.2 | Search by project-tags | 2 | extend search query DSL |
+| 6.E.1 | Optional LLM hooks: OpenAI/Ollama config, opt-in per-session budget | 5 | new `internal/llm/`, Preferences pane |
+
+Total: ~42 hours. Optional/deferred.
+
+## Signals to watch
+
+| Item | Signal |
+|---|---|
+| 6.A | Drop a frame on search → top-K visually-similar clips appear in <2s; query precision >50% on a curated test set |
+| 6.B | Filter "codec=ProRes422HQ" returns only matching files; sub-500ms across a 100K-file library |
+| 6.C | Face-detected tags appear as suggestions; only accepted ones become searchable |
+| 6.D | `git clone <repo with .juiceproject>` → open → pinned + tagged within 60s |
+| 6.E | LLM-generated captions appear only after explicit opt-in; cost tracking surfaces in popover |

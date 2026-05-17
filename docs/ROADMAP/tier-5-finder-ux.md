@@ -131,3 +131,41 @@ from Finder into the popover → it becomes a pin root.
   share link" — share links should reference the project.
 - Tier 2's installer flow needs to handle FinderSync registration on
   first launch (system prompt for enable permission).
+
+## Iteration plan
+
+Tier-5 requires Xcode extension targets (FinderSync, QuickLook,
+mdimporter), which complicates the SPM-only build pipeline currently
+in `scripts/build-app.sh`. First slice is build-system work.
+
+| # | Slice | Hours | Files |
+|---|---|---|---|
+| 5.0 | Move build pipeline to support extension targets — likely Xcode project (or `swift package` with `XCTestPlan`-style hack); update `scripts/build-app.sh` accordingly | 6 | `app/JuiceMount.xcodeproj/`, `build-app.sh` |
+| 5.A | `NSServices` entries: Pin for Offline, Unpin, Copy Share Link, Show in JuiceMount | 4 | `Info.plist` services dict + handler funcs in main app |
+| 5.B.1 | FinderSync extension scaffold (Info.plist with `NSExtensionPointIdentifier = com.apple.FinderSync` — NOT FileProvider) | 3 | new `app/JuiceMountFinderSync/` target |
+| 5.B.2 | Badge logic: subscribe to admin-API WebSocket for pin-state changes; render pinned/syncing/failed/offline-fallback badges | 6 | extension code |
+| 5.B.3 | Build-time guard: `scripts/build-app.sh` rejects any FileProviderExtension plist (per `docs/no-fileprovider.md`) | 1 | extend existing guard |
+| 5.C.1 | QuickLook preview extension scaffold | 4 | new `app/JuiceMountQuickLook/` target |
+| 5.C.2 | Video proxy preview: if proxy exists serve it; else 1s budget on FUSE read fallback | 4 | extension code |
+| 5.D.1 | mdimporter scaffold | 3 | new `app/JuiceMountSpotlight/` target |
+| 5.D.2 | Wire to metadata store: read filename/size/mtime/inode and expose via `kMDItem*` attributes | 4 | extension code |
+| 5.E | Drag-drop to popover → register as pin root | 2 | extend popover root with `NSDraggingDestination` |
+
+Total: ~37 hours = ~5 working days.
+
+**Critical safety check, every iteration**: `scripts/build-app.sh`
+runs the FileProvider guard. If anyone (including tier-5 work)
+accidentally introduces an extension declaring
+`com.apple.fileprovider-extension`, the build refuses. This must
+never break.
+
+## Signals to watch
+
+| Item | Signal |
+|---|---|
+| 5.A | Right-click any file in any app → JuiceMount Services menu items appear |
+| 5.B | Pinned file in Finder gets a green-dot overlay; pinning-in-progress shows spinner; state changes propagate <5s |
+| 5.C | Quick Look on a `.mov` file in `/Volumes/zpool-dev/` shows a video preview within 2s |
+| 5.D | Cmd-Space "TestVideo" finds files in JuiceMount mount; results include path, size, type |
+| 5.E | Dragging a folder from another Finder window onto popover root → folder appears in "Active Projects" tree as a pin root |
+| ALL | `pluginkit -m -p com.apple.fileprovider-extension` produces zero JuiceMount results. Forever. |

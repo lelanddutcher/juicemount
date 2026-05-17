@@ -142,3 +142,42 @@ Each user-configurable in Preferences.
   the data the UI surfaces. Tier 2 builds the surface.
 - Tier 5 (Finder UX) needs an installer flow for FinderSync
   registration — overlaps 2.A's wizard step.
+
+## Iteration plan
+
+Each item is one commit + code-reviewer pass (Swift-UI changes don't
+always need review, but onboarding-wizard and Sparkle do touch
+lifecycle).
+
+| # | Slice | Hours | Files |
+|---|---|---|---|
+| 2.A.1 | Welcome screen + server URL field (paste → validate via TCP dial) | 4 | `app/JuiceMount/Sources/JuiceMount/UI/OnboardingWindow.swift` (new) |
+| 2.A.2 | Mount-point picker + cache-size slider + "starter pin" optional | 3 | same |
+| 2.A.3 | First-launch detection (skip wizard if `Preferences.hasCompletedOnboarding`) | 1 | `Preferences.swift` + App.swift |
+| 2.B.1 | Popover redesign: per-project tree replacing flat actions list | 4 | `MenuPopoverView.swift` |
+| 2.B.2 | Active-Projects list driven by `.juiceproject` files (depends on tier 6 schema — can stub with manual pin roots) | 3 | same |
+| 2.C.1 | Error catalog: map every user-facing `syscall.*`/NFSStatus to (description, next-step, copy-diagnostic) | 5 | new `ErrorCatalog.swift` |
+| 2.C.2 | "Copy diagnostic" button in error sheets, generates remediation snippet | 2 | `ErrorCatalog.swift` + popover row |
+| 2.D.1 | Self-test dashboard window (read throughput + write probe + RPC latency + recent errors) | 4 | new `DashboardWindow.swift` |
+| 2.D.2 | Sparkline rendering for historical self-test results | 3 | Charts framework |
+| 2.E.1 | `UNUserNotificationCenter` events: pin-complete, sync-complete, offline-transition, error | 3 | extend `ServerController.swift` (offline-notify pattern already exists) |
+| 2.E.2 | Per-event opt-in toggles in Preferences | 2 | `Preferences.swift` + new pane |
+| 2.F.1 | Sparkle dependency added to SPM, plist config for stable channel | 2 | `Package.swift`, `Info.plist` |
+| 2.F.2 | Beta-channel toggle in Preferences + appcast feed split | 2 | same |
+| 2.G.1 | Dark-mode audit — render every view in light + dark, fix contrast | 3 | all UI files |
+| 2.G.2 | VoiceOver labels on every interactive element, .accessibilityLabel everywhere | 3 | all UI files |
+| 2.G.3 | High-contrast mode pass (replace `.ultraThinMaterial` washes) | 2 | popover background |
+
+Total: ~46 hours = ~6 working days of focused tier-2 work.
+
+## Signals to watch
+
+| Item | Signal proving it works |
+|---|---|
+| 2.A | New user (defaults wiped) reaches mounted state via wizard, no docs consulted, <2min stopwatch |
+| 2.B | Popover renders pinned-project tree at p99 <50ms (no cgo blocking on MainActor) |
+| 2.C | Every error in the user-facing surface includes a "Copy diagnostic" button; clicked outputs a non-generic remediation |
+| 2.D | Dashboard sparkline updates within 5s of each self-test cycle |
+| 2.E | Toggling preferences off silences notifications immediately (next event); on grants permission and emits |
+| 2.F | `appcast.xml` reachable; "Check for Updates" surfaces release notes |
+| 2.G | macOS Accessibility Inspector reports 0 issues; high-contrast mode is legible |
