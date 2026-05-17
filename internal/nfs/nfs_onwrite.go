@@ -57,16 +57,44 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
-	if req.Offset > 0 {
-		if _, err := file.Seek(int64(req.Offset), io.SeekStart); err != nil {
-			return &NFSStatusError{NFSStatusIO, err}
-		}
-	}
 	end := req.Count
 	if len(req.Data) < int(end) {
 		end = uint32(len(req.Data))
 	}
-	writtenCount, err := file.Write(req.Data[:end])
+
+	// QA-14 fix (2026-05-17): use WriteAt(data, offset) instead of
+	// Seek+Write. Seek+Write is TWO separate syscalls that share the
+	// fd's internal position. Under concurrent dispatch (iter 1's
+	// change in 691f550), two parallel WRITE RPCs hitting the same
+	// pooled fd would race on the offset: RPC_A.Seek(0) +
+	// RPC_B.Seek(1MB) + RPC_A.Write + RPC_B.Write interleaves
+	// chaotically and writes both RPC payloads at the WRONG offsets.
+	// Result: file ends up at the right total size but with bytes
+	// shuffled — the exact "size right, content wrong" pattern
+	// QA-14 documented.
+	//
+	// WriteAt(p, off) is a single atomic positioned write (pwrite(2)
+	// on Unix) — no fd-internal offset involved, no race possible.
+	// billy.File doesn't require WriteAt, so we type-assert to
+	// io.WriterAt. Our handler's writeFile implements it (see
+	// nfs/handler.go:1112); billyFile embeds *os.File which has
+	// WriteAt natively. The fallback path covers the contract.
+	var writtenCount int
+	if wa, ok := file.(io.WriterAt); ok {
+		writtenCount, err = wa.WriteAt(req.Data[:end], int64(req.Offset))
+	} else {
+		// Fallback for billy.File implementations without WriteAt.
+		// NOT race-safe — but the only callers we care about
+		// (writeFile, billyFile) both implement WriterAt. Logging
+		// this branch so a regression is visible.
+		Log.Errorf("write fallback: file %T missing WriteAt — RACE-PRONE; offset=%d", file, req.Offset)
+		if req.Offset > 0 {
+			if _, err := file.Seek(int64(req.Offset), io.SeekStart); err != nil {
+				return &NFSStatusError{NFSStatusIO, err}
+			}
+		}
+		writtenCount, err = file.Write(req.Data[:end])
+	}
 	if err != nil {
 		Log.Errorf("Error writing: %v", err)
 		return &NFSStatusError{NFSStatusIO, err}

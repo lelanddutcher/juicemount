@@ -398,9 +398,54 @@ clicks Start in the menu bar, the harness can be invoked and is
 expected to FAIL on tests 2-5 (proving it detects QA-14). C.1 then
 proceeds with the fix, and the harness should PASS afterward.
 
-### QA-14 (2026-05-17, user QA) — NFS write path corrupts bytes (size right, content wrong)
+### QA-14 (2026-05-17, user QA) — NFS write path corrupts bytes (size right, content wrong) — ⚠ FIX LANDED — pending runtime validation 2026-05-17
 
-**Observed (validation of QA-13 fix, 2026-05-17 ~14:15):** with
+**Fix (Loop C.1, 2026-05-17 ~14:40):**
+
+Replaced Seek+Write with io.WriterAt-based positioned write in
+`internal/nfs/nfs_onwrite.go` lines 56-97. The bug WAS in the NFS
+handler's onWrite path itself (not in writeFile.Write as initially
+suspected): onWrite called `file.Seek(off)` then `file.Write(p)` —
+two separate syscalls sharing the fd's internal position counter.
+Under iter 1's concurrent dispatch, two parallel WRITE RPCs at
+different offsets would race on that shared counter and writes
+would interleave at wrong offsets — the exact "size right, content
+wrong" pattern QA-14 documented.
+
+Fix: type-assert to `io.WriterAt` and call `WriteAt(p, off)`,
+which is a single atomic positioned write (`pwrite(2)` on Unix).
+The two billy.File implementations we hand out (writeFile, billyFile)
+both implement WriterAt. Fallback to the old Seek+Write path
+remains for defensive purposes with a loud error log.
+
+**Code-reviewer pass (Rule 4 concurrency-audit prompt):** Approved.
+One HIGH finding flagged: FDPool eviction's `refCount<=0` check is
+sound-in-practice but not formally race-free — `lastUsed` is updated
+only on Get/GetWrite, not inside Release. Under sustained
+high-concurrency write bursts an evict tick landing in the
+brief refCount==0 window between RPCs could theoretically close
+an fd about to be re-acquired. Not a QA-14 blocker; logged for
+future hardening. One MEDIUM: tryStat after Close may report
+stale WCC size — spec-legal per RFC 1813 §2.6.
+
+**Runtime validation BLOCKED 2026-05-17 14:35:** backend MinIO at
+192.168.0.197:9000 returned unreachable (curl exit 7, ping ok).
+This put the running app into auto-offline mode (QA-12 — open-time
+gate too aggressive), so writes through `/Volumes/zpool-dev`
+returned "Device not configured" before they could exercise the
+fix. The write-integrity harness (scripts/wedge-tests/write-integrity.sh)
+needs the backend up to run end-to-end. Mark the fix ⚠ until the
+harness passes.
+
+**Adjacent scenarios to test once backend recovers (per Rule 3):**
+  1. 512 KiB single-RPC write — should pass on old binary too
+  2. 10 MiB multi-RPC sequential — should now pass (was failing)
+  3. 200 MiB multi-RPC sequential — should now pass
+  4. 4 × 10 MiB concurrent parallel — primary repro, must pass
+  5. cp -p with xattrs (Finder-equivalent) — primary user-reported case
+  6. Cold-restart variant — restart JuiceMount, re-run 1-5
+
+**Original observation (2026-05-17 ~14:15):** with
 the `._` Stat-filter removed (QA-13 partial fix landed), AppleDouble
 sidecars create successfully — but a `cat 5MB > /Volumes/zpool/dst`
 produces a file with the correct SIZE (5 MB) and a STABLE but
