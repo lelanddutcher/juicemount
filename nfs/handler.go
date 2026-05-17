@@ -43,9 +43,20 @@ type JuiceMountHandler struct {
 	// Synthetic inode counter for locally-created entries (atomic)
 	inodeCounter atomic.Uint64
 
-	// Write size tracking: path → latest known size (for WCC accuracy)
+	// Write size tracking: path → latest known size (for WCC accuracy).
+	// Sticky — entries persist after writers close (QA-16: concurrent
+	// closes must not lose the high-water mark).
 	writeSizeMu sync.Mutex
 	writeSizes  map[string]int64
+
+	// Active writer refcount: path → number of in-flight write handles.
+	// Used by phantom-purge gate to distinguish "active writer right now"
+	// from "was ever written" (writeSizes is sticky so it can't answer
+	// the first question). Incremented when OpenFile returns a writeFile;
+	// decremented on writeFile.Close; entry deleted when count reaches 0.
+	// (QA-19 fix, 2026-05-17)
+	activeWritersMu sync.Mutex
+	activeWriters   map[string]int
 
 	// READDIRPLUS cookie tracking
 	verifierMu sync.Mutex
@@ -97,8 +108,9 @@ func NewHandler(store *metadata.Store, fusePath string) *JuiceMountHandler {
 		fdPool:       fdPool,
 		readahead:    NewReadaheadManager(fusePath, fdPool),
 		memBuf:       NewMemoryBuffer(DefaultMemBufThreshold, DefaultMemBufBudget),
-		writeSizes:   make(map[string]int64),
-		verifiers:    make(map[string]verifierData),
+		writeSizes:    make(map[string]int64),
+		activeWriters: make(map[string]int),
+		verifiers:     make(map[string]verifierData),
 		prefetched:   make(map[string]time.Time),
 		prefetchSem:  make(chan struct{}, 4), // max 4 concurrent prefetches
 		verifierStop: make(chan struct{}),
@@ -173,6 +185,41 @@ func (h *JuiceMountHandler) SetRedisClient(rc *metadata.RedisClient) {
 // Uses high bit set to distinguish from JuiceFS inodes.
 func (h *JuiceMountHandler) nextSyntheticInode() uint64 {
 	return h.inodeCounter.Add(1) | (1 << 63)
+}
+
+// incActiveWriter records that a new write handle is in flight for this path.
+// Pairs with decActiveWriter on writeFile.Close. The Stat phantom-purge gate
+// reads this count to decide whether the cache entry must be preserved (any
+// nonzero count means the writer's NFS handle is in active use; deleting
+// the inode cache entry would surface as ESTALE on the writer's next RPC).
+func (h *JuiceMountHandler) incActiveWriter(path string) {
+	h.activeWritersMu.Lock()
+	h.activeWriters[path]++
+	h.activeWritersMu.Unlock()
+}
+
+// decActiveWriter releases one in-flight handle reference. Deletes the map
+// entry when the count returns to zero so the map doesn't grow unbounded
+// across the process lifetime.
+func (h *JuiceMountHandler) decActiveWriter(path string) {
+	h.activeWritersMu.Lock()
+	if c, ok := h.activeWriters[path]; ok {
+		if c <= 1 {
+			delete(h.activeWriters, path)
+		} else {
+			h.activeWriters[path] = c - 1
+		}
+	}
+	h.activeWritersMu.Unlock()
+}
+
+// hasActiveWriter reports whether any write handle is currently in flight
+// for the given path. The phantom-purge gate consults this to avoid
+// invalidating an active writer's NFS handle. (QA-19 fix.)
+func (h *JuiceMountHandler) hasActiveWriter(path string) bool {
+	h.activeWritersMu.Lock()
+	defer h.activeWritersMu.Unlock()
+	return h.activeWriters[path] > 0
 }
 
 // trackWriteSize records the high-water mark of written size for a path.
@@ -565,7 +612,24 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 			// it — but the cost of being wrong here (stale handle that
 			// requires a remount to recover) is much higher than the
 			// cost of a few extra seconds of "this stale entry exists."
-			if jfs.handler.redisClient != nil && jfs.handler.redisClient.RecentlyDegraded(60*time.Second) {
+			if jfs.handler.hasActiveWriter(filename) {
+				// QA-19 fix (2026-05-17): NEVER purge a file with an
+				// in-flight write handle. The NFS file handle is the
+				// inode (see ToHandle/FromHandle); deleting the cache
+				// entry removes inodeCache[inode] and the writer's next
+				// WRITE RPC gets NFS3ERR_STALE. A concurrent GETATTR
+				// (NFSv3 kernel clients periodically refresh attrs under
+				// sustained I/O) racing a writeback-mode juicefs sync
+				// can momentarily observe ENOENT from FUSE even though
+				// the writer's data is in the writeback buffer.
+				//
+				// Uses the activeWriters refcount (not the sticky
+				// writeSizes map) so the gate self-clears the moment
+				// the last writer closes. A file that's stale AND has
+				// no active writer still gets purged on the next stat.
+				// Reproducer: scripts/qa-suite/04-fio.sh seqwrite-1m
+				// firing at ~52s into a 512 MiB write.
+			} else if jfs.handler.redisClient != nil && jfs.handler.redisClient.RecentlyDegraded(60*time.Second) {
 				// Treat the cache entry as authoritative. Skip purge.
 			} else {
 				fusePath := jfs.fullPath(filename)
@@ -849,6 +913,10 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			inode = jfs.handler.nextSyntheticInode()
 		}
 		entry := &metadata.Entry{Path: filename, Inode: inode}
+		// QA-19: register the active writer BEFORE returning. Pair
+		// with decActiveWriter in writeFile.Close so the phantom-purge
+		// gate in Stat() can see this writer is in flight.
+		jfs.handler.incActiveWriter(filename)
 		return &writeFile{
 			File:    fd,
 			name:    filename,
@@ -885,6 +953,12 @@ func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 	e := metadata.MakeEntry(filename, false, 0, now, jfs.handler.nextSyntheticInode())
 	e.LocalOnly = true
 	jfs.handler.store.Insert(e)
+
+	// QA-19: Create returns a writeFile whose Close calls decActiveWriter.
+	// Match it with an inc here so the phantom-purge gate sees the writer.
+	// Without this, the NFS CREATE → first-write window (which is exactly
+	// fio seqwrite's startup path) gets no protection.
+	jfs.handler.incActiveWriter(filename)
 
 	return &writeFile{
 		File:    f,
@@ -1166,6 +1240,12 @@ func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (f *writeFile) Close() error {
+	// QA-19: release the active-writer refcount paired with the
+	// incActiveWriter at OpenFile time. Done first thing so a panic
+	// in any of the downstream cache/SQLite work below doesn't leak
+	// the refcount (would permanently block phantom-purge for the path).
+	f.handler.decActiveWriter(f.name)
+
 	// Do NOT Sync() here — the go-nfs library calls OpenFile+Write+Close on
 	// every WRITE RPC, so syncing here would flush to MinIO on every RPC.
 	// Instead, rely on JuiceFS's writeback buffer and its own flush timing.
