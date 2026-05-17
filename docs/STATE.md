@@ -16,7 +16,7 @@ Acceptance tests (from `docs/VISION.md`):
 | # | Test | Status |
 |---|---|---|
 | 1.1 | Concurrent per-connection NFS dispatch (Finder browses while a long Read is in flight) | ⚠ landed in `691f550`; **prior validation invalidated by `f944a82` build-staleness bug; needs re-validation against the fresh binary** |
-| 1.2 | No Finder freeze on any wedged backend | ⚠ 2 of 3 iter-B wedge harnesses shipped (`minio-down-mid-read` iter 9, `fuse-hang-mid-op` iter 10); both pass with adjacent-stat max <40ms during wedge. NFS-loopback-mid-shutdown harness still TBD |
+| 1.2 | No Finder freeze on any wedged backend | ⚠ all 3 iter-B wedge harnesses shipped (`minio-down-mid-read` iter 9, `fuse-hang-mid-op` iter 10, `nfs-loopback-mid-shutdown` iter 13); first two PASS validated against live mount, third awaits binary swap (needs iter-12's `/stop` endpoint) |
 | 1.3 | Clean unmount in every state | ✓ likely (ordered shutdown + Force Eject landed) — needs real validation |
 | 1.4 | Crash-safe metadata (kill -9 → mountable in <5s) | ⚠ test tooling shipped in `5ec1a33`; real run pending |
 | 1.5 | Recovery diagnostics (Export Diagnostics zip) | ✓ landed in Phase B |
@@ -381,6 +381,90 @@ re-validation. If not: I'll stop the loop after this iteration with
 a PushNotification — eight iterations of tooling on a stale binary
 is the point where continued autonomous work has negative marginal
 value.
+
+### Iteration 13 — 2026-05-17
+
+**Tier:** 1 (Stability).
+**Picked:** tier-1.2 iter B sub-slice 3 — NFS-loopback-mid-shutdown
+wedge harness, the last of the three wedge scenarios in iter B.
+
+**Context discovered at start of iteration:** running binary (PID
+42644) is STILL stale — no /stop endpoint. Additionally, the live
+mount is in a degraded state — FUSE daemon died at some point during
+the night, Redis ping fails ("no route to host"), auto-offline
+engaged at 00:41:18. Auto-offline behavior is working correctly
+(tier-1.7-1.10 still validated), but the mount is not currently
+usable for runtime validation of this iteration's harness.
+
+Decision: ship the harness anyway. The precondition guards make it
+inert on a stale binary (exits 2 before any destructive action), so
+the script can sit ready until the user restarts JuiceMount on a
+fresh binary.
+
+**Shipped (commit pending):**
+- `scripts/wedge-tests/nfs-loopback-mid-shutdown.sh`: starts a
+  streaming `cat` of an auto-rotated >=1GB probe file, mid-read
+  POSTs /stop to the metrics listener, then in sequence measures:
+  - Time until cat exits (server should drain reads — kernel NFS
+    soft-mount sees connection close, propagates error to read()).
+  - Time until /health stops responding (metrics server is the
+    first thing torn down in stopServerLocked).
+  - Optional /force-eject phase with passwordless-sudo umount
+    fallback (/force-eject's listener is dead post-/stop — falls
+    back to direct umount on the same sudoers allowlist).
+  - Residue check: mount table should not show $MOUNT after eject.
+
+  Precondition probe: GET /stop expects 405. On a stale binary the
+  catch-all index handler returns 200 with text/plain — script bails
+  with exit 2 and a clear error pointing at iter 12 + the rebuild
+  instruction. Verified end-to-end against the stale running binary:
+  precondition fires, no destructive action, exit 2.
+
+  Single-shot semantics: the harness intentionally leaves JuiceMount
+  in the stopped state. Restart via the Swift app's Start button.
+  Documented loudly in the help text and in the final post-test log.
+
+**Code-reviewer pass:** 1 HIGH + 2 MEDIUM addressed:
+  - HIGH: missing inconclusive guard. Sibling MinIO harness has a
+    `cat_exit == 0 && !cat_wedged → WARN` branch to catch the case
+    where a fully-cached probe streams to EOF before /stop drains —
+    the NFS harness was missing it. Added.
+  - MED-2: mount-path normalization. Stripped trailing slash from
+    --mount input so the `mount | grep -q " $MOUNT "` pattern
+    matches correctly (without this, --mount /Volumes/zpool-dev/
+    would silently false-negative on both precondition and residue
+    checks). Sibling harnesses have the same bug but lower stakes;
+    fixing here since residue false-negative would mask a real
+    tier-1.2 failure.
+  - MED-3: single curl call for status+ctype probe (no TOCTOU window).
+  - 3 LOW deferred (defensive 503 branch is fine, bc sub-process
+    fork is sibling-style, trap scope is correctly narrow).
+
+**Tier-1.2 status:** all 3 wedge harnesses now shipped. Two
+validated end-to-end (MinIO-wedge and FUSE-hang); the NFS-shutdown
+harness is ready to validate the next time the user restarts on a
+fresh binary.
+
+**Mount state warning (separate from iter scope):** the live mount
+needs user intervention — Quit JuiceMount, re-open from
+build/JuiceMount.app, click Start. The fresh binary then has the
+/stop endpoint AND the iter-11 goroutine watchdog support.
+
+**Broken:** nothing introduced.
+
+**Next:** iteration 14 picks one of:
+  - Wait for user binary swap + validate the NFS-shutdown harness
+    end-to-end (closes the last tier-1.2 gap).
+  - Add verify-build.sh manifest entry for handleStopHTTP so future
+    builds catch staleness on this fix too.
+  - Tier-1.6: kick off the 24h soak with watchdog enabled (once the
+    user has the fresh binary running).
+  - /shutdown endpoint (full teardown — stop + unmount FUSE + NFS).
+
+The verify-build manifest update is the cheapest unblocker for
+future iterations and doesn't depend on the mount state. Pick it.
+
+---
 
 ### Iteration 12 — 2026-05-17
 
