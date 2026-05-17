@@ -468,6 +468,23 @@ func (jfs *juiceFS) fullPath(filename string) string {
 	return path.Join(jfs.handler.fusePath, filename)
 }
 
+// cacheProbeHit returns true when the SSD cache reader can serve the
+// first block of `e`. Returns false on any miss, timeout, or absent
+// cacheReader. Used by OpenFile's C.2/QA-12 path to allow opens of
+// "recently cached" files in offline mode.
+//
+// 200ms is the timeout — see the call site for the rationale.
+func (jfs *juiceFS) cacheProbeHit(e *metadata.Entry) bool {
+	if e == nil || jfs.handler.cacheReader == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	var scratch [4096]byte
+	n, err := jfs.handler.cacheReader.ReadBlock(ctx, e.Inode, 0, scratch[:])
+	return err == nil && n > 0
+}
+
 func (jfs *juiceFS) entryToFileInfo(e *metadata.Entry) os.FileInfo {
 	return e.FileInfo()
 }
@@ -750,8 +767,23 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 		isPinned = jfs.handler.isPinnedReady(canonical)
 	}
 
-	if !isWrite && pin.IsOffline() && jfs.handler.pinStore != nil {
-		if !isPinned {
+	if !isWrite && pin.IsOffline() && jfs.handler.pinStore != nil && !isPinned {
+		// C.2 fix (QA-12, 2026-05-17): before refusing the open,
+		// probe whether the SSD cache can serve the first block of
+		// this file. If it can, the file is "recently cached" and
+		// the user-intent of offline mode (don't trigger backend
+		// traffic on un-pinned reads) is still respected — the read
+		// path is cache-priority-correct downstream (cachedFile.ReadAt
+		// runs the cache reader BEFORE the per-read offline gate at
+		// handler.go:1052). Only refuse if the cache can't help.
+		//
+		// 200ms timeout: covers Redis localhost LRange (sub-ms warm,
+		// ≤50ms under load) + first-open APFS dir-cache miss
+		// (~10-40ms) + ReadAt of one 4 KiB block. Tight enough that
+		// a hanging Redis can't stall OpenFile but loose enough that
+		// a legitimately-cached file on a sleepy cold system doesn't
+		// get false-refused.
+		if !jfs.cacheProbeHit(e) {
 			jmlog.Debug("offline: refusing open of un-pinned file",
 				"in_mount", filename,
 				"canonical", canonical)
@@ -761,6 +793,9 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			// file handles; NoEnt does).
 			return nil, pin.ErrOfflineNotAvailable
 		}
+		jmlog.Debug("offline: allowing open of cached un-pinned file (probe hit)",
+			"in_mount", filename,
+			"inode", func() uint64 { if e != nil { return e.Inode }; return 0 }())
 	}
 
 	// For read-only opens, try to use fd pool + cache reader
