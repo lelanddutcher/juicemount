@@ -66,16 +66,20 @@ BULK_DIR="$TROOT/bulk-import"
 mkdir -p "$BULK_DIR"
 PIDS=()
 declare -a EXPECTED_MD5
+declare -a BULK_SRCS
 for i in $(seq 1 20); do
     size=$(( (RANDOM % 50) + 1 ))  # 1–50 MiB
     src="$TMPDIR_LOCAL/bulk-$$-$i"
     pool_slice "$src" "$size"
     EXPECTED_MD5[$i]=$(md5q "$src")
+    BULK_SRCS+=("$src")
     cp "$src" "$BULK_DIR/file-$i.bin" &
     PIDS+=($!)
-    rm -f "$src" &  # benign race — cp has already opened the source
 done
 for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null; done
+# Clean up sources AFTER all cps are done — backgrounding rm in the loop
+# above produced a race where the source vanished before cp could open it.
+for src in "${BULK_SRCS[@]}"; do rm -f "$src" 2>/dev/null; done
 # Verify all
 BULK_OK=0
 BULK_BAD=0

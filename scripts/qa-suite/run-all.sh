@@ -127,6 +127,12 @@ done
 SUITE_ELAPSED=$(( $(date +%s) - SUITE_START ))
 SUMMARY_FILE="${RUN_DIR}/run.summary"
 
+# Default totals to 0 so the exit-code check is safe under `set -u`
+# even if PHASE_NAMES is empty (e.g., suite aborted before any phase).
+TOTAL_PASS=0
+TOTAL_FAIL=0
+TOTAL_WARN=0
+
 {
     echo "JuiceMount QA Suite — final report"
     echo "==================================="
