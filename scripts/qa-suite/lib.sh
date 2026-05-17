@@ -33,6 +33,14 @@ mkdir -p "$RUN_DIR" 2>/dev/null
 
 ts() { date +%H:%M:%S; }
 
+# Counters are initialized HERE (at sourcing time) so the orchestrator can
+# call pass/fail/warn before any phase_init runs. phase_init re-zeroes them
+# for each phase. Without these defaults, `set -u` in a phase or in the
+# orchestrator kills the script on the first warn() call outside a phase.
+: "${PASS_COUNT:=0}"
+: "${FAIL_COUNT:=0}"
+: "${WARN_COUNT:=0}"
+
 log()     { printf '[%s] %s\n' "$(ts)" "$*"; }
 section() { printf '\n[%s] \033[36m== %s ==\033[0m\n' "$(ts)" "$*"; }
 pass()    { printf '\033[32m[PASS]\033[0m %s\n' "$*"; PASS_COUNT=$((PASS_COUNT+1)); }
