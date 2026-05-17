@@ -15,6 +15,81 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### QA suite run 20260517-191053 (run #4, post-QA-18/19 fixes) — partial closure
+
+**Setup:** suite run against jm5 CLI binary (not the Swift app) with
+fixes c21cc5e (QA-18), 4251c26 (QA-19), c88f038 (harness corrections).
+The CLI takes a different code path than Swift's NFSServerStart and
+doesn't register the /offline /pin /unpin /cache-status routes, so
+00-precheck and parts of 07-failure read the "JuiceMount metrics"
+landing page instead of JSON — minor cosmetic failures in the totals
+(2 in 00-precheck, 2 warns in 07-failure) that don't reflect bugs.
+
+**QA-18 ✓ CLOSED — VALIDATED**
+Reproducer was 02-finder's "1000 × 1 KiB" test crashing with "Not a
+directory" at file-390 under cache pressure. Result this run:
+**02-finder PASSED 12/12, including the 1000-small-files test
+(43s, zero failures)**. The fix (Lstat in ToHandle fallback + dirs
+pinned in evictOldest) addresses the root cause: parent dir's cache
+entry no longer gets evicted under file LRU pressure, AND if the
+fallback DOES fire it now Lstats FUSE to get the real IsDir.
+Adjacent scenarios tested:
+  - Standalone 1000-files tight loop: clean
+  - Inside the full suite after prior I/O burst: clean
+  - cp -R, mv, Spotlight stat-storm, Quick Look, rsync: all pass
+Side-benefit: 05-metadata went from 6/1 (1 stochastic ls fail) to 5/0
+— the ls-during-writes race is also gone.
+
+**QA-19 ✓ CLOSED — VALIDATED**
+Reproducer was fio seqwrite-1m hitting ESTALE at ~52s into a sustained
+512 MB write via psync. Result this run:
+**seqwrite-1m PASSED. parallel-write PASSED. Zero ESTALE errors
+in any of the 8 fio profiles.** The fix (active-writer refcount
+gating the phantom-purge in Stat) addresses the root cause:
+mid-write GETATTR refreshes from the kernel client can no longer
+delete an in-use file's cache entry. Standalone validation: fio
+seqwrite-1m wrote 36.7 GiB in 60s at 656 MB/s, zero errors.
+Adjacent scenarios tested:
+  - Sustained sequential write (seqwrite-1m): clean
+  - 4-stream parallel writers (parallel-write): clean
+  - Concurrent 8R+8W: 06-concurrency 6/6
+  - Endurance (4R+4W × 20min): RSS DROPPED (no leak), zero RPC errors
+
+**QA-20 (new candidate, found while validating) — fio randread EIO on
+256 MiB file at high iodepth**
+Six of the eight fio profiles still failed in run #4, but with **errno
+5 (EIO), not errno 70 (ESTALE)** — a distinct bug, not a QA-19 residual.
+Specifically: randread-4k against a 256 MiB file at iodepth=32 fails
+deterministically at offset 262266880 (about 6.5 MiB before EOF).
+  - Reproducer (standalone): `fio --name=rr --directory=/Volumes/zpool-dev/.x --size=256M --rw=randread --bs=4k --runtime=10 --time_based --iodepth=32 --direct=0 --ioengine=psync`
+  - Confirmed clean: same profile at size=32M; same profile against an
+    existing >100MB file with iodepth=8; sequential reads at any size.
+  - Hypothesis: the failure mode looks like a juicefs writeback +
+    read-back-from-just-written interaction with high concurrent
+    pressure. The error fires AFTER the write phase completes and the
+    random-read phase starts cycling. With our `--writeback` flag, the
+    writeback buffer may rotate chunks to MinIO (unreachable here at
+    127.0.0.1:9000) before the read phase finishes — and the reader
+    then gets EIO from juicefs trying and failing to fetch the chunk
+    back. If true, this would be an environment-specific symptom
+    (MinIO not at localhost) not a JM correctness bug, BUT it WAS the
+    same shape failure seen with the Swift JM in run #3 against the
+    LAN MinIO — so the hypothesis isn't airtight. Needs separate
+    investigation slice.
+  - Severity: MEDIUM-HIGH for fio-style scrubbing workloads;
+    in real-world media editing scrubs the workload pattern is
+    different (smaller iodepth, files already in JuiceFS cache
+    after first sequential read for playback).
+
+**Other observations from run #4:**
+  - 09-endurance: in-progress at the time of analysis. Samples
+    through 8/20 min show RSS DROPPING (188 MB → 128 MB) and zero
+    RPC errors — no leak.
+  - 10-control-plane: pending (after endurance).
+  - 08-netshape: skipped (no passwordless sudo for pfctl).
+
+Artifacts: /tmp/jm-qa-artifacts/20260517-191053/
+
 ### QA suite run 20260517-173656 (run #3, after fixes)
 
 **Final tally:** 61 PASS / 207 FAIL (mostly phantom from 2 × 99
