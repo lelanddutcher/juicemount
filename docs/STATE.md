@@ -304,6 +304,81 @@ JuiceMount's doesn't, the bug is in our panel config, not the mount.
 
 ---
 
+### QA-10 (2026-05-17, user QA) — no notification when auto-offline engages
+
+**Observed:** mount degraded silently mid-session. Backend
+connection dropped, auto-offline engaged at 13:44:02. The fail-
+safe worked correctly, but the user had no idea until they opened
+the popover and saw the offline toggle was on. They were copying
+files and continued working as if everything was normal.
+
+**Fix path:** the reachability monitor's `OnChange` callback in
+cbridge.go already fires when `auto_offline` flips. Wire it to
+NSUserNotification (opt-in via Preferences). Two events worth
+notifying on: false→true ("Network lost — JuiceMount switched to
+offline mode") and true→false ("Network restored").
+
+**Why this matters:** silent fail-safes feel like silent failures.
+The user kept clicking around expecting things to "just work,"
+unaware that writes were diverging from the backend's view of
+truth.
+
+### QA-11 (2026-05-17, user QA) — Start button silent no-op in .degraded state
+
+**Observed:** with mount in degraded state (FUSE down, Redis
+unreachable, auto-offline engaged), clicking the Start button in
+the popover produces no feedback — no toast, no error dialog, no
+state change. User reported it twice as "Start does nothing."
+
+**Root cause:** `ServerController.start()` has
+`guard case .idle = state else { return }`. The current state is
+`.degraded` (NFS server still listening; FUSE/Redis sick), which
+is not `.idle`, so the guard silently returns.
+
+**Fix path:** EITHER
+  (a) make Start tolerate .degraded by internally calling
+      `softStop` then `start` to fully re-init globals — risky
+      around the FUSE/juicefs respawn path; or
+  (b) disable the Start button visually when state ∉ .idle and
+      surface "Use Stop everything to fully reset" inline.
+
+(b) is the lower-risk slice. Ship it first; revisit (a) only if
+users complain about needing the extra click.
+
+### QA-12 (2026-05-17, user QA) — recently-cached-but-unpinned files unreadable when offline + FUSE down
+
+**Observed:** files copied to the mount "a few minutes ago" — so
+they're in JuiceFS chunk cache — fail to open after auto-offline
+engages and the JuiceFS daemon dies.
+
+**Reopened from QA-2 closure:** my earlier QA-2 investigation
+toggled offline manually while FUSE was healthy; pinned, cached,
+and fresh reads all worked correctly. That scenario is different
+from this one. Here:
+  - FUSE itself is DOWN (juicefs daemon died with the network drop)
+  - auto-offline is engaged
+  - The OPEN-time gate at `nfs/handler.go:745` refuses non-pinned
+    opens when offline BEFORE the read-time cache check at line
+    1044 ever runs.
+
+So even if `cacheReader` has the bytes locally, the kernel never
+gets a file handle.
+
+**Fix path:** at OpenFile, when `pin.IsOffline() && !isPinned`,
+probe whether `cacheReader` can serve the first block of the
+file before returning `ErrOfflineNotAvailable`. If cache has the
+bytes, allow the open; downstream `ReadAt` is already cache-
+priority-correct. Acceptance test: pin nothing, copy a 1 MB file,
+toggle auto-offline (or kill juicefs), confirm the file still
+opens.
+
+This is the most architecturally important of the three — it
+defeats the cache's value proposition for the "I just copied
+this" workflow, which is exactly what tier-1.7 was supposed to
+guarantee.
+
+---
+
 ### QA-7a (2026-05-17) — pin store fd leak after Stop — ⚠ landed-needs-validation 2026-05-17
 
 **Root cause (Loop A.11, iter 22, 2026-05-17 ~03:50):**
