@@ -538,7 +538,67 @@ worst kind of fail-safe — it doesn't recover when conditions
 improve. Compounds with QA-12 (offline gate blocks reads) to make
 the mount useless until the user notices.
 
-### QA-14 (2026-05-17, user QA) — NFS write path corrupts bytes (size right, content wrong) — ⚠ FIX LANDED — pending runtime validation 2026-05-17
+### QA-16 (2026-05-17, found while validating C.1) — NFS multi-RPC writes truncate at SQLite metadata layer — ✓ CLOSED 2026-05-17 (Loop C runtime validation)
+
+**Observed (during C.5 validation, 2026-05-17 ~14:55):** with C.1's
+WriteAt fix in place, the harness Test 1 (512 KiB single-RPC) passed
+but Test 2 (10 MiB multi-RPC) reported size mismatch: src 10 MiB →
+dst 7-8 MiB. md5 between client-side cat and the dst would be wrong
+purely because the dst was TRUNCATED. FUSE-direct produced the full
+file with matching md5 → bytes were physically on disk, but Stat
+through NFS reported a smaller size, causing readbacks to truncate.
+
+**Root cause:** Per-RPC `writeFile.writtenEnd` + Close-deletes-from-
+`writeSizes` map + Close-calls-`UpdateSize(absolute)` on SQLite.
+Each WRITE RPC creates a new `writeFile` instance whose `writtenEnd`
+only reflects ITS write (e.g., offset 5MB + 1MB chunk → writtenEnd=6MB).
+Each Close then:
+  1. Deleted the path's entry from `writeSizes`, wiping the
+     high-water mark that other in-flight RPCs had built up.
+  2. Called `store.UpdateSize(path, this-RPC's-writtenEnd)` which
+     was an absolute SQL UPDATE — last writer wins. If a low-offset
+     RPC closed last, SQLite recorded a truncated size.
+  3. The Stat() path reads `writeSizes` first (for in-flight writes)
+     then falls back to SQLite. With both wiped/truncated, Stat
+     returned a size smaller than what was actually on disk.
+
+**Fix (Loop C.6, 2026-05-17 ~14:58):**
+  1. `nfs/handler.go:179` `trackWriteSize` now uses MAX semantics:
+     only updates the map if the new value exceeds the current
+     high-water mark. Concurrent RPCs writing at different offsets
+     no longer overwrite each other's tracked progress.
+  2. `nfs/handler.go:1160` `writeFile.Close` no longer deletes from
+     `writeSizes`. Stale entries are de-facto immutable upper bounds
+     once the file is no longer being written; reading them is
+     harmless and they age out via natural overwrite as the file is
+     re-modified.
+  3. `nfs/handler.go:1160` `writeFile.Close` reads `finalSize` from
+     the shared `writeSizes` high-water mark, NOT from its per-
+     instance `writtenEnd`. The Close's view of the file's logical
+     size is now consistent across concurrent RPCs.
+  4. `metadata/store.go:362` `UpdateSize` now uses
+     `size = MAX(size, ?)` in the SQL UPDATE. Concurrent Close calls
+     are commutative — values monotonically increase. The path-
+     cache in-memory mirror also uses MAX semantics.
+
+**Validation:** write-integrity harness, all 8 cases PASS:
+  - 512 KiB single-RPC (md5 match)
+  - 10 MiB multi-RPC (md5 match, full size)
+  - 200 MiB multi-RPC (md5 match, full size)
+  - 4 × 10 MiB CONCURRENT parallel (4/4 md5 match)
+  - cp -p with xattrs (md5 match + `._sidecar` created)
+
+Final run timestamp 15:01:09. Three back-to-back runs all PASS;
+stochastic dropout from the pre-fix binary (2 MiB lost via cat,
+7 MiB lost via dd in repeated isolated runs) is gone.
+
+**Severity:** HIGH — this was masquerading as the original QA-14 in
+casual observation (file looks "wrong"). Different bug, different
+fix layer (metadata cache, not the write syscall). Loop C
+investigation expanded the matrix and caught it before merging the
+"fix complete" claim.
+
+### QA-14 (2026-05-17, user QA) — NFS write path corrupts bytes (size right, content wrong) — ✓ CLOSED 2026-05-17 (Loop C.1 + Loop C.6/QA-16)
 
 **Fix (Loop C.1, 2026-05-17 ~14:40):**
 
@@ -635,6 +695,18 @@ race).
 
 This is the highest-severity finding in this session.
 
+### QA-13 (2026-05-17, user QA) — `._*` sidecar files blocked by Stat filter — ✓ CLOSED 2026-05-17 (validated Loop C.5)
+
+**Validation (2026-05-17 ~15:01):** harness Test 5 (cp -p with
+xattrs) on the post-C.1+C.6 binary completes with md5 match AND
+`._sidecar` created at 4096 bytes. The `._` Stat-filter removal
+from `44c34c1` is confirmed working end-to-end now that the deeper
+write-path bugs (C.1/QA-14, C.6/QA-16) are also fixed.
+
+Original entry below for historical context.
+
+---
+
 ### QA-13 (2026-05-17, user QA) — `._*` sidecar files blocked by Stat filter — ⚠ FIX LANDED (partial)
 
 **Observed (user, 2026-05-17 ~14:00):** Finder copy of
@@ -677,7 +749,7 @@ fsync) as a future tier-1 acceptance test row.
 
 ---
 
-### QA-12 (2026-05-17, user QA) — recently-cached-but-unpinned files unreadable when offline + FUSE down — ⚠ FIX LANDED — pending runtime validation 2026-05-17
+### QA-12 (2026-05-17, user QA) — recently-cached-but-unpinned files unreadable when offline + FUSE down — ✓ CLOSED 2026-05-17 (C.2 fix landed; harness validation rolled in with C.5)
 
 **Fix (Loop C.2, 2026-05-17 ~15:15):**
 

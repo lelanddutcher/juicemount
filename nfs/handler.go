@@ -175,10 +175,18 @@ func (h *JuiceMountHandler) nextSyntheticInode() uint64 {
 	return h.inodeCounter.Add(1) | (1 << 63)
 }
 
-// trackWriteSize records the current written size for a file path.
+// trackWriteSize records the high-water mark of written size for a path.
+// QA-16 fix (2026-05-17): uses MAX semantics, not absolute set. Under
+// concurrent WRITE RPCs each writeFile instance reports the size after
+// ITS write. Without MAX, a late RPC writing at a low offset would
+// shrink the tracked size, even though earlier RPCs already wrote past
+// it. The tracked value is the file's logical size, not any individual
+// RPC's contribution — so it must only grow.
 func (h *JuiceMountHandler) trackWriteSize(path string, size int64) {
 	h.writeSizeMu.Lock()
-	h.writeSizes[path] = size
+	if cur, ok := h.writeSizes[path]; !ok || size > cur {
+		h.writeSizes[path] = size
+	}
 	h.writeSizeMu.Unlock()
 }
 
@@ -1158,7 +1166,6 @@ func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (f *writeFile) Close() error {
-	finalSize := f.writtenEnd
 	// Do NOT Sync() here — the go-nfs library calls OpenFile+Write+Close on
 	// every WRITE RPC, so syncing here would flush to MinIO on every RPC.
 	// Instead, rely on JuiceFS's writeback buffer and its own flush timing.
@@ -1174,12 +1181,33 @@ func (f *writeFile) Close() error {
 		f.handler.memBuf.Invalidate(f.name)
 	}
 
-	// Clean up write size tracking to prevent memory leak
+	// QA-16 fix (2026-05-17): use the HIGH-WATER mark from the shared
+	// writeSizes accumulator, NOT this RPC's per-instance writtenEnd.
+	// Under concurrent dispatch, each WRITE RPC has its own writeFile
+	// with its own writtenEnd that only reflects ITS write. A low-offset
+	// RPC closing last would have used a small writtenEnd here,
+	// truncating the SQLite-recorded size even though earlier RPCs
+	// wrote past it. The shared writeSizes map (updated MAX-wise by
+	// trackWriteSize) is the true logical size.
+	//
+	// We also do NOT delete the writeSizes entry on Close — under
+	// concurrent dispatch, another RPC may still be writing past this
+	// one's position. Stale entries are cleaned up lazily by the next
+	// Stat() comparing against SQLite, or could be aged out by a future
+	// sweep. The previous delete-on-close created a window where Stat()
+	// would briefly see no in-flight tracking and fall back to the old
+	// SQLite size.
 	f.handler.writeSizeMu.Lock()
-	delete(f.handler.writeSizes, f.name)
+	finalSize, ok := f.handler.writeSizes[f.name]
+	if !ok || f.writtenEnd > finalSize {
+		finalSize = f.writtenEnd
+		f.handler.writeSizes[f.name] = finalSize
+	}
 	f.handler.writeSizeMu.Unlock()
 
-	// Update SQLite with final size
+	// Update SQLite with the high-water size. UpdateSize itself uses
+	// MAX semantics (see metadata/store.go) so the order of concurrent
+	// Close() calls no longer matters — values monotonically increase.
 	now := time.Now()
 	if finalSize > 0 {
 		f.handler.store.UpdateSize(f.name, finalSize, now)

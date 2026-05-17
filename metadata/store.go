@@ -359,10 +359,25 @@ func (s *Store) bulkInsertBatch(batch []*Entry) error {
 }
 
 // UpdateSize updates the size and mtime for an entry identified by path.
+//
+// QA-16 fix (2026-05-17): MAX semantics on size. Under concurrent NFS
+// WRITE RPC dispatch, multiple writeFile.Close() calls land here for
+// the same path with each RPC's view of the in-flight high-water mark.
+// Without MAX, a Close that observes a stale (lower) value and runs
+// last would shrink the stored size, even though earlier RPCs already
+// wrote past it. SQLite's metadata then mis-reports the file as
+// smaller and NFS readbacks/stats are truncated. mtime is always
+// updated to the most-recent call so "newest modification wins" still
+// holds.
+//
+// Truncate(2) does not go through this code path (writeFile.Close is
+// the only caller); explicit size shrinks come from a SETATTR path
+// that resets the SQLite row directly. So MAX here is safe for the
+// real-world write workflow.
 func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error {
 	s.writeMu.Lock()
 	_, err := s.db.Exec(
-		`UPDATE entries SET size = ?, mtime = ? WHERE path = ?`,
+		`UPDATE entries SET size = MAX(size, ?), mtime = ? WHERE path = ?`,
 		size, mtime.Unix(), entryPath,
 	)
 	s.writeMu.Unlock()
@@ -373,7 +388,9 @@ func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error 
 
 	s.mu.Lock()
 	if e, ok := s.pathCache[entryPath]; ok {
-		e.Size = size
+		if size > e.Size {
+			e.Size = size
+		}
 		e.Mtime = mtime
 		e.PreSerializedGetAttr = nil // [JM5] invalidate cached XDR bytes
 	}
