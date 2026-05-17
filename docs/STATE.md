@@ -469,6 +469,75 @@ clicks Start in the menu bar, the harness can be invoked and is
 expected to FAIL on tests 2-5 (proving it detects QA-14). C.1 then
 proceeds with the fix, and the harness should PASS afterward.
 
+### QA-15 (2026-05-17, user-observed during Loop C wait) — reachability monitor doesn't recover when backend becomes reachable again
+
+**Observed (Loop C, 2026-05-17 ~14:35 → ~14:50):** auto-offline mode
+engaged at 14:35:15 with "probe failed 2x — backend unreachable".
+At 14:50 the user pointed out that the backend was actually fine —
+verified independently:
+  - `ping 192.168.0.210` (Redis host): 0.4ms RTT
+  - `nc -zv 192.168.0.210 6379`: 5/5 succeeds back-to-back
+  - `printf 'PING\r\nQUIT\r\n' | nc 192.168.0.210 6379`: `+PONG`
+  - juicefs container log: live operations against `juicefs-minio:9000`
+    (Docker-internal MinIO), including periodic metadata backups
+    (`backup metadata succeed, ... s3://juicefs-minio:9000/zpool/...`)
+  - SMB shares to 192.168.0.197 are mounted and serving
+
+Inside the JuiceMount Go process, `lsof` shows exactly ONE socket to
+Redis and it's in `CLOSED` state:
+
+```
+TCP 192.168.0.60:62997->192.168.0.210:6379 (CLOSED)
+```
+
+The reachability probe is supposed to dial every 2s with 1s timeout
+and a single success flips state back to reachable (per
+`health/reachability.go` defaults: failsToOffline=2,
+passesToOnline=1, baseInterval=2s). 15 minutes × 30 probes/min =
+~450 probe opportunities since the transition. None of them
+succeeded — yet external nc to the same target succeeds immediately.
+
+**Likely root causes (to investigate):**
+  1. **Goroutine death** — the reachability loop goroutine may have
+     panicked or deadlocked. The `applyResult` lock window is small,
+     but if a callback (cb in line 283) blocks forever, the next
+     probe never runs. `pin.SetAutoOffline` and `rc.TriggerSync` are
+     both called inline without a deadline.
+  2. **Source-address binding** — JuiceMount opened the socket from
+     `192.168.0.60` (en0 perhaps). If the user's Mac switched to a
+     different active interface (the juicefs container log shows
+     IPs 192.168.0.60 AND 192.168.0.216 in the host's interface
+     list — multi-homed), the in-process dialer might bind to a
+     no-longer-valid source IP. macOS would return `EHOSTUNREACH`
+     ("no route to host") for that specific source+dest pair while
+     external `nc` (which chooses freely) succeeds.
+  3. **Connection pool stuck** — the go-redis client at
+     `bridge/cbridge.go:295` holds a long-lived pool. If all its
+     pooled conns are in a half-dead state, the health endpoint's
+     PING uses the pool's broken conn and reports failure while
+     fresh dials succeed.
+
+**Where to investigate:**
+  - `health/reachability.go:196` (`loop()`) — confirm the goroutine
+    is alive. Add a heartbeat counter or stack-dump endpoint.
+  - `health/reachability.go:280-285` (callback fan-out) — wrap each
+    callback in a timeout / `go cb(...)` to prevent one callback
+    from parking the loop.
+  - `metadata/redis.go` Redis client construction — consider explicit
+    `Network: "tcp"` and `MaxRetries`/`PoolTimeout` settings; check
+    whether NetWatcher-style re-establish-on-interface-change exists.
+  - Add a `/debug/reachability` endpoint that returns
+    `{last_probe_at, last_probe_result, consecutive_fails,
+    socket_state}` so we can diagnose without lsof next time.
+
+**Workaround for now:** restart JuiceMount — fresh process gets a
+fresh dial from whatever interface is currently up.
+
+**Severity:** HIGH. Auto-offline that fails CLOSED forever is the
+worst kind of fail-safe — it doesn't recover when conditions
+improve. Compounds with QA-12 (offline gate blocks reads) to make
+the mount useless until the user notices.
+
 ### QA-14 (2026-05-17, user QA) — NFS write path corrupts bytes (size right, content wrong) — ⚠ FIX LANDED — pending runtime validation 2026-05-17
 
 **Fix (Loop C.1, 2026-05-17 ~14:40):**
