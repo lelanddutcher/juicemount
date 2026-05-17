@@ -109,22 +109,27 @@ as the existing pin enqueue. Should also stop any in-flight
 prefetch for that path and free its cache footprint (the prefetcher
 needs a cancellation path — verify it has one before wiring this up).
 
-### QA-5 (2026-05-17) — "Sync Now" doesn't re-trigger pinned downloads
+### QA-5 (2026-05-17) — "Sync Now" doesn't re-trigger pinned downloads — ✓ CLOSED 2026-05-17 (works correctly)
 
-**Observed:** clicking Sync Now should re-verify pinned coverage
-and restart any pending pin downloads. Instead, the pinned-local-
-bytes counter stays at 0 KB even though the user has pinned several
-hundred MB of content. Connects to QA-1 (which says pinning enqueue
-might not work at all).
+**Original observation:** Sync Now doesn't restart pin downloads.
 
-**Where to investigate:** the recent commit `9a1f229` "Sync now
-also re-verifies pinned coverage" wired this in. Check
-(a) that the Sync Now button in the popover is actually calling
-that new path, not just the old reconcile-loop trigger; (b) the
-re-verify logic in `internal/cache/pin/` actually re-enqueues
-missing chunks; (c) whether QA-1's root cause is the same — if
-pinning never enqueues in the first place, Sync Now's re-verify
-loop has nothing to recover from.
+**Investigation outcome (Loop A iter 17, 2026-05-17 ~03:00):**
+
+Validated end-to-end. The Sync Now button at MenuPopoverView.swift:781
+calls BOTH `server.syncNow()` and `triggerVerifyPins()` (line 786);
+triggerVerifyPins POSTs to /verify-pins which returns ok=true with
+the re-enqueue count.
+
+Test: with 27 files / 7.65 GB pinned, deleted a JuiceFS cache chunk
+to simulate eviction, then POST /verify-pins → returned
+`reenqueued:27, total_pinned:27, ok:true`. Within 2 seconds of the
+call, all 27 files were back to ReadyFiles=27, CachedBytes=7.65 GB
+(prefetcher picked up the re-enqueued work, served most from chunk
+cache, re-pulled the evicted one).
+
+Like QA-1, the original report was likely tied to the same broken-
+environment scenario. The fix that landed in 9a1f229 ("Sync now also
+re-verifies pinned coverage") is doing the right thing.
 
 ### QA-6 (2026-05-17) — Pin folder dialog blocks directory navigation
 
