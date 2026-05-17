@@ -15,6 +15,32 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### QA-9 (2026-05-17) — pin progress feels stuck at scale — ⚠ landed-needs-validation 2026-05-17
+
+**Fix (Loop A.9, iter 21, 2026-05-17 ~03:30):**
+
+Added a live MB/s rate readout to the popover cache row, displayed
+between "N pinned" and "X MB / Y MB" while PendingFiles > 0 and
+the measured rate is >= 0.5 MB/s. Computes the rate from successive
+CachedBytes samples at the existing 2s polling cadence — faster
+polling would just produce noisier numbers; the perception bug is
+solved by SHOWING activity, not sampling more often.
+
+State: `prevCachedBytes`, `prevCachedAt`, `pinRateMBps`. Reset to
+0 when nothing pending so a stale rate doesn't linger after a pin
+completes. Pure UI change — no bridge involvement.
+
+This is the perception-bug fix that the original QA-1 report
+actually wanted: at scale (whole-root pin), the popover used to
+look stuck at "0 B / 50 GB" for minutes while the prefetcher
+drained the queue. Now it shows "120 MB/s · 5 GB / 50 GB" so the
+user sees progress.
+
+Validation pending binary swap: user pins a 1+ GB folder, observes
+the blue "X MB/s" appear next to the byte counter while it climbs.
+
+---
+
 ### QA-1 (2026-05-17) — pinned folders not downloading — ✓ CLOSED 2026-05-17 (could not reproduce)
 
 **Original observation:** marking a folder as pinned does not cause
