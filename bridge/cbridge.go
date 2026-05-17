@@ -1005,17 +1005,8 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 	//
 	// Write size stays at 1 MiB — writes are sequential and the
 	// failure mode there is different.
-	// noappledouble (QA-13, 2026-05-17): without this, macOS Finder
-	// and cp(1) try to write `._filename` AppleDouble sidecars for
-	// extended-attribute storage on every copy. NFSv3 doesn't have
-	// native xattr support and the kernel's sidecar-create fallback
-	// is failing with EPERM on this mount — which crashes cp's
-	// copyfile(3) into a "rollback" that truncates the dest to 0
-	// bytes (and Finder shows error -36). noappledouble tells the
-	// kernel to silently no-op xattr ops on this volume, so copies
-	// don't try the AppleDouble dance at all.
 	opts := fmt.Sprintf(
-		"port=%s,mountport=%s,soft,intr,timeo=10,retrans=2,nolocks,locallocks,rsize=262144,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp,noappledouble",
+		"port=%s,mountport=%s,soft,intr,timeo=10,retrans=2,nolocks,locallocks,rsize=262144,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
 		port, port)
 
 	// [JM6] Two-tier mount strategy.

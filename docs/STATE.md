@@ -380,12 +380,66 @@ Recommend (b)+(c) for the first ship. (a) is appealing but the
 "call stop first, then start" sequencing is exactly the recovery
 flow that goes wrong elsewhere in the codebase.
 
-### QA-13 (2026-05-17, user QA) — copies fail / truncate to 0 bytes (xattr-EPERM cascade) — ⚠ FIX LANDED
+### QA-14 (2026-05-17, user QA) — NFS write path corrupts bytes (size right, content wrong)
+
+**Observed (validation of QA-13 fix, 2026-05-17 ~14:15):** with
+the `._` Stat-filter removed (QA-13 partial fix landed), AppleDouble
+sidecars create successfully — but a `cat 5MB > /Volumes/zpool/dst`
+produces a file with the correct SIZE (5 MB) and a STABLE but
+WRONG md5. The wrong md5 persists across `sync` and re-read.
+Same source written via FUSE-direct (bypassing NFS handler)
+produces correct md5.
+
+So writes are going through, files exist at the right size, but
+bytes are being SCRAMBLED somewhere in the NFS handler path.
+
+**Suspect:** `writeFile.Write(p)` at nfs/handler.go:1099 uses
+`f.File.Write(p)` — non-positional, relies on the fd's internal
+offset. Combined with:
+  - the FDPool that caches *os.File across WRITE RPCs (a single fd
+    is shared by every WRITE for that path)
+  - the concurrent-dispatch change from iter 1 (`691f550`) that
+    lets multiple RPCs run in parallel
+
+Two parallel WRITE RPCs on the same fd would race for the offset.
+The kernel-NFS-client sends WRITE_A at offset 0 and WRITE_B at
+offset 1MB simultaneously. Both call `f.File.Write(p)` which uses
+the fd's CURRENT position (shared). Bytes interleave wrong.
+
+The handler does expose `WriteAt(p, off)` (line 1112) which IS
+positional and correct. The bug is that the go-billy / go-nfs
+plumbing is calling `Write(p)` instead of `WriteAt(p, off)` for
+some path(s). Need to trace which billy.File method the NFS WRITE
+RPC handler invokes.
+
+**Fix path:** either
+  (a) make `writeFile.Write(p)` a no-op or panic so we discover
+      which caller uses it, then fix that caller to use WriteAt; or
+  (b) make `writeFile.Write(p)` thread-safe by Seek+Write under a
+      file-local mutex (heavy-handed, hides design issue); or
+  (c) audit the internal/nfs/nfs_onwrite.go path and confirm it
+      always calls WriteAt with the protocol-supplied offset.
+
+(c) is the right first step. If onwrite.go IS using WriteAt, then
+the bug is elsewhere — maybe in the fd pool's flag handling or in
+JuiceFS's writeback buffer.
+
+**Severity:** this defeats the entire write path for any non-trivial
+file. Users cannot reliably copy data to the mount via cp, Finder,
+or `cat >`. Only raw `dd` with bs=1M count=N seems to work, and
+even that may be coincidence (single-RPC writes don't expose the
+race).
+
+This is the highest-severity finding in this session.
+
+### QA-13 (2026-05-17, user QA) — `._*` sidecar files blocked by Stat filter — ⚠ FIX LANDED (partial)
 
 **Observed (user, 2026-05-17 ~14:00):** Finder copy of
 `LAD37451.mov` to `/Volumes/zpool` failed with error code -36
-("can't be read or written"). Investigating, this turned out to
-be a much broader bug:
+("can't be read or written"). Initial diagnosis identified a
+`._*` file blocking issue (this entry). Subsequent investigation
+revealed a SEPARATE deeper bug — see QA-14 above — that this fix
+alone does not address.
 
   - `cp /tmp/file /Volumes/zpool/dst` → dst is 0 bytes, cp exit 0
   - `cp -p` shows the smoking gun: "could not copy extended

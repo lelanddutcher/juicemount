@@ -478,12 +478,20 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 	}
 	filename = strings.TrimPrefix(filename, "/")
 
-	// Fast rejection for macOS resource fork and metadata patterns.
-	// These never exist on JuiceFS and would otherwise fall through to
-	// a slow FUSE stat. This eliminates ~1/3 of LOOKUPs from Finder.
+	// Fast rejection for macOS metadata patterns that never exist on
+	// JuiceFS. Eliminates ~1/3 of LOOKUPs from Finder.
+	//
+	// QA-13 (2026-05-17): `._*` AppleDouble sidecars REMOVED from
+	// this filter. The kernel's setxattr fallback creates `._filename`
+	// then immediately stat's it to confirm. With the filter, the
+	// post-create stat returned ENOENT — the kernel concluded the
+	// create had failed and reported EPERM/ENOENT back to userspace,
+	// which crashed copyfile(3) into a 0-byte truncation. cp and
+	// Finder both broke as a result. Let `._*` files round-trip
+	// normally; ReadDir keeps suppressing them from listings so they
+	// don't clutter Finder's view of user-facing files.
 	base := path.Base(filename)
-	if strings.HasPrefix(base, "._") ||
-		base == ".DS_Store" ||
+	if base == ".DS_Store" ||
 		base == ".Spotlight-V100" ||
 		base == ".Trashes" ||
 		base == ".fseventsd" ||

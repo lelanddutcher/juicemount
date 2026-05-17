@@ -287,12 +287,7 @@ func mountNFS(addr, mountPoint string) error {
 		return fmt.Errorf("invalid addr: %s", addr)
 	}
 
-	// noappledouble (QA-13): suppresses macOS AppleDouble sidecar
-	// dance for xattrs. Without it, cp(1) and Finder fail to copy
-	// files because setxattr → ._sidecar create returns EPERM and
-	// copyfile(3) truncates the dest to 0 bytes. See cbridge.go for
-	// the long version.
-	opts := fmt.Sprintf("port=%s,mountport=%s,soft,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp,noappledouble", port, port)
+	opts := fmt.Sprintf("port=%s,mountport=%s,soft,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp", port, port)
 	cmd := exec.Command("sudo", "mount_nfs", "-o", opts,
 		fmt.Sprintf("%s:/", host), mountPoint)
 
