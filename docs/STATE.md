@@ -608,9 +608,51 @@ fsync) as a future tier-1 acceptance test row.
 
 ---
 
-### QA-12 (2026-05-17, user QA) — recently-cached-but-unpinned files unreadable when offline + FUSE down
+### QA-12 (2026-05-17, user QA) — recently-cached-but-unpinned files unreadable when offline + FUSE down — ⚠ FIX LANDED — pending runtime validation 2026-05-17
 
-**Observed:** files copied to the mount "a few minutes ago" — so
+**Fix (Loop C.2, 2026-05-17 ~15:15):**
+
+Loosened the OpenFile offline gate in `nfs/handler.go` to probe the
+SSD cache before refusing. New helper `juiceFS.cacheProbeHit(e)`
+calls `cacheReader.ReadBlock(ctx, e.Inode, 0, scratch[:4096])` with
+a 200ms context timeout. On hit: open is allowed; downstream
+`cachedFile.ReadAt` (handler.go:1052) still enforces the per-read
+offline gate for cache misses, so the user-intent of offline mode
+(no surprise backend traffic) is preserved. On miss/timeout: refuse
+with `pin.ErrOfflineNotAvailable` as before.
+
+The probe uses the same code path as a normal read, so it has zero
+new state mutations beyond what the next read would do anyway
+(slice-cache warming, fd-pool entry).
+
+**Code-reviewer pass:** Approved after addressing two findings:
+  - HIGH: initial 50ms timeout was too tight — could false-refuse
+    a legitimately cached file on a cold APFS dir cache or slow
+    localhost Redis. Raised to 200ms (covers Redis localhost LRange
+    sub-ms warm/≤50ms loaded + APFS dir-cache miss ~10-40ms + a
+    4 KiB ReadAt). Tight enough that a hanging Redis can't stall
+    OpenFile but loose enough that a legitimately-cached file on a
+    sleepy system doesn't get false-refused.
+  - MEDIUM: refactored an initial `goto allowedOpen` label to an
+    extracted helper + early-return idiom. Eliminates the
+    maintenance trap where future code added between the return and
+    the label would silently skip initialization.
+
+**Adjacent scenarios (per Rule 3 — built only, runtime validation
+pending the backend coming back up):**
+  1. Pinned file, offline: opens (existing path, unaffected)
+  2. Cached + un-pinned file, offline: opens via probe hit (NEW)
+  3. Un-cached + un-pinned file, offline: refused with NXIO (existing)
+  4. Cached + un-pinned, offline, Redis hanging: 200ms refused (safe)
+  5. Cold-restart with cache populated, offline: depends on whether
+     slice-cache is warm (it's in-memory, lost on restart). With
+     hanging Redis: refused. With responsive Redis: opens. This is
+     a known limitation for QA-12; would need persistent slice
+     cache to fully solve. Out of scope for this slice.
+  6. Online (pin.IsOffline() == false): unchanged — no gate at all,
+     all opens proceed.
+
+**Original observation:** files copied to the mount "a few minutes ago" — so
 they're in JuiceFS chunk cache — fail to open after auto-offline
 engages and the JuiceFS daemon dies.
 
