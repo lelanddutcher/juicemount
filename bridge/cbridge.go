@@ -1963,6 +1963,15 @@ type SelfTestResult struct {
 	WriteOK    bool   `json:"write_ok"`
 	WriteMs    int64  `json:"write_ms"`
 	WriteHint  string `json:"write_hint,omitempty"`
+
+	// B.6 (2026-05-17): first-byte read latency in milliseconds.
+	// Distinct signal from MBPerSec — measures round-trip latency
+	// (FUSE → JuiceFS → metadata Redis → chunk fetch starts), not
+	// sustained throughput. High RTT + high MB/s = bursty cache hits
+	// after a slow first hop; low RTT + low MB/s = uniformly slow
+	// backend. UI surfaces both because each signal points at a
+	// different remediation.
+	FirstByteMs int64 `json:"first_byte_ms,omitempty"`
 }
 
 var (
@@ -2064,18 +2073,46 @@ func runSelfTest() SelfTestResult {
 	}
 	defer f.Close()
 
+	// B.6: time the FIRST chunk separately. Captures round-trip
+	// latency (how long until any byte comes back) — different
+	// signal from sustained throughput. The overall MB/s
+	// measurement still covers the full read including the first
+	// chunk, so the two metrics agree at the integral level even
+	// though FirstByteMs is reported separately.
 	buf := make([]byte, 256*1024) // 256 KiB read chunks; cheaper than one 10 MB alloc
 	var total int64
+	var firstByteMs int64
 	start := time.Now()
-	for total < selfTestSize {
+	firstN, firstErr := f.Read(buf)
+	firstByteMs = time.Since(start).Milliseconds()
+	if firstN > 0 {
+		total += int64(firstN)
+	}
+	if firstErr != nil && firstErr != io.EOF {
+		return SelfTestResult{
+			ElapsedMs:   time.Since(start).Milliseconds(),
+			BytesRead:   total,
+			Status:      "error",
+			Hint:        "self-test read failed: " + firstErr.Error(),
+			RanAt:       now,
+			Target:      target,
+			FirstByteMs: firstByteMs,
+		}
+	}
+	// If the first read already hit EOF (regular files can return data
+	// AND io.EOF in one call), don't re-enter the loop — it would
+	// spin returning (0, EOF) every iteration until probeDeadline,
+	// turning a tiny file into a 30s false-timeout.
+	for firstErr != io.EOF && total < selfTestSize {
 		if time.Now().After(probeDeadline) {
 			return SelfTestResult{
-				ElapsedMs: time.Since(start).Milliseconds(),
-				BytesRead: total,
-				Status:    "error",
-				Hint:      "self-test read exceeded 30 s wall-clock deadline",
-				RanAt:     now,
-				Target:    target,
+				ElapsedMs:   time.Since(start).Milliseconds(),
+				BytesRead:   total,
+				Status:      "error",
+				Hint:        "self-test read exceeded 30 s wall-clock deadline",
+				RanAt:       now,
+				Target:      target,
+				FirstByteMs: firstByteMs,
 			}
 		}
 		n, readErr := f.Read(buf)
@@ -2119,16 +2156,17 @@ func runSelfTest() SelfTestResult {
 	}
 
 	return SelfTestResult{
-		ElapsedMs: elapsed.Milliseconds(),
-		BytesRead: total,
-		MBPerSec:  mbps,
-		Status:    status,
-		Hint:      hint,
-		RanAt:     now,
-		Target:    target,
-		WriteOK:   writeOK,
-		WriteMs:   writeMs,
-		WriteHint: writeHint,
+		ElapsedMs:   elapsed.Milliseconds(),
+		BytesRead:   total,
+		MBPerSec:    mbps,
+		Status:      status,
+		Hint:        hint,
+		RanAt:       now,
+		Target:      target,
+		WriteOK:     writeOK,
+		WriteMs:     writeMs,
+		WriteHint:   writeHint,
+		FirstByteMs: firstByteMs,
 	}
 }
 
