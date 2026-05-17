@@ -9,6 +9,60 @@ unblocked item is.
 
 ---
 
+## QA findings (pending investigation)
+
+User-reported issues from live use, not yet diagnosed or assigned to
+an iteration. These should be triaged before tier-1 advances —
+they're real-world correctness signals that synthetic harnesses miss.
+
+### QA-1 (2026-05-17) — pinned folders not downloading
+
+**Observed:** marking a folder as pinned does not cause its bytes to
+download to the local cache.
+
+**Reporter:** user, manual test.
+**Where to investigate:** `internal/cache/pin/prefetcher.go` —
+specifically `workerLoop` and the pin-enqueue path. Worth checking:
+(a) does pinning enqueue work at all? (b) is the prefetcher worker
+goroutine alive? (c) is the work it produces being silently rejected
+by MinIO (auth / network)?
+**Repro hint:** mount up, pick a folder, "Pin for Offline" from the
+UI, watch `internal/cache/pin/` activity in juicemount.log and
+/metrics. Expected: pin-progress metric climbs.
+
+### QA-2 (2026-05-17) — offline toggle blocks cached files
+
+**Observed:** toggling offline in the app lets navigation continue
+(good — directory listings work), but files the user JUST opened or
+copied to the JuiceMount become unreadable in offline mode. Those
+files should still be in the local JuiceFS chunk cache and therefore
+readable even when the network path to MinIO is blocked.
+
+**Reporter:** user, manual test.
+**Hypothesis (user):** the offline gate may be returning fail-fast
+on EVERY non-pinned read, not just reads that would miss the cache
+— effectively treating the cache as if it didn't exist when offline.
+**Where to investigate:** the offline gate in
+`internal/nfs/nfs_on_read.go` and `nfs_on_lookup.go`, plus how it
+interacts with `cache.Reader`'s in-flight + recently-cached chunk
+state. The fail-fast sentinel `pin.ErrOfflineNotAvailable` was added
+in `54b744b` for the un-pinned-when-offline-disconnected case; it
+may be firing too eagerly, ignoring that the data is actually
+present in JuiceFS's chunk cache or in JuiceMount's MemoryBuffer.
+**Repro hint:** mount up online, open a small file (gets cached),
+toggle offline via the menu bar, try to open the same file again.
+Expected: opens from cache. Observed: fails.
+
+**Why this matters:** if confirmed, offline mode is defeating its
+own value proposition — the whole point of having a local cache is
+that recently-touched files survive a network drop. The tier-1.7
+acceptance test ("pinned files keep working when network drops") is
+✓ validated for PINNED files, but does NOT exercise the cached-but-
+unpinned case. The acceptance test may need to be tightened, AND
+the gate logic may need to be fixed.
+
+---
+
 ## Active tier: Tier 1 — Stability
 
 Acceptance tests (from `docs/VISION.md`):
