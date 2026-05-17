@@ -365,6 +365,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/cache-status": handleCacheStatusHTTP,
 			"/offline":      handleOfflineHTTP,
 			"/reclaim":      handleReclaimHTTP,
+			// Clears the on-disk JuiceFS chunk cache. POST-only.
+			// Optional ?keep-pinned=true reissues a verify-pins after
+			// the clear so pinned content immediately starts re-caching.
+			// Returns bytes_freed + files_removed. Destructive but safe
+			// — chunks are immutable, in-flight reads via open fds keep
+			// working, next access just misses and refetches.
+			"/cache-clear": handleCacheClearHTTP,
 			"/verify-pins":  handleVerifyPinsHTTP,
 			// In-app rescue when the kernel mount table is wedged. Runs the
 			// privileged `umount -f -t nfs` via AppleScript; user enters
@@ -1675,6 +1682,132 @@ func handleReclaimHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, `{"ok":true,"freed_bytes":%d,"freed_gb":%.2f}`,
 		freed, float64(freed)/(1<<30))
+}
+
+// cacheClearInProgress gates concurrent /cache-clear POSTs. Without
+// it, two simultaneous calls would each walk the chunks tree and
+// each spawn a VerifyAndRepair goroutine — double-marking every
+// pinned file Pending, which doubles the re-download bandwidth on
+// the next prefetcher pass. atomic.Bool matches the /stop pattern.
+var cacheClearInProgress atomic.Bool
+
+// handleCacheClearHTTP — POST /cache-clear[?keep-pinned=true]
+//
+// Walks the JuiceFS chunk cache (~/.juicefs/cache/{uuid}/raw/chunks/)
+// and removes every chunk file. Reports bytes freed and files removed.
+// Returns 405 on non-POST.
+//
+// SAFETY: chunks are immutable content-addressed blobs. Removing one
+// while JuiceFS has an open fd to it is benign (Unix fd semantics —
+// the fd keeps the inode alive until close). New chunk requests after
+// the rm will miss and refetch from MinIO. Worst case is a brief
+// cache-miss spike on next access, no data loss.
+//
+// keep-pinned=true: after clearing, issue an internal verify-pins so
+// pinned content immediately starts re-downloading. Pinned files are
+// chunk-cached too, so without this they would be evicted along with
+// everything else — defeating the pinned-for-offline contract until
+// the next user action.
+func handleCacheClearHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	if !cacheClearInProgress.CompareAndSwap(false, true) {
+		w.WriteHeader(http.StatusConflict)
+		fmt.Fprint(w, `{"ok":false,"error":"cache-clear already in progress"}`)
+		return
+	}
+	defer cacheClearInProgress.Store(false)
+
+	keepPinned := r.URL.Query().Get("keep-pinned") == "true"
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		w.WriteHeader(500)
+		fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+		return
+	}
+	cacheBase := filepath.Join(home, ".juicefs", "cache")
+
+	// Walk every UUID's chunks dir under cacheBase. There's usually one
+	// UUID per JuiceFS volume; supporting many is robust against future
+	// multi-volume setups.
+	var bytesFreed int64
+	var filesRemoved int64
+	entries, err := os.ReadDir(cacheBase)
+	if err != nil {
+		w.WriteHeader(500)
+		fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		chunksDir := filepath.Join(cacheBase, e.Name(), "raw", "chunks")
+		// If the chunks dir doesn't exist (no JuiceFS writes yet, or
+		// alternate layout), filepath.Walk returns an error at the
+		// top level. ENOENT is benign; anything else is a real
+		// problem and needs to be visible.
+		walkErr := filepath.Walk(chunksDir, func(p string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				// Per-entry error (e.g. file deleted under us) — skip
+				// the entry but keep walking the rest of the tree.
+				return nil
+			}
+			if info.IsDir() {
+				return nil
+			}
+			sz := info.Size()
+			if rmErr := os.Remove(p); rmErr == nil {
+				bytesFreed += sz
+				filesRemoved++
+			} else if !os.IsNotExist(rmErr) {
+				// EPERM/EACCES on a chunk would otherwise be invisible.
+				jmlog.Warn("cache-clear: failed to remove chunk",
+					"path", p, "error", rmErr.Error())
+			}
+			return nil
+		})
+		if walkErr != nil && !os.IsNotExist(walkErr) {
+			jmlog.Warn("cache-clear: walk failed for chunks dir",
+				"dir", chunksDir, "error", walkErr.Error())
+		}
+	}
+
+	jmlog.Info("handleCacheClearHTTP: cleared JuiceFS chunk cache",
+		"files_removed", filesRemoved,
+		"bytes_freed", bytesFreed,
+		"keep_pinned", keepPinned,
+		"remote", r.RemoteAddr)
+
+	// Optionally re-trigger pin coverage verification so pinned content
+	// starts re-caching immediately. Fire-and-forget on the prefetcher
+	// since the actual re-download happens later in the worker loop
+	// (driven by PullPending). VerifyAndRepair itself just marks rows
+	// Pending; that part completes in milliseconds. We bound it at 30s
+	// as a safety belt and tie cancellation to globalPinCtx so it
+	// dies cleanly on server shutdown rather than orphaning the
+	// goroutine.
+	reverify := false
+	if keepPinned && globalPrefetcher != nil {
+		go func() {
+			pinCtx := globalPinCtx()
+			ctx, cancel := context.WithTimeout(pinCtx.(context.Context), 30*time.Second)
+			defer cancel()
+			if _, err := globalPrefetcher.VerifyAndRepair(ctx); err != nil {
+				jmlog.Warn("cache-clear keep-pinned: verify-pins failed", "error", err.Error())
+			}
+		}()
+		reverify = true
+	}
+
+	fmt.Fprintf(w, `{"ok":true,"files_removed":%d,"bytes_freed":%d,"bytes_freed_gb":%.2f,"keep_pinned":%t,"pin_reverify_triggered":%t}`,
+		filesRemoved, bytesFreed, float64(bytesFreed)/(1<<30), keepPinned, reverify)
 }
 
 func handleOfflineHTTP(w http.ResponseWriter, r *http.Request) {

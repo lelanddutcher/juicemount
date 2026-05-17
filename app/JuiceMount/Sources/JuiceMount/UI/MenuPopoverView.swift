@@ -20,6 +20,7 @@ struct MenuPopoverView: View {
     @State private var diskImportantGB: Double = 0
     @State private var diskTotalGB: Double = 0
     @State private var reclaimBusy = false
+    @State private var cacheClearBusy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -121,8 +122,10 @@ struct MenuPopoverView: View {
                     .controlSize(.mini)
                     .disabled(reclaimBusy)
                     .help("Thin Time Machine local snapshots and other purgeable space so JuiceFS can use it for cache.")
+                    cacheClearButton
                 } else {
                     Spacer()
+                    cacheClearButton
                 }
             }
 
@@ -217,6 +220,46 @@ struct MenuPopoverView: View {
                               message: "macOS reports purgeable space, but tmutil couldn't free any. The reclaimable space may be in iCloud Drive or system caches that the system manages on its own under disk pressure.")
                 } else {
                     NSLog("[JuiceMount] Reclaimed %.1f GB", freedGB)
+                }
+            }
+        }
+    }
+
+    /// Calls /cache-clear on the local control plane with
+    /// keep-pinned=true so pinned content immediately starts
+    /// re-downloading rather than evicting along with everything else.
+    /// Fire-and-forget on the prefetcher side; user sees progress in
+    /// the cache stats row tick down to zero then back up.
+    private func triggerClearCache() {
+        cacheClearBusy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let url = URL(string: "http://127.0.0.1:11050/cache-clear?keep-pinned=true")!
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            let sem = DispatchSemaphore(value: 0)
+            var freedGB: Double = 0
+            var filesRemoved: Int = 0
+            var errMsg: String?
+            URLSession.shared.dataTask(with: req) { data, _, err in
+                defer { sem.signal() }
+                if let err = err { errMsg = err.localizedDescription; return }
+                guard let data = data,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { return }
+                if let f = obj["bytes_freed_gb"] as? Double { freedGB = f }
+                if let n = obj["files_removed"] as? Int { filesRemoved = n }
+                if let e = obj["error"] as? String { errMsg = e }
+            }.resume()
+            sem.wait()
+            DispatchQueue.main.async {
+                cacheClearBusy = false
+                refreshDiskSpace()
+                refreshCacheStatus()
+                if let errMsg = errMsg {
+                    showAlert(title: "Clear cache failed", message: errMsg)
+                } else {
+                    NSLog("[JuiceMount] Cleared %d chunks, freed %.1f GB; pinned content re-queueing",
+                          filesRemoved, freedGB)
                 }
             }
         }
@@ -518,6 +561,22 @@ struct MenuPopoverView: View {
         alert.informativeText = message
         alert.alertStyle = .informational
         alert.runModal()
+    }
+
+    @ViewBuilder
+    private var cacheClearButton: some View {
+        Button {
+            triggerClearCache()
+        } label: {
+            if cacheClearBusy {
+                ProgressView().controlSize(.small)
+            } else {
+                Text("Clear Cache").font(.caption2)
+            }
+        }
+        .controlSize(.mini)
+        .disabled(cacheClearBusy)
+        .help("Empty the JuiceFS chunk cache. Pinned folders re-download immediately; other content downloads on next access.")
     }
 
     private var offlineToggle: some View {
