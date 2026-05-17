@@ -16,7 +16,7 @@ Acceptance tests (from `docs/VISION.md`):
 | # | Test | Status |
 |---|---|---|
 | 1.1 | Concurrent per-connection NFS dispatch (Finder browses while a long Read is in flight) | ⚠ landed in `691f550`; **prior validation invalidated by `f944a82` build-staleness bug; needs re-validation against the fresh binary** |
-| 1.2 | No Finder freeze on any wedged backend | ⚠ MinIO-wedge harness shipped in iter 9 (`scripts/wedge-tests/minio-down-mid-read.sh`); 3 runs pass with adjacent-stat max 27-37ms during pf-block, read-to-EOF-error 1.2-4.3s. FUSE-hang + NFS-mid-shutdown harnesses still TBD |
+| 1.2 | No Finder freeze on any wedged backend | ⚠ 2 of 3 iter-B wedge harnesses shipped (`minio-down-mid-read` iter 9, `fuse-hang-mid-op` iter 10); both pass with adjacent-stat max <40ms during wedge. NFS-loopback-mid-shutdown harness still TBD |
 | 1.3 | Clean unmount in every state | ✓ likely (ordered shutdown + Force Eject landed) — needs real validation |
 | 1.4 | Crash-safe metadata (kill -9 → mountable in <5s) | ⚠ test tooling shipped in `5ec1a33`; real run pending |
 | 1.5 | Recovery diagnostics (Export Diagnostics zip) | ✓ landed in Phase B |
@@ -381,6 +381,70 @@ re-validation. If not: I'll stop the loop after this iteration with
 a PushNotification — eight iterations of tooling on a stale binary
 is the point where continued autonomous work has negative marginal
 value.
+
+### Iteration 10 — 2026-05-17
+
+**Tier:** 1 (Stability).
+**Picked:** tier-1.2 iter-B sub-slice 2 — FUSE-hang-mid-op wedge harness.
+
+**Shipped (commit pending):**
+- `scripts/wedge-tests/fuse-hang-mid-op.sh`: SIGSTOP's all juicefs
+  processes matching `juicefs mount.*fuse-internal` (the JuiceMount-
+  managed FUSE backend), then in parallel measures:
+  - Fresh-path stat (forces FUSE traversal — handler can't satisfy
+    from metadata.Store cache, must go through wedged FUSE) → must
+    return within `--fuse-timeout` (default 4s).
+  - Cached-path stats (mount root, served from metadata.Store) →
+    must stay under `--stat-budget-ms` (default 500ms). The "Finder
+    doesn't beachball even while FUSE is wedged" proxy.
+  - Post-SIGCONT recovery stat → must succeed within `--recover-budget`
+    (default 5s).
+
+  Trap-EXIT/INT/TERM SIGCONTs unconditionally; only SIGKILL of the
+  script itself leaves a wedged mount (documented with manual recovery).
+
+**Validated:** 4 consecutive runs against the live mount:
+  - run 1: fresh=0.70s, cached_max=27ms (8 probes), recovery=0.02s — PASS
+  - run 2: fresh=0.70s, cached_max=26ms, recovery=0.17s — PASS
+  - run 3: fresh=0.94s, cached_max=27ms, recovery=0.02s — PASS
+  - run 4 (post-fix): fresh=0.68s, cached_max=30ms, recovery=0.02s — PASS
+
+  Fresh-stat consistently returns in 0.7-1.0s, well under the
+  handler's internal 2s Lstat timeout. Reason: the NFS client mounts
+  `soft` with `timeo=1s`, so the kernel surrenders before the handler
+  deadline fires. Same user-facing outcome, different cause —
+  documented inline so future readers don't conclude the handler
+  timeout is broken.
+
+**Code-reviewer pass:** 2 HIGH + 1 MEDIUM addressed:
+  - HIGH-1: TOCTOU between PID discovery and SIGSTOP. Fix: re-discover
+    PIDs immediately before SIGSTOP, abort if set changed.
+  - HIGH-2: `set -e` would abort mid-wedge if any SIGSTOP target died
+    between cross-check and kill, producing uninterpretable exit
+    code. Fix: guard each kill with `|| { log "WARN"; }` and continue.
+  - MEDIUM: NFS-soft-mount-timeout-vs-handler-timeout explanation
+    documented inline at the fresh-stat measurement.
+
+  1 MEDIUM deferred (multi-instance PID-pattern false positive —
+  not relevant single-instance dev setup, would matter for CI hosts
+  running multiple JuiceMount profiles simultaneously).
+
+**Tier-1.2 status:** advances from "MinIO-wedge shipped; FUSE-hang +
+NFS-mid-shutdown harnesses still TBD" to "2 of 3 wedge harnesses
+shipped; NFS-loopback-mid-shutdown still TBD." One scenario left
+before 1.2 ✓ validated.
+
+**Broken:** nothing.
+
+**Next:** iteration 11 picks the third and final wedge scenario —
+`scripts/wedge-tests/nfs-loopback-mid-shutdown.sh` (trigger Stop
+while a 5GB read is in flight, expect read errors cleanly and
+unmount succeeds without kernel mount-table residue). This one
+touches mount lifecycle directly so the test requires triggering
+JuiceMount Stop programmatically — likely via the admin API or by
+killing the JuiceMount process and observing macOS's mount table.
+
+---
 
 ### Iteration 9 — 2026-05-17
 
