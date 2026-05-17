@@ -21,9 +21,9 @@ Acceptance tests (from `docs/VISION.md`):
 | 1.4 | Crash-safe metadata (kill -9 → mountable in <5s) | ⚠ test tooling shipped in `5ec1a33`; real run pending |
 | 1.5 | Recovery diagnostics (Export Diagnostics zip) | ✓ landed in Phase B |
 | 1.6 | Stress test harness (24h CI run) | ⚠ scaffold landed in `74a9739`; 24h soak run pending |
-| 1.7 | Walk-out: pinned files keep working when network drops | ⚠ wired in `54b744b` + UI in `68e2ffb`; pending real Wi-Fi disconnect |
-| 1.8 | Auto-engage offline mode within 5s of route loss | ⚠ wired in `10607ab` + UI in `68e2ffb`; menu-bar blue dot fires when `offlineState.offline==true`; pending real disconnect timing |
-| 1.9 | Auto-recover offline mode within 30s of route return | ⚠ wired in `10607ab` + UI in `68e2ffb`; pending real reconnect timing |
+| 1.7 | Walk-out: pinned files keep working when network drops | ✓ validated 2026-05-16 23:21 via pfctl harness: un-pinned stat refused in 0.02s (budget 2s) |
+| 1.8 | Auto-engage offline mode within 5s of route loss | ✓ validated 2026-05-16 23:21 via pfctl harness: auto_offline=true in 3.28s (budget 5s) |
+| 1.9 | Auto-recover offline mode within 30s of route return | ✓ validated 2026-05-16 23:21 via pfctl harness: auto_offline=false in 0.77s (budget 30s) |
 | 1.10 | Network errors classified as network (not "Redis degraded") | ✓ landed in `e8aa5cb`; validated 2026-05-16 15:27-15:30 — three real "no route to host" events all logged with new `network path to backend lost` / `kind: network_path` shape |
 
 **Tier-1 cannot be declared "production-ready" until all six pass.**
