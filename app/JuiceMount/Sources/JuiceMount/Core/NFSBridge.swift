@@ -341,6 +341,16 @@ public enum NFSBridge {
         NFSServerShutdown()
     }
 
+    /// Middle-ground stop (QA-7, 2026-05-17): unmounts NFS so the
+    /// /Volumes/<name> path disappears from the user's view, then tears
+    /// down the NFS server + metadata + caches + metrics. Leaves FUSE
+    /// and the JuiceFS daemon alive so the subsequent Start avoids the
+    /// admin password re-prompt for re-mount. Wired to the "Stop mount
+    /// and finish sync" menu item.
+    public static func stopMount() {
+        NFSServerStopMount()
+    }
+
     public static var isRunning: Bool {
         NFSServerIsRunning() != 0
     }

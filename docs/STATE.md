@@ -326,7 +326,49 @@ holding pin.db open via a different code path. Inspect with
 3. Move pin.db/pin.db-shm/pin.db-wal to backups/
 4. Re-open JuiceMount.app — pin store recreates empty
 
-### QA-7 (2026-05-17) — Stop button doesn't fully stop JuiceMount
+### QA-7 (2026-05-17) — Stop button doesn't fully stop JuiceMount — ⚠ landed-needs-validation 2026-05-17
+
+**Fix (Loop A.10, iter 21, 2026-05-17 ~03:30):** user-approved
+two-button design (AskUserQuestion → user picked "rename + add"):
+
+- "Stop mount and finish sync" (new orange pause-icon button):
+  unmounts NFS so /Volumes/<name> disappears, tears down NFS server
+  + metadata + caches + metrics, but DELIBERATELY leaves FUSE +
+  JuiceFS daemon alive. Next Start reuses the existing mount — no
+  admin-password re-prompt.
+
+- "Stop everything" (red stop-icon button, with confirmation
+  dialog): full teardown via NFSServerShutdown — also unmounts FUSE
+  and kills JuiceFS daemons.
+
+Implementation: new cgo export NFSServerStopMount in bridge/cbridge.go,
+NFSBridge.stopMount() Swift wrapper, ServerController.stopMount() —
+all mirror existing stop()/NFSServerShutdown plumbing for
+consistency. Confirm dialog on "Stop everything" prevents mis-taps
+mid-ingest. Defensive fix added to NFSServerStart: if globalFUSE is
+non-nil but fuseLooksHealthy rejects it (the post-stopMount edge
+case), stop the old FUSEManager before overwriting — prevents
+monitor-goroutine leak.
+
+Verify-build manifest gained main.NFSServerStopMount + main.handleCacheClearHTTP
+so future staleness on these landing fixes is detectable.
+
+Code-reviewer pass: 1 HIGH (FUSEManager double-mount risk on Start
+after stopMount) fixed defensively; 1 HIGH (double-click start race)
+deferred as it matches existing stop() behavior, not a regression;
+1 MEDIUM (no confirm on destructive button) addressed with
+SwiftUI .confirmationDialog; 1 MEDIUM (FUSEPath stale on config
+change) deferred — config changes are rare and would need a fuller
+Start refactor.
+
+Validation pending binary swap: user reopens, sees TWO stop
+buttons, exercises both, verifies the orange one keeps FUSE alive
+for fast restart and the red one fully tears down with confirm
+dialog.
+
+---
+
+### QA-7 (original report, 2026-05-17) — Stop button doesn't fully stop JuiceMount
 
 **Observed:** clicking Stop in the menu bar ends the NFS share but
 leaves JuiceFS and the JuiceMount background processes running.

@@ -96,6 +96,8 @@ declare -a FIXES=(
     "pin.ErrOfflineNotAvailable|Offline fail-fast sentinel for handler (54b744b, 2026-05-16)"
     "main.handleStopHTTP|POST /stop admin endpoint (ba47621, 2026-05-17)"
     "main.stopInProgress|/stop concurrent-POST gate (same commit)"
+    "main.NFSServerStopMount|Middle-ground stop semantic for QA-7 (2026-05-17)"
+    "main.handleCacheClearHTTP|POST /cache-clear admin endpoint for QA-3 (d09be09, 2026-05-17)"
 )
 
 FAILURES=0

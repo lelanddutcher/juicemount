@@ -3,6 +3,10 @@
 # silently un-tracking the headless CLI source. Anchor to repo root.)
 /jm5
 /juicemount
+# Loop-A test tools, built+copied to repo root for convenience
+/jmstress
+/jmcompare
+/jmwatch
 *.a
 *.dylib
 *.so
@@ -25,6 +29,7 @@
 /build/*.a
 /build/*.h
 /build/JuiceMount.app/
+/build/AppIcon.iconset/
 app/JuiceMount/.build/
 
 # SQLite databases (local state, not code)

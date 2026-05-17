@@ -113,6 +113,24 @@ public final class ServerController {
         }
     }
 
+    /// Middle-ground stop (QA-7, 2026-05-17): unmount NFS + tear down
+    /// the server, but leave FUSE/JuiceFS alive so the subsequent
+    /// Start avoids the admin-password re-prompt. /Volumes/<name>
+    /// disappears from Finder; the backend stays warm.
+    public func stopMount(completion: (@MainActor () -> Void)? = nil) {
+        log.info("Stopping mount + draining sync (FUSE stays alive)")
+        pollTask?.cancel()
+        pollTask = nil
+        workQueue.async { [weak self] in
+            NFSBridge.stopMount()
+            Task { @MainActor in
+                self?.state = .idle
+                self?.stats = .zero
+                completion?()
+            }
+        }
+    }
+
     /// Internal soft-stop used by `restart()`. Leaves FUSE + NFS mounted so
     /// the subsequent start is fast and prompt-free. Not exposed in the UI
     /// — the user-facing Stop button uses the hard `stop()` above.
