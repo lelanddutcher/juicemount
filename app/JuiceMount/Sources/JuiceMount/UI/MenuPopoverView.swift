@@ -611,9 +611,18 @@ struct MenuPopoverView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else if result.mb_per_sec > 0 {
-                    Text("Self-test: \(String(format: "%.0f", result.mb_per_sec)) MB/s")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    // B.6: show first-byte RTT alongside MB/s when
+                    // available. RTT is a distinct signal (round-trip
+                    // latency) from throughput (sustained transfer).
+                    if result.first_byte_ms > 0 {
+                        Text("Self-test: \(String(format: "%.0f", result.mb_per_sec)) MB/s · \(result.first_byte_ms)ms RTT")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Self-test: \(String(format: "%.0f", result.mb_per_sec)) MB/s")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 } else {
                     Text("Self-test: pending")
                         .font(.caption2)

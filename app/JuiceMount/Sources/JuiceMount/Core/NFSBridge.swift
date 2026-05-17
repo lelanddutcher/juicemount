@@ -229,6 +229,13 @@ public enum NFSBridge {
         public var write_ms: Int64 = 0
         public var write_hint: String = ""
 
+        /// B.6 (2026-05-17): first-byte read latency in milliseconds.
+        /// Round-trip signal distinct from mb_per_sec — high
+        /// first-byte-ms + high MB/s = cold cache hit after a slow
+        /// metadata hop; low both = uniformly slow backend. Popover
+        /// surfaces both alongside each other.
+        public var first_byte_ms: Int64 = 0
+
         /// True when the result represents something the user might care to
         /// see surfaced on the icon (anything not green, including errors).
         /// "pending" (no run yet — placeholder served while Go's background
