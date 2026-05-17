@@ -16,7 +16,7 @@ Acceptance tests (from `docs/VISION.md`):
 | # | Test | Status |
 |---|---|---|
 | 1.1 | Concurrent per-connection NFS dispatch (Finder browses while a long Read is in flight) | ⚠ landed in `691f550`; **prior validation invalidated by `f944a82` build-staleness bug; needs re-validation against the fresh binary** |
-| 1.2 | No Finder freeze on any wedged backend | ⚠ partial — many vectors closed, full validation TBD |
+| 1.2 | No Finder freeze on any wedged backend | ⚠ MinIO-wedge harness shipped in iter 9 (`scripts/wedge-tests/minio-down-mid-read.sh`); 3 runs pass with adjacent-stat max 27-37ms during pf-block, read-to-EOF-error 1.2-4.3s. FUSE-hang + NFS-mid-shutdown harnesses still TBD |
 | 1.3 | Clean unmount in every state | ✓ likely (ordered shutdown + Force Eject landed) — needs real validation |
 | 1.4 | Crash-safe metadata (kill -9 → mountable in <5s) | ⚠ test tooling shipped in `5ec1a33`; real run pending |
 | 1.5 | Recovery diagnostics (Export Diagnostics zip) | ✓ landed in Phase B |
@@ -381,6 +381,75 @@ re-validation. If not: I'll stop the loop after this iteration with
 a PushNotification — eight iterations of tooling on a stale binary
 is the point where continued autonomous work has negative marginal
 value.
+
+### Iteration 9 — 2026-05-17
+
+**Tier:** 1 (Stability).
+**Picked:** tier-1.2 iter-B sub-slice 1 — first wedge-test script (MinIO
+down mid-read). The active loop resumed against a fresh-binary mount
+(PID 42644, verified via `scripts/verify-build.sh --running`), unblocking
+real wedge-injection testing.
+
+**Shipped (commit pending):**
+- `scripts/wedge-tests/minio-down-mid-read.sh`: pfctl-based harness that
+  starts a streaming `cat` of an auto-rotated 1GB+ probe file, mid-read
+  engages a pf block on the MinIO endpoint (default `192.168.0.212:9000`)
+  via a dedicated sub-anchor (`com.apple/251.JuiceMountWedge`, distinct
+  from the offline-resilience harness's 250 anchor), then in parallel
+  measures (a) how long until the streaming read errors, (b) how long
+  adjacent stats on the mount root take during the wedge.
+
+  Verdict logic:
+    HARD FAIL if cat wedges past `--max-wait` (default 10s) OR adjacent
+      stat max exceeds `--stat-budget-ms` (default 500ms) — the real
+      "Finder would beachball" signal.
+    WARN if read-to-EOF-error exceeds `--read-budget` (default 5s) but
+      the test otherwise passes — cat drains the JuiceFS prefetch buffer
+      before erroring, so it's strictly conservative vs the Finder
+      experience (which issues small reads, sees the first error sooner).
+    INCONCLUSIVE if cat exits 0 (probe was cached); rotation cache
+      `/tmp/jmwedge-last-probe` reduces but doesn't eliminate this.
+
+  Trap-EXIT cleanup releases the pf anchor on every termination path
+  except external SIGKILL (documented in help text with manual recovery).
+
+**Validated:** 4 consecutive runs against the live mount:
+  - run 1 (2.3GB cold): read-error 4.25s, stat max 27ms over 15 probes — PASS
+  - run 2 (same probe, partial cache): read-error 1.16s, stat max 32ms — PASS
+  - run 3 (rotated probe): read-error 1.73s, stat max 28ms — PASS
+  - run 4 (rotated probe): read-error 2.04s, stat max 37ms — PASS
+  Stat-side proxy (the canonical "no beachball" check) sat at 27-37ms
+  across all runs — order of magnitude below the 500ms budget.
+
+**Code-reviewer pass:** spawned, 1 MEDIUM addressed (wedge/clean-exit
+verdict-ordering race guard), 1 LOW addressed (max-wait > read-budget
+precondition guard), 1 LOW addressed (manual pf-recovery documented in
+help text). 1 MEDIUM deferred (python3/bc subprocess overhead inside the
+stat-probe loop — measurements show stat_max stays at 27-37ms, well under
+500ms budget, so the overhead isn't biasing the signal yet).
+
+**Tier-1.2 status:** advances from "many vectors closed, full validation
+TBD" to "MinIO-wedge harness shipped, FUSE-hang + NFS-mid-shutdown
+harnesses still TBD." Two more wedge scenarios needed before 1.2 ✓.
+
+**Broken:** nothing.
+
+**Observation about the handler:** cat-to-EOF-error times varied from
+1.16s to 4.25s post-block depending on cache state. The handler appears
+to NOT enforce a tight chunked-loop deadline — it lets the JuiceFS
+prefetch buffer drain before failing. That's user-acceptable (Finder
+doesn't beachball, mount stays responsive) but it's a real signal:
+adding an explicit per-chunk-fetch deadline (~1s) would tighten this
+to a consistent <2s exit and free worker goroutines faster under
+sustained backend failure. Belongs to a future tier-1.2 follow-up, not
+this slice.
+
+**Next:** iteration 10 picks the second wedge harness — `scripts/wedge-tests/fuse-hang-mid-op.sh`
+(SIGSTOP the JuiceFS daemon mid-op, expect Lstat-timeout-bounded
+recovery). Pattern reuses this iteration's structure: probe + wedge-
+inject + concurrent-stat probe + verdict.
+
+---
 
 ### Iteration 8 — 2026-05-16 — LOOP TERMINATED
 
