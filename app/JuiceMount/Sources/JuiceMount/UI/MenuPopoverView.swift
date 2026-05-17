@@ -1175,13 +1175,50 @@ struct MenuPopoverView: View {
     @ViewBuilder
     private var primaryActionButton: some View {
         switch server.state {
-        case .idle, .error, .disconnected:
+        case .idle:
             ActionButton(
                 title: "Start JuiceMount",
                 systemImage: "play.fill",
                 tint: .accentColor,
                 action: { server.start() }
             )
+        case .error, .disconnected:
+            // QA-11 fix (Loop C.3, 2026-05-17): in .error/.disconnected,
+            // ServerController.start() silently returns (guard case .idle).
+            // Previously the popover offered a Start button anyway → user
+            // clicked, nothing happened, no visible recovery path. Now we
+            // disable Start, surface the reason, and offer Stop everything
+            // as the explicit recovery action below.
+            ActionButton(
+                title: "Start JuiceMount",
+                systemImage: "play.fill",
+                tint: .accentColor,
+                disabled: true,
+                action: {}
+            )
+            Text("Server is \(server.state == .disconnected ? "disconnected" : "in error") — use \"Stop everything\" to fully reset, then Start.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.bottom, 4)
+            ActionButton(
+                title: "Stop everything",
+                systemImage: "stop.fill",
+                tint: .red,
+                action: { showStopEverythingConfirm = true }
+            )
+            .confirmationDialog(
+                "Stop everything?",
+                isPresented: $showStopEverythingConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("Stop everything", role: .destructive) {
+                    server.stop()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Tears down FUSE and any partial state so the next Start can begin from a clean slate.")
+            }
         case .starting:
             ActionButton(
                 title: "Starting…",
