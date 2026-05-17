@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -94,6 +95,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if globalServer != nil {
 		return C.CString("error: server already running")
 	}
+
+	// Reset the /stop gate so the next /stop in this process lifetime
+	// actually triggers teardown. Without this, after a Start+Stop+Start
+	// cycle the second /stop would CAS-fail and silently no-op.
+	stopInProgress.Store(false)
 
 	var cfg ServerConfig
 	rawJSON := C.GoString(configJSON)
@@ -364,6 +370,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// privileged `umount -f -t nfs` via AppleScript; user enters
 			// their admin password once. Returns JSON with the result.
 			"/force-eject": handleForceEjectHTTP,
+			// Soft stop: tears down NFS server + metadata + caches without
+			// unmounting (Stop/Start cycle stays fast, no admin password
+			// re-prompt). Use /force-eject afterward for a full teardown.
+			// Returns immediately; teardown runs async so the response
+			// flushes before the metrics server closes its own socket.
+			"/stop": handleStopHTTP,
 			// A2 — post-mount self-test. GET returns cached result; POST reruns.
 			"/self-test": handleSelfTestHTTP,
 			// Phase B observability: net/http/pprof routes for live
@@ -1588,6 +1600,69 @@ func handleForceEjectHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(500)
 	fmt.Fprintf(w, `{"ok":false,"mount_point":%q,"error":"unmount failed; mount may be wedged in kernel — reboot or 'sudo umount -f -t nfs %s' from a fresh terminal"}`, mp, mp)
+}
+
+// stopInProgress gates the /stop handler's teardown goroutine.
+// Concurrent /stop POSTs within the 100 ms flush-grace would otherwise
+// each spawn their own teardown goroutine. stopServerLocked is already
+// serialized by globalMu (snapshot AND nil happen under one lock pair,
+// so the second goroutine sees nil and no-ops), but spawning an extra
+// goroutine just to nil-then-no-op is wasteful and pollutes the
+// goroutine count the iter-11 watchdog watches. CAS gates the spawn
+// at the handler level.
+//
+// Reset by NFSServerStart so the NEXT Start+Stop cycle works. A
+// process-wide sync.Once would be permanently "spent" after the first
+// /stop and silently break subsequent /stops after a Start.
+var stopInProgress atomic.Bool
+
+// handleStopHTTP triggers the soft-stop sequence (stopServerLocked).
+// Returns immediately with {"ok": true, "stopping": true} so the
+// response is flushed BEFORE the metrics server tears itself down —
+// otherwise the active HTTP connection would be killed mid-write by
+// metricsSrv.Stop() and the client wouldn't see the response.
+//
+// Restricted to POST: this is a destructive operation, the listener
+// is localhost-only but HTTP convention is to use POST for state-
+// changing requests. GET callers get 405 with an Allow: POST header.
+//
+// Idempotent: stopOnce ensures only the first call triggers
+// stopServerLocked; subsequent calls still return ok:true,stopping:
+// true so callers can poll until the server actually stops responding.
+//
+// Does NOT unmount FUSE/NFS — Stop/Start should not require admin
+// re-prompt. For a full teardown use /force-eject after /stop, or
+// add /shutdown in a future iteration if there's demand.
+//
+// KNOWN LIMITATION: the 100 ms grace before tearing down the metrics
+// listener is a heuristic. Under sustained NFS I/O load (exactly the
+// condition the tier-1.2 wedge harness creates) the loopback TCP send
+// buffer might not drain in 100 ms, and a slow client may see a
+// connection reset instead of the JSON body. The fix would be to
+// Hijack() the connection and write+close before sleeping — overkill
+// for v1; revisit if the wedge harness sees flaky empty-body results.
+func handleStopHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"ok":true,"stopping":true}`)
+	// Flush the response onto the socket before triggering teardown.
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	jmlog.Info("handleStopHTTP: soft-stop requested via HTTP", "remote", r.RemoteAddr)
+	if stopInProgress.CompareAndSwap(false, true) {
+		go func() {
+			// Tiny grace so the kernel actually writes the queued bytes
+			// to the client before we yank the listener out from under
+			// it. See KNOWN LIMITATION in the doc comment.
+			time.Sleep(100 * time.Millisecond)
+			stopServerLocked()
+		}()
+	}
 }
 
 func handleReclaimHTTP(w http.ResponseWriter, r *http.Request) {
