@@ -77,7 +77,7 @@ services:
         condition: service_healthy
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-juicemount}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set in .env}
     # Bootstrap: create the bucket if absent, then format JuiceFS
     # against it. mc is the MinIO client; juicefs format expects the
     # bucket to already exist.
@@ -102,5 +102,60 @@ services:
           ${JUICEFS_VOL_NAME:-zpool}
     # No restart — we want this to exit 0 and stay exited.
     restart: "no"
+
+  juicemount-server:
+    # Tier-3 iter 2: NFS export side. Builds from the repo root
+    # (context: ..) using server/juicemount-server/Dockerfile.
+    # depends_on: minio + redis healthy, and juicefs-init exit 0 so
+    # the bucket exists and JuiceFS volume is formatted before jm5
+    # tries to mount FUSE.
+    build:
+      context: ..
+      dockerfile: server/juicemount-server/Dockerfile
+    container_name: juicemount-server
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      juicefs-init:
+        condition: service_completed_successfully
+    # FUSE needs SYS_ADMIN + /dev/fuse + apparmor unconfined on hosts
+    # that ship with that policy. macFUSE doesn't exist on Linux —
+    # we use the kernel fuse module. juicefs handles the actual mount
+    # syscall inside the container.
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "${NFS_PORT:-2049}:2049"
+      - "${ADMIN_PORT:-11050}:11050"
+    volumes:
+      # SQLite metadata.db + pin.db live here. Bind-mount so they
+      # survive container churn. Use absolute paths on prod hosts
+      # (set JM_DATA_DIR in .env) — the relative default is fine
+      # for local-quickstart.
+      - ${JM_DATA_DIR:-./data/jm}:/data
+    environment:
+      # Inherit MinIO creds so jm5 → JuiceFS → MinIO works without
+      # the user having to set them in three places.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-juicemount}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set in .env}
+      JM_REDIS: redis://redis:6379/1
+      JM_CACHE_SIZE_MB: ${JM_CACHE_SIZE_MB:-100000}
+    healthcheck:
+      # Same shape as the Dockerfile HEALTHCHECK but on the compose
+      # side too so `docker compose ps` shows the right state and
+      # `depends_on: service_healthy` works for any future services
+      # that need to wait on jm5 to come up.
+      test: ["CMD", "curl", "-fsS", "http://localhost:11050/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 volumes: {}

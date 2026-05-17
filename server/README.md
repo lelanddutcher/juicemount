@@ -8,30 +8,44 @@ to a mountable backend in under 10 minutes.
 This directory implements tier 3 of the JuiceMount roadmap. See
 `docs/ROADMAP/tier-3-server-packaging.md` for the full spec.
 
-## What's in this iteration (tier-3 iter 1)
+## What's in this iteration (tier-3 iter 2)
 
-The foundation: the three services every JuiceMount deployment needs.
+The full headless stack. After this iteration, JuiceMount serves an
+NFS export from a Linux container — no Mac involvement required.
 
-| Service        | What it does                                    | Port  |
-|----------------|-------------------------------------------------|-------|
-| `minio`        | S3-compatible object store                      | 9000  |
-| `redis`        | JuiceFS metadata authority                      | 6379  |
-| `juicefs-init` | One-shot — formats the JuiceFS volume on first run | —  |
+| Service             | What it does                                | Port  |
+|---------------------|---------------------------------------------|-------|
+| `minio`             | S3-compatible object store                  | 9000  |
+| `redis`             | JuiceFS metadata authority                  | 6379  |
+| `juicefs-init`      | One-shot — formats the JuiceFS volume       | —     |
+| `juicemount-server` | NFS export + admin API                      | 2049, 11050 |
 
-A web console for MinIO is on port 9001 — point a browser at
-`http://<host>:9001` and log in with `MINIO_ROOT_USER` /
-`MINIO_ROOT_PASSWORD` from your `.env`.
+MinIO web console at port 9001 (`http://<host>:9001`, log in with
+`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` from your `.env`).
 
-**Not yet in this iteration** (tier-3 iter 2+):
+**Mount the volume from any NFS client:**
 
-- `juicemount-server` container exporting NFS on 2049
-- Caddy reverse-proxy with TLS
-- `juicemount doctor` healthcheck command
-- Backup job (`mc mirror` to remote bucket)
-- Admin UI behind the Caddy layer
+```sh
+# macOS
+sudo mkdir -p /Volumes/zpool
+sudo mount -t nfs -o vers=3,soft,timeo=300,resvport <host>:/ /Volumes/zpool
 
-For now, your macOS JuiceMount.app talks directly to the MinIO + Redis
-above, doing the FUSE / NFS-loopback work locally.
+# Linux
+sudo mkdir -p /mnt/zpool
+sudo mount -t nfs -o vers=3,soft,timeo=300 <host>:/ /mnt/zpool
+```
+
+The JuiceMount.app on macOS can also drive this container as its
+backend by pointing its profile at `<host>:11050` for admin and using
+the same `<host>:2049` for the NFS path (in the Custom mount path
+preference).
+
+**Not yet in this iteration** (tier-3 iter 3+):
+
+- Caddy reverse-proxy with TLS + admin-key auth (iter 3)
+- `juicemount doctor` healthcheck command (iter 4)
+- Backup job (`mc mirror` to remote bucket) (iter 5)
+- Admin UI behind the Caddy layer (iter 6)
 
 ## Quick start
 
@@ -91,12 +105,26 @@ docker compose up -d
 This is destructive. Take a backup first if there's anything you want
 to keep — there's no in-place migration story between formats.
 
-## What this stack does NOT include
+## What this stack does NOT include yet
 
-- TLS termination (defer to tier-3 iter 2's Caddy)
-- Authentication beyond MinIO's root password (defer to admin-key
-  middleware in iter 2)
-- The NFS export (currently your macOS JuiceMount.app provides this
-  locally — the server-side `juicemount-server` container lands in
-  iter 2)
-- Notarized release / signed images (defer to tier-3 iter 5 polish)
+- TLS termination + admin-key middleware (Caddy, iter 3)
+- `juicemount doctor` healthcheck CLI (iter 4)
+- Scheduled backups (`mc mirror` to remote bucket, iter 5)
+- Admin UI (iter 6)
+- Notarized / signed container images (iter 7)
+
+## Security notes for production deployments
+
+- **Redis port (6379) is exposed.** Set `REDIS_PORT=127.0.0.1:6379`
+  in `.env` if only the local host needs metadata access. Without
+  TLS+auth, anyone who can reach the port can read/write/delete
+  the entire JuiceFS metadata store — equivalent to total volume
+  loss even if the MinIO data survives. iter 3 will put Redis
+  behind Caddy with admin-key auth.
+- **MinIO console (9001) is HTTP-only.** Don't expose to public
+  IPs without first putting it behind Caddy+TLS (iter 3).
+- **`MINIO_ROOT_PASSWORD` is the master key.** Anyone with this
+  password can read every byte in the volume. Rotate before going
+  to production; `juicefs format` writes the secret-key into the
+  Redis metadata, so re-format is the only way to rotate cleanly
+  today.
