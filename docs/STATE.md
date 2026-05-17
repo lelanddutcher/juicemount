@@ -323,11 +323,45 @@ The user kept clicking around expecting things to "just work,"
 unaware that writes were diverging from the backend's view of
 truth.
 
-### QA-11 (2026-05-17, user QA) — Start button silent no-op + no escape in .disconnected state
+### QA-11 (2026-05-17, user QA) — Start button silent no-op + no escape in .disconnected state — ✓ CLOSED 2026-05-17 (Loop C.3)
 
-**Observed:** mount degraded mid-session. Clicking Start in the
-popover produced no feedback — no toast, no error, no state
-change. Worse, no Stop button was visible to fall back to.
+**Fix (Loop C.3, 2026-05-17 ~14:50):**
+
+Picked recommendation (b)+(c) from the plan below. In
+`app/JuiceMount/Sources/JuiceMount/UI/MenuPopoverView.swift`
+`primaryActionButton`:
+  - `.error`/`.disconnected` no longer share the `.idle` branch.
+    They render a DISABLED Start button + an inline caption
+    ("Server is disconnected — use Stop everything to fully reset")
+    + an enabled "Stop everything" button with its existing
+    confirmation dialog (re-bound to a message about clearing
+    partial state for a fresh Start).
+  - `.idle` retains the enabled Start button.
+  - `.running/.syncing/.degraded` unchanged.
+
+No controller changes — `ServerController.start()`'s
+`guard case .idle` guard remains as the single source of truth
+about when Start is legal. The popover now matches that contract.
+
+**Adjacent scenarios tested (per Rule 3 — built only, not yet
+runtime-validated against live mount):**
+  1. `.idle` → Start enabled, label "Start JuiceMount" — unchanged
+  2. `.starting` → Start shows "Starting…" disabled — unchanged
+  3. `.disconnected` → Start DISABLED with grey opacity, caption
+     "Server is disconnected — use Stop everything to fully reset…",
+     Stop everything visible + clickable
+  4. `.error` → same as .disconnected but caption reads "in error"
+  5. `.running/.syncing/.degraded` → both Stop buttons present —
+     unchanged (no regression)
+
+Runtime validation pending: requires reproducing a real
+`.disconnected` state to verify the caption + button positions
+render cleanly in the popover. Build succeeded; no logic changes
+to controllers, so confidence is high this is purely cosmetic.
+
+**Original observation:** mount degraded mid-session. Clicking
+Start in the popover produced no feedback — no toast, no error,
+no state change. Worse, no Stop button was visible to fall back to.
 Functionally stuck; only escape was force-quit-and-relaunch.
 
 **Root cause (post-investigation, 2026-05-17 ~14:00):** the popover
