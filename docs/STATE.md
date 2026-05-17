@@ -115,7 +115,43 @@ acceptance test ("pinned files keep working when network drops") is
 unpinned case. The acceptance test may need to be tightened, AND
 the gate logic may need to be fixed.
 
-### QA-3 (2026-05-17) — no way to clear the cache
+### QA-3 (2026-05-17) — no way to clear the cache — ⚠ landed-needs-validation 2026-05-17
+
+**Fix (Loop A.7, iter 20, 2026-05-17 ~03:30):**
+
+Backend: new POST /cache-clear admin endpoint in bridge/cbridge.go.
+Walks ~/.juicefs/cache/{uuid}/raw/chunks/ and removes every chunk
+file. Optional ?keep-pinned=true triggers an internal
+globalPrefetcher.VerifyAndRepair afterward so pinned content
+immediately starts re-downloading. atomic.Bool gate prevents
+concurrent calls (matches /stop pattern).
+
+UI: "Clear Cache" button added next to Reclaim in the disk-space
+row. Calls /cache-clear?keep-pinned=true so pinned content
+recovers automatically. Extracted as @ViewBuilder cacheClearButton
+to avoid code duplication across the high-/normal-pressure UI
+branches.
+
+Code-reviewer pass: 2 HIGH + 2 MEDIUM all addressed:
+  - HIGH-1: filepath.Walk now distinguishes ENOENT (benign — dir
+    doesn't exist) from real walk failures (logged via jmlog.Warn);
+    per-chunk Remove errors that aren't ENOENT also logged.
+  - HIGH-2: VerifyAndRepair goroutine now uses globalPinCtx (cancels
+    on shutdown) instead of context.Background — 30s timeout kept
+    as safety belt with comment clarifying it only bounds the
+    DB-mark phase, not the actual re-download work in PullPending.
+  - MED-1: atomic.Bool concurrency gate matching /stop pattern.
+  - MED-2: button extracted to @ViewBuilder.
+  - 2 LOW deferred (URLSession semaphore pattern is project-wide
+    convention).
+
+Validation pending binary swap: user reopen, hit "Clear Cache",
+observe cache GB drop in disk-space row, then climb back up as
+pinned content re-downloads.
+
+---
+
+### QA-3 (original report, 2026-05-17) — no way to clear the cache
 
 **Observed:** no surface (UI button, /admin endpoint, CLI command)
 to evict cached files. Users who pin too aggressively or want to
