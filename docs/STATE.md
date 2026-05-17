@@ -382,6 +382,83 @@ a PushNotification — eight iterations of tooling on a stale binary
 is the point where continued autonomous work has negative marginal
 value.
 
+### Iteration 14b — 2026-05-17 — LOOP TERMINATED (binary-swap blocked)
+
+**Tier:** 1 (Stability).
+**Outcome:** stopped after iter 14 verify-build update. Continuing
+would stack more code on the same validation debt — 5 iterations
+(11-14) have shipped commits that need the user's binary swap to
+runtime-validate. The iter-8 termination pattern repeats: at some
+point the cost of more unvalidated code outweighs its benefit.
+
+**Pending runtime validation (in order of effort to validate):**
+
+1. **Restart JuiceMount on fresh binary**:
+   - Quit JuiceMount (menu bar → Quit, or `kill 42644`)
+   - `open build/JuiceMount.app`
+   - Click Start
+   - `bash scripts/verify-build.sh --running` should show 11 ✓ green
+     fixes and "process started after binary was built — likely current"
+
+2. **Validate iter-12 /stop endpoint**:
+   - `curl -s -X GET http://127.0.0.1:11050/stop -o /dev/null -w '%{http_code}\n'`
+   - Expected: `405` (was `200` on stale binary)
+
+3. **Validate iter-13 NFS-shutdown harness** (DESTRUCTIVE):
+   - `scripts/wedge-tests/nfs-loopback-mid-shutdown.sh`
+   - Leaves JuiceMount in stopped state; restart via Start button
+     when done
+
+4. **Validate iter-11 goroutine watchdog** (long-running):
+   - `cmd/jmstress --mount /Volumes/zpool-dev --duration 1h --json
+     --periodic-json 60s --goroutine-tick 60s --goroutine-warmup 5m
+     > /tmp/soak-1h.jsonl`
+   - Look for `goroutines` block in each tick; `breaches: 0` at the
+     end means no leak in this window.
+
+5. **Tier-1.6 24h soak** (the real acceptance gate):
+   - Same command, `--duration 24h`. Run when network won't be
+     touched for that long.
+
+**Commits this session (iter 9-14):**
+
+| Iter | Commit  | Theme                                         |
+|------|---------|-----------------------------------------------|
+| 9    | cb04f56 | MinIO-down-mid-read wedge harness (tier-1.2)  |
+| 10   | 76695da | FUSE-hang-mid-op wedge harness (tier-1.2)     |
+| 11   | 09906a6 | Goroutine-leak watchdog in jmstress (tier-1.6)|
+| 12   | ba47621 | POST /stop admin endpoint                     |
+| 13   | 84af5a5 | NFS-loopback-mid-shutdown wedge harness       |
+| 14   | d07de1d | verify-build manifest entry for /stop         |
+
+Iter 9 and 10 PASS-validated against live mount in-session. Iter 11
+smoke-validated; needs 1h+ run to be confidence-tested. Iter 12-14
+all need the binary swap.
+
+**Tier-1 state at stop:**
+- 1.1: code landed, validation invalidated by old binary-staleness,
+  needs re-run with current binary
+- 1.2: ALL 3 iter-B wedge harnesses shipped (MinIO/FUSE/NFS); MinIO
+  and FUSE validated; NFS needs binary swap
+- 1.3: depends on user manual unmount-matrix
+- 1.4: tooling shipped; user-driven real run pending
+- 1.5: ✓ done
+- 1.6: scaffold + JSON + comparer + watchdog all in; 24h soak
+  acceptance run still pending
+- 1.7-1.10: ✓ all validated
+
+**Live mount state at stop:**
+- PID 42644 still on May-16 stale binary
+- FUSE daemon died at some point overnight
+- Redis ping fails ("no route to host")
+- Auto-offline correctly engaged at 00:41:18
+- Mount needs restart to be usable
+
+**To resume:** after restart, re-fire `/loop`. Iteration 15 will
+pick up wherever STATE.md points.
+
+---
+
 ### Iteration 14 — 2026-05-17
 
 **Tier:** 1 (Stability) — dev-infra slice that hardens future
