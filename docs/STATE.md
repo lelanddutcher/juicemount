@@ -15,6 +15,87 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### QA suite run 20260517-173656 (run #3, after fixes)
+
+**Final tally:** 61 PASS / 207 FAIL (mostly phantom from 2 × 99
+"missing summary" markers) / 2 WARN. Wall-clock 23 min.
+
+Real failures (not phantom): **9** = 8 from QA-19 fio cascade + 1
+stochastic 05-metadata ls. The 207 reduces to 9 if you subtract
+2 × 99 phantom markers for the 2 phases that crashed mid-execution.
+
+**Bug discoveries (new in this run):**
+
+**QA-18 — "Not a directory" after rapid small-file creation.**
+  02-finder phase, "1000 × 1 KiB" test: created 389 files successfully
+  via `head -c 1024 /dev/urandom > "$dir/file-$i.txt"` in a tight loop,
+  then file-390 errored with "/Volumes/zpool-dev/.jmqa-finder-37615/
+  small-files/file-390.txt: Not a directory". The script died (set -u)
+  with no summary produced.
+  Same test passes when run standalone in isolation — the failure
+  is timing/load-dependent, surfacing only when small-files creation
+  follows the prior phase's I/O burst. Suggests a metadata-store race
+  where a path component temporarily resolves as a file rather than
+  a directory under rapid mkdir+create sequences.
+  Where to look: nfs/handler.go `Create`/`OpenFile` interaction with
+  metadata/store.go LookupByPath. Possibly the in-memory pathCache
+  returns a stale entry when a sibling directory was just modified.
+
+**QA-19 — Stale NFS file handle during sustained sequential write.**
+  04-fio phase, seqwrite-1m profile: fio writes 1 MiB blocks to a
+  512 MiB file via psync. After ~52 seconds (writing ~400 MiB),
+  errno=70 ESTALE fires:
+  ```
+  fio: io_u error on file ... seqwrite-1m.0.0: Stale NFS file handle:
+  write offset=412090368, buflen=1048576
+  fio: pid=39722, err=70/file:io_u.c:2018
+  ```
+  The file handle becomes stale mid-write, terminating fio with rc=1.
+  After this, all 7 subsequent fio profiles in the same phase fail
+  within 1 second of each other — the mount is briefly wedged.
+  06-concurrency and 09-endurance ran clean AFTER this, so the
+  wedge auto-recovers.
+  Where to look: fdPool eviction (nfs/fdpool.go) — `fdIdleTimeout`
+  is 2min and `fdEvictTick` is 30s; under sustained write, the
+  fd-pool entry's `lastUsed` is only touched on `Get`/`GetWrite`,
+  not inside per-WriteAt operations. If the eviction loop runs in
+  parallel with an in-flight long write, the fd may close out from
+  under the WriteAt, causing the NFS handle to go stale. This is
+  the HIGH-flagged finding from the C.1 code review that we left
+  for "future hardening". This run reproduces it.
+  Fix candidate: touch `entry.lastUsed = time.Now()` inside
+  `WriteAt`/`ReadAt` of writeFile/cachedFile, not just inside the
+  pool's Get/GetWrite entry points.
+
+**Clean wins this run:**
+  - 01-smoke ✓ 10/10 — QA-16 flake did NOT recur
+  - 03-media ✓ 6/6 — rm-race fix verified, bulk import 20/20
+  - 06-concurrency ✓ 6/6 — 16 writers + 32 readers + tar round-trip
+  - 09-endurance ✓ 3/3 — 20 min sustained 4R+4W load, NO leak
+  - 10-control-plane ✓ 16/16 — endpoint contracts now correct
+
+**Status of prior fixes (verified by this run):**
+  - posixaio→psync switch: confirmed the EIO from run #1 was a
+    macOS POSIX-AIO/NFS shim issue (not a JM bug). With psync, fio
+    surfaces real ESTALE behavior (QA-19) instead of generic EIO.
+  - 03-media rm-race: bulk import 20/20 (was 0/20 in run #1).
+  - 10-control-plane endpoint contracts: 16/16 now (was 2 warns).
+  - lib.sh counter init: orchestrator no longer crashes on warn().
+  - QA-15 defense (`go cb(...)`): in binary; not exercised this run.
+
+**Memory baseline:** JM RSS 1.5 GB at suite start → 2.4 GB at end
+(54 min uptime, including ~24 min of intense I/O). 60% growth is
+larger than I'd want long-term — flag for tier-2 investigation,
+but 09-endurance specifically showed NO drift across its 20-min
+window so the growth is concentrated in the fio/02-finder phases.
+
+**07-failure crashed at scenario B** (toggle user-offline mid-write)
+because the harness POSTs JSON to `/offline` but `/offline` may
+take query params. Confirm contract and patch as part of the
+recurring harness work.
+
+Artifacts: /tmp/jm-qa-artifacts/20260517-173656/
+
 ### QA suite run 20260517-152205 (3-hour pressure test, 30-min actual)
 
 **Final tally:** 76 PASS / 8 FAIL / 7 WARN across 11 phases. Total
