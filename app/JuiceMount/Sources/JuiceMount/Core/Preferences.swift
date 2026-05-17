@@ -54,7 +54,7 @@ public final class Preferences {
     public init(
         volumeName: String = "zpool",
         mountPoint: String = "/Volumes/zpool",
-        redisURL: String = "redis://192.168.0.210:6379/1",
+        redisURL: String = "redis://127.0.0.1:6379/1",
         nfsListenAddr: String = "127.0.0.1:11049",
         metricsAddr: String = "127.0.0.1:11050",
         dbPath: String = "",
@@ -141,7 +141,7 @@ public final class Preferences {
         return Preferences(
             volumeName:        d.string(forKey: Key.volumeName.rawValue) ?? "zpool",
             mountPoint:        d.string(forKey: Key.mountPoint.rawValue) ?? "/Volumes/zpool",
-            redisURL:          d.string(forKey: Key.redisURL.rawValue) ?? "redis://192.168.0.210:6379/1",
+            redisURL:          d.string(forKey: Key.redisURL.rawValue) ?? "redis://127.0.0.1:6379/1",
             nfsListenAddr:     d.string(forKey: Key.nfsListenAddr.rawValue) ?? "127.0.0.1:11049",
             metricsAddr:       d.string(forKey: Key.metricsAddr.rawValue) ?? "127.0.0.1:11050",
             dbPath:            d.string(forKey: Key.dbPath.rawValue) ?? defaultDBPath(),

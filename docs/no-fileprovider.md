@@ -68,7 +68,7 @@ dead extension, started spinning, and pinned two daemons at 100%+ CPU.
 
 ```applescript
 tell application "Finder"
-    delete POSIX file "/Users/LelandDutcher/Library/CloudStorage/JuiceMount-zpool"
+    delete POSIX file "/Users/USER/Library/CloudStorage/JuiceMount-zpool"
 end tell
 ```
 

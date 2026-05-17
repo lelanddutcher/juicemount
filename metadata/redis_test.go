@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const testRedisURL = "redis://192.168.0.210:6379/1"
+const testRedisURL = "redis://127.0.0.1:6379/1"
 
 func newTestRedisClient(t *testing.T) *RedisClient {
 	t.Helper()
@@ -30,9 +30,9 @@ func TestRedisParseURL(t *testing.T) {
 		wantAddr string
 		wantDB   int
 	}{
-		{"redis://192.168.0.210:6379/1", "192.168.0.210:6379", 1},
+		{"redis://127.0.0.1:6379/1", "127.0.0.1:6379", 1},
 		{"redis://localhost:6379/0", "localhost:6379", 0},
-		{"192.168.0.210:6379/1", "192.168.0.210:6379", 1},
+		{"127.0.0.1:6379/1", "127.0.0.1:6379", 1},
 		{"redis://host:1234/5", "host:1234", 5},
 	}
 	for _, tt := range tests {

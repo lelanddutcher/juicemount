@@ -174,7 +174,7 @@ Before any benchmark run, especially remote scenarios:
 ```bash
 # 1. Verify juicefs-minio resolves (required for MinIO access off home network)
 host juicefs-minio
-# If NXDOMAIN: sudo bash -c 'echo "192.168.0.212   juicefs-minio" >> /etc/hosts'
+# If NXDOMAIN: sudo bash -c 'echo "127.0.0.1   juicefs-minio" >> /etc/hosts'
 
 # 2. Force-unmount stale FUSE (if it was up before network switch)
 sudo umount -f ~/.juicemount/fuse-internal
@@ -183,13 +183,13 @@ sudo umount -f ~/.juicemount/fuse-internal
 juicefs mount --background \
   --cache-dir ~/.juicefs/cache --cache-size 102400 \
   --attr-cache 3600 --entry-cache 3600 --dir-entry-cache 3600 \
-  redis://192.168.0.210:6379/1 ~/.juicemount/fuse-internal
+  redis://127.0.0.1:6379/1 ~/.juicemount/fuse-internal
 
 # 4. Kill existing JM5, start with fresh DB
 pkill -f '/tmp/jm5'
 rm -f /tmp/jm5-bench.db
 ssh localhost "export PATH=/usr/local/go/bin:/opt/homebrew/bin:\$PATH && \
-  /tmp/jm5 --redis redis://192.168.0.210:6379/1 \
+  /tmp/jm5 --redis redis://127.0.0.1:6379/1 \
   --fuse-path ~/.juicemount/fuse-internal \
   --mount /Volumes/zpool \
   --listen 127.0.0.1:11049 \
@@ -265,7 +265,7 @@ stat ~/.juicemount/fuse-internal/__bench_write_test.mov  # must exist and correc
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| `juicefs-minio` hostname only resolves on home LAN | Data reads/writes fail off home network | Fix: `sudo bash -c 'echo "192.168.0.212 juicefs-minio" >> /etc/hosts'` |
+| `juicefs-minio` hostname only resolves on home LAN | Data reads/writes fail off home network | Fix: `sudo bash -c 'echo "127.0.0.1 juicefs-minio" >> /etc/hosts'` |
 | NFS COMMIT on slow WiFi | Large writes (>50MB) time out | Known; writes work on local network only |
 | Synthetic inodes (1<<63) | SQLite insert error on SUBSCRIBE echo-back | Needs fix before production |
 | `go-nfs` exclusive create unsupported | Finder logs errors on some creates | Benign, falls back gracefully |

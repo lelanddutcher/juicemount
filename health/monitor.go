@@ -20,8 +20,8 @@ import (
 
 // Config holds the endpoints and paths that the monitor checks.
 type Config struct {
-	RedisURL      string // e.g. "192.168.0.210:6379"
-	MinIOURL      string // e.g. "http://192.168.0.212:9000"
+	RedisURL      string // e.g. "127.0.0.1:6379"
+	MinIOURL      string // e.g. "http://127.0.0.1:9000"
 	FUSEPath      string // e.g. ~/.juicemount/fuse-internal
 	NFSMountPoint string // e.g. /mnt/juice
 }

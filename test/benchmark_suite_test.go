@@ -21,7 +21,7 @@ import (
 
 const (
 	nfsMount  = "/Volumes/zpool"
-	fuseMount = "/Users/LelandDutcher/.juicemount/fuse-internal"
+	fuseMount = "/Users/USER/.juicemount/fuse-internal"
 	smbMount  = "/Volumes/zSSD" // optional
 
 	// Known directories of various sizes on the NFS mount
@@ -75,7 +75,7 @@ func loadBaselines(t *testing.T) baselines {
 	}
 	if _, err := os.Stat(path); err != nil {
 		// Last resort: hardcoded path
-		path = "/Users/LelandDutcher/Developer/JuiceMount5/test/benchmark_baselines.json"
+		path = "./test/benchmark_baselines.json"
 	}
 
 	data, err := os.ReadFile(path)
@@ -985,7 +985,7 @@ func TestBenchmarkSuite_UpdateBaselines(t *testing.T) {
 		t.Fatalf("marshal baselines: %v", err)
 	}
 
-	outPath := "/Users/LelandDutcher/Developer/JuiceMount5/test/benchmark_baselines.json"
+	outPath := "./test/benchmark_baselines.json"
 	if err := os.WriteFile(outPath, data, 0644); err != nil {
 		t.Fatalf("write baselines: %v", err)
 	}

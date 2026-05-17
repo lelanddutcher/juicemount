@@ -24,7 +24,7 @@ import (
 )
 
 func main() {
-	redisURL := flag.String("redis", "redis://192.168.0.210:6379/1", "Redis URL")
+	redisURL := flag.String("redis", "redis://127.0.0.1:6379/1", "Redis URL")
 	fusePath := flag.String("fuse-path", "", "Path to JuiceFS FUSE mount (auto-detected if empty)")
 	mountPoint := flag.String("mount", "/Volumes/zpool", "Mount point for NFS volume")
 	listenAddr := flag.String("listen", "127.0.0.1:11049", "NFS server listen address")
@@ -176,7 +176,7 @@ func main() {
 			addr, _, _ := metadata.ParseRedisURL(*redisURL)
 			return addr
 		}(),
-		MinIOURL:      "http://192.168.0.212:9000",
+		MinIOURL:      "http://127.0.0.1:9000",
 		FUSEPath:      *fusePath,
 		NFSMountPoint: *mountPoint,
 	})

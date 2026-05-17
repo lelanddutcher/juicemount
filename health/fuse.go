@@ -22,7 +22,7 @@ import (
 
 // FUSEConfig holds JuiceFS mount configuration.
 type FUSEConfig struct {
-	RedisURL   string // e.g. "redis://192.168.0.210:6379/1"
+	RedisURL   string // e.g. "redis://127.0.0.1:6379/1"
 	MountPoint string // e.g. ~/.juicemount/fuse-internal
 	CacheDir   string // e.g. ~/.juicefs/cache (empty = JuiceFS default)
 	CacheSize  string // e.g. "100000" in MiB (empty = JuiceFS default ~100 GiB)

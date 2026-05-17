@@ -88,7 +88,7 @@ in 15-120 ms via the NFS loopback.
                     |                             |
            +-------v--------+          +---------v--------+
            | Redis Server   |          | MinIO Server     |
-           | 192.168.0.210  |          | 192.168.0.212    |
+           | 127.0.0.1  |          | 127.0.0.1    |
            | :6379 (DB 1)   |          | :9000            |
            |                |          |                  |
            | JuiceFS meta   |          | JuiceFS data     |
@@ -799,7 +799,7 @@ ratio > 1.20 for throughput). Test fails if any benchmark regresses.
 
 ```bash
 # Run the benchmark suite (requires NFS mount at /Volumes/zpool)
-cd /Users/LelandDutcher/Developer/JuiceMount5
+cd /Users/USER/Developer/JuiceMount5
 go test -v -run TestBenchmarkSuite ./test/ -timeout 10m
 
 # Update baselines after a performance improvement
@@ -833,8 +833,8 @@ UPDATE_BASELINES=1 go test -v -run TestBenchmarkSuite_UpdateBaselines ./test/ -t
 
 | Component | Address | Purpose |
 |-----------|---------|---------|
-| Redis | `192.168.0.210:6379` (DB 1) | JuiceFS metadata (d*, i*, c* keys) + pub/sub |
-| MinIO | `192.168.0.212:9000` | JuiceFS data storage (S3-compatible) |
+| Redis | `127.0.0.1:6379` (DB 1) | JuiceFS metadata (d*, i*, c* keys) + pub/sub |
+| MinIO | `127.0.0.1:9000` | JuiceFS data storage (S3-compatible) |
 | JuiceFS volume | "zpool" | The JuiceFS filesystem |
 | FUSE mount | `~/.juicemount/fuse-internal` | Hidden JuiceFS FUSE mount (not user-facing) |
 | NFS server | `127.0.0.1:11049` | Loopback NFS server |
@@ -965,7 +965,7 @@ Tests in `nfs/canonicalize_test.go`.
 
 What the menu-bar app launches:
 ```
-juicefs mount redis://192.168.0.210:6379/1 ~/.juicemount/fuse-internal \
+juicefs mount redis://127.0.0.1:6379/1 ~/.juicemount/fuse-internal \
   -d --no-usage-report --writeback --buffer-size 1024 --prefetch 3 \
   -o nobrowse --cache-size <auto> --free-space-ratio 0.01
 ```
@@ -1103,7 +1103,7 @@ on system memory pressure.
 # Unit tests (no network or mount required)
 go test ./metadata/ ./cache/ ./nfs/ ./health/
 
-# Integration tests (requires Redis at 192.168.0.210:6379)
+# Integration tests (requires Redis at 127.0.0.1:6379)
 go test -v ./metadata/ -run TestRedis
 
 # NFS mount tests (requires running JuiceMount5 + sudo access)
@@ -1135,15 +1135,15 @@ The NFS mount/unmount commands require `sudo`. For CI or automated testing:
 
 - Go 1.26+
 - JuiceFS 1.3.x (`/opt/homebrew/bin/juicefs`)
-- Redis server at 192.168.0.210:6379
-- MinIO server at 192.168.0.212:9000
+- Redis server at 127.0.0.1:6379
+- MinIO server at 127.0.0.1:9000
 - JuiceFS volume "zpool" already created and mountable
 - macOS (for NFS mount_nfs and Finder integration)
 
 ### Build
 
 ```bash
-cd /Users/LelandDutcher/Developer/JuiceMount5
+cd /Users/USER/Developer/JuiceMount5
 
 # Build the CLI
 go build -o jm5 ./cmd/jm5/
@@ -1157,7 +1157,7 @@ go build -buildmode=c-archive -o libjm5.a ./cbridge.go
 
 ```bash
 # Start JuiceFS FUSE mount first (hidden, internal)
-juicefs mount redis://192.168.0.210:6379/1 ~/.juicemount/fuse-internal \
+juicefs mount redis://127.0.0.1:6379/1 ~/.juicemount/fuse-internal \
   --cache-dir ~/.juicefs/cache \
   --cache-size 102400 \
   --buffer-size 1024 \
@@ -1166,14 +1166,14 @@ juicefs mount redis://192.168.0.210:6379/1 ~/.juicemount/fuse-internal \
 
 # Start JuiceMount5
 ./jm5 \
-  --redis redis://192.168.0.210:6379/1 \
+  --redis redis://127.0.0.1:6379/1 \
   --fuse-path ~/.juicemount/fuse-internal \
   --mount /Volumes/zpool \
   --listen 127.0.0.1:11049
 
 # Or with custom paths
 ./jm5 \
-  --redis redis://192.168.0.210:6379/1 \
+  --redis redis://127.0.0.1:6379/1 \
   --fuse-path /path/to/fuse \
   --mount /Volumes/myvolume \
   --listen 127.0.0.1:12345 \
@@ -1187,7 +1187,7 @@ juicefs mount redis://192.168.0.210:6379/1 ~/.juicemount/fuse-internal \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--redis` | `redis://192.168.0.210:6379/1` | Redis URL |
+| `--redis` | `redis://127.0.0.1:6379/1` | Redis URL |
 | `--fuse-path` | `~/.juicemount/fuse-internal` | JuiceFS FUSE mount path |
 | `--mount` | `/Volumes/zpool` | NFS mount point |
 | `--listen` | `127.0.0.1:11049` | NFS server listen address |

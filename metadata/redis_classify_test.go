@@ -121,7 +121,7 @@ func TestClassifyConnErr(t *testing.T) {
 			// String-fallback path: go-redis wraps some errors in
 			// fmt.Errorf without preserving the *net.OpError chain.
 			name:     "string fallback: no route to host",
-			err:      errors.New("dial tcp 192.168.0.210:6379: connect: no route to host"),
+			err:      errors.New("dial tcp 127.0.0.1:6379: connect: no route to host"),
 			wantKind: errKindNetworkPath,
 		},
 		{

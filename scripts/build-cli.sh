@@ -31,7 +31,7 @@ codesign -d --entitlements - "$OUT" 2>&1 | grep -A1 "com.apple.security" | head 
 echo ""
 echo "==> Done. Run directly (no SSH workaround needed):"
 echo "    $OUT \\"
-echo "      --redis redis://192.168.0.210:6379/1 \\"
+echo "      --redis redis://127.0.0.1:6379/1 \\"
 echo "      --mount /Volumes/zpool \\"
 echo "      --listen 127.0.0.1:11049 \\"
 echo "      --db /tmp/jm5-new.db \\"

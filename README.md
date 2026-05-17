@@ -44,7 +44,7 @@ For headless / TrueNAS / Linux deployment without the menu bar app:
 
 ```bash
 ./scripts/build-cli.sh                # builds /tmp/jm5
-/tmp/jm5 --redis redis://192.168.0.210:6379/1 \
+/tmp/jm5 --redis redis://127.0.0.1:6379/1 \
          --mount /Volumes/zpool \
          --listen 127.0.0.1:11049 \
          --db /tmp/jm5.db \
@@ -126,7 +126,7 @@ For full detail see `ARCHITECTURE_juicemount.md` § 11 (pin/prefetcher/offline-m
 ## Configuration
 
 Edit Preferences in the app, or set defaults via:
-- **Redis URL:** `redis://192.168.0.210:6379/1`
+- **Redis URL:** `redis://127.0.0.1:6379/1`
 - **Mount point:** `/Volumes/zpool`
 - **NFS listen:** `127.0.0.1:11049`
 - **Metrics / control plane:** `127.0.0.1:11050`
