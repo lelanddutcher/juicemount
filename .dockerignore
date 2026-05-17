@@ -1,0 +1,55 @@
+# Sent to the Docker daemon as build context. Mirror .gitignore for
+# the obvious things, plus a stricter list of "never put in any image
+# layer" items (credentials, local config, build artifacts).
+#
+# Without this, server/juicemount-server/Dockerfile's `context: ..`
+# pulls the whole repo (~293 MB) into the daemon on every build, AND
+# credentials.md / .env / SQLite databases land in the Stage-1
+# builder layer — which is cached by the daemon and travels with
+# any `docker push --target builder`.
+
+# --- secrets — NEVER let these into any layer ---
+credentials.md
+**/.env
+.env
+
+# --- VCS ---
+.git/
+.gitignore
+.gitattributes
+
+# --- Build artifacts ---
+build/
+/jm5
+/juicemount
+/jmstress
+/jmcompare
+/jmwatch
+*.app
+*.a
+*.dylib
+*.so
+*.o
+
+# --- Pre-built SQLite databases (local state, not code) ---
+*.db
+*.db-wal
+*.db-shm
+
+# --- IDE / OS junk ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+._*
+
+# --- Claude Code state ---
+.claude/
+
+# --- Loop runtime logs / state ---
+/tmp/
+*.log
+
+# --- Server-side data dirs that may exist from local quickstart ---
+server/data/

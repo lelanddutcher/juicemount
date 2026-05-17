@@ -472,8 +472,9 @@ fixes likely cascade from one root cause.
 
 | # | Test | Status |
 |---|---|---|
-| 3.1 | Cold-deploy on Ubuntu Server 24.04 LTS | ⚠ iter 1 of N landed: `server/docker-compose.yml` + `.env.example` + `README.md` for the foundation (minio + redis + juicefs-init). Real cold-deploy timing pending — local Docker daemon was not running. Compose config validates cleanly via `docker compose config`. |
-| 3.2-3.7 | Synology / Configuration / Healthchecks / doctor / Backup / Upgrade | not started; depend on iter 2+ (juicemount-server container, Caddy, doctor command) |
+| 3.1 | Cold-deploy on Ubuntu Server 24.04 LTS | ⚠ iter 1+2 of N landed: minio + redis + juicefs-init + **juicemount-server** all in `server/docker-compose.yml`. Cold-deploy timing pending Docker daemon start; compose config validates cleanly. |
+| 3.4 | Healthchecks | ⚠ healthchecks defined on all 4 services + Dockerfile HEALTHCHECK against /health |
+| 3.2/3.3/3.5/3.6/3.7 | Synology / Configuration / doctor / Backup / Upgrade | not started; depend on iter 3+ (Caddy, doctor command) |
 
 ---
 
