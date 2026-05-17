@@ -100,6 +100,32 @@ func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok b
 	}
 }
 
+// lstatWithTimeout is the FileInfo-returning sibling of
+// lstatNotExistWithTimeout. ok=false means the underlying Lstat didn't
+// complete within the timeout; callers should fall back to a safe default
+// (typically: treat the entry as unknown rather than blocking the request
+// goroutine on a wedged FUSE daemon).
+func lstatWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, ok bool) {
+	type result struct {
+		fi  os.FileInfo
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		fi, err := os.Lstat(p)
+		ch <- result{fi: fi, err: err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, true // call completed but failed (e.g., ENOENT); caller decides
+		}
+		return r.fi, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
+
 func NewHandler(store *metadata.Store, fusePath string) *JuiceMountHandler {
 	fdPool := NewFDPool()
 	h := &JuiceMountHandler{
@@ -432,8 +458,29 @@ func (h *JuiceMountHandler) ToHandle(f billy.Filesystem, path []string) []byte {
 	hash.Write([]byte(fullPath))
 	inode := hash.Sum64() | (1 << 63) // high bit set = synthetic
 
-	// Insert a minimal cache entry so FromHandle works
-	entry := metadata.MakeEntry(fullPath, false, 0, time.Now(), inode)
+	// QA-18 fix (2026-05-17): determine the REAL IsDir from FUSE before
+	// fabricating the cache entry. Previously this hardcoded IsDir=false,
+	// which under cache pressure (BulkInsert evictOldest pushing a parent
+	// directory out of the cache after rapid sibling creates) re-created
+	// the directory's cache entry as a regular file. Subsequent NFS
+	// LOOKUPs for that path saw type=NF3REG, and any child operation
+	// (create/open/mkdir under it) returned ENOTDIR to the client.
+	// Reproducer: scripts/qa-suite/02-finder.sh "1000 × 1 KiB" test at
+	// file-390 ("Not a directory").
+	//
+	// Lstat against FUSE adds one syscall, but this path only fires on
+	// a cache miss — already a slow path. Guard with the same 2-second
+	// FUSE-wedge timeout the phantom-purge uses so a stalled juicefs
+	// daemon can't block every NFS LOOKUP that lands in this fallback.
+	// On Lstat failure / timeout / nil-fi, we fall back to the original
+	// hardcoded false; the entry will be corrected on the next sync or
+	// LOOKUP that succeeds.
+	isDir := false
+	// (parameter `path` shadows the package here; use string concat.)
+	if fi, ok := lstatWithTimeout(h.fusePath+"/"+fullPath, 2*time.Second); ok && fi != nil {
+		isDir = fi.IsDir()
+	}
+	entry := metadata.MakeEntry(fullPath, isDir, 0, time.Now(), inode)
 	h.store.InsertToCache(entry)
 	go h.store.Insert(entry) // persist async
 

@@ -684,26 +684,49 @@ func (s *Store) CacheStats() (pathCacheSize, inodeCacheSize int) {
 
 // evictOldest trims the caches to maxCacheSize by removing the entries
 // with the oldest mtime. Must be called with s.mu held for writing.
+//
+// QA-18 defense (2026-05-17): directories are always retained. Losing
+// a file entry to LRU just means the next access fabricates a fresh
+// synthetic handle via ToHandle; harmless. Losing a DIRECTORY entry
+// is high-impact: ToHandle's fallback historically hardcoded IsDir=false
+// (now Lstat-corrected, but still slower), and any in-flight LOOKUP
+// for the dir in the eviction window can race with the re-fabrication.
+// Dir count is typically O(thousands) vs file count O(millions), so
+// the memory cost of pinning all dirs is negligible.
 func (s *Store) evictOldest() {
 	if s.maxCacheSize <= 0 || len(s.pathCache) <= s.maxCacheSize {
 		return
 	}
 
-	// Collect all entries, sort by mtime descending, keep the newest maxCacheSize.
-	entries := make([]*Entry, 0, len(s.pathCache))
+	// Split entries: directories always retained, files sorted by mtime.
+	dirs := make([]*Entry, 0, len(s.pathCache)/16)
+	files := make([]*Entry, 0, len(s.pathCache))
 	for _, e := range s.pathCache {
-		entries = append(entries, e)
+		if e.IsDir {
+			dirs = append(dirs, e)
+		} else {
+			files = append(files, e)
+		}
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Mtime.After(entries[j].Mtime)
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Mtime.After(files[j].Mtime)
 	})
 
-	// Build new caches from the newest entries.
-	newPathCache := make(map[string]*Entry, s.maxCacheSize)
-	newInodeCache := make(map[uint64]*Entry, s.maxCacheSize)
+	// Budget: keep all dirs + as many newest files as fit. If dirs alone
+	// exceed maxCacheSize (pathological), keep all dirs anyway (the
+	// alternative — evicting dirs — is the bug we're trying to prevent).
+	fileBudget := s.maxCacheSize - len(dirs)
+	if fileBudget < 0 {
+		fileBudget = 0
+	}
+	if fileBudget > len(files) {
+		fileBudget = len(files)
+	}
+
+	newPathCache := make(map[string]*Entry, len(dirs)+fileBudget)
+	newInodeCache := make(map[uint64]*Entry, len(dirs)+fileBudget)
 	newChildrenIdx := make(map[string]map[string]*Entry)
-	for i := 0; i < s.maxCacheSize && i < len(entries); i++ {
-		e := entries[i]
+	addEntry := func(e *Entry) {
 		newPathCache[e.Path] = e
 		newInodeCache[e.Inode] = e
 		children, ok := newChildrenIdx[e.ParentPath]
@@ -712,6 +735,12 @@ func (s *Store) evictOldest() {
 			newChildrenIdx[e.ParentPath] = children
 		}
 		children[e.Path] = e
+	}
+	for _, e := range dirs {
+		addEntry(e)
+	}
+	for i := 0; i < fileBudget; i++ {
+		addEntry(files[i])
 	}
 
 	s.pathCache = newPathCache
