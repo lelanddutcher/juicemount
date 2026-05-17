@@ -20,7 +20,7 @@ Acceptance tests (from `docs/VISION.md`):
 | 1.3 | Clean unmount in every state | ✓ likely (ordered shutdown + Force Eject landed) — needs real validation |
 | 1.4 | Crash-safe metadata (kill -9 → mountable in <5s) | ⚠ test tooling shipped in `5ec1a33`; real run pending |
 | 1.5 | Recovery diagnostics (Export Diagnostics zip) | ✓ landed in Phase B |
-| 1.6 | Stress test harness (24h CI run) | ⚠ scaffold landed in `74a9739`; 24h soak run pending |
+| 1.6 | Stress test harness (24h CI run) | ⚠ scaffold landed in `74a9739`; goroutine-leak watchdog (iter D) landed in iter 11; 24h soak run pending |
 | 1.7 | Walk-out: pinned files keep working when network drops | ✓ validated 2026-05-16 23:21 via pfctl harness: un-pinned stat refused in 0.02s (budget 2s) |
 | 1.8 | Auto-engage offline mode within 5s of route loss | ✓ validated 2026-05-16 23:21 via pfctl harness: auto_offline=true in 3.28s (budget 5s) |
 | 1.9 | Auto-recover offline mode within 30s of route return | ✓ validated 2026-05-16 23:21 via pfctl harness: auto_offline=false in 0.77s (budget 30s) |
@@ -381,6 +381,81 @@ re-validation. If not: I'll stop the loop after this iteration with
 a PushNotification — eight iterations of tooling on a stale binary
 is the point where continued autonomous work has negative marginal
 value.
+
+### Iteration 11 — 2026-05-17
+
+**Tier:** 1 (Stability).
+**Picked:** tier-1 iter D — goroutine-leak watchdog in `cmd/jmstress`.
+
+**Why this slice (not the next wedge harness):** the iter-10 STATE.md
+note pointed at `nfs-loopback-mid-shutdown.sh` as iter B sub-slice 3.
+Investigation showed that scenario needs JuiceMount Stop triggered
+programmatically — but there is no `/stop` admin endpoint today, only
+`/force-eject` (unmounts but doesn't drain the NFS server). Building
+that endpoint is a real product feature deserving its own slice
+(per "no bundled-PR scope creep"). Pivoting to iter D — a clean
+self-contained code addition that hardens tier-1.6's 24h soak gate.
+
+**Shipped (commit pending):**
+- `cmd/jmstress`: goroutine watchdog component that polls
+  `/debug/pprof/goroutine?debug=1` on a configurable ticker, captures
+  the post-warmup baseline, flags subsequent ticks where count >
+  baseline × multiplier as breaches. Surfaces a `goroutines` block
+  in periodic JSON snapshots and the final summary. Any breach exits
+  jmstress non-zero, so a CI gate parsing the final JSON line OR
+  the exit code catches the leak class where latency and errors look
+  healthy but goroutines ramp unbounded.
+
+  Flags: `--goroutine-check` (default true), `--goroutine-multiplier`
+  (default 3.0 — empirical NLE-worker variance is ~3x; 1.5x would
+  false-positive on healthy workloads), `--goroutine-tick` (default
+  30s), `--goroutine-warmup` (default 5min — delays first tick so
+  baseline reflects steady-state worker activity, not the spike
+  during NLE/backup worker ramp-up).
+
+**Validated:** 3 smoke runs and 1 forced-breach run:
+  - normal 50s run with --goroutine-warmup 15s: baseline=241,
+    current 136-275, max_ratio=1.14, 0 breaches, exit 0
+  - forced --goroutine-multiplier 0.5: 1 breach at tick 2, exit 1,
+    JSON summary shows breaches=1
+  - bad metrics URL: "goroutine watchdog disabled" logged,
+    run completes normally, exit 0
+  - go vet ./cmd/jmstress/ clean; go build OK
+
+**Code-reviewer pass:** 2 MEDIUM addressed:
+  - MED-1: tick() now rejects count <= 0 from fetch() before storing
+    baseline (defends against malformed pprof response producing
+    "total 0" which would divide-by-zero subsequent ratio calcs).
+  - MED-2: probe() now initializes max to the probe count, so any
+    JSON snapshot emitted in the warmup window shows max >= current
+    (avoids confusing readers expecting that invariant).
+  - 2 LOW deferred (fetch-error logging in tick() — would generate
+    per-tick noise on a flapping network; could surface as an error
+    counter in a follow-up).
+
+**Tier-1.6 status:** advances from "scaffold landed" to "scaffold +
+goroutine watchdog landed; 24h soak run pending." The remaining
+gate is the actual 24h soak run, which needs a quiet window.
+
+**NFS-shutdown wedge harness:** deferred pending a `/stop` admin
+endpoint (which would be a tier-1 follow-up product slice). The
+existing two wedge harnesses (`minio-down-mid-read.sh`,
+`fuse-hang-mid-op.sh`) already validate the most common backend-
+failure modes for tier-1.2.
+
+**Broken:** nothing.
+
+**Next:** iteration 12 picks one of:
+  - Ship `/stop` admin endpoint (unblocks the third wedge harness;
+    also useful for headless deployments and automated upgrades).
+  - Kick off the actual 24h soak run with the watchdog enabled
+    (closes tier-1.6 if it passes).
+  - Tier-1.4 crash-recover-test --real run (needs user buy-in for
+    a destructive operation against the live mount).
+
+The `/stop` endpoint is the most-leveraged code work — pick that.
+
+---
 
 ### Iteration 10 — 2026-05-17
 
