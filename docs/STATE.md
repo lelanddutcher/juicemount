@@ -127,6 +127,74 @@ JuiceMount's doesn't, the bug is in our panel config, not the mount.
 
 ---
 
+### QA-7a (2026-05-17) — pin store fd leak after Stop
+
+**Observed during QA-7 triage:** after clicking Stop, the
+JuiceMount app process held the pin.db file open with 9 file
+descriptors and the pin.db-wal with 2, even though stopServerLocked
+documents that pinStore.Close() runs as part of the soft-stop
+sequence. The leak prevents a clean pin-store reset from outside —
+e.g. moving pin.db aside requires killing the app first.
+
+**Where to investigate:** stopServerLocked at bridge/cbridge.go line
+494 nils globalPinStore under globalMu then calls pinStore.Close()
+outside the lock. Either Close() isn't fully releasing the fds, OR
+some OTHER component (Swift UI showing the pinned list?) is also
+holding pin.db open via a different code path. Inspect with
+`lsof <path-to-pin.db>` mid-Stop to confirm.
+
+**Recovery (used 2026-05-17 to clear runaway pins from QA-1 spiral):**
+1. Quit JuiceMount fully (kill app PID)
+2. Kill all juicefs daemons matching fuse-internal
+3. Move pin.db/pin.db-shm/pin.db-wal to backups/
+4. Re-open JuiceMount.app — pin store recreates empty
+
+### QA-7 (2026-05-17) — Stop button doesn't fully stop JuiceMount
+
+**Observed:** clicking Stop in the menu bar ends the NFS share but
+leaves JuiceFS and the JuiceMount background processes running.
+User-visible symptom: "Stop" doesn't feel like stop — things are
+still happening.
+
+**Root cause (already in code, not a bug per se but a UX mismatch):**
+the menu-bar Stop button calls the cgo `NFSServerStop` export, which
+is a deliberate SOFT stop — tears down NFS server + metadata + caches
++ metrics listener, but intentionally leaves FUSE/NFS mounts in
+place so subsequent Start cycles don't require admin password
+re-prompt for re-mount (per the comment in `bridge/cbridge.go`
+line 463-474). `NFSServerShutdown` is the HARD stop that also
+unmounts. The Swift app never wires the hard-stop into a UI control.
+
+**Two possible fixes (pick at investigation time, not bundled with
+the user-reported symptom):**
+
+  1. Rename the menu-bar action: "Stop" → "Stop NFS Server" to set
+     user expectation. Add a separate "Quit JuiceMount" or "Stop
+     Completely" that calls NFSServerShutdown. Preserves the
+     fast-cycle property for power users.
+
+  2. Change Stop to call NFSServerShutdown unconditionally. Matches
+     naive user expectation. Costs the fast Start-Stop cycle (admin
+     re-prompt on each remount) unless we also wire the
+     passwordless-sudo path the offline-resilience harness uses.
+
+**Where to investigate:** `app/JuiceMount/Sources/JuiceMount/UI/
+MenuBarController.swift` for the Stop action handler. The Stop
+button likely calls `nfsBridge.stop()` (which maps to NFSServerStop);
+swapping to `nfsBridge.shutdown()` (or similar — confirm the
+NFSBridge.swift naming) plus a confirm-dialog would land fix #2 in
+~30 min. Fix #1 is more like 1-2 hours (new menu items, two code
+paths, copy revision).
+
+**Why this matters for autonomous testing:** the testing loop needs
+a reliable "tear it all down and re-init" path. Right now
+"click Stop → click Start" leaves stale FUSE state behind. The
+/stop endpoint shipped in iter 12 is the soft-stop too — for a true
+clean-slate cycle we either need a /shutdown endpoint or to fix the
+underlying UX confusion here.
+
+---
+
 ## Pattern: pin/offline subsystem needs a dedicated investigation
 
 QA-1, QA-2, QA-5, QA-6 all point at the pin/offline subsystem.
