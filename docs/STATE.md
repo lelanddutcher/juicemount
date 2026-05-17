@@ -382,6 +382,82 @@ a PushNotification — eight iterations of tooling on a stale binary
 is the point where continued autonomous work has negative marginal
 value.
 
+### Iteration 12 — 2026-05-17
+
+**Tier:** 1 (Stability) — product-feature slice that unblocks
+tier-1.2's third wedge harness.
+**Picked:** ship POST /stop admin endpoint.
+
+**Why this slice:** iter-11's STATE.md note called it out as the next
+unblocker for `scripts/wedge-tests/nfs-loopback-mid-shutdown.sh`. The
+wedge harness needs to trigger JuiceMount Stop programmatically while
+a large read is in flight; today the only entry points are the Swift
+menu-bar Stop button (manual click) and the cgo NFSServerStop export
+(not callable from a shell script). `/stop` closes that gap and is
+independently useful for headless server deployments and automated
+upgrade flows (stop, swap binary, start).
+
+**Shipped (commit pending):**
+- `bridge/cbridge.go`: `handleStopHTTP` registered at POST /stop on
+  the existing localhost-only metrics listener (127.0.0.1:11050,
+  alongside /pin, /offline, /force-eject, etc). Returns
+  {"ok":true,"stopping":true} immediately, flushes, then spawns a
+  goroutine that sleeps 100ms (grace for the kernel to flush the
+  response onto the socket) and calls stopServerLocked() — the same
+  soft-stop sequence the cgo NFSServerStop entry point uses.
+- `stopInProgress` atomic.Bool gates the teardown spawn so concurrent
+  /stop POSTs within the 100ms flush window don't each spawn their
+  own teardown goroutine (stopServerLocked is already serialized by
+  globalMu so the second goroutine would no-op, but it's wasteful
+  and pollutes the goroutine count the iter-11 watchdog observes).
+- NFSServerStart resets stopInProgress so subsequent Start+Stop+Start
+  cycles work as expected (a process-wide sync.Once would be
+  permanently spent after the first /stop).
+
+**Validated:** go vet clean, go build clean, scripts/build-app.sh
+produces a fresh app bundle, `nm -a` confirms `_main.handleStopHTTP`
+and `_main.stopInProgress` symbols are linked, `strings` confirms
+the "/stop" route literal and the "handleStopHTTP: soft-stop
+requested via HTTP" log line are in the binary. Runtime validation
+(POST /stop against a running mount, verify drain semantics)
+requires a binary swap — the live mount is still on iter-10's
+binary (PID 42644 from May 16 17:29).
+
+**Code-reviewer pass:** 1 HIGH addressed, 1 MEDIUM documented,
+2 LOW addressed:
+  - HIGH-1: concurrent-POST double-teardown race. Initial fix used
+    sync.Once but that would permanently break /stop after one use.
+    Switched to atomic.Bool gating + reset on NFSServerStart so the
+    Start+Stop+Start cycle works correctly.
+  - MEDIUM-1: 100ms flush grace is a heuristic; under sustained
+    NFS I/O load the loopback TCP buffer might not drain. Known
+    limitation documented inline; if wedge harness sees flaky
+    empty-body results, switch to ResponseWriter.Hijack().
+  - LOW-1: added jmlog.Info("handleStopHTTP: soft-stop requested",
+    "remote", r.RemoteAddr) so /stop calls are correlatable with
+    "server stopped responding" reports.
+  - LOW-2: subsumed by the HIGH fix (atomic.Bool + reset means no
+    orphaned long-lived goroutines).
+
+**Tier-1 status:** no acceptance-test row changes; this is
+infrastructure unlocking iter B sub-slice 3 (NFS-shutdown wedge
+harness, future iteration).
+
+**Broken:** nothing. /force-eject still available as the existing
+unmount path; /stop is purely additive.
+
+**Next:** iteration 13 picks one of:
+  - Ship `scripts/wedge-tests/nfs-loopback-mid-shutdown.sh` against
+    POST /stop (closes tier-1.2 once user swaps binaries).
+  - Add a `verify-build.sh` manifest entry for handleStopHTTP so
+    future builds catch staleness on this fix too.
+  - Tier-1.6: kick off the 24h soak with the watchdog enabled.
+
+The wedge harness is the most-leveraged: it both validates /stop's
+shutdown semantics AND closes a tier-1.2 acceptance gap.
+
+---
+
 ### Iteration 11 — 2026-05-17
 
 **Tier:** 1 (Stability).
