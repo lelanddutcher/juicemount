@@ -209,9 +209,20 @@ T5_DST="$MOUNT/.wi-t5-$$"
 DESTS+=("$T5_DST")
 dd if=/dev/urandom of="$T5_SRC" bs=1M count=5 2>/dev/null
 # Set a fake Finder xattr on the source so cp -p has something to copy.
-xattr -w com.apple.FinderInfo "00000000000000000000000000000000" "$T5_SRC" 2>/dev/null || true
+# 32-byte hex string (FinderInfo is 32 bytes); some macOS xattr versions
+# reject shorter strings with "Result too large" — that's harmless for
+# this test (we just want SOMETHING for cp -p to try to copy).
+xattr -w com.apple.FinderInfo \
+    "00000000000000000000000000000000000000000000000000000000000000000000000000000000" \
+    "$T5_SRC" 2>/dev/null || true
 src_md5=$(md5 -q "$T5_SRC")
+# cp -p returns non-zero when it warns about xattr issues even if the
+# byte stream copied cleanly. We only care about md5 round-trip and
+# sidecar presence — both are observable after the cp completes.
+# Disable `set -e` for this one call so the harness keeps going.
+set +e
 cp -p "$T5_SRC" "$T5_DST" 2>&1 | head -3
+set -e
 rm -f "$T5_SRC"
 dst_md5=$(md5 -q "$T5_DST" 2>/dev/null)
 dst_size=$(stat -f%z "$T5_DST" 2>/dev/null)
