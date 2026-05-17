@@ -15,6 +15,69 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### QA suite run 20260517-152205 (3-hour pressure test, 30-min actual)
+
+**Final tally:** 76 PASS / 8 FAIL / 7 WARN across 11 phases. Total
+wall-clock 30 min (much faster than the 3h budget — phases 02/04/09
+were the only slow ones; 08-netshape skipped on passwordless-sudo
+availability).
+
+**Clean wins (no investigation needed):**
+  - 02-finder ✓ 12/12 (cp -p, cp -R, mv, Spotlight, Quick Look, rsync, 1000 small files)
+  - 06-concurrency ✓ 6/6 (16 writers, 32 readers, mixed 8R+8W, tar round-trip)
+  - 07-failure ✓ 7/7 (SIGSTOP juicefs, cancel mid-copy, pin/unpin)
+  - 09-endurance ✓ 3/3 — RSS DROPPED 1.59GB→1.26GB over 20min (no leak),
+    fd count 2007→912, rpc_errors=0
+  - 10-control-plane ✓ 13/13 (every HTTP endpoint, 100-way /health hammer)
+
+**Real findings to investigate:**
+
+**QA-17 candidate — fio random reads return EIO at random offsets.**
+  All read-class fio profiles (seqread-1m, randread-4k, randread-1m,
+  mixed-7030, parallel-randmix) and randwrite-4k failed with kernel
+  EIO. Seqread fails AT OFFSET 0 of a just-written file. Writes that
+  are sequential (seqwrite-1m, parallel-write) succeed. **Most likely
+  a macOS POSIX-AIO + NFS-loopback incompatibility, not a JuiceMount
+  bug.** The harness used `--ioengine=posixaio`; macOS POSIX AIO over
+  NFS is known-flaky. Re-test with `--ioengine=psync` to confirm: if
+  it passes, fix the harness (close); if it still fails, real bug.
+  Patch path: scripts/qa-suite/04-fio.sh line 39 `--ioengine=posixaio`
+  → `--ioengine=psync`.
+
+**QA-16 residual flake — 1 stochastic md5 mismatch in concurrent
+write test 4.2.** Test 4 (4 × 10 MiB simultaneous writes to distinct
+paths) reported 1/4 corrupted. The same harness passed 3 back-to-back
+clean runs immediately after the C.6 fix in Loop C. Failure here may
+be a TIMING-DEPENDENT residual that only surfaces under sustained
+multi-phase load (this test was run within phase 01-smoke, just after
+the suite kicked up). May or may not be reproducible — needs a focused
+re-test of just the multi-RPC concurrent write path under load.
+
+**Performance baselines (informational, not regressions):**
+  - 5000-file flat-dir creation: 34 files/s (acceptable for NFSv3 loopback)
+  - 10× readdir on 5000 entries: 67s total (~6.7s each — slow but
+    Finder-tolerable; tier-1.2 was Finder-doesn't-freeze, not Finder-fast)
+  - Sequential whole-file playback: 166 MiB/s
+  - 100 random ±1 MiB seeks: 100 seeks/s
+
+**Not exercised this run:**
+  - 08-netshape (dnctl/pfctl bandwidth/latency/loss + auto-offline
+    recovery — reproducer for QA-15). Skipped because passwordless
+    sudo for pfctl wasn't configured. To exercise: `sudo visudo` and
+    add `<user> ALL=(ALL) NOPASSWD: /sbin/pfctl, /usr/sbin/dnctl`
+    then re-run with `PHASES="08-netshape" bash scripts/qa-suite/run-all.sh`.
+
+**Harness bugs found (fix in scripts/qa-suite/, not JuiceMount):**
+  - 03-media.sh bulk import: `rm -f "$src" &` races the `cp &` — src
+    deleted before cp opens it. Remove the `&` from rm.
+  - run-all.sh: `TOTAL_FAIL: unbound variable` at exit when the totals
+    loop runs in a subshell context under `set -u`. Defaults needed.
+  - 10-control-plane.sh `/pin` and `/selftest` endpoint probes — the
+    `/pin` requires `?path=` query param not POST body; `/selftest`
+    GET returns endpoint listing, needs POST. Re-check API contracts.
+
+Artifacts: /tmp/jm-qa-artifacts/20260517-152205/
+
 ### QA-9 (2026-05-17) — pin progress feels stuck at scale — ⚠ landed-needs-validation 2026-05-17
 
 **Fix (Loop A.9, iter 21, 2026-05-17 ~03:30):**
