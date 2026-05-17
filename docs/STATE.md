@@ -380,6 +380,24 @@ Recommend (b)+(c) for the first ship. (a) is appealing but the
 "call stop first, then start" sequencing is exactly the recovery
 flow that goes wrong elsewhere in the codebase.
 
+### Loop C.0 (2026-05-17) — write-integrity harness — ⚠ harness landed, runtime validation pending
+
+**Shipped:** `scripts/wedge-tests/write-integrity.sh` with 5 test cases
+covering (1) small single-RPC 512 KiB, (2) medium 10 MiB multi-RPC,
+(3) large 200 MiB multi-RPC, (4) 4 concurrent parallel writes,
+(5) cp -p with xattrs (Finder-equivalent).
+
+Per docs/QA-procedure.md Rule 1, this is now the primary correctness
+gate for any change touching nfs/, internal/nfs/, bridge/, cache/,
+metadata/.
+
+Validation pending: at commit time, the JuiceMount app was running
+but `.idle` (autoMount: false), so /Volumes/zpool was not mounted
+as nfs. Harness needs an active NFS mount to run. Once the user
+clicks Start in the menu bar, the harness can be invoked and is
+expected to FAIL on tests 2-5 (proving it detects QA-14). C.1 then
+proceeds with the fix, and the harness should PASS afterward.
+
 ### QA-14 (2026-05-17, user QA) — NFS write path corrupts bytes (size right, content wrong)
 
 **Observed (validation of QA-13 fix, 2026-05-17 ~14:15):** with
