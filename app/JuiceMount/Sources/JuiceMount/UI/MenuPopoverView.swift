@@ -29,6 +29,7 @@ struct MenuPopoverView: View {
     @State private var prevCachedBytes: Int64 = 0
     @State private var prevCachedAt: Date = .distantPast
     @State private var pinRateMBps: Double = 0
+    @State private var showStopEverythingConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1027,12 +1028,38 @@ struct MenuPopoverView: View {
                 action: {}
             )
         case .running, .syncing, .degraded:
+            // Two-tier Stop (QA-7, 2026-05-17):
+            //   - "Stop mount and finish sync" → ServerController.stopMount()
+            //     Unmounts /Volumes/<name> + drains in-flight sync, but
+            //     keeps FUSE + JuiceFS alive so next Start is fast.
+            //   - "Stop everything" → ServerController.stop()
+            //     Full teardown — also unmounts FUSE + kills JuiceFS
+            //     daemons. Next Start re-mounts (admin password if
+            //     passwordless-sudo not configured).
             ActionButton(
-                title: "Stop JuiceMount",
+                title: "Stop mount and finish sync",
+                systemImage: "pause.fill",
+                tint: .orange,
+                action: { server.stopMount() }
+            )
+            ActionButton(
+                title: "Stop everything",
                 systemImage: "stop.fill",
                 tint: .red,
-                action: { server.stop() }
+                action: { showStopEverythingConfirm = true }
             )
+            .confirmationDialog(
+                "Stop everything?",
+                isPresented: $showStopEverythingConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("Stop everything", role: .destructive) {
+                    server.stop()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Unmounts the volume and kills the JuiceFS daemon. Next Start may prompt for your password to re-mount. Use \"Stop mount and finish sync\" if you'll restart soon.")
+            }
         }
     }
 

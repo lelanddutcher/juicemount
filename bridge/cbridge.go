@@ -173,6 +173,21 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// silently disable below 10% free, sending every read straight
 			// to S3 with no warning. 1% is the sweet spot for our use case
 			// — the disk is the cache.
+			// QA-7 followup: if we're entering this branch with a still-
+			// live globalFUSE (e.g. fuseLooksHealthy misfired after
+			// NFSServerStopMount which intentionally preserved it), stop
+			// the old manager FIRST so we don't leak its monitor
+			// goroutine. The old FUSEManager's monitor would otherwise
+			// keep ticking against the now-replaced mount and could
+			// race with the new one. Idempotent — Stop on an already-
+			// stopped manager is a no-op.
+			if globalFUSE != nil {
+				jmlog.Warn("Start: replacing existing globalFUSE that fuseLooksHealthy rejected — stopping the old one first to prevent monitor leak",
+					"path", cfg.FUSEPath)
+				oldFM := globalFUSE
+				globalFUSE = nil
+				oldFM.Stop()
+			}
 			fm := health.NewFUSEManager(health.FUSEConfig{
 				RedisURL:       cfg.RedisURL,
 				MountPoint:     cfg.FUSEPath,
@@ -611,6 +626,46 @@ func stopServerLocked() {
 //     timeo=10,retrans=2 the wedge is annoying-not-catastrophic; with
 //     the old timeo=300,retrans=5 settings, a wedge required reboot.
 //
+// NFSServerStopMount is the middle-ground Stop semantic (QA-7,
+// 2026-05-17): unmount NFS so /Volumes/<name> disappears from the
+// user's view, then tear down the NFS server + metadata + caches +
+// metrics — but leave FUSE/JuiceFS alive so the next Start avoids
+// the admin-password re-prompt for re-mount.
+//
+// Use this for the menu-bar "Stop mount and finish sync" button.
+// Full teardown (kills JuiceFS daemons + unmounts FUSE) is still
+// NFSServerShutdown — wired to the "Stop everything" button.
+//
+//export NFSServerStopMount
+func NFSServerStopMount() {
+	globalMu.Lock()
+	mountPath := globalMountPath
+	// Mark mount-gone publicly so concurrent Stats / IsRunning read
+	// honest state during the slow unmount.
+	globalMountPath = ""
+	globalMu.Unlock()
+
+	// Step 1: unmount NFS while server is still alive so the kernel
+	// gets clean flush/getattr responses during the unmount handshake.
+	if mountPath != "" {
+		if !unmountNFS(mountPath) {
+			jmlog.Error("nfs unmount FAILED during StopMount",
+				"mount_point", mountPath,
+				"hint", "killing server anyway; user can run sudo umount -f -t nfs")
+		}
+	}
+
+	// Step 2: tear down server + metadata + caches + metrics. This is
+	// the same drain that NFSServerStop does (which is what gives the
+	// "finish sync" semantic — the metadata sync goroutine and the
+	// in-flight RPC queue both drain cleanly here).
+	stopServerLocked()
+
+	// Step 3: deliberately DO NOT touch globalFUSE — leaving
+	// FUSE/JuiceFS alive is the whole point of this entry point.
+	// The next Start will reuse the existing FUSE mount.
+}
+
 //export NFSServerShutdown
 func NFSServerShutdown() {
 	// CRITICAL: do NOT hold globalMu across the slow unmount paths. Each
