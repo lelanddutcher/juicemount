@@ -100,18 +100,39 @@ except Exception:
 }
 
 # Engage pf block on outbound traffic to TARGET_HOST:TARGET_PORT.
-# Idempotent: removes any prior juicemount-test ruleset first.
+#
+# Anchor choice: we use `com.apple/250.JuiceMountTest` — a sub-anchor
+# under com.apple/* which is the only namespace /etc/pf.conf evaluates
+# automatically on macOS via the line:
+#     anchor "com.apple/*"
+# Custom top-level anchors (e.g. com.juicemount/...) load successfully
+# but are never reached during packet evaluation because pf.conf
+# doesn't reference them. The numeric prefix `250.` keeps us sorted
+# after Apple's own sub-anchors (typically 200-series); the name half
+# makes it obvious in `pfctl -s Anchors` what put the rules there.
+#
+# Idempotent: re-loading overwrites any prior rules in the same anchor.
+PF_ANCHOR="com.apple/250.JuiceMountTest"
 engage_block() {
     local rule="block out quick proto tcp from any to $TARGET_HOST port $TARGET_PORT"
-    echo "$rule" | sudo -n /sbin/pfctl -a com.juicemount/test -f - 2>/dev/null
-    # The anchor must be activated via the main pf ruleset.
-    # On systems where pf isn't enabled by default, -E enables it.
+    # Enable pf overall if it isn't already (no-op when already on).
     sudo -n /sbin/pfctl -E 2>/dev/null || true
+    # Load rule into the evaluated sub-anchor.
+    echo "$rule" | sudo -n /sbin/pfctl -a "$PF_ANCHOR" -f - 2>/dev/null
 }
 
 # Remove the pf block.
 release_block() {
-    sudo -n /sbin/pfctl -a com.juicemount/test -F all 2>/dev/null || true
+    sudo -n /sbin/pfctl -a "$PF_ANCHOR" -F all 2>/dev/null || true
+}
+
+# Probe whether the pf rule is actually taking effect. Returns 0 (true)
+# if the target is currently blocked; non-zero if it's reachable.
+# Used to validate that engage_block did something — pf rule-loading
+# silently no-ops when the anchor isn't in the evaluation path.
+is_blocked() {
+    nc -G 1 "$TARGET_HOST" "$TARGET_PORT" </dev/null 2>/dev/null
+    [ $? -ne 0 ]
 }
 
 # Wait up to $1 seconds for the predicate $2 to be true. Returns
@@ -201,7 +222,19 @@ log ""
 log "== test 1.8: auto-engage offline within ${ENGAGE_BUDGET}s of network loss =="
 log "  engaging pf block to $TARGET_HOST:$TARGET_PORT..."
 engage_block
-log "  pf rule active. Polling /offline for auto_offline=true..."
+# Validate the block is actually in effect — pf silently no-ops when
+# the anchor isn't in the evaluation path. If the rule loaded but pf
+# isn't routing through it, every downstream test fails for the wrong
+# reason. Fail fast here with a clear message instead.
+if ! is_blocked; then
+    fail "pf block loaded but $TARGET_HOST:$TARGET_PORT is still reachable"
+    fail "  pf state: $(sudo -n /sbin/pfctl -s info 2>&1 | grep '^Status' || echo unknown)"
+    fail "  anchor rules: $(sudo -n /sbin/pfctl -a $PF_ANCHOR -s rules 2>&1 | head -1 || echo none)"
+    fail "  cleanup: sudo /sbin/pfctl -a $PF_ANCHOR -F all"
+    release_block
+    exit 2
+fi
+log "  ✓ pf block confirmed effective. Polling /offline for auto_offline=true..."
 
 engage_elapsed=$(wait_for "$ENGAGE_BUDGET" '[ "$(auto_offline)" = "true" ]') || true
 if [[ "$engage_elapsed" == "-1" ]]; then
