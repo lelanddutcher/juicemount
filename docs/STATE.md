@@ -50,7 +50,41 @@ SHOW activity at scale even when fewer percent of the bytes are
 cached, so users don't see a flat 0 KB readout. Goal A.9 in the
 current loop will fix that via the popover rate readout.
 
-### QA-2 (2026-05-17) — offline toggle blocks cached files
+### QA-2 (2026-05-17) — offline toggle blocks cached files — ✓ CLOSED 2026-05-17 (works correctly)
+
+**Investigation outcome (Loop A iter 18, 2026-05-17 ~03:10):**
+
+Could not reproduce. The handler's read path at nfs/handler.go:994
+(`cachedFile.ReadAt`) services reads in priority order:
+  1. MemoryBuffer (memBuf) — hits return immediately
+  2. SSD cache reader (cacheReader) — hits return immediately
+  3. FUSE fallthrough — ONLY at this point does the
+     `pin.IsOffline() && !f.pinned` gate at line 1044 fire
+
+So cached content is ALREADY served before the offline gate is even
+consulted. This is exactly what QA-2 asked for.
+
+Tested with offline toggled true:
+  - Pinned file (VOs): read worked, 172ms (served from pin cache)
+  - Cached-but-unpinned file (Bolts, 10 MB full read): worked, 16ms
+  - Fresh-untouched file (OVERLAYS): **failed fast with exit=1 in 7ms**
+    — the gate fires correctly only for genuinely uncached content
+
+The OpenFile gate at line 745 enforces the same logic at open-time
+(refuses unpinned files when offline) — but only after the cache
+readers' attempts have completed. So the user's hypothesis ("gate
+fires too eagerly even when bytes are in cache") doesn't match the
+code: the gate only refuses when both cache layers MISS.
+
+Like QA-1 and QA-5, the original report was likely environmental
+(degraded FUSE/Redis state) rather than a code bug.
+
+KEEPING ORIGINAL ENTRY BELOW for archeology — but the symptom is
+not currently reproducing in a clean environment.
+
+---
+
+### QA-2 (original report, 2026-05-17) — offline toggle blocks cached files
 
 **Observed:** toggling offline in the app lets navigation continue
 (good — directory listings work), but files the user JUST opened or
