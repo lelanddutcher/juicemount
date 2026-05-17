@@ -192,7 +192,36 @@ Like QA-1, the original report was likely tied to the same broken-
 environment scenario. The fix that landed in 9a1f229 ("Sync now also
 re-verifies pinned coverage") is doing the right thing.
 
-### QA-6 (2026-05-17) — Pin folder dialog blocks directory navigation
+### QA-6 (2026-05-17) — Pin folder dialog blocks directory navigation — ⚠ landed-needs-validation 2026-05-17
+
+**Root cause (Loop A.6, iter 20, 2026-05-17 ~03:10):** JuiceMount
+is an LSUIElement accessory app (no Dock icon, menu-bar only). When
+NSOpenPanel.runModal() runs from inside the popover, macOS does NOT
+auto-promote the app to foreground. The panel APPEARS but focus and
+click events fall through to whatever full-app was previously
+foreground — textbook "panel visible, clicks don't register"
+symptom.
+
+**Fix:** added `NSApp.activate()` immediately before runModal so
+the panel becomes the keyWindow with focus. Also set:
+  - `treatsFilePackagesAsDirectories = true` so video-production
+    packages (.photoslibrary, .fcpbundle, .drp) can be descended
+    into (side-effect: .app bundles also traversable — harmless).
+  - `canCreateDirectories = false` (we're pinning existing folders).
+  - `showsHiddenFiles = false`.
+
+Code-reviewer pass: 2 MEDIUM both addressed — switched to the
+non-parameterized `NSApp.activate()` form (macOS 14+ API; old form
+deprecated in Sonoma), and added a comment noting the .app descent
+side-effect.
+
+Validation pending binary swap: user quit + reopen, click Pin
+Folder for Offline, verify panel opens AND clicks into
+subdirectories navigate normally.
+
+---
+
+### QA-6 (original report, 2026-05-17) — Pin folder dialog blocks directory navigation
 
 **Observed:** clicking "Pin folder for offline" opens a Finder-
 style picker, but clicking into subdirectories doesn't work. The

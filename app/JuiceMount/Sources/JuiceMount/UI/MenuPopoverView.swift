@@ -446,6 +446,20 @@ struct MenuPopoverView: View {
     /// Opens a folder picker rooted at the JuiceMount mount and pins the
     /// chosen directories. Pin work runs on a background queue so the
     /// popover doesn't freeze.
+    ///
+    /// QA-6 fix: NSStatusItem-based menu-bar apps run as accessory apps
+    /// (LSUIElement). When a modal NSOpenPanel is spawned from inside
+    /// the popover, macOS doesn't always promote the app to a regular
+    /// foreground app — the panel appears but click events go to
+    /// whatever full-app currently owns the foreground. Symptom: panel
+    /// is visible but clicks into subdirectories register nothing.
+    ///
+    /// The fix has two parts: (a) explicitly activate the app
+    /// (`NSApp.activate(ignoringOtherApps: true)`) before runModal so
+    /// the panel becomes the keyWindow with focus, and (b) set
+    /// `treatsFilePackagesAsDirectories = true` so .photoslibrary,
+    /// .app, .bundle etc. behave like directories (some video assets
+    /// arrive as packages from FCP / DaVinci).
     private func pickFolderToPin() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -454,6 +468,21 @@ struct MenuPopoverView: View {
         panel.directoryURL = URL(fileURLWithPath: server.preferences.mountPoint)
         panel.message = "Select folder(s) to pre-cache for offline use."
         panel.prompt = "Pin"
+        // treatsFilePackagesAsDirectories lets us descend into video-
+        // production packages (.photoslibrary, .fcpbundle, .drp) which
+        // is the intent. Side-effect: .app bundles also become
+        // traversable — confusing but harmless; pinning the inside of
+        // an .app is a no-op for the user's typical workflow.
+        panel.treatsFilePackagesAsDirectories = true
+        panel.canCreateDirectories = false  // we're pinning existing folders, not creating new ones
+        panel.showsHiddenFiles = false
+
+        // Promote the accessory app to foreground so the modal panel
+        // becomes key — without this, panel clicks fall through to
+        // whatever Foreground app the user was in. Non-parameterized
+        // form is the macOS 14+ recommended API (parameterized form is
+        // deprecated as of Sonoma).
+        NSApp.activate()
 
         guard panel.runModal() == .OK else { return }
         let urls = panel.urls
