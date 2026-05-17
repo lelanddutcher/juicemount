@@ -102,8 +102,37 @@ func (p *Prefetcher) EnqueueWait(ctx context.Context, e Entry) error {
 	}
 }
 
+// Go launches fn as a tracked background goroutine. Stop() waits for
+// every Go-launched goroutine to return before completing. Use this
+// for long-running loops (PullPending, ReWarmupLoop) that hold pin
+// store references — calling `go x.PullPending(...)` directly leaks
+// SQLite file descriptors on Stop because the goroutine may still
+// have a connection checked out when Close runs (QA-7a, 2026-05-17).
+//
+// The Add MUST happen synchronously here, not inside fn, otherwise
+// Stop().Wait() can return before fn even gets a chance to register
+// itself — wg.Add after the counter has hit zero is undefined.
+func (p *Prefetcher) Go(fn func()) {
+	// Defensive: Go() called after Stop() would race wg.Add against
+	// a zero-counter Wait — undefined per sync.WaitGroup docs. Today
+	// the only callers are in NFSServerStart before any shutdown, so
+	// this is belt-and-suspenders. Returning silently rather than
+	// panicking keeps a misuse from taking down the whole process.
+	select {
+	case <-p.stopCh:
+		return
+	default:
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		fn()
+	}()
+}
+
 // PullPending repeatedly drains the store's Pending queue and enqueues
-// jobs. Runs until ctx is cancelled. Call this from a daemon goroutine.
+// jobs. Runs until ctx is cancelled. Call via Prefetcher.Go so the
+// goroutine is tracked for Stop's wg.Wait (QA-7a).
 func (p *Prefetcher) PullPending(ctx context.Context, batchSize int) {
 	if batchSize <= 0 {
 		batchSize = 100
@@ -136,6 +165,7 @@ func (p *Prefetcher) PullPending(ctx context.Context, batchSize int) {
 // pinned file falls off the LRU under cache pressure and gets evicted.
 //
 // ttl is how stale a file can get before re-warmup. Recommended: 6 hours.
+// Call via Prefetcher.Go (QA-7a — see PullPending comment).
 func (p *Prefetcher) ReWarmupLoop(ctx context.Context, ttl time.Duration, batchSize int) {
 	if batchSize <= 0 {
 		batchSize = 50

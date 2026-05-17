@@ -304,7 +304,47 @@ JuiceMount's doesn't, the bug is in our panel config, not the mount.
 
 ---
 
-### QA-7a (2026-05-17) — pin store fd leak after Stop
+### QA-7a (2026-05-17) — pin store fd leak after Stop — ⚠ landed-needs-validation 2026-05-17
+
+**Root cause (Loop A.11, iter 22, 2026-05-17 ~03:50):**
+
+`Prefetcher.Stop()` does `close(stopCh); close(jobs); p.wg.Wait()`.
+But `p.wg` only tracked the worker-loop goroutines (registered in
+`NewPrefetcher`). The two LONG-RUNNING daemons launched from
+cbridge.go — `PullPending` and `ReWarmupLoop` — were spawned via
+plain `go globalPrefetcher.X(...)` with no wg tracking. So
+`wg.Wait()` returned while those loops were mid-query on the pin
+store, and `pinStore.Close()` (immediately after, in
+stopServerLocked) raced with SQLite connections still checked out
+→ leaked file descriptors on every Stop cycle.
+
+**Fix:** new `Prefetcher.Go(fn)` helper that does `p.wg.Add(1)`
+synchronously then `go func(){ defer wg.Done(); fn() }()`. The Add
+MUST happen synchronously with the launch (not inside the goroutine
+body) — otherwise `Stop().Wait()` could complete before the
+goroutine got a chance to register itself, and a subsequent `Add`
+on a zero-counter wg with active Wait is undefined per Go docs.
+
+cbridge.go now spawns the two daemons via `pf.Go(func() { pf.X() })`,
+with `pf` snapshotted into a local so the closures don't TOCTOU
+against a future re-Start's globalPrefetcher.
+
+Bonus cleanup along the way: replaced the historical structural-
+interface `contextLike` type alias with `context.Context` directly
+for `globalPinCtx`. Removes the runtime type-assertion in the
+launch sites.
+
+Code-reviewer pass: 2 MEDIUM addressed (closure capture, contextLike
+removal), 1 LOW addressed defensively (`Go()` returns silently if
+called after Stop closed the stopCh, vs panicking).
+
+Validation pending binary swap: user reopens, pins a folder, clicks
+Stop, verifies `lsof ~/Library/Application\ Support/JuiceMount/pin.db`
+shows zero fds (vs the 9 + 2 we saw on the broken binary).
+
+---
+
+### QA-7a (original report, 2026-05-17) — pin store fd leak after Stop
 
 **Observed during QA-7 triage:** after clicking Stop, the
 JuiceMount app process held the pin.db file open with 9 file

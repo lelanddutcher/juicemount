@@ -330,10 +330,22 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if ps, err := pin.Open(pinDBPath); err == nil {
 		globalPinStore = ps
 		globalPrefetcher = pin.NewPrefetcher(ps, cfg.FUSEPath, cfg.MountPoint, 4)
-		// Long-running daemons that drain the queue and re-warm pinned files.
-		// They terminate when globalPrefetcher.Stop() is called in shutdown.
-		go globalPrefetcher.PullPending(globalPinCtx(), 100)
-		go globalPrefetcher.ReWarmupLoop(globalPinCtx(), 6*time.Hour, 50)
+		// Long-running daemons that drain the queue and re-warm pinned
+		// files. Launched via Prefetcher.Go so they're tracked by the
+		// prefetcher's wg — Stop()'s wg.Wait then actually waits for
+		// them to exit before the caller proceeds to pinStore.Close.
+		// QA-7a fix: previously these were `go globalPrefetcher.X(...)`
+		// directly, leaving them outside wg tracking, so Stop returned
+		// while they still had pin.db connections out → SQLite file-
+		// descriptor leak on every Stop cycle.
+		//
+		// Capture the prefetcher into a local before closing over it so
+		// a future Stop-then-Start cycle's new globalPrefetcher doesn't
+		// silently inherit these still-running closures (review MEDIUM).
+		pf := globalPrefetcher
+		pinCtx := globalPinCtx()
+		pf.Go(func() { pf.PullPending(pinCtx, 100) })
+		pf.Go(func() { pf.ReWarmupLoop(pinCtx, 6*time.Hour, 50) })
 		// Wire the pin store into the NFS handler so the offline-mode
 		// open gate can fail-fast on un-pinned reads. The mount point is
 		// the prefix the gate uses to canonicalize in-mount filenames into
@@ -1372,16 +1384,16 @@ var globalPinCtxBox struct{ ctx interface{ Done() <-chan struct{} } } // lazy in
 
 // globalPinCtx returns the context. Use a closure to avoid pulling in
 // context globally where it isn't needed.
-func globalPinCtx() (ctx contextLike) {
+// globalPinCtx returns the process-lifetime context that backs
+// long-running pin/prefetcher daemons. Returning context.Context
+// directly (rather than the historical structural-interface alias)
+// lets callers pass the result through to context.WithTimeout /
+// context.WithCancel without a type assertion. The concrete bgCtx{}
+// implements every Context method so the interface conversion is
+// trivial.
+func globalPinCtx() context.Context {
 	// Background context lives for the whole process. Good enough for v1.
 	return bgCtx{}
-}
-
-type contextLike = interface {
-	Done() <-chan struct{}
-	Err() error
-	Value(key any) any
-	Deadline() (time.Time, bool)
 }
 
 type bgCtx struct{}
