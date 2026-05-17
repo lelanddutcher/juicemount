@@ -15,20 +15,40 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
-### QA-1 (2026-05-17) — pinned folders not downloading
+### QA-1 (2026-05-17) — pinned folders not downloading — ✓ CLOSED 2026-05-17 (could not reproduce)
 
-**Observed:** marking a folder as pinned does not cause its bytes to
-download to the local cache.
+**Original observation:** marking a folder as pinned does not cause
+its bytes to download.
 
-**Reporter:** user, manual test.
-**Where to investigate:** `internal/cache/pin/prefetcher.go` —
-specifically `workerLoop` and the pin-enqueue path. Worth checking:
-(a) does pinning enqueue work at all? (b) is the prefetcher worker
-goroutine alive? (c) is the work it produces being silently rejected
-by MinIO (auth / network)?
-**Repro hint:** mount up, pick a folder, "Pin for Offline" from the
-UI, watch `internal/cache/pin/` activity in juicemount.log and
-/metrics. Expected: pin-progress metric climbs.
+**Investigation outcome (Loop A iter 15-16, 2026-05-17 ~02:55):**
+
+Could not reproduce after the clean reset documented in QA-7a.
+Tested at three scales against fresh binary ba47621+:
+  - 41 MB (Bolts, pre-cached): pin returned in 34ms with ReadyFiles=7
+    instant — bytes were already in JuiceFS chunk cache.
+  - 502 MB (VOs): cold-cache, 0 → 100% within 3s. CachedBytes climbed
+    +526 MB in one watcher tick.
+  - 6.6 GB (GRAINS & DUST): 0 → 100% within 6s (1.8 GB/s observed,
+    indicating warm chunk cache); CachedBytes counter climbed
+    cleanly across ticks.
+
+The /pin HTTP endpoint and the cgo NFSServerPin (which the Swift
+UI calls via NFSBridge.pin) route to the SAME pinStore.PinMany
+code, so the UI path can't behave differently from the HTTP path.
+
+**Hypothesis for the original report:** the symptom was the
+combination of (a) the degraded mount environment (Redis "no route
+to host", FUSE daemon dead, auto-offline engaged) that we found at
+loop resume earlier in this session, plus (b) the user accidentally
+pinned the entire mount root, which floods the prefetcher with
+thousands of files and the popover's CachedBytes/TotalBytes counter
+appears stuck near zero for minutes while the queue drains. Not a
+"doesn't work" — a "doesn't work fast enough at runaway scale."
+
+QA-9 (added below) tracks the UX side of this: pin progress should
+SHOW activity at scale even when fewer percent of the bytes are
+cached, so users don't see a flat 0 KB readout. Goal A.9 in the
+current loop will fix that via the popover rate readout.
 
 ### QA-2 (2026-05-17) — offline toggle blocks cached files
 
