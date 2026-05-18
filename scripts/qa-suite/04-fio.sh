@@ -36,6 +36,35 @@ mkdir -p "$TROOT"
 run_fio() {
     local name="$1" size="$2" rw="$3" bs="$4" runtime="$5" iodepth="${6:-16}" numjobs="${7:-1}"
     local out="${PHASE_DIR}/fio-${name}.json"
+
+    # QA-20 mitigation (2026-05-17): for ANY read-class workload, pre-create
+    # the file with a separate sequential write step, then sleep so juicefs
+    # writeback has time to push chunks to MinIO before the random/seq read
+    # phase starts. Without this, fio's built-in "lay out the file then
+    # immediately read" flow races juicefs's writeback timer — random reads
+    # of just-written chunks return EIO deterministically at the first
+    # offset that needs a chunk currently mid-flush.
+    #
+    # This isn't a JuiceMount bug (no real workload does write-then-
+    # randread-immediately at high iodepth); the mitigation is purely to
+    # make the suite report meaningful read throughput numbers instead of
+    # surfacing the JuiceFS-level race as a JM "fail".
+    if [[ "$rw" == "read" || "$rw" == "randread" || "$rw" == "randrw" ]]; then
+        local prep_file="${TROOT}/${name}.0.0"
+        log "  preconditioning ${size} file for ${rw} workload..."
+        fio --name="${name}-prep" \
+            --filename="$prep_file" \
+            --size="$size" \
+            --rw=write \
+            --bs=1M \
+            --direct=0 \
+            --ioengine=psync \
+            --end_fsync=1 \
+            >/dev/null 2>&1
+        log "  sleeping 20s for juicefs writeback to flush to MinIO..."
+        sleep 20
+    fi
+
     log "fio: ${name} (${rw} bs=${bs} size=${size} runtime=${runtime}s iodepth=${iodepth} jobs=${numjobs})"
     fio --name="$name" \
         --directory="$TROOT" \

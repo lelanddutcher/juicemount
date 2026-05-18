@@ -67,13 +67,21 @@ cp -R "$TREE_SRC" "$TREE_DST" 2>"${PHASE_DIR}/cp-R.err"
 cp_exit=$?
 set -e
 ELAPSED=$(( $(date +%s) - START ))
-DST_FILES=$(find "$TREE_DST" -type f 2>/dev/null | wc -l | tr -d ' ')
-DST_TOTAL=$(du -sk "$TREE_DST" 2>/dev/null | awk '{print $1}')
-log "cp -R: $SRC_FILES files / ${SRC_TOTAL}K → $DST_FILES files / ${DST_TOTAL}K in ${ELAPSED}s, exit=$cp_exit"
+# QA-21 fix (2026-05-17): exclude `._*` AppleDouble sidecars from the dst
+# count + size. macOS cp creates a `._dirname` sidecar (4096 bytes each)
+# for every directory it copies when the dst filesystem isn't HFS+/APFS
+# native — so the dst legitimately ends up larger than src by
+# (#dirs × 4096). Old assertion was byte-exact and falsely failed.
+# We compare the DATA-FILE counts and sizes (what the user actually cares
+# about); the sidecar accumulation is reported as informational.
+DST_FILES=$(find "$TREE_DST" -type f ! -name '._*' 2>/dev/null | wc -l | tr -d ' ')
+DST_TOTAL=$(find "$TREE_DST" -type f ! -name '._*' -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
+DST_SIDECARS=$(find "$TREE_DST" -type f -name '._*' 2>/dev/null | wc -l | tr -d ' ')
+log "cp -R: $SRC_FILES files / ${SRC_TOTAL}K → $DST_FILES data files (+$DST_SIDECARS sidecars) / ${DST_TOTAL}K in ${ELAPSED}s, exit=$cp_exit"
 if [[ "$SRC_FILES" -eq "$DST_FILES" && "$SRC_TOTAL" -eq "$DST_TOTAL" ]]; then
-    pass "cp -R file count + total size match"
+    pass "cp -R file count + total size match (data files only)"
 else
-    fail "cp -R divergence: src=$SRC_FILES/${SRC_TOTAL}K vs dst=$DST_FILES/${DST_TOTAL}K"
+    fail "cp -R divergence: src=$SRC_FILES/${SRC_TOTAL}K vs dst-data=$DST_FILES/${DST_TOTAL}K"
 fi
 
 # Spot-check md5 on a handful of nested files
