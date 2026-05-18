@@ -23,8 +23,11 @@ phase_init "08-netshape"
 
 # ---------------------------------------------------------------------------
 # Detect MinIO target
-BACKEND_HOST="${BACKEND_HOST:-192.168.0.197}"
+BACKEND_HOST="${BACKEND_HOST:-192.168.0.212}"
 BACKEND_PORT="${BACKEND_PORT:-9000}"
+# 192.168.0.212 is the macvlan IP for the juicefs-minio container.
+# Earlier this defaulted to .197 (the SMB host); was a wrong guess.
+# Override with BACKEND_HOST env if your setup differs.
 log "shaping target: ${BACKEND_HOST}:${BACKEND_PORT}"
 
 # Bail early if we can't even reach the backend on a non-shaped run
