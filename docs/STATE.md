@@ -15,6 +15,86 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### QA-23 (2026-05-17, user QA) — popover status indicator doesn't refresh after auto-offline recovers
+
+**Observed:** when the mount goes auto-offline (backend disruption) and
+then the backend recovers, the popover header still shows "JuiceMount
+offline · Xm" indefinitely even though `/health` reports all four
+components green, `/offline` reports `auto_offline: false`, and the
+mount itself performs normally.
+
+**Likely cause:** the popover has two offline state sources:
+  - `cacheStatus.offline_mode` (from `NFSServerCacheStatus` cgo) — what
+    the bottom-row toggle reads
+  - `offlineState.offline` (from HTTP `/offline`) — what the header
+    "Offline · 14m" banner reads
+Both are refreshed by `refreshCacheStatus()` in ServerController.swift,
+but the SwiftUI re-render may not be triggered if the polling task
+doesn't observe a transition edge that re-publishes the value. Or the
+polling cadence is just too long.
+
+**Fix path:** audit `refreshCacheStatus()` polling cadence (currently
+unknown — needs grep); bind both header and toggle to a single
+@Published source so they can't diverge; ensure the @Bindable / @State
+hierarchy in the popover view causes a re-render when offline edge
+flips back to false.
+
+### Feature: allow offline toggle even when nothing pinned (user request 2026-05-17)
+
+**Current behavior:** at `MenuPopoverView.swift:579` the toggle is
+hidden when `cacheStatus.aggregate.TotalFiles == 0 &&
+cacheStatus.live.FilesPrefetched == 0` — replaced with a "Nothing
+pinned yet" message and pin instructions.
+
+**User point:** the JuiceFS chunk cache holds chunks of every file
+ever read, not just pinned content. Offline mode with cache-priority
+reads is genuinely useful even without explicit pins (e.g., "I just
+finished editing this project; let me go offline so I can keep working
+on the train"). Hiding the toggle prevents this workflow.
+
+**Fix:** drop the gate; show the toggle unconditionally; adjust the
+help text to say "Reads on un-cached files fail fast (good for going
+offline with whatever's already cached)" without implying pins are
+required.
+
+### Audit: Reclaim button — currently only thins Time Machine snapshots (user QA 2026-05-17)
+
+**Audit finding (handleReclaimHTTP at bridge/cbridge.go:1742):** the
+button calls `health.ReclaimPurgeableSpace("/", 0)` which under the
+hood runs `tmutil thinlocalsnapshots / 0 4`. That's the only thing
+it does. It does NOT:
+  - Run macOS `purge` (drops cached pages, frees inactive memory)
+  - Touch APFS purgeable space (cleanable containers, system snapshots)
+  - Empty the JuiceFS chunk cache (that's the separate /cache-clear
+    endpoint behind the "Empty cache" button)
+  - Clean app caches, Spotlight rebuild data, etc.
+
+**User's intent:** doesn't want anything aggressive, but wants the
+button to actually do something meaningful when invoked. TM snapshots
+are real, valid, AND something most users won't think to clean
+themselves.
+
+**Verdict:** current scope is the safe one. Reasonable enhancements
+without being aggressive:
+  - Report WHAT was reclaimed in the post-action toast (currently:
+    "Cleared X GB"; could be: "Thinned 4 Time Machine local snapshots,
+    X GB freed")
+  - Optional second button "Deep clean" that also runs `purge` (macOS-
+    native, requires admin) — opt-in, separate from the default
+    Reclaim
+**Not blocking; nice-to-have.**
+
+### Feature: "Open Mount" button in popover (user request 2026-05-17)
+
+Add a button below "Search files" that opens a Finder window at the
+mount path (`/Volumes/zpool-dev/` or whatever `preferences.mountPoint`
+is). Implementation: `NSWorkspace.shared.open(URL(fileURLWithPath:
+preferences.mountPoint))`. Disabled when state ∉ {.running, .syncing,
+.degraded} (no point opening Finder at a path that isn't mounted).
+
+**Low effort (~10 LOC); high UX value** — saves the user a Finder
+navigation every time they want to drag a file in.
+
 ### QA suite — final state-of-the-union (2026-05-17 23:38)
 
 After two iterations of harness fixes on top of the fresh-mount run,
