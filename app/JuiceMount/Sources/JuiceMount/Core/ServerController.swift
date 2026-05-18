@@ -335,8 +335,20 @@ public final class ServerController {
     private func startPolling() {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
+            var tick = 0
             while !Task.isCancelled {
                 self?.refreshStats()
+                // QA-23 fix (2026-05-18): the offline/cache state was only
+                // refreshing on UI events (popover open, toggle click). After
+                // auto-offline recovered the header banner "Offline · Xm"
+                // stayed stuck because offlineState was never re-read. Refresh
+                // cacheStatus + offlineState every 5th tick (~10s) so the
+                // header and toggle converge on backend state within a single
+                // popover sit. Stats poll stays at 2s for snappy health dots.
+                tick &+= 1
+                if tick % 5 == 0 {
+                    self?.refreshCacheStatus()
+                }
                 try? await Task.sleep(for: .seconds(2))
             }
         }

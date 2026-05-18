@@ -1740,15 +1740,15 @@ func handleStopHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleReclaimHTTP(w http.ResponseWriter, r *http.Request) {
-	freed, err := health.ReclaimPurgeableSpace("/", 0)
+	freed, snapshots, source, err := health.ReclaimPurgeableSpace("/", 0)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		w.WriteHeader(500)
 		fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
 		return
 	}
-	fmt.Fprintf(w, `{"ok":true,"freed_bytes":%d,"freed_gb":%.2f}`,
-		freed, float64(freed)/(1<<30))
+	fmt.Fprintf(w, `{"ok":true,"freed_bytes":%d,"freed_gb":%.2f,"snapshots_thinned":%d,"source":%q}`,
+		freed, float64(freed)/(1<<30), snapshots, source)
 }
 
 // cacheClearInProgress gates concurrent /cache-clear POSTs. Without

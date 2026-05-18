@@ -102,7 +102,7 @@ func (fm *FUSEManager) Mount() error {
 	{
 		free, _ := volumeFreeBytes("/")
 		if free < 50*(1<<30) {
-			if freed, err := ReclaimPurgeableSpace("/", 0); err != nil {
+			if freed, _, _, err := ReclaimPurgeableSpace("/", 0); err != nil {
 				jmlog.Warn("auto-reclaim failed (non-fatal)", "error", err.Error())
 			} else if freed > 0 {
 				jmlog.Info("auto-reclaim succeeded before mount",
@@ -693,7 +693,8 @@ func logVolumeCapacityBreakdown(volume string) {
 
 // ReclaimPurgeableSpace asks macOS to free purgeable disk space — primarily
 // Time Machine local snapshots, which can hoard tens of GB on a typical
-// laptop. Returns the bytes freed, or an error.
+// laptop. Returns the bytes freed, count of snapshots thinned, and a
+// human-readable source description (e.g. "Time Machine local snapshots").
 //
 // Mechanism: `tmutil thinlocalsnapshots <vol> <purgeAmountBytes> <urgency>`.
 // Urgency 4 is "as much as possible." It's a non-interactive, no-sudo
@@ -702,7 +703,7 @@ func logVolumeCapacityBreakdown(volume string) {
 // We measure the actual freed bytes by sampling the volume's free space
 // before and after; the tmutil command's own output is unreliable for this
 // (depends on macOS version and which snapshots existed).
-func ReclaimPurgeableSpace(volume string, targetBytes int64) (freedBytes int64, err error) {
+func ReclaimPurgeableSpace(volume string, targetBytes int64) (freedBytes int64, snapshotsThinned int, source string, err error) {
 	beforeFree, _ := volumeFreeBytes(volume)
 
 	// Urgency 4 = thin as much as possible. tmutil rejects "0" as an invalid
@@ -723,7 +724,7 @@ func ReclaimPurgeableSpace(volume string, targetBytes int64) (freedBytes int64, 
 	cmd := exec.CommandContext(tmCtx, "tmutil", "thinlocalsnapshots", volume, amount, "4")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return 0, fmt.Errorf("tmutil thinlocalsnapshots: %w (output: %s)",
+		return 0, 0, "Time Machine local snapshots", fmt.Errorf("tmutil thinlocalsnapshots: %w (output: %s)",
 			err, strings.TrimSpace(string(out)))
 	}
 
@@ -732,13 +733,51 @@ func ReclaimPurgeableSpace(volume string, targetBytes int64) (freedBytes int64, 
 	if freedBytes < 0 {
 		freedBytes = 0 // negative means another process took space concurrently
 	}
+
+	// Parse tmutil's output to count thinned snapshots. The format is
+	// macOS-version-dependent but the common case has lines like:
+	//   "Thinned local snapshots:" followed by one snapshot ID per line
+	//   ("2024-01-01-120000" etc.). On macOS without anything to thin
+	//   the output is usually empty. We count snapshot-ID lines (the
+	//   ones that look like a tmutil snapshot timestamp).
+	snapshotsThinned = countTmutilSnapshotLines(string(out))
+	source = "Time Machine local snapshots"
+
 	jmlog.Info("reclaimed purgeable space",
 		"volume", volume,
 		"freed_gb", fmt.Sprintf("%.1f", float64(freedBytes)/(1<<30)),
 		"before_free_gb", fmt.Sprintf("%.1f", float64(beforeFree)/(1<<30)),
 		"after_free_gb", fmt.Sprintf("%.1f", float64(afterFree)/(1<<30)),
+		"snapshots_thinned", snapshotsThinned,
 		"tmutil_output", strings.TrimSpace(string(out)))
-	return freedBytes, nil
+	return freedBytes, snapshotsThinned, source, nil
+}
+
+// countTmutilSnapshotLines extracts the count of thinned snapshots from
+// `tmutil thinlocalsnapshots` output. Matches lines that look like a
+// tmutil snapshot ID — typically "YYYY-MM-DD-HHMMSS" optionally prefixed
+// by some path metadata. Conservative: only counts lines that start with
+// 4 digits (a year), to avoid double-counting header lines.
+func countTmutilSnapshotLines(out string) int {
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if len(trimmed) < 10 {
+			continue
+		}
+		// Crude but effective: snapshot lines start with a 4-digit year
+		// followed by '-' (e.g. "2026-05-18-..." or full paths ending in
+		// such a timestamp). Headers like "Thinned local snapshots:" do
+		// not match. False positives are extremely unlikely for tmutil.
+		if trimmed[0] >= '0' && trimmed[0] <= '9' &&
+			trimmed[1] >= '0' && trimmed[1] <= '9' &&
+			trimmed[2] >= '0' && trimmed[2] <= '9' &&
+			trimmed[3] >= '0' && trimmed[3] <= '9' &&
+			trimmed[4] == '-' {
+			n++
+		}
+	}
+	return n
 }
 
 func volumeFreeBytes(volume string) (int64, error) {

@@ -347,6 +347,8 @@ struct MenuPopoverView: View {
             req.httpMethod = "POST"
             let sem = DispatchSemaphore(value: 0)
             var freedGB: Double = 0
+            var snapshots: Int = 0
+            var source: String = "Time Machine local snapshots"
             var errMsg: String?
             URLSession.shared.dataTask(with: req) { data, _, err in
                 defer { sem.signal() }
@@ -355,6 +357,8 @@ struct MenuPopoverView: View {
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                 else { return }
                 if let f = obj["freed_gb"] as? Double { freedGB = f }
+                if let n = obj["snapshots_thinned"] as? Int { snapshots = n }
+                if let s = obj["source"] as? String, !s.isEmpty { source = s }
                 if let e = obj["error"] as? String { errMsg = e }
             }.resume()
             sem.wait()
@@ -368,9 +372,17 @@ struct MenuPopoverView: View {
                     // showAlert for this case so we don't surface a
                     // "Copy diagnostic" button on a no-op outcome.
                     showAlert(title: "Nothing to reclaim",
-                              message: "macOS reports purgeable space, but tmutil couldn't free any. The reclaimable space may be in iCloud Drive or system caches that the system manages on its own under disk pressure.")
+                              message: "Reclaim only thins \(source). macOS may report purgeable space elsewhere (iCloud Drive, system caches) that's managed automatically under disk pressure — those aren't safe to clean from here.")
                 } else {
-                    NSLog("[JuiceMount] Reclaimed %.1f GB", freedGB)
+                    // Report WHAT was reclaimed, not just how much. The user
+                    // should know we touched Time Machine snapshots and
+                    // nothing else (no app caches, no system files).
+                    let detail = snapshots > 0
+                        ? "Thinned \(snapshots) \(source.lowercased()), freed \(String(format: "%.1f", freedGB)) GB."
+                        : "Freed \(String(format: "%.1f", freedGB)) GB from \(source.lowercased())."
+                    NSLog("[JuiceMount] Reclaim: %@", detail)
+                    showAlert(title: "Reclaimed \(String(format: "%.1f", freedGB)) GB",
+                              message: detail + "\n\nReclaim only touches Time Machine snapshots; app caches and other purgeable space are managed by macOS automatically.")
                 }
             }
         }
@@ -576,18 +588,22 @@ struct MenuPopoverView: View {
             // full reason string when degraded.
             healthDotsRow
 
+            // Always show cache counts. With 0 pins the JuiceFS chunk
+            // cache still holds every-ever-read chunk and offline mode
+            // is still useful for working with whatever's been touched
+            // recently — hiding the cache UI hid that fact. (User QA
+            // 2026-05-17.)
+            cacheCounts
+            if !cacheStatus.live.CurrentFile.isEmpty {
+                livePrefetchRow
+            }
+            if !cacheStatus.roots.isEmpty {
+                rootsList
+            }
             if cacheStatus.aggregate.TotalFiles == 0 && cacheStatus.live.FilesPrefetched == 0 {
-                Text("Nothing pinned yet. Pick a folder above, or right-click in Finder → Services → Pin for Offline.")
+                Text("Tip: pin a folder above (or in Finder → Services → Pin for Offline) to guarantee it stays cached. Even without pins, the chunk cache holds recently-read files for offline use.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-            } else {
-                cacheCounts
-                if !cacheStatus.live.CurrentFile.isEmpty {
-                    livePrefetchRow
-                }
-                if !cacheStatus.roots.isEmpty {
-                    rootsList
-                }
             }
         }
         .padding(.horizontal, 12)
@@ -814,8 +830,8 @@ struct MenuPopoverView: View {
         .toggleStyle(.switch)
         .controlSize(.mini)
         .help(cacheStatus.offline_mode
-            ? "Reads on un-cached files fail fast (good for cellular)"
-            : "Reads fall through to backend on cache miss")
+            ? "Offline: reads are served from local cache; un-cached requests fail fast instead of stalling the network."
+            : "Online: cache misses transparently fall through to the backend. Toggle to use only what's already cached.")
     }
 
     private var cacheCounts: some View {
@@ -1114,6 +1130,19 @@ struct MenuPopoverView: View {
                 shortcut: "⌘⇧F",
                 disabled: !isRunningLike,
                 action: onSearch
+            )
+
+            // Open the mount in Finder. Most-common need is "drag a file in"
+            // and the user otherwise has to navigate Finder → Go → Connect or
+            // type the path. Disabled when the mount isn't ready.
+            ActionButton(
+                title: "Open Mount in Finder",
+                systemImage: "folder",
+                disabled: !isRunningLike,
+                action: {
+                    let url = URL(fileURLWithPath: server.preferences.mountPoint)
+                    NSWorkspace.shared.open(url)
+                }
             )
 
             // Sync now (only when running). Triggers BOTH a metadata
