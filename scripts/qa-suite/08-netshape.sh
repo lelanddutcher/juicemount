@@ -38,9 +38,21 @@ if ! nc -zv -G 3 "$BACKEND_HOST" "$BACKEND_PORT" >/dev/null 2>&1; then
     exit 0
 fi
 
-if ! sudo -n true 2>/dev/null; then
-    warn "sudo requires password — this phase can't run unattended. Skipping."
-    warn "to enable: configure passwordless sudo for pfctl/dnctl, or run this phase manually."
+# Test the SPECIFIC commands we need rather than `sudo -n true`.
+# `sudo -n true` requires NOPASSWD for ANY command; we only need NOPASSWD
+# for pfctl + dnctl. A targeted entry like
+#   <user> ALL=(ALL) NOPASSWD: /sbin/pfctl, /usr/sbin/dnctl
+# is the recommended setup and lets `true` correctly require a password
+# while still allowing this phase to run.
+if ! sudo -n /sbin/pfctl -s info >/dev/null 2>&1; then
+    warn "sudo /sbin/pfctl requires password — this phase can't run unattended. Skipping."
+    warn "to enable, add to /etc/sudoers.d/juicemount-qa (chmod 0440):"
+    warn "  $(whoami) ALL=(ALL) NOPASSWD: /sbin/pfctl, /usr/sbin/dnctl"
+    phase_report
+    exit 0
+fi
+if ! sudo -n /usr/sbin/dnctl pipe show >/dev/null 2>&1; then
+    warn "sudo /usr/sbin/dnctl requires password — sudoers entry incomplete. Skipping."
     phase_report
     exit 0
 fi
