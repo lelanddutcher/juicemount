@@ -15,6 +15,59 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### QA-20 (2026-05-17) — fio random-read EIO on freshly-written files — ✓ CLOSED 2026-05-17 (server-side compose fix)
+
+**Final root cause:** the MinIO bucket `zpool` was missing. JuiceFS's
+Redis-stored metadata referenced chunks at `zpool/chunks/...`, but
+the bucket had been wiped at some point (MinIO data volume reset)
+and `juicefs format` only creates the bucket on initial format —
+never re-runs because the filesystem already existed in Redis.
+
+The result was a silent half-broken state:
+  - Reads of CACHED chunks worked fine (container's 2 TB SSD cache
+    held the working set)
+  - Reads of un-cached chunks returned EIO / "Stale NFS file handle"
+    / 0 bytes — manifested as the original fio randread failures
+    AND as the user's "sluggish, sporadic files not loading"
+  - Mac juicefs writes appeared to succeed (writeback buffered them
+    locally) but actually failed to push to MinIO — silent data
+    loss for anything not yet pushed when the buffer rotated
+
+Discovery path: investigating QA-20 via `juicefs info` showed
+correct slice metadata; `juicefs gc` failed with NoSuchBucket;
+opening MinIO Console at 192.168.0.212:9001 confirmed ZERO buckets
+present. The Mac and the container had been silently masking the
+issue via local caches for some time.
+
+**Fix:** new `bucket-init` sidecar service added to the server-side
+docker compose. Uses `minio/mc:latest`, runs once on every
+`docker compose up`, idempotently creates the `zpool` bucket. Both
+the `juicefs` and `fs2es-indexer` services now declare
+`depends_on: bucket-init: condition: service_completed_successfully`
+so they refuse to start if bucket creation fails.
+
+Additional compose hardening:
+  - `--writeback` removed from the SERVER-side juicefs mount
+    (server is on localhost-bridge to MinIO with sub-ms latency;
+    buffer offered near-zero perf benefit while risking data loss
+    on container crash). Mac client keeps its `--writeback` for
+    NFS-loopback latency hiding.
+  - MinIO healthcheck switched to `http://juicefs-minio:9000/...`
+    (hostname over localhost) for robustness against bind-address
+    changes.
+
+Validation: user reset the compose stack with empty Redis + empty
+MinIO; bucket-init created the bucket; juicefs format ran;
+Mac juicefs picked up the new state via /etc/hosts resolution;
+write+read cycle confirmed via test file in /Volumes/zpool-dev.
+
+The /etc/hosts entry on the Mac (`192.168.0.212 juicefs-minio`)
+remains the canonical resolution for the Mac client. Container
+clients resolve via Docker DNS to the bridge IP — both work
+because the same hostname maps to different addresses depending on
+the client's network position. Standard pattern for multi-network
+service deployments.
+
 ### QA suite run 20260517-191053 (run #4, post-QA-18/19 fixes) — partial closure
 
 **Setup:** suite run against jm5 CLI binary (not the Swift app) with
