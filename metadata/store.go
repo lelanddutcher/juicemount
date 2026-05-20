@@ -172,6 +172,13 @@ func (s *Store) Insert(e *Entry) error {
 	if old, ok := s.pathCache[e.Path]; ok {
 		s.removeFromChildrenIdx(old)
 	}
+	// QA-25 (2026-05-20): juicefs preserves inode across rename. If another
+	// path previously owned this inode, evict the stale orphan now so
+	// pathCache/childrenIdx don't carry a ghost entry until reconcile prunes
+	// it (60s window). Without this, ListChildren returns ghosts AND
+	// evictOldest can rebuild inodeCache from the stale pathCache pointer,
+	// re-creating the QA-25 stale-handle bug.
+	s.evictInodeOrphanLocked(e)
 	s.inodeCache[e.Inode] = e
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
@@ -196,7 +203,14 @@ func (s *Store) Delete(entryPath string) error {
 
 	s.mu.Lock()
 	if e != nil {
-		delete(s.inodeCache, e.Inode)
+		// QA-25 (2026-05-20): only drop the inode mapping if it still points
+		// to THIS entry. A concurrent rename (juicefs preserves inode) may
+		// have re-assigned inodeCache[e.Inode] to a new-path entry between
+		// our RLock pre-fetch and now; dropping it would orphan that new
+		// path and make every cached NFS handle for it go STALE.
+		if cur, ok := s.inodeCache[e.Inode]; ok && cur == e {
+			delete(s.inodeCache, e.Inode)
+		}
 		s.removeFromChildrenIdx(e)
 	}
 	delete(s.pathCache, entryPath)
@@ -213,6 +227,8 @@ func (s *Store) InsertToCache(e *Entry) {
 	if old, ok := s.pathCache[e.Path]; ok {
 		s.removeFromChildrenIdx(old)
 	}
+	// QA-25: see Insert.
+	s.evictInodeOrphanLocked(e)
 	s.inodeCache[e.Inode] = e
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
@@ -223,11 +239,29 @@ func (s *Store) InsertToCache(e *Entry) {
 func (s *Store) DeleteFromCache(entryPath string) {
 	s.mu.Lock()
 	if e, ok := s.pathCache[entryPath]; ok {
-		delete(s.inodeCache, e.Inode)
+		// QA-25: see Delete.
+		if cur, inodeOk := s.inodeCache[e.Inode]; inodeOk && cur == e {
+			delete(s.inodeCache, e.Inode)
+		}
 		s.removeFromChildrenIdx(e)
 		delete(s.pathCache, entryPath)
 	}
 	s.mu.Unlock()
+}
+
+// evictInodeOrphanLocked removes a stale path entry that owned `new.Inode`
+// under a different path. Caller must hold s.mu.Lock(). This is the QA-25
+// proactive-cleanup half: when a rename inserts a new path entry whose inode
+// already maps to a stale old-path entry, sweep the old path out of
+// pathCache + childrenIdx in the same critical section so callers never see
+// the ghost. Pairs with the pointer-equality guard in Delete*.
+func (s *Store) evictInodeOrphanLocked(new *Entry) {
+	prev, ok := s.inodeCache[new.Inode]
+	if !ok || prev == nil || prev.Path == new.Path {
+		return
+	}
+	s.removeFromChildrenIdx(prev)
+	delete(s.pathCache, prev.Path)
 }
 
 // LookupByInode returns the entry with the given inode, or nil.
@@ -299,6 +333,8 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 		if old, ok := s.pathCache[e.Path]; ok {
 			s.removeFromChildrenIdx(old)
 		}
+		// QA-25: see Insert.
+		s.evictInodeOrphanLocked(e)
 		s.inodeCache[e.Inode] = e
 		s.pathCache[e.Path] = e
 		s.addToChildrenIdx(e)
@@ -665,7 +701,10 @@ func (s *Store) DeletePaths(paths []string) error {
 	s.mu.Lock()
 	for _, p := range paths {
 		if e, ok := s.pathCache[p]; ok {
-			delete(s.inodeCache, e.Inode)
+			// QA-25: see Delete.
+			if cur, inodeOk := s.inodeCache[e.Inode]; inodeOk && cur == e {
+				delete(s.inodeCache, e.Inode)
+			}
 			s.removeFromChildrenIdx(e)
 			delete(s.pathCache, p)
 		}

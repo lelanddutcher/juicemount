@@ -15,6 +15,85 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### QA-25 ✓ CLOSED (2026-05-20) — moved folder contents become inaccessible ~30-60s after rename
+
+**Observed:** user moves a folder with subfolders within the same volume.
+Immediate access works. ~30-60 s later, the moved tree's children show
+red-minus in Finder (`ls` returns "Stale NFS file handle"). Stop+Start
+of JM restored access (rebuilt inodeCache from scratch).
+
+**Reproduced (2026-05-20, fresh build at 38adfa6 + diagnostic at HEAD):**
+created `Testing/{sub1,sub2}/{file-1..4.txt, leaf-fingerprint.bin}`, ran
+`mv Testing → .qa25-dst-XXX`, immediate `ls` worked, T+30 s `ls sub1` →
+"Stale NFS file handle". Diagnostic log captured FromHandle STALE with
+real (non-synthetic) inode `0x1b4b1`, `pathCache_size=49326`,
+`inodeCache_size=49325` — exactly one inode dropped while its path was
+still in pathCache.
+
+**Root cause:** JuiceFS preserves inode across rename. The reconcile
+loop sees old path disappear from Redis and new path appear with the
+same inode. Sequence:
+
+1. `metadata/redis.go syncMetadata` BulkInsert at line 749 inserts new
+   path `/.qa25-dst-XXX/sub1` — `metadata/store.go BulkInsert` overwrites
+   `inodeCache[0x1b4b1]` from old-path-entry pointer to new-path-entry
+   pointer (correct).
+2. Old path `/Testing/sub1` left in `pathCache` (still pointing to
+   old-path-entry, which still references inode `0x1b4b1`).
+3. Two reconcile cycles later (≥60 s), `PruneThreshold=2` fires
+   `store.DeletePaths(["/Testing/sub1", ...])`.
+4. `metadata/store.go DeletePaths` does `delete(s.inodeCache, e.Inode)`
+   unconditionally — drops inode `0x1b4b1`, which the new path now
+   legitimately owns.
+5. NFS kernel client's cached handle `0x1b4b1` → `FromHandle()` → cache
+   miss → `NFSStatusStale`.
+
+Same bug surface in `Delete`, `DeleteFromCache`, and `DeletePaths`.
+
+**Fix (metadata/store.go):** two complementary layers, both per Rule 4
+code-reviewer audit (2026-05-20):
+
+1. **Deletion-side guard.** Before `delete(s.inodeCache, e.Inode)`,
+   check pointer-equality: only drop if `inodeCache[e.Inode] == e`. If
+   a concurrent BulkInsert/Insert has re-assigned the inode to a
+   different `*Entry`, leave the inode mapping intact.
+
+2. **Proactive cleanup in `Insert`/`InsertToCache`/`BulkInsert`.** When
+   inserting an entry whose inode already maps to a different-path
+   entry, sweep that other path out of `pathCache` + `childrenIdx`
+   immediately (new helper `evictInodeOrphanLocked`). Closes a second
+   bug: without it, `ListChildren` returns ghost entries during the
+   60 s prune window AND `evictOldest` rebuilds `inodeCache` from the
+   stale pathCache, re-creating the bug through eviction.
+
+**Validation (2026-05-20, build at HEAD):**
+- Fresh-build JM restarted clean. `Testing/sub1,sub2` baseline md5 of
+  10 files recorded. `mv Testing → .qa25-MOVED`, slept 95 s past mv:
+  `ls sub1` ✓, `ls sub2` ✓, md5 of all 10 files matches baseline
+  exactly. Then `mv .qa25-MOVED → Testing` (back), slept 100 s: same
+  result, all ls succeed, all md5 match.
+- JM log shows the reconcile correctly ran (`upserted=6, pruned=24`)
+  but ZERO `FromHandle STALE` entries fired after the fix (vs 14+
+  pre-fix on the same operation).
+- `01-smoke.sh` regression: 10 PASS / 0 FAIL.
+
+**Adjacent scenarios that should also be safe** (logic is general —
+the deletion-side guard + proactive cleanup applies to any rename,
+not just same-depth same-parent moves):
+- `mv` (atomic rename, same depth)
+- `cp -R + rm` (different inodes, distinct path entries; unaffected
+  because no inode collision)
+- Cross-depth moves (e.g. nested → top-level): same rename code path,
+  inode preserved, fix covers it identically.
+- Multiple consecutive moves: each move triggers reconcile→ prune,
+  each cycle correctness-bounded by the same fix.
+
+**Files touched:** `metadata/store.go` (Insert, Delete, InsertToCache,
+DeleteFromCache, BulkInsert, DeletePaths, +helper evictInodeOrphanLocked).
+Diagnostic log retained at Warn level in `nfs/handler.go FromHandle`
+for future telemetry — fires only on stale-handle requests so the
+cost is bounded.
+
 ### QA-23 (2026-05-17, user QA) — popover status indicator doesn't refresh after auto-offline recovers
 
 **Observed:** when the mount goes auto-offline (backend disruption) and
