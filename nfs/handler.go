@@ -505,6 +505,19 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 	// Look up by inode
 	e := h.store.LookupByInode(inode)
 	if e == nil {
+		// QA-25 diagnostic (2026-05-20): log every STALE so we can
+		// see exactly which inode the kernel is presenting and
+		// correlate against what we have in the cache. Remove after
+		// QA-25 is closed; the cost of this Warn-level log is small.
+		pathSample := "(no entry)"
+		ps, is := h.store.CacheStats()
+		jmlog.Warn("FromHandle STALE",
+			"inode", fmt.Sprintf("%x", inode),
+			"inode_synthetic", inode&(1<<63) != 0,
+			"pathCache_size", ps,
+			"inodeCache_size", is,
+			"sample", pathSample,
+		)
 		return nil, nil, &nfslib.NFSStatusError{NFSStatus: nfslib.NFSStatusStale}
 	}
 
