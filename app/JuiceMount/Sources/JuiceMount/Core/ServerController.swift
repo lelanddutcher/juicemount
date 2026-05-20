@@ -63,6 +63,19 @@ public final class ServerController {
         // Reflect the actual Go-side state on launch
         if NFSBridge.isRunning {
             self.state = .running
+            // QA-24 fix (2026-05-19): when the app launches while the Go
+            // daemon is ALREADY running (re-launch with daemon still alive),
+            // App.swift skips server.start() — which used to be the only
+            // call site for startPolling(). The polling task never started,
+            // so the state machine couldn't transition back from
+            // .disconnected to .running on network recovery. The header
+            // would say "Disconnected" forever while the four health dots
+            // all read green (stats was being read on UI events, but
+            // updateStateFromStats was never called to consume them).
+            //
+            // Move polling kickoff to wherever we believe the server is
+            // running, not just to the start() path.
+            startPolling()
         }
     }
 
@@ -379,15 +392,41 @@ public final class ServerController {
             if case .running = state { state = .disconnected }
             return
         }
+
+        // QA-24 (2026-05-19): explicit recovery path. If a previous poll
+        // observed degraded/disconnected health and now the snapshot is
+        // fully healthy, transition to .running. Previously this case was
+        // implicit in the else branch below, but it was hard to reason
+        // about because a single non-healthy intermediate poll would
+        // ping-pong the state. Making the recovery explicit ALSO logs the
+        // transition so future diagnosis has evidence.
+        let fullyHealthy = s.healthFUSE && s.healthRedis && s.healthMinIO
+        if fullyHealthy {
+            switch state {
+            case .running, .syncing:
+                // Already in a good state; preserve .syncing (transient).
+                if case .syncing = state { return }
+                state = .running
+                return
+            case .disconnected, .degraded:
+                // Recovery edge — log it. Future-me trying to debug a
+                // "stuck disconnected" report will check os_log for this.
+                log.info("recovery: backend healthy, transitioning \(self.state.displayLabel, privacy: .public) -> running")
+                state = .running
+                return
+            default:
+                // .idle / .starting / .error are sticky; don't overwrite.
+                return
+            }
+        }
+
+        // Not fully healthy — pick the most-severe component as the cause.
         if !s.healthFUSE {
             state = .disconnected
         } else if !s.healthRedis {
             state = .degraded("Redis unreachable — serving from cache")
         } else if !s.healthMinIO {
             state = .degraded("MinIO unreachable — reads may fail")
-        } else {
-            if case .syncing = state { return } // don't override transient sync state
-            state = .running
         }
     }
 }
