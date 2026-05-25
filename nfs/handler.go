@@ -69,6 +69,15 @@ type JuiceMountHandler struct {
 
 	// Verifier cleanup lifecycle
 	verifierStop chan struct{}
+
+	// QA-30 Layer B: singleflight per inode for FromHandle recovery so a
+	// burst of identical stale-handle retries (DaVinci can fire 50+/sec
+	// on a single inode) collapses to one Lstat + one re-insert. The
+	// negative side caches recently-failed recoveries so we don't re-Lstat
+	// for a genuinely-gone inode on every retry within the same burst.
+	recoveryMu        sync.Mutex
+	recoveryInFlight  map[uint64]chan struct{}        // inode → done-when-closed
+	recoveryNegative  map[uint64]time.Time            // inode → expiry; if now < expiry, skip
 }
 
 type verifierData struct {
@@ -83,7 +92,24 @@ type verifierData struct {
 // conservative path. On timeout the spawned goroutine is leaked; it
 // will terminate naturally when the underlying FUSE syscall returns.
 // That's preferable to blocking the request goroutine forever.
+// nfsLstatGate caps concurrent in-flight Lstats spawned by lstatWithTimeout
+// and lstatNotExistWithTimeout. Under a FUSE wedge (the scenario these
+// timeouts exist to handle), each call leaks a goroutine until the
+// underlying Lstat returns — which under a sustained wedge is "never."
+// Bounded gate prevents thousands of leaked goroutines during a stale-
+// handle storm (QA-30 Layer B code review HIGH-1). 8 slots is enough for
+// healthy throughput; when saturated, callers bail on the gate wait
+// within their own deadline (treated as "FUSE degraded, fail conservative").
+var nfsLstatGate = make(chan struct{}, 8)
+
 func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case nfsLstatGate <- struct{}{}:
+	case <-timer.C:
+		return false, false
+	}
 	type result struct {
 		err error
 	}
@@ -91,11 +117,13 @@ func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok b
 	go func() {
 		_, err := os.Lstat(p)
 		ch <- result{err: err}
+		<-nfsLstatGate // release slot only after Lstat actually returns
 	}()
 	select {
 	case r := <-ch:
 		return os.IsNotExist(r.err), true
-	case <-time.After(timeout):
+	case <-timer.C:
+		// Worker still holds gate until its Lstat returns; bounded leak.
 		return false, false
 	}
 }
@@ -106,6 +134,15 @@ func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok b
 // (typically: treat the entry as unknown rather than blocking the request
 // goroutine on a wedged FUSE daemon).
 func lstatWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, ok bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	// QA-30 Layer B HIGH-1: bounded gate so a FUSE wedge can't leak
+	// unbounded goroutines. Shared with lstatNotExistWithTimeout.
+	select {
+	case nfsLstatGate <- struct{}{}:
+	case <-timer.C:
+		return nil, false
+	}
 	type result struct {
 		fi  os.FileInfo
 		err error
@@ -114,6 +151,7 @@ func lstatWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, ok bool)
 	go func() {
 		fi, err := os.Lstat(p)
 		ch <- result{fi: fi, err: err}
+		<-nfsLstatGate // release slot only after Lstat actually returns
 	}()
 	select {
 	case r := <-ch:
@@ -121,7 +159,7 @@ func lstatWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, ok bool)
 			return nil, true // call completed but failed (e.g., ENOENT); caller decides
 		}
 		return r.fi, true
-	case <-time.After(timeout):
+	case <-timer.C:
 		return nil, false
 	}
 }
@@ -505,6 +543,17 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 	// Look up by inode
 	e := h.store.LookupByInode(inode)
 	if e == nil {
+		// QA-30 Layer B (2026-05-25): before returning STALE, try one-shot
+		// recovery from the recently-evicted shadow map. If the entry was
+		// removed by a prune/eviction within the last ShadowTTL (5 min)
+		// AND FUSE confirms the path still exists, re-insert it and serve
+		// normally. Singleflight by inode so DaVinci's scrub retries don't
+		// cascade into N redundant Lstat calls.
+		if recovered := h.tryRecoverEvicted(inode); recovered != nil {
+			parts := splitPath(recovered.Path)
+			return &juiceFS{handler: h}, parts, nil
+		}
+
 		// QA-25 diagnostic (2026-05-20): log every STALE so we can
 		// see exactly which inode the kernel is presenting and
 		// correlate against what we have in the cache. Remove after
@@ -523,6 +572,102 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 
 	parts := splitPath(e.Path)
 	return &juiceFS{handler: h}, parts, nil
+}
+
+// tryRecoverEvicted is QA-30 Layer B's recovery path. Called by FromHandle
+// on cache-miss for a real (non-synthetic) inode. Looks up the recently-
+// evicted shadow map; if present AND FUSE confirms the path still exists,
+// re-inserts the entry into the cache and returns it. Otherwise returns
+// nil (caller falls through to STALE).
+//
+// Singleflight by inode: a DaVinci scrub-storm produces 50+ identical
+// FromHandle calls per second on the same stale inode. Without
+// singleflight, each would race to Lstat + re-insert. The first call
+// owns the recovery; later concurrent calls wait on the shared
+// done-channel and then re-Lookup the cache (which the first call has
+// either populated, or skipped via the negative cache).
+//
+// Negative cache (recoveryNegative) bounds the Lstat rate on confirmed-
+// gone handles. Default TTL 5s — long enough to absorb a typical retry
+// burst, short enough that a real "file came back" recovery isn't
+// blocked forever.
+func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
+	// Synthetic inodes (high bit set) have no shadow entry — they're
+	// counter-based ToHandle fallbacks, not real juicefs inodes.
+	if inode&(1<<63) != 0 {
+		return nil
+	}
+	// Negative cache check.
+	h.recoveryMu.Lock()
+	if exp, ok := h.recoveryNegative[inode]; ok {
+		if time.Now().Before(exp) {
+			h.recoveryMu.Unlock()
+			return nil
+		}
+		delete(h.recoveryNegative, inode)
+	}
+	// Singleflight: if another goroutine is already recovering this
+	// inode, wait on its done channel then retry the cache lookup.
+	if done, ok := h.recoveryInFlight[inode]; ok {
+		h.recoveryMu.Unlock()
+		<-done
+		// Whoever ran the recovery has either populated the cache or
+		// installed a negative entry. Re-lookup.
+		return h.store.LookupByInode(inode)
+	}
+	// Become the owner.
+	if h.recoveryInFlight == nil {
+		h.recoveryInFlight = make(map[uint64]chan struct{}, 8)
+	}
+	if h.recoveryNegative == nil {
+		h.recoveryNegative = make(map[uint64]time.Time, 8)
+	}
+	done := make(chan struct{})
+	h.recoveryInFlight[inode] = done
+	h.recoveryMu.Unlock()
+
+	// Cleanup when we return.
+	defer func() {
+		h.recoveryMu.Lock()
+		delete(h.recoveryInFlight, inode)
+		close(done)
+		h.recoveryMu.Unlock()
+	}()
+
+	// Look up the shadow record.
+	shadow, ok := h.store.LookupRecentlyEvicted(inode)
+	if !ok {
+		// Not in shadow → real STALE. Cache the negative briefly so
+		// burst retries skip the lookup.
+		h.recoveryMu.Lock()
+		h.recoveryNegative[inode] = time.Now().Add(5 * time.Second)
+		h.recoveryMu.Unlock()
+		return nil
+	}
+
+	// Verify the path actually exists in FUSE before recovering.
+	fusePath := h.fusePath + "/" + strings.TrimLeft(shadow.Path, "/")
+	fi, fok := lstatWithTimeout(fusePath, 2*time.Second)
+	if !fok {
+		// Lstat timed out — FUSE is degraded. Don't recover, don't
+		// cache negative (might succeed next time).
+		return nil
+	}
+	if fi == nil {
+		// File is genuinely gone. Cache negative so burst retries skip.
+		h.recoveryMu.Lock()
+		h.recoveryNegative[inode] = time.Now().Add(5 * time.Second)
+		h.recoveryMu.Unlock()
+		return nil
+	}
+
+	// File exists. Promote the shadow back to live cache.
+	recovered := h.store.RecoverShadow(shadow, inode)
+	jmlog.Info("FromHandle recovered evicted entry",
+		"inode", fmt.Sprintf("%x", inode),
+		"path", shadow.Path,
+	)
+	return recovered
 }
 
 func (h *JuiceMountHandler) InvalidateHandle(f billy.Filesystem, handle []byte) error {
@@ -953,6 +1098,17 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			inode:       e.Inode,
 			fileSize:    e.Size,
 			pinned:      isPinned,
+			// QA-31 + HIGH-1 fix: value-copy snapshot, NOT a pointer
+			// to the live Entry. The Entry can be mutated in-place by
+			// concurrent UpdateSize on writeback paths.
+			cachedInfo: &snapshotFileInfo{
+				name:  e.Name,
+				size:  e.Size,
+				mode:  e.Mode,
+				mtime: e.Mtime,
+				isDir: e.IsDir,
+				inode: e.Inode,
+			},
 		}, nil
 	}
 
@@ -1172,6 +1328,67 @@ type cachedFile struct {
 	// Un-pinned files never reach this struct in offline mode (open-time
 	// gate refuses them before we construct the cachedFile).
 	pinned bool
+
+	// QA-31 (2026-05-25): VALUE snapshot of the file's metadata at Open
+	// time. Exposed via CachedInfo() to satisfy
+	// internal/nfs.CachedInfoProvider — onRead uses this for the size-
+	// clamp and the post-op attrs of every READ RPC, eliminating two
+	// FUSE Stat round-trips per RPC.
+	//
+	// IMPORTANT (QA-31 code-review HIGH-1): this is a VALUE-COPY of the
+	// metadata.Entry's scalars, NOT a pointer wrapper around the live
+	// Entry. The live Entry can be mutated in-place by concurrent paths
+	// (e.g. UpdateSize on writeback) under the Store's mu.Lock with no
+	// synchronization between the writer and a reader going through
+	// FileInfo.Size(). Holding a value snapshot eliminates the race
+	// entirely on the cachedFile side; staleness was already acceptable
+	// per NFS post-op-attrs semantics (advisory; clients revalidate via
+	// GETATTR).
+	cachedInfo *snapshotFileInfo
+}
+
+// snapshotFileInfo is a frozen-at-construction os.FileInfo for cachedFile.
+// All fields are copied by value at Open time; no aliasing of the live
+// metadata.Entry.
+type snapshotFileInfo struct {
+	name  string
+	size  int64
+	mode  os.FileMode
+	mtime time.Time
+	isDir bool
+	inode uint64
+}
+
+func (s *snapshotFileInfo) Name() string       { return s.name }
+func (s *snapshotFileInfo) Size() int64        { return s.size }
+func (s *snapshotFileInfo) Mode() os.FileMode  { return s.mode }
+func (s *snapshotFileInfo) ModTime() time.Time { return s.mtime }
+func (s *snapshotFileInfo) IsDir() bool        { return s.isDir }
+func (s *snapshotFileInfo) Sys() any {
+	return &syscall.Stat_t{
+		Ino:   s.inode,
+		Uid:   snapshotUID,
+		Gid:   snapshotGID,
+		Nlink: 1,
+	}
+}
+
+// snapshotUID/snapshotGID mirror metadata/types.go's currentUID/currentGID
+// so the Sys() result matches what GETATTR returns through the metadata
+// path. Initialized once at process start.
+var (
+	snapshotUID = uint32(os.Getuid())
+	snapshotGID = uint32(os.Getgid())
+)
+
+// CachedInfo implements internal/nfs.CachedInfoProvider. Returns the
+// file's metadata as observed at Open time (immutable value snapshot;
+// safe to read concurrently with mutations on the source Entry).
+func (f *cachedFile) CachedInfo() os.FileInfo {
+	if f.cachedInfo == nil {
+		return nil
+	}
+	return f.cachedInfo
 }
 
 func (f *cachedFile) Name() string { return f.name }

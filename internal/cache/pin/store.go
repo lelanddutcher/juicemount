@@ -242,6 +242,41 @@ func (s *Store) IsPinnedReady(path string) bool {
 	return false
 }
 
+// PinnedPaths returns the set of all paths in the pin store, regardless of
+// status (Pending, Prefetching, Ready, Failed). Used by the metadata layer's
+// prune and eviction logic to enforce the invariant that a pinned path is
+// NEVER pruned from the metadata caches — pinning is an explicit user
+// contract that the file should remain offline-accessible. Bounded by the
+// number of pins (typically <1000); cheap to fetch on demand.
+//
+// Returns an explicit error on DB failure (QA-30 code review HIGH-2): callers
+// MUST treat an error as "I don't know what's pinned" and fail-safe — i.e.
+// SKIP any prune or eviction pass that depended on this set. Silently
+// returning an empty map would re-introduce the very ESTALE-on-pinned-media
+// bug QA-30 was created to close (a SQLite hiccup would unprotect every
+// pinned file).
+func (s *Store) PinnedPaths() (map[string]struct{}, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`SELECT path FROM pinned_files`)
+	if err != nil {
+		return nil, fmt.Errorf("pin: query pinned paths: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]struct{}, 256)
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("pin: scan pinned path: %w", err)
+		}
+		out[p] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pin: iterate pinned paths: %w", err)
+	}
+	return out, nil
+}
+
 // Pending returns up to limit entries waiting for prefetch.
 func (s *Store) Pending(limit int) ([]Entry, error) {
 	return s.queryStatus(StatusPending, limit)

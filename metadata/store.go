@@ -63,6 +63,29 @@ PRAGMA busy_timeout = 30000;
 // DefaultMaxCacheSize is the default maximum number of entries in the in-memory caches.
 const DefaultMaxCacheSize = 500_000
 
+// PinChecker is the minimal interface the metadata layer needs from the pin
+// store. QA-30 (2026-05-25): pinned paths must NEVER be pruned from the
+// metadata caches — pinning is an explicit user contract that the file
+// remains offline-accessible, and dropping its cache entry causes kernel-
+// cached NFS handles to surface as ESTALE (observed: DaVinci Resolve
+// treating fully-cached media as offline mid-edit). Both syncMetadata's
+// transient-SCAN-miss prune and Store.evictOldest's memory-pressure eviction
+// consult this to filter pinned paths from any deletion candidate set.
+//
+// The interface is intentionally tiny and pull-based: callers fetch the
+// pinned set once per pass and check against it in memory. Backed by a
+// single SELECT against pinned_files; pin counts are small (<1000) so the
+// cost is negligible per cycle.
+//
+// IMPORTANT: an error return from PinnedPaths is a FAIL-SAFE signal. The
+// caller does not know what's pinned and MUST NOT proceed with any
+// destructive operation (prune, eviction) that relies on the protection.
+// Returning an empty set on error would unprotect every pinned file and
+// re-introduce the exact ESTALE-on-pinned-media bug QA-30 closes.
+type PinChecker interface {
+	PinnedPaths() (map[string]struct{}, error)
+}
+
 // Store is a SQLite-backed metadata store with in-memory caches.
 type Store struct {
 	db           *sql.DB
@@ -72,6 +95,200 @@ type Store struct {
 	pathCache    map[string]*Entry
 	childrenIdx  map[string]map[string]*Entry // parentPath → {path → *Entry}
 	maxCacheSize int
+	pinChecker   PinChecker // optional (QA-30); see PinChecker docstring
+
+	// QA-30 Layer B (2026-05-25): recently-evicted shadow map. When an entry
+	// is removed from pathCache+inodeCache via Delete/DeleteFromCache/
+	// DeletePaths or via evictOldest's rebuild, a copy of its scalar
+	// metadata is parked here keyed by inode with a TTL. FromHandle in the
+	// NFS handler consults this on cache-miss BEFORE returning ESTALE:
+	// if the recently-evicted shadow has the inode AND FUSE confirms the
+	// path still exists, the entry is re-inserted into pathCache+inodeCache
+	// and the request is served normally. This is the safety net for any
+	// stale-handle bug class Layers A+C don't catch.
+	//
+	// Bounded by ShadowTTL × eviction rate; pruned opportunistically when
+	// new entries are added. Guarded by mu (same lock as pathCache).
+	recentlyEvicted map[uint64]evictedShadow
+
+	// QA-30 Layer B HIGH-2 (2026-05-25): pre-fetched pinned set for the
+	// next evictOldest call. Set by stagePinnedForEviction BEFORE the
+	// caller acquires mu; consumed and cleared by evictOldest. Guarded
+	// by mu (write only happens after stagePinnedForEviction returns).
+	// pinnedSetErr non-nil → evictOldest skips this cycle (fail-safe).
+	pinnedSetForEviction map[string]struct{}
+	pinnedSetErr         error
+}
+
+// stagePinnedForEviction is called by BulkInsert/rebuildCaches BEFORE they
+// take s.mu, so the pin-store SQL query doesn't run while the NFS hot-path
+// lock is held. The result is consumed by evictOldest on its next call
+// from this caller (caller must call evictOldest while still holding mu).
+//
+// QA-30 Layer B HIGH-2 fix: previously evictOldest called pinnedSetLocked
+// with mu held, blocking all NFS LookupByInode/LookupByPath until SQLite
+// returned — up to 30 s under SQLite busy contention.
+func (s *Store) stagePinnedForEviction() {
+	pinned, err := s.pinnedSetPublic() // takes RLock briefly, NOT mu.Lock
+	s.mu.Lock()
+	s.pinnedSetForEviction = pinned
+	s.pinnedSetErr = err
+	s.mu.Unlock()
+}
+
+// ShadowTTL is the lifetime of recently-evicted shadow entries. 5 min is
+// chosen to comfortably outlive any reasonable NFS-client handle-cache
+// retry window — macOS NFS hangs onto handles for ~3 min by default,
+// DaVinci's retry storms last seconds. After ShadowTTL the entry is
+// dropped; if the kernel still uses the handle then, ESTALE fires
+// (correct NFSv3 behavior, prompts client to re-LOOKUP).
+const ShadowTTL = 5 * time.Minute
+
+// evictedShadow captures just enough metadata to rebuild an Entry's cache
+// presence if Layer B confirms the file is still on disk. Value-copy of
+// scalars only — never aliases the original *Entry.
+type evictedShadow struct {
+	Path      string
+	Name      string
+	ParentPath string
+	Mode      fs.FileMode
+	Size      int64
+	Mtime     time.Time
+	IsDir     bool
+	ExpiresAt time.Time
+}
+
+// shadowEvictedLocked parks a scalar copy of an entry being removed from
+// the caches, keyed by inode, with a TTL. Caller must hold s.mu.Lock.
+// Opportunistically expires any other shadow entries that are past TTL —
+// keeps the map size bounded without a separate sweep goroutine.
+//
+// nil-safe: nil entry is a no-op (legitimate for Delete calls where the
+// pre-fetch found nothing).
+func (s *Store) shadowEvictedLocked(e *Entry) {
+	if e == nil {
+		return
+	}
+	if s.recentlyEvicted == nil {
+		s.recentlyEvicted = make(map[uint64]evictedShadow, 64)
+	}
+	now := time.Now()
+	// Opportunistic TTL sweep (cheap, bounded by map size).
+	if len(s.recentlyEvicted) > 1024 {
+		for k, v := range s.recentlyEvicted {
+			if v.ExpiresAt.Before(now) {
+				delete(s.recentlyEvicted, k)
+			}
+		}
+	}
+	s.recentlyEvicted[e.Inode] = evictedShadow{
+		Path:       e.Path,
+		Name:       e.Name,
+		ParentPath: e.ParentPath,
+		Mode:       e.Mode,
+		Size:       e.Size,
+		Mtime:      e.Mtime,
+		IsDir:      e.IsDir,
+		ExpiresAt:  now.Add(ShadowTTL),
+	}
+}
+
+// LookupRecentlyEvicted returns the shadow record for `inode` if one
+// exists and has not yet expired. Used by NFS handler's FromHandle on
+// cache-miss to attempt recovery before returning ESTALE.
+func (s *Store) LookupRecentlyEvicted(inode uint64) (evictedShadow, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec, ok := s.recentlyEvicted[inode]
+	if !ok {
+		return evictedShadow{}, false
+	}
+	if rec.ExpiresAt.Before(time.Now()) {
+		return evictedShadow{}, false
+	}
+	return rec, true
+}
+
+// EvictedShadow is the public type alias for the shadow record. Renamed
+// from evictedShadow without changing fields so external callers (NFS
+// handler) can name the type by exported identifier.
+type EvictedShadow = evictedShadow
+
+// RecoverShadow promotes a recently-evicted shadow back into the
+// pathCache + inodeCache. Used by FromHandle once it has confirmed via
+// FUSE Lstat that the file still exists. Builds a new Entry from the
+// shadow's scalar copy.
+func (s *Store) RecoverShadow(rec evictedShadow, inode uint64) *Entry {
+	e := &Entry{
+		Path:       rec.Path,
+		Name:       rec.Name,
+		ParentPath: rec.ParentPath,
+		IsDir:      rec.IsDir,
+		Size:       rec.Size,
+		Mtime:      rec.Mtime,
+		Inode:      inode,
+		Mode:       rec.Mode,
+	}
+	s.mu.Lock()
+	if old, ok := s.pathCache[e.Path]; ok {
+		s.removeFromChildrenIdx(old)
+		s.evictPathOrphanLocked(old, e)
+	}
+	s.evictInodeOrphanLocked(e)
+	s.inodeCache[e.Inode] = e
+	s.pathCache[e.Path] = e
+	s.addToChildrenIdx(e)
+	// Clear the shadow now that the entry is live again.
+	delete(s.recentlyEvicted, inode)
+	s.mu.Unlock()
+	return e
+}
+
+// SetPinChecker installs the pin-store backed pin checker. Nil-safe: callers
+// (and tests) may pass nil, in which case the metadata layer falls back to
+// "no pinned files" — same behavior as before QA-30.
+//
+// Concurrency (QA-30 code review HIGH-1): takes s.mu.Lock so we don't race
+// with concurrent readers. The bridge wires this on the start path which
+// runs after RedisClient.Start has already launched its reconcile goroutine,
+// so the very first sync tick can otherwise interleave with this write.
+func (s *Store) SetPinChecker(pc PinChecker) {
+	s.mu.Lock()
+	s.pinChecker = pc
+	s.mu.Unlock()
+}
+
+// pinnedSetLocked returns the current pinned-path set under s.mu (caller
+// already holds the lock, e.g. evictOldest). Returns nil + error to caller
+// on DB failure; the caller MUST fail-safe (skip eviction this cycle).
+func (s *Store) pinnedSetLocked() (map[string]struct{}, error) {
+	pc := s.pinChecker
+	if pc == nil {
+		return map[string]struct{}{}, nil
+	}
+	return pc.PinnedPaths()
+}
+
+// pinnedSetPublic is the lock-free entry for in-package callers
+// (RedisClient.syncMetadata) that do NOT already hold s.mu. Takes RLock to
+// snapshot the pinChecker pointer safely, then queries outside the lock to
+// avoid holding s.mu across a SQL call. Returns nil + error on failure;
+// callers MUST fail-safe.
+func (s *Store) pinnedSetPublic() (map[string]struct{}, error) {
+	s.mu.RLock()
+	pc := s.pinChecker
+	s.mu.RUnlock()
+	if pc == nil {
+		return map[string]struct{}{}, nil
+	}
+	return pc.PinnedPaths()
+}
+
+// isPinned returns true if `p` is in the pinned-set map. Tiny helper to
+// keep eviction/prune call sites readable.
+func isPinned(set map[string]struct{}, p string) bool {
+	_, ok := set[p]
+	return ok
 }
 
 // Open creates or opens a SQLite metadata database at the given path.
@@ -171,6 +388,9 @@ func (s *Store) Insert(e *Entry) error {
 	// Remove old entry from children index if path existed with different parent
 	if old, ok := s.pathCache[e.Path]; ok {
 		s.removeFromChildrenIdx(old)
+		// QA-27 (2026-05-21): if the displaced entry had a different inode,
+		// clean up its now-orphaned inodeCache mapping. See evictPathOrphanLocked.
+		s.evictPathOrphanLocked(old, e)
 	}
 	// QA-25 (2026-05-20): juicefs preserves inode across rename. If another
 	// path previously owned this inode, evict the stale orphan now so
@@ -212,6 +432,9 @@ func (s *Store) Delete(entryPath string) error {
 			delete(s.inodeCache, e.Inode)
 		}
 		s.removeFromChildrenIdx(e)
+		// QA-30 Layer B: park a shadow so FromHandle can recover if FUSE
+		// later proves the file actually exists. Cheap; bounded TTL.
+		s.shadowEvictedLocked(e)
 	}
 	delete(s.pathCache, entryPath)
 	s.mu.Unlock()
@@ -226,6 +449,8 @@ func (s *Store) InsertToCache(e *Entry) {
 	s.mu.Lock()
 	if old, ok := s.pathCache[e.Path]; ok {
 		s.removeFromChildrenIdx(old)
+		// QA-27: see Insert.
+		s.evictPathOrphanLocked(old, e)
 	}
 	// QA-25: see Insert.
 	s.evictInodeOrphanLocked(e)
@@ -244,6 +469,8 @@ func (s *Store) DeleteFromCache(entryPath string) {
 			delete(s.inodeCache, e.Inode)
 		}
 		s.removeFromChildrenIdx(e)
+		// QA-30 Layer B: shadow for possible recovery (see Delete).
+		s.shadowEvictedLocked(e)
 		delete(s.pathCache, entryPath)
 	}
 	s.mu.Unlock()
@@ -262,6 +489,48 @@ func (s *Store) evictInodeOrphanLocked(new *Entry) {
 	}
 	s.removeFromChildrenIdx(prev)
 	delete(s.pathCache, prev.Path)
+}
+
+// evictPathOrphanLocked is the symmetric counterpart to
+// evictInodeOrphanLocked. Addresses two related bugs:
+//
+//   - QA-27 (2026-05-21): when a path gets reused with a different inode
+//     (Finder delete+recreate of `._xxx` AppleDouble sidecars during a
+//     folder copy; JuiceFS assigns a fresh inode each cycle), the old
+//     entry's inodeCache mapping was left orphaned. 3,806 leaked entries
+//     observed in one Editor Resource Vault copy.
+//
+//   - QA-28 (2026-05-21): a naive "delete the orphan" fix to QA-27
+//     caused error code 100070 (ESTALE) mid-copy. Reason: synthetic
+//     inodes created by ToHandle's fallback are handed to the kernel
+//     as NFS file handles BEFORE the metadata sync replaces them with
+//     real juicefs inodes. Deleting the synthetic mapping when the
+//     real one arrives broke every in-flight kernel-cached handle —
+//     Finder surfaces this as "operation can't be completed (100070)".
+//
+// Resolution: REDIRECT the old inode's mapping to the new entry rather
+// than deleting it. The kernel's cached handle still resolves to the
+// correct logical file. pathCache stays clean (caller overwrites it
+// with `new` in the next line). Cost: inodeCache may carry alias
+// entries for displaced inodes; bounded by the rate of inode-change
+// events on shared paths and far below the 500k cache limit in
+// realistic use. evictOldest rebuilds from pathCache so aliases
+// eventually drop after enough churn — at which point any kernel
+// handles still pointing at them will get a fresh ESTALE and the
+// client will re-LOOKUP, which is the correct NFSv3 protocol behavior.
+//
+// Caller must hold s.mu.Lock(). Called BEFORE the new entry is written
+// to pathCache; `old` here is `pathCache[new.Path]` at call time.
+func (s *Store) evictPathOrphanLocked(old, new *Entry) {
+	if old == nil || old.Inode == new.Inode {
+		return
+	}
+	// Redirect only if the old entry is still the authoritative owner of
+	// its inode — otherwise another path has already taken over and we
+	// shouldn't overwrite that mapping.
+	if cur, ok := s.inodeCache[old.Inode]; ok && cur == old {
+		s.inodeCache[old.Inode] = new
+	}
 }
 
 // LookupByInode returns the entry with the given inode, or nil.
@@ -327,11 +596,18 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 		}
 	}
 
+	// QA-30 Layer B HIGH-2: pre-fetch the pinned set BEFORE taking mu so
+	// the SQLite query on pin.db doesn't block NFS LookupByInode while
+	// the write lock is held.
+	s.stagePinnedForEviction()
+
 	// Rebuild caches after all batches insert
 	s.mu.Lock()
 	for _, e := range entries {
 		if old, ok := s.pathCache[e.Path]; ok {
 			s.removeFromChildrenIdx(old)
+			// QA-27: see Insert.
+			s.evictPathOrphanLocked(old, e)
 		}
 		// QA-25: see Insert.
 		s.evictInodeOrphanLocked(e)
@@ -706,6 +982,8 @@ func (s *Store) DeletePaths(paths []string) error {
 				delete(s.inodeCache, e.Inode)
 			}
 			s.removeFromChildrenIdx(e)
+			// QA-30 Layer B: shadow for possible recovery (see Delete).
+			s.shadowEvictedLocked(e)
 			delete(s.pathCache, p)
 		}
 	}
@@ -738,12 +1016,46 @@ func (s *Store) evictOldest() {
 	}
 
 	// Split entries: directories always retained, files sorted by mtime.
+	// QA-30 (2026-05-25): pinned files are also always retained, regardless
+	// of mtime budget. Evicting a pinned file's entry causes its kernel-
+	// cached NFS handle to surface as ESTALE on next access — DaVinci
+	// treats the media as offline mid-edit. Pinning is the user's explicit
+	// contract that the file stay available; honoring it through eviction
+	// is non-negotiable.
+	//
+	// QA-30 Layer B code review HIGH-2 (2026-05-25): the pinned set is
+	// PRE-FETCHED by the caller (BulkInsert/rebuildCaches) BEFORE the
+	// caller acquired s.mu — passed in via s.pinnedSetForEviction. Holding
+	// s.mu (the hot NFS-cache lock) across a SQLite query against the
+	// pin store could stall every concurrent LookupByInode/LookupByPath
+	// up to 30 s (SQLite busy_timeout). The pre-fetch sidesteps that.
+	//
+	// Fail-safe on pin-checker error: if the pre-fetch failed (caller set
+	// pinnedSetErr), SKIP eviction entirely rather than risk evicting
+	// pinned entries. The cache will exceed maxCacheSize for one cycle;
+	// the next BulkInsert/rebuild retries.
+	if s.pinnedSetErr != nil {
+		log.Printf("[metadata] evictOldest: pin-checker error, skipping eviction this cycle: %v", s.pinnedSetErr)
+		s.pinnedSetForEviction = nil
+		s.pinnedSetErr = nil
+		return
+	}
+	pinned := s.pinnedSetForEviction
+	if pinned == nil {
+		// Caller didn't pre-fetch (legacy path or test). Fail-safe.
+		pinned = map[string]struct{}{}
+	}
+	s.pinnedSetForEviction = nil
 	dirs := make([]*Entry, 0, len(s.pathCache)/16)
+	pinnedFiles := make([]*Entry, 0, len(pinned))
 	files := make([]*Entry, 0, len(s.pathCache))
 	for _, e := range s.pathCache {
-		if e.IsDir {
+		switch {
+		case e.IsDir:
 			dirs = append(dirs, e)
-		} else {
+		case isPinned(pinned, e.Path):
+			pinnedFiles = append(pinnedFiles, e)
+		default:
 			files = append(files, e)
 		}
 	}
@@ -751,10 +1063,12 @@ func (s *Store) evictOldest() {
 		return files[i].Mtime.After(files[j].Mtime)
 	})
 
-	// Budget: keep all dirs + as many newest files as fit. If dirs alone
-	// exceed maxCacheSize (pathological), keep all dirs anyway (the
-	// alternative — evicting dirs — is the bug we're trying to prevent).
-	fileBudget := s.maxCacheSize - len(dirs)
+	// Budget: keep all dirs + all pinned files + as many newest non-pinned
+	// files as fit. If dirs+pinned alone exceed maxCacheSize (pathological),
+	// keep them all anyway (the alternative — evicting them — re-introduces
+	// the bug we're trying to prevent).
+	mandatory := len(dirs) + len(pinnedFiles)
+	fileBudget := s.maxCacheSize - mandatory
 	if fileBudget < 0 {
 		fileBudget = 0
 	}
@@ -762,8 +1076,8 @@ func (s *Store) evictOldest() {
 		fileBudget = len(files)
 	}
 
-	newPathCache := make(map[string]*Entry, len(dirs)+fileBudget)
-	newInodeCache := make(map[uint64]*Entry, len(dirs)+fileBudget)
+	newPathCache := make(map[string]*Entry, mandatory+fileBudget)
+	newInodeCache := make(map[uint64]*Entry, mandatory+fileBudget)
 	newChildrenIdx := make(map[string]map[string]*Entry)
 	addEntry := func(e *Entry) {
 		newPathCache[e.Path] = e
@@ -778,8 +1092,21 @@ func (s *Store) evictOldest() {
 	for _, e := range dirs {
 		addEntry(e)
 	}
+	for _, e := range pinnedFiles {
+		addEntry(e)
+	}
 	for i := 0; i < fileBudget; i++ {
 		addEntry(files[i])
+	}
+
+	// QA-30 Layer B: shadow every entry that was dropped by this eviction
+	// so FromHandle can recover if FUSE proves they still exist. Iterate
+	// the OLD pathCache (still in scope until we replace it) and shadow
+	// anything that didn't make it into newPathCache.
+	for path, e := range s.pathCache {
+		if _, kept := newPathCache[path]; !kept {
+			s.shadowEvictedLocked(e)
+		}
 	}
 
 	s.pathCache = newPathCache
@@ -814,6 +1141,9 @@ func (s *Store) rebuildCaches() error {
 		}
 		children[e.Path] = e
 	}
+
+	// QA-30 Layer B HIGH-2: pre-fetch pinned set outside the lock.
+	s.stagePinnedForEviction()
 
 	s.mu.Lock()
 	s.inodeCache = iCache

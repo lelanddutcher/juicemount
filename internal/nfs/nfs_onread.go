@@ -97,13 +97,39 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 
 	resp := nfsReadResponse{}
 
+	// QA-31 (2026-05-25): fast-path the size-clamp via the handle's cached
+	// info when available. The legacy fs.Stat path went through JM's
+	// Stat() which contains a 2-second-budgeted FUSE Lstat for the
+	// phantom-purge gate — a fixed per-RPC cost that dominated read
+	// throughput on cached files. Cached size is a snapshot from Open
+	// time; a stale value can only cause a benign short read (NFS clients
+	// reissue), not a correctness issue.
 	if obj.Count > CheckRead {
-		info, err := fs.Stat(fs.Join(path...))
-		if err != nil {
-			return &NFSStatusError{NFSStatusAccess, err}
+		var size int64
+		var haveSize bool
+		if cp, ok := fh.(CachedInfoProvider); ok {
+			if info := cp.CachedInfo(); info != nil {
+				size = info.Size()
+				haveSize = true
+			}
 		}
-		if info.Size()-int64(obj.Offset) < int64(obj.Count) {
-			obj.Count = uint32(uint64(info.Size()) - obj.Offset)
+		if !haveSize {
+			info, err := fs.Stat(fs.Join(path...))
+			if err != nil {
+				return &NFSStatusError{NFSStatusAccess, err}
+			}
+			size = info.Size()
+		}
+		// QA-31 HIGH-2 fix: explicit EOF-at-or-past-end handling. Without
+		// this, uint64(size)-obj.Offset underflows when Offset > size,
+		// producing a huge spurious Count that downstream clamps to
+		// MaxRead and wastes a 16 MiB allocation per such RPC. RFC 1813
+		// §3.3.6: server should return zero-length result when reading
+		// at or past EOF.
+		if int64(obj.Offset) >= size {
+			obj.Count = 0
+		} else if size-int64(obj.Offset) < int64(obj.Count) {
+			obj.Count = uint32(size - int64(obj.Offset))
 		}
 	}
 	if obj.Count > MaxRead {
@@ -200,7 +226,15 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		putResponseBuffer(writer)
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := WritePostOpAttrs(writer, tryStat(fs, path)); err != nil {
+	// QA-31 (2026-05-25): prefer the cached attrs from the open handle
+	// over a fresh tryStat. NFS post-op attrs are documented as advisory
+	// (clients use a separate GETATTR for fresh state); skipping the
+	// per-RPC Lstat here is a measured win on cached-read throughput.
+	postAttrs := tryCachedStat(fh, fs.Join(path...))
+	if postAttrs == nil {
+		postAttrs = tryStat(fs, path)
+	}
+	if err := WritePostOpAttrs(writer, postAttrs); err != nil {
 		putResponseBuffer(writer)
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}

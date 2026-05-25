@@ -5,6 +5,22 @@ import JuiceMountCore
 /// All calls are blocking — wrap in a background queue if calling from the UI thread.
 public enum NFSBridge {
 
+    /// Per-call ephemeral session for loopback metrics calls. URLSession.shared
+    /// caches connections aggressively; after a wifi/interface switch the
+    /// cached HTTP/1.1 connection to 127.0.0.1 can be stuck in a "reachable
+    /// but unusable" state for many minutes — the call times out silently
+    /// even though `curl` to the same URL succeeds. An ephemeral session has
+    /// no on-disk cache and short connection reuse windows, so each call
+    /// opens a fresh TCP socket. The wall-clock cost on loopback is single-
+    /// digit milliseconds; well worth the resilience.
+    fileprivate static func loopbackSession() -> URLSession {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 2
+        cfg.timeoutIntervalForResource = 5
+        cfg.waitsForConnectivity = false
+        return URLSession(configuration: cfg)
+    }
+
     public struct ServerConfig: Codable {
         public var redisURL: String
         public var fusePath: String
@@ -187,6 +203,36 @@ public enum NFSBridge {
         }
     }
 
+    /// Independent /health probe. Defensive backstop: when the cgo Stats
+    /// path is for any reason reporting unhealthy (or being missed by the
+    /// state machine) we still want to know whether the Go-side monitor
+    /// considers itself healthy. Returns nil on any failure (timeout,
+    /// decode error, non-200 status). Successful nil-`reason` + `healthy`
+    /// means "Go thinks every backend is up right now."
+    public struct HealthProbe: Codable, Equatable {
+        public var healthy: Bool
+        public var components: [String: String]
+        public var reason: String?
+    }
+
+    public static func healthProbe(metricsAddr: String = "127.0.0.1:11050") -> HealthProbe? {
+        guard let url = URL(string: "http://\(metricsAddr)/health") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 2
+        let sem = DispatchSemaphore(value: 0)
+        var result: HealthProbe?
+        let session = loopbackSession()
+        session.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            result = try? JSONDecoder().decode(HealthProbe.self, from: data)
+        }.resume()
+        sem.wait()
+        session.finishTasksAndInvalidate()
+        return result
+    }
+
     /// Fetch the offline state from the local metrics server. Blocking
     /// — call from a background queue. Endpoint: `/offline` (GET, no
     /// `?on=` param returns state JSON; `?on=true/false` is the toggle).
@@ -197,12 +243,14 @@ public enum NFSBridge {
         req.timeoutInterval = 2
         let sem = DispatchSemaphore(value: 0)
         var result: OfflineState?
-        URLSession.shared.dataTask(with: req) { data, _, _ in
+        let session = loopbackSession()
+        session.dataTask(with: req) { data, _, _ in
             defer { sem.signal() }
             guard let data else { return }
             result = try? JSONDecoder().decode(OfflineState.self, from: data)
         }.resume()
         sem.wait()
+        session.finishTasksAndInvalidate()
         return result
     }
 
@@ -264,12 +312,14 @@ public enum NFSBridge {
 
         let sem = DispatchSemaphore(value: 0)
         var result: SelfTestResult?
-        URLSession.shared.dataTask(with: req) { data, _, _ in
+        let session = loopbackSession()
+        session.dataTask(with: req) { data, _, _ in
             defer { sem.signal() }
             guard let data else { return }
             result = try? JSONDecoder().decode(SelfTestResult.self, from: data)
         }.resume()
         sem.wait()
+        session.finishTasksAndInvalidate()
         return result
     }
 

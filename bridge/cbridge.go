@@ -232,6 +232,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		return C.CString(fmt.Sprintf("error: redis: %v", err))
 	}
 	globalRC = rc
+	// QA-30 (2026-05-25): give the reconcile loop the path config it needs
+	// for pin-filter normalization (mountpoint-prefixed pin paths vs
+	// internal metadata paths) and per-path FUSE Lstat verification of
+	// prune candidates. Both are essential to prevent ESTALE on still-
+	// valid files; SetPathConfig MUST happen before rc.Start launches the
+	// reconcile goroutine below.
+	rc.SetPathConfig(cfg.MountPoint, cfg.FUSEPath)
 
 	// [JM6 tier-1.8/1.9] Reachability monitor against the metadata
 	// host. Probes a cheap TCP dial at 2s cadence; transitions
@@ -329,6 +336,14 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	pinDBPath := pinStorePath(cfg.DBPath)
 	if ps, err := pin.Open(pinDBPath); err == nil {
 		globalPinStore = ps
+		// QA-30 (2026-05-25): wire the pin store as the metadata layer's
+		// PinChecker so syncMetadata's prune and Store.evictOldest skip
+		// pinned paths. Pinning is an explicit user contract for offline
+		// availability — its files MUST remain in the metadata caches to
+		// keep kernel-cached NFS handles valid. Without this, transient
+		// Redis SCAN gaps trigger ESTALE on still-cached files mid-edit
+		// (observed: DaVinci treating fully-cached media as offline).
+		store.SetPinChecker(ps)
 		globalPrefetcher = pin.NewPrefetcher(ps, cfg.FUSEPath, cfg.MountPoint, 4)
 		// Long-running daemons that drain the queue and re-warm pinned
 		// files. Launched via Prefetcher.Go so they're tracked by the
@@ -960,9 +975,26 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 	}
 
 	// Timeout policy. Tuned for a localhost NFS server (us). The kernel
-	// client's timeo is in 0.1-second units, so timeo=10 means 1 s initial
-	// timeout; retrans=2 means at most 2 retries before returning EIO to
-	// the calling syscall. Worst-case dead-server detection: ~3 s.
+	// client's timeo is in 0.1-second units, so timeo=200 means 20 s
+	// initial timeout; retrans=2 means at most 2 retries before returning
+	// EIO to the calling syscall. Worst-case dead-server detection: ~60 s.
+	//
+	// QA-29 (2026-05-21): bumped from timeo=100 (10 s) to timeo=200 (20 s).
+	// Under heavy folder-copy load (Editor Resource Vault with thousands
+	// of small files), per-RPC measurements showed CREATE max = 29.02 s
+	// while WRITE max stayed at 5.07 s. CREATE chains JuiceFS LOOKUP +
+	// Create + metadata.Store Insert — the SQLite writeMu contends with
+	// the reconcile loop's BulkInsert which holds the lock per 500-entry
+	// batch. The previous timeo=100 (~30 s budget) was right at the edge;
+	// any TCP RTT pushed CREATEs over the kernel's retransmit window and
+	// surfaced ETIMEDOUT to Finder as "operation can't be completed
+	// (error 100060)" mid-copy. timeo=200 gives ~60 s budget — comfortable
+	// margin for CREATE stalls during metadata sync.
+	//
+	// QA-27 (2026-05-21): bumped from timeo=10 (1 s) to timeo=100 (10 s)
+	// after measuring WRITE p99=1.88 s, worst=6.23 s when JuiceFS disk
+	// cache was 94% full. That fix covered WRITE-side stalls; QA-29 closes
+	// the CREATE-side gap.
 	//
 	// Why this matters: with the previous timeo=300,retrans=5 settings,
 	// when the JuiceMount user-space server died but the kernel mount
@@ -974,39 +1006,38 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 	// process repeated the same enumeration. The user perceived "Finder
 	// won't launch."
 	//
-	// The tradeoff: real backend hiccups now surface as EIO after ~3 s
+	// The tradeoff: real backend hiccups now surface as EIO after ~60 s
 	// instead of after ~150 s. For our localhost-only NFS path, that's
-	// the right policy — a 3 s blip is annoying, a 150 s blip looks
-	// indistinguishable from a system hang.
-	// [JM6] rsize=262144 (256 KiB). Was 1048576 (1 MiB).
+	// the right policy — a 60 s blip is annoying, a 150 s blip looks
+	// indistinguishable from a system hang. (Original aggressive 3 s
+	// budget was too tight for big-file copy under JuiceFS writeback
+	// pressure; QA-27/QA-29 moved the dial to 60 s.)
+	// [QA-31] rsize=1048576 (1 MiB). Was 262144 (256 KiB).
 	//
-	// 2026-05-16 cold-read instrumentation showed individual NFS READ
-	// RPCs for 1 MiB chunks taking up to 4 s when the underlying
-	// JuiceFS-over-MinIO path is slow (cold blocks, Redis flakes on
-	// the metadata backend). The kernel's per-operation budget with
-	// timeo=10,retrans=2 over TCP is ~7 s of cumulative wall-clock
-	// before the client returns EIO to the caller. A single slow 1
-	// MiB read can therefore exhaust the budget by itself, killing
-	// `cat`/`dd`/NLE-scrub on large cold files.
+	// History: QA-31 (2026-05-25): bumped back to 1 MiB. Live
+	// measurement on a hot cached MP4 showed NFS throughput at 9.5
+	// MB/s vs FUSE-direct 1.3 GB/s — a 140× slowdown isolated to the
+	// per-NFS-RPC overhead (each READ RPC chains an Open via fdPool +
+	// two Stats via fs.Stat/tryStat which each go through JuiceFS's
+	// FUSE layer + cachedFile.ReadAt). At rsize=256 KiB this overhead
+	// fires 4× per MiB; bumping back to 1 MiB cuts the per-MiB
+	// overhead to a quarter immediately. The original reason to drop
+	// rsize was timeo=10's tight ~7s per-RPC budget; we're now at
+	// timeo=200 (60s budget) so 1 MiB even on a cold MinIO fetch is
+	// safely within budget.
 	//
-	// Reducing rsize to 256 KiB means each kernel RPC asks for a
-	// quarter as much. The server's chunked-loop deadline (2 s, see
-	// internal/nfs/nfs_onread.go) was already subdividing 1 MiB
-	// requests into 256 KiB sub-reads internally; this just moves
-	// the subdivision out to the kernel-NFS layer where each RPC is
-	// independently budgeted. Net latency for a warm 1 MiB transfer
-	// is unchanged in practice — 4 kernel RPCs in flight under our
-	// concurrent dispatch get pipelined.
-	//
-	// The cost is more RPC overhead at high throughput. For 200 MiB
-	// at 250 MB/s that's 800 RPCs/sec instead of 200 RPCs/sec. Our
-	// concurrent-dispatch handler comfortably handles that load (>5
-	// kRPC/sec is fine).
+	// Earlier history: 2026-05-16 cold-read instrumentation showed
+	// individual NFS READ RPCs for 1 MiB chunks taking up to 4 s
+	// when JuiceFS-over-MinIO was slow. That problem was fixed at the
+	// timeout layer (QA-29 timeo=200) and is no longer the binding
+	// constraint. The server's internal 256-KiB subdivision in
+	// nfs_onread.go remains as a deadline-protection guarantee inside
+	// each NFS RPC; the OUTER kernel RPC can again be 1 MiB.
 	//
 	// Write size stays at 1 MiB — writes are sequential and the
 	// failure mode there is different.
 	opts := fmt.Sprintf(
-		"port=%s,mountport=%s,soft,intr,timeo=10,retrans=2,nolocks,locallocks,rsize=262144,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
+		"port=%s,mountport=%s,soft,intr,timeo=200,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
 		port, port)
 
 	// [JM6] Two-tier mount strategy.
