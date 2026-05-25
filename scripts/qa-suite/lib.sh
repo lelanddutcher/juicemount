@@ -18,7 +18,17 @@
 # ---------------------------------------------------------------------------
 # Env defaults
 
-export MOUNT="${MOUNT:-/Volumes/zpool-dev}"
+# QA-22+ (2026-05-25): auto-detect the live NFS mount instead of hardcoding
+# /Volumes/zpool-dev. Picks the first 127.0.0.1:/ NFS mount. Falls back to
+# the legacy default if no NFS mount is currently active so CI runs that
+# start before JM is up still get a usable path.
+if [ -z "${MOUNT:-}" ]; then
+  MOUNT="$(mount | awk '$1 == "127.0.0.1:/" && $3 != "" && /nfs/ {print $3; exit}')"
+  if [ -z "$MOUNT" ]; then
+    MOUNT="/Volumes/zpool-dev"
+  fi
+fi
+export MOUNT
 export JM_METRICS_ADDR="${JM_METRICS_ADDR:-127.0.0.1:11050}"
 export FUSE_INTERNAL="${FUSE_INTERNAL:-$HOME/.juicemount/fuse-internal}"
 export ARTIFACTS_ROOT="${ARTIFACTS_ROOT:-/tmp/jm-qa-artifacts}"
