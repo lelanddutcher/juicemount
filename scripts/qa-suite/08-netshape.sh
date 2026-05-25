@@ -30,6 +30,16 @@ BACKEND_PORT="${BACKEND_PORT:-9000}"
 # Override with BACKEND_HOST env if your setup differs.
 log "shaping target: ${BACKEND_HOST}:${BACKEND_PORT}"
 
+# QA-22 (2026-05-25): Redis target for case 4. Auto-offline engages when
+# the JM monitor sees BOTH Redis and the object store unreachable. The
+# pre-QA-22 script only blocked MinIO and was a no-op for auto-offline
+# detection if Redis was on a separate host (the typical TrueNAS layout
+# where the same box runs both, but as distinct containers/services on
+# different macvlan IPs). Resolve case 4 by blocking both ports.
+REDIS_HOST="${REDIS_HOST:-192.168.0.210}"
+REDIS_PORT="${REDIS_PORT:-6379}"
+log "redis target (for case 4 only): ${REDIS_HOST}:${REDIS_PORT}"
+
 # Bail early if we can't even reach the backend on a non-shaped run
 if ! nc -zv -G 3 "$BACKEND_HOST" "$BACKEND_PORT" >/dev/null 2>&1; then
     warn "backend ${BACKEND_HOST}:${BACKEND_PORT} not currently reachable — net-shaping tests would be redundant"
@@ -146,14 +156,21 @@ rm -f "$TMPDIR_LOCAL/N3-src-$$"
 
 # ---------------------------------------------------------------------------
 section "case 4: full backend block (forces auto-offline) + recovery"
-# Block all traffic to backend
+# QA-22 (2026-05-25): block BOTH MinIO and Redis. Auto-offline only
+# engages when the JM monitor sees both backends unreachable; blocking
+# MinIO alone left Redis reachable and the prior test was a no-op
+# (auto-offline never engaged → assert always failed if it ever ran on
+# a multi-host backend).
 sudo -n pfctl -a com.juicemount.qa -F all >/dev/null 2>&1
 sudo -n dnctl pipe flush >/dev/null 2>&1
 tmpf=$(mktemp)
-echo "block drop out proto tcp to ${BACKEND_HOST} port ${BACKEND_PORT}" > "$tmpf"
+{
+    echo "block drop out proto tcp to ${BACKEND_HOST} port ${BACKEND_PORT}"
+    echo "block drop out proto tcp to ${REDIS_HOST} port ${REDIS_PORT}"
+} > "$tmpf"
 sudo -n pfctl -a com.juicemount.qa -f "$tmpf" >/dev/null 2>&1
 rm -f "$tmpf"
-log "backend traffic blocked. waiting up to 20s for auto-offline…"
+log "backend (${BACKEND_HOST}:${BACKEND_PORT}) + redis (${REDIS_HOST}:${REDIS_PORT}) blocked. waiting up to 20s for auto-offline…"
 DETECTED=0
 for i in $(seq 1 10); do
     if jm_auto_offline_engaged; then
