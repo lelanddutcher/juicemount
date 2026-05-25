@@ -15,6 +15,140 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### QA-31 ✓ CLOSED (2026-05-25) — Resolve playback <2 fps on cached media; NFS READ path was the bottleneck
+
+**Observed (user, 2026-05-25):** DaVinci Resolve playback at <2 fps on
+footage that JM reports as fully cached (13/13 pinned files Ready,
+13.90 GB cached in pin store, JuiceFS chunk cache showing 80,078 blocks /
+37.7 GB cached with 0 evictions).
+
+**Diagnosis:** measured throughput differential
+- FUSE direct (`/Users/.../.juicemount/fuse-internal/...`): **1.3 GB/s**
+- NFS via JM (`/Volumes/zpool/...`): **9.5 MB/s** — a 140× slowdown
+- Server-side `READ` p95: 3.4 s, max 3.45 s, mean 640 ms
+
+Two compounding causes in the NFS read path:
+
+1. `bridge/cbridge.go` mount option `rsize=262144` (256 KiB). Historical
+   value from when `timeo=10` gave us a ~7 s per-RPC budget; current
+   `timeo=200` budget (60 s) doesn't need such a small read size. Cut the
+   RPC count by 4× by bumping back to 1 MiB.
+
+2. `internal/nfs/nfs_onread.go` was making TWO FUSE Stat round-trips per
+   NFS READ RPC:
+   - Line 100-108: `fs.Stat(...)` for the size-clamp (fires on every read
+     larger than `CheckRead = 32 KiB`, i.e. ALL of them at the new rsize)
+   - Line 203: `tryStat(fs, path)` for the post-op attrs in the NFS reply
+   - Both calls go through `nfs/handler.go juiceFS.Stat` which contains a
+     2-second-budgeted `lstatNotExistWithTimeout` for the phantom-purge
+     gate at line 696. Even when fast in healthy state, that's 2 FUSE
+     round-trips fully serialized with any other FUSE activity per RPC.
+
+**Fix:**
+
+1. `bridge/cbridge.go`: `rsize=262144` → `rsize=1048576`. Comments updated
+   with the QA-29-budget rationale.
+
+2. New interface `internal/nfs/file.go CachedInfoProvider` with
+   `CachedInfo() os.FileInfo`. `nfs/handler.go cachedFile` implements it,
+   serving a VALUE snapshot (struct `snapshotFileInfo`) of the metadata
+   at Open time. The value-snapshot avoids the data race the original
+   `e.FileInfo()` pointer would have caused with concurrent
+   `UpdateSize` (QA-31 code review HIGH-1).
+
+3. `internal/nfs/nfs_onread.go` size-clamp and post-op-attrs paths
+   type-assert `fh` to `CachedInfoProvider`. When present, use the cached
+   info directly; fall back to `fs.Stat` / `tryStat` only for handle
+   types that don't expose cached info (writeFile, billyFile).
+
+4. EOF-underflow fix in the same size-clamp (QA-31 code review HIGH-2):
+   when `obj.Offset >= size`, `uint64(size) - obj.Offset` underflows;
+   handle the at-or-past-EOF case explicitly (set Count=0).
+
+**Validation:** dd 200 MiB reads on the same cached MP4
+- Before QA-31: 9.5 MB/s
+- After Slice 2 (rsize=1M only): 50 MB/s
+- After full QA-31 (rsize + Stat fast-path + EOF fix): **226-571 MB/s**
+
+Server-side READ profile after QA-31: count=771, mean=242 ms, p50=304 ms,
+p95=481 ms, max=370 ms. p95 down from 3.4 s to 481 ms (~7× improvement),
+max down from 3.45 s to 0.37 s (~9× improvement).
+
+Smoke 01-smoke.sh: 10 PASS / 0 FAIL.
+
+### QA-30 ✓ CLOSED (2026-05-25) — kernel-cached NFS handles for still-valid pinned files going ESTALE
+
+**Observed:** DaVinci treating fully-cached media as offline; JM log
+shows storms of `FromHandle STALE` events for real (non-synthetic)
+inodes whose paths are still in pathCache. Pin store says `status=Ready,
+bytes_cached=size`.
+
+**Root cause (bug class):** `metadata/redis.go syncMetadata` uses Redis
+SCAN as the authoritative source for "does this file still exist?". A
+transient incomplete SCAN (observed: 17 s sync cycles returning
+incomplete result sets under load) increments `pruneAbsent[path]`. After
+`PruneThreshold=2` cycles (≤60 s), `DeletePaths` fires on the path. The
+QA-25 pointer-equality guard correctly preserves `inodeCache[inode]` IF
+a newer entry has overtaken the inode, but the common path — a single
+authoritative entry getting pruned — DOES drop the inode mapping.
+Kernel-cached NFS handle then returns STALE → DaVinci treats as offline.
+
+**Fix — three layers + defense in depth:**
+
+- **Layer C (pin guard, primary, `metadata/store.go` + `internal/cache/pin/store.go`):**
+  pinned files are never pruned or evicted. `pin.Store.PinnedPaths()
+  (map[string]struct{}, error)` returns the current pin set with
+  explicit error reporting. `metadata.Store.SetPinChecker(pc)` wires it.
+  `syncMetadata` filters pinned paths out of `toDelete` before
+  `DeletePaths`; `evictOldest` retains pinned files alongside dirs
+  unconditionally. Fail-safe: any pin-checker error skips the entire
+  prune/eviction pass for that cycle (cost: one cycle of stale entries;
+  much cheaper than the bug we're closing).
+- **Layer A (FUSE Lstat verification, secondary, `metadata/redis.go`
+  syncMetadata):** every prune candidate that survives Layer C is then
+  Lstat-verified via FUSE with a 1 s per-path budget. Only paths that
+  FUSE confirms gone are pruned. Bounded gate of 8 in-flight Lstats
+  caps goroutine leak under FUSE wedge. If >25% of probes time out
+  (with absolute floor of 4 timeouts), skip the entire prune cycle.
+- **Layer B (FromHandle recovery, defensive net, `metadata/store.go` +
+  `nfs/handler.go`):** every entry removed from caches is parked in a
+  `recentlyEvicted map[uint64]evictedShadow` with a 5-minute TTL. On
+  FromHandle cache miss, `tryRecoverEvicted` checks the shadow,
+  Lstat-verifies the path, and re-inserts the entry. Singleflight by
+  inode collapses stale-handle storms (DaVinci's 50+/sec scrub retries)
+  to one recovery attempt. Negative cache (5 s TTL) bounds Lstat rate
+  on confirmed-gone handles.
+- **`PruneThreshold` bumped 2 → 10** — 5-minute buffer before any prune
+  fires regardless of layers above.
+- **Path normalization fix:** pin.db keys on `/Volumes/zpool/...` while
+  metadata.db keys on `Film Projects/...`. New
+  `RedisClient.internalFromMounted` + `fusePathFor` helpers convert
+  between the two formats. Wired via `rc.SetPathConfig(mountPoint,
+  fuseRoot)`.
+
+**Validation:** zero `FromHandle STALE` events since Layer C + A deploy.
+Layer A logged `fuse_present_skipped: 4` at 18:52:36 — concrete proof it
+saved 4 still-present paths from incorrect pruning during a metadata
+sync cycle. Layer B unit tests cover all four eviction paths + shadow
+TTL + recovery race conditions. All tests pass under `-race`.
+
+**Code-review gates (Rule 4): two full audits across Layers A+C, one
+full audit on Layer B, FIVE HIGH findings total, all fixed before
+deploy:**
+1. Data race on `s.pinChecker` (Layer C) → SetPinChecker takes Lock,
+   pinnedSetPublic takes RLock to read.
+2. Silent SQLite error in `PinnedPaths` (Layer C) → returns error,
+   callers fail-safe.
+3. Goroutine leak under permanent FUSE wedge (Layer A) → bounded gate
+   of 8 in-flight Lstats.
+4. Test flake on `time.After(0)` (Layer A) → atomic.Pointer injection
+   for deterministic test of timeout path.
+5. Small-batch threshold cutoff (Layer A) → absolute floor of 4
+   timeouts before bail.
+Plus on Layer B: HIGH-1 (lstatWithTimeout same goroutine-leak issue,
+shared `nfsLstatGate`); HIGH-2 (pinnedSetLocked held s.mu across SQL
+query → pre-fetch via `stagePinnedForEviction`).
+
 ### QA-25 ✓ CLOSED (2026-05-20) — moved folder contents become inaccessible ~30-60s after rename
 
 **Observed:** user moves a folder with subfolders within the same volume.
