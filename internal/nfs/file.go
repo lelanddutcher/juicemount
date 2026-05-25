@@ -193,6 +193,36 @@ func tryStat(fs billy.Filesystem, path []string) *FileAttribute {
 	return ToFileAttribute(attrs, fullPath)
 }
 
+// CachedInfoProvider is the fast-path interface for billy.File implementations
+// that have already loaded the file's metadata at Open time. When a handle
+// implements this, onRead uses the cached info for both the size-clamp and
+// the post-op attrs, skipping two FUSE Stat round-trips per NFS READ RPC.
+//
+// QA-31 (2026-05-25): adding this interface unlocked Resolve playback. The
+// per-RPC Stat amplification was the dominant cost on cached reads (~640ms
+// mean READ for chunks JuiceFS serves in microseconds).
+//
+// Returning a non-nil os.FileInfo opts the handle into the fast path; a
+// handle that returns nil falls back to the legacy fs.Stat / tryStat path.
+type CachedInfoProvider interface {
+	CachedInfo() os.FileInfo
+}
+
+// tryCachedStat returns a FileAttribute synthesized from a handle's cached
+// info, or nil if the handle didn't supply one. fullPath is used only for
+// the file-id fallback (when Sys() doesn't carry an inode).
+func tryCachedStat(fh interface{}, fullPath string) *FileAttribute {
+	cp, ok := fh.(CachedInfoProvider)
+	if !ok {
+		return nil
+	}
+	info := cp.CachedInfo()
+	if info == nil {
+		return nil
+	}
+	return ToFileAttribute(info, fullPath)
+}
+
 // WriteWcc writes the `wcc_data` representation of an object.
 func WriteWcc(writer io.Writer, pre *FileCacheAttribute, post *FileAttribute) error {
 	if pre == nil {

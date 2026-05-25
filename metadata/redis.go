@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,9 +32,17 @@ const (
 
 	// PruneThreshold is the number of consecutive reconciliation cycles an entry
 	// must be absent from Redis before it is deleted from SQLite.
-	// At 30s intervals, 2 cycles = ~60s minimum before any prune fires.
-	// This prevents transient Redis scan misses from dropping legitimate entries.
-	PruneThreshold = 2
+	// At 30s intervals, 10 cycles = ~5 minutes minimum before any prune fires.
+	//
+	// QA-30 (2026-05-25): bumped from 2 to 10. A single 17s SCAN cycle was
+	// observed returning incomplete results under load — only 2 consecutive
+	// such cycles (≤60s) were enough to mark a still-present file for
+	// deletion. DaVinci saw ESTALE on fully-cached media mid-edit. 10 cycles
+	// gives ~5 min buffer for any realistic transient Redis or network blip;
+	// pairs with the pin-store guard below (pinned files are never pruned
+	// regardless of threshold) and the per-path FUSE Lstat verification
+	// added separately to syncMetadata.
+	PruneThreshold = 10
 )
 
 // MetadataEvent represents a real-time metadata change published via Redis SUBSCRIBE.
@@ -75,6 +84,134 @@ type RedisClient struct {
 	// has been absent from Redis. Only paths absent for PruneThreshold+ cycles
 	// are actually deleted from SQLite. Guarded by mu.
 	pruneAbsent map[string]int
+
+	// QA-30 (2026-05-25): path conversion config so syncMetadata can
+	// correctly cross-reference the pin store (mountpoint-prefixed paths)
+	// against metadata.Store entries (JuiceFS-internal paths, no prefix)
+	// and probe FUSE for prune verification. Set once at startup via
+	// SetPathConfig; reads thereafter are unsynchronized but safe because
+	// they happen on the single reconcile goroutine.
+	mountPoint string
+	fuseRoot   string
+}
+
+// SetPathConfig wires the mount point (e.g. "/Volumes/zpool") and the
+// JuiceFS FUSE root (e.g. "/Users/x/.juicemount/fuse-internal") used by
+// QA-30's pin-filter normalization and per-path Lstat verification. Must
+// be called before reconcileLoop is started. No-op if either argument is
+// empty — disables QA-30 path-aware behavior gracefully.
+func (rc *RedisClient) SetPathConfig(mountPoint, fuseRoot string) {
+	rc.mountPoint = strings.TrimRight(mountPoint, "/")
+	rc.fuseRoot = strings.TrimRight(fuseRoot, "/")
+}
+
+// lstatFunc is the type of the package-level Lstat hook. Aliased so we can
+// use it with sync/atomic safely (atomic.Pointer needs a concrete named type
+// to store).
+type lstatFunc func(string) (os.FileInfo, error)
+
+// lstatFnPtr is the injection point for tests. Production callers always
+// use os.Lstat; tests can substitute a deterministic blocker to exercise
+// the timeout path without relying on scheduler timing.
+//
+// Stored as atomic.Pointer because tests legitimately swap the value while
+// production worker goroutines may still be reading it — the race detector
+// requires explicit synchronization (QA-30 code review HIGH-2 follow-up).
+var lstatFnPtr atomic.Pointer[lstatFunc]
+
+func init() {
+	var def lstatFunc = os.Lstat
+	lstatFnPtr.Store(&def)
+}
+
+// setLstatFn is the test-only setter; the prior value is returned for
+// cleanup via the standard `defer setLstatFn(old)` pattern.
+func setLstatFn(fn lstatFunc) lstatFunc {
+	old := *lstatFnPtr.Load()
+	lstatFnPtr.Store(&fn)
+	return old
+}
+
+// lstatGate caps concurrent FUSE Lstat calls so a sustained FUSE wedge
+// can't spawn an unbounded number of goroutines (QA-30 code review HIGH-1).
+// 8 in flight is enough to amortize per-call latency on a healthy FUSE
+// without saturating the kernel's request queue. When the gate is full,
+// callers block briefly until a slot frees; on a wedged FUSE, the gate's
+// own ctx-based wait drops the request rather than queuing forever.
+var lstatGate = make(chan struct{}, 8)
+
+// lstatNotExistWithTimeout mirrors nfs/handler.go's helper of the same
+// name. Kept package-private here so metadata doesn't depend on nfs.
+// Returns (isNotExist, ok); ok=false means the Lstat timed out (FUSE
+// likely wedged) — callers MUST NOT interpret a timeout as "file gone".
+//
+// QA-30 code review HIGH-1 mitigation: bounded concurrency via lstatGate
+// caps in-flight goroutines at 8. If the gate is full beyond the deadline,
+// the call returns ok=false (treated as "FUSE degraded, don't prune").
+// The spawned worker still leaks for the duration of the wedged Lstat,
+// but the leak is bounded to gate-size and drains naturally when FUSE
+// recovers.
+func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok bool) {
+	// Acquire gate slot or bail. timer is shared with the actual Lstat
+	// deadline below — if we waste 500ms here waiting for a slot, we
+	// only have 500ms left for the Lstat itself.
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case lstatGate <- struct{}{}:
+	case <-timer.C:
+		return false, false
+	}
+
+	// Atomic load; safe even when tests swap the function concurrently.
+	fn := *lstatFnPtr.Load()
+	ch := make(chan error, 1)
+	go func() {
+		_, err := fn(p)
+		ch <- err
+		<-lstatGate // release slot only after Lstat actually returns
+	}()
+	select {
+	case err := <-ch:
+		return os.IsNotExist(err), true
+	case <-timer.C:
+		// Worker still owns the gate slot until its Lstat returns; that
+		// caps the leak at lstatGate's buffer size. The next caller will
+		// either get a slot (if the wedge clears) or bail on the gate
+		// wait above.
+		return false, false
+	}
+}
+
+// internalFromMounted converts a mountpoint-prefixed path
+// (e.g. "/Volumes/zpool/Foo/Bar") into the JuiceFS-internal form used by
+// metadata.Store ("Foo/Bar"). Returns the input unchanged if rc.mountPoint
+// is unset or the path doesn't carry the expected prefix.
+func (rc *RedisClient) internalFromMounted(p string) string {
+	if rc.mountPoint == "" {
+		return p
+	}
+	if p == rc.mountPoint {
+		return ""
+	}
+	prefix := rc.mountPoint + "/"
+	if strings.HasPrefix(p, prefix) {
+		return p[len(prefix):]
+	}
+	return p
+}
+
+// fusePathFor maps a JuiceFS-internal path back to its absolute location
+// in the FUSE mount, so syncMetadata can Lstat-verify a prune candidate
+// before deletion. Returns "" if rc.fuseRoot is unset.
+func (rc *RedisClient) fusePathFor(internalPath string) string {
+	if rc.fuseRoot == "" {
+		return ""
+	}
+	if internalPath == "" {
+		return rc.fuseRoot
+	}
+	return rc.fuseRoot + "/" + strings.TrimLeft(internalPath, "/")
 }
 
 // ParseRedisURL extracts host, port, and db from a redis:// URL.
@@ -824,6 +961,95 @@ func (rc *RedisClient) syncMetadata() error {
 		}
 	}
 
+	// QA-30 (2026-05-25): two-layer protection against pruning still-valid
+	// files. Layer C (pin guard) runs first because it's authoritative:
+	// pinning is the user's explicit contract that the file remain offline-
+	// accessible. Layer A (FUSE Lstat verification) catches everything else
+	// — paths Redis SCAN missed but FUSE confirms are present. Together
+	// they close the "transient SCAN gap causes ESTALE on cached media"
+	// bug class (observed: DaVinci treating fully-cached files as offline).
+	//
+	// Both layers fail-safe: any unrecoverable error skips the entire prune
+	// pass for this cycle. The cost of a delayed prune is at most one
+	// cycle of stale entries; the cost of an incorrect prune is the bug
+	// we're closing.
+	prunedPinned := 0
+	prunedFUSEpresent := 0
+	if len(toDelete) > 0 {
+		// === Layer C: filter out pinned paths ===
+		pinned, perr := rc.store.pinnedSetPublic()
+		if perr != nil {
+			jmlog.Warn("metadata sync: pin-checker error, skipping prune this cycle",
+				"error", perr.Error(),
+				"would_have_pruned", len(toDelete),
+			)
+			toDelete = nil
+		} else if len(pinned) > 0 {
+			// Pin store keys on the mountpoint-prefixed path; metadata
+			// entries key on the JuiceFS-internal path. Normalize the
+			// pinned set to the internal form once, then check by lookup.
+			pinnedInternal := make(map[string]struct{}, len(pinned))
+			for mp := range pinned {
+				pinnedInternal[rc.internalFromMounted(mp)] = struct{}{}
+			}
+			filtered := toDelete[:0]
+			for _, p := range toDelete {
+				if _, ok := pinnedInternal[p]; ok {
+					prunedPinned++
+					continue
+				}
+				filtered = append(filtered, p)
+			}
+			toDelete = filtered
+		}
+
+		// === Layer A: per-path FUSE Lstat verification ===
+		// Even non-pinned paths shouldn't be pruned if FUSE still shows
+		// them present — that means JuiceFS still has them, Redis SCAN
+		// just happened to miss them this cycle. Each Lstat capped at 1s
+		// so a FUSE wedge can't pin the reconcile goroutine. If more than
+		// 25% of probes time out, treat FUSE as degraded and skip the
+		// whole prune (defensive — degraded FUSE plus blind prune was
+		// what surfaced the bug in production).
+		if len(toDelete) > 0 && rc.fuseRoot != "" {
+			verified := toDelete[:0]
+			lstatTimeouts := 0
+			for _, p := range toDelete {
+				fusePath := rc.fusePathFor(p)
+				if fusePath == "" {
+					verified = append(verified, p)
+					continue
+				}
+				isAbsent, ok := lstatNotExistWithTimeout(fusePath, time.Second)
+				if !ok {
+					lstatTimeouts++
+					continue // timed out — don't prune, retry next cycle
+				}
+				if isAbsent {
+					verified = append(verified, p)
+				} else {
+					prunedFUSEpresent++ // FUSE says it's there — keep it
+				}
+			}
+			// QA-30 code review HIGH-3: absolute floor of 4 timeouts before
+			// bailing the whole cycle. Without this, a small batch
+			// (N<=3) trips the bail on a single transient timeout —
+			// effectively a 100%/50%/33% threshold instead of the
+			// intended 25%. Small batches handle individual timeouts
+			// fine via the `continue` above (paths simply stay
+			// unpruned this cycle, retried next time).
+			if lstatTimeouts >= 4 && lstatTimeouts*4 > len(toDelete) {
+				jmlog.Warn("metadata sync: FUSE degraded (>25% Lstat timeouts), skipping prune this cycle",
+					"timeouts", lstatTimeouts,
+					"total_probes", len(toDelete),
+				)
+				toDelete = nil
+			} else {
+				toDelete = verified
+			}
+		}
+	}
+
 	if len(toDelete) > 0 {
 		if err := rc.store.DeletePaths(toDelete); err != nil {
 			return fmt.Errorf("delete pruned: %w", err)
@@ -842,6 +1068,8 @@ func (rc *RedisClient) syncMetadata() error {
 		"entries", len(redisEntries),
 		"upserted", len(toUpsert),
 		"pruned", len(toDelete),
+		"pinned_skipped", prunedPinned,        // QA-30 Layer C: pinned paths spared
+		"fuse_present_skipped", prunedFUSEpresent, // QA-30 Layer A: FUSE-confirmed present
 		"pending_prune", pendingPrune,
 		"duration_ms", duration.Round(time.Millisecond).Milliseconds(),
 	)

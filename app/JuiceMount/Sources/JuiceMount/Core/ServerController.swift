@@ -354,15 +354,76 @@ public final class ServerController {
                 // QA-23 fix (2026-05-18): the offline/cache state was only
                 // refreshing on UI events (popover open, toggle click). After
                 // auto-offline recovered the header banner "Offline · Xm"
-                // stayed stuck because offlineState was never re-read. Refresh
-                // cacheStatus + offlineState every 5th tick (~10s) so the
-                // header and toggle converge on backend state within a single
-                // popover sit. Stats poll stays at 2s for snappy health dots.
+                // stayed stuck because offlineState was never re-read.
+                //
+                // QA-26 (2026-05-21): bumped cadence from every-5th (10s) to
+                // every-2nd (4s). The semi-stale window after a second wifi-
+                // recovery was on the order of minutes; cutting the worst-case
+                // re-converge time matters more than the extra HTTP calls
+                // (loopback, ~ms each).
                 tick &+= 1
-                if tick % 5 == 0 {
+                if tick % 2 == 0 {
                     self?.refreshCacheStatus()
                 }
+                // QA-26 backstop (2026-05-21): if the state machine has been
+                // stuck in .disconnected/.degraded for ≥3 consecutive ticks
+                // (~6s) AND the Go-side /health endpoint reports healthy,
+                // force-transition to .running. This is independent of the
+                // cgo Stats path and protects against any future stuck-state
+                // failure mode where Stats keeps reporting unhealthy while
+                // the Go monitor disagrees. Costs one extra HTTP call per
+                // tick only while stuck — zero overhead in the healthy case.
+                if let self {
+                    self.runStuckStateBackstop()
+                }
                 try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    /// QA-26: counter for consecutive ticks observed in a non-healthy state.
+    /// Reset whenever updateStateFromStats transitions to .running/.syncing.
+    private var stuckTicks: Int = 0
+
+    /// QA-26 backstop. Runs every poll tick while polling is active.
+    /// When stuckTicks ≥3 and state is .disconnected/.degraded, fires an
+    /// HTTP /health probe (ephemeral session — independent of cgo Stats).
+    /// If the probe says healthy, force-transition the state machine and
+    /// log it loudly so future debugging can find this path.
+    @MainActor
+    private func runStuckStateBackstop() {
+        let isStuck: Bool
+        switch state {
+        case .disconnected, .degraded:
+            isStuck = true
+        default:
+            isStuck = false
+        }
+        if !isStuck {
+            stuckTicks = 0
+            return
+        }
+        stuckTicks &+= 1
+        guard stuckTicks >= 3 else { return }
+
+        let metricsAddr = preferences.metricsAddr
+        workQueue.async { [weak self] in
+            guard let probe = NFSBridge.healthProbe(metricsAddr: metricsAddr) else { return }
+            guard probe.healthy else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                switch self.state {
+                case .disconnected, .degraded:
+                    self.log.warning("backstop: /health probe says healthy while state=\(self.state.displayLabel, privacy: .public) for \(self.stuckTicks) ticks — forcing transition to .running")
+                    self.state = .running
+                    self.stuckTicks = 0
+                    // Refresh ancillary state too so the popover doesn't
+                    // keep showing "Offline · disconnected M:SS" against
+                    // an offline_state that's also stale.
+                    self.refreshCacheStatus()
+                default:
+                    return
+                }
             }
         }
     }
@@ -413,6 +474,7 @@ public final class ServerController {
                 // "stuck disconnected" report will check os_log for this.
                 log.info("recovery: backend healthy, transitioning \(self.state.displayLabel, privacy: .public) -> running")
                 state = .running
+                stuckTicks = 0
                 return
             default:
                 // .idle / .starting / .error are sticky; don't overwrite.
