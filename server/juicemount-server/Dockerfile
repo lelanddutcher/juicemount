@@ -47,7 +47,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -ldflags="-s -w" -o /out/jm5 ./cmd/jm5
 
 # ----- Stage 2: runtime -----
-FROM juicedata/mount:v1.2.3
+# Pin to a specific JuiceFS release for CI reproducibility. JuiceFS
+# changed its tag scheme in mid-2025: the old `v1.2.3` form is gone,
+# replaced by `ce-v1.3.1` (Community Edition prefix). Bump intentionally
+# on each release rather than tracking `latest`.
+FROM juicedata/mount:ce-v1.3.1
 
 # Tools the entrypoint needs: curl for healthcheck, ca-certificates
 # for any future S3 over HTTPS. The base image is alpine-derived.
