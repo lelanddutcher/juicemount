@@ -179,7 +179,18 @@ func (fm *FUSEManager) Mount() error {
 	// only with the NFS volume at /Volumes/zpool. We hide the FUSE mount:
 	//   - Mount point is ~/.juicemount/fuse-internal (hidden dotdir, not /Volumes)
 	//   - nobrowse: tells macOS not to show the volume in Finder sidebar
-	args := []string{"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
+	args := []string{}
+	// QA-34 Slice 2 (2026-05-25): --verbose adds debug-level logging
+	// to ~/.juicefs/juicefs.log. Useful for investigating write-path
+	// wedges. Gated behind the JM_FUSE_VERBOSE env var so production
+	// users don't pay the cost (per-FUSE-op log overhead + tens of MB
+	// of log data per write burst). Set JM_FUSE_VERBOSE=1 for debug
+	// sessions.
+	if os.Getenv("JM_FUSE_VERBOSE") != "" {
+		args = append(args, "--verbose")
+	}
+	args = append(args,
+		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
 		"-d",                // daemon mode
 		"--no-usage-report",
 		"--writeback",       // enable writeback for write performance
@@ -198,7 +209,7 @@ func (fm *FUSEManager) Mount() error {
 		"--buffer-size", "4096", // 4 GiB
 		"--prefetch", "3",   // prefetch 3 blocks ahead
 		"-o", "nobrowse",    // hide from Finder (MNT_DONTBROWSE flag)
-	}
+	)
 	if fm.cfg.CacheDir != "" {
 		args = append(args, "--cache-dir", fm.cfg.CacheDir)
 	}
@@ -506,10 +517,26 @@ func (fm *FUSEManager) isMountedLocked() bool {
 	case ok := <-done:
 		return ok
 	case <-time.After(5 * time.Second):
-		log.Printf("[fuse] mount at %s is unresponsive (stale), force unmounting", fm.cfg.MountPoint)
-		// Force unmount the dead FUSE — don't leave it hanging. Bounded
-		// (15 s) and reaped so a hung umount can't leak processes.
-		go runBoundedCommand(15*time.Second, "umount", "-f", fm.cfg.MountPoint)
+		// QA-34 Slice 2 (2026-05-25): no longer fires a side-effect
+		// `umount -f` from inside this health probe.
+		//
+		// History of the bug: isMountedLocked is the leaf "is the mount
+		// healthy right now" check, called by the monitorLoop AND by
+		// any other code path that wants a snapshot. Pre-fix, a 5-second
+		// ReadDir timeout would trigger a fire-and-forget `umount -f`
+		// as a hidden side effect — which bypassed QA-33's 30-second
+		// consecutive-failure tolerance entirely. Under sustained
+		// writes, juicefs does fsync flushes that can take 15-30 s
+		// (observed: 16.86 s in production), during which ReadDir
+		// against the mount point hangs. The hidden umount then races
+		// the in-flight fsync, fails-or-succeeds depending on timing,
+		// and either way kills the daemon mid-write.
+		//
+		// New rule: this function is pure-read. It returns false on
+		// timeout and lets monitorLoop (which honors the consecutive-
+		// failure tolerance) decide whether to actually remount. The
+		// 5-second probe timeout stays so callers don't block forever.
+		log.Printf("[fuse] mount at %s is unresponsive (stale); reporting unhealthy. Remount decision deferred to monitorLoop.", fm.cfg.MountPoint)
 		return false
 	}
 }
@@ -562,14 +589,33 @@ func (fm *FUSEManager) unmountLocked() {
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	// Bounded force-unmount, fired async. runBoundedCommand reaps the
-	// process so we don't leak zombies the way the prior
-	// .Start()-without-.Wait() pattern did. CRITICAL: must be `go`'d
-	// rather than synchronous — unmountLocked is called with fm.mu held,
-	// and a synchronous 15 s wait here regresses the very class of bug
-	// this branch is hardening against. Found by code review post-fix.
-	go runBoundedCommand(15*time.Second, "umount", "-f", fm.cfg.MountPoint)
-	time.Sleep(500 * time.Millisecond)
+	// QA-34 Slice 2 (2026-05-25): umount is now BLOCKING on this
+	// goroutine with a 60s budget. Pre-fix it was fire-and-forget,
+	// which created a race window where the caller (typically
+	// Mount() about to relaunch juicefs) could attempt to attach
+	// to a mount point the kernel had not yet released. At 15 s
+	// budget the window was small; at the new 60 s budget required
+	// to absorb realistic juicefs fsync durations (15-30 s), the
+	// race window would have been catastrophic.
+	//
+	// Holding fm.mu across the umount is fine: this is the
+	// explicit remount path. By definition the world is waiting
+	// for the mount transition; no other useful work can complete
+	// while the FUSE mount is half-gone.
+	//
+	// runBoundedCommand handles the timeout + reaping internally.
+	done := make(chan struct{})
+	go func() {
+		runBoundedCommand(60*time.Second, "umount", "-f", fm.cfg.MountPoint)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(65 * time.Second):
+		// Safety net: even if runBoundedCommand hangs (shouldn't,
+		// it has its own ctx deadline), don't pin fm.mu forever.
+		jmlog.Warn("unmountLocked: umount goroutine did not return in 65s, proceeding anyway")
+	}
 }
 
 // monitorLoop checks mount health periodically and remounts if needed.
