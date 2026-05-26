@@ -76,7 +76,32 @@ CREATE INDEX IF NOT EXISTS idx_pinned_root ON pinned_files(pin_root);
 type Store struct {
 	db    *sql.DB
 	mu    sync.RWMutex
+
+	// QA-35 (2026-05-26): in-memory cache for IsPinnedReady. The
+	// pre-cache implementation ran a SQLite SELECT on every call.
+	// IsPinnedReady is hit by juiceFS.OpenFile on every NFS READ RPC
+	// (`nfs/handler.go:1044`), making it a per-RPC tax of one SQLite
+	// round-trip — at hundreds of RPCs/sec during sustained reads
+	// the dominant cost.
+	//
+	// Cache contains the set of paths currently in StatusReady OR
+	// (StatusPrefetching AND bytes_cached >= size). Invalidated on
+	// any pin/unpin/UpdateStatus mutation; auto-expires after readyTTL
+	// as a defensive belt against missed invalidations. Refreshed
+	// lazily on first read after invalidation.
+	//
+	// Negative results (path not in map) ARE cacheable — pin counts
+	// are small (<1000 typically), so storing the full ready-set is
+	// cheap. A read for a non-pinned path == map-miss == false.
+	readyMu          sync.RWMutex
+	ready            map[string]struct{}
+	readyValidUntil  time.Time
 }
+
+// readyTTL is the maximum staleness of the IsPinnedReady cache. Short
+// enough that a "I just pinned this file" delay is imperceptible;
+// long enough that the cache absorbs steady-state read traffic.
+const readyTTL = 1 * time.Second
 
 // Open creates or opens the pin store at the given path. Use ":memory:" for
 // tests. The DB file can be the same one as the metadata store or a separate
@@ -127,6 +152,7 @@ func (s *Store) Pin(path string, size int64, root string) error {
 	if err != nil {
 		return fmt.Errorf("pin %q: %w", path, err)
 	}
+	s.invalidateReady() // QA-35
 	return nil
 }
 
@@ -165,7 +191,11 @@ func (s *Store) PinMany(entries []Entry) error {
 			return fmt.Errorf("pin %q: %w", e.Path, err)
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateReady() // QA-35
+	return nil
 }
 
 // Unpin removes paths under root (everything pinned with this root or
@@ -179,6 +209,7 @@ func (s *Store) Unpin(root string) (int, error) {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	s.invalidateReady() // QA-35
 	return int(n), nil
 }
 
@@ -187,6 +218,9 @@ func (s *Store) UnpinPath(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM pinned_files WHERE path = ?`, path)
+	if err == nil {
+		s.invalidateReady() // QA-35
+	}
 	return err
 }
 
@@ -200,6 +234,9 @@ func (s *Store) UpdateStatus(path string, status Status, bytesCached int64, errM
 		SET status = ?, bytes_cached = ?, last_prefetched = ?, last_error = ?
 		WHERE path = ?`,
 		int(status), bytesCached, now, errMsg, path)
+	if err == nil {
+		s.invalidateReady() // QA-35
+	}
 	return err
 }
 
@@ -220,26 +257,67 @@ func (s *Store) UpdateStatus(path string, status Status, bytesCached int64, errM
 // Promoting Pending here would re-introduce the very freeze (FUSE →
 // backend → timeout) the offline gate exists to prevent.
 func (s *Store) IsPinnedReady(path string) bool {
+	// QA-35 (2026-05-26): fast path through in-memory ready-set
+	// cache. See type Store readyMu/ready/readyValidUntil docstring
+	// for the rationale.
+	s.readyMu.RLock()
+	if time.Now().Before(s.readyValidUntil) {
+		_, ok := s.ready[path]
+		s.readyMu.RUnlock()
+		return ok
+	}
+	s.readyMu.RUnlock()
+
+	// Slow path: refresh the cache atomically, then re-read.
+	s.refreshReadyCache()
+
+	s.readyMu.RLock()
+	defer s.readyMu.RUnlock()
+	_, ok := s.ready[path]
+	return ok
+}
+
+// refreshReadyCache rebuilds the in-memory ready-set from SQLite under
+// readyMu.Lock. Cheap: one indexed SELECT, ~1000 rows max for typical
+// pin counts. Called on demand from IsPinnedReady when the TTL expires
+// or after explicit invalidation.
+func (s *Store) refreshReadyCache() {
+	// Build the new set OUTSIDE the readyMu so other readers aren't
+	// blocked across the SQL call.
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var statusInt int
-	var size, bytesCached int64
-	err := s.db.QueryRow(
-		`SELECT status, size, bytes_cached FROM pinned_files WHERE path = ?`,
-		path,
-	).Scan(&statusInt, &size, &bytesCached)
+	rows, err := s.db.Query(
+		`SELECT path FROM pinned_files WHERE status = ? OR (status = ? AND bytes_cached >= size AND size > 0)`,
+		int(StatusReady), int(StatusPrefetching),
+	)
 	if err != nil {
-		return false
+		s.mu.RUnlock()
+		// Cache build failed; leave the existing cache as-is.
+		// readyValidUntil stays past, so next call retries.
+		return
 	}
-	st := Status(statusInt)
-	if st == StatusReady {
-		return true
+	newSet := make(map[string]struct{}, 256)
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err == nil {
+			newSet[p] = struct{}{}
+		}
 	}
-	// Late-Ready window: prefetcher has the bytes but hasn't updated status yet.
-	if st == StatusPrefetching && size > 0 && bytesCached >= size {
-		return true
-	}
-	return false
+	rows.Close()
+	s.mu.RUnlock()
+
+	s.readyMu.Lock()
+	s.ready = newSet
+	s.readyValidUntil = time.Now().Add(readyTTL)
+	s.readyMu.Unlock()
+}
+
+// invalidateReady marks the in-memory ready-set as stale. Called by
+// every mutation method (Pin/PinMany/Unpin/UnpinPath/UpdateStatus) so
+// state changes are reflected before the next IsPinnedReady call.
+func (s *Store) invalidateReady() {
+	s.readyMu.Lock()
+	s.readyValidUntil = time.Time{} // zero time = always expired
+	s.readyMu.Unlock()
 }
 
 // PinnedPaths returns the set of all paths in the pin store, regardless of
