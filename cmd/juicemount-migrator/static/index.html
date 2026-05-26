@@ -1,0 +1,32 @@
+<!doctype html>
+<!-- Placeholder until Slice 3 of the /loop builds the real UI.
+     The Jinja-2-of-a-real-product version is at the bottom of the
+     same file. Keep this stub valid HTML so embedFS doesn't panic. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JuiceMount Migrator</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px; margin: 2em auto; padding: 0 1em; color: #222; }
+    h1 { font-weight: 600; }
+    .placeholder { background: #fffae0; border: 1px solid #f0d060; padding: 1em; border-radius: 6px; }
+    code { background: #f3f3f3; padding: 0.15em 0.3em; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>JuiceMount Migrator</h1>
+  <p class="placeholder">
+    UI under construction. Backend API is live and responds to:
+    <ul>
+      <li><code>GET /api/sources</code></li>
+      <li><code>GET /api/browse?path=...</code></li>
+      <li><code>POST /api/migrate</code> with <code>{"source":"...","destination":"..."}</code></li>
+      <li><code>GET /api/jobs</code></li>
+      <li><code>GET /api/jobs/&lt;id&gt;</code></li>
+      <li><code>GET /api/jobs/&lt;id&gt;/stream</code> (Server-Sent Events)</li>
+      <li><code>DELETE /api/jobs/&lt;id&gt;</code></li>
+    </ul>
+    Authorization (if configured): <code>X-JuiceMount-Admin-Key: &lt;admin-key&gt;</code>
+  </p>
+</body>
+</html>
