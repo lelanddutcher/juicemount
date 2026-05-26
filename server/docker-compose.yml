@@ -132,7 +132,11 @@ services:
     security_opt:
       - apparmor:unconfined
     ports:
-      - "${NFS_PORT:-2049}:2049"
+      # NFS port default 12049 (not 2049) — TrueNAS Scale, Synology DSM,
+      # and QNAP QTS all ship a host nfsd on 2049 that wins port-bind
+      # races silently. Macs mount with `-o port=12049,mountport=12049`.
+      # Override NFS_PORT=2049 on Linux hosts without a host nfsd.
+      - "${NFS_PORT:-12049}:2049"
       - "${ADMIN_PORT:-11050}:11050"
     volumes:
       # SQLite metadata.db + pin.db live here. Bind-mount so they
