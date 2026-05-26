@@ -1081,6 +1081,44 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 		fd, err := jfs.handler.fdPool.Get(fusePath)
 		if err != nil {
 			if os.IsNotExist(err) {
+				// QA-32 (2026-05-25): the phantom-purge here used to fire
+				// unconditionally. That destroyed pinned-file cache entries
+				// during write-upload windows when FUSE returns ENOENT for
+				// legitimate files because juicefs is busy uploading
+				// staging blocks. Layer C protects the prune path; this
+				// open path bypassed it. Three guards now match Stat()'s
+				// phantom-purge in spirit:
+				//   1. NEVER purge a pinned file. Pinning is the user's
+				//      explicit contract. If FUSE says ENOENT on a pinned
+				//      path, FUSE is wrong, not the cache.
+				//   2. NEVER purge while there's an active writer for
+				//      this path — concurrent OpenFile races with writes.
+				//   3. Verify via a 2-second-budgeted Lstat that the file
+				//      really doesn't exist before destroying the entry
+				//      (FUSE's fdPool.Get ENOENT can be a fast lie under
+				//      load; an explicit Lstat re-probes deterministically).
+				canonical := jfs.handler.canonicalize(filename)
+				if jfs.handler.isPinnedReady(canonical) {
+					jmlog.Debug("open ENOENT on pinned file — NOT purging (FUSE likely busy)",
+						"path", filename)
+					return nil, err
+				}
+				if jfs.handler.hasActiveWriter(filename) {
+					jmlog.Debug("open ENOENT but active writer present — NOT purging",
+						"path", filename)
+					return nil, err
+				}
+				isNotExist, ok := lstatNotExistWithTimeout(fusePath, 2*time.Second)
+				if !ok {
+					jmlog.Debug("open ENOENT but Lstat-verify timed out — NOT purging (FUSE degraded)",
+						"path", filename)
+					return nil, err
+				}
+				if !isNotExist {
+					jmlog.Debug("open ENOENT but Lstat-verify says file exists — NOT purging (FUSE racy)",
+						"path", filename)
+					return nil, err
+				}
 				jmlog.Warn("purging phantom entry on open", "path", filename)
 				jfs.handler.store.DeleteFromCache(filename)
 				go jfs.handler.store.Delete(filename)
