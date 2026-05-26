@@ -1,17 +1,15 @@
-# Build and publish the juicemount-server container image to GHCR.
+# Build and publish the JuiceMount container images to GHCR.
 #
 # Triggers:
 #   - push to main / production-hardening  → tags: <branch>, <branch>-<sha>
 #   - tag push matching v*.*.*             → tags: <version>, latest
 #
-# The image is consumed by the TrueNAS app (see juicemount-truenas-apps
-# repo, ix-dev/community/juicemount/ix_values.yaml). Until the first
-# successful run of this workflow, the catalog references an image tag
-# that doesn't exist and Install fails with a manifest-not-found error.
+# Two images are published in parallel as a matrix job:
+#   ghcr.io/<owner>/juicemount-server    NFSv3 gateway daemon
+#   ghcr.io/<owner>/juicemount-migrator  data-migration sidecar
 #
-# Multi-arch (amd64 + arm64) so the same image runs on Intel macs (via
-# rosetta) and on Apple Silicon TrueNAS hosts (rare but legal) and on
-# Synology/QNAP ARM-based NAS units.
+# Multi-arch (amd64 + arm64) so the same images run on Intel + Apple
+# Silicon TrueNAS hosts and on Synology/QNAP ARM-based NAS units.
 
 name: docker-publish
 
@@ -26,7 +24,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/juicemount-server
 
 jobs:
   build:
@@ -34,6 +31,16 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false  # one image's failure shouldn't cancel the other
+      matrix:
+        include:
+          - name: juicemount-server
+            dockerfile: server/juicemount-server/Dockerfile
+            description: NFSv3 gateway for JuiceFS — self-hosted media editing
+          - name: juicemount-migrator
+            dockerfile: server/juicemount-migrator/Dockerfile
+            description: Data-migration sidecar — wraps juicefs sync with a web UI
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,11 +58,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Extract metadata for ${{ matrix.name }}
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
           tags: |
             # branch name on branch push
             type=ref,event=branch
@@ -67,15 +74,15 @@ jobs:
             # 'latest' on release tags only
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
-            org.opencontainers.image.title=juicemount-server
-            org.opencontainers.image.description=NFSv3 gateway for JuiceFS — self-hosted media editing
+            org.opencontainers.image.title=${{ matrix.name }}
+            org.opencontainers.image.description=${{ matrix.description }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
-      - name: Build and push
+      - name: Build and push ${{ matrix.name }}
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: server/juicemount-server/Dockerfile
+          file: ${{ matrix.dockerfile }}
           # arm64 build via QEMU is ~3-4x slower than amd64. Keeping it
           # in CI is worth it for the Synology/QNAP ARM cases; revisit
           # if total wall time becomes a real bottleneck.
@@ -83,7 +90,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Cache layers via GHA cache. Significantly speeds up
-          # incremental builds (Go compile + linker dominate).
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Per-image GHA cache scope so the two matrix jobs don't
+          # invalidate each other's layers.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
