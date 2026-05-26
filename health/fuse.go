@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,20 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
+
+// redactURLCreds returns a copy of `raw` with any user:password component
+// of a parseable URL replaced by `<redacted>`. Used to keep credentials
+// out of logs when a user supplies a `--bucket` URL of the form
+// `http://user:pass@host:port/bucket`. Non-URL strings pass through
+// unchanged so this is safe to apply to anything log-suspect.
+func redactURLCreds(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	u.User = url.User("<redacted>")
+	return u.String()
+}
 
 // FUSEConfig holds JuiceFS mount configuration.
 type FUSEConfig struct {
@@ -36,6 +51,22 @@ type FUSEConfig struct {
 	//
 	// Empty = pass nothing (JuiceFS default applies). "0.01" = keep 1% free.
 	FreeSpaceRatio string
+
+	// BucketOverride is the S3 endpoint URL the Mac juicefs daemon should
+	// use, overriding whatever bucket URL was stored in Redis at format
+	// time. Empty = no override; juicefs reads the URL from Redis.
+	//
+	// Why this exists: JuiceFS stores the bucket URL in Redis when the
+	// volume is formatted. On a docker-bridge-networked server-side
+	// install the format URL is the docker-internal DNS name (e.g.
+	// http://minio:9000/zpool) which the Mac cannot resolve. Setting
+	// BucketOverride to http://<truenas-lan-ip>:30151/zpool lets the
+	// Mac client reach the server's MinIO directly without /etc/hosts
+	// hacks or macvlan networking on the server.
+	//
+	// Passed as the `--bucket` flag on `juicefs mount`, which wins over
+	// the Redis-stored URL.
+	BucketOverride string
 }
 
 // FUSEManager manages the JuiceFS FUSE mount lifecycle.
@@ -219,8 +250,33 @@ func (fm *FUSEManager) Mount() error {
 	if fm.cfg.FreeSpaceRatio != "" {
 		args = append(args, "--free-space-ratio", fm.cfg.FreeSpaceRatio)
 	}
+	if fm.cfg.BucketOverride != "" {
+		// Override the Redis-stored bucket URL for this Mac client only.
+		// See FUSEConfig.BucketOverride comment for rationale.
+		//
+		// Arg-ordering note (2026-05-26): `--bucket` lands after the
+		// positional <meta-url> <mountpoint> args. JuiceFS 1.3.1 accepts
+		// flags in this position (verified empirically via direct CLI
+		// invocation — `juicefs mount redis://... /mnt/test --bucket
+		// http://192.168.0.197:30151/zpool` mounts cleanly). If a future
+		// JuiceFS version tightens its parser, this is the line to move
+		// — relocate the entire conditional-flag block to BEFORE the
+		// `mount, fm.cfg.RedisURL, fm.cfg.MountPoint` append above.
+		args = append(args, "--bucket", fm.cfg.BucketOverride)
+	}
 
-	log.Printf("[fuse] mounting JuiceFS: %s %s", fm.cfg.JuiceFSBin, strings.Join(args, " "))
+	// Redact secrets from the log line. Currently only the bucket URL
+	// can carry creds (user:pass@host form). Build a sanitized copy of
+	// args just for logging; the actual exec.Command still gets the
+	// real values.
+	logArgs := make([]string, len(args))
+	copy(logArgs, args)
+	for i, a := range logArgs {
+		if a == "--bucket" && i+1 < len(logArgs) {
+			logArgs[i+1] = redactURLCreds(logArgs[i+1])
+		}
+	}
+	log.Printf("[fuse] mounting JuiceFS: %s %s", fm.cfg.JuiceFSBin, strings.Join(logArgs, " "))
 
 	// `juicefs mount -d` daemonizes and returns quickly in the happy path,
 	// but can hang on certain backend failures (e.g. unreachable Redis

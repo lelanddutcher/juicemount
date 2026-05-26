@@ -32,6 +32,7 @@ func main() {
 	noMount := flag.Bool("no-mount", false, "Start NFS server without mounting (for testing)")
 	noFuse := flag.Bool("no-fuse", false, "Skip JuiceFS FUSE mount (assume already mounted)")
 	cacheSize := flag.String("cache-size", "100000", "JuiceFS SSD cache size in MB")
+	bucketOverride := flag.String("bucket-override", "", "Override the S3 bucket URL stored in Redis (e.g. http://192.168.0.197:30151/zpool). Empty = use the URL written by juicefs format.")
 	logFile := flag.String("log-file", "", "Optional path to additionally write JSON log records")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	metricsAddr := flag.String("metrics-addr", "127.0.0.1:11050", "HTTP listen address for /metrics and /health")
@@ -71,9 +72,10 @@ func main() {
 	var fuseMgr *health.FUSEManager
 	if !*noFuse {
 		fuseMgr = health.NewFUSEManager(health.FUSEConfig{
-			RedisURL:   *redisURL,
-			MountPoint: *fusePath,
-			CacheSize:  *cacheSize,
+			RedisURL:       *redisURL,
+			MountPoint:     *fusePath,
+			CacheSize:      *cacheSize,
+			BucketOverride: *bucketOverride,
 		})
 		if err := fuseMgr.Mount(); err != nil {
 			jmlog.Error("juicefs FUSE mount failed", "error", err)

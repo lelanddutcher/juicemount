@@ -76,15 +76,16 @@ var (
 
 // ServerConfig is the JSON configuration passed from Swift.
 type ServerConfig struct {
-	RedisURL    string `json:"redis_url"`
-	FUSEPath    string `json:"fuse_path"`
-	MountPoint  string `json:"mount_point"`
-	ListenAddr  string `json:"listen_addr"`
-	DBPath      string `json:"db_path"`
-	CacheSize   string `json:"cache_size"`
-	MetricsAddr string `json:"metrics_addr"`
-	LogFile     string `json:"log_file"`
-	LogLevel    string `json:"log_level"`
+	RedisURL       string `json:"redis_url"`
+	FUSEPath       string `json:"fuse_path"`
+	MountPoint     string `json:"mount_point"`
+	ListenAddr     string `json:"listen_addr"`
+	DBPath         string `json:"db_path"`
+	CacheSize      string `json:"cache_size"`
+	MetricsAddr    string `json:"metrics_addr"`
+	LogFile        string `json:"log_file"`
+	LogLevel       string `json:"log_level"`
+	BucketOverride string `json:"bucket_override"`
 }
 
 //export NFSServerStart
@@ -193,6 +194,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				MountPoint:     cfg.FUSEPath,
 				CacheSize:      cfg.CacheSize,
 				FreeSpaceRatio: "0.01",
+				BucketOverride: cfg.BucketOverride,
 			})
 			if err := fm.Mount(); err != nil {
 				jmlog.Error("juicefs FUSE mount failed", "error", err.Error())

@@ -121,18 +121,38 @@ struct PreferencesWindowView: View {
                     TextField("redis://127.0.0.1:6379/1", text: $preferences.redisURL)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
+                        .onChange(of: preferences.redisURL) { _, newValue in
+                            let clean = stripWhitespace(newValue)
+                            if clean != newValue { preferences.redisURL = clean }
+                        }
+                }
+                LabeledContent("S3 Endpoint Override") {
+                    TextField("http://<truenas-ip>:30151/zpool", text: $preferences.s3EndpointOverride)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .onChange(of: preferences.s3EndpointOverride) { _, newValue in
+                            let clean = stripWhitespace(newValue)
+                            if clean != newValue { preferences.s3EndpointOverride = clean }
+                        }
                 }
                 LabeledContent("NFS Listen Address") {
                     TextField("127.0.0.1:11049", text: $preferences.nfsListenAddr)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
+                        .onChange(of: preferences.nfsListenAddr) { _, newValue in
+                            let clean = stripWhitespace(newValue)
+                            if clean != newValue { preferences.nfsListenAddr = clean }
+                        }
                 }
             } header: {
                 Text("Connection").font(.headline)
             } footer: {
-                Text("Redis stores JuiceFS metadata. The NFS listen address is the local NFS server endpoint that macOS mounts.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Redis stores JuiceFS metadata. The NFS listen address is the local NFS server endpoint that macOS mounts.")
+                    Text("S3 Endpoint Override: leave empty for direct-LAN setups. Set this when the server formatted JuiceFS with a docker-internal hostname your Mac can't resolve (typical for the TrueNAS app install). Example: http://192.168.0.197:30151/zpool")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Section {
@@ -278,6 +298,19 @@ struct PreferencesWindowView: View {
         case .running, .syncing, .degraded: return true
         default: return false
         }
+    }
+
+    /// Strip ALL whitespace (spaces, tabs, newlines) from URL / address
+    /// fields. URLs and host:port pairs never contain whitespace, so this
+    /// is always safe. Catches paste-with-stray-space accidents
+    /// (e.g. `redis://192.168.0.197: 30179/1`) that would otherwise
+    /// produce an unhelpful `juicefs mount: exit status 1` six layers down.
+    private func stripWhitespace(_ s: String) -> String {
+        return s.replacingOccurrences(
+            of: "\\s+",
+            with: "",
+            options: .regularExpression
+        )
     }
 
     private func healthDot(_ label: String, healthy: Bool) -> some View {

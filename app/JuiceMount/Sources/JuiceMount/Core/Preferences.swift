@@ -51,6 +51,21 @@ public final class Preferences {
         didSet { save() }
     }
 
+    /// Optional override for the S3 bucket URL the local JuiceFS daemon
+    /// uses to fetch chunks. Empty = use the URL stored in Redis by the
+    /// server-side `juicefs format`. Set this when the Redis-stored URL
+    /// is unreachable from this Mac — typically because the server was
+    /// formatted with a docker-internal hostname (e.g. `http://minio:9000/...`)
+    /// that only resolves inside the docker network.
+    ///
+    /// Example value: `http://192.168.0.197:30151/zpool`
+    ///
+    /// Passed to `juicefs mount` as `--bucket <value>`, which takes
+    /// precedence over the URL stored in Redis at format time.
+    public var s3EndpointOverride: String {
+        didSet { save() }
+    }
+
     public init(
         volumeName: String = "zpool",
         mountPoint: String = "/Volumes/zpool",
@@ -64,7 +79,8 @@ public final class Preferences {
         reconcileSeconds: Int = 30,
         startAtLogin: Bool = false,
         showSearchHotkey: Bool = true,
-        offlineNotificationsEnabled: Bool = false
+        offlineNotificationsEnabled: Bool = false,
+        s3EndpointOverride: String = ""
     ) {
         self.volumeName = volumeName
         self.mountPoint = mountPoint
@@ -79,6 +95,7 @@ public final class Preferences {
         self.startAtLogin = startAtLogin
         self.showSearchHotkey = showSearchHotkey
         self.offlineNotificationsEnabled = offlineNotificationsEnabled
+        self.s3EndpointOverride = s3EndpointOverride
     }
 
     public static func defaultDBPath() -> String {
@@ -120,7 +137,8 @@ public final class Preferences {
             cacheSize: String(ssdCacheGB * 1024), // GB → MB
             metricsAddr: metricsAddr,
             logFile: Self.defaultLogPath(),
-            logLevel: "info"
+            logLevel: "info",
+            bucketOverride: s3EndpointOverride
         )
     }
 
@@ -134,6 +152,7 @@ public final class Preferences {
         case ssdCacheGB, memoryBufferMB, memBufFileLimitMB, reconcileSeconds
         case startAtLogin, showSearchHotkey
         case offlineNotificationsEnabled
+        case s3EndpointOverride
     }
 
     public static func load() -> Preferences {
@@ -151,7 +170,8 @@ public final class Preferences {
             reconcileSeconds:  d.object(forKey: Key.reconcileSeconds.rawValue) as? Int ?? 30,
             startAtLogin:      d.bool(forKey: Key.startAtLogin.rawValue),
             showSearchHotkey:  d.object(forKey: Key.showSearchHotkey.rawValue) as? Bool ?? true,
-            offlineNotificationsEnabled: d.bool(forKey: Key.offlineNotificationsEnabled.rawValue)
+            offlineNotificationsEnabled: d.bool(forKey: Key.offlineNotificationsEnabled.rawValue),
+            s3EndpointOverride: d.string(forKey: Key.s3EndpointOverride.rawValue) ?? ""
         )
     }
 
@@ -170,5 +190,6 @@ public final class Preferences {
         d.set(startAtLogin, forKey: Key.startAtLogin.rawValue)
         d.set(showSearchHotkey, forKey: Key.showSearchHotkey.rawValue)
         d.set(offlineNotificationsEnabled, forKey: Key.offlineNotificationsEnabled.rawValue)
+        d.set(s3EndpointOverride, forKey: Key.s3EndpointOverride.rawValue)
     }
 }
