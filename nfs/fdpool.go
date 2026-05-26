@@ -116,6 +116,22 @@ func (p *FDPool) Release(path string) {
 	}
 }
 
+// HasOpenRefs returns true if there is at least one outstanding Get
+// without a matching Release for `path` — i.e. somebody currently
+// holds a FD on this file.
+//
+// QA-35 (2026-05-26): used by juiceFS.Stat to skip the phantom-purge
+// FUSE Lstat gate when an active reader holds the file open. If a FD
+// is open, the file is not a phantom — the reader proves it exists.
+// Eliminates a per-metadata-RPC FUSE round-trip during sustained
+// reads of a held file (Resolve playback, Finder Quick Look, etc.).
+func (p *FDPool) HasOpenRefs(path string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, ok := p.entries[path]
+	return ok && entry.refCount > 0
+}
+
 func (p *FDPool) evictLoop() {
 	ticker := time.NewTicker(fdEvictTick)
 	defer ticker.Stop()
