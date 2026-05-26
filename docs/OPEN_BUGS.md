@@ -9,7 +9,7 @@
 ## P0 — blocking the user vision
 
 ### QA-34 — FUSE mount disappears under sustained write
-**Status:** open. Reproduced cleanly.
+**Status:** open. Reproduced cleanly. **WRONGTYPE sub-issue closed (commit 6fa28cf+1)** — Lua SCAN MATCH tightened from `d*` to `d[0-9]*` to exclude juicefs `delfiles` / `delSlices` LIST keys. Mount-wedge still reproduces without the WRONGTYPE spam.
 
 **Symptom:** sustained `dd`-style write to `/Volumes/zpool` past ~1.4 GB cumulative bytes results in the FUSE mount disappearing from the mount table mid-write. dd reports "Permission denied" on subsequent file opens. JM logs show:
 
@@ -30,8 +30,11 @@
 
 ## P1 — known bug under specific workload
 
-### QA-32 follow-up — 1,577 `FromHandle STALE` events during `pin-coverage-verify`
-**Status:** open. Diagnosed but not fully traced.
+### ~~QA-32 follow-up — 1,577 STALE events during pin-coverage-verify~~
+**Status:** ✓ CLOSED 2026-05-25 by commit 6fa28cf. Re-ran the workload post-QA-32 (build 6fa28cf vs original 88ccee8): **0 STALE events (was 1577)**. The pin-guard added to the OpenFile phantom-purge path in QA-32 was the fix — that path was bypassing Layer C, allowing the cascade.
+
+### QA-32 follow-up — (entry preserved for history)
+**Status:** ✓ CLOSED (see above).
 
 **Symptom:** running `scripts/qa-suite/11-workloads/pin-coverage-verify.sh` on the post-QA-31 build produces 1,577 `FromHandle STALE` events in 60 s, all on real (non-synthetic) inodes. Layer B recovered the MP4 inode `0x1aa63` once but STALE re-fired 25 more times for the same inode. `pathCache` and `inodeCache` size delta grew from baseline 5 → 147 during the run (alias-inode accumulation past Layer B).
 

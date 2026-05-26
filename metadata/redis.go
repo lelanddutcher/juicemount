@@ -778,15 +778,36 @@ func min(a, b int) int {
 }
 
 // luaScript is the JuiceFS Redis metadata tree pull script.
-// It SCANs all d* keys (directory entries), builds an inode→path reverse map,
-// resolves full paths, and fetches inode attributes (i{inode}) for mtime and size.
+// It SCANs juicefs directory-entry keys (d{inode}), builds an
+// inode→path reverse map, resolves full paths, and fetches inode
+// attributes (i{inode}) for mtime and size.
+//
+// QA-34 (2026-05-25): MATCH pattern tightened from 'd*' to 'd[0-9]*'.
+// The previous pattern also matched juicefs system keys that start
+// with 'd' followed by a letter — `delfiles` (LIST) and `delSlices`
+// (LIST). HGETALL on a LIST returns WRONGTYPE, which we observed in
+// production as:
+//   reconciliation failed: redis EVAL: WRONGTYPE Operation against a
+//   key holding the wrong kind of value script: …, on @user_script:9
+// The error surfaces only when juicefs has accumulated del* entries
+// (post-delete cleanup pending) — typically after sustained writes,
+// which is exactly the QA-34 reproducer. Directory entries are
+// d{numeric-inode}; the d[0-9]* MATCH precisely targets those.
+//
+// Code-review note (HIGH-1): considered also adding a TYPE check per
+// key before HGETALL as defense-in-depth, but at 132K entries that
+// adds ~130ms of Redis-blocking per reconcile cycle. The MATCH glob
+// alone is sufficient for the known juicefs schema; if juicefs ever
+// adds new d{number} non-hash key types, this WRONGTYPE will return
+// and we'll add the TYPE check then with eyes open. Don't pre-pay
+// the cost for a hypothetical future schema change.
 const luaScript = `
 local function gi(v) if #v~=9 then return nil end
 local a,b,c,d=string.byte(v,6,9) return a*16777216+b*65536+c*256+d end
 local function u32(s,o) local a,b,c,d=string.byte(s,o,o+3) return a*16777216+b*65536+c*256+d end
 local function u64(s,o) return u32(s,o)*4294967296+u32(s,o+4) end
 local cursor='0' local rev={} local all={}
-repeat local r=redis.call('SCAN',cursor,'MATCH','d*','COUNT',1000) cursor=r[1]
+repeat local r=redis.call('SCAN',cursor,'MATCH','d[0-9]*','COUNT',1000) cursor=r[1]
 for _,key in ipairs(r[2]) do local pi=string.sub(key,2)
 local ent=redis.call('HGETALL',key)
 for i=1,#ent,2 do local nm=ent[i] local val=ent[i+1]
