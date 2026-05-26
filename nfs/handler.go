@@ -834,6 +834,28 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 				// no active writer still gets purged on the next stat.
 				// Reproducer: scripts/qa-suite/04-fio.sh seqwrite-1m
 				// firing at ~52s into a 512 MiB write.
+			} else if jfs.handler.fdPool != nil && jfs.handler.fdPool.HasOpenRefs(jfs.fullPath(filename)) {
+				// QA-35 (2026-05-26): NEVER purge a file with an active
+				// READER. fdPool.HasOpenRefs returns true when at least
+				// one outstanding Get holds a FD on this path. The
+				// typical phantom-purge trigger is ENOENT from Lstat
+				// during a transient juicefs staging-block upload spike;
+				// an active reader rules that out as the explanation.
+				//
+				// Trade-off: this is a heuristic, NOT a proof of dentry
+				// existence. The kernel keeps the inode alive while a
+				// FD is open, so a remote `juicefs rmr` from another
+				// client could leave us with an open FD whose dentry is
+				// genuinely gone. In that narrow case we serve stale
+				// FileInfo until the reader closes — acceptable for the
+				// playback workload (operator controls remote deletes
+				// during active sessions). Worst-case staleness clears
+				// when the FD is released and the next Stat reverifies.
+				//
+				// This eliminates one FUSE Lstat per GETATTR/LOOKUP on
+				// any file Resolve, Finder Quick Look, or any other
+				// long-open reader has open — the dominant per-metadata-
+				// RPC tax in the playback workload.
 			} else if jfs.handler.redisClient != nil && jfs.handler.redisClient.RecentlyDegraded(60*time.Second) {
 				// Treat the cache entry as authoritative. Skip purge.
 			} else {
@@ -921,7 +943,60 @@ type writeSizeInfo struct {
 
 func (w *writeSizeInfo) Size() int64 { return w.size }
 
+// Lstat is the fast-path for NFS GETATTR. It is called from
+// internal/nfs/nfs_ongetattr.go which then uses Entry.PreSerializedGetAttr to
+// skip XDR encoding entirely.
+//
+// QA-35 (2026-05-26): GETATTR runs at high frequency (every kernel attr
+// cache refresh — typically every 3 s per open file, more under sustained
+// I/O). Routing it through Stat's phantom-purge gate burned one FUSE
+// Lstat round-trip per GETATTR for every cache-miss file (the open-FD and
+// hasActiveWriter gates only cover held files). On 100 files that is 100
+// FUSE syscalls per attr-cache cycle.
+//
+// Bypass rationale: GETATTR operates on an NFS handle the client already
+// owns, i.e. the cache must have known about this inode at handle-issue
+// time. If the metadata cache still has the entry, that is sufficient
+// truth for GETATTR — no need to revalidate against FUSE on every refresh.
+// On cache miss we fall through to Stat, which does the full phantom-purge
+// dance (the FUSE fallback path) — this is rare for GETATTR because the
+// existence-of-handle implies existence-of-entry in the common case.
 func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
+	if filename == "" || filename == "." || filename == "/" {
+		return &rootDirInfo{}, nil
+	}
+	filename = strings.TrimPrefix(filename, "/")
+
+	// Mirror Stat's macOS metadata filter — see lines 770-779 there.
+	// Keeps Lstat and Stat behaviorally identical for these names so
+	// the fast-path can never reach LookupByPath for a path that Stat
+	// would reject outright.
+	base := path.Base(filename)
+	if base == ".DS_Store" ||
+		base == ".Spotlight-V100" ||
+		base == ".Trashes" ||
+		base == ".fseventsd" ||
+		base == ".TemporaryItems" ||
+		base == ".VolumeIcon.icns" ||
+		base == "Icon\r" {
+		return nil, os.ErrNotExist
+	}
+
+	// Tracked write size for in-flight writes (sticky map — see Stat).
+	jfs.handler.writeSizeMu.Lock()
+	writeSize, hasWriteSize := jfs.handler.writeSizes[filename]
+	jfs.handler.writeSizeMu.Unlock()
+
+	if e := jfs.handler.store.LookupByPath(filename); e != nil {
+		if hasWriteSize && writeSize > e.Size {
+			clone := *e
+			clone.Size = writeSize
+			clone.Mtime = time.Now()
+			return clone.FileInfo(), nil
+		}
+		return e.FileInfo(), nil
+	}
+
 	return jfs.Stat(filename)
 }
 
