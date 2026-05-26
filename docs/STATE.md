@@ -15,6 +15,39 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### Phase-II perf hardening — harness shipped + Slice 1 baseline captured (2026-05-25)
+
+Born out of the QA-31 post-mortem: the QA suite tested correctness per
+op type but never sustained the RPC rate that exposes per-RPC overhead
+bugs. New harness in `scripts/qa-suite/11-workloads/` + orchestrator
+in `scripts/qa-suite/12-perf-regression.sh` + doctrine in
+`docs/PERFORMANCE_METHODOLOGY.md` + `cmd/jmctl/` thin CLI for
+control-plane operations from scripts.
+
+Baselines captured against build `88ccee8`:
+- `resolve-scrub`: 12,692 NFS READ RPCs in 30s (423/sec sustained),
+  READ p95=12.5ms, max=5.4s, throughput per byte-counter is misleading
+  due to page-cache absorption (real signal is RPC rate)
+- `bin-browse`: clean
+- `cold-playback` (COLD=0 warm sequential): clean
+- `finder-copy-deep` (writing to /Volumes/zpool root): clean, 0 STALE
+- **`pin-coverage-verify`: 1,577 `FromHandle STALE` events in 60s** —
+  all on real (non-synthetic) inodes. Layer B recovered inode 0x1aa63
+  (the 5.4 GB MP4) once but STALE re-fired 25 more times for the same
+  inode. `pathCache=132,485` vs `inodeCache=132,632` — orphan-inode
+  count grew from baseline 5 to 147 during the verify run.
+
+**QA-32 (open, Slice 3 territory):** the verify-driven re-prefetch +
+concurrent metadata-sync surface still has a stale-handle bug class
+past Layers C/A/B. Hypothesis: alias inodes from QA-28 redirect
+accumulate during sustained churn; evictOldest's pathCache iteration
+doesn't preserve them; subsequent FromHandle on those aliases misses
+the recoverable-shadow window because the alias inode never had a
+shadow entry in the first place (only the original eviction did).
+
+Next iteration runs Slice 2 chaos × workload matrix and Slice 3
+investigation of QA-32.
+
 ### QA-31 ✓ CLOSED (2026-05-25) — Resolve playback <2 fps on cached media; NFS READ path was the bottleneck
 
 **Observed (user, 2026-05-25):** DaVinci Resolve playback at <2 fps on
