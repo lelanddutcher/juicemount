@@ -54,8 +54,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM juicedata/mount:ce-v1.3.1
 
 # Tools the entrypoint needs: curl for healthcheck, ca-certificates
-# for any future S3 over HTTPS. The base image is alpine-derived.
-RUN apk add --no-cache curl ca-certificates
+# for any future S3 over HTTPS. The juicedata/mount:ce-v1.3.1 base
+# image is Debian-based (the pre-ce-* alpine variants are gone), so
+# this uses apt-get instead of apk. Cache cleanup keeps image size
+# down; we don't need apt at runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 # Drop the jm5 binary in. The base image already has /usr/local/bin
 # on PATH; juicefs lives there too so PATH lookups inside the
