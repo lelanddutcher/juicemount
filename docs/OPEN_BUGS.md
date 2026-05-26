@@ -8,8 +8,10 @@
 
 ## P0 — blocking the user vision
 
-### QA-34 — FUSE mount disappears under sustained write
-**Status:** open. Reproduced cleanly. **WRONGTYPE sub-issue closed (commit 6fa28cf+1)** — Lua SCAN MATCH tightened from `d*` to `d[0-9]*` to exclude juicefs `delfiles` / `delSlices` LIST keys. Mount-wedge still reproduces without the WRONGTYPE spam.
+### ~~QA-34 — FUSE mount disappears under sustained write~~
+**Status:** ✓ CLOSED 2026-05-25. Root cause was a hidden side-effect in `health/fuse.go isMountedLocked()`: when a 5s ReadDir probe timed out, it fired `umount -f` as a fire-and-forget goroutine. That umount races juicefs's in-flight fsync (which can run 15-30s under sustained writes), reliably killing the daemon mid-write. QA-33's consecutive-failure tolerance was bypassed because the kill came from the leaf health check, not from `monitorLoop`. Fix (commit pending): `isMountedLocked()` is now pure-read; only `monitorLoop` triggers remounts; `unmountLocked()` now waits synchronously (60s bound) for umount to complete before returning, eliminating the umount/remount race. Validation: 5 GB write test completed all 5 × 1 GiB copies end-to-end, single juicefs daemon survived two slow-fsync wedges by self-recovering, zero bounded-command timeouts.
+
+Plus earlier sub-fix: Lua SCAN MATCH tightened from `d*` to `d[0-9]*` to exclude juicefs `delfiles` / `delSlices` LIST keys (was producing WRONGTYPE errors in `metadata.RedisClient` sync). Both fixes were necessary; the WRONGTYPE was a secondary symptom of the same load condition.
 
 **Symptom:** sustained `dd`-style write to `/Volumes/zpool` past ~1.4 GB cumulative bytes results in the FUSE mount disappearing from the mount table mid-write. dd reports "Permission denied" on subsequent file opens. JM logs show:
 
