@@ -1,0 +1,318 @@
+// JuiceMount Migrator — vanilla JS UI. No frameworks, no build step,
+// no external deps. Talks to the same-origin backend at /api/*.
+// Designed to be servable as static content from a Go binary.
+
+(() => {
+  'use strict';
+
+  const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+  // -------- State --------
+  const state = {
+    sourceRoots: [],
+    destMount: '/jfs',
+    activeRoot: null,
+    cwd: null,           // current browsing path
+    selectedPath: null,  // path the user clicked (file or dir)
+    jobs: new Map(),     // jobId -> {job, sse}
+    adminKey: localStorage.getItem('jm-admin-key') || '',
+  };
+
+  // -------- Fetch helpers --------
+  function authHeaders() {
+    const h = { 'Content-Type': 'application/json' };
+    if (state.adminKey) h['X-JuiceMount-Admin-Key'] = state.adminKey;
+    return h;
+  }
+
+  async function api(method, path, body) {
+    const opts = { method, headers: authHeaders() };
+    if (body) opts.body = JSON.stringify(body);
+    const r = await fetch(path, opts);
+    if (r.status === 401) {
+      const key = prompt('X-JuiceMount-Admin-Key (will be saved locally):');
+      if (key) {
+        state.adminKey = key;
+        localStorage.setItem('jm-admin-key', key);
+        return api(method, path, body); // retry once
+      }
+      throw new Error('authentication required');
+    }
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText} — ${await r.text()}`);
+    if (r.status === 204) return null;
+    return r.json();
+  }
+
+  // -------- Source roots --------
+  async function loadSources() {
+    const data = await api('GET', '/api/sources');
+    state.sourceRoots = data.sources || [];
+    state.destMount = data.destination || '/jfs';
+    renderSourceRoots();
+  }
+
+  function renderSourceRoots() {
+    const wrap = $('#source-roots');
+    wrap.innerHTML = '';
+    if (state.sourceRoots.length === 0) {
+      wrap.textContent = '(no source roots configured)';
+      return;
+    }
+    for (const root of state.sourceRoots) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'source-root-btn';
+      btn.textContent = root;
+      btn.addEventListener('click', () => browseInto(root, btn));
+      wrap.appendChild(btn);
+    }
+  }
+
+  // -------- Browser --------
+  async function browseInto(path, btn) {
+    $$('.source-root-btn').forEach((b) => b.classList.toggle('active', b === btn));
+    state.activeRoot = state.sourceRoots.find((r) => path.startsWith(r)) || path;
+    await listDir(path);
+  }
+
+  async function listDir(path) {
+    const data = await api('GET', `/api/browse?path=${encodeURIComponent(path)}`);
+    state.cwd = data.path;
+    state.selectedPath = path;
+    updateSelectedDisplay();
+    suggestDefaultDestination(path);
+
+    $('#browser').hidden = false;
+    $('#cwd').textContent = state.cwd;
+    $('#up-btn').disabled = state.cwd === state.activeRoot;
+
+    const ul = $('#entries');
+    ul.innerHTML = '';
+
+    for (const e of (data.entries || [])) {
+      const li = document.createElement('li');
+      li.dataset.name = e.name;
+      li.dataset.isDir = String(e.is_dir);
+
+      const icon = document.createElement('span');
+      icon.className = 'entry-icon';
+      icon.textContent = e.is_dir ? '📁' : '📄';
+      li.appendChild(icon);
+
+      const name = document.createElement('span');
+      name.className = 'entry-name';
+      name.textContent = e.name;
+      li.appendChild(name);
+
+      if (!e.is_dir) {
+        const sz = document.createElement('span');
+        sz.className = 'entry-size';
+        sz.textContent = formatBytes(e.size);
+        li.appendChild(sz);
+      }
+
+      li.addEventListener('click', () => onEntryClick(e, li));
+      li.addEventListener('dblclick', () => {
+        if (e.is_dir) listDir(state.cwd + '/' + e.name);
+      });
+      ul.appendChild(li);
+    }
+  }
+
+  function onEntryClick(entry, li) {
+    $$('#entries li').forEach((x) => x.classList.toggle('selected', x === li));
+    state.selectedPath = state.cwd + '/' + entry.name;
+    updateSelectedDisplay();
+    suggestDefaultDestination(state.selectedPath);
+  }
+
+  function updateSelectedDisplay() {
+    $('#selected-source').textContent = state.selectedPath || '(nothing selected yet)';
+    $('#start-btn').disabled = !state.selectedPath;
+  }
+
+  function suggestDefaultDestination(source) {
+    const input = $('#dest-input');
+    if (input.value && input.dataset.userEdited === 'true') return;
+    const basename = source.split('/').filter(Boolean).pop() || 'imported';
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    input.value = `${state.destMount}/imported/${ts}-${basename}`;
+  }
+
+  $('#dest-input').addEventListener('input', (e) => {
+    e.target.dataset.userEdited = 'true';
+  });
+
+  $('#up-btn').addEventListener('click', () => {
+    const idx = state.cwd.lastIndexOf('/');
+    if (idx <= 0) return;
+    const parent = state.cwd.slice(0, idx) || '/';
+    listDir(parent);
+  });
+
+  // -------- Migrate --------
+  $('#start-btn').addEventListener('click', async () => {
+    const dest = $('#dest-input').value.trim();
+    if (!state.selectedPath || !dest) return;
+    $('#error').hidden = true;
+    try {
+      const job = await api('POST', '/api/migrate', {
+        source: state.selectedPath,
+        destination: dest,
+      });
+      // Reset suggestion for next migration.
+      $('#dest-input').dataset.userEdited = 'false';
+      addJob(job);
+    } catch (err) {
+      $('#error').textContent = err.message;
+      $('#error').hidden = false;
+    }
+  });
+
+  // -------- Jobs --------
+  async function loadJobs() {
+    const jobs = await api('GET', '/api/jobs');
+    for (const j of (jobs || [])) addJob(j);
+  }
+
+  function addJob(job) {
+    if (state.jobs.has(job.id)) {
+      // Update existing card
+      renderJob(job);
+      return;
+    }
+    state.jobs.set(job.id, { job, sse: null });
+    renderJob(job);
+    if (job.state === 'pending' || job.state === 'running') {
+      subscribeJob(job.id);
+    }
+  }
+
+  function subscribeJob(id) {
+    const entry = state.jobs.get(id);
+    if (!entry || entry.sse) return;
+    const url = state.adminKey
+      ? `/api/jobs/${id}/stream?key=${encodeURIComponent(state.adminKey)}`
+      : `/api/jobs/${id}/stream`;
+    const es = new EventSource(url);
+    entry.sse = es;
+    es.addEventListener('message', async (e) => {
+      try {
+        const ev = JSON.parse(e.data);
+        entry.job.last = ev;
+        // Refresh job state from the JSON endpoint occasionally;
+        // SSE only carries ProgressEvent so the state field may
+        // be stale.
+        const fresh = await api('GET', `/api/jobs/${id}`);
+        Object.assign(entry.job, fresh);
+        renderJob(entry.job);
+        if (['done', 'error', 'canceled'].includes(entry.job.state)) {
+          es.close();
+          entry.sse = null;
+        }
+      } catch (err) {
+        console.error('progress parse', err);
+      }
+    });
+    es.addEventListener('error', () => {
+      es.close();
+      entry.sse = null;
+      // poll once more in 2s to get final state
+      setTimeout(async () => {
+        try {
+          const fresh = await api('GET', `/api/jobs/${id}`);
+          Object.assign(entry.job, fresh);
+          renderJob(entry.job);
+        } catch (_) {}
+      }, 2000);
+    });
+  }
+
+  function renderJob(job) {
+    let el = document.getElementById('job-' + job.id);
+    if (!el) {
+      el = document.createElement('li');
+      el.id = 'job-' + job.id;
+      el.className = 'job';
+      $('#job-list').prepend(el);
+    }
+
+    const last = job.last || {};
+    const bytes = last.bytes || 0;
+    const files = last.files || 0;
+    const errors = last.errors || 0;
+    const etaSec = last.eta_sec || 0;
+
+    // We don't know total bytes upfront — show "indeterminate" via
+    // a striped bar when running, fill on completion.
+    let progressClass = '';
+    let progressWidth = '0%';
+    if (job.state === 'done') { progressClass = 'done'; progressWidth = '100%'; }
+    else if (job.state === 'error') { progressClass = 'error'; progressWidth = '100%'; }
+    else if (job.state === 'canceled') { progressWidth = '0%'; }
+    else if (job.state === 'running') { progressWidth = '50%'; } // indeterminate-ish
+
+    el.innerHTML = `
+      <div class="job-head">
+        <span class="job-id">${job.id}</span>
+        <span class="job-state ${job.state}">${job.state}</span>
+      </div>
+      <div class="job-paths">${escapeHtml(job.source)} → ${escapeHtml(job.destination)}</div>
+      <div class="progress-bar"><div class="progress-fill ${progressClass}" style="width:${progressWidth}"></div></div>
+      <div class="job-stats">
+        <span><strong>${files}</strong> files</span>
+        <span><strong>${formatBytes(bytes)}</strong> copied</span>
+        <span><strong>${errors}</strong> errors</span>
+        ${etaSec > 0 ? `<span>ETA <strong>${etaSec}s</strong></span>` : ''}
+        ${(job.state === 'pending' || job.state === 'running')
+          ? `<button class="job-cancel" data-id="${job.id}">Cancel</button>` : ''}
+      </div>
+      ${job.error ? `<p class="error">${escapeHtml(job.error)}</p>` : ''}
+    `;
+    el.querySelectorAll('.job-cancel').forEach((b) => {
+      b.addEventListener('click', () => cancelJob(b.dataset.id));
+    });
+  }
+
+  async function cancelJob(id) {
+    try {
+      await api('DELETE', `/api/jobs/${id}`);
+    } catch (e) {
+      console.error('cancel', e);
+    }
+  }
+
+  // -------- Helpers --------
+  function formatBytes(b) {
+    if (!b) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    let i = 0;
+    while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+    return `${b.toFixed(i ? 2 : 0)} ${u[i]}`;
+  }
+
+  function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
+  // -------- Boot --------
+  (async () => {
+    try {
+      await loadSources();
+      await loadJobs();
+      if (state.adminKey) {
+        $('#auth-state').textContent = 'Admin key configured';
+      }
+    } catch (err) {
+      $('#error').textContent = 'Failed to initialize: ' + err.message;
+      $('#error').hidden = false;
+    }
+  })();
+
+  // Re-poll jobs list periodically to catch new entries created
+  // out-of-band (e.g. from another browser tab or jmctl).
+  setInterval(loadJobs, 10000);
+})();

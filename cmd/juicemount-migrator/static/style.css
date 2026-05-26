@@ -1,0 +1,323 @@
+/* JuiceMount Migrator — minimal, system-native look. Matches the
+   JuiceMount Mac app's design language: SF fonts, light/dark friendly,
+   no framework dependencies, no external CSS. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #f6f6f6;
+  --bg-elev: #ffffff;
+  --border: #d0d0d0;
+  --text: #1a1a1a;
+  --text-muted: #6b6b6b;
+  --accent: #007aff;
+  --accent-bg: rgba(0, 122, 255, 0.10);
+  --danger: #d70015;
+  --success: #00875a;
+  --running: #ff9500;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e;
+    --bg-elev: #2c2c2e;
+    --border: #3a3a3c;
+    --text: #f2f2f7;
+    --text-muted: #98989d;
+    --accent: #0a84ff;
+    --accent-bg: rgba(10, 132, 255, 0.18);
+    --danger: #ff453a;
+    --success: #30d158;
+    --running: #ff9f0a;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  margin: 0;
+  padding: 0;
+}
+
+header {
+  padding: 2rem 1.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+
+header h1 {
+  margin: 0;
+  font-size: 1.8rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.subtitle {
+  margin: 0.25rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.95rem;
+}
+
+main {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 1rem;
+  padding: 1.5rem;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+@media (max-width: 1000px) {
+  main { grid-template-columns: 1fr; }
+}
+
+.pane {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem;
+  min-height: 320px;
+}
+
+.pane h2 {
+  margin: 0 0 0.25rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.hint {
+  margin: 0 0 1rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.source-roots {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.source-root-btn {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.source-root-btn:hover { background: var(--accent-bg); border-color: var(--accent); }
+.source-root-btn.active { background: var(--accent-bg); border-color: var(--accent); }
+
+.browser-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 1rem 0 0.5rem;
+}
+
+.browser-bar button {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.browser-bar button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+#cwd {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  overflow-x: auto;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.entries {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 360px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.entries li {
+  padding: 0.4rem 0.75rem;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.entries li:last-child { border-bottom: none; }
+.entries li:hover { background: var(--accent-bg); }
+.entries li.selected { background: var(--accent-bg); }
+
+.entry-icon { font-size: 1rem; flex-shrink: 0; }
+.entry-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.entry-size { color: var(--text-muted); font-size: 0.75rem; }
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+}
+
+.field > span {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.field input,
+.field code {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.field input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+.field .readonly { color: var(--text-muted); }
+
+#start-btn {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 0.6rem 1.25rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.95rem;
+  font-weight: 500;
+  width: 100%;
+}
+
+#start-btn:disabled { background: var(--text-muted); cursor: not-allowed; }
+
+.error {
+  color: var(--danger);
+  font-size: 0.85rem;
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.75rem;
+  background: rgba(215, 0, 21, 0.08);
+  border-radius: 4px;
+}
+
+.job-list { list-style: none; padding: 0; margin: 0; }
+
+.job {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.5rem;
+  background: var(--bg);
+}
+
+.job-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.4rem;
+}
+
+.job-id {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.job-state {
+  font-size: 0.8rem;
+  font-weight: 500;
+  padding: 0.15rem 0.5rem;
+  border-radius: 10px;
+}
+
+.job-state.pending  { background: var(--accent-bg); color: var(--accent); }
+.job-state.running  { background: rgba(255, 149, 0, 0.18); color: var(--running); }
+.job-state.done     { background: rgba(0, 135, 90, 0.18); color: var(--success); }
+.job-state.error    { background: rgba(215, 0, 21, 0.18); color: var(--danger); }
+.job-state.canceled { background: rgba(155, 155, 155, 0.20); color: var(--text-muted); }
+
+.job-paths {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.progress-bar {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 0.4rem;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease-out;
+}
+
+.progress-fill.error { background: var(--danger); }
+.progress-fill.done  { background: var(--success); }
+
+.job-stats {
+  display: flex;
+  gap: 1.5rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.job-stats strong { color: var(--text); font-weight: 600; }
+
+.job-cancel {
+  margin-left: 0.5rem;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+.job-cancel:hover { color: var(--danger); border-color: var(--danger); }
+
+footer {
+  text-align: center;
+  padding: 1rem;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-size: 0.8rem;
+}
+
+footer a { color: var(--accent); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
