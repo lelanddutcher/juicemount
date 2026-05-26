@@ -15,6 +15,79 @@ User-reported issues from live use, not yet diagnosed or assigned to
 an iteration. These should be triaged before tier-1 advances —
 they're real-world correctness signals that synthetic harnesses miss.
 
+### QA-32 ✓ CLOSED + QA-33 ✓ CLOSED + QA-34 ◐ OPEN (2026-05-25) — write-path investigation triggered by user vision for Dropbox-style write model
+
+**Context:** user observed that the current writeback model bottlenecks
+sustained big-file writes to upload bandwidth after ~1 GB. Vision is
+Dropbox-style: write to mount at local-disk speed up to cache size,
+upload in background, UI shows pending. Investigation started with a
+controlled 5 GB write test (5× 1 GiB urandom payload via `dd`).
+
+**Tests revealed THREE distinct bugs, two now fixed and one open:**
+
+**QA-32 (✓ CLOSED, `nfs/handler.go OpenFile`):** the phantom-purge
+gate on the OpenFile-ENOENT path was UNCONDITIONAL — no pin guard, no
+active-writer check, no Lstat re-probe. During the test, juicefs was
+busy uploading staging blocks and FUSE returned ENOENT for unrelated
+files (Spotlight / fseventsd background scans). The unguarded purge
+then DELETED pinned files from the metadata cache: `beta premiere.mov`,
+`styel clip 1.mov`, `sequence style 2.mov`, multiple screenshots, plus
+~30 other paths in a cascade. This bypassed every QA-30 layer; Layer C
+only protected the sync-prune path. Fix: bring OpenFile's phantom-purge
+to parity with `juiceFS.Stat`'s — three guards (pin / active-writer /
+Lstat-verify-with-timeout). Re-test confirms zero phantom-purges on
+pinned files during the same test pattern.
+
+**QA-33 (✓ CLOSED, `health/fuse.go monitorLoop` + `--buffer-size`):**
+the FUSE watchdog at `monitorLoop` was killing and restarting the
+juicefs daemon on a SINGLE 5-second stat timeout. A slow flush under
+wifi load (we observed `slow operation: flush ... 16.17s`) looks
+identical to a dead daemon to that check. Result: 30+ seconds of
+write failure during every kill/restart cycle, plus loss of in-flight
+buffered writes. Fix: require 3 consecutive unhealthy checks (30 s
+sustained) before remount, WITH a fast-path exception that remounts
+immediately if the juicefs PID is actually gone. Also bumped
+`--buffer-size 1024 → 4096` to give the in-flight upload queue more
+headroom for chunky-render writes.
+
+**QA-34 (◐ OPEN, deeper write-path instability):** even with QA-32 +
+QA-33 deployed, the 5 GB sequential write test still fails partway
+through:
+  - Copy 1 (1 GB): completes at ~46 MB/s (wifi-upload bound, expected)
+  - Copy 2 (1 GB): only 421 MB through in 32 s, then stops
+  - Copies 3-5: instant "Permission denied"
+At time of failure (22:04:52), JM log shows:
+  - `component degraded: FUSE — not mounted (directory exists but no FUSE)`
+  - `reconciliation failed: redis EVAL: WRONGTYPE Operation against a key`
+The FUSE mount actually disappeared from the mount table partway
+through the write. This is a separate failure mode from QA-32/QA-33
+and from anything QA-26..QA-31 addressed.
+
+The WRONGTYPE error on a Redis EVAL is particularly suspicious —
+JuiceFS uses Lua scripts for atomic operations; a WRONGTYPE response
+suggests a Redis key has a different data type than the script
+expects. This may be JM's metadata.RedisClient interfering with
+JuiceFS's own Redis usage on the same DB, OR juicefs internal state
+divergence under sustained write pressure.
+
+**Action items for QA-34 (next session):**
+1. Reproduce the FUSE-mount-disappearance without the surrounding
+   noise (smaller controlled test, possibly with juicefs verbose logs)
+2. Determine WHO sent the unmount: macOS-FUSE kernel, juicefs itself,
+   or our watchdog before the QA-33 fix kicked in
+3. Resolve the Redis WRONGTYPE — either JM and juicefs need
+   separate Redis DBs, or our schema is colliding with juicefs's
+4. Then re-evaluate the Dropbox-style write model — the buffer-size
+   knob is not the binding constraint; whatever's killing the FUSE
+   mount during sustained writes is
+
+**User vision not yet delivered.** The Dropbox-style write model
+requires QA-34 closed first. Current state: short writes work fine;
+sustained writes >1 GB risk hitting QA-34 and losing the mount mid-
+flight. The fixes shipped this commit reduce the blast radius (no
+more pinned-file destruction; no more juicefs murder on slow flush)
+but don't solve the underlying instability.
+
 ### Phase-II perf hardening — harness shipped + Slice 1 baseline captured (2026-05-25)
 
 Born out of the QA-31 post-mortem: the QA suite tested correctness per

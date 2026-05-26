@@ -183,7 +183,19 @@ func (fm *FUSEManager) Mount() error {
 		"-d",                // daemon mode
 		"--no-usage-report",
 		"--writeback",       // enable writeback for write performance
-		"--buffer-size", "1024", // 1GB buffer
+		// QA-33 (2026-05-25): bumped --buffer-size 1024 → 4096 (4 GiB).
+		// Vision: writes to /Volumes/zpool should sustain at local SSD
+		// speed; uploads to MinIO happen async in background; cache
+		// holds dirty data. The previous 1 GiB ceiling capped sustained
+		// write throughput at the network upload rate after only ~1 GB
+		// — wrong model for video-render workflows where a 20 GB export
+		// would slow to wifi speed mid-bounce.
+		// 4 GiB is a balanced point: enough buffer to absorb realistic
+		// chunky-render write bursts before back-pressure kicks in,
+		// without eating an unbounded amount of RAM. Crash window
+		// (data not yet durable in S3): ≤4 GiB; the on-disk cache holds
+		// the persistent copy until upload completes.
+		"--buffer-size", "4096", // 4 GiB
 		"--prefetch", "3",   // prefetch 3 blocks ahead
 		"-o", "nobrowse",    // hide from Finder (MNT_DONTBROWSE flag)
 	}
@@ -561,10 +573,30 @@ func (fm *FUSEManager) unmountLocked() {
 }
 
 // monitorLoop checks mount health periodically and remounts if needed.
+//
+// QA-33 (2026-05-25): require multiple consecutive unhealthy checks
+// before remounting. A single 5-second stat timeout in checkFUSE looks
+// identical to "JuiceFS is dead" but is actually the common case during
+// sustained big-file writes — the FUSE-side flush can stall the stat
+// syscall for 10-30s while a 4-MiB chunk uploads to MinIO under wifi
+// pressure. The pre-QA-33 code killed-and-restarted juicefs on a single
+// stall, which (a) dropped 30+ seconds of writes during the restart
+// window, and (b) made the "Dropbox-style local-disk-speed write"
+// architecture impossible because every sustained write got murdered
+// mid-flight.
+//
+// Fast-path exception: if the juicefs PID is actually gone (process
+// died, was OOM-killed, segfaulted), remount immediately — that IS the
+// scenario the watchdog was originally for.
 func (fm *FUSEManager) monitorLoop() {
 	defer close(fm.done)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+
+	// QA-33: 3 consecutive failures × 10s tick = 30s of sustained
+	// unhealthiness before remount. A slow flush completes well inside
+	// that window; a genuinely-dead daemon doesn't.
+	const remountAfterNFailures = 3
 
 	consecutiveFailures := 0
 	for {
@@ -585,7 +617,19 @@ func (fm *FUSEManager) monitorLoop() {
 			}
 
 			consecutiveFailures++
-			log.Printf("[fuse] mount unhealthy (attempt %d), remounting...", consecutiveFailures)
+
+			// Fast-path: if the daemon is genuinely gone (not just slow),
+			// don't wait for the threshold — remount immediately.
+			juicefsAlive := isJuiceFSProcessAlive()
+			if !juicefsAlive {
+				log.Printf("[fuse] juicefs process gone — remounting immediately (attempt %d)", consecutiveFailures)
+			} else if consecutiveFailures < remountAfterNFailures {
+				log.Printf("[fuse] mount unhealthy (check %d/%d); juicefs PID alive, deferring remount in case the daemon is just slow",
+					consecutiveFailures, remountAfterNFailures)
+				continue
+			} else {
+				log.Printf("[fuse] mount unhealthy for %d consecutive checks — remounting", consecutiveFailures)
+			}
 
 			if err := fm.Mount(); err != nil {
 				log.Printf("[fuse] remount failed: %v", err)
@@ -607,6 +651,17 @@ func (fm *FUSEManager) monitorLoop() {
 			}
 		}
 	}
+}
+
+// isJuiceFSProcessAlive returns true if any `juicefs mount` process
+// is currently running. Used by the watchdog's fast-path exception
+// to distinguish "daemon is slow" from "daemon is dead".
+func isJuiceFSProcessAlive() bool {
+	out, err := exec.Command("pgrep", "-f", "juicefs mount").Output()
+	if err != nil {
+		return false
+	}
+	return len(strings.TrimSpace(string(out))) > 0
 }
 
 // findJuiceFSBin locates the juicefs binary.
