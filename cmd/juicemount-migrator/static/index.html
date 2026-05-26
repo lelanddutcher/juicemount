@@ -1,32 +1,60 @@
 <!doctype html>
-<!-- Placeholder until Slice 3 of the /loop builds the real UI.
-     The Jinja-2-of-a-real-product version is at the bottom of the
-     same file. Keep this stub valid HTML so embedFS doesn't panic. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>JuiceMount Migrator</title>
-  <style>
-    body { font-family: -apple-system, system-ui, sans-serif; max-width: 720px; margin: 2em auto; padding: 0 1em; color: #222; }
-    h1 { font-weight: 600; }
-    .placeholder { background: #fffae0; border: 1px solid #f0d060; padding: 1em; border-radius: 6px; }
-    code { background: #f3f3f3; padding: 0.15em 0.3em; border-radius: 3px; }
-  </style>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <h1>JuiceMount Migrator</h1>
-  <p class="placeholder">
-    UI under construction. Backend API is live and responds to:
-    <ul>
-      <li><code>GET /api/sources</code></li>
-      <li><code>GET /api/browse?path=...</code></li>
-      <li><code>POST /api/migrate</code> with <code>{"source":"...","destination":"..."}</code></li>
-      <li><code>GET /api/jobs</code></li>
-      <li><code>GET /api/jobs/&lt;id&gt;</code></li>
-      <li><code>GET /api/jobs/&lt;id&gt;/stream</code> (Server-Sent Events)</li>
-      <li><code>DELETE /api/jobs/&lt;id&gt;</code></li>
-    </ul>
-    Authorization (if configured): <code>X-JuiceMount-Admin-Key: &lt;admin-key&gt;</code>
-  </p>
+  <header>
+    <h1>JuiceMount Migrator</h1>
+    <p class="subtitle">Copy media from an existing dataset into your JuiceFS volume</p>
+  </header>
+
+  <main id="app">
+    <section class="pane source">
+      <h2>1 · Source</h2>
+      <p class="hint">Browse a source root and pick a directory to migrate.</p>
+      <div id="source-roots" class="source-roots">Loading…</div>
+      <div id="browser" class="browser" hidden>
+        <div class="browser-bar">
+          <button id="up-btn" type="button" disabled>↑ Up</button>
+          <code id="cwd"></code>
+        </div>
+        <ul id="entries" class="entries"></ul>
+      </div>
+    </section>
+
+    <section class="pane destination">
+      <h2>2 · Destination</h2>
+      <p class="hint">Path inside the JuiceFS volume. A timestamped subdir is suggested by default; edit freely.</p>
+      <label class="field">
+        <span>Selected source</span>
+        <code id="selected-source" class="readonly">(nothing selected yet)</code>
+      </label>
+      <label class="field">
+        <span>Destination path</span>
+        <input id="dest-input" type="text" placeholder="/jfs/imported/2026-05-26-150405" autocomplete="off" spellcheck="false">
+      </label>
+      <button id="start-btn" type="button" disabled>Start migration</button>
+      <p id="error" class="error" hidden></p>
+    </section>
+
+    <section class="pane jobs">
+      <h2>3 · Jobs</h2>
+      <p class="hint">Live progress for running migrations. SSE streams every ~200 ms.</p>
+      <ul id="job-list" class="job-list"></ul>
+    </section>
+  </main>
+
+  <footer>
+    <small>
+      <span id="auth-state">No auth required</span> ·
+      <a href="https://github.com/lelanddutcher/juicemount" rel="noopener">github.com/lelanddutcher/juicemount</a>
+    </small>
+  </footer>
+
+  <script src="/app.js"></script>
 </body>
 </html>

@@ -39,13 +39,22 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 
 // auth wraps a handler with X-JuiceMount-Admin-Key check.
 // Empty configured key disables auth (LAN-only / dev mode).
+//
+// Also accepts the key via a `?key=...` query parameter — needed for
+// the EventSource API which can't set custom HTTP headers from
+// JavaScript. The query param is only consulted when the header is
+// absent or empty; never logged.
 func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if a.adminKey == "" {
 			next(w, r)
 			return
 		}
-		if r.Header.Get("X-JuiceMount-Admin-Key") != a.adminKey {
+		got := r.Header.Get("X-JuiceMount-Admin-Key")
+		if got == "" {
+			got = r.URL.Query().Get("key")
+		}
+		if got != a.adminKey {
 			http.Error(w, "missing or invalid X-JuiceMount-Admin-Key", http.StatusUnauthorized)
 			return
 		}
