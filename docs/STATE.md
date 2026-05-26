@@ -2802,3 +2802,91 @@ actually improve real-world behavior?"
 2. If stale: quit JuiceMount, `open build/JuiceMount.app`, click Start, re-verify
 3. Re-fire `/loop`. Iteration 9 will pick up wherever STATE.md points.
 4. Optional: check on the baseline soak — `tail -1 /tmp/baseline-old-pid41860.jsonl | jq` for the latest tick, or `pgrep -lf jmstress-bin`.
+
+---
+
+## TrueNAS-app + migrator foolproofing loop — 2026-05-26
+
+Multi-iteration `/loop` session producing the user-installable TrueNAS
+app + a data-migration sidecar. Driven by the foolproofing prompt at
+`docs/OPEN_BUGS.md` (none — this is greenfield) and the user's request
+to iterate the install path until a stranger could do it in <30 min.
+
+### QA findings logged this loop
+
+**JuiceFS gotchas (caught during user's manual install attempt):**
+
+1. **`juicedata/mount` tag scheme changed mid-2025.** The old `v1.2.3` tags
+   were removed from Docker Hub. New form: `ce-v1.3.1` (Community Edition
+   prefix). Old image was alpine-based; new image is Debian-based — so
+   `apk add` → `apt-get install -y --no-install-recommends ... && rm -rf
+   /var/lib/apt/lists/*`. Caught both in the user's TrueNAS install (exit
+   127 — mc not found, then format error) AND the first GHCR build
+   (image-not-found). Pinned the catalog repo + Dockerfile to ce-v1.3.1.
+
+2. **`juicefs config --bucket <IP-URL>` is broken in v1.3.1.** It mangles
+   the URL into `minio://http:///http:/192.168.0.197:30151/zpool//http:/zpool/`
+   (visible double-encoding of the scheme). Workaround: wipe Redis +
+   bucket, re-`juicefs format` with the new URL. `juicefs format` parses
+   IP-URLs cleanly; only `config` doesn't. Documented in
+   `feedback_input_sanitization.md` memory.
+
+3. **`juicefs mount --bucket http://IP:PORT/bucket` works on v1.3.1.**
+   Confirmed empirically via direct CLI test. The Mac client uses this
+   as an override to escape the docker-internal bucket URL stored in
+   Redis at format time.
+
+**TrueNAS Scale UI:**
+
+4. **Custom catalogs are gone from 24.10+ (Electric Eel, Fangtooth,
+   Goldeye).** No "Add Catalog" button anywhere. Only the four iX-managed
+   trains (stable/enterprise/community/test) are available. Sideload-able
+   catalogs still have value as a PR payload, but cannot be installed by
+   anyone on a current TrueNAS. Real install path on 25.10 is
+   **Apps → Discover → ⋮ → Install via YAML**.
+
+**Architecture decisions made:**
+
+5. **Docker bridge networking + Mac-side `--bucket` override**
+   (vs. macvlan). The user's prod stack uses macvlan to give each container
+   a real LAN IP so the bucket URL (`http://juicefs-minio:9000/zpool`)
+   resolves from both inside and outside. For the shippable TrueNAS app,
+   macvlan is too advanced (requires parent-interface knowledge + LAN
+   IP allocation). Instead: bridge networking on the server, plus a
+   "S3 Endpoint Override" preference on the Mac client that becomes
+   `--bucket <override>` on `juicefs mount`. Wired through
+   `Preferences.swift:s3EndpointOverride` → cgo bridge → `FUSEConfig.BucketOverride`
+   → `health/fuse.go` arg builder.
+
+### Commits shipped this loop
+
+`juicemount` repo (production-hardening):
+  c5e3cd4 fix(server): compose NFS port default 12049
+  da46708 feat(mac): S3 endpoint override + URL-field whitespace strip
+  686e5e6 ci+wip(migrator): GHCR workflow + migrator skeleton
+  a3f6ff3 fix(docker): pin juicedata/mount to ce-v1.3.1
+  bfd2d42 fix(docker): apt-get instead of apk for ce-v1.3.1
+  2cd6d8a feat(migrator): jobs + sync + api + tests
+  2799e5e feat(migrator): three-pane web UI with live SSE
+  0458057 feat(migrator): container image + matrix CI publish
+
+`juicemount-truenas-apps` repo (main):
+  80d8980 init: scaffold catalog
+  c25648b chore(catalog): align image tags with what is published on GHCR
+  cf03f13 feat(catalog): slices 5+6+7 validation + preflight + quick-start
+
+### Remaining work (gated on user action)
+
+- **Slice 8 — end-to-end install rehearsal**. Requires the user to wipe
+  + re-paste the foolproofed YAML and walk through every form field
+  fresh. The catalog repo template incorporates all today's learnings;
+  the user's deployed paste-YAML does not. Once re-installed cleanly +
+  the migrator runs a small dataset migration, this slice closes.
+
+- **One-time GHCR package visibility flip (private → public)**.
+  Documented in juicemount-truenas-apps/README.md. Both
+  `juicemount-server` and `juicemount-migrator` images need the flip.
+
+- **Mac app build with the override pref**. `build/JuiceMount.app`
+  has the new preference; user has confirmed connection via this build.
+  Optional: code-sign for distribution.
