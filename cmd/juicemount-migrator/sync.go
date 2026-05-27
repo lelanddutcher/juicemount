@@ -68,16 +68,80 @@ func RunSync(ctx context.Context, juicefsBin, metaURL, volName, destMount, sourc
 		return fmt.Errorf("start juicefs sync: %w", err)
 	}
 
-	// Parse stderr in the foreground; juicefs writes progress to stderr.
-	parseSyncProgress(stderr, progress)
+	// Tee stderr into both the progress parser (extracts numeric
+	// counters) and a tail-buffer that captures the most recent log
+	// lines verbatim. On non-zero exit we surface those tail lines in
+	// the returned error so the operator can see WHY juicefs failed
+	// — exit-1-with-no-stderr-context was the original UX of this
+	// path, and it was useless. The tail buffer keeps the last 32 KB
+	// to bound memory; juicefs FATAL lines are usually one-shot near
+	// the end of the run anyway.
+	stderrTail := newRingBuffer(32 * 1024)
+	teed := io.TeeReader(stderr, stderrTail)
+	parseSyncProgress(teed, progress)
 
 	if err := cmd.Wait(); err != nil {
 		if ctx.Err() == context.Canceled {
 			return context.Canceled
 		}
-		return fmt.Errorf("juicefs sync exited: %w", err)
+		tail := stderrTail.String()
+		if tail == "" {
+			return fmt.Errorf("juicefs sync exited: %w (no stderr output)", err)
+		}
+		return fmt.Errorf("juicefs sync exited: %w — last stderr:\n%s", err, tail)
 	}
 	return nil
+}
+
+// ringBuffer is a tiny io.Writer that keeps only the last N bytes.
+// Used to capture the tail of juicefs sync's stderr for inclusion in
+// error messages without unbounded memory growth.
+type ringBuffer struct {
+	buf  []byte
+	max  int
+	full bool
+	pos  int
+}
+
+func newRingBuffer(max int) *ringBuffer {
+	return &ringBuffer{buf: make([]byte, 0, max), max: max}
+}
+
+func (r *ringBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if n >= r.max {
+		// Source line bigger than buffer: keep just the tail.
+		copy(r.buf[:cap(r.buf)], p[n-r.max:])
+		r.buf = r.buf[:r.max]
+		r.full = true
+		r.pos = 0
+		return n, nil
+	}
+	if !r.full && len(r.buf)+n <= r.max {
+		r.buf = append(r.buf, p...)
+		return n, nil
+	}
+	// Wrap-around: extend or evict from the front.
+	r.full = true
+	if len(r.buf) < r.max {
+		r.buf = r.buf[:r.max]
+	}
+	for _, b := range p {
+		r.buf[r.pos] = b
+		r.pos = (r.pos + 1) % r.max
+	}
+	return n, nil
+}
+
+func (r *ringBuffer) String() string {
+	if !r.full {
+		return string(r.buf)
+	}
+	// Reorder ring → linear, starting at the oldest byte.
+	out := make([]byte, r.max)
+	copy(out, r.buf[r.pos:])
+	copy(out[r.max-r.pos:], r.buf[:r.pos])
+	return string(out)
 }
 
 // progressRegex matches a juicefs sync progress line. Example formats
