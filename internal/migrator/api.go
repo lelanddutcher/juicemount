@@ -48,6 +48,7 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	}
 	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
 	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))
+	mux.HandleFunc(prefix+"/api/preview", a.auth(a.handlePreview))
 	mux.HandleFunc(prefix+"/api/migrate", a.auth(a.handleMigrate))
 	mux.HandleFunc(prefix+"/api/jobs", a.auth(a.handleListJobs))
 	mux.HandleFunc(prefix+"/api/jobs/", a.auth(a.handleJobOps))
@@ -179,6 +180,94 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.jobs.List())
+}
+
+// handlePreview walks the source path (file or directory) and returns
+// aggregate stats: total file count, total size, top file extensions.
+// Bounded by maxPreviewEntries to avoid hanging on enormous trees.
+const maxPreviewEntries = 50000
+
+func (a *API) handlePreview(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	if !a.pathAllowed(path) {
+		http.Error(w, "path outside permitted source roots", http.StatusForbidden)
+		return
+	}
+	type preview struct {
+		Files       int64            `json:"files"`
+		Directories int64            `json:"directories"`
+		Bytes       int64            `json:"bytes"`
+		ExtCounts   map[string]int64 `json:"ext_counts"` // .mp4 → 142, .mov → 38, ...
+		Truncated   bool             `json:"truncated"`
+	}
+	out := preview{ExtCounts: map[string]int64{}}
+
+	var walk func(p string) error
+	visited := int64(0)
+	walk = func(p string) error {
+		if visited >= maxPreviewEntries {
+			out.Truncated = true
+			return filepath.SkipAll
+		}
+		entries, err := os.ReadDir(p)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			visited++
+			if visited >= maxPreviewEntries {
+				out.Truncated = true
+				return filepath.SkipAll
+			}
+			// Skip hidden entries from the count too — matches the
+			// junk-filter the sync runner applies.
+			if strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			full := filepath.Join(p, e.Name())
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if e.IsDir() {
+				out.Directories++
+				if err := walk(full); err == filepath.SkipAll {
+					return err
+				}
+			} else {
+				out.Files++
+				out.Bytes += info.Size()
+				ext := strings.ToLower(filepath.Ext(e.Name()))
+				if ext == "" {
+					ext = "(no extension)"
+				}
+				out.ExtCounts[ext]++
+			}
+		}
+		return nil
+	}
+	// If the path itself is a file, return single-file stats.
+	info, err := os.Stat(path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !info.IsDir() {
+		out.Files = 1
+		out.Bytes = info.Size()
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext == "" {
+			ext = "(no extension)"
+		}
+		out.ExtCounts[ext] = 1
+	} else {
+		_ = walk(path)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleJobOps routes /api/jobs/{id} and /api/jobs/{id}/stream.

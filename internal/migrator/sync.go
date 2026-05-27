@@ -17,15 +17,15 @@ import (
 // SyncOptions controls per-job behavior. Tier-1/2/3 features in the
 // foolproofing roadmap map directly onto these fields.
 type SyncOptions struct {
-	PreserveStructure bool     // if false, copy flat (basename only) [tier-1]
-	PreserveTimes     bool     // --preserve mtime,uid,gid [tier-1]
-	DryRun            bool     // --dry [tier-1]
-	SkipJunk          bool     // auto-exclude .DS_Store, Thumbs.db, ._* [tier-1]
-	BWLimit           int      // --bwlimit MB/s (0 = unlimited) [tier-2]
-	Threads           int      // --threads N (default 10) [tier-2]
-	Excludes          []string // user-provided --exclude patterns [tier-2]
-	Includes          []string // user-provided --include patterns [tier-2]
-	Verify            bool     // --check-new (post-sync verify) [tier-3]
+	PreserveStructure bool     `json:"preserve_structure"` // if false, copy flat (basename only) [tier-1]
+	PreserveTimes     bool     `json:"preserve_times"`     // --preserve mtime,uid,gid [tier-1]
+	DryRun            bool     `json:"dry_run"`            // --dry [tier-1]
+	SkipJunk          bool     `json:"skip_junk"`          // auto-exclude .DS_Store, Thumbs.db, ._* [tier-1]
+	BWLimit           int      `json:"bw_limit"`           // --bwlimit MB/s (0 = unlimited) [tier-2]
+	Threads           int      `json:"threads"`            // --threads N (default 10) [tier-2]
+	Excludes          []string `json:"excludes"`           // user-provided --exclude patterns [tier-2]
+	Includes          []string `json:"includes"`           // user-provided --include patterns [tier-2]
+	Verify            bool     `json:"verify"`             // --check-new (post-sync verify) [tier-3]
 }
 
 // DefaultSyncOptions returns the safe defaults applied when the user

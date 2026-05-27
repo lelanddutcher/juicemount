@@ -310,6 +310,73 @@ main {
 
 .job-cancel:hover { color: var(--danger); border-color: var(--danger); }
 
+/* Source preview pane (tier-1) */
+.preview {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.preview h3 { margin: 0 0 0.5rem; font-size: 0.9rem; font-weight: 600; }
+.preview-stats {
+  display: flex; gap: 1.5rem; margin-bottom: 0.5rem; font-size: 0.85rem;
+}
+.preview-stats strong { font-size: 1rem; color: var(--accent); font-weight: 600; }
+.preview-types {
+  display: flex; flex-wrap: wrap; gap: 0.35rem;
+  font-size: 0.75rem; color: var(--text-muted);
+}
+.ext-pill {
+  background: var(--accent-bg); border-radius: 12px;
+  padding: 0.15rem 0.6rem; white-space: nowrap;
+}
+.ext-pill strong {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  color: var(--accent); font-weight: 600;
+}
+
+/* Options form (tier-1 + tier-2) */
+.options {
+  margin: 1rem 0; padding: 0.75rem 1rem;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+}
+.options legend {
+  padding: 0 0.4rem; font-weight: 600; font-size: 0.85rem; color: var(--text-muted);
+}
+.opt {
+  display: flex; align-items: flex-start; gap: 0.5rem;
+  padding: 0.4rem 0; border-bottom: 1px dashed var(--border); cursor: pointer;
+}
+.opt:last-child { border-bottom: none; }
+.opt input[type="checkbox"] { margin-top: 0.2rem; flex-shrink: 0; }
+.opt span { display: flex; flex-direction: column; gap: 0.1rem; }
+.opt span strong { font-size: 0.9rem; }
+.opt span em {
+  font-style: normal; font-size: 0.78rem; color: var(--text-muted);
+}
+.advanced {
+  margin-top: 0.5rem; padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
+.advanced summary {
+  cursor: pointer; font-size: 0.85rem; color: var(--text-muted); padding: 0.25rem 0;
+}
+.advanced summary:hover { color: var(--accent); }
+.advanced .field { margin-top: 0.6rem; margin-bottom: 0; }
+.advanced textarea {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.8rem; padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg-elev); color: var(--text); resize: vertical;
+}
+.advanced input[type="number"] {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem; padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg-elev); color: var(--text); width: 8rem;
+}
+
 footer {
   text-align: center;
   padding: 1rem;
