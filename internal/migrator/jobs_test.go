@@ -218,3 +218,55 @@ func TestJobManagerGetMissing(t *testing.T) {
 		t.Errorf("Subscribe for missing ID should return ok=false")
 	}
 }
+
+func TestMergeProgress(t *testing.T) {
+	// Locks in the merge semantic: monotonic max for counters; latest
+	// non-zero for Current/ETA/BPS/UpdatedAt. Prevents the regex
+	// parser's Bytes=0 final flush from clobbering the metrics
+	// poller's accurate Bytes total at end-of-job.
+	prev := ProgressEvent{Files: 1000, Bytes: 500_000_000, Current: "old.mov", ETASec: 60, UpdatedAt: 100}
+
+	t.Run("regex-final-flush does not clobber metrics bytes", func(t *testing.T) {
+		flush := ProgressEvent{Files: 1234, Bytes: 0, UpdatedAt: 200}
+		got := mergeProgress(prev, flush)
+		if got.Files != 1234 {
+			t.Errorf("Files: got %d want 1234", got.Files)
+		}
+		if got.Bytes != 500_000_000 {
+			t.Errorf("Bytes clobbered: got %d want 500000000", got.Bytes)
+		}
+		if got.UpdatedAt != 200 {
+			t.Errorf("UpdatedAt: got %d want 200", got.UpdatedAt)
+		}
+	})
+
+	t.Run("monotonic max on counters", func(t *testing.T) {
+		next := ProgressEvent{Files: 999, Bytes: 600_000_000, Errors: 5, UpdatedAt: 200}
+		got := mergeProgress(prev, next)
+		if got.Files != 1000 {
+			t.Errorf("Files should stay max: got %d want 1000", got.Files)
+		}
+		if got.Bytes != 600_000_000 {
+			t.Errorf("Bytes should advance: got %d", got.Bytes)
+		}
+		if got.Errors != 5 {
+			t.Errorf("Errors should advance: got %d", got.Errors)
+		}
+	})
+
+	t.Run("empty Current preserves previous", func(t *testing.T) {
+		next := ProgressEvent{Current: "", UpdatedAt: 200}
+		got := mergeProgress(prev, next)
+		if got.Current != "old.mov" {
+			t.Errorf("Current cleared: got %q want %q", got.Current, "old.mov")
+		}
+	})
+
+	t.Run("new Current replaces previous", func(t *testing.T) {
+		next := ProgressEvent{Current: "new.mov", UpdatedAt: 200}
+		got := mergeProgress(prev, next)
+		if got.Current != "new.mov" {
+			t.Errorf("Current: got %q want %q", got.Current, "new.mov")
+		}
+	})
+}
