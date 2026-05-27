@@ -132,20 +132,54 @@ func TestApplyUnit(t *testing.T) {
 	}
 }
 
-func TestNormalizeSyncURI(t *testing.T) {
+func TestNormalizeSourceURI(t *testing.T) {
 	cases := []struct {
 		in   string
 		want string
 	}{
-		{"/mnt/source", "file:///mnt/source"},
-		{"file:///mnt/source", "file:///mnt/source"},
-		{"s3://bucket/path", "s3://bucket/path"},
-		{"jfs://zpool/imported", "jfs://zpool/imported"},
+		{"/mnt/source", "file:///mnt/source/"},
+		{"/mnt/source/", "file:///mnt/source/"},
+		{"file:///mnt/source", "file:///mnt/source/"},
+		{"file:///mnt/source/", "file:///mnt/source/"},
+		{"s3://bucket/path", "s3://bucket/path/"},
+		{"s3://bucket/path/", "s3://bucket/path/"},
+		{"jfs://zpool/imported", "jfs://zpool/imported/"},
+		{"  /with-whitespace  ", "file:///with-whitespace/"},
 	}
 	for _, tc := range cases {
-		got := normalizeSyncURI(tc.in)
+		got := normalizeSourceURI(tc.in)
 		if got != tc.want {
-			t.Errorf("normalizeSyncURI(%q) = %q, want %q", tc.in, got, tc.want)
+			t.Errorf("normalizeSourceURI(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeDestURI(t *testing.T) {
+	cases := []struct {
+		dest, destMount, volName string
+		want                     string
+	}{
+		// Path-style dest under destMount → translated to jfs://volname/...
+		{"/jfs/imported/2026-05-27", "/jfs", "zpool", "jfs://zpool/imported/2026-05-27/"},
+		{"/jfs/imported/2026-05-27/", "/jfs", "zpool", "jfs://zpool/imported/2026-05-27/"},
+		{"/jfs", "/jfs", "zpool", "jfs://zpool/"},
+		{"/jfs/", "/jfs", "zpool", "jfs://zpool/"},
+		// Path NOT under destMount → still relative to volume root.
+		{"/foo/bar", "/jfs", "zpool", "jfs://zpool/foo/bar/"},
+		// Already-scheme'd → pass through (+ trailing slash).
+		{"jfs://other-vol/path", "/jfs", "zpool", "jfs://other-vol/path/"},
+		{"s3://my-bucket/key", "/jfs", "zpool", "s3://my-bucket/key/"},
+		{"s3://my-bucket/key/", "/jfs", "zpool", "s3://my-bucket/key/"},
+		// Different volume name.
+		{"/data/migrate", "/data", "myvol", "jfs://myvol/migrate/"},
+		// Whitespace trimmed.
+		{"  /jfs/foo  ", "/jfs", "zpool", "jfs://zpool/foo/"},
+	}
+	for _, tc := range cases {
+		got := normalizeDestURI(tc.dest, tc.destMount, tc.volName)
+		if got != tc.want {
+			t.Errorf("normalizeDestURI(%q, %q, %q) = %q, want %q",
+				tc.dest, tc.destMount, tc.volName, got, tc.want)
 		}
 	}
 }

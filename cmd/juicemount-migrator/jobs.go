@@ -54,7 +54,7 @@ type Job struct {
 // SyncFunc is the signature of a "run one sync" implementation. The
 // default is RunSync (which invokes `juicefs sync` via exec). Tests
 // override this to mock the subprocess.
-type SyncFunc func(ctx context.Context, juicefsBin, metaURL, source, destination string, progress chan<- ProgressEvent) error
+type SyncFunc func(ctx context.Context, juicefsBin, metaURL, volName, destMount, source, destination string, progress chan<- ProgressEvent) error
 
 // JobManager owns all jobs in this process. Single-worker for v1
 // (sync runs one at a time); a tiny queue could be added later if
@@ -62,6 +62,8 @@ type SyncFunc func(ctx context.Context, juicefsBin, metaURL, source, destination
 type JobManager struct {
 	juicefsBin string
 	metaURL    string
+	volName    string // JuiceFS volume name, used in jfs:// destination URIs
+	destMount  string // Path prefix that maps to the JuiceFS volume root in the UI
 
 	// runner is the underlying sync implementation. Defaults to
 	// RunSync; set via SetRunner() for tests that need deterministic
@@ -74,10 +76,12 @@ type JobManager struct {
 	active *Job
 }
 
-func NewJobManager(juicefsBin, metaURL string) *JobManager {
+func NewJobManager(juicefsBin, metaURL, volName, destMount string) *JobManager {
 	return &JobManager{
 		juicefsBin: juicefsBin,
 		metaURL:    metaURL,
+		volName:    volName,
+		destMount:  destMount,
 		runner:     RunSync,
 		jobs:       make(map[string]*Job),
 	}
@@ -267,7 +271,7 @@ func (m *JobManager) run(j *Job) {
 	runner := m.runner
 	m.mu.RUnlock()
 	go func() {
-		done <- runner(ctx, m.juicefsBin, m.metaURL, j.Source, j.Destination, progress)
+		done <- runner(ctx, m.juicefsBin, m.metaURL, m.volName, m.destMount, j.Source, j.Destination, progress)
 		close(progress)
 	}()
 
