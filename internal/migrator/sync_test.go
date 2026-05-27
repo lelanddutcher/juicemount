@@ -141,10 +141,11 @@ func TestNormalizeSourceURI(t *testing.T) {
 		{"file:///mnt/source", true, "file:///mnt/source/"},
 		{"s3://bucket/path", true, "s3://bucket/path/"},
 		{"  /with-whitespace  ", true, "file:///with-whitespace/"},
-		// preserve=false → no auto trailing slash; juicefs sync will create
-		// <dst>/<basename>/... (flatten-by-basename semantics)
+		// preserve=false → trailing slash always stripped so src and dst
+		// agree (juicefs FATALs if they disagree). With no trailing
+		// slash, juicefs creates <dst>/<basename>/... (flatten-by-basename).
 		{"/mnt/source", false, "file:///mnt/source"},
-		{"file:///mnt/source/", false, "file:///mnt/source/"}, // existing slash preserved
+		{"file:///mnt/source/", false, "file:///mnt/source"}, // existing slash stripped for consistency
 	}
 	for _, tc := range cases {
 		got := normalizeSourceURI(tc.in, tc.preserve)
@@ -158,27 +159,67 @@ func TestNormalizeSourceURI(t *testing.T) {
 func TestNormalizeDestURIEmbedded(t *testing.T) {
 	cases := []struct {
 		dest, fuseMount string
+		preserve        bool
 		want            string
 	}{
-		// /jfs prefix stripped → file:///<fuseMount>/<rest>
-		{"/jfs/imported/2026-05-27", "/mnt/juicefs", "file:///mnt/juicefs/imported/2026-05-27/"},
-		{"/jfs", "/mnt/juicefs", "file:///mnt/juicefs/"},
-		{"/jfs/", "/mnt/juicefs", "file:///mnt/juicefs/"},
-		// bare path without /jfs prefix → still rooted at fuseMount
-		{"/foo/bar", "/mnt/juicefs", "file:///mnt/juicefs/foo/bar/"},
-		// already-scheme'd → pass through
-		{"s3://my-bucket/key", "/mnt/juicefs", "s3://my-bucket/key/"},
-		{"file:///raw/path/", "/mnt/juicefs", "file:///raw/path/"},
-		// fuseMount with trailing slash → idempotent
-		{"/jfs/foo", "/mnt/juicefs/", "file:///mnt/juicefs/foo/"},
-		// whitespace trim
-		{"  /jfs/foo  ", "/mnt/juicefs", "file:///mnt/juicefs/foo/"},
+		// preserve=true → trailing slash matches src
+		{"/jfs/imported/2026-05-27", "/mnt/juicefs", true, "file:///mnt/juicefs/imported/2026-05-27/"},
+		{"/jfs", "/mnt/juicefs", true, "file:///mnt/juicefs/"},
+		{"/jfs/", "/mnt/juicefs", true, "file:///mnt/juicefs/"},
+		{"/foo/bar", "/mnt/juicefs", true, "file:///mnt/juicefs/foo/bar/"},
+		{"s3://my-bucket/key", "/mnt/juicefs", true, "s3://my-bucket/key/"},
+		{"file:///raw/path/", "/mnt/juicefs", true, "file:///raw/path/"},
+		{"/jfs/foo", "/mnt/juicefs/", true, "file:///mnt/juicefs/foo/"},
+		{"  /jfs/foo  ", "/mnt/juicefs", true, "file:///mnt/juicefs/foo/"},
+
+		// preserve=false → NO trailing slash (rsync "copy directory by basename")
+		{"/jfs/foo", "/mnt/juicefs", false, "file:///mnt/juicefs/foo"},
+		{"/jfs/foo/", "/mnt/juicefs", false, "file:///mnt/juicefs/foo"},
+		{"s3://b/k/", "/mnt/juicefs", false, "s3://b/k"},
 	}
 	for _, tc := range cases {
-		got := normalizeDestURIEmbedded(tc.dest, tc.fuseMount)
+		got := normalizeDestURIEmbedded(tc.dest, tc.fuseMount, tc.preserve)
 		if got != tc.want {
-			t.Errorf("normalizeDestURIEmbedded(%q, %q) = %q, want %q",
-				tc.dest, tc.fuseMount, got, tc.want)
+			t.Errorf("normalizeDestURIEmbedded(%q, %q, %v) = %q, want %q",
+				tc.dest, tc.fuseMount, tc.preserve, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeDestURIJFS(t *testing.T) {
+	cases := []struct {
+		dest, volName string
+		preserve      bool
+		want          string
+	}{
+		// preserve=true → trailing slash
+		{"/jfs/Film Projects/Leland TikToks", "zpool", true, "jfs://zpool/Film Projects/Leland TikToks/"},
+		{"/jfs", "zpool", true, "jfs://zpool/"},
+		{"/foo/bar", "zpool", true, "jfs://zpool/foo/bar/"},
+		// preserve=false → no trailing slash
+		{"/jfs/Film Projects/Leland TikToks", "zpool", false, "jfs://zpool/Film Projects/Leland TikToks"},
+		{"/jfs/foo/", "zpool", false, "jfs://zpool/foo"},
+	}
+	for _, tc := range cases {
+		got := normalizeDestURIJFS(tc.dest, tc.volName, tc.preserve)
+		if got != tc.want {
+			t.Errorf("normalizeDestURIJFS(%q, %q, %v) = %q, want %q",
+				tc.dest, tc.volName, tc.preserve, got, tc.want)
+		}
+	}
+}
+
+func TestMatchSlashSrcDstConsistency(t *testing.T) {
+	// The whole point of matchSlash is to guarantee src and dst agree
+	// on the trailing slash — juicefs sync FATALs otherwise.
+	for _, preserve := range []bool{true, false} {
+		src := normalizeSourceURI("/sources/foo", preserve)
+		dst := normalizeDestURIJFS("/jfs/foo", "zpool", preserve)
+		srcSlash := strings.HasSuffix(src, "/")
+		dstSlash := strings.HasSuffix(dst, "/")
+		if srcSlash != dstSlash {
+			t.Errorf("preserve=%v: src=%q (slash=%v) and dst=%q (slash=%v) disagree — juicefs sync would FATAL",
+				preserve, src, srcSlash, dst, dstSlash)
 		}
 	}
 }

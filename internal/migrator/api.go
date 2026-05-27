@@ -81,6 +81,7 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
 	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))
 	mux.HandleFunc(prefix+"/api/preview", a.auth(a.handlePreview))
+	mux.HandleFunc(prefix+"/api/resolve-destination", a.auth(a.handleResolveDestination))
 	mux.HandleFunc(prefix+"/api/migrate", a.auth(a.handleMigrate))
 	mux.HandleFunc(prefix+"/api/jobs", a.auth(a.handleListJobs))
 	mux.HandleFunc(prefix+"/api/jobs/", a.auth(a.handleJobOps))
@@ -337,6 +338,189 @@ func (a *API) handlePreview(w http.ResponseWriter, r *http.Request) {
 		_ = walk(path)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// resolveDestRequest mirrors the JSON body of POST /api/resolve-destination.
+type resolveDestRequest struct {
+	Source            string `json:"source"`
+	Destination       string `json:"destination"`
+	PreserveStructure bool   `json:"preserve_structure"`
+}
+
+// exampleMapping describes one source→destination path pair for the
+// destination preview UI. Helps users see exactly where their files
+// will land before they hit Start.
+type exampleMapping struct {
+	SourcePath string `json:"source"`
+	DestPath   string `json:"destination"`
+}
+
+// resolveDestResponse is the body returned from /api/resolve-destination.
+// SourceURL/DestinationURL are the literal arguments that will be
+// handed to `juicefs sync` (so users can verify the trailing-slash
+// agreement that juicefs FATALs on). ExampleMappings shows up to
+// maxExamples source-relative file paths and the corresponding host-side
+// destination path the user will see in Finder.
+type resolveDestResponse struct {
+	SourceURL       string           `json:"source_url"`
+	DestinationURL  string           `json:"destination_url"`
+	ExampleMappings []exampleMapping `json:"example_mappings"`
+	Info            string           `json:"info"`
+}
+
+// handleResolveDestination computes the resolved sync URLs + a few
+// example file mappings for the dest-preview UI block. Read-only.
+func (a *API) handleResolveDestination(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req resolveDestRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Source == "" || req.Destination == "" {
+		http.Error(w, "source and destination are required", http.StatusBadRequest)
+		return
+	}
+	if !a.pathAllowed(req.Source) {
+		http.Error(w, "source outside permitted source roots", http.StatusForbidden)
+		return
+	}
+	// Reject URL-scheme destinations and `..` traversal so the preview
+	// shows the same constraints /api/migrate enforces — users get
+	// immediate feedback instead of discovering the rejection at submit.
+	dest := strings.TrimSpace(req.Destination)
+	if i := strings.Index(dest, "://"); i > 0 && i < 10 {
+		http.Error(w, "destination must be a path under "+a.destMount+", not a URL", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(dest, "/") {
+		http.Error(w, "destination must be an absolute path", http.StatusBadRequest)
+		return
+	}
+	cleaned := filepath.Clean(dest)
+	dmClean := filepath.Clean(a.destMount)
+	if cleaned != dmClean && !strings.HasPrefix(cleaned, dmClean+"/") {
+		http.Error(w, "destination must be under "+a.destMount, http.StatusForbidden)
+		return
+	}
+	dest = cleaned
+
+	// Resolve to the exact URL forms RunSync will use, via the same
+	// normalize helpers — no JS-side replica that could drift.
+	srcURL := normalizeSourceURI(req.Source, req.PreserveStructure)
+	var destURL string
+	if a.fuseMount != "" {
+		destURL = normalizeDestURIEmbedded(dest, a.fuseMount, req.PreserveStructure)
+	} else {
+		destURL = normalizeDestURIJFS(dest, a.volName, req.PreserveStructure)
+	}
+
+	// Sample up to maxExamples files from the source tree. For a single
+	// file, the sample is just that file. For a directory, walk shallow-
+	// first and stop at maxExamples to keep the preview snappy.
+	samples := sampleSourceFiles(req.Source, maxResolveExamples)
+	mappings := make([]exampleMapping, 0, len(samples))
+	for _, s := range samples {
+		// rel is source-relative; same string is also the destination
+		// suffix when preserve_structure=true (1:1 mapping). For
+		// preserve_structure=false, juicefs sync prepends the source
+		// basename, so the destination gains an extra path segment.
+		rel := strings.TrimPrefix(s, req.Source)
+		rel = strings.TrimPrefix(rel, "/")
+		var destPath string
+		if req.PreserveStructure {
+			destPath = filepath.Join(dest, rel)
+		} else {
+			// flatten-by-basename: juicefs sync without trailing slash
+			// puts contents at <dst>/<basename-of-src>/<rel>.
+			base := filepath.Base(req.Source)
+			destPath = filepath.Join(dest, base, rel)
+		}
+		mappings = append(mappings, exampleMapping{
+			SourcePath: s,
+			DestPath:   destPath,
+		})
+	}
+
+	info := "Files will be copied 1:1, preserving the folder structure under the source."
+	if !req.PreserveStructure {
+		info = "Files will be placed under " + dest + "/" + filepath.Base(req.Source) + "/ — juicefs sync adds the source's basename as a parent directory in this mode."
+	}
+
+	writeJSON(w, http.StatusOK, resolveDestResponse{
+		SourceURL:       srcURL,
+		DestinationURL:  destURL,
+		ExampleMappings: mappings,
+		Info:            info,
+	})
+}
+
+// maxResolveExamples caps the number of sample file paths returned by
+// /api/resolve-destination so the preview stays cheap even on large
+// trees. The UI shows ~3, so a few extras absorbs hidden/skipped files.
+const maxResolveExamples = 5
+
+// sampleSourceFiles walks `root` shallow-first and returns up to `limit`
+// regular file paths, skipping dotfiles (which match the auto-junk
+// filter). If `root` is a regular file, returns [root].
+//
+// Each discovered path is re-validated under the resolved root to
+// prevent symlinked subdirectories from causing the preview to leak
+// filenames from outside the configured source root. Caller has
+// already validated `root` itself via pathAllowed; this layer guards
+// against symlinks planted in writable source trees by other users.
+func sampleSourceFiles(root string, limit int) []string {
+	info, err := os.Stat(root)
+	if err != nil {
+		return nil
+	}
+	if !info.IsDir() {
+		return []string{root}
+	}
+	rootResolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		rootResolved = root
+	}
+	underRoot := func(p string) bool {
+		resolved, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return false
+		}
+		return resolved == rootResolved || strings.HasPrefix(resolved, rootResolved+string(filepath.Separator))
+	}
+	out := make([]string, 0, limit)
+	// Breadth-first so the user sees representative files near the top
+	// of the tree, not the alphabetically-first deep branch.
+	queue := []string{root}
+	for len(queue) > 0 && len(out) < limit {
+		dir := queue[0]
+		queue = queue[1:]
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		// Files first, then dirs, so we return file samples sooner.
+		var subdirs []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			full := filepath.Join(dir, e.Name())
+			if !underRoot(full) {
+				continue
+			}
+			if e.IsDir() {
+				subdirs = append(subdirs, full)
+			} else if len(out) < limit {
+				out = append(out, full)
+			}
+		}
+		queue = append(queue, subdirs...)
+	}
+	return out
 }
 
 // handleJobOps routes /api/jobs/{id} and /api/jobs/{id}/stream.

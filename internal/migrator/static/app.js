@@ -28,6 +28,8 @@
     jobs: new Map(),
     adminKey: localStorage.getItem('jm-admin-key') || '',
     previewAbort: null,
+    destPreviewAbort: null,
+    destPreviewTimer: null,
   };
 
   // -------- Fetch helpers --------
@@ -152,14 +154,36 @@
 
   function suggestDefaultDestination(source) {
     const input = $('#dest-input');
-    if (input.value && input.dataset.userEdited === 'true') return;
-    const basename = source.split('/').filter(Boolean).pop() || 'imported';
-    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    input.value = `${state.destMount}/imported/${ts}-${basename}`;
+    if (input.value && input.dataset.userEdited === 'true') {
+      updateDestPreview();
+      return;
+    }
+    // Strip the longest-matching source-root prefix so the destination
+    // mirrors the source tree without leaking the bind-mount name
+    // (e.g. /sources/oldzpool/Foo/Bar → /jfs/Foo/Bar, not
+    // /jfs/imported/<timestamp>-Bar). The user can still edit it.
+    let rel = source;
+    let match = '';
+    for (const root of state.sourceRoots) {
+      if ((source === root || source.startsWith(root + '/')) && root.length > match.length) {
+        match = root;
+      }
+    }
+    if (match) {
+      rel = source.slice(match.length);
+      if (source === match) {
+        // Edge: user picked the root itself — fall back to its basename.
+        rel = '/' + (match.split('/').filter(Boolean).pop() || 'imported');
+      }
+    }
+    if (!rel.startsWith('/')) rel = '/' + rel;
+    input.value = state.destMount + rel;
+    updateDestPreview();
   }
 
   $('#dest-input').addEventListener('input', (e) => {
     e.target.dataset.userEdited = 'true';
+    updateDestPreview();
   });
 
   $('#up-btn').addEventListener('click', () => {
@@ -203,6 +227,82 @@
       includes:           linesOf('#opt-includes'),
     };
   }
+
+  // -------- Destination preview --------
+  // Calls /api/resolve-destination with the current source + dest +
+  // preserve toggle, displays the resolved URLs and 3 example file
+  // mappings so users can sanity-check where files will land BEFORE
+  // hitting Start. Debounced 150ms to absorb keystrokes.
+  function updateDestPreview() {
+    if (state.destPreviewTimer) clearTimeout(state.destPreviewTimer);
+    state.destPreviewTimer = setTimeout(updateDestPreviewNow, 150);
+  }
+
+  async function updateDestPreviewNow() {
+    const dest = $('#dest-input').value.trim();
+    const previewEl = $('#dest-preview');
+    if (!state.selectedPath || !dest) {
+      previewEl.hidden = true;
+      return;
+    }
+    previewEl.hidden = false;
+    const errEl = $('#dest-preview-error');
+    errEl.hidden = true;
+
+    if (state.destPreviewAbort) state.destPreviewAbort.abort();
+    state.destPreviewAbort = new AbortController();
+
+    try {
+      const r = await fetch(apiURL('/resolve-destination'), {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          source: state.selectedPath,
+          destination: dest,
+          preserve_structure: $('#opt-preserve-structure').checked,
+        }),
+        signal: state.destPreviewAbort.signal,
+      });
+      if (!r.ok) {
+        const msg = await r.text();
+        errEl.textContent = msg.trim() || `${r.status} ${r.statusText}`;
+        errEl.hidden = false;
+        $('#dest-preview-source-url').textContent = '—';
+        $('#dest-preview-dest-url').textContent = '—';
+        $('#dest-preview-examples').innerHTML = '';
+        $('#dest-preview-info').textContent = '';
+        return;
+      }
+      const data = await r.json();
+      $('#dest-preview-info').textContent = data.info || '';
+      $('#dest-preview-source-url').textContent = data.source_url || '—';
+      $('#dest-preview-dest-url').textContent = data.destination_url || '—';
+      const ul = $('#dest-preview-examples');
+      ul.innerHTML = '';
+      const mappings = (data.example_mappings || []).slice(0, 3);
+      if (mappings.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'src';
+        li.textContent = '(no sample files found in selection)';
+        ul.appendChild(li);
+      }
+      for (const m of mappings) {
+        const li = document.createElement('li');
+        li.innerHTML = `<span class="src">${escapeHtml(m.source)}</span>` +
+                       `<span class="arrow">→</span>` +
+                       `<span class="dst">${escapeHtml(m.destination)}</span>`;
+        ul.appendChild(li);
+      }
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      errEl.textContent = 'Preview failed: ' + err.message;
+      errEl.hidden = false;
+    }
+  }
+
+  // Preserve-structure toggle directly affects destination semantics,
+  // so re-run the preview when it flips.
+  $('#opt-preserve-structure').addEventListener('change', updateDestPreview);
 
   // -------- Source preview --------
   async function fetchPreview(path) {

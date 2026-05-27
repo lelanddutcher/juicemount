@@ -336,6 +336,60 @@ main {
   color: var(--accent); font-weight: 600;
 }
 
+/* Destination preview (transform sanity check) */
+.dest-preview {
+  margin: 0.25rem 0 1rem;
+  padding: 0.75rem 0.9rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.dest-preview h3 { margin: 0 0 0.4rem; font-size: 0.9rem; font-weight: 600; }
+.dest-preview h4 {
+  margin: 0.6rem 0 0.25rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.dest-preview-info {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.dest-preview-urls {
+  margin: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.6rem;
+  font-size: 0.78rem;
+}
+.dest-preview-urls dt {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.dest-preview-urls dd {
+  margin: 0;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  word-break: break-all;
+}
+.dest-preview-examples {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.75rem;
+}
+.dest-preview-examples li {
+  padding: 0.2rem 0;
+  border-bottom: 1px dashed var(--border);
+}
+.dest-preview-examples li:last-child { border-bottom: none; }
+.dest-preview-examples .src { color: var(--text-muted); }
+.dest-preview-examples .arrow { color: var(--accent); padding: 0 0.4rem; }
+.dest-preview-examples .dst { color: var(--text); font-weight: 500; }
+
 /* Options form (tier-1 + tier-2) */
 .options {
   margin: 1rem 0; padding: 0.75rem 1rem;
