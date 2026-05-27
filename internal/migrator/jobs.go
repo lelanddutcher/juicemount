@@ -57,14 +57,12 @@ type Job struct {
 // SyncFunc is the signature of a "run one sync" implementation. The
 // default is RunSync (which invokes `juicefs sync` via exec). Tests
 // override this to mock the subprocess.
-type SyncFunc func(ctx context.Context, juicefsBin, fuseMount, source, destination string, opts SyncOptions, progress chan<- ProgressEvent) error
+type SyncFunc func(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, progress chan<- ProgressEvent) error
 
-// JobManager owns all jobs in this process. Single-worker for v1
-// (sync runs one at a time); MaxConcurrent can later let multiple
-// migrations run in parallel for users with capable hardware.
+// JobManager owns all jobs in this process. Single-worker for v1.
 type JobManager struct {
 	juicefsBin string
-	fuseMount  string // in-process JuiceFS FUSE mount; destinations write here
+	spec       RunSyncSpec // destination-resolution config
 
 	// runner is the underlying sync implementation. Defaults to
 	// RunSync; set via SetRunner() for tests.
@@ -72,18 +70,17 @@ type JobManager struct {
 
 	mu     sync.RWMutex
 	jobs   map[string]*Job
-	order  []string // insertion order for stable listing
+	order  []string
 	active *Job
 }
 
 // NewJobManager constructs a JobManager. juicefsBin is the path to
-// the juicefs CLI (or just "juicefs" for PATH lookup). fuseMount is
-// the path where the JuiceFS volume is FUSE-mounted in the SAME
-// process (e.g. /mnt/juicefs inside the juicemount-server container).
-func NewJobManager(juicefsBin, fuseMount string) *JobManager {
+// the juicefs CLI (or just "juicefs" for PATH lookup). spec controls
+// destination URL resolution — see RunSyncSpec doc.
+func NewJobManager(juicefsBin string, spec RunSyncSpec) *JobManager {
 	return &JobManager{
 		juicefsBin: juicefsBin,
-		fuseMount:  fuseMount,
+		spec:       spec,
 		runner:     RunSync,
 		jobs:       make(map[string]*Job),
 	}
@@ -273,9 +270,10 @@ func (m *JobManager) run(j *Job) {
 
 	m.mu.RLock()
 	runner := m.runner
+	spec := m.spec
 	m.mu.RUnlock()
 	go func() {
-		done <- runner(ctx, m.juicefsBin, m.fuseMount, j.Source, j.Destination, j.Options, progress)
+		done <- runner(ctx, m.juicefsBin, spec, j.Source, j.Destination, j.Options, progress)
 		close(progress)
 	}()
 

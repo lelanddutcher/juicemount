@@ -189,10 +189,10 @@ func main() {
 		// /migrator/ to it.
 		migMux := http.NewServeMux()
 		migJobMgr = migrator.Register(migMux, "/migrator", migrator.Config{
-			JuiceFSBin:  "juicefs", // PATH lookup; works regardless of base image path
-			FUSEMount:   *fusePath,
+			JuiceFSBin:  "juicefs", // PATH lookup
+			FUSEMount:   *fusePath, // embedded mode: write via in-process FUSE mount
 			SourceRoots: roots,
-			DestMount:   "/jfs", // UI convention; rewritten to file://<fusePath> in the runner
+			DestMount:   "/jfs",
 			AdminKey:    *migratorAdminKey,
 		})
 		metricsSrv.ExtraRoutes["/migrator/"] = migMux.ServeHTTP

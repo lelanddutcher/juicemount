@@ -24,9 +24,23 @@ type API struct {
 }
 
 // Config bundles the fields needed to construct + register the API.
+//
+// Destination-write mode: pick ONE of (FUSEMount) or (MetaURL+VolName).
+//
+//   - FUSEMount set → embedded mode. Writes go through the in-process
+//     juicefs FUSE mount at file:///<FUSEMount>/<path>. Used when the
+//     migrator runs inside juicemount-server which already has the
+//     volume mounted.
+//
+//   - MetaURL + VolName set → standalone mode. Writes go through
+//     jfs://<VolName>/<path> with VolName=MetaURL set as an env var
+//     (juicefs sync's URL-alias convention). Used when the migrator
+//     runs as its own container without a local FUSE mount.
 type Config struct {
 	JuiceFSBin  string   // path to juicefs binary (or "juicefs" for PATH lookup)
-	FUSEMount   string   // in-process JuiceFS FUSE mount path (e.g. /mnt/juicefs)
+	FUSEMount   string   // embedded mode: in-process FUSE mount path
+	MetaURL     string   // standalone mode: redis://host:port/db
+	VolName     string   // standalone mode: JuiceFS volume name (e.g. "zpool")
 	SourceRoots []string // host paths the user is allowed to browse from
 	DestMount   string   // user-facing destination prefix (e.g. /jfs)
 	AdminKey    string   // empty = no auth (LAN-only)
@@ -39,7 +53,19 @@ type Config struct {
 // Static UI is served from <prefix>/, JSON API from <prefix>/api/...
 func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	prefix = strings.TrimSuffix(prefix, "/")
-	mgr := NewJobManager(cfg.JuiceFSBin, cfg.FUSEMount)
+	// Derive the RunSync spec from the Config's destination-mode fields.
+	// Embedded (FUSEMount) takes precedence; falls back to standalone
+	// (MetaURL+VolName) if FUSEMount is unset.
+	spec := RunSyncSpec{}
+	if cfg.FUSEMount != "" {
+		spec.Mode = ModeEmbedded
+		spec.FUSEMount = cfg.FUSEMount
+	} else {
+		spec.Mode = ModeStandalone
+		spec.MetaURL = cfg.MetaURL
+		spec.VolName = cfg.VolName
+	}
+	mgr := NewJobManager(cfg.JuiceFSBin, spec)
 	a := &API{
 		jobs:        mgr,
 		sourceRoots: cfg.SourceRoots,
