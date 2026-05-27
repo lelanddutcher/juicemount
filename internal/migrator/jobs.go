@@ -45,8 +45,13 @@ type Job struct {
 	CreatedAt   int64         `json:"created_at"` // unix-ms
 	StartedAt   int64         `json:"started_at"`
 	FinishedAt  int64         `json:"finished_at"`
-	Last        ProgressEvent `json:"last"`
-	Error       string        `json:"error,omitempty"`
+	// TotalBytes is the pre-computed source size from the UI's preview
+	// pane, passed through on job creation. Used by the frontend to
+	// render a real % progress bar (vs an indeterminate placeholder).
+	// 0 means "unknown" — frontend falls back to indeterminate display.
+	TotalBytes int64         `json:"total_bytes"`
+	Last       ProgressEvent `json:"last"`
+	Error      string        `json:"error,omitempty"`
 
 	// runtime-only — not serialized
 	cancel    context.CancelFunc `json:"-"`
@@ -95,7 +100,9 @@ func (m *JobManager) SetRunner(fn SyncFunc) {
 
 // Submit queues a job. Returns the assigned ID. If the manager has
 // no active job, kicks it off immediately on a background goroutine.
-func (m *JobManager) Submit(source, destination string, opts SyncOptions) (*Job, error) {
+// totalBytes is the pre-computed source size (from the UI's preview
+// scan); pass 0 for unknown.
+func (m *JobManager) Submit(source, destination string, opts SyncOptions, totalBytes int64) (*Job, error) {
 	id := newJobID()
 	j := &Job{
 		ID:          id,
@@ -104,6 +111,7 @@ func (m *JobManager) Submit(source, destination string, opts SyncOptions) (*Job,
 		Options:     opts,
 		State:       JobPending,
 		CreatedAt:   time.Now().UnixMilli(),
+		TotalBytes:  totalBytes,
 	}
 	m.mu.Lock()
 	m.jobs[id] = j

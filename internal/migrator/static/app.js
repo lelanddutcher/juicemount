@@ -30,6 +30,10 @@
     previewAbort: null,
     destPreviewAbort: null,
     destPreviewTimer: null,
+    // Last computed source-preview totals for the current selection.
+    // Passed into the job on submit so the progress bar can show real %
+    // instead of an indeterminate placeholder.
+    previewTotals: { bytes: 0, files: 0, truncated: false },
   };
 
   // -------- Fetch helpers --------
@@ -203,6 +207,10 @@
         source: state.selectedPath,
         destination: dest,
         options: collectOptions(),
+        // Pass the preview's scanned bytes total. If the scan was
+        // truncated we still send it — the bar will overshoot 100%
+        // and clamp visually, which is better UX than no bar at all.
+        total_bytes: state.previewTotals.bytes,
       });
       $('#dest-input').dataset.userEdited = 'false';
       addJob(job);
@@ -319,16 +327,25 @@
       const r = await fetch(url, { headers: authHeaders(), signal: state.previewAbort.signal });
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
       const data = await r.json();
-      $('#preview-files').textContent = data.files.toLocaleString();
-      $('#preview-size').textContent = formatBytes(data.bytes);
-      $('#preview-dirs').textContent = data.directories.toLocaleString();
+      // When the walker hit the entry cap, every number is a lower
+      // bound, not a final value. Prefix with "≥" and add a "still
+      // scanning" note so users don't read partial totals as truth.
+      state.previewTotals = {
+        bytes: data.bytes,
+        files: data.files,
+        truncated: !!data.truncated,
+      };
+      const prefix = data.truncated ? '≥' : '';
+      $('#preview-files').textContent = prefix + data.files.toLocaleString();
+      $('#preview-size').textContent = prefix + formatBytes(data.bytes);
+      $('#preview-dirs').textContent = prefix + data.directories.toLocaleString();
       const exts = Object.entries(data.ext_counts || {})
         .sort((a, b) => b[1] - a[1])
         .slice(0, 6)
         .map(([k, v]) => `<span class="ext-pill"><strong>${escapeHtml(k)}</strong>: ${v.toLocaleString()}</span>`)
         .join(' ');
       $('#preview-types').innerHTML = exts +
-        (data.truncated ? ' <span class="hint">(stopped at 50k entries)</span>' : '');
+        (data.truncated ? ' <span class="hint">(scan capped — totals are lower bounds)</span>' : '');
     } catch (err) {
       if (err.name === 'AbortError') return;
       $('#preview-types').textContent = 'preview failed: ' + err.message;
@@ -409,14 +426,23 @@
     const errors = last.errors || 0;
     const etaSec = last.eta_sec || 0;
 
-    // We don't know total bytes upfront — show "indeterminate" via
-    // a striped bar when running, fill on completion.
+    // Real progress when we have a total from the preview pane;
+    // indeterminate placeholder otherwise.
     let progressClass = '';
     let progressWidth = '0%';
+    const total = job.total_bytes || 0;
     if (job.state === 'done') { progressClass = 'done'; progressWidth = '100%'; }
     else if (job.state === 'error') { progressClass = 'error'; progressWidth = '100%'; }
     else if (job.state === 'canceled') { progressWidth = '0%'; }
-    else if (job.state === 'running') { progressWidth = '50%'; } // indeterminate-ish
+    else if (job.state === 'running') {
+      if (total > 0) {
+        const pct = Math.min(99, Math.max(1, Math.round((bytes / total) * 100)));
+        progressWidth = pct + '%';
+      } else {
+        progressClass = 'indeterminate';
+        progressWidth = '100%';
+      }
+    }
 
     el.innerHTML = `
       <div class="job-head">
@@ -427,7 +453,8 @@
       <div class="progress-bar"><div class="progress-fill ${progressClass}" style="width:${progressWidth}"></div></div>
       <div class="job-stats">
         <span><strong>${files}</strong> files</span>
-        <span><strong>${formatBytes(bytes)}</strong> copied</span>
+        <span><strong>${formatBytes(bytes)}</strong>${total > 0 ? ' / ' + formatBytes(total) : ''} copied</span>
+        ${total > 0 && job.state === 'running' ? `<span><strong>${Math.min(99, Math.round((bytes / total) * 100))}%</strong></span>` : ''}
         <span><strong>${errors}</strong> errors</span>
         ${etaSec > 0 ? `<span>ETA <strong>${etaSec}s</strong></span>` : ''}
         ${(job.state === 'pending' || job.state === 'running')
