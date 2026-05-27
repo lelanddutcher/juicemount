@@ -1,6 +1,6 @@
-// JuiceMount Migrator — vanilla JS UI. No frameworks, no build step,
-// no external deps. Talks to the same-origin backend at /api/*.
-// Designed to be servable as static content from a Go binary.
+// JuiceMount Migrator — vanilla JS UI. No frameworks, no build step.
+// Embedded mode: served from /migrator/ inside juicemount-server, so
+// all API paths must be relative to the page's base path.
 
 (() => {
   'use strict';
@@ -8,15 +8,26 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+  // Base path = the dir part of the current URL (e.g. /migrator/ → /migrator).
+  // All /api/... calls are prefixed with this so the same JS works under
+  // any deployment prefix.
+  const BASE = (() => {
+    const p = location.pathname;
+    const trimmed = p.endsWith('/') ? p.slice(0, -1) : p.replace(/\/[^/]*$/, '');
+    return trimmed || '';
+  })();
+  const apiURL = (p) => BASE + '/api' + p;
+
   // -------- State --------
   const state = {
     sourceRoots: [],
     destMount: '/jfs',
     activeRoot: null,
-    cwd: null,           // current browsing path
-    selectedPath: null,  // path the user clicked (file or dir)
-    jobs: new Map(),     // jobId -> {job, sse}
+    cwd: null,
+    selectedPath: null,
+    jobs: new Map(),
     adminKey: localStorage.getItem('jm-admin-key') || '',
+    previewAbort: null,
   };
 
   // -------- Fetch helpers --------
@@ -29,7 +40,9 @@
   async function api(method, path, body) {
     const opts = { method, headers: authHeaders() };
     if (body) opts.body = JSON.stringify(body);
-    const r = await fetch(path, opts);
+    // path is "/api/..." with no base; rewrite to BASE-relative.
+    const url = path.startsWith('/api') ? BASE + path : path;
+    const r = await fetch(url, opts);
     if (r.status === 401) {
       const key = prompt('X-JuiceMount-Admin-Key (will be saved locally):');
       if (key) {
@@ -130,6 +143,11 @@
   function updateSelectedDisplay() {
     $('#selected-source').textContent = state.selectedPath || '(nothing selected yet)';
     $('#start-btn').disabled = !state.selectedPath;
+    if (state.selectedPath) {
+      fetchPreview(state.selectedPath);
+    } else {
+      $('#preview').hidden = true;
+    }
   }
 
   function suggestDefaultDestination(source) {
@@ -160,8 +178,8 @@
       const job = await api('POST', '/api/migrate', {
         source: state.selectedPath,
         destination: dest,
+        options: collectOptions(),
       });
-      // Reset suggestion for next migration.
       $('#dest-input').dataset.userEdited = 'false';
       addJob(job);
     } catch (err) {
@@ -169,6 +187,53 @@
       $('#error').hidden = false;
     }
   });
+
+  // -------- Options form → JSON --------
+  function collectOptions() {
+    const linesOf = (id) => $(id).value.split('\n').map(s => s.trim()).filter(Boolean);
+    return {
+      preserve_structure: $('#opt-preserve-structure').checked,
+      preserve_times:     $('#opt-preserve-times').checked,
+      dry_run:            $('#opt-dry-run').checked,
+      skip_junk:          $('#opt-skip-junk').checked,
+      verify:             $('#opt-verify').checked,
+      bw_limit:           Math.max(0, parseInt($('#opt-bwlimit').value, 10) || 0),
+      threads:            Math.max(1, parseInt($('#opt-threads').value, 10) || 10),
+      excludes:           linesOf('#opt-excludes'),
+      includes:           linesOf('#opt-includes'),
+    };
+  }
+
+  // -------- Source preview --------
+  async function fetchPreview(path) {
+    if (state.previewAbort) state.previewAbort.abort();
+    state.previewAbort = new AbortController();
+    const previewEl = $('#preview');
+    previewEl.hidden = false;
+    $('#preview-files').textContent = '…';
+    $('#preview-size').textContent = '…';
+    $('#preview-dirs').textContent = '…';
+    $('#preview-types').textContent = 'scanning…';
+    try {
+      const url = `${BASE}/api/preview?path=${encodeURIComponent(path)}`;
+      const r = await fetch(url, { headers: authHeaders(), signal: state.previewAbort.signal });
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      const data = await r.json();
+      $('#preview-files').textContent = data.files.toLocaleString();
+      $('#preview-size').textContent = formatBytes(data.bytes);
+      $('#preview-dirs').textContent = data.directories.toLocaleString();
+      const exts = Object.entries(data.ext_counts || {})
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6)
+        .map(([k, v]) => `<span class="ext-pill"><strong>${escapeHtml(k)}</strong>: ${v.toLocaleString()}</span>`)
+        .join(' ');
+      $('#preview-types').innerHTML = exts +
+        (data.truncated ? ' <span class="hint">(stopped at 50k entries)</span>' : '');
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      $('#preview-types').textContent = 'preview failed: ' + err.message;
+    }
+  }
 
   // -------- Jobs --------
   async function loadJobs() {
@@ -193,8 +258,8 @@
     const entry = state.jobs.get(id);
     if (!entry || entry.sse) return;
     const url = state.adminKey
-      ? `/api/jobs/${id}/stream?key=${encodeURIComponent(state.adminKey)}`
-      : `/api/jobs/${id}/stream`;
+      ? `${BASE}/api/jobs/${id}/stream?key=${encodeURIComponent(state.adminKey)}`
+      : `${BASE}/api/jobs/${id}/stream`;
     const es = new EventSource(url);
     entry.sse = es;
     es.addEventListener('message', async (e) => {
