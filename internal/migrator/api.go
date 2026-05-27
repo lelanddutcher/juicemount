@@ -21,6 +21,9 @@ type API struct {
 	sourceRoots []string // allowable host paths under /browse
 	destMount   string   // user-facing prefix used in destination paths (e.g. /jfs)
 	adminKey    string   // empty = no auth
+	prefix      string   // route-mount prefix (e.g. "/migrator"); empty for standalone
+	fuseMount   string   // for ModeEmbedded dest-traversal check; empty in standalone
+	volName     string   // for ModeStandalone dest-validation
 }
 
 // Config bundles the fields needed to construct + register the API.
@@ -71,6 +74,9 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		sourceRoots: cfg.SourceRoots,
 		destMount:   cfg.DestMount,
 		adminKey:    cfg.AdminKey,
+		prefix:      prefix,
+		fuseMount:   cfg.FUSEMount,
+		volName:     cfg.VolName,
 	}
 	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
 	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))
@@ -91,7 +97,17 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 // Also accepts the key via a `?key=...` query parameter — needed for
 // the EventSource API which can't set custom HTTP headers from
 // JavaScript. The query param is only consulted when the header is
-// absent or empty; never logged.
+// absent or empty.
+//
+// **Known limitation (Rule 4 MEDIUM finding):** the metrics HTTP
+// server itself does not log request URIs, but a TLS-terminating
+// proxy in front of this server (nginx, Caddy, Traefik) typically
+// logs full URIs by default — including the `?key=` value. Operators
+// behind a logging proxy must either: (a) disable access-log query-
+// string capture for /api/jobs/*/stream, or (b) only expose this
+// service on the LAN behind a non-logging proxy. Documented in
+// `docs/OPEN_BUGS.md` for a future fix (issue: POST-then-stream
+// ticket exchange so the key never traverses a URL).
 func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if a.adminKey == "" {
@@ -186,11 +202,34 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source outside permitted source roots", http.StatusForbidden)
 		return
 	}
-	// Destination defaults to /jfs/imported/<timestamp> if user just
-	// gave the JuiceFS mount root.
-	dest := req.Destination
-	if dest == a.destMount || dest == a.destMount+"/" {
-		dest = filepath.Join(a.destMount, "imported", time.Now().UTC().Format("20060102-150405"))
+	// Destination security gates (Rule 4 HIGH findings):
+	//   1. Reject any user-supplied URL scheme. Only path-style
+	//      destinations are accepted; the runner converts them to
+	//      file:// or jfs:// internally. Otherwise a client with
+	//      the admin key could exfiltrate to s3://attacker-bucket/.
+	//   2. Reject any path containing `..` segments. Clean the path
+	//      and verify it still starts with destMount. Otherwise
+	//      "/jfs/../../../tmp/evil" escapes the JuiceFS volume into
+	//      the host filesystem.
+	dest := strings.TrimSpace(req.Destination)
+	if i := strings.Index(dest, "://"); i > 0 && i < 10 {
+		http.Error(w, "destination must be a path under "+a.destMount+", not a URL", http.StatusBadRequest)
+		return
+	}
+	if dest == "" || !strings.HasPrefix(dest, "/") {
+		http.Error(w, "destination must be an absolute path", http.StatusBadRequest)
+		return
+	}
+	cleaned := filepath.Clean(dest)
+	dmClean := filepath.Clean(a.destMount)
+	if cleaned != dmClean && !strings.HasPrefix(cleaned, dmClean+"/") {
+		http.Error(w, "destination must be under "+a.destMount+" (no parent-dir traversal)", http.StatusForbidden)
+		return
+	}
+	// At this point `cleaned` is safe: absolute, no `..`, under destMount.
+	dest = cleaned
+	if dest == dmClean {
+		dest = filepath.Join(dmClean, "imported", time.Now().UTC().Format("20060102-150405"))
 	}
 	opts := DefaultSyncOptions()
 	if req.Options != nil {
@@ -244,15 +283,19 @@ func (a *API) handlePreview(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		for _, e := range entries {
+			// Skip hidden entries entirely — matches the junk-filter
+			// the sync runner applies AND keeps the visited counter
+			// honest. Previously dotfile-heavy trees (e.g. Time
+			// Machine backups full of ._ sidecars) would burn through
+			// the 50k limit returning truncated=true alongside
+			// files=0, which looked like an empty directory in the UI.
+			if strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
 			visited++
 			if visited >= maxPreviewEntries {
 				out.Truncated = true
 				return filepath.SkipAll
-			}
-			// Skip hidden entries from the count too — matches the
-			// junk-filter the sync runner applies.
-			if strings.HasPrefix(e.Name(), ".") {
-				continue
 			}
 			full := filepath.Join(p, e.Name())
 			info, err := e.Info()
@@ -297,8 +340,18 @@ func (a *API) handlePreview(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleJobOps routes /api/jobs/{id} and /api/jobs/{id}/stream.
+// Uses a.prefix to strip the mount prefix in embedded mode — without
+// this, r.URL.Path is "/migrator/api/jobs/..." and TrimPrefix against
+// "/api/jobs/" returns the whole path unchanged, causing every job-
+// specific endpoint to return 400. Caught by Rule 4 review.
 func (a *API) handleJobOps(w http.ResponseWriter, r *http.Request) {
-	suffix := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
+	suffix := strings.TrimPrefix(r.URL.Path, a.prefix+"/api/jobs/")
+	if suffix == r.URL.Path {
+		// TrimPrefix is a no-op when prefix doesn't match → bug.
+		// Fall back to the unprefixed form for safety in standalone
+		// mode (a.prefix == "" already, but defensive).
+		suffix = strings.TrimPrefix(r.URL.Path, "/api/jobs/")
+	}
 	if suffix == "" {
 		http.Error(w, "job id required", http.StatusBadRequest)
 		return
