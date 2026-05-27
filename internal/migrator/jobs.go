@@ -417,8 +417,18 @@ func (m *JobManager) run(j *Job) {
 
 	for ev := range progress {
 		j.mu.Lock()
-		j.Last = ev
-		j.notifyListenersLocked(ev)
+		// Merge monotonically rather than overwrite. Two concurrent
+		// producers feed `progress`: the regex stderr parser and the
+		// Prometheus metrics poller. Each may emit events that carry
+		// only a SUBSET of the counters (e.g. the regex parser's final
+		// "copied 14589" line has Files=14589 but Bytes=0 because the
+		// line has no byte unit). Without this merge, that final event
+		// clobbers the accurate Bytes value the metrics poller already
+		// stored. Files/Bytes/Errors are monotonic in juicefs so max
+		// is always the right choice; Current/ETASec/UpdatedAt take
+		// the latest value.
+		j.Last = mergeProgress(j.Last, ev)
+		j.notifyListenersLocked(j.Last)
 		j.mu.Unlock()
 	}
 
@@ -456,6 +466,38 @@ func (m *JobManager) run(j *Job) {
 	if nextToRun != nil {
 		go m.run(nextToRun)
 	}
+}
+
+// mergeProgress combines a sparsely-populated incoming event with the
+// already-stored last-known state. juicefs counters are monotonic so
+// max is correct for Files/Bytes/Errors; Current/ETASec/UpdatedAt
+// always take the latest non-zero value (Current "" means "unchanged",
+// not "cleared"). See the run() loop comment for the producer
+// asymmetry this guards against.
+func mergeProgress(prev, next ProgressEvent) ProgressEvent {
+	out := prev
+	if next.Files > out.Files {
+		out.Files = next.Files
+	}
+	if next.Bytes > out.Bytes {
+		out.Bytes = next.Bytes
+	}
+	if next.Errors > out.Errors {
+		out.Errors = next.Errors
+	}
+	if next.Current != "" {
+		out.Current = next.Current
+	}
+	if next.ETASec != 0 {
+		out.ETASec = next.ETASec
+	}
+	if next.BPS != 0 {
+		out.BPS = next.BPS
+	}
+	if next.UpdatedAt > out.UpdatedAt {
+		out.UpdatedAt = next.UpdatedAt
+	}
+	return out
 }
 
 // notifyListenersLocked broadcasts an event to all subscribers.
