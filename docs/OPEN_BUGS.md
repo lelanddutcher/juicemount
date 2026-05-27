@@ -91,6 +91,68 @@ Plus earlier sub-fix: Lua SCAN MATCH tightened from `d*` to `d[0-9]*` to exclude
 
 ---
 
+## P1.5 — migrator tier-3 / tier-4 features (deferred)
+
+The migrator's tier-1 toggles + tier-2 advanced opts shipped in
+commit `0e58106`. The remaining tiers from the design discussion are
+parked here so they're not lost. Each item is a self-contained slice.
+
+**Tier 3 — polish + advanced (next iterations):**
+
+- **Job persistence to SQLite.** Currently job state lives in
+  in-process memory; a juicemount-server restart loses everything.
+  Add a `migrator_jobs` table to the existing pin store DB or a
+  sibling DB; persist Submit / state transitions / final Last
+  ProgressEvent. On startup, load incomplete jobs and either
+  resume (if --resume-on-startup) or surface them as "interrupted."
+  Smallest viable: add to internal/migrator/state.go, wire into
+  JobManager.Submit + run() transitions.
+
+- **Scheduled migrations.** Cron-style picker in the UI ("Now",
+  "Tonight at 2 AM", "Custom cron expression"). New JobState
+  `scheduled` + a goroutine in JobManager that promotes
+  scheduled→pending at the right time. Requires #1 (persistence).
+
+- **Continuous mirror mode.** Toggle in the options form. After the
+  initial sync completes, queue a follow-up sync N hours later.
+  Implementation: when a job finishes with mirror=true, JobManager
+  schedules a fresh job with the same params at now+interval.
+
+- **Migration profiles.** Save the current options form (source set
+  + destination + all toggles) by name; re-run by clicking the
+  profile. Backend: small CRUD endpoint on /api/profiles. Storage:
+  same SQLite as job persistence.
+
+- **Live throughput sparkline.** SSE already emits BPS per tick;
+  the UI just needs to keep a rolling window and render an SVG
+  sparkline in the job card. Pure frontend work.
+
+- **CSV migration report.** Per-job "what got copied" log:
+  path, size, mtime, status. juicefs sync has --metrics-prefix
+  and stderr lines already include this; capture into the job's
+  job.csv during run, expose as GET /api/jobs/{id}/report.csv.
+
+- **Multi-job concurrency knob.** JobManager today is strictly
+  single-worker. Add MaxConcurrent (default 1) so prosumers with
+  fast NAS can run 2-3 migrations in parallel. Watch out for the
+  per-job Redis lock semantics of juicefs sync at higher counts.
+
+**Tier 4 — moonshot (someday):**
+
+- **Source thumbnail previews** for media files in the source browser
+  (ffmpeg/imagemagick sidecar, cached at /tmp/thumb-<sha>.jpg).
+- **AI-assisted destination structure** — scan source for camera /
+  date metadata, suggest folder organization. Out of scope unless
+  there's clear user demand.
+- **Delete source after verified migration.** Dangerous, gated
+  behind double confirmation. Useful only for "decommissioning the
+  old NAS" workflows.
+
+**Smallest viable next step:** ship tier-3 job persistence (item #1).
+Everything else in tier 3 depends on durable job state.
+
+---
+
 ## P2 — user-vision deliverables (depend on P0)
 
 ### Dropbox-style write model
