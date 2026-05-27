@@ -320,6 +320,19 @@ main {
 
 .job-cancel:hover { color: var(--danger); border-color: var(--danger); }
 
+.job-resume {
+  margin-left: 0.5rem;
+  background: none;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.job-resume:hover { background: var(--accent-bg); }
+
 /* Source preview pane (tier-1) */
 .preview {
   margin-top: 1rem;

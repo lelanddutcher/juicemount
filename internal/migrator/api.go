@@ -47,6 +47,7 @@ type Config struct {
 	SourceRoots []string // host paths the user is allowed to browse from
 	DestMount   string   // user-facing destination prefix (e.g. /jfs)
 	AdminKey    string   // empty = no auth (LAN-only)
+	StateFile   string   // optional JSON path for job-history persistence (empty = ephemeral)
 }
 
 // Register wires the migrator's routes onto an existing ServeMux at
@@ -69,6 +70,7 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		spec.VolName = cfg.VolName
 	}
 	mgr := NewJobManager(cfg.JuiceFSBin, spec)
+	mgr.SetStateFile(cfg.StateFile)
 	a := &API{
 		jobs:        mgr,
 		sourceRoots: cfg.SourceRoots,

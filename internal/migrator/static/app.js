@@ -459,12 +459,40 @@
         ${etaSec > 0 ? `<span>ETA <strong>${etaSec}s</strong></span>` : ''}
         ${(job.state === 'pending' || job.state === 'running')
           ? `<button class="job-cancel" data-id="${job.id}">Cancel</button>` : ''}
+        ${(job.state === 'canceled' || job.state === 'error')
+          ? `<button class="job-resume" data-id="${job.id}">Resume</button>` : ''}
       </div>
       ${job.error ? `<p class="error">${escapeHtml(job.error)}</p>` : ''}
     `;
     el.querySelectorAll('.job-cancel').forEach((b) => {
       b.addEventListener('click', () => cancelJob(b.dataset.id));
     });
+    el.querySelectorAll('.job-resume').forEach((b) => {
+      b.addEventListener('click', () => resumeJob(b.dataset.id));
+    });
+  }
+
+  // resumeJob re-submits a canceled/errored job's source+dest+options
+  // as a new job. juicefs sync --update --check-change is in args by
+  // default so files already at the destination are skipped, making
+  // this a true resume rather than a re-copy. The original job stays
+  // in the list (terminal state) and a fresh card appears at the top.
+  async function resumeJob(id) {
+    const entry = state.jobs.get(id);
+    if (!entry) return;
+    const orig = entry.job;
+    try {
+      const job = await api('POST', '/api/migrate', {
+        source: orig.source,
+        destination: orig.destination,
+        options: orig.options,
+        total_bytes: orig.total_bytes || 0,
+      });
+      addJob(job);
+    } catch (err) {
+      $('#error').textContent = 'Resume failed: ' + err.message;
+      $('#error').hidden = false;
+    }
   }
 
   async function cancelJob(id) {

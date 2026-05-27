@@ -7,6 +7,10 @@ package migrator
 
 import (
 	"context"
+	"encoding/json"
+	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -73,10 +77,24 @@ type JobManager struct {
 	// RunSync; set via SetRunner() for tests.
 	runner SyncFunc
 
+	// stateFile is an optional JSON file the manager loads on startup
+	// and writes after every job state transition. Bind-mount the
+	// containing dir to make job history survive container restart.
+	// Empty = no persistence (jobs vanish on process exit).
+	stateFile string
+
 	mu     sync.RWMutex
 	jobs   map[string]*Job
 	order  []string
 	active *Job
+}
+
+// persistedState is what we serialize to disk. Mirrors the in-memory
+// shape but only the JSON-tagged fields of Job (no runtime mutex /
+// listener slices). order preserves submission order across restarts.
+type persistedState struct {
+	Jobs  map[string]*Job `json:"jobs"`
+	Order []string        `json:"order"`
 }
 
 // NewJobManager constructs a JobManager. juicefsBin is the path to
@@ -88,6 +106,110 @@ func NewJobManager(juicefsBin string, spec RunSyncSpec) *JobManager {
 		spec:       spec,
 		runner:     RunSync,
 		jobs:       make(map[string]*Job),
+	}
+}
+
+// SetStateFile enables JSON persistence at the given path and loads
+// any existing history immediately. Should be called once before any
+// job is submitted; safe-but-pointless to call later (the load only
+// runs the first time and would clobber in-memory state). Empty path
+// is a no-op — useful for the default "ephemeral" mode.
+//
+// Jobs that were Running or Pending at the moment the previous process
+// died are marked as JobError on load with the reason "interrupted by
+// container restart" — they're not auto-resumed (the user can hit the
+// Resume button in the UI if they want to).
+func (m *JobManager) SetStateFile(path string) {
+	if path == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stateFile = path
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("migrator: read state file %s: %v", path, err)
+		}
+		return
+	}
+	var s persistedState
+	if err := json.Unmarshal(data, &s); err != nil {
+		log.Printf("migrator: parse state file %s: %v (starting fresh)", path, err)
+		return
+	}
+	for _, j := range s.Jobs {
+		if j == nil {
+			continue
+		}
+		// Crash recovery: any job that was running/pending pre-restart
+		// is orphaned. Promote to error so the UI surfaces it (with
+		// the Resume button enabled).
+		if j.State == JobRunning || j.State == JobPending {
+			j.State = JobError
+			if j.Error == "" {
+				j.Error = "interrupted by container restart"
+			}
+			if j.FinishedAt == 0 {
+				j.FinishedAt = time.Now().UnixMilli()
+			}
+		}
+		m.jobs[j.ID] = j
+	}
+	m.order = s.Order
+	log.Printf("migrator: loaded %d jobs from %s", len(m.jobs), path)
+}
+
+// saveStateLocked atomically writes the current jobs map + order to
+// stateFile. Caller must hold m.mu (any level). Best-effort — logs
+// errors but never blocks the caller; persistence is convenience, not
+// correctness-critical.
+func (m *JobManager) saveStateLocked() {
+	if m.stateFile == "" {
+		return
+	}
+	// Snapshot under read of each job's mutex so we don't catch a
+	// half-written field. The outer m.mu (caller-held) already
+	// excludes concurrent map writes.
+	out := persistedState{
+		Jobs:  make(map[string]*Job, len(m.jobs)),
+		Order: append([]string(nil), m.order...),
+	}
+	for id, j := range m.jobs {
+		j.mu.Lock()
+		// Shallow copy by value so we don't serialize the mutex.
+		snap := Job{
+			ID:          j.ID,
+			Source:      j.Source,
+			Destination: j.Destination,
+			Options:     j.Options,
+			State:       j.State,
+			CreatedAt:   j.CreatedAt,
+			StartedAt:   j.StartedAt,
+			FinishedAt:  j.FinishedAt,
+			TotalBytes:  j.TotalBytes,
+			Last:        j.Last,
+			Error:       j.Error,
+		}
+		j.mu.Unlock()
+		out.Jobs[id] = &snap
+	}
+	data, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		log.Printf("migrator: marshal state: %v", err)
+		return
+	}
+	tmp := m.stateFile + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(m.stateFile), 0o755); err != nil {
+		log.Printf("migrator: mkdir state dir: %v", err)
+		return
+	}
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("migrator: write state tmp: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, m.stateFile); err != nil {
+		log.Printf("migrator: rename state: %v", err)
 	}
 }
 
@@ -120,6 +242,7 @@ func (m *JobManager) Submit(source, destination string, opts SyncOptions, totalB
 	if canStart {
 		m.active = j
 	}
+	m.saveStateLocked()
 	m.mu.Unlock()
 	if canStart {
 		go m.run(j)
@@ -271,6 +394,9 @@ func (m *JobManager) run(j *Job) {
 	j.State = JobRunning
 	j.StartedAt = time.Now().UnixMilli()
 	j.mu.Unlock()
+	m.mu.Lock()
+	m.saveStateLocked()
+	m.mu.Unlock()
 
 	// Wire progress callbacks into the job's listener fan-out. Cap 64
 	// because two concurrent producers (parseSyncProgress + the
@@ -316,15 +442,20 @@ func (m *JobManager) run(j *Job) {
 	// Dequeue and kick the next pending job if any.
 	m.mu.Lock()
 	m.active = nil
+	var nextToRun *Job
 	for _, id := range m.order {
 		next := m.jobs[id]
 		if next.State == JobPending {
 			m.active = next
-			go m.run(next)
+			nextToRun = next
 			break
 		}
 	}
+	m.saveStateLocked()
 	m.mu.Unlock()
+	if nextToRun != nil {
+		go m.run(nextToRun)
+	}
 }
 
 // notifyListenersLocked broadcasts an event to all subscribers.

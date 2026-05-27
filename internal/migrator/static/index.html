@@ -86,8 +86,8 @@
           <summary>Advanced options</summary>
           <label class="opt">
             <input type="checkbox" id="opt-verify">
-            <span><strong>Verify after sync</strong>
-              <em>Post-sync checksum check (slow but exhaustive).</em></span>
+            <span><strong>Verify after sync (--check-all)</strong>
+              <em>Re-reads every source AND destination file byte-by-byte. Adds ~2× the read I/O. Worth it for archival or one-off transfers where you want certainty. Skip for routine incremental syncs.</em></span>
           </label>
           <label class="field">
             <span>Bandwidth limit (MB/s; 0 = unlimited)</span>
