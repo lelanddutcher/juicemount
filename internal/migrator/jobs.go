@@ -264,8 +264,12 @@ func (m *JobManager) run(j *Job) {
 	j.StartedAt = time.Now().UnixMilli()
 	j.mu.Unlock()
 
-	// Wire progress callbacks into the job's listener fan-out.
-	progress := make(chan ProgressEvent, 8)
+	// Wire progress callbacks into the job's listener fan-out. Cap 64
+	// because two concurrent producers (parseSyncProgress + the
+	// pollJuicefsMetrics goroutine) both emit here, and bursty stretches
+	// — startup, large-file boundaries — would saturate a smaller buffer
+	// and silently drop events via the non-blocking sends both producers use.
+	progress := make(chan ProgressEvent, 64)
 	done := make(chan error, 1)
 
 	m.mu.RLock()

@@ -48,7 +48,7 @@ func TestParseSyncProgress(t *testing.T) {
 		{
 			name: "empty input — no events",
 			in:   "",
-			w:    want{minEmissions: 1}, // final flush still emits a zero event
+			w:    want{minEmissions: 0}, // final flush is suppressed when nothing parsed (else it would clobber pollJuicefsMetrics's accurate final counts)
 		},
 		{
 			name: "garbage lines ignored",
@@ -86,6 +86,9 @@ func TestParseSyncProgress(t *testing.T) {
 			if len(events) < tc.w.minEmissions {
 				t.Fatalf("expected at least %d emissions, got %d (events=%v)",
 					tc.w.minEmissions, len(events), events)
+			}
+			if len(events) == 0 {
+				return // minEmissions==0 case: no final-flush comparison
 			}
 			last := events[len(events)-1]
 			if tc.w.finalFiles != 0 && last.Files != tc.w.finalFiles {

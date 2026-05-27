@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -14,6 +15,13 @@ import (
 	"strings"
 	"time"
 )
+
+// juicefsMetricsAddr is the host:port juicefs sync exposes Prometheus
+// metrics on. The default is 127.0.0.1:9567; we pin it explicitly via
+// --metrics so the parent process can poll a known address. Only one
+// juicefs sync runs at a time (JobManager serializes), so a fixed port
+// is safe.
+const juicefsMetricsAddr = "127.0.0.1:9567"
 
 // SyncOptions controls per-job behavior. Tier-1/2/3 features in the
 // foolproofing roadmap map directly onto these fields.
@@ -102,6 +110,10 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		"--threads", strconv.Itoa(threads),
 		"--update",
 		"--check-change",
+		// Pin metrics port so the parent can poll for accurate progress
+		// counters (juicefs's stderr progress bar is TTY-only; non-TTY
+		// stderr emits sparse logs that the regex parser barely catches).
+		"--metrics", juicefsMetricsAddr,
 	}
 	if opts.PreserveTimes {
 		// juicefs sync 1.3.1 only exposes --perms (mode bits). mtime
@@ -155,9 +167,29 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	// path, and it was useless. The tail buffer keeps the last 32 KB
 	// to bound memory; juicefs FATAL lines are usually one-shot near
 	// the end of the run anyway.
+	//
+	// Two progress sources run concurrently:
+	//   1. parseSyncProgress reads stderr line-by-line. juicefs's
+	//      non-TTY logs are sparse (≈ one summary line at the end), so
+	//      this mostly catches the final-flush counts and the
+	//      "Copying <path>" current-file markers when present.
+	//   2. pollJuicefsMetrics scrapes the juicefs Prometheus endpoint
+	//      every 2s for the live `juicefs_sync_copied` /
+	//      `..._copied_bytes` / `..._failed` counters. This is what
+	//      drives the UI's live progress bar — without it the UI shows
+	//      "0 files" for the duration of any non-trivial copy.
 	stderrTail := newRingBuffer(32 * 1024)
 	teed := io.TeeReader(stderr, stderrTail)
+
+	metricsCtx, stopMetrics := context.WithCancel(ctx)
+	metricsDone := make(chan struct{})
+	go func() {
+		defer close(metricsDone)
+		pollJuicefsMetrics(metricsCtx, juicefsMetricsAddr, progress)
+	}()
 	parseSyncProgress(teed, progress)
+	stopMetrics()
+	<-metricsDone
 
 	if err := cmd.Wait(); err != nil {
 		if ctx.Err() == context.Canceled {
@@ -170,6 +202,115 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		return fmt.Errorf("juicefs sync exited: %w — last stderr:\n%s", err, tail)
 	}
 	return nil
+}
+
+// pollJuicefsMetrics scrapes the juicefs sync Prometheus endpoint every
+// 2s and translates the relevant counters into ProgressEvents. Returns
+// when ctx is canceled — typically as soon as parseSyncProgress sees
+// the stderr EOF that signals juicefs has exited.
+//
+// We only emit when counters change so the SSE consumer doesn't get a
+// flood of identical heartbeats during long no-op stretches (e.g. a
+// 30-second stat-pass that finds nothing to copy).
+func pollJuicefsMetrics(ctx context.Context, addr string, progress chan<- ProgressEvent) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	url := "http://" + addr + "/metrics"
+
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	// First scrape after a short delay so juicefs has time to bind
+	// the metrics port (it logs "Prometheus metrics listening on ..."
+	// during startup but the listener appears within ~50ms; the 200ms
+	// initial delay is generous and keeps the first scrape from
+	// racing the bind).
+	firstScrape := time.NewTimer(200 * time.Millisecond)
+	defer firstScrape.Stop()
+
+	var last ProgressEvent
+	scrape := func() {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
+		ev := parseJuicefsMetrics(body)
+		// Only emit on change so we don't spam the SSE stream during
+		// long idle periods.
+		if ev.Files == last.Files && ev.Bytes == last.Bytes && ev.Errors == last.Errors {
+			return
+		}
+		ev.UpdatedAt = time.Now().UnixMilli()
+		select {
+		case progress <- ev:
+			last = ev
+		default:
+			// Channel full — caller is behind. Skip this update; the
+			// counters are cumulative so the next scrape will carry
+			// the latest values anyway.
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-firstScrape.C:
+			scrape()
+		case <-tick.C:
+			scrape()
+		}
+	}
+}
+
+// metricNameRegex captures any line of the form
+//   juicefs_sync_<name>{...} <number>
+// and pulls out the counter name + value. We don't strip labels — the
+// juicefs sync metrics have only {cmd="sync",pid="..."} so the simplest
+// thing is to scan for known counter names by prefix.
+var metricLineRegex = regexp.MustCompile(`^(juicefs_sync_[a-z_]+)\{[^}]*\}\s+([0-9.eE+-]+)`)
+
+// parseJuicefsMetrics extracts the counters we surface to the UI from a
+// /metrics scrape body. Unrecognized counters are ignored. Bytes are
+// rounded down (juicefs reports bytes as float64; we keep int64 for the
+// SSE wire format consistency with the regex-parser path).
+func parseJuicefsMetrics(body []byte) ProgressEvent {
+	var ev ProgressEvent
+	scanner := bufio.NewScanner(strings.NewReader(string(body)))
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "juicefs_sync_") {
+			continue
+		}
+		m := metricLineRegex.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		val, err := strconv.ParseFloat(m[2], 64)
+		if err != nil {
+			continue
+		}
+		switch m[1] {
+		case "juicefs_sync_copied":
+			ev.Files = int64(val)
+		case "juicefs_sync_copied_bytes":
+			ev.Bytes = int64(val)
+		case "juicefs_sync_failed":
+			ev.Errors = int64(val)
+		}
+	}
+	return ev
 }
 
 // ringBuffer is a tiny io.Writer that keeps only the last N bytes.
@@ -308,8 +449,15 @@ func parseSyncProgress(r io.Reader, progress chan<- ProgressEvent) {
 			}
 		}
 	}
-	// Final flush — emit whatever we have so the listener sees the
-	// last state even if the throttle window was active.
+	// Final flush — emit only if we actually parsed something. juicefs
+	// non-TTY stderr is sparse, so `current` is often all-zero here.
+	// pollJuicefsMetrics is the authoritative source for counters; if
+	// we emit a zeroed event after it stopped, last-write-wins in jobs.go
+	// would clobber the accurate metrics-derived final state and the UI
+	// would show 0 files / 0 bytes for a successful copy.
+	if current.Files == 0 && current.Bytes == 0 && current.Errors == 0 && current.Current == "" {
+		return
+	}
 	current.UpdatedAt = time.Now().UnixMilli()
 	select {
 	case progress <- current:
@@ -361,6 +509,7 @@ var junkPatterns = []string{
 	".TemporaryItems",
 	"Thumbs.db",
 	"desktop.ini",
+	".sync.ffs_db", // FreeFileSync database sidecar
 }
 
 // normalizeSourceURI converts a user-provided source string into the
