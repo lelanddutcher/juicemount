@@ -42,12 +42,17 @@ type SyncOptions struct {
 func DefaultSyncOptions() SyncOptions {
 	return SyncOptions{
 		PreserveStructure: true,
-		PreserveTimes:     true,
-		DryRun:            false,
-		SkipJunk:          true,
-		BWLimit:           0,
-		Threads:           10,
-		Verify:            false,
+		// PreserveTimes=false by default: source files often carry uids
+		// and modes that don't map cleanly to the JuiceFS volume on a
+		// Mac client (we hit mode 070 with uid 100 from the prior
+		// dataset — Mac users couldn't open the resulting files). Users
+		// who actually want fidelity can opt in via the UI toggle.
+		PreserveTimes: false,
+		DryRun:        false,
+		SkipJunk:      true,
+		BWLimit:       0,
+		Threads:       10,
+		Verify:        false,
 	}
 }
 

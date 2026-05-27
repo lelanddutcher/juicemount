@@ -67,9 +67,9 @@
             <em>OFF flattens by basename — most users want ON.</em></span>
         </label>
         <label class="opt">
-          <input type="checkbox" id="opt-preserve-times" checked>
+          <input type="checkbox" id="opt-preserve-times">
           <span><strong>Preserve file permissions</strong>
-            <em>Passes --perms to juicefs sync. Modification times are preserved by default for file→file; uid/gid don't round-trip through S3 destinations.</em></span>
+            <em>OFF by default — most users want sensible 644/755 defaults at the destination. Turn ON only if you need to faithfully replicate source uid/gid/mode (e.g. for archival or another POSIX system that maps the same uids).</em></span>
         </label>
         <label class="opt">
           <input type="checkbox" id="opt-skip-junk" checked>
