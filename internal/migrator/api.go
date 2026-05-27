@@ -1,7 +1,4 @@
-//go:build migrator_wip
-// +build migrator_wip
-
-package main
+package migrator
 
 import (
 	"embed"
@@ -21,20 +18,44 @@ var staticFS embed.FS
 // API holds the HTTP handlers and their shared state.
 type API struct {
 	jobs        *JobManager
-	sourceRoots []string // allowable host paths under /api/browse
-	destMount   string   // path of the JuiceFS mount inside this container
+	sourceRoots []string // allowable host paths under /browse
+	destMount   string   // user-facing prefix used in destination paths (e.g. /jfs)
 	adminKey    string   // empty = no auth
-	juicefsBin  string
 }
 
-// RegisterRoutes wires API handlers onto a ServeMux.
-func (a *API) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/api/sources", a.auth(a.handleSources))
-	mux.HandleFunc("/api/browse", a.auth(a.handleBrowse))
-	mux.HandleFunc("/api/migrate", a.auth(a.handleMigrate))
-	mux.HandleFunc("/api/jobs", a.auth(a.handleListJobs))
-	mux.HandleFunc("/api/jobs/", a.auth(a.handleJobOps))
-	mux.HandleFunc("/", a.handleStatic)
+// Config bundles the fields needed to construct + register the API.
+type Config struct {
+	JuiceFSBin  string   // path to juicefs binary (or "juicefs" for PATH lookup)
+	FUSEMount   string   // in-process JuiceFS FUSE mount path (e.g. /mnt/juicefs)
+	SourceRoots []string // host paths the user is allowed to browse from
+	DestMount   string   // user-facing destination prefix (e.g. /jfs)
+	AdminKey    string   // empty = no auth (LAN-only)
+}
+
+// Register wires the migrator's routes onto an existing ServeMux at
+// the given prefix (e.g. "/migrator"). Returns the JobManager so
+// callers can attach lifecycle hooks (StopAll on shutdown).
+//
+// Static UI is served from <prefix>/, JSON API from <prefix>/api/...
+func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
+	prefix = strings.TrimSuffix(prefix, "/")
+	mgr := NewJobManager(cfg.JuiceFSBin, cfg.FUSEMount)
+	a := &API{
+		jobs:        mgr,
+		sourceRoots: cfg.SourceRoots,
+		destMount:   cfg.DestMount,
+		adminKey:    cfg.AdminKey,
+	}
+	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
+	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))
+	mux.HandleFunc(prefix+"/api/migrate", a.auth(a.handleMigrate))
+	mux.HandleFunc(prefix+"/api/jobs", a.auth(a.handleListJobs))
+	mux.HandleFunc(prefix+"/api/jobs/", a.auth(a.handleJobOps))
+	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
+	// the existing handleStatic logic still works.
+	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
+	mux.Handle(prefix+"/", staticHandler)
+	return mgr
 }
 
 // auth wraps a handler with X-JuiceMount-Admin-Key check.
@@ -112,10 +133,12 @@ func (a *API) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"path": path, "entries": out})
 }
 
-// migrateRequest is the body of POST /api/migrate.
+// migrateRequest is the body of POST /api/migrate. Options is optional;
+// missing fields fall back to DefaultSyncOptions().
 type migrateRequest struct {
-	Source      string `json:"source"`
-	Destination string `json:"destination"`
+	Source      string       `json:"source"`
+	Destination string       `json:"destination"`
+	Options     *SyncOptions `json:"options,omitempty"`
 }
 
 func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
@@ -136,13 +159,17 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source outside permitted source roots", http.StatusForbidden)
 		return
 	}
-	// Destination defaults to /jfs/imported/<job-id> if it's just
-	// the JuiceFS mount root.
+	// Destination defaults to /jfs/imported/<timestamp> if user just
+	// gave the JuiceFS mount root.
 	dest := req.Destination
 	if dest == a.destMount || dest == a.destMount+"/" {
 		dest = filepath.Join(a.destMount, "imported", time.Now().UTC().Format("20060102-150405"))
 	}
-	job, err := a.jobs.Submit(req.Source, dest)
+	opts := DefaultSyncOptions()
+	if req.Options != nil {
+		opts = *req.Options
+	}
+	job, err := a.jobs.Submit(req.Source, dest, opts)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

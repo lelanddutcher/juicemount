@@ -1,7 +1,4 @@
-//go:build migrator_wip
-// +build migrator_wip
-
-package main
+package migrator
 
 import (
 	"bufio"
@@ -17,55 +14,89 @@ import (
 	"time"
 )
 
-// RunSync invokes `juicefs sync` against the given source and
-// destination. Source is any URL/path juicefs sync accepts
-// (file://, s3://, sftp://, etc.). Destination is interpreted as
-// a path inside the JuiceFS volume identified by metaURL.
-//
-// Folder-structure preservation: source is unconditionally given
-// a trailing slash so juicefs sync uses the rsync "copy contents,
-// not the directory itself" semantic. The UI's destination already
-// includes a basename; without the trailing slash we'd produce
-// `<dest>/<basename>/<basename>/...` double-nested output.
-//
-// Destination URL form: jfs://<volName>/<path-within-volume>. This
-// uses juicefs's native meta+S3 write path so the migrator container
-// does NOT need a FUSE mount of the volume — chunks are written
-// directly to MinIO with metadata going through Redis via JFS_META_URL.
-//
-// Emits ProgressEvent on the `progress` channel each time juicefs
-// writes a recognized stderr progress line. Blocks until juicefs
-// exits or ctx is canceled.
-//
-// Returns nil on clean exit (`juicefs sync` returned 0), or a
-// non-nil error describing why it failed. Cancelation via ctx
-// returns context.Canceled.
-func RunSync(ctx context.Context, juicefsBin, metaURL, volName, destMount, source, destination string, progress chan<- ProgressEvent) error {
-	src := normalizeSourceURI(source)
-	dst := normalizeDestURI(destination, destMount, volName)
+// SyncOptions controls per-job behavior. Tier-1/2/3 features in the
+// foolproofing roadmap map directly onto these fields.
+type SyncOptions struct {
+	PreserveStructure bool     // if false, copy flat (basename only) [tier-1]
+	PreserveTimes     bool     // --preserve mtime,uid,gid [tier-1]
+	DryRun            bool     // --dry [tier-1]
+	SkipJunk          bool     // auto-exclude .DS_Store, Thumbs.db, ._* [tier-1]
+	BWLimit           int      // --bwlimit MB/s (0 = unlimited) [tier-2]
+	Threads           int      // --threads N (default 10) [tier-2]
+	Excludes          []string // user-provided --exclude patterns [tier-2]
+	Includes          []string // user-provided --include patterns [tier-2]
+	Verify            bool     // --check-new (post-sync verify) [tier-3]
+}
 
+// DefaultSyncOptions returns the safe defaults applied when the user
+// hasn't customized via the UI.
+func DefaultSyncOptions() SyncOptions {
+	return SyncOptions{
+		PreserveStructure: true,
+		PreserveTimes:     true,
+		DryRun:            false,
+		SkipJunk:          true,
+		BWLimit:           0,
+		Threads:           10,
+		Verify:            false,
+	}
+}
+
+// RunSync invokes `juicefs sync` against the given source and
+// destination, with the supplied options.
+//
+// fuseMount is the in-process FUSE mount of the JuiceFS volume (e.g.
+// /mnt/juicefs). Destinations are written via file:///<fuse-mount>/<path>
+// so chunks flow through the same juicefs daemon as the NFS gateway —
+// no jfs:// env-var-named-after-volume dance, no separate Redis/S3
+// client.
+//
+// Source is always given a trailing slash when PreserveStructure is
+// true (rsync "copy contents" semantic).
+//
+// Emits ProgressEvent on `progress` each time juicefs writes a
+// recognized progress line. Blocks until juicefs exits or ctx cancels.
+func RunSync(ctx context.Context, juicefsBin, fuseMount, source, destination string, opts SyncOptions, progress chan<- ProgressEvent) error {
+	src := normalizeSourceURI(source, opts.PreserveStructure)
+	dst := normalizeDestURIEmbedded(destination, fuseMount)
+
+	threads := opts.Threads
+	if threads <= 0 {
+		threads = 10
+	}
 	args := []string{
 		"sync",
-		"--list-threads", "10", // parallel directory walk
-		"--threads", "10", // parallel file copy
-		"--update",        // only copy newer / missing — idempotent re-run
-		"--check-change",  // verify size/mtime to skip already-synced files
-		// Note (2026-05-27): --no-https and --manager-addr removed.
-		// --no-https isn't a real juicefs flag (was rclone confusion).
-		// --manager-addr binds 6710 for distributed-sync coordination;
-		// for single-node migration it can fail and is unnecessary.
-		src,
-		dst,
+		"--list-threads", strconv.Itoa(threads),
+		"--threads", strconv.Itoa(threads),
+		"--update",
+		"--check-change",
 	}
+	if opts.PreserveTimes {
+		args = append(args, "--preserve", "mtime,uid,gid")
+	}
+	if opts.DryRun {
+		args = append(args, "--dry")
+	}
+	if opts.BWLimit > 0 {
+		args = append(args, "--bwlimit", strconv.Itoa(opts.BWLimit))
+	}
+	if opts.SkipJunk {
+		for _, p := range junkPatterns {
+			args = append(args, "--exclude", p)
+		}
+	}
+	for _, p := range opts.Excludes {
+		args = append(args, "--exclude", p)
+	}
+	for _, p := range opts.Includes {
+		args = append(args, "--include", p)
+	}
+	if opts.Verify {
+		args = append(args, "--check-new")
+	}
+	args = append(args, src, dst)
+
 	cmd := exec.CommandContext(ctx, juicefsBin, args...)
-	// juicefs sync uses a quirky env var convention: the env var name
-	// must MATCH the URL alias. For `jfs://zpool/...` the env var has
-	// to be literally named `zpool` with the meta URL as value. The
-	// usual JuiceFS-wide `JFS_META_URL` env var is IGNORED by sync.
-	// Source: juicefs sync --help shows
-	//   $ myfs=redis://localhost juicefs sync src jfs://myfs/
-	// — the env var name IS the URL alias.
-	cmd.Env = append(cmd.Env, volName+"="+metaURL)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -277,71 +308,70 @@ func applyUnit(v float64, unit string) float64 {
 	return v
 }
 
+// junkPatterns are the common OS-metadata files we auto-exclude when
+// SyncOptions.SkipJunk is true. Saves users from polluting the
+// destination with .DS_Store / Thumbs.db / AppleDouble sidecar litter.
+var junkPatterns = []string{
+	".DS_Store",
+	"._*",
+	".Spotlight-V100",
+	".Trashes",
+	".fseventsd",
+	".TemporaryItems",
+	"Thumbs.db",
+	"desktop.ini",
+}
+
 // normalizeSourceURI converts a user-provided source string into the
-// form juicefs sync expects.
-//
-//   - bare absolute path (starts with /): becomes file://<abspath>/
-//   - already-scheme'd URL (scheme://...): trailing slash appended if absent
-//
-// Trailing slash is ALWAYS appended (idempotent if already present)
-// so juicefs sync uses rsync "copy contents" semantics instead of
-// "copy this directory itself". See the RunSync doc comment for why.
-func normalizeSourceURI(s string) string {
+// form juicefs sync expects. Trailing slash → "copy contents" rsync
+// semantic. Caller controls whether we apply that semantic (via
+// preserveStructure=true).
+func normalizeSourceURI(s string, preserveStructure bool) string {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "/") {
 		s = "file://" + s
 	}
-	if !strings.HasSuffix(s, "/") {
+	if preserveStructure && !strings.HasSuffix(s, "/") {
 		s = s + "/"
 	}
 	return s
 }
 
-// normalizeDestURI translates a UI-supplied destination path into a
-// juicefs-sync-compatible URL.
+// normalizeDestURIEmbedded translates a UI-supplied destination into
+// a juicefs-sync-compatible URL using the in-process FUSE mount.
 //
-// The UI shows the destination to users as a filesystem path like
-// `/jfs/imported/2026-05-27-foo` because that maps to their mental
-// model of "a place inside the JuiceFS volume." Internally we
-// translate that to `jfs://<volName>/imported/2026-05-27-foo` so
-// juicefs sync writes directly through JFS_META_URL — no FUSE mount
-// required in the migrator container.
+// In-process means the JuiceFS volume is already mounted in the same
+// container at fuseMount (e.g. /mnt/juicefs). We just rewrite the
+// user-visible path (e.g. /jfs/imported/foo) to a file:// URL under
+// the actual mount point.
 //
-// Path-resolution rules:
-//   - If dest already has a scheme: kept as-is + trailing slash
-//   - If dest starts with destMount (e.g. "/jfs/foo"): strip the
-//     destMount prefix and emit "jfs://<volName>/foo/"
-//   - Otherwise (bare absolute path not under destMount): assume the
-//     user means a path within the volume rooted at the path itself.
-//     Emit "jfs://<volName>/<the-whole-path>/"
-//
-// The trailing slash is always appended for consistency, though
-// destinations are less sensitive to it than sources.
-func normalizeDestURI(dest, destMount, volName string) string {
+// Rules:
+//   - Already-scheme'd URL: pass through (+ trailing slash)
+//   - "/jfs/PATH" (the UI's destMount convention) → file:///<fuseMount>/PATH/
+//   - bare /PATH → file:///<fuseMount>/PATH/
+func normalizeDestURIEmbedded(dest, fuseMount string) string {
 	dest = strings.TrimSpace(dest)
-	// Already-scheme'd → pass through unchanged (+ trailing slash).
 	if i := strings.Index(dest, "://"); i > 0 && i < 10 {
 		if !strings.HasSuffix(dest, "/") {
 			dest = dest + "/"
 		}
 		return dest
 	}
-	// Strip optional destMount prefix to get the path inside the volume.
+	fuse := strings.TrimSuffix(fuseMount, "/")
+	// Strip /jfs prefix if the UI sent that.
 	rel := dest
-	mp := strings.TrimSuffix(destMount, "/")
-	if mp != "" && strings.HasPrefix(rel, mp+"/") {
-		rel = rel[len(mp):] // keep leading slash for the path
-	} else if rel == mp {
+	if strings.HasPrefix(rel, "/jfs/") {
+		rel = rel[len("/jfs"):]
+	} else if rel == "/jfs" {
 		rel = "/"
 	}
-	// Ensure rel starts with /.
 	if !strings.HasPrefix(rel, "/") {
 		rel = "/" + rel
 	}
 	if !strings.HasSuffix(rel, "/") {
 		rel = rel + "/"
 	}
-	return "jfs://" + volName + rel
+	return "file://" + fuse + rel
 }
 
 // randHex returns n random bytes as a hex string. Used for job IDs.

@@ -32,15 +32,12 @@ jobs:
       contents: read
       packages: write
     strategy:
-      fail-fast: false  # one image's failure shouldn't cancel the other
+      fail-fast: false
       matrix:
         include:
           - name: juicemount-server
             dockerfile: server/juicemount-server/Dockerfile
-            description: NFSv3 gateway for JuiceFS — self-hosted media editing
-          - name: juicemount-migrator
-            dockerfile: server/juicemount-migrator/Dockerfile
-            description: Data-migration sidecar — wraps juicefs sync with a web UI
+            description: NFSv3 gateway for JuiceFS — self-hosted media editing (includes embedded migrator UI)
     steps:
       - name: Checkout
         uses: actions/checkout@v4

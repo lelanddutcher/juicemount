@@ -1,7 +1,4 @@
-//go:build migrator_wip
-// +build migrator_wip
-
-package main
+package migrator
 
 import (
 	"strings"
@@ -134,52 +131,54 @@ func TestApplyUnit(t *testing.T) {
 
 func TestNormalizeSourceURI(t *testing.T) {
 	cases := []struct {
-		in   string
-		want string
+		in        string
+		preserve  bool
+		want      string
 	}{
-		{"/mnt/source", "file:///mnt/source/"},
-		{"/mnt/source/", "file:///mnt/source/"},
-		{"file:///mnt/source", "file:///mnt/source/"},
-		{"file:///mnt/source/", "file:///mnt/source/"},
-		{"s3://bucket/path", "s3://bucket/path/"},
-		{"s3://bucket/path/", "s3://bucket/path/"},
-		{"jfs://zpool/imported", "jfs://zpool/imported/"},
-		{"  /with-whitespace  ", "file:///with-whitespace/"},
+		// preserve=true → trailing slash always appended (rsync "copy contents")
+		{"/mnt/source", true, "file:///mnt/source/"},
+		{"/mnt/source/", true, "file:///mnt/source/"},
+		{"file:///mnt/source", true, "file:///mnt/source/"},
+		{"s3://bucket/path", true, "s3://bucket/path/"},
+		{"  /with-whitespace  ", true, "file:///with-whitespace/"},
+		// preserve=false → no auto trailing slash; juicefs sync will create
+		// <dst>/<basename>/... (flatten-by-basename semantics)
+		{"/mnt/source", false, "file:///mnt/source"},
+		{"file:///mnt/source/", false, "file:///mnt/source/"}, // existing slash preserved
 	}
 	for _, tc := range cases {
-		got := normalizeSourceURI(tc.in)
+		got := normalizeSourceURI(tc.in, tc.preserve)
 		if got != tc.want {
-			t.Errorf("normalizeSourceURI(%q) = %q, want %q", tc.in, got, tc.want)
+			t.Errorf("normalizeSourceURI(%q, %v) = %q, want %q",
+				tc.in, tc.preserve, got, tc.want)
 		}
 	}
 }
 
-func TestNormalizeDestURI(t *testing.T) {
+func TestNormalizeDestURIEmbedded(t *testing.T) {
 	cases := []struct {
-		dest, destMount, volName string
-		want                     string
+		dest, fuseMount string
+		want            string
 	}{
-		// Path-style dest under destMount → translated to jfs://volname/...
-		{"/jfs/imported/2026-05-27", "/jfs", "zpool", "jfs://zpool/imported/2026-05-27/"},
-		{"/jfs/imported/2026-05-27/", "/jfs", "zpool", "jfs://zpool/imported/2026-05-27/"},
-		{"/jfs", "/jfs", "zpool", "jfs://zpool/"},
-		{"/jfs/", "/jfs", "zpool", "jfs://zpool/"},
-		// Path NOT under destMount → still relative to volume root.
-		{"/foo/bar", "/jfs", "zpool", "jfs://zpool/foo/bar/"},
-		// Already-scheme'd → pass through (+ trailing slash).
-		{"jfs://other-vol/path", "/jfs", "zpool", "jfs://other-vol/path/"},
-		{"s3://my-bucket/key", "/jfs", "zpool", "s3://my-bucket/key/"},
-		{"s3://my-bucket/key/", "/jfs", "zpool", "s3://my-bucket/key/"},
-		// Different volume name.
-		{"/data/migrate", "/data", "myvol", "jfs://myvol/migrate/"},
-		// Whitespace trimmed.
-		{"  /jfs/foo  ", "/jfs", "zpool", "jfs://zpool/foo/"},
+		// /jfs prefix stripped → file:///<fuseMount>/<rest>
+		{"/jfs/imported/2026-05-27", "/mnt/juicefs", "file:///mnt/juicefs/imported/2026-05-27/"},
+		{"/jfs", "/mnt/juicefs", "file:///mnt/juicefs/"},
+		{"/jfs/", "/mnt/juicefs", "file:///mnt/juicefs/"},
+		// bare path without /jfs prefix → still rooted at fuseMount
+		{"/foo/bar", "/mnt/juicefs", "file:///mnt/juicefs/foo/bar/"},
+		// already-scheme'd → pass through
+		{"s3://my-bucket/key", "/mnt/juicefs", "s3://my-bucket/key/"},
+		{"file:///raw/path/", "/mnt/juicefs", "file:///raw/path/"},
+		// fuseMount with trailing slash → idempotent
+		{"/jfs/foo", "/mnt/juicefs/", "file:///mnt/juicefs/foo/"},
+		// whitespace trim
+		{"  /jfs/foo  ", "/mnt/juicefs", "file:///mnt/juicefs/foo/"},
 	}
 	for _, tc := range cases {
-		got := normalizeDestURI(tc.dest, tc.destMount, tc.volName)
+		got := normalizeDestURIEmbedded(tc.dest, tc.fuseMount)
 		if got != tc.want {
-			t.Errorf("normalizeDestURI(%q, %q, %q) = %q, want %q",
-				tc.dest, tc.destMount, tc.volName, got, tc.want)
+			t.Errorf("normalizeDestURIEmbedded(%q, %q) = %q, want %q",
+				tc.dest, tc.fuseMount, got, tc.want)
 		}
 	}
 }

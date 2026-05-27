@@ -1,7 +1,9 @@
-//go:build migrator_wip
-// +build migrator_wip
-
-package main
+// Package migrator implements one-click data migration into a JuiceFS
+// volume. Wraps `juicefs sync` with an HTTP API and SSE progress.
+//
+// Consumed by juicemount-server which registers the routes on its
+// existing metrics listener — single process, no cross-network plumbing.
+package migrator
 
 import (
 	"context"
@@ -38,6 +40,7 @@ type Job struct {
 	ID          string        `json:"id"`
 	Source      string        `json:"source"`
 	Destination string        `json:"destination"`
+	Options     SyncOptions   `json:"options"`
 	State       JobState      `json:"state"`
 	CreatedAt   int64         `json:"created_at"` // unix-ms
 	StartedAt   int64         `json:"started_at"`
@@ -54,20 +57,17 @@ type Job struct {
 // SyncFunc is the signature of a "run one sync" implementation. The
 // default is RunSync (which invokes `juicefs sync` via exec). Tests
 // override this to mock the subprocess.
-type SyncFunc func(ctx context.Context, juicefsBin, metaURL, volName, destMount, source, destination string, progress chan<- ProgressEvent) error
+type SyncFunc func(ctx context.Context, juicefsBin, fuseMount, source, destination string, opts SyncOptions, progress chan<- ProgressEvent) error
 
 // JobManager owns all jobs in this process. Single-worker for v1
-// (sync runs one at a time); a tiny queue could be added later if
-// concurrent migrations turn out to be valuable.
+// (sync runs one at a time); MaxConcurrent can later let multiple
+// migrations run in parallel for users with capable hardware.
 type JobManager struct {
 	juicefsBin string
-	metaURL    string
-	volName    string // JuiceFS volume name, used in jfs:// destination URIs
-	destMount  string // Path prefix that maps to the JuiceFS volume root in the UI
+	fuseMount  string // in-process JuiceFS FUSE mount; destinations write here
 
 	// runner is the underlying sync implementation. Defaults to
-	// RunSync; set via SetRunner() for tests that need deterministic
-	// long-running / canceled / errored behavior.
+	// RunSync; set via SetRunner() for tests.
 	runner SyncFunc
 
 	mu     sync.RWMutex
@@ -76,12 +76,14 @@ type JobManager struct {
 	active *Job
 }
 
-func NewJobManager(juicefsBin, metaURL, volName, destMount string) *JobManager {
+// NewJobManager constructs a JobManager. juicefsBin is the path to
+// the juicefs CLI (or just "juicefs" for PATH lookup). fuseMount is
+// the path where the JuiceFS volume is FUSE-mounted in the SAME
+// process (e.g. /mnt/juicefs inside the juicemount-server container).
+func NewJobManager(juicefsBin, fuseMount string) *JobManager {
 	return &JobManager{
 		juicefsBin: juicefsBin,
-		metaURL:    metaURL,
-		volName:    volName,
-		destMount:  destMount,
+		fuseMount:  fuseMount,
 		runner:     RunSync,
 		jobs:       make(map[string]*Job),
 	}
@@ -96,12 +98,13 @@ func (m *JobManager) SetRunner(fn SyncFunc) {
 
 // Submit queues a job. Returns the assigned ID. If the manager has
 // no active job, kicks it off immediately on a background goroutine.
-func (m *JobManager) Submit(source, destination string) (*Job, error) {
+func (m *JobManager) Submit(source, destination string, opts SyncOptions) (*Job, error) {
 	id := newJobID()
 	j := &Job{
 		ID:          id,
 		Source:      source,
 		Destination: destination,
+		Options:     opts,
 		State:       JobPending,
 		CreatedAt:   time.Now().UnixMilli(),
 	}
@@ -147,6 +150,7 @@ func (j *Job) GetSnapshot() Job {
 		ID:          j.ID,
 		Source:      j.Source,
 		Destination: j.Destination,
+		Options:     j.Options,
 		State:       j.State,
 		CreatedAt:   j.CreatedAt,
 		StartedAt:   j.StartedAt,
@@ -271,7 +275,7 @@ func (m *JobManager) run(j *Job) {
 	runner := m.runner
 	m.mu.RUnlock()
 	go func() {
-		done <- runner(ctx, m.juicefsBin, m.metaURL, m.volName, m.destMount, j.Source, j.Destination, progress)
+		done <- runner(ctx, m.juicefsBin, m.fuseMount, j.Source, j.Destination, j.Options, progress)
 		close(progress)
 	}()
 

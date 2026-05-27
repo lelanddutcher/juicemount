@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -16,12 +17,26 @@ import (
 
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/health"
-	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"github.com/lelanddutcher/juicemount/internal/migrator"
+	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
+
+// splitNonEmpty is a small helper for parsing comma-separated CLI args.
+func splitNonEmpty(s, sep string) []string {
+	parts := strings.Split(s, sep)
+	out := parts[:0]
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 func main() {
 	redisURL := flag.String("redis", "redis://127.0.0.1:6379/1", "Redis URL")
@@ -36,6 +51,8 @@ func main() {
 	logFile := flag.String("log-file", "", "Optional path to additionally write JSON log records")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	metricsAddr := flag.String("metrics-addr", "127.0.0.1:11050", "HTTP listen address for /metrics and /health")
+	migratorSourceRoots := flag.String("migrator-source-roots", "", "Comma-separated host paths the migrator's web UI may browse from. Empty = migrator disabled.")
+	migratorAdminKey := flag.String("migrator-admin-key", os.Getenv("JM_ADMIN_KEY"), "Admin key for the migrator's X-JuiceMount-Admin-Key header. Empty disables auth.")
 	flag.Parse()
 
 	// Initialize structured logging before anything else logs.
@@ -151,8 +168,45 @@ func main() {
 	// Wire per-RPC observation into the metrics package.
 	jmlibnfs.SetObserver(metrics.ObserveRPC)
 
-	// Start metrics HTTP server (exposes /metrics and /health).
+	// Start metrics HTTP server (exposes /metrics and /health, plus
+	// the embedded migrator UI at /migrator/ when source roots are set).
 	metricsSrv := metrics.NewServer(*metricsAddr, metrics.Default())
+
+	// Wire the migrator's routes onto the metrics listener — single
+	// process, no separate container. Migrator writes through the
+	// in-process FUSE mount so chunks flow via the same juicefs
+	// daemon as the NFS gateway.
+	var migJobMgr *migrator.JobManager
+	if *migratorSourceRoots != "" {
+		roots := splitNonEmpty(*migratorSourceRoots, ",")
+		if metricsSrv.ExtraRoutes == nil {
+			metricsSrv.ExtraRoutes = make(map[string]http.HandlerFunc)
+		}
+		// metrics.Server.ExtraRoutes maps a path → handler. The
+		// migrator's Register attaches its routes to a ServeMux,
+		// not directly to ExtraRoutes — so we build a sub-mux and
+		// register one catch-all that forwards everything under
+		// /migrator/ to it.
+		migMux := http.NewServeMux()
+		migJobMgr = migrator.Register(migMux, "/migrator", migrator.Config{
+			JuiceFSBin:  "juicefs", // PATH lookup; works regardless of base image path
+			FUSEMount:   *fusePath,
+			SourceRoots: roots,
+			DestMount:   "/jfs", // UI convention; rewritten to file://<fusePath> in the runner
+			AdminKey:    *migratorAdminKey,
+		})
+		metricsSrv.ExtraRoutes["/migrator/"] = migMux.ServeHTTP
+		// Also handle the bare /migrator (no trailing slash) so a
+		// browser hitting that URL gets redirected to the UI.
+		metricsSrv.ExtraRoutes["/migrator"] = func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/migrator/", http.StatusFound)
+		}
+		jmlog.Info("migrator enabled",
+			"prefix", "/migrator",
+			"source_roots", roots,
+			"auth_enabled", *migratorAdminKey != "")
+	}
+
 	if err := metricsSrv.Start(); err != nil {
 		jmlog.Warn("metrics server failed to start", "error", err, "addr", *metricsAddr)
 	} else {
@@ -243,6 +297,12 @@ func main() {
 	srv.Stop()
 	srv.Handler().StopHandler()
 
+	if migJobMgr != nil {
+		// Cancel in-flight migrations before tearing down the FUSE mount;
+		// otherwise juicefs sync writes against a path that's
+		// disappearing under it.
+		migJobMgr.StopAll()
+	}
 	if metricsSrv != nil {
 		metricsSrv.Stop()
 	}
