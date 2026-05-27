@@ -1,7 +1,4 @@
-//go:build migrator_wip
-// +build migrator_wip
-
-package main
+package migrator
 
 import (
 	"context"
@@ -10,24 +7,17 @@ import (
 	"time"
 )
 
-// runnerForeverUntilCanceled is a SyncFunc that blocks until ctx is
-// canceled, then returns context.Canceled. Used in tests where we
-// need a job that's deterministically "running" until we explicitly
-// Cancel it.
-func runnerForeverUntilCanceled(ctx context.Context, _, _, _, _, _, _ string, _ chan<- ProgressEvent) error {
+// Mock SyncFuncs for deterministic test paths.
+func runnerForeverUntilCanceled(ctx context.Context, _, _, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
 	<-ctx.Done()
 	return context.Canceled
 }
 
-// runnerErrorImmediately is a SyncFunc that returns an error right
-// away, simulating a sync that fails its initial setup.
-func runnerErrorImmediately(_ context.Context, _, _, _, _, _, _ string, _ chan<- ProgressEvent) error {
+func runnerErrorImmediately(_ context.Context, _, _, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
 	return errors.New("simulated sync failure")
 }
 
-// runnerSucceedImmediately is a SyncFunc that returns nil right
-// away, simulating a fast successful sync (e.g. empty source dir).
-func runnerSucceedImmediately(_ context.Context, _, _, _, _, _, _ string, _ chan<- ProgressEvent) error {
+func runnerSucceedImmediately(_ context.Context, _, _, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
 	return nil
 }
 
@@ -47,12 +37,12 @@ func TestJobIDFormat(t *testing.T) {
 }
 
 func TestJobManagerSubmitListGet(t *testing.T) {
-	m := NewJobManager("/dev/null", "redis://localhost:6379/1", "zpool", "/jfs")
+	m := NewJobManager("/dev/null", "/mnt/juicefs")
 	m.SetRunner(runnerForeverUntilCanceled)
 	defer m.StopAll()
 
 	// Submit one job — should kick off immediately (active==nil).
-	j1, err := m.Submit("/tmp/src1", "/jfs/dst1")
+	j1, err := m.Submit("/tmp/src1", "/jfs/dst1", DefaultSyncOptions())
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
@@ -70,7 +60,7 @@ func TestJobManagerSubmitListGet(t *testing.T) {
 	}
 
 	// Submit a second job — should queue (active is the first).
-	j2, _ := m.Submit("/tmp/src2", "/jfs/dst2")
+	j2, _ := m.Submit("/tmp/src2", "/jfs/dst2", DefaultSyncOptions())
 	if j2.ID == j1.ID {
 		t.Errorf("two jobs got same ID")
 	}
@@ -87,10 +77,10 @@ func TestJobManagerSubmitListGet(t *testing.T) {
 }
 
 func TestJobManagerCancel(t *testing.T) {
-	m := NewJobManager("/dev/null", "redis://localhost:6379/1", "zpool", "/jfs")
+	m := NewJobManager("/dev/null", "/mnt/juicefs")
 	m.SetRunner(runnerForeverUntilCanceled)
 
-	j, _ := m.Submit("/tmp/x", "/jfs/y")
+	j, _ := m.Submit("/tmp/x", "/jfs/y", DefaultSyncOptions())
 	// Wait for the job to actually transition to Running.
 	deadline := time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
@@ -120,10 +110,10 @@ func TestJobManagerCancel(t *testing.T) {
 }
 
 func TestJobManagerErrorPropagates(t *testing.T) {
-	m := NewJobManager("/dev/null", "redis://localhost:6379/1", "zpool", "/jfs")
+	m := NewJobManager("/dev/null", "/mnt/juicefs")
 	m.SetRunner(runnerErrorImmediately)
 
-	j, _ := m.Submit("/tmp/src", "/jfs/dst")
+	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if m.Get(j.ID).GetState() == JobError {
@@ -139,10 +129,10 @@ func TestJobManagerErrorPropagates(t *testing.T) {
 }
 
 func TestJobManagerSuccessReachesDone(t *testing.T) {
-	m := NewJobManager("/dev/null", "redis://localhost:6379/1", "zpool", "/jfs")
+	m := NewJobManager("/dev/null", "/mnt/juicefs")
 	m.SetRunner(runnerSucceedImmediately)
 
-	j, _ := m.Submit("/tmp/src", "/jfs/dst")
+	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if m.Get(j.ID).GetState() == JobDone {
@@ -154,10 +144,10 @@ func TestJobManagerSuccessReachesDone(t *testing.T) {
 }
 
 func TestJobManagerSubscribe(t *testing.T) {
-	m := NewJobManager("/dev/null", "redis://localhost:6379/1", "zpool", "/jfs")
+	m := NewJobManager("/dev/null", "/mnt/juicefs")
 	m.SetRunner(runnerSucceedImmediately)
 
-	j, _ := m.Submit("/tmp/src", "/jfs/dst")
+	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions())
 	ch, cleanup, ok := m.Subscribe(j.ID)
 	if !ok {
 		t.Fatalf("Subscribe returned ok=false")
@@ -185,11 +175,11 @@ func TestJobManagerSubscribe(t *testing.T) {
 }
 
 func TestJobManagerStopAll(t *testing.T) {
-	m := NewJobManager("/dev/null", "redis://localhost:6379/1", "zpool", "/jfs")
+	m := NewJobManager("/dev/null", "/mnt/juicefs")
 	m.SetRunner(runnerForeverUntilCanceled)
 
-	_, _ = m.Submit("/tmp/a", "/jfs/a")
-	_, _ = m.Submit("/tmp/b", "/jfs/b")
+	_, _ = m.Submit("/tmp/a", "/jfs/a", DefaultSyncOptions())
+	_, _ = m.Submit("/tmp/b", "/jfs/b", DefaultSyncOptions())
 	time.Sleep(100 * time.Millisecond)
 
 	m.StopAll()
@@ -217,7 +207,7 @@ func TestJobManagerStopAll(t *testing.T) {
 }
 
 func TestJobManagerGetMissing(t *testing.T) {
-	m := NewJobManager("/dev/null", "redis://localhost:6379/1", "zpool", "/jfs")
+	m := NewJobManager("/dev/null", "/mnt/juicefs")
 	if got := m.Get("nope"); got != nil {
 		t.Errorf("Get for missing ID should return nil, got %v", got)
 	}
