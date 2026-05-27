@@ -1,76 +1,77 @@
 # JuiceMount server-side stack
 
 `docker compose up` boots a working JuiceMount backend on any host
-with Docker installed: Ubuntu, Synology DSM 7+ via Container Manager,
-TrueNAS SCALE Apps, any laptop with Docker Desktop. From `git clone`
-to a mountable backend in under 10 minutes.
+with Docker installed: TrueNAS Scale Apps, Synology DSM 7+ via
+Container Manager, Ubuntu, any laptop with Docker Desktop.
 
-This directory implements tier 3 of the JuiceMount roadmap. See
-`docs/ROADMAP/tier-3-server-packaging.md` for the full spec.
+## Production install (TrueNAS Scale)
 
-## What's in this iteration (tier-3 iter 3)
+The proven path is **TrueNAS Apps → Discover → ⋮ menu → Install via
+YAML**, pasting the production-hardened compose. Full step-by-step
+in [INSTALL-TrueNAS.md](INSTALL-TrueNAS.md).
 
-The full headless stack with TLS termination and admin-key auth.
-After this iteration, JuiceMount serves an NFS export from a Linux
-container, and admin endpoints are behind https.
+The stack:
 
-| Service             | What it does                                | Port  |
-|---------------------|---------------------------------------------|-------|
-| `minio`             | S3-compatible object store                  | 9000  |
-| `redis`             | JuiceFS metadata authority                  | 6379  |
-| `juicefs-init`      | One-shot — formats the JuiceFS volume       | —     |
-| `juicemount-server` | NFS export + admin API                      | 2049, 11050 |
-| `caddy`             | TLS termination + admin-key auth gate       | 443, 80 |
+| Service               | What it does                                  | Port  |
+|-----------------------|-----------------------------------------------|-------|
+| `redis`               | JuiceFS metadata authority (AOF persistence)  | 30179 |
+| `minio`               | S3-compatible object store for JuiceFS chunks | 30151 (S3), 30152 (console) |
+| `juicefs-init`        | One-shot pre-flight + first-time volume format | —    |
+| `juicefs`             | Live FUSE mount + WebDAV (browse / smoke test) | 30180 |
+| `juicemount-migrator` | Copy-into-JuiceFS web UI                       | 30190 |
 
-MinIO web console at `https://<host>/` (proxied by Caddy; log in
-with `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` from your `.env`).
+The Mac JuiceMount.app drives this stack via:
+- Redis URL: `redis://<host>:30179/1`
+- S3 Endpoint Override: `http://<host>:30151/zpool`
 
-**Mount the volume from any NFS client:**
+(The MinIO + Redis credentials don't need to live on the Mac side —
+they're embedded in the JuiceFS volume's format header. The override
+fields are documented in the app's Preferences → Connection pane.)
 
-```sh
-# macOS
-sudo mkdir -p /Volumes/zpool
-sudo mount -t nfs -o vers=3,soft,timeo=300,resvport <host>:/ /Volumes/zpool
+## Plain Docker host (Ubuntu / Synology / laptop)
 
-# Linux
-sudo mkdir -p /mnt/zpool
-sudo mount -t nfs -o vers=3,soft,timeo=300 <host>:/ /mnt/zpool
-```
-
-The JuiceMount.app on macOS can also drive this container as its
-backend by pointing its profile at `<host>:11050` for admin and using
-the same `<host>:2049` for the NFS path (in the Custom mount path
-preference).
-
-**Not yet in this iteration** (tier-3 iter 3+):
-
-- Caddy reverse-proxy with TLS + admin-key auth (iter 3)
-- `juicemount doctor` healthcheck command (iter 4)
-- Backup job (`mc mirror` to remote bucket) (iter 5)
-- Admin UI behind the Caddy layer (iter 6)
-
-## Quick start
+Same compose file works. Edit the bind-mount paths at the top of
+`docker-compose.yml` (the defaults are TrueNAS-flavored `/mnt/zSSD/...`)
+to wherever you want the data to live, then:
 
 ```sh
 cd server
-cp .env.example .env
-$EDITOR .env                          # set MINIO_ROOT_PASSWORD (required)
 docker compose up -d
-docker compose ps                     # minio + redis should be healthy
-docker compose logs juicefs-init      # confirms first-time format
+docker compose ps          # all services healthy
+docker compose logs juicefs-init   # confirms first-time format
 ```
 
-Point JuiceMount.app at:
-- Redis URL: `redis://<host>:6379/1`
-- Bucket URL: `http://<host>:9000/zpool`
-- Access key: value of `MINIO_ROOT_USER` (default `juicemount`)
-- Secret key: value of `MINIO_ROOT_PASSWORD`
+## Migrating existing data
+
+The included `juicemount-migrator` service exposes a web UI at port
+30190 that copies data from any bind-mounted source directory into
+the JuiceFS volume.
+
+1. Bind-mount each existing dataset read-only at `/sources/<name>`
+   in the `juicemount-migrator` service.
+2. Open `http://<host>:30190/` in a browser.
+3. Browse the source root, pick a folder, hit Start.
+
+Features:
+
+- **Live progress bar** with real percentage (driven by juicefs's
+  Prometheus metrics, scraped every 2s).
+- **Smart default destination** that strips the source-root bind-mount
+  name so `/jfs/oldzpool/...` doesn't clutter the structure.
+- **Destination preview** showing the resolved URLs + 3 example file
+  destinations before you commit.
+- **Junk-filter** for `.DS_Store`, `._*`, `Thumbs.db`, `.sync.ffs_db`,
+  Spotlight/Trash metadata.
+- **Permissions OFF by default** — destination files land with sensible
+  modes the Mac user can open. Tick the option only if you need
+  archival fidelity (matters for POSIX-to-POSIX with uid-preserving
+  intent).
+- Jobs queue and run sequentially.
 
 ## Persistence & upgrade
 
-Data lives in the host paths you set via `MINIO_DATA_DIR` and
-`REDIS_DATA_DIR` (defaults to `./data/{minio,redis}` next to the
-compose file). To upgrade:
+Data lives in the host paths you set in the `volumes:` lines. To
+upgrade:
 
 ```sh
 cd server
@@ -81,80 +82,42 @@ docker compose up -d      # restart with no data loss
 
 The bind-mount strategy means container churn never touches your data.
 
+## Reset (DESTROYS DATA)
+
+```sh
+docker compose down
+sudo rm -rf /mnt/.../juicemount/{redis,bucket,cache}/*
+docker compose up -d
+```
+
+Take a backup first.
+
+## Security notes
+
+- **Redis port (30179) is exposed on the LAN.** Anyone who can reach
+  the host on that port can read/write the entire JuiceFS metadata —
+  equivalent to total volume loss. Confine via host firewall (TrueNAS
+  Networks → firewall rules) if untrusted clients are on the same LAN.
+- **MinIO console (30152) is HTTP-only.** Don't expose to public IPs.
+- **`MINIO_ROOT_PASSWORD` is the master key.** Generate via
+  `openssl rand -base64 24`. Anyone with this password can read every
+  byte in the volume.
+- **Migrator admin key (`JM_ADMIN_KEY`)** gates write access to the
+  migrator's HTTP API. Empty = LAN-only / no auth (fine for a home
+  TrueNAS). Generate via `openssl rand -hex 32` for anything internet-
+  reachable.
+
 ## Troubleshooting
 
 | Symptom                               | Likely cause / fix |
 |---------------------------------------|--------------------|
-| `juicefs-init` exited non-zero        | Check `.env` — MINIO_ROOT_PASSWORD probably empty |
-| Redis container unhealthy             | Port 6379 already in use; set REDIS_PORT in `.env` |
-| MinIO web console unreachable         | Port 9001 collides; set MINIO_CONSOLE_PORT |
-| Can't connect from JuiceMount.app     | Firewall blocking 6379/9000; or wrong host in app preferences |
+| `juicefs-init` exited 2               | MinIO unreachable from inside the container network |
+| `juicefs-init` exited 4               | MinIO credentials empty, whitespace, or placeholder |
+| `juicefs-init` exited 5               | `JM_BUCKET_URL` missing `http://` |
+| `juicefs-init` exited 6               | `juicefs format` errored — read the log for the JuiceFS-side reason |
+| Migrator copy reports "0 files / 0 B" | Stale image — pull `ghcr.io/lelanddutcher/juicemount-migrator:production-hardening` and redeploy |
+| Mac can't open copied files           | Source had restrictive perms; either un-tick Preserve permissions before migrating, or `chmod -R u+rwX,g+rwX,o+rX` on the destination |
 
 Use `docker compose logs <service>` for the full output of any
-container's startup.
-
-## Resetting the stack (DESTROYS DATA)
-
-If you need to start fresh — wipes the MinIO bucket and the JuiceFS
-metadata:
-
-```sh
-docker compose down
-rm -rf data/   # or whatever you set MINIO_DATA_DIR / REDIS_DATA_DIR to
-docker compose up -d
-```
-
-This is destructive. Take a backup first if there's anything you want
-to keep — there's no in-place migration story between formats.
-
-## What this stack does NOT include yet
-
-- `juicemount doctor` healthcheck CLI (iter 4)
-- Scheduled backups (`mc mirror` to remote bucket, iter 5)
-- Admin UI (iter 6)
-- Notarized / signed container images (iter 7)
-
-## TLS + admin-key auth (iter 3)
-
-Caddy fronts MinIO console + the JuiceMount admin API behind a
-single TLS port. Generate an admin key and add to `.env`:
-
-```sh
-echo "ADMIN_KEY=$(openssl rand -hex 32)" >> .env
-```
-
-After `docker compose up -d`:
-
-- `https://<host>/` → MinIO web console (self-signed cert by default;
-  set `JM_HOSTNAME` to a real DNS name and swap `tls internal` →
-  `tls your@email` in the Caddyfile to enable Let's Encrypt).
-- `https://<host>/api/*` → JuiceMount admin endpoints, but requires:
-  ```
-  X-JuiceMount-Admin-Key: <your ADMIN_KEY>
-  ```
-  Example:
-  ```sh
-  curl -sk -H "X-JuiceMount-Admin-Key: $(grep ADMIN_KEY .env | cut -d= -f2)" \
-       https://localhost/api/health
-  ```
-
-NFS (2049) is exposed directly, not through Caddy. NFS is a stateful
-TCP protocol and HTTP-layer routing doesn't help. On-LAN deployments
-should put NFS behind a host firewall; over-internet exposure would
-need stunnel or wireguard wrapping (future iteration).
-
-## Security notes for production deployments
-
-- **Redis port (6379) is exposed.** Set `REDIS_PORT=127.0.0.1:6379`
-  in `.env` if only the local host needs metadata access. Without
-  TLS+auth, anyone who can reach the port can read/write/delete
-  the entire JuiceFS metadata store — equivalent to total volume
-  loss even if the MinIO data survives. iter 3 will put Redis
-  behind Caddy with admin-key auth.
-- **MinIO console (9001) is HTTP-only.** Don't expose to public
-  IPs without first putting it behind Caddy+TLS (iter 3).
-- **`MINIO_ROOT_PASSWORD` is the master key.** Anyone with this
-  password can read every byte in the volume. Rotate before going
-  to production; `juicefs format` writes the secret-key into the
-  Redis metadata, so re-format is the only way to rotate cleanly
-  today.
+container's startup. Each pre-flight log line starts with
+`[precheck-N]` for easy grepping.
