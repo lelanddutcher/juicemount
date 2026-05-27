@@ -49,6 +49,7 @@ func main() {
 	destMount := flag.String("dest-mount", "/jfs", "User-facing destination prefix shown in the UI")
 	sourceRoots := flag.String("source-roots", "/sources", "Comma-separated host paths the migrator may browse from")
 	adminKey := flag.String("admin-key", os.Getenv("JM_ADMIN_KEY"), "Admin key for X-JuiceMount-Admin-Key auth (empty = disabled)")
+	stateFile := flag.String("state-file", os.Getenv("JM_STATE_FILE"), "Optional JSON path for job-history persistence (empty = jobs lost on restart). Bind-mount the dir to make history survive container churn.")
 	flag.Parse()
 
 	roots := splitNonEmpty(*sourceRoots, ",")
@@ -74,6 +75,7 @@ func main() {
 		SourceRoots: roots,
 		DestMount:   *destMount,
 		AdminKey:    *adminKey,
+		StateFile:   *stateFile,
 	}
 	mgr := migrator.Register(mux, "", cfg)
 
@@ -98,6 +100,7 @@ func main() {
 	log.Printf("  dest-mount:   %s", *destMount)
 	log.Printf("  source-roots: %v", roots)
 	log.Printf("  auth enabled: %v", *adminKey != "")
+	log.Printf("  state-file:   %s", *stateFile)
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

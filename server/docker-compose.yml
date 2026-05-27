@@ -159,6 +159,7 @@ services:
       JM_VOL_NAME: "zpool"
       JM_SOURCE_ROOTS: "/sources"
       JM_ADMIN_KEY: ""               # EDIT — set to a 32+ char random string for prod
+      JM_STATE_FILE: "/var/lib/migrator/jobs.json"   # persists job history across container restart
     ports:
       - "30190:8080"                 # web UI
     volumes:
@@ -166,3 +167,6 @@ services:
       # browsed as /sources/<name> in the UI. Add as many lines as you
       # want — one per existing dataset to migrate from.
       - /mnt/storage0/zpool:/sources/oldzpool:ro    # EDIT — your source dataset(s)
+      # Tiny writable mount for the JSON job-history file. Lets canceled
+      # or interrupted jobs show up with a Resume button after a redeploy.
+      - /mnt/zSSD/juicemount/migrator-state:/var/lib/migrator

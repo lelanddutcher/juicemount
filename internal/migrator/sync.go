@@ -34,7 +34,7 @@ type SyncOptions struct {
 	Threads           int      `json:"threads"`            // --threads N (default 10) [tier-2]
 	Excludes          []string `json:"excludes"`           // user-provided --exclude patterns [tier-2]
 	Includes          []string `json:"includes"`           // user-provided --include patterns [tier-2]
-	Verify            bool     `json:"verify"`             // --check-new (post-sync verify) [tier-3]
+	Verify            bool     `json:"verify"`             // --check-all (byte-level post-sync verify, slow) [tier-3]
 }
 
 // DefaultSyncOptions returns the safe defaults applied when the user
@@ -145,7 +145,13 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		args = append(args, "--include", p)
 	}
 	if opts.Verify {
-		args = append(args, "--check-new")
+		// --check-all re-reads every file in source AND destination and
+		// compares byte-by-byte. Doubles the read I/O of the sync but
+		// gives true byte-level confidence the copy succeeded. The
+		// older --check-new only verified newly-copied files (~free)
+		// which barely caught anything useful — bumped to --check-all
+		// since "Verify after sync" implies real verification.
+		args = append(args, "--check-all")
 	}
 	args = append(args, src, dst)
 

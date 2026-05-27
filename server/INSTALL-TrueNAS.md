@@ -24,6 +24,12 @@ volume becomes your single source of truth), note its full path too.
 The migrator service exposes it read-only inside the container so the
 copy can't damage the source. You can add multiple.
 
+Also create one small dataset for migrator state (job history JSON):
+
+| Dataset | What it holds | Sized for |
+|---|---|---|
+| `migrator-state` | JSON file of job history + resume targets | <1 MB; any pool fine |
+
 Generate a strong MinIO password and JuiceMount admin key:
 
 ```
@@ -203,12 +209,17 @@ services:
       JM_VOL_NAME: "zpool"
       JM_SOURCE_ROOTS: "/sources"
       JM_ADMIN_KEY: CHANGEME_ADMIN_KEY        # !!! EDIT — 32+ random chars; empty = LAN-only
+      JM_STATE_FILE: "/var/lib/migrator/jobs.json"   # job history persists across restart
     ports:
       - "30190:8080"                          # web UI
     volumes:
       # One bind-mount per existing dataset you want to migrate from.
       # Each becomes a browsable source root in the UI.
       - CHANGEME_SOURCE_PATH:/sources/<your-source-name>:ro
+      # Small writable mount for the JSON state file. Without this,
+      # job history vanishes on container restart (no Resume button
+      # available for canceled jobs after a redeploy).
+      - CHANGEME_STATE_PATH:/var/lib/migrator
 ```
 
 ## After install
