@@ -78,11 +78,19 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Defaults are overridable via the command in docker-compose:
 #   command: ["--meta", "redis://redis:6379/1", "--source-roots", "/sources/media"]
 # Note: --meta is REQUIRED (no default) — fail-fast if not supplied.
+#
+# --juicefs is the bare binary name `juicefs` so Go's exec.Command does a
+# PATH lookup. The juicedata/mount:ce-v1.3.1 base image puts the binary
+# somewhere in PATH (verified by the existing juicefs-init container in
+# the main compose, which calls `juicefs` unqualified successfully) but
+# the exact directory has moved across upstream releases — hardcoding
+# /usr/bin/juicefs in an earlier revision broke when the base image
+# changed in mid-2025. PATH-lookup is the resilient form.
 ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/juicemount-migrator \
     --listen=\"$JM_LISTEN\" \
     --dest-mount=\"$JM_DEST_MOUNT\" \
     --source-roots=\"$JM_SOURCE_ROOTS\" \
-    --juicefs=/usr/bin/juicefs \
+    --juicefs=juicefs \
     --meta=\"${JM_META:-}\" \
     --admin-key=\"${JM_ADMIN_KEY:-}\" \
     \"$@\"", "--"]
