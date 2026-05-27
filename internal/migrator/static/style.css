@@ -287,6 +287,16 @@ main {
 
 .progress-fill.error { background: var(--danger); }
 .progress-fill.done  { background: var(--success); }
+.progress-fill.indeterminate {
+  background: linear-gradient(90deg,
+    transparent 0%, var(--accent) 30%, var(--accent) 70%, transparent 100%);
+  background-size: 200% 100%;
+  animation: indeterminate-slide 1.4s linear infinite;
+}
+@keyframes indeterminate-slide {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
+}
 
 .job-stats {
   display: flex;

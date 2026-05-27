@@ -42,7 +42,7 @@ func TestJobManagerSubmitListGet(t *testing.T) {
 	defer m.StopAll()
 
 	// Submit one job — should kick off immediately (active==nil).
-	j1, err := m.Submit("/tmp/src1", "/jfs/dst1", DefaultSyncOptions())
+	j1, err := m.Submit("/tmp/src1", "/jfs/dst1", DefaultSyncOptions(), 0)
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestJobManagerSubmitListGet(t *testing.T) {
 	}
 
 	// Submit a second job — should queue (active is the first).
-	j2, _ := m.Submit("/tmp/src2", "/jfs/dst2", DefaultSyncOptions())
+	j2, _ := m.Submit("/tmp/src2", "/jfs/dst2", DefaultSyncOptions(), 0)
 	if j2.ID == j1.ID {
 		t.Errorf("two jobs got same ID")
 	}
@@ -80,7 +80,7 @@ func TestJobManagerCancel(t *testing.T) {
 	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerForeverUntilCanceled)
 
-	j, _ := m.Submit("/tmp/x", "/jfs/y", DefaultSyncOptions())
+	j, _ := m.Submit("/tmp/x", "/jfs/y", DefaultSyncOptions(), 0)
 	// Wait for the job to actually transition to Running.
 	deadline := time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadline) {
@@ -113,7 +113,7 @@ func TestJobManagerErrorPropagates(t *testing.T) {
 	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerErrorImmediately)
 
-	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions())
+	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions(), 0)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if m.Get(j.ID).GetState() == JobError {
@@ -132,7 +132,7 @@ func TestJobManagerSuccessReachesDone(t *testing.T) {
 	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerSucceedImmediately)
 
-	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions())
+	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions(), 0)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if m.Get(j.ID).GetState() == JobDone {
@@ -147,7 +147,7 @@ func TestJobManagerSubscribe(t *testing.T) {
 	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerSucceedImmediately)
 
-	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions())
+	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions(), 0)
 	ch, cleanup, ok := m.Subscribe(j.ID)
 	if !ok {
 		t.Fatalf("Subscribe returned ok=false")
@@ -178,8 +178,8 @@ func TestJobManagerStopAll(t *testing.T) {
 	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerForeverUntilCanceled)
 
-	_, _ = m.Submit("/tmp/a", "/jfs/a", DefaultSyncOptions())
-	_, _ = m.Submit("/tmp/b", "/jfs/b", DefaultSyncOptions())
+	_, _ = m.Submit("/tmp/a", "/jfs/a", DefaultSyncOptions(), 0)
+	_, _ = m.Submit("/tmp/b", "/jfs/b", DefaultSyncOptions(), 0)
 	time.Sleep(100 * time.Millisecond)
 
 	m.StopAll()

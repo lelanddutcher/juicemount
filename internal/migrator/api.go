@@ -178,11 +178,14 @@ func (a *API) handleBrowse(w http.ResponseWriter, r *http.Request) {
 }
 
 // migrateRequest is the body of POST /api/migrate. Options is optional;
-// missing fields fall back to DefaultSyncOptions().
+// missing fields fall back to DefaultSyncOptions(). TotalBytes is the
+// pre-computed source size from the UI's preview pane and drives the
+// progress bar's % display — 0 means "unknown, show indeterminate."
 type migrateRequest struct {
 	Source      string       `json:"source"`
 	Destination string       `json:"destination"`
 	Options     *SyncOptions `json:"options,omitempty"`
+	TotalBytes  int64        `json:"total_bytes,omitempty"`
 }
 
 func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
@@ -236,7 +239,7 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	if req.Options != nil {
 		opts = *req.Options
 	}
-	job, err := a.jobs.Submit(req.Source, dest, opts)
+	job, err := a.jobs.Submit(req.Source, dest, opts, req.TotalBytes)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -251,7 +254,10 @@ func (a *API) handleListJobs(w http.ResponseWriter, r *http.Request) {
 // handlePreview walks the source path (file or directory) and returns
 // aggregate stats: total file count, total size, top file extensions.
 // Bounded by maxPreviewEntries to avoid hanging on enormous trees.
-const maxPreviewEntries = 50000
+// 500k chosen so most personal libraries scan to completion (the prior
+// 50k cap left root-level previews showing dramatically undercounted
+// totals labeled as if they were final).
+const maxPreviewEntries = 500000
 
 func (a *API) handlePreview(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
