@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -42,23 +43,54 @@ func DefaultSyncOptions() SyncOptions {
 	}
 }
 
+// Mode controls how destinations are written.
+type Mode int
+
+const (
+	// ModeEmbedded writes via file:///<FUSEMount>/<path>. The container
+	// must have the JuiceFS volume FUSE-mounted at FUSEMount before
+	// RunSync is called.
+	ModeEmbedded Mode = iota
+	// ModeStandalone writes via jfs://<VolName>/<path> with the env
+	// var named <VolName> set to MetaURL. No FUSE mount required;
+	// juicefs sync connects to Redis + MinIO directly. Requires
+	// network reachability to both from inside the container.
+	ModeStandalone
+)
+
+// RunSyncSpec bundles destination-resolution config so RunSync can
+// pick the right URL form without re-deriving it from a half-set
+// JobManager.
+type RunSyncSpec struct {
+	Mode      Mode
+	FUSEMount string // ModeEmbedded
+	MetaURL   string // ModeStandalone
+	VolName   string // ModeStandalone
+}
+
 // RunSync invokes `juicefs sync` against the given source and
-// destination, with the supplied options.
-//
-// fuseMount is the in-process FUSE mount of the JuiceFS volume (e.g.
-// /mnt/juicefs). Destinations are written via file:///<fuse-mount>/<path>
-// so chunks flow through the same juicefs daemon as the NFS gateway —
-// no jfs:// env-var-named-after-volume dance, no separate Redis/S3
-// client.
+// destination, with the supplied options. The spec determines which
+// destination-URL form is used. See Mode constants for details.
 //
 // Source is always given a trailing slash when PreserveStructure is
 // true (rsync "copy contents" semantic).
 //
 // Emits ProgressEvent on `progress` each time juicefs writes a
 // recognized progress line. Blocks until juicefs exits or ctx cancels.
-func RunSync(ctx context.Context, juicefsBin, fuseMount, source, destination string, opts SyncOptions, progress chan<- ProgressEvent) error {
+func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, progress chan<- ProgressEvent) error {
 	src := normalizeSourceURI(source, opts.PreserveStructure)
-	dst := normalizeDestURIEmbedded(destination, fuseMount)
+
+	var dst string
+	var extraEnv []string
+	switch spec.Mode {
+	case ModeStandalone:
+		dst = normalizeDestURIJFS(destination, spec.VolName)
+		// juicefs sync's URL syntax: env var name = URL alias. So for
+		// jfs://zpool/... we set zpool=redis://...
+		extraEnv = append(extraEnv, spec.VolName+"="+spec.MetaURL)
+	default: // ModeEmbedded
+		dst = normalizeDestURIEmbedded(destination, spec.FUSEMount)
+	}
 
 	threads := opts.Threads
 	if threads <= 0 {
@@ -97,6 +129,11 @@ func RunSync(ctx context.Context, juicefsBin, fuseMount, source, destination str
 	args = append(args, src, dst)
 
 	cmd := exec.CommandContext(ctx, juicefsBin, args...)
+	// Inherit parent env (PATH, HOME, TMPDIR) then add any mode-
+	// specific vars (the URL-alias env for ModeStandalone). Replacing
+	// Env outright would leave juicefs without PATH for its child
+	// processes (e.g. the temp-dir resolution it does on macOS).
+	cmd.Env = append(os.Environ(), extraEnv...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -335,6 +372,35 @@ func normalizeSourceURI(s string, preserveStructure bool) string {
 		s = s + "/"
 	}
 	return s
+}
+
+// normalizeDestURIJFS translates a UI-supplied destination into a
+// jfs://<volName>/<path>/ URL. Used by ModeStandalone (no FUSE
+// mount in the container; juicefs sync talks Redis + MinIO directly).
+//
+// The /jfs UI prefix is stripped to get the path within the volume,
+// then re-prefixed as jfs://<volName>/<path>/.
+func normalizeDestURIJFS(dest, volName string) string {
+	dest = strings.TrimSpace(dest)
+	if i := strings.Index(dest, "://"); i > 0 && i < 10 {
+		if !strings.HasSuffix(dest, "/") {
+			dest = dest + "/"
+		}
+		return dest
+	}
+	rel := dest
+	if strings.HasPrefix(rel, "/jfs/") {
+		rel = rel[len("/jfs"):]
+	} else if rel == "/jfs" {
+		rel = "/"
+	}
+	if !strings.HasPrefix(rel, "/") {
+		rel = "/" + rel
+	}
+	if !strings.HasSuffix(rel, "/") {
+		rel = rel + "/"
+	}
+	return "jfs://" + volName + rel
 }
 
 // normalizeDestURIEmbedded translates a UI-supplied destination into

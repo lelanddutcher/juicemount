@@ -8,16 +8,16 @@ import (
 )
 
 // Mock SyncFuncs for deterministic test paths.
-func runnerForeverUntilCanceled(ctx context.Context, _, _, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
+func runnerForeverUntilCanceled(ctx context.Context, _ string, _ RunSyncSpec, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
 	<-ctx.Done()
 	return context.Canceled
 }
 
-func runnerErrorImmediately(_ context.Context, _, _, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
+func runnerErrorImmediately(_ context.Context, _ string, _ RunSyncSpec, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
 	return errors.New("simulated sync failure")
 }
 
-func runnerSucceedImmediately(_ context.Context, _, _, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
+func runnerSucceedImmediately(_ context.Context, _ string, _ RunSyncSpec, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
 	return nil
 }
 
@@ -37,7 +37,7 @@ func TestJobIDFormat(t *testing.T) {
 }
 
 func TestJobManagerSubmitListGet(t *testing.T) {
-	m := NewJobManager("/dev/null", "/mnt/juicefs")
+	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerForeverUntilCanceled)
 	defer m.StopAll()
 
@@ -77,7 +77,7 @@ func TestJobManagerSubmitListGet(t *testing.T) {
 }
 
 func TestJobManagerCancel(t *testing.T) {
-	m := NewJobManager("/dev/null", "/mnt/juicefs")
+	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerForeverUntilCanceled)
 
 	j, _ := m.Submit("/tmp/x", "/jfs/y", DefaultSyncOptions())
@@ -110,7 +110,7 @@ func TestJobManagerCancel(t *testing.T) {
 }
 
 func TestJobManagerErrorPropagates(t *testing.T) {
-	m := NewJobManager("/dev/null", "/mnt/juicefs")
+	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerErrorImmediately)
 
 	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions())
@@ -129,7 +129,7 @@ func TestJobManagerErrorPropagates(t *testing.T) {
 }
 
 func TestJobManagerSuccessReachesDone(t *testing.T) {
-	m := NewJobManager("/dev/null", "/mnt/juicefs")
+	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerSucceedImmediately)
 
 	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions())
@@ -144,7 +144,7 @@ func TestJobManagerSuccessReachesDone(t *testing.T) {
 }
 
 func TestJobManagerSubscribe(t *testing.T) {
-	m := NewJobManager("/dev/null", "/mnt/juicefs")
+	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerSucceedImmediately)
 
 	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions())
@@ -175,7 +175,7 @@ func TestJobManagerSubscribe(t *testing.T) {
 }
 
 func TestJobManagerStopAll(t *testing.T) {
-	m := NewJobManager("/dev/null", "/mnt/juicefs")
+	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	m.SetRunner(runnerForeverUntilCanceled)
 
 	_, _ = m.Submit("/tmp/a", "/jfs/a", DefaultSyncOptions())
@@ -207,7 +207,7 @@ func TestJobManagerStopAll(t *testing.T) {
 }
 
 func TestJobManagerGetMissing(t *testing.T) {
-	m := NewJobManager("/dev/null", "/mnt/juicefs")
+	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
 	if got := m.Get("nope"); got != nil {
 		t.Errorf("Get for missing ID should return nil, got %v", got)
 	}

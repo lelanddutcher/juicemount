@@ -38,6 +38,9 @@ jobs:
           - name: juicemount-server
             dockerfile: server/juicemount-server/Dockerfile
             description: NFSv3 gateway for JuiceFS — self-hosted media editing (includes embedded migrator UI)
+          - name: juicemount-migrator
+            dockerfile: server/juicemount-migrator/Dockerfile
+            description: Standalone data-migration container (juicefs sync + web UI)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
