@@ -48,6 +48,7 @@ func main() {
 	addr := flag.String("listen", "0.0.0.0:8080", "HTTP listen address")
 	juicefsBin := flag.String("juicefs", "juicefs", "Path to juicefs binary")
 	metaURL := flag.String("meta", "", "JuiceFS metadata URL (e.g. redis://redis:6379/1). REQUIRED.")
+	volName := flag.String("vol-name", "zpool", "JuiceFS volume name (used in jfs:// destination URIs)")
 	destMount := flag.String("dest-mount", "/jfs", "Filesystem path of the JuiceFS mount (used for path-style destinations in the UI)")
 	sourceRoots := flag.String("source-roots", "/sources", "Comma-separated list of host paths the migrator may read from (typically bind-mounted into the container)")
 	adminKey := flag.String("admin-key", os.Getenv("JM_ADMIN_KEY"), "Admin key for the X-JuiceMount-Admin-Key header. Empty disables auth.")
@@ -62,7 +63,7 @@ func main() {
 		log.Fatal("--source-roots must contain at least one path")
 	}
 
-	mgr := NewJobManager(*juicefsBin, *metaURL)
+	mgr := NewJobManager(*juicefsBin, *metaURL, *volName, *destMount)
 	api := &API{
 		jobs:        mgr,
 		sourceRoots: roots,
