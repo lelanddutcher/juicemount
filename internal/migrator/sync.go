@@ -84,12 +84,12 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	var extraEnv []string
 	switch spec.Mode {
 	case ModeStandalone:
-		dst = normalizeDestURIJFS(destination, spec.VolName)
+		dst = normalizeDestURIJFS(destination, spec.VolName, opts.PreserveStructure)
 		// juicefs sync's URL syntax: env var name = URL alias. So for
 		// jfs://zpool/... we set zpool=redis://...
 		extraEnv = append(extraEnv, spec.VolName+"="+spec.MetaURL)
 	default: // ModeEmbedded
-		dst = normalizeDestURIEmbedded(destination, spec.FUSEMount)
+		dst = normalizeDestURIEmbedded(destination, spec.FUSEMount, opts.PreserveStructure)
 	}
 
 	threads := opts.Threads
@@ -104,7 +104,11 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		"--check-change",
 	}
 	if opts.PreserveTimes {
-		args = append(args, "--preserve", "mtime,uid,gid")
+		// juicefs sync 1.3.1 only exposes --perms (mode bits). mtime
+		// is preserved by default for file:// → file:// transfers but
+		// can't be carried through S3 cleanly. The UI labels this
+		// "Preserve permissions" accordingly.
+		args = append(args, "--perms")
 	}
 	if opts.DryRun {
 		args = append(args, "--dry")
@@ -360,84 +364,76 @@ var junkPatterns = []string{
 }
 
 // normalizeSourceURI converts a user-provided source string into the
-// form juicefs sync expects. Trailing slash → "copy contents" rsync
-// semantic. Caller controls whether we apply that semantic (via
-// preserveStructure=true).
+// form juicefs sync expects. Routes through matchSlash so src and dst
+// agree on the rsync trailing-slash convention.
 func normalizeSourceURI(s string, preserveStructure bool) string {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "/") {
 		s = "file://" + s
 	}
-	if preserveStructure && !strings.HasSuffix(s, "/") {
-		s = s + "/"
-	}
-	return s
+	return matchSlash(s, preserveStructure)
 }
 
 // normalizeDestURIJFS translates a UI-supplied destination into a
-// jfs://<volName>/<path>/ URL. Used by ModeStandalone (no FUSE
-// mount in the container; juicefs sync talks Redis + MinIO directly).
+// jfs://<volName>/<path> URL. Used by ModeStandalone.
 //
-// The /jfs UI prefix is stripped to get the path within the volume,
-// then re-prefixed as jfs://<volName>/<path>/.
-func normalizeDestURIJFS(dest, volName string) string {
+// preserveStructure controls the trailing slash: juicefs sync REQUIRES
+// src and dst to agree on the trailing-slash convention (else FATAL:
+// "SRC and DST should both end with path separator or not!"). Caller
+// must pass the SAME value used for normalizeSourceURI.
+func normalizeDestURIJFS(dest, volName string, preserveStructure bool) string {
 	dest = strings.TrimSpace(dest)
 	if i := strings.Index(dest, "://"); i > 0 && i < 10 {
-		if !strings.HasSuffix(dest, "/") {
-			dest = dest + "/"
-		}
-		return dest
+		return matchSlash(dest, preserveStructure)
 	}
 	rel := dest
 	if strings.HasPrefix(rel, "/jfs/") {
 		rel = rel[len("/jfs"):]
 	} else if rel == "/jfs" {
-		rel = "/"
+		rel = ""
 	}
-	if !strings.HasPrefix(rel, "/") {
+	if !strings.HasPrefix(rel, "/") && rel != "" {
 		rel = "/" + rel
 	}
-	if !strings.HasSuffix(rel, "/") {
-		rel = rel + "/"
+	return matchSlash("jfs://"+volName+rel, preserveStructure)
+}
+
+// matchSlash applies the rsync trailing-slash convention based on the
+// preserveStructure flag. Caller-managed slash discipline; both
+// normalizeSourceURI and the dest helpers route through this so src
+// and dst can never disagree.
+func matchSlash(s string, preserveStructure bool) string {
+	if preserveStructure {
+		if !strings.HasSuffix(s, "/") {
+			s = s + "/"
+		}
+	} else {
+		s = strings.TrimSuffix(s, "/")
 	}
-	return "jfs://" + volName + rel
+	return s
 }
 
 // normalizeDestURIEmbedded translates a UI-supplied destination into
 // a juicefs-sync-compatible URL using the in-process FUSE mount.
 //
-// In-process means the JuiceFS volume is already mounted in the same
-// container at fuseMount (e.g. /mnt/juicefs). We just rewrite the
-// user-visible path (e.g. /jfs/imported/foo) to a file:// URL under
-// the actual mount point.
-//
-// Rules:
-//   - Already-scheme'd URL: pass through (+ trailing slash)
-//   - "/jfs/PATH" (the UI's destMount convention) → file:///<fuseMount>/PATH/
-//   - bare /PATH → file:///<fuseMount>/PATH/
-func normalizeDestURIEmbedded(dest, fuseMount string) string {
+// preserveStructure controls the trailing slash so src and dst agree
+// — see matchSlash + normalizeDestURIJFS for why.
+func normalizeDestURIEmbedded(dest, fuseMount string, preserveStructure bool) string {
 	dest = strings.TrimSpace(dest)
 	if i := strings.Index(dest, "://"); i > 0 && i < 10 {
-		if !strings.HasSuffix(dest, "/") {
-			dest = dest + "/"
-		}
-		return dest
+		return matchSlash(dest, preserveStructure)
 	}
 	fuse := strings.TrimSuffix(fuseMount, "/")
-	// Strip /jfs prefix if the UI sent that.
 	rel := dest
 	if strings.HasPrefix(rel, "/jfs/") {
 		rel = rel[len("/jfs"):]
 	} else if rel == "/jfs" {
-		rel = "/"
+		rel = ""
 	}
-	if !strings.HasPrefix(rel, "/") {
+	if !strings.HasPrefix(rel, "/") && rel != "" {
 		rel = "/" + rel
 	}
-	if !strings.HasSuffix(rel, "/") {
-		rel = rel + "/"
-	}
-	return "file://" + fuse + rel
+	return matchSlash("file://"+fuse+rel, preserveStructure)
 }
 
 // randHex returns n random bytes as a hex string. Used for job IDs.

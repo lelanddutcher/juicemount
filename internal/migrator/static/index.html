@@ -44,8 +44,20 @@
       </label>
       <label class="field">
         <span>Destination path</span>
-        <input id="dest-input" type="text" placeholder="/jfs/imported/2026-05-26-150405" autocomplete="off" spellcheck="false">
+        <input id="dest-input" type="text" placeholder="/jfs/Film Projects/Leland TikToks" autocomplete="off" spellcheck="false">
       </label>
+
+      <div id="dest-preview" class="dest-preview" hidden>
+        <h3>Destination preview</h3>
+        <p class="dest-preview-info" id="dest-preview-info"></p>
+        <dl class="dest-preview-urls">
+          <dt>Source URL</dt><dd id="dest-preview-source-url">—</dd>
+          <dt>Destination URL</dt><dd id="dest-preview-dest-url">—</dd>
+        </dl>
+        <h4>Example file destinations</h4>
+        <ul id="dest-preview-examples" class="dest-preview-examples"></ul>
+        <p id="dest-preview-error" class="error" hidden></p>
+      </div>
 
       <fieldset class="options">
         <legend>Migration options</legend>
@@ -56,8 +68,8 @@
         </label>
         <label class="opt">
           <input type="checkbox" id="opt-preserve-times" checked>
-          <span><strong>Preserve modification times + owner</strong>
-            <em>Keeps mtime, uid, gid intact. Crucial for date-sorted media libraries.</em></span>
+          <span><strong>Preserve file permissions</strong>
+            <em>Passes --perms to juicefs sync. Modification times are preserved by default for file→file; uid/gid don't round-trip through S3 destinations.</em></span>
         </label>
         <label class="opt">
           <input type="checkbox" id="opt-skip-junk" checked>
