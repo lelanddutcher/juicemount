@@ -18,11 +18,17 @@ Create three datasets in TrueNAS (Datasets → Add Dataset):
 
 Note their full paths (e.g., `/mnt/tank/juicemount/bucket`).
 
+**Optional — for migrating existing data**: if you have an existing
+dataset full of media you want to copy into JuiceMount (so the JuiceFS
+volume becomes your single source of truth), note its full path too.
+The migrator service exposes it read-only inside the container so the
+copy can't damage the source. You can add multiple.
+
 Generate a strong MinIO password and JuiceMount admin key:
 
 ```
 openssl rand -base64 24   # for MINIO_ROOT_PASSWORD
-openssl rand -hex 32      # for JM_ADMIN_KEY
+openssl rand -hex 32      # for JM_ADMIN_KEY (used to gate /migrator UI)
 ```
 
 Note your TrueNAS LAN IP — your Mac will need to reach this address
@@ -179,6 +185,30 @@ services:
         juicefs webdav --cache-dir /jfs-cache --cache-size 100000 \
           redis://redis:6379/1 0.0.0.0:80 &
         wait
+
+  # ─── juicemount-migrator: copy existing data into JuiceFS via web UI ─
+  # Browse host paths under /sources, pick a destination under /jfs,
+  # watch live progress with real % bar (driven by juicefs's Prometheus
+  # metrics). Bind-mount as many existing datasets read-only as you
+  # want. Omit this service entirely if you have no existing data.
+  juicemount-migrator:
+    image: ghcr.io/lelanddutcher/juicemount-migrator:production-hardening
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      juicefs-init:
+        condition: service_completed_successfully
+    environment:
+      JM_META: "redis://redis:6379/1"
+      JM_VOL_NAME: "zpool"
+      JM_SOURCE_ROOTS: "/sources"
+      JM_ADMIN_KEY: CHANGEME_ADMIN_KEY        # !!! EDIT — 32+ random chars; empty = LAN-only
+    ports:
+      - "30190:8080"                          # web UI
+    volumes:
+      # One bind-mount per existing dataset you want to migrate from.
+      # Each becomes a browsable source root in the UI.
+      - CHANGEME_SOURCE_PATH:/sources/<your-source-name>:ro
 ```
 
 ## After install
@@ -196,6 +226,28 @@ Then click Save. The Mac NFS volume mounts at `/Volumes/zpool`.
 
 - MinIO Console: `http://<truenas-ip>:30152`
 - WebDAV (Finder Cmd+K): `http://<truenas-ip>:30180`
+- Migrator web UI: `http://<truenas-ip>:30190` (if you included the service)
+
+## Migrating existing data
+
+The migrator UI at `:30190` lets you copy from any bind-mounted source
+root into the JuiceFS volume:
+
+1. Click a source root (e.g. `/sources/oldzpool`), drill into the folder
+   to migrate.
+2. The destination input auto-fills with a sensible mirror path under
+   `/jfs/` — strips the source-root prefix so you don't get
+   `/jfs/oldzpool/...` cluttering the structure.
+3. Default options are tuned for Mac access: structure preserved 1:1,
+   junk files (`.DS_Store`, `._*`, `Thumbs.db`, `.sync.ffs_db`) excluded,
+   file permissions NOT preserved (so destination files land with
+   sensible defaults the Mac user can read).
+4. Live progress shows real %, files copied, bytes copied, errors.
+   Multiple jobs queue and run sequentially.
+
+If you do want to preserve source uid/gid/mode (e.g. archival to
+another POSIX system), tick **Preserve file permissions** before
+hitting Start.
 
 ## If the init container exits non-zero
 

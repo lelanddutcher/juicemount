@@ -1,130 +1,115 @@
-# JuiceMount server-side stack (Tier 3, iter 1)
+# JuiceMount server-side stack — TrueNAS Scale "Install via YAML" reference.
 #
-# `docker compose up -d` boots the three backing services:
-#   - minio        — S3-compatible object store on :9000 (S3 API) and :9001 (web)
-#   - redis        — JuiceFS metadata authority on :6379
-#   - juicefs-init — one-shot that formats the JuiceFS volume on first run
+# This is the production-tested compose for the JuiceMount NAS app:
 #
-# This is the FOUNDATION. Tier-3 iter-2 adds the juicemount-server
-# container (the NFS export side) and a Caddy reverse-proxy. With
-# those, the stack matches the architecture diagram in
-# docs/ROADMAP/tier-3-server-packaging.md.
+#   redis                — JuiceFS metadata authority (AOF persistence)
+#   minio                — S3 object store for JuiceFS chunks
+#   juicefs-init         — one-shot pre-flight + first-time volume format
+#   juicefs              — live FUSE mount + WebDAV (browse / smoke test)
+#   juicemount-migrator  — copy-into-JuiceFS web UI (port 30190)
 #
-# Usage from a fresh Ubuntu / Synology / TrueNAS box:
+# The bind-mount paths are TrueNAS-flavored (`/mnt/<pool>/juicemount/*`).
+# On a plain Linux/Synology host, edit the `volumes:` paths and the
+# `MINIO_ROOT_PASSWORD` value, then `docker compose up -d`.
 #
-#   cp .env.example .env
-#   $EDITOR .env                       # set MINIO_ROOT_PASSWORD, paths
-#   docker compose up -d
-#   docker compose logs juicefs-init   # confirms first-time format
-#
-# Acceptance: `docker compose ps` shows minio + redis healthy and
-# juicefs-init exited 0. Data persists across `docker compose down`
-# via the named volumes below.
+# Pre-flight (juicefs-init) returns named exit codes — see
+# server/INSTALL-TrueNAS.md for the table.
 
 services:
+
+  # ── Redis: JuiceFS metadata authority ────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    ports:
+      - "30179:6379"                # Mac client connects here
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
+      - "--maxmemory-policy"
+      - "noeviction"
+      - "--save"
+      - "900"
+      - "1"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - /mnt/zSSD/juicemount/redis:/data    # EDIT — your Redis dataset path
+
+  # ── MinIO: S3 object store for chunks ────────────────────────────
   minio:
     image: minio/minio:RELEASE.2025-01-20T14-49-07Z
-    container_name: juicemount-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-juicemount}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set in .env}
+      MINIO_ROOT_USER: juicemount
+      MINIO_ROOT_PASSWORD: CHANGEME_MINIO_PASSWORD    # EDIT — strong, no whitespace
+      MINIO_API_REQUESTS_DEADLINE: 10m
     ports:
-      - "${MINIO_S3_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
-    volumes:
-      - ${MINIO_DATA_DIR:-./data/minio}:/data
+      - "30151:9000"                # Mac client connects here
+      - "30152:9001"                # MinIO console — web UI
     healthcheck:
-      # MinIO's documented liveness endpoint. 200 = healthy, anything
-      # else = restart by Docker's default policy.
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
-      interval: 30s
+      interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
       start_period: 10s
-
-  redis:
-    image: redis:7.4-alpine
-    container_name: juicemount-redis
-    restart: unless-stopped
-    # AOF persistence so JuiceFS metadata survives container restart.
-    # Without --appendonly yes a crash loses uncommitted RDB checkpoints
-    # and the JuiceFS volume needs a re-format from the user.
-    command: redis-server --appendonly yes
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
     volumes:
-      - ${REDIS_DATA_DIR:-./data/redis}:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
+      - /mnt/zSSD/juicemount/bucket:/data   # EDIT — MinIO bucket dataset path
 
+  # ── juicefs-init: pre-flight checks + idempotent format ──────────
   juicefs-init:
-    # One-shot container that formats the JuiceFS volume on first run.
-    # `juicefs format` is idempotent — already-formatted = no-op exit 0.
-    # depends_on with service_healthy means we wait for minio + redis
-    # to be reachable before attempting the format.
-    image: juicedata/mount:v1.2.3
-    container_name: juicemount-init
+    image: juicedata/mount:ce-v1.3.1
+    restart: "no"
     depends_on:
       minio:
         condition: service_healthy
       redis:
         condition: service_healthy
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-juicemount}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set in .env}
-    # Bootstrap: create the bucket if absent, then format JuiceFS
-    # against it. mc is the MinIO client; juicefs format expects the
-    # bucket to already exist.
+      MINIO_ROOT_USER: juicemount
+      MINIO_ROOT_PASSWORD: CHANGEME_MINIO_PASSWORD    # EDIT — same as MinIO above
+      JM_BUCKET_URL: "http://minio:9000/zpool"
+      JM_META_URL: "redis://redis:6379/1"
+      JM_VOL_NAME: "zpool"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
-        # Wait an extra second so MinIO admin API is fully ready
-        # (healthcheck passes on /minio/health/live but admin can
-        # lag briefly).
         sleep 2
-        # mc alias + bucket create (idempotent).
-        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
-        mc mb --ignore-existing local/${JUICEFS_BUCKET:-zpool}
-        # Format JuiceFS. Idempotent on a re-run.
-        juicefs format \
-          --storage minio \
-          --bucket http://minio:9000/${JUICEFS_BUCKET:-zpool} \
-          --access-key "$$MINIO_ROOT_USER" \
-          --secret-key "$$MINIO_ROOT_PASSWORD" \
-          redis://redis:6379/1 \
-          ${JUICEFS_VOL_NAME:-zpool}
-    # No restart — we want this to exit 0 and stay exited.
-    restart: "no"
+        if ! curl -fsS -m 5 http://minio:9000/minio/health/live >/dev/null; then
+          echo "[precheck-1] minio unreachable" >&2; exit 2
+        fi
+        if [ -z "$$MINIO_ROOT_USER" ] || [ -z "$$MINIO_ROOT_PASSWORD" ]; then
+          echo "[precheck-3] empty MinIO credentials" >&2; exit 4
+        fi
+        case "$$MINIO_ROOT_PASSWORD" in CHANGEME*|CHANGE*|REPLACE*|replaceme*)
+          echo "[precheck-3] placeholder MinIO password — edit the YAML" >&2; exit 4 ;;
+        esac
+        case "$$JM_BUCKET_URL" in http://*|https://*) ;; *)
+          echo "[precheck-4] bucket URL must start with http:// or https://" >&2; exit 5 ;;
+        esac
+        if juicefs status "$$JM_META_URL" >/dev/null 2>&1; then
+          echo "[precheck-5] already formatted"; exit 0
+        fi
+        echo "[format] running juicefs format with bucket=$$JM_BUCKET_URL"
+        juicefs format --storage minio --bucket "$$JM_BUCKET_URL" \
+          --access-key "$$MINIO_ROOT_USER" --secret-key "$$MINIO_ROOT_PASSWORD" \
+          --trash-days 0 "$$JM_META_URL" "$$JM_VOL_NAME" || { echo "[format] FAIL" >&2; exit 6; }
 
-  juicemount-server:
-    # Tier-3 iter 2: NFS export side. Builds from the repo root
-    # (context: ..) using server/juicemount-server/Dockerfile.
-    # depends_on: minio + redis healthy, and juicefs-init exit 0 so
-    # the bucket exists and JuiceFS volume is formatted before jm5
-    # tries to mount FUSE.
-    build:
-      context: ..
-      dockerfile: server/juicemount-server/Dockerfile
-    container_name: juicemount-server
+  # ── juicefs: live FUSE mount + WebDAV ────────────────────────────
+  juicefs:
+    image: juicedata/mount:ce-v1.3.1
     restart: unless-stopped
     depends_on:
-      minio:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
       juicefs-init:
         condition: service_completed_successfully
-    # FUSE needs SYS_ADMIN + /dev/fuse + apparmor unconfined on hosts
-    # that ship with that policy. macFUSE doesn't exist on Linux —
-    # we use the kernel fuse module. juicefs handles the actual mount
-    # syscall inside the container.
     cap_add:
       - SYS_ADMIN
     devices:
@@ -132,68 +117,52 @@ services:
     security_opt:
       - apparmor:unconfined
     ports:
-      # NFS port default 12049 (not 2049) — TrueNAS Scale, Synology DSM,
-      # and QNAP QTS all ship a host nfsd on 2049 that wins port-bind
-      # races silently. Macs mount with `-o port=12049,mountport=12049`.
-      # Override NFS_PORT=2049 on Linux hosts without a host nfsd.
-      - "${NFS_PORT:-12049}:2049"
-      - "${ADMIN_PORT:-11050}:11050"
-    volumes:
-      # SQLite metadata.db + pin.db live here. Bind-mount so they
-      # survive container churn. Use absolute paths on prod hosts
-      # (set JM_DATA_DIR in .env) — the relative default is fine
-      # for local-quickstart.
-      - ${JM_DATA_DIR:-./data/jm}:/data
-    environment:
-      # Inherit MinIO creds so jm5 → JuiceFS → MinIO works without
-      # the user having to set them in three places.
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-juicemount}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set in .env}
-      JM_REDIS: redis://redis:6379/1
-      JM_CACHE_SIZE_MB: ${JM_CACHE_SIZE_MB:-100000}
+      - "30180:80"                  # WebDAV — Finder Cmd+K
     healthcheck:
-      # Same shape as the Dockerfile HEALTHCHECK but on the compose
-      # side too so `docker compose ps` shows the right state and
-      # `depends_on: service_healthy` works for any future services
-      # that need to wait on jm5 to come up.
-      test: ["CMD", "curl", "-fsS", "http://localhost:11050/health"]
+      test: ["CMD", "sh", "-c", "mountpoint -q /jfs && curl -sf http://localhost:80/ || exit 1"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 60s
+    volumes:
+      - /mnt/zSSD/juicemount/cache:/jfs-cache    # EDIT — fast-SSD cache path
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        juicefs mount \
+          --cache-dir /jfs-cache --cache-size 100000 --buffer-size 4096 --prefetch 3 \
+          --backup-meta 3600 \
+          redis://redis:6379/1 /jfs &
+        sleep 5
+        until mountpoint -q /jfs; do sleep 1; done
+        mkdir -p /jfs/data /jfs/shared
+        chmod 777 /jfs/data /jfs/shared
+        juicefs webdav --cache-dir /jfs-cache --cache-size 100000 \
+          redis://redis:6379/1 0.0.0.0:80 &
+        wait
 
-  caddy:
-    # Tier-3 iter 3 (B.5): TLS termination + admin-key gate. Caddy
-    # reverse-proxies to MinIO console (port 9001) on / and to the
-    # juicemount-server admin API (port 11050) on /api/* — the
-    # latter requires the X-JuiceMount-Admin-Key header to match
-    # ADMIN_KEY.
-    #
-    # NFS (2049) is NOT proxied through Caddy. Clients connect
-    # directly to the host's 2049. See Caddyfile rationale.
-    image: caddy:2.8-alpine
-    container_name: juicemount-caddy
+  # ── juicemount-migrator: web UI to copy data into the JuiceFS volume ─
+  # Browse host paths under /sources, pick a destination under /jfs,
+  # watch live progress via SSE. Set JM_ADMIN_KEY for HTTP auth (the
+  # migrator owns write access to your data — don't leave it open on
+  # the public internet). Empty admin key = LAN-only / no auth.
+  juicemount-migrator:
+    image: ghcr.io/lelanddutcher/juicemount-migrator:production-hardening
+    pull_policy: always
     restart: unless-stopped
     depends_on:
-      minio:
-        condition: service_healthy
-      juicemount-server:
-        condition: service_healthy
-    ports:
-      - "${CADDY_HTTPS_PORT:-443}:443"
-      - "${CADDY_HTTP_PORT:-80}:80"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ${CADDY_DATA_DIR:-./data/caddy}:/data
-      - ${CADDY_CONFIG_DIR:-./data/caddy-config}:/config
+      juicefs-init:
+        condition: service_completed_successfully
     environment:
-      JM_HOSTNAME: ${JM_HOSTNAME:-localhost}
-      ADMIN_KEY: "${ADMIN_KEY:?ADMIN_KEY must be set in .env}"
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/caddy-health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-volumes: {}
+      JM_META: "redis://redis:6379/1"
+      JM_VOL_NAME: "zpool"
+      JM_SOURCE_ROOTS: "/sources"
+      JM_ADMIN_KEY: ""               # EDIT — set to a 32+ char random string for prod
+    ports:
+      - "30190:8080"                 # web UI
+    volumes:
+      # Mount your existing-data datasets here, read-only. Each gets
+      # browsed as /sources/<name> in the UI. Add as many lines as you
+      # want — one per existing dataset to migrate from.
+      - /mnt/storage0/zpool:/sources/oldzpool:ro    # EDIT — your source dataset(s)
