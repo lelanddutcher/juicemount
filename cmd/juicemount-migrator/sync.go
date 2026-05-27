@@ -58,7 +58,14 @@ func RunSync(ctx context.Context, juicefsBin, metaURL, volName, destMount, sourc
 		dst,
 	}
 	cmd := exec.CommandContext(ctx, juicefsBin, args...)
-	cmd.Env = append(cmd.Env, "JFS_META_URL="+metaURL)
+	// juicefs sync uses a quirky env var convention: the env var name
+	// must MATCH the URL alias. For `jfs://zpool/...` the env var has
+	// to be literally named `zpool` with the meta URL as value. The
+	// usual JuiceFS-wide `JFS_META_URL` env var is IGNORED by sync.
+	// Source: juicefs sync --help shows
+	//   $ myfs=redis://localhost juicefs sync src jfs://myfs/
+	// — the env var name IS the URL alias.
+	cmd.Env = append(cmd.Env, volName+"="+metaURL)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
