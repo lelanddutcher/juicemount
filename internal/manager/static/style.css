@@ -893,6 +893,105 @@ main {
   gap: 0.5rem;
 }
 
+/* SLICE 6 — Maintenance tab. Five operational levers in a responsive
+   grid. Each card has a header, hint, controls row, output pre, and
+   error pill. The output panel is monospaced and scrollable so a 1000-
+   line capture stays compact. */
+.maintenance-pane .maintenance-header { margin: 0 0 1rem; }
+.maintenance-pane .maintenance-header h2 { margin: 0; font-size: 1.4rem; font-weight: 600; }
+.maintenance-pane .maintenance-header .hint { margin: 0.25rem 0 0; color: var(--text-muted); font-size: 0.9rem; }
+.maintenance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1rem;
+}
+.maintenance-card {
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  border-radius: 6px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.maintenance-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+.maintenance-card h3 { margin: 0; font-size: 1.05rem; font-weight: 600; }
+.maintenance-state {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.18);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.maintenance-state[data-state="running"] { background: rgba(255, 149, 0, 0.18); color: var(--running); }
+.maintenance-state[data-state="done"] { background: rgba(0, 135, 90, 0.18); color: var(--success); }
+.maintenance-state[data-state="error"] { background: rgba(215, 0, 21, 0.18); color: var(--danger); }
+.maintenance-card .hint { margin: 0; color: var(--text-muted); font-size: 0.85rem; }
+.maintenance-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.maintenance-controls input[type=text] {
+  flex: 1 1 200px;
+  padding: 0.35rem 0.5rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+}
+.maintenance-controls button {
+  padding: 0.35rem 0.85rem;
+  background: var(--accent);
+  color: var(--bg);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.maintenance-controls button:hover { filter: brightness(1.1); }
+.maintenance-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+.maintenance-output {
+  margin: 0;
+  padding: 0.5rem;
+  max-height: 14rem;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+.maintenance-output:empty { display: none; }
+.maintenance-error {
+  margin: 0;
+  padding: 0.5rem;
+  background: rgba(215, 0, 21, 0.12);
+  border: 1px solid rgba(215, 0, 21, 0.35);
+  color: var(--danger);
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
 footer {
   text-align: center;
   padding: 1rem;

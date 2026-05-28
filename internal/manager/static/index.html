@@ -322,11 +322,105 @@
         </div>
       </section>
 
-      <!-- Maintenance tab (placeholder; SLICE 6). -->
-      <section data-tab="maintenance" class="tab-pane" hidden>
-        <div class="placeholder">
+      <!-- Maintenance tab (SLICE 6). Five operational levers wrapping
+           juicefs CLI subprocesses. Each card has a Run button, an
+           optional flag (dry-run for GC, path for Warmup), and a live
+           output panel fed by the per-kind SSE stream. -->
+      <section data-tab="maintenance" class="tab-pane maintenance-pane" hidden>
+        <header class="maintenance-header">
           <h2>Maintenance</h2>
-          <p>GC, FSCK, warmup, cache flush, metadata compaction. Coming soon.</p>
+          <p class="hint">
+            Operational levers for the JuiceFS volume. One op per kind
+            at a time (different kinds run in parallel). Output is
+            captured up to 1000 lines per op; older lines drop with a
+            <code>[truncated]</code> marker.
+          </p>
+        </header>
+        <div class="maintenance-grid">
+          <article class="maintenance-card" data-kind="gc">
+            <header>
+              <h3>Garbage collect</h3>
+              <span class="maintenance-state" data-field="state">idle</span>
+            </header>
+            <p class="hint">
+              Reclaim unreferenced object-storage chunks. Dry-run reports
+              the bytes that would be reclaimed without modifying storage.
+            </p>
+            <div class="maintenance-controls">
+              <label class="maintenance-toggle">
+                <input type="checkbox" data-field="dry-run" checked>
+                Dry run (report only)
+              </label>
+              <button type="button" data-action="run">Run GC</button>
+            </div>
+            <pre class="maintenance-output" data-field="output" aria-live="polite"></pre>
+            <p class="maintenance-error" data-field="error" hidden></p>
+          </article>
+
+          <article class="maintenance-card" data-kind="fsck">
+            <header>
+              <h3>FSCK</h3>
+              <span class="maintenance-state" data-field="state">idle</span>
+            </header>
+            <p class="hint">
+              Verify metadata consistency. Defects appear in the output;
+              fsck typically exits 0 even when issues are reported.
+            </p>
+            <div class="maintenance-controls">
+              <button type="button" data-action="run">Run FSCK</button>
+            </div>
+            <pre class="maintenance-output" data-field="output" aria-live="polite"></pre>
+            <p class="maintenance-error" data-field="error" hidden></p>
+          </article>
+
+          <article class="maintenance-card" data-kind="warmup">
+            <header>
+              <h3>Warmup cache</h3>
+              <span class="maintenance-state" data-field="state">idle</span>
+            </header>
+            <p class="hint">
+              Pre-fetch chunks for a path so subsequent reads hit the
+              local cache. Defaults to the volume root.
+            </p>
+            <div class="maintenance-controls">
+              <input type="text" data-field="path" placeholder="/jfs (volume root)">
+              <button type="button" data-action="run">Run warmup</button>
+            </div>
+            <pre class="maintenance-output" data-field="output" aria-live="polite"></pre>
+            <p class="maintenance-error" data-field="error" hidden></p>
+          </article>
+
+          <article class="maintenance-card" data-kind="cache-flush">
+            <header>
+              <h3>Cache flush</h3>
+              <span class="maintenance-state" data-field="state">idle</span>
+            </header>
+            <p class="hint">
+              Evict every cached chunk for this volume. Useful after a
+              storage migration or to reclaim local disk space.
+            </p>
+            <div class="maintenance-controls">
+              <button type="button" data-action="run">Flush cache</button>
+            </div>
+            <pre class="maintenance-output" data-field="output" aria-live="polite"></pre>
+            <p class="maintenance-error" data-field="error" hidden></p>
+          </article>
+
+          <article class="maintenance-card" data-kind="compact-meta">
+            <header>
+              <h3>Compact metadata</h3>
+              <span class="maintenance-state" data-field="state">idle</span>
+            </header>
+            <p class="hint">
+              Repack slice chunks into denser objects. Reduces object
+              count and improves read throughput for fragmented volumes.
+            </p>
+            <div class="maintenance-controls">
+              <button type="button" data-action="run">Run compact</button>
+            </div>
+            <pre class="maintenance-output" data-field="output" aria-live="polite"></pre>
+            <p class="maintenance-error" data-field="error" hidden></p>
+          </article>
         </div>
       </section>
 
