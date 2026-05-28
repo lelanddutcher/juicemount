@@ -182,7 +182,7 @@ Every slice MUST pass:
 ### SLICE 0 — Rename + tab nav scaffold
 
 **ID:** `slice-0-rename`
-**Status:** NOT STARTED
+**Status:** CODE COMPLETE (deploy + live validation deferred while user is mid-copy on production TrueNAS; commit db2b531, image published, awaiting redeploy authorization)
 **Depends on:** none
 **Blocks:** every other slice (foundation)
 
