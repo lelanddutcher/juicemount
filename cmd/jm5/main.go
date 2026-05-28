@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"strconv"
+
 	"github.com/redis/go-redis/v9"
 
 	"github.com/lelanddutcher/juicemount/cache"
@@ -185,6 +187,59 @@ func main() {
 	}
 	srv.Handler().SetRedisClient(rc)
 
+	// Spool wiring (Option 2). Same env-gated path as bridge/cbridge.go
+	// — JM_SPOOL_ENABLE=1 + optional JM_SPOOL_DIR / JM_SPOOL_SIZE_GB.
+	// Defaults to ~/Library/Application Support/JuiceMount/spool/ on
+	// Darwin or $TMPDIR/jm5-spool/ elsewhere.
+	var (
+		spoolStore *jmnfs.SpoolStore
+		drainer    *jmnfs.Drainer
+	)
+	if os.Getenv("JM_SPOOL_ENABLE") == "1" {
+		spoolDir := os.Getenv("JM_SPOOL_DIR")
+		if spoolDir == "" {
+			home, err := os.UserHomeDir()
+			if err != nil || home == "" {
+				spoolDir = filepath.Join(os.TempDir(), "jm5-spool")
+				jmlog.Warn("UserHomeDir failed; spool dir fell back to tmp",
+					"dir", spoolDir, "error", fmt.Sprintf("%v", err))
+			} else {
+				spoolDir = filepath.Join(home, "Library", "Application Support", "JuiceMount", "spool")
+			}
+		}
+		spoolCapacity := int64(50) << 30
+		if s := os.Getenv("JM_SPOOL_SIZE_GB"); s != "" {
+			if v, err := strconv.ParseInt(s, 10, 64); err != nil || v < 1 {
+				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using 50 GiB default",
+					"raw", s)
+			} else {
+				spoolCapacity = v << 30
+			}
+		}
+		if err := metadata.InitSpoolSchema(store.DB()); err != nil {
+			jmlog.Warn("spool schema init failed (spool disabled)", "error", err.Error())
+		} else {
+			meta := metadata.NewSpoolStore(store.DB())
+			ss, err := jmnfs.NewSpoolStore(spoolDir, spoolCapacity, meta)
+			if err != nil {
+				jmlog.Warn("spool store open failed (spool disabled)", "error", err.Error())
+			} else {
+				dr, err := jmnfs.NewDrainer(ss, jmnfs.DrainerConfig{FuseRoot: *fusePath})
+				if err != nil {
+					jmlog.Warn("drainer construct failed (spool disabled)", "error", err.Error())
+					ss.Stop()
+				} else {
+					srv.Handler().SetSpool(ss, dr)
+					dr.Start()
+					spoolStore = ss
+					drainer = dr
+					jmlog.Info("spool ready",
+						"dir", spoolDir,
+						"capacity_gb", float64(spoolCapacity)/(1<<30))
+				}
+			}
+		}
+	}
 	jmlog.Info("nfs server listening", "addr", srv.Addr())
 
 	// Wire per-RPC observation into the metrics package.
@@ -262,6 +317,16 @@ func main() {
 			"source_roots", roots,
 			"auth_enabled", effectiveAdminKey != "",
 			"migrator_redirect", "/migrator/* → /manager/*")
+	}
+
+	// /spool — slice E. Always register the route; the handler 503s
+	// when the spool isn't enabled so callers can detect the state
+	// without conditional URLs.
+	if metricsSrv.ExtraRoutes == nil {
+		metricsSrv.ExtraRoutes = make(map[string]http.HandlerFunc)
+	}
+	metricsSrv.ExtraRoutes["/spool"] = func(w http.ResponseWriter, r *http.Request) {
+		jmnfs.WriteSpoolStatusJSON(w, spoolStore, drainer)
 	}
 
 	if err := metricsSrv.Start(); err != nil {

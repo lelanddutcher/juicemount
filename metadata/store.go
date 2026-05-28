@@ -366,6 +366,14 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// DB returns the underlying *sql.DB. Exposed so peer subsystems can
+// register their own schemas alongside `entries` and share the same
+// connection pool + WAL — currently used by metadata.InitSpoolSchema +
+// metadata.NewSpoolStore for the Option-2 spool architecture, which
+// puts its `spool_entries` table in the same database file as the
+// entries cache.
+func (s *Store) DB() *sql.DB { return s.db }
+
 // Insert adds or replaces an entry in the store.
 func (s *Store) Insert(e *Entry) error {
 	s.writeMu.Lock()
