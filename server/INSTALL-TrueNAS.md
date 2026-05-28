@@ -143,9 +143,13 @@ services:
           exit 0
         fi
         echo "[format] running juicefs format with bucket=$$JM_BUCKET_URL"
+        # SLICE 3 default: --trash-days 7. New installs format with
+        # JuiceFS's built-in trash retention enabled so the Manager
+        # UI's Trash tab has a useful default window. The "Upgrading
+        # from --trash-days 0" section below covers existing installs.
         juicefs format --storage minio --bucket "$$JM_BUCKET_URL" \
           --access-key "$$MINIO_ROOT_USER" --secret-key "$$MINIO_ROOT_PASSWORD" \
-          --trash-days 0 "$$JM_META_URL" "$$JM_VOL_NAME" || { echo "[format] FAIL: juicefs format errored" >&2; exit 6; }
+          --trash-days 7 "$$JM_META_URL" "$$JM_VOL_NAME" || { echo "[format] FAIL: juicefs format errored" >&2; exit 6; }
         echo "[format] complete"
 
   # ─── juicefs: live FUSE mount + WebDAV (for browse / smoke test) ─
@@ -227,6 +231,45 @@ services:
       # available for canceled jobs after a redeploy).
       - CHANGEME_STATE_PATH:/var/lib/manager
 ```
+
+## Upgrading from --trash-days 0 (SLICE 3 trash retention)
+
+JuiceMount installs that formatted before SLICE 3 used
+`--trash-days 0`, which disabled JuiceFS's built-in trash retention
+entirely (deletes were immediate, permanent, and unrecoverable). SLICE
+3 ships with `--trash-days 7` for new installs and introduces the
+**Trash tab** in the Manager UI for browse/restore/delete operations.
+
+`juicefs format` is idempotent-skipped on every boot after the first
+(the `precheck-5` step in `juicefs-init` short-circuits when the
+metadata store already exists), so flipping the YAML value above does
+**NOT** auto-migrate existing volumes. To turn on 7-day retention on
+an already-formatted volume, exec into the running init container
+once:
+
+```sh
+docker exec ix-juicemount-juicefs-1 juicefs config <metaURL> --trash-days 7
+```
+
+Replace `<metaURL>` with the same Redis URL the compose YAML sets in
+`JM_META_URL` (typically `redis://redis:6379/1`). Verify the change:
+
+```sh
+docker exec ix-juicemount-juicefs-1 juicefs config <metaURL> | grep TrashDays
+```
+
+Once the value is set, the Manager UI's Trash tab → Retention drop-
+down shows the current value live and can update it from there
+without further `docker exec` calls.
+
+**What this does NOT recover:** files deleted before the retention
+knob was turned on are already gone. The change applies forward only.
+
+**Capacity heads-up:** the `.trash/` subtree lives inside the JuiceFS
+volume itself. A high-churn workflow with a long retention window
+will see real space sitting in trash. The Trash tab header banner
+makes this LOUD; operators should size the JuiceFS volume with a
+margin for retention.
 
 ## Upgrading from juicemount-migrator (SLICE 0 rename)
 

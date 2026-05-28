@@ -746,6 +746,153 @@ main {
   color: var(--text);
 }
 
+/* Trash tab (SLICE 3). Date-grouped list of .trash/ entries with
+   per-row Restore/Delete buttons, bulk-select via checkbox + shift-
+   click range, a retention drop-down that calls juicefs config, and
+   an Empty Trash button gated by a typed-confirmation modal. The
+   banner across the top makes the "trash counts against volume
+   capacity" risk LOUD in operator-facing copy. */
+.trash-pane .trash-header { margin: 0 0 1rem; }
+.trash-pane .trash-header h2 { margin: 0; font-size: 1.4rem; font-weight: 600; }
+.trash-banner {
+  margin: 0.5rem 0;
+  padding: 0.6rem 0.9rem;
+  border-left: 4px solid var(--running);
+  background: rgba(255, 149, 0, 0.08);
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+.trash-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+  margin: 0.75rem 0 0.5rem;
+}
+.trash-retention {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+.trash-retention select {
+  padding: 0.25rem 0.4rem;
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.trash-retention .hint {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+.trash-actions { display: inline-flex; gap: 0.5rem; flex-wrap: wrap; }
+.trash-actions button { font-size: 0.85rem; padding: 0.3rem 0.7rem; }
+.trash-actions .danger,
+.trash-modal-actions .danger {
+  background: var(--danger);
+  color: #fff;
+}
+.trash-summary {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+.trash-summary strong, .trash-summary #trash-count, .trash-summary #trash-bytes {
+  color: var(--text);
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+}
+
+.trash-list-wrap { margin: 1rem 0; }
+.trash-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+}
+.trash-list .trash-group-head {
+  background: var(--accent-bg);
+  color: var(--text);
+  font-weight: 600;
+  font-size: 0.8rem;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.trash-list .trash-row {
+  display: grid;
+  grid-template-columns: max-content 1fr max-content max-content;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px dashed var(--border);
+  font-size: 0.85rem;
+}
+.trash-list .trash-row:last-child { border-bottom: none; }
+.trash-list .trash-row.selected { background: var(--accent-bg); }
+.trash-row .trash-path {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trash-row .trash-size {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.trash-row .trash-row-actions { display: inline-flex; gap: 0.4rem; }
+.trash-row .trash-row-actions button {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.55rem;
+}
+.trash-empty-hint {
+  padding: 1rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-style: italic;
+}
+.trash-pager { margin: 0.5rem 0; text-align: center; }
+
+.trash-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.trash-modal-inner {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  max-width: 32rem;
+  width: calc(100% - 2rem);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+}
+.trash-modal-inner h3 { margin: 0 0 0.5rem; }
+.trash-modal-inner input[type=text] {
+  width: 100%;
+  padding: 0.5rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+}
+.trash-modal-actions {
+  margin-top: 0.75rem;
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
 footer {
   text-align: center;
   padding: 1rem;
