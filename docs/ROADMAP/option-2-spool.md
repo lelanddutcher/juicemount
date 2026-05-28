@@ -1,6 +1,6 @@
 # JuiceMount Spool — Option 2
 
-**Status:** IN PROGRESS — Slice D COMPLETE 2026-05-28 (CI pending)
+**Status:** IN PROGRESS — Slice D COMPLETE 2026-05-28 (CI green at 88b9790 after flaky-rerun)
 **Type:** Foundational architecture change
 **Scope:** ~1 week implementation + 2–3 days hardening/testing
 **Branch:** `production-hardening` (continues on it; not a separate branch)
