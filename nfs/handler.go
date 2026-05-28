@@ -78,6 +78,18 @@ type JuiceMountHandler struct {
 	recoveryMu        sync.Mutex
 	recoveryInFlight  map[uint64]chan struct{}        // inode → done-when-closed
 	recoveryNegative  map[uint64]time.Time            // inode → expiry; if now < expiry, skip
+
+	// Spool routing (Option 2, slice C). When non-nil, O_CREATE writes
+	// are routed through the spool instead of going directly to FUSE,
+	// decoupling Finder write ack from MinIO upload completion. Gated
+	// by JM_SPOOL_ENABLE at startup; nil means the existing fdPool
+	// writeFile path is used (the pre-spool behavior). Read path is
+	// NOT consulted here in slice C — slice D adds the 3-tier read
+	// lookup. Files written via spool are temporarily invisible to
+	// reads until the drainer copies them to FUSE (documented
+	// limitation in docs/ROADMAP/option-2-spool.md).
+	spool   *SpoolStore
+	drainer *Drainer
 }
 
 type verifierData struct {
@@ -238,6 +250,27 @@ func (h *JuiceMountHandler) isPinnedReady(canonicalPath string) bool {
 		return false
 	}
 	return h.pinStore.IsPinnedReady(canonicalPath)
+}
+
+// SetSpool attaches the JuiceMount-side write spool and its drainer.
+//
+// When set (non-nil), juiceFS.OpenFile routes O_CREATE writes through
+// the spool instead of directly through the fdPool/FUSE path. This
+// decouples Finder write ack from MinIO upload completion — writes
+// land on local SSD via spool, drainer copies to FUSE asynchronously.
+//
+// Pre-spool behavior is preserved when this is nil: the existing
+// writeFile path runs unchanged. This is the JM_SPOOL_ENABLE rollout
+// gate per the slice-C plan; callers (cmd/jm5/main.go, bridge/
+// cbridge.go) check the env var and skip SetSpool when disabled.
+//
+// Slice C scope: write path only. The read path does NOT consult the
+// spool here — slice D adds the 3-tier read lookup. Until slice D
+// ships, files newly written via spool are briefly invisible to
+// subsequent reads until the drainer copies them to FUSE.
+func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
+	h.spool = spool
+	h.drainer = drainer
 }
 
 // SetRedisClient attaches a Redis client for publishing metadata events.
@@ -431,7 +464,18 @@ func (h *JuiceMountHandler) evictStaleVerifiers(ttl time.Duration) {
 }
 
 // Stop cleans up handler resources.
+//
+// Shutdown order (slice C): drainer FIRST, then spool, then the older
+// subsystems. The drainer holds in-flight goroutines that touch the
+// spool, and the spool's index/db are still needed during the drainer
+// drain-window. Old fdPool and verifierStop sweep after that.
 func (h *JuiceMountHandler) StopHandler() {
+	if h.drainer != nil {
+		h.drainer.Stop(30 * time.Second)
+	}
+	if h.spool != nil {
+		h.spool.Stop()
+	}
 	if h.verifierStop != nil {
 		close(h.verifierStop)
 	}
@@ -1235,6 +1279,42 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	fullPath := jfs.fullPath(filename)
 
 	if isWrite {
+		// Spool-routed path (Option 2, slice C): O_CREATE writes go
+		// through the spool so Finder ack happens at local SSD speed
+		// regardless of MinIO/FUSE backpressure. Scoped to O_CREATE
+		// only — in-place RDWR opens of existing files keep the
+		// fdPool/FUSE path so this slice doesn't change behavior for
+		// editors that re-save existing files.
+		if jfs.handler.spool != nil && flag&os.O_CREATE != 0 {
+			sentry, err := jfs.handler.spool.OpenWrite(filename)
+			if err != nil {
+				return nil, err
+			}
+			// Slice C does not carry a metadata.Entry through the
+			// spool path — the inode + metadata-store entry are
+			// owned by the eventual drain into FUSE (which triggers
+			// the publishEvent that the existing writeFile path
+			// emits). Slice E will surface in-flight entries to the
+			// UI via the spool index, not the metadata store.
+			//
+			// Orphan recovery: if the process is SIGKILLed after
+			// spool.OpenWrite but before spoolWriteFile.Close, the
+			// SQL row sits in `writing` state with the spool file
+			// half-written. Slice F's boot scrubber reaps these.
+			// Until slice F ships, an orphan-writing-row check at
+			// jm5 boot is a known TODO.
+			//
+			// QA-19: same phantom-purge gate as the legacy write
+			// path. spoolWriteFile.Close calls decActiveWriter via
+			// a defer so the gate stays up through entry.Close.
+			jfs.handler.incActiveWriter(filename)
+			return &spoolWriteFile{
+				name:    filename,
+				entry:   sentry,
+				handler: jfs.handler,
+			}, nil
+		}
+
 		fd, err := jfs.handler.fdPool.GetWrite(fullPath, flag, perm)
 		if err != nil {
 			return nil, err
