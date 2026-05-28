@@ -158,6 +158,7 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 		hashValid: true,
 		store:     s,
 	}
+	entry.lastWrite.Store(time.Now().UnixNano())
 	entry.refcount.Store(1)
 	s.index.Insert(nfsPath, entry)
 	return entry, nil
@@ -325,6 +326,24 @@ type SpoolEntry struct {
 	nfsPath   string
 	spoolFile string
 
+	// Inode assigned at OpenFile time by the handler so Stat/Lstat
+	// during the writing/ready/draining lifetime return a stable value.
+	// Set via SetInode (once) after OpenWrite returns. Zero until set.
+	//
+	// atomic.Uint64 (slice D reviewer CRITICAL fix): SetInode and Inode
+	// can race across goroutines (OpenFile-write sets; Stat/Lstat read
+	// concurrently). Plain field had a data race that -race would catch
+	// in a concurrent Stat + OpenWrite interleaving. CompareAndSwap
+	// preserves the once-set semantics atomically.
+	inode atomic.Uint64
+
+	// lastWrite is atomic Unix-nanoseconds of the most recent WriteAt
+	// that extended writtenEnd. Used by the slice D Stat/Lstat shadow
+	// so an in-flight file's mtime reflects writer activity instead of
+	// returning 1970-epoch. Initialized to OpenWrite time; updated on
+	// each writing-extending WriteAt.
+	lastWrite atomic.Int64
+
 	mu         sync.RWMutex
 	file       *os.File // nil after Close
 	writtenEnd int64
@@ -359,6 +378,26 @@ func (e *SpoolEntry) WrittenEnd() int64 {
 	n := e.writtenEnd
 	e.mu.RUnlock()
 	return n
+}
+
+// SetInode sets the synthetic inode for this entry. Called once by the
+// NFS handler immediately after OpenWrite so Stat/Lstat returning a
+// FileInfo for this entry reports a stable inode for the lifetime of
+// the entry. CAS preserves once-set semantics: only the first non-zero
+// SetInode wins; subsequent calls are no-ops.
+func (e *SpoolEntry) SetInode(inode uint64) {
+	e.inode.CompareAndSwap(0, inode)
+}
+
+// Inode returns the synthetic inode set via SetInode. Zero if SetInode
+// was never called (drainer rows recovered via boot scrubber will have
+// 0 here; callers must guard).
+func (e *SpoolEntry) Inode() uint64 { return e.inode.Load() }
+
+// LastWrite returns the time of the most recent extending WriteAt as a
+// time.Time. Used by the slice D Stat/Lstat shadow path for mtime.
+func (e *SpoolEntry) LastWrite() time.Time {
+	return time.Unix(0, e.lastWrite.Load())
 }
 
 // SHA256 returns the final streaming SHA-256 hash. Returns nil if Close
@@ -425,6 +464,7 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 				e.store.releaseCapacity(reserved - actualDelta)
 			}
 			e.writtenEnd = end
+			e.lastWrite.Store(time.Now().UnixNano())
 		} else if reserved > 0 {
 			// Wrote bytes but did not extend writtenEnd — release the
 			// whole reservation since we never actually grew the file.
