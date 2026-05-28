@@ -76,6 +76,17 @@
     if (name === 'migrations') {
       initMigrationsOnce();
     }
+    // SLICE 2: lifecycle the overview poller so it only runs while
+    // the tab is actually visible to the user. startOverviewPolling
+    // is idempotent — repeated start calls just refresh the cached
+    // tab-active flag. The visibilitychange listener (set up in
+    // initOverviewOnce) handles tab-hidden pauses orthogonally.
+    if (name === 'overview') {
+      initOverviewOnce();
+      startOverviewPolling();
+    } else {
+      stopOverviewPolling();
+    }
   }
 
   window.addEventListener('hashchange', route);
@@ -712,6 +723,207 @@
     // starts only after first activation so placeholder tabs don't
     // fire useless requests.
     setInterval(loadJobs, 10000);
+  }
+
+  // -------- Overview (SLICE 2) --------
+  // Read-only dashboard. Polls /api/overview every OVERVIEW_INTERVAL_MS
+  // while the tab is visible AND the document is visible. Polling
+  // pauses on document.hidden (background tab / screen lock) and on
+  // tab-switch away from #/overview; it resumes on the next visible
+  // window. Each card re-renders from one section of OverviewSnapshot
+  // — per-section .error strings render in a small error pill so a
+  // failing backend degrades only that card.
+  const OVERVIEW_INTERVAL_MS = 10000;
+  const overviewState = {
+    inited: false,
+    timer: null,
+    inFlight: false,
+  };
+
+  // initOverviewOnce wires the visibilitychange listener exactly once.
+  // The listener pauses/resumes the poller based on document.visibilityState
+  // so background tabs don't burn CPU or fire backend probes.
+  function initOverviewOnce() {
+    if (overviewState.inited) return;
+    overviewState.inited = true;
+    document.addEventListener('visibilitychange', () => {
+      // visibilityState transitions: 'visible' ↔ 'hidden'. We only
+      // (re)start polling when the dashboard tab is the active one;
+      // a hidden window while sitting on Overview should not be
+      // polling. Conversely a foreground window on a different tab
+      // should not be polling Overview either.
+      const onOverview = location.hash === '#/overview';
+      if (document.visibilityState === 'visible' && onOverview) {
+        startOverviewPolling();
+      } else {
+        stopOverviewPolling();
+      }
+    });
+  }
+
+  function startOverviewPolling() {
+    if (overviewState.timer) return; // already running
+    if (document.visibilityState !== 'visible') return; // window hidden
+    // Fire one immediately so the UI doesn't show stale "—" placeholders
+    // for the first OVERVIEW_INTERVAL_MS while waiting for the tick.
+    pollOverview();
+    overviewState.timer = setInterval(pollOverview, OVERVIEW_INTERVAL_MS);
+  }
+
+  function stopOverviewPolling() {
+    if (!overviewState.timer) return;
+    clearInterval(overviewState.timer);
+    overviewState.timer = null;
+  }
+
+  async function pollOverview() {
+    if (overviewState.inFlight) return; // skip overlap; next tick re-tries
+    overviewState.inFlight = true;
+    try {
+      const snap = await api('GET', '/api/overview');
+      renderOverview(snap);
+    } catch (err) {
+      // The endpoint is supposed to never 5xx, so anything reaching
+      // here is a transport-layer issue (network blip, auth prompt
+      // cancellation, page navigated mid-flight). Show a non-blocking
+      // hint in the header without nuking the previously-rendered cards.
+      const upd = document.getElementById('overview-updated');
+      if (upd) upd.textContent = 'last poll failed: ' + (err.message || err);
+    } finally {
+      overviewState.inFlight = false;
+    }
+  }
+
+  function renderOverview(snap) {
+    const upd = document.getElementById('overview-updated');
+    if (upd && snap && snap.collected_at) {
+      const d = new Date(snap.collected_at);
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      upd.textContent = `last updated ${hh}:${mm}:${ss}`;
+    }
+    renderOverviewCard('volume', snap.volume, (card, v) => {
+      setField(card, 'name', v.name || '(unset)');
+      setField(card, 'used', formatBytes(v.used_bytes || 0));
+      setField(card, 'files', (v.files || 0).toLocaleString());
+    });
+    renderOverviewCard('redis', snap.redis, (card, v) => {
+      setField(card, 'latency', v.latency_ms != null ? v.latency_ms + ' ms' : '—');
+      setField(card, 'version', v.version || '—');
+      setField(card, 'memory', v.used_memory_mb ? v.used_memory_mb + ' MB' : '—');
+      setField(card, 'uptime', v.uptime_sec ? formatDuration(v.uptime_sec * 1000) : '—');
+    });
+    renderOverviewCard('minio', snap.minio, (card, v) => {
+      setField(card, 'endpoint', v.endpoint || '—');
+      setField(card, 'latency', v.latency_ms != null ? v.latency_ms + ' ms' : '—');
+    });
+    renderOverviewCard('cache', snap.cache, (card, v) => {
+      setField(card, 'hit', v.available ? (v.hit_rate_pct || 0).toFixed(1) + '%' : 'unavailable');
+      setField(card, 'reads', v.available ? (v.read_ops_per_s || 0).toFixed(1) : 'unavailable');
+      setField(card, 'writes', v.available ? (v.write_ops_per_s || 0).toFixed(1) : 'unavailable');
+    });
+    renderOverviewJobs(snap.jobs);
+  }
+
+  // renderOverviewCard updates one stat-card. Each card has a section
+  // header pill (ok / warn / error) and an .overview-error <p>
+  // populated from the section's .error string. The body-render
+  // closure handles the per-card field wiring.
+  function renderOverviewCard(name, section, fillBody) {
+    const card = document.querySelector(`.overview-card[data-card="${name}"]`);
+    if (!card || !section) return;
+    const errEl = card.querySelector('.overview-error');
+    const stateEl = card.querySelector('.overview-card-state');
+    if (section.error) {
+      errEl.textContent = section.error;
+      errEl.hidden = false;
+      stateEl.textContent = 'error';
+      stateEl.className = 'overview-card-state error';
+    } else {
+      errEl.hidden = true;
+      errEl.textContent = '';
+      // OK pill state: most cards default to "ok" when no error; the
+      // Redis/MinIO cards key off .reachable, and Cache keys off
+      // .available, so the dashboard's pill stays informative even
+      // when the backend returns successfully-but-unreachable.
+      let ok = true;
+      if (name === 'redis' || name === 'minio') ok = !!section.reachable;
+      if (name === 'cache') ok = !!section.available;
+      stateEl.textContent = ok ? 'ok' : 'down';
+      stateEl.className = ok ? 'overview-card-state ok' : 'overview-card-state warn';
+    }
+    fillBody(card, section);
+  }
+
+  function setField(card, key, value) {
+    const el = card.querySelector(`[data-field="${key}"]`);
+    if (el) el.textContent = value;
+  }
+
+  function renderOverviewJobs(section) {
+    const card = document.querySelector('.overview-card[data-card="jobs"]');
+    if (!card) return;
+    const errEl = card.querySelector('.overview-error');
+    const stateEl = card.querySelector('.overview-card-state');
+    const list = card.querySelector('.overview-jobs');
+    if (!section) return;
+    if (section.error) {
+      errEl.textContent = section.error;
+      errEl.hidden = false;
+      stateEl.textContent = 'error';
+      stateEl.className = 'overview-card-state error';
+      list.innerHTML = '';
+      return;
+    }
+    errEl.hidden = true;
+    const items = section.items || [];
+    stateEl.textContent = items.length + ' recent';
+    stateEl.className = 'overview-card-state ok';
+    list.innerHTML = '';
+    if (items.length === 0) {
+      const li = document.createElement('li');
+      li.innerHTML = '<span class="ov-paths">(no jobs yet)</span>';
+      list.appendChild(li);
+      return;
+    }
+    for (const j of items) {
+      const li = document.createElement('li');
+      const state = document.createElement('span');
+      state.className = 'ov-state ' + j.state;
+      state.textContent = j.state;
+      const paths = document.createElement('span');
+      paths.className = 'ov-paths';
+      paths.textContent = j.source + ' → ' + j.destination;
+      const bytes = document.createElement('span');
+      bytes.className = 'ov-bytes';
+      bytes.textContent = formatBytes(j.bytes || 0);
+      const dur = document.createElement('span');
+      dur.className = 'ov-duration';
+      dur.textContent = formatDuration(j.duration_ms || 0);
+      li.appendChild(state);
+      li.appendChild(paths);
+      li.appendChild(bytes);
+      li.appendChild(dur);
+      list.appendChild(li);
+    }
+  }
+
+  // formatDuration takes milliseconds and renders a compact label
+  // ("3.2s", "1m12s", "2h05m"). Used by the recent-jobs row + the
+  // Redis uptime field. Bounded growth — never returns days-level
+  // labels because the Overview slice doesn't surface long-running
+  // job history at that resolution.
+  function formatDuration(ms) {
+    if (!ms || ms < 0) return '—';
+    const totalSec = Math.round(ms / 1000);
+    if (totalSec < 60) return totalSec + 's';
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    if (m < 60) return m + 'm' + String(s).padStart(2, '0') + 's';
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return h + 'h' + String(mm).padStart(2, '0') + 'm';
   }
 
   // -------- Boot --------

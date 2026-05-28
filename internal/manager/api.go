@@ -25,6 +25,12 @@ type API struct {
 	prefix      string   // route-mount prefix (e.g. "/manager"); empty for standalone
 	fuseMount   string   // for ModeEmbedded dest-traversal check; empty in standalone
 	volName     string   // for ModeStandalone dest-validation
+
+	// overview is the SLICE-2 fan-out aggregator. Nil only in unit
+	// tests that hand-construct an API without going through Register
+	// (the handler defensively returns an "overview not configured"
+	// snapshot in that case rather than NPE'ing).
+	overview *overviewSource
 }
 
 // Config bundles the fields needed to construct + register the API.
@@ -49,6 +55,18 @@ type Config struct {
 	DestMount   string   // user-facing destination prefix (e.g. /jfs)
 	AdminKey    string   // empty = no auth (LAN-only)
 	StateFile   string   // optional JSON path for job-history persistence (empty = ephemeral)
+	// MinIOURL is the http endpoint the SLICE-2 Overview tab pings via
+	// /minio/health/live. Optional — when empty the MinIO card on the
+	// dashboard renders an "endpoint not configured" hint rather than a
+	// false-green reachable state.
+	MinIOURL string
+	// OverviewMetaURL is the Redis URL the SLICE-2 Overview tab uses for
+	// `juicefs status` + Redis INFO probes when running in embedded
+	// mode (where MetaURL above stays unset because the FUSE mount
+	// handles writes). When OverviewMetaURL is empty we fall back to
+	// MetaURL — useful for standalone mode where the one URL serves
+	// both purposes.
+	OverviewMetaURL string
 }
 
 // Register wires the manager's routes onto an existing ServeMux at
@@ -81,6 +99,17 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		fuseMount:   cfg.FUSEMount,
 		volName:     cfg.VolName,
 	}
+	// SLICE 2: wire the overview aggregator. Picks OverviewMetaURL when
+	// set (embedded mode passes it explicitly so the dashboard can probe
+	// Redis even though writes go through FUSE), falls back to MetaURL
+	// (standalone mode). Either may be empty in which case the per-
+	// section probes emit an "metaURL not configured" Error and the
+	// dashboard shows an actionable hint instead of bogus data.
+	overviewMeta := cfg.OverviewMetaURL
+	if overviewMeta == "" {
+		overviewMeta = cfg.MetaURL
+	}
+	a.overview = newOverviewSource(mgr, cfg.JuiceFSBin, overviewMeta, cfg.MinIOURL, cfg.FUSEMount)
 	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
 	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))
 	// SLICE 1: /api/browse-jfs walks the JuiceFS FUSE mount tree.
@@ -94,6 +123,11 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mux.HandleFunc(prefix+"/api/migrate", a.auth(a.handleMigrate))
 	mux.HandleFunc(prefix+"/api/jobs", a.auth(a.handleListJobs))
 	mux.HandleFunc(prefix+"/api/jobs/", a.auth(a.handleJobOps))
+	// SLICE 2: read-only Overview dashboard aggregator. Always returns
+	// 200 — per-backend failures surface in OverviewSnapshot.<section>.Error
+	// so a hung Redis doesn't break the entire dashboard. Auth-wrapped
+	// like every other endpoint (no auth bypass).
+	mux.HandleFunc(prefix+"/api/overview", a.auth(a.handleOverview))
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))

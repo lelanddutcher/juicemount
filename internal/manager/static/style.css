@@ -620,6 +620,132 @@ main {
   background: var(--bg-elev); color: var(--text); width: 8rem;
 }
 
+/* Overview tab (SLICE 2). Stat-card grid: 4 cards across on desktop,
+   collapsing to a single column on narrow screens. The "wide" card
+   (Recent jobs) spans all columns so the job-list isn't squished. */
+.overview-pane .overview-header {
+  margin: 0 0 1rem;
+}
+.overview-pane .overview-header h2 {
+  margin: 0;
+  font-size: 1.4rem;
+  font-weight: 600;
+}
+.overview-pane .overview-header .hint {
+  margin: 0.25rem 0 0;
+}
+.overview-updated {
+  margin-left: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+}
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+.overview-card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+}
+.overview-card-wide {
+  grid-column: 1 / -1;
+}
+.overview-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.5rem;
+}
+.overview-card header h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.overview-card-state {
+  font-size: 0.7rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-weight: 500;
+}
+.overview-card-state.ok { background: rgba(0, 135, 90, 0.18); color: var(--success); }
+.overview-card-state.warn { background: rgba(255, 149, 0, 0.18); color: var(--running); }
+.overview-card-state.error { background: rgba(215, 0, 21, 0.18); color: var(--danger); }
+.overview-card dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2rem 0.6rem;
+  font-size: 0.85rem;
+}
+.overview-card dt {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.overview-card dd {
+  margin: 0;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  word-break: break-all;
+}
+.overview-error {
+  margin: 0.5rem 0 0;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.75rem;
+  color: var(--danger);
+  background: rgba(215, 0, 21, 0.08);
+  border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+}
+.overview-jobs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.8rem;
+}
+.overview-jobs li {
+  display: grid;
+  grid-template-columns: max-content 1fr max-content max-content;
+  gap: 0.6rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px dashed var(--border);
+  align-items: baseline;
+}
+.overview-jobs li:last-child { border-bottom: none; }
+.overview-jobs .ov-state {
+  font-size: 0.7rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 8px;
+}
+.overview-jobs .ov-state.done     { background: rgba(0, 135, 90, 0.18); color: var(--success); }
+.overview-jobs .ov-state.running  { background: rgba(255, 149, 0, 0.18); color: var(--running); }
+.overview-jobs .ov-state.pending  { background: var(--accent-bg); color: var(--accent); }
+.overview-jobs .ov-state.error    { background: rgba(215, 0, 21, 0.18); color: var(--danger); }
+.overview-jobs .ov-state.canceled { background: rgba(155, 155, 155, 0.20); color: var(--text-muted); }
+.overview-jobs .ov-paths {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.overview-jobs .ov-bytes,
+.overview-jobs .ov-duration {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.75rem;
+  color: var(--text);
+}
+
 footer {
   text-align: center;
   padding: 1rem;

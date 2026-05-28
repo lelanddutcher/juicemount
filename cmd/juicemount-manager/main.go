@@ -50,6 +50,7 @@ func main() {
 	sourceRoots := flag.String("source-roots", "/sources", "Comma-separated host paths the manager may browse from")
 	adminKey := flag.String("admin-key", os.Getenv("JM_ADMIN_KEY"), "Admin key for X-JuiceMount-Admin-Key auth (empty = disabled)")
 	stateFile := flag.String("state-file", os.Getenv("JM_STATE_FILE"), "Optional JSON path for job-history persistence (empty = jobs lost on restart). Bind-mount the dir to make history survive container churn.")
+	minioURL := flag.String("minio-url", envOr("JM_MINIO_URL", ""), "SLICE 2: MinIO base URL the Overview dashboard pings via /minio/health/live. Empty disables the MinIO probe (Overview card shows an actionable hint). Use the same URL Mac clients connect to so the dashboard reflects what they see.")
 	flag.Parse()
 
 	roots := splitNonEmpty(*sourceRoots, ",")
@@ -76,6 +77,7 @@ func main() {
 		DestMount:   *destMount,
 		AdminKey:    *adminKey,
 		StateFile:   *stateFile,
+		MinIOURL:    *minioURL,
 	}
 	mgr := manager.Register(mux, "", cfg)
 
@@ -114,6 +116,16 @@ func main() {
 	log.Println("shutting down...")
 	mgr.StopAll()
 	_ = srv.Close()
+}
+
+// envOr returns the environment variable's value if set+non-empty,
+// otherwise fallback. Used as a flag-default helper so JM_* env vars
+// override the hardcoded defaults without breaking explicit flag values.
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func splitNonEmpty(s, sep string) []string {

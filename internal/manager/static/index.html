@@ -31,11 +31,67 @@
     </nav>
 
     <main id="app">
-      <!-- Overview tab (placeholder; SLICE 2). -->
-      <section data-tab="overview" class="tab-pane" hidden>
-        <div class="placeholder">
+      <!-- Overview tab (SLICE 2). Read-only at-a-glance dashboard.
+           Polls /api/overview every 10s while the tab is visible
+           (paused on document visibilitychange when hidden). Each
+           card renders independently from one section of
+           OverviewSnapshot — per-section .error strings render in an
+           error pill so a single failing backend doesn't blank the
+           whole dashboard. -->
+      <section data-tab="overview" class="tab-pane overview-pane" hidden>
+        <div class="overview-header">
           <h2>Overview</h2>
-          <p>Read-only volume health dashboard. Coming soon.</p>
+          <p class="hint">
+            Volume health at a glance. Polled every 10 seconds while this tab is open.
+            <span id="overview-updated" class="overview-updated"></span>
+          </p>
+        </div>
+        <div class="overview-grid">
+          <article class="overview-card" data-card="volume">
+            <header><h3>Volume</h3><span class="overview-card-state"></span></header>
+            <dl>
+              <dt>Name</dt><dd data-field="name">—</dd>
+              <dt>Used</dt><dd data-field="used">—</dd>
+              <dt>Files</dt><dd data-field="files">—</dd>
+            </dl>
+            <p class="overview-error" hidden></p>
+          </article>
+
+          <article class="overview-card" data-card="redis">
+            <header><h3>Redis</h3><span class="overview-card-state"></span></header>
+            <dl>
+              <dt>Latency</dt><dd data-field="latency">—</dd>
+              <dt>Version</dt><dd data-field="version">—</dd>
+              <dt>Memory</dt><dd data-field="memory">—</dd>
+              <dt>Uptime</dt><dd data-field="uptime">—</dd>
+            </dl>
+            <p class="overview-error" hidden></p>
+          </article>
+
+          <article class="overview-card" data-card="minio">
+            <header><h3>MinIO</h3><span class="overview-card-state"></span></header>
+            <dl>
+              <dt>Endpoint</dt><dd data-field="endpoint">—</dd>
+              <dt>Latency</dt><dd data-field="latency">—</dd>
+            </dl>
+            <p class="overview-error" hidden></p>
+          </article>
+
+          <article class="overview-card" data-card="cache">
+            <header><h3>Cache</h3><span class="overview-card-state"></span></header>
+            <dl>
+              <dt>Hit rate</dt><dd data-field="hit">—</dd>
+              <dt>Reads/s</dt><dd data-field="reads">—</dd>
+              <dt>Writes/s</dt><dd data-field="writes">—</dd>
+            </dl>
+            <p class="overview-error" hidden></p>
+          </article>
+
+          <article class="overview-card overview-card-wide" data-card="jobs">
+            <header><h3>Recent jobs</h3><span class="overview-card-state"></span></header>
+            <ul class="overview-jobs" data-field="items"></ul>
+            <p class="overview-error" hidden></p>
+          </article>
         </div>
       </section>
 

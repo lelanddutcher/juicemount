@@ -18,12 +18,24 @@ import (
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/health"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
-	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/manager"
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
+
+// defaultStr returns s if non-empty, otherwise fallback. Used for
+// env-var-fallback flag defaults so JM_* env vars override the
+// hardcoded defaults without breaking explicit flag values (Go's
+// flag.String uses its default as the resolved value when the flag
+// isn't passed).
+func defaultStr(s, fallback string) string {
+	if s != "" {
+		return s
+	}
+	return fallback
+}
 
 // splitNonEmpty is a small helper for parsing comma-separated CLI args.
 func splitNonEmpty(s, sep string) []string {
@@ -51,6 +63,11 @@ func main() {
 	logFile := flag.String("log-file", "", "Optional path to additionally write JSON log records")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	metricsAddr := flag.String("metrics-addr", "127.0.0.1:11050", "HTTP listen address for /metrics and /health")
+	// SLICE 2: MinIO URL the Overview dashboard pings via
+	// /minio/health/live. Defaults to localhost:9000 for backwards
+	// compat with single-host deployments. JM_MINIO_URL env var
+	// fallback so docker-compose deployments don't have to wire a flag.
+	managerMinIOURL := flag.String("manager-minio-url", defaultStr(os.Getenv("JM_MINIO_URL"), "http://127.0.0.1:9000"), "Base URL the Overview dashboard probes for MinIO liveness. Use the same value Mac clients connect to so the dashboard reflects what they see.")
 	// SLICE 0 rename: --migrator-* flags kept as backward-compat
 	// aliases (one release). The canonical flags are --manager-*.
 	// If both are set, --manager-* wins.
@@ -219,6 +236,13 @@ func main() {
 			SourceRoots: roots,
 			DestMount:   "/jfs",
 			AdminKey:    effectiveAdminKey,
+			// SLICE 2: Overview dashboard probes. Embedded mode doesn't
+			// set MetaURL (FUSE handles writes), so we hand the Redis
+			// URL in via OverviewMetaURL — same value, separate field
+			// to keep the existing destination-resolution logic
+			// untouched. MinIOURL matches the health-monitor's pin.
+			MinIOURL:        *managerMinIOURL,
+			OverviewMetaURL: *redisURL,
 		})
 		metricsSrv.ExtraRoutes["/manager/"] = mgrMux.ServeHTTP
 		// Also handle the bare /manager (no trailing slash) so a
