@@ -19,7 +19,7 @@ import (
 	"github.com/lelanddutcher/juicemount/health"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
-	"github.com/lelanddutcher/juicemount/internal/migrator"
+	"github.com/lelanddutcher/juicemount/internal/manager"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
@@ -51,8 +51,13 @@ func main() {
 	logFile := flag.String("log-file", "", "Optional path to additionally write JSON log records")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	metricsAddr := flag.String("metrics-addr", "127.0.0.1:11050", "HTTP listen address for /metrics and /health")
-	migratorSourceRoots := flag.String("migrator-source-roots", "", "Comma-separated host paths the migrator's web UI may browse from. Empty = migrator disabled.")
-	migratorAdminKey := flag.String("migrator-admin-key", os.Getenv("JM_ADMIN_KEY"), "Admin key for the migrator's X-JuiceMount-Admin-Key header. Empty disables auth.")
+	// SLICE 0 rename: --migrator-* flags kept as backward-compat
+	// aliases (one release). The canonical flags are --manager-*.
+	// If both are set, --manager-* wins.
+	managerSourceRoots := flag.String("manager-source-roots", "", "Comma-separated host paths the manager's web UI may browse from. Empty = manager disabled.")
+	managerAdminKey := flag.String("manager-admin-key", "", "Admin key for the manager's X-JuiceMount-Admin-Key header. Empty disables auth. JM_ADMIN_KEY env var used as fallback if neither this nor --migrator-admin-key is set explicitly.")
+	migratorSourceRoots := flag.String("migrator-source-roots", "", "DEPRECATED: alias for --manager-source-roots, kept for one-release compat.")
+	migratorAdminKey := flag.String("migrator-admin-key", "", "DEPRECATED: alias for --manager-admin-key, kept for one-release compat.")
 	flag.Parse()
 
 	// Initialize structured logging before anything else logs.
@@ -169,42 +174,70 @@ func main() {
 	jmlibnfs.SetObserver(metrics.ObserveRPC)
 
 	// Start metrics HTTP server (exposes /metrics and /health, plus
-	// the embedded migrator UI at /migrator/ when source roots are set).
+	// the embedded manager UI at /manager/ when source roots are set).
 	metricsSrv := metrics.NewServer(*metricsAddr, metrics.Default())
 
-	// Wire the migrator's routes onto the metrics listener — single
-	// process, no separate container. Migrator writes through the
+	// Wire the manager's routes onto the metrics listener — single
+	// process, no separate container. Manager writes through the
 	// in-process FUSE mount so chunks flow via the same juicefs
 	// daemon as the NFS gateway.
-	var migJobMgr *migrator.JobManager
-	if *migratorSourceRoots != "" {
-		roots := splitNonEmpty(*migratorSourceRoots, ",")
+	//
+	// SLICE 0 rename compat: --manager-* wins if set; otherwise fall
+	// back to the legacy --migrator-* aliases.
+	effectiveSourceRoots := *managerSourceRoots
+	if effectiveSourceRoots == "" {
+		effectiveSourceRoots = *migratorSourceRoots
+	}
+	// Admin-key precedence: explicit --manager-admin-key > explicit
+	// --migrator-admin-key (legacy alias) > JM_ADMIN_KEY env var. The
+	// env var is only a fallback so an operator who passes a flag
+	// value explicitly always overrides whatever's in env (matches
+	// pre-rename behaviour of --migrator-admin-key, which had env as
+	// its flag default and thus was overridden by any explicit value).
+	effectiveAdminKey := *managerAdminKey
+	if effectiveAdminKey == "" {
+		effectiveAdminKey = *migratorAdminKey
+	}
+	if effectiveAdminKey == "" {
+		effectiveAdminKey = os.Getenv("JM_ADMIN_KEY")
+	}
+	var mgrJobMgr *manager.JobManager
+	if effectiveSourceRoots != "" {
+		roots := splitNonEmpty(effectiveSourceRoots, ",")
 		if metricsSrv.ExtraRoutes == nil {
 			metricsSrv.ExtraRoutes = make(map[string]http.HandlerFunc)
 		}
 		// metrics.Server.ExtraRoutes maps a path → handler. The
-		// migrator's Register attaches its routes to a ServeMux,
+		// manager's Register attaches its routes to a ServeMux,
 		// not directly to ExtraRoutes — so we build a sub-mux and
 		// register one catch-all that forwards everything under
-		// /migrator/ to it.
-		migMux := http.NewServeMux()
-		migJobMgr = migrator.Register(migMux, "/migrator", migrator.Config{
+		// /manager/ to it.
+		mgrMux := http.NewServeMux()
+		mgrJobMgr = manager.Register(mgrMux, "/manager", manager.Config{
 			JuiceFSBin:  "juicefs", // PATH lookup
 			FUSEMount:   *fusePath, // embedded mode: write via in-process FUSE mount
 			SourceRoots: roots,
 			DestMount:   "/jfs",
-			AdminKey:    *migratorAdminKey,
+			AdminKey:    effectiveAdminKey,
 		})
-		metricsSrv.ExtraRoutes["/migrator/"] = migMux.ServeHTTP
-		// Also handle the bare /migrator (no trailing slash) so a
+		metricsSrv.ExtraRoutes["/manager/"] = mgrMux.ServeHTTP
+		// Also handle the bare /manager (no trailing slash) so a
 		// browser hitting that URL gets redirected to the UI.
-		metricsSrv.ExtraRoutes["/migrator"] = func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/migrator/", http.StatusFound)
+		metricsSrv.ExtraRoutes["/manager"] = func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/manager/", http.StatusFound)
 		}
-		jmlog.Info("migrator enabled",
-			"prefix", "/migrator",
+		// SLICE 0 compat shim: 301 every legacy /migrator/* request
+		// to the corresponding /manager/* path. The redirect is
+		// permanent (browsers/proxies may cache) — the migrator
+		// alias is dropped one release after slice-0 ships.
+		redirector := manager.RedirectMigrator()
+		metricsSrv.ExtraRoutes["/migrator/"] = redirector
+		metricsSrv.ExtraRoutes["/migrator"] = redirector
+		jmlog.Info("manager enabled",
+			"prefix", "/manager",
 			"source_roots", roots,
-			"auth_enabled", *migratorAdminKey != "")
+			"auth_enabled", effectiveAdminKey != "",
+			"migrator_redirect", "/migrator/* → /manager/*")
 	}
 
 	if err := metricsSrv.Start(); err != nil {
@@ -297,11 +330,11 @@ func main() {
 	srv.Stop()
 	srv.Handler().StopHandler()
 
-	if migJobMgr != nil {
+	if mgrJobMgr != nil {
 		// Cancel in-flight migrations before tearing down the FUSE mount;
 		// otherwise juicefs sync writes against a path that's
 		// disappearing under it.
-		migJobMgr.StopAll()
+		mgrJobMgr.StopAll()
 	}
 	if metricsSrv != nil {
 		metricsSrv.Stop()

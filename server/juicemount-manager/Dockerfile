@@ -1,9 +1,9 @@
-# Standalone JuiceMount Migrator container.
+# Standalone JuiceMount Manager container.
 #
-# This image is for users who run the migrator WITHOUT juicemount-server
+# This image is for users who run the manager WITHOUT juicemount-server
 # on the same host (e.g. TrueNAS users whose NFS gateway lives on the
-# Mac client). Users running juicemount-server already get the migrator
-# embedded at /migrator/ on the existing metrics port — no separate
+# Mac client). Users running juicemount-server already get the manager
+# embedded at /manager/ on the existing metrics port — no separate
 # container needed.
 #
 # Standalone mode talks to Redis + MinIO directly via jfs://<vol> URLs.
@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux \
     go build -ldflags="-s -w" \
-      -o /out/juicemount-migrator ./cmd/juicemount-migrator
+      -o /out/juicemount-manager ./cmd/juicemount-manager
 
 # ----- Stage 2: runtime -----
 # juicedata/mount gives us /usr/local/bin/juicefs for the sync subprocess.
@@ -39,7 +39,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /out/juicemount-migrator /usr/local/bin/juicemount-migrator
+COPY --from=builder /out/juicemount-manager /usr/local/bin/juicemount-manager
 
 RUN mkdir -p /sources
 
@@ -57,7 +57,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # (e.g. JM_META=redis://192.168.0.197:30179/1). To switch to embedded
 # mode, override with `command: ["--fuse-mount=/jfs"]` in compose AND
 # pre-mount the JuiceFS volume at /jfs (cap_add SYS_ADMIN, /dev/fuse).
-ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/juicemount-migrator \
+ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/juicemount-manager \
     --listen=\"$JM_LISTEN\" \
     --dest-mount=\"$JM_DEST_MOUNT\" \
     --source-roots=\"$JM_SOURCE_ROOTS\" \

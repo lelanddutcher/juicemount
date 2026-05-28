@@ -6,7 +6,11 @@
 #   minio                — S3 object store for JuiceFS chunks
 #   juicefs-init         — one-shot pre-flight + first-time volume format
 #   juicefs              — live FUSE mount + WebDAV (browse / smoke test)
-#   juicemount-migrator  — copy-into-JuiceFS web UI (port 30190)
+#   juicemount-manager   — control-plane web UI (migrations, trash, backups, maintenance, settings) on port 30190
+#                          (renamed from juicemount-migrator in SLICE 0 of
+#                          docs/ROADMAP/juicemount-manager.md; the legacy
+#                          juicemount-migrator image tag is still published
+#                          from CI for one release as a backward-compat alias)
 #
 # The bind-mount paths are TrueNAS-flavored (`/mnt/<pool>/juicemount/*`).
 # On a plain Linux/Synology host, edit the `volumes:` paths and the
@@ -142,13 +146,17 @@ services:
           redis://redis:6379/1 0.0.0.0:80 &
         wait
 
-  # ── juicemount-migrator: web UI to copy data into the JuiceFS volume ─
+  # ── juicemount-manager: control-plane web UI for the JuiceFS volume ─
+  # Renamed from juicemount-migrator in SLICE 0. Today this tab is
+  # Migrations only — Overview, Trash, Destinations, Backups,
+  # Maintenance, Settings tabs ship across slices 1–8.
+  #
   # Browse host paths under /sources, pick a destination under /jfs,
   # watch live progress via SSE. Set JM_ADMIN_KEY for HTTP auth (the
-  # migrator owns write access to your data — don't leave it open on
+  # manager owns write access to your data — don't leave it open on
   # the public internet). Empty admin key = LAN-only / no auth.
-  juicemount-migrator:
-    image: ghcr.io/lelanddutcher/juicemount-migrator:production-hardening
+  juicemount-manager:
+    image: ghcr.io/lelanddutcher/juicemount-manager:production-hardening
     pull_policy: always
     restart: unless-stopped
     depends_on:
@@ -159,7 +167,7 @@ services:
       JM_VOL_NAME: "zpool"
       JM_SOURCE_ROOTS: "/sources"
       JM_ADMIN_KEY: ""               # EDIT — set to a 32+ char random string for prod
-      JM_STATE_FILE: "/var/lib/migrator/jobs.json"   # persists job history across container restart
+      JM_STATE_FILE: "/var/lib/manager/state.json"   # persists job history + future control-plane state across container restart
     ports:
       - "30190:8080"                 # web UI
     volumes:
@@ -167,6 +175,11 @@ services:
       # browsed as /sources/<name> in the UI. Add as many lines as you
       # want — one per existing dataset to migrate from.
       - /mnt/storage0/zpool:/sources/oldzpool:ro    # EDIT — your source dataset(s)
-      # Tiny writable mount for the JSON job-history file. Lets canceled
+      # Tiny writable mount for the JSON state file. Lets canceled
       # or interrupted jobs show up with a Resume button after a redeploy.
-      - /mnt/zSSD/juicemount/migrator-state:/var/lib/migrator
+      # SLICE 0 also reads the legacy /var/lib/migrator/jobs.json path
+      # as a fallback if the new state file doesn't exist yet, so
+      # existing installs migrate job history automatically — but if
+      # you want to keep that history, additionally bind-mount the
+      # OLD migrator-state dataset at /var/lib/migrator (read-only is fine).
+      - /mnt/zSSD/juicemount/manager-state:/var/lib/manager

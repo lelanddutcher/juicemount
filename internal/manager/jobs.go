@@ -1,9 +1,12 @@
-// Package migrator implements one-click data migration into a JuiceFS
-// volume. Wraps `juicefs sync` with an HTTP API and SSE progress.
+// Package manager implements the JuiceMount control plane. SLICE 0
+// of the manager roadmap covers the migrator's existing functionality
+// — copy-into-JuiceFS via `juicefs sync` exposed as an HTTP API with
+// SSE progress. Subsequent slices add overview, trash, destinations,
+// backups (schedules), maintenance, and settings tabs.
 //
 // Consumed by juicemount-server which registers the routes on its
 // existing metrics listener — single process, no cross-network plumbing.
-package migrator
+package manager
 
 import (
 	"context"
@@ -77,6 +80,12 @@ type JobManager struct {
 	// RunSync; set via SetRunner() for tests.
 	runner SyncFunc
 
+	// stateFileLoaded guards SetStateFile against repeated loads.
+	// Without this, a second SetStateFile call (defensive or
+	// accidental) would re-read the on-disk snapshot and clobber any
+	// jobs submitted since the first call. Set once in SetStateFile.
+	stateFileLoaded bool
+
 	// stateFile is an optional JSON file the manager loads on startup
 	// and writes after every job state transition. Bind-mount the
 	// containing dir to make job history survive container restart.
@@ -109,11 +118,27 @@ func NewJobManager(juicefsBin string, spec RunSyncSpec) *JobManager {
 	}
 }
 
+// legacyStateFile is the SLICE 0 fallback path: if the configured
+// state file doesn't exist yet, we also check the pre-rename location
+// (/var/lib/migrator/jobs.json from the migrator era) so a one-release
+// in-place upgrade carries job history forward without manual copying.
+// Going forward, writes always go to the new path (state file as
+// configured, typically /var/lib/manager/state.json). The fallback
+// path is read-only; we never write back to it.
+const legacyStateFile = "/var/lib/migrator/jobs.json"
+
 // SetStateFile enables JSON persistence at the given path and loads
-// any existing history immediately. Should be called once before any
-// job is submitted; safe-but-pointless to call later (the load only
-// runs the first time and would clobber in-memory state). Empty path
-// is a no-op — useful for the default "ephemeral" mode.
+// any existing history immediately. Idempotent — repeated calls after
+// the first are no-ops (guarded by m.stateFileLoaded) so a defensive
+// or accidental second call cannot clobber the in-memory state with a
+// stale on-disk snapshot. Empty path is a no-op — useful for the
+// default "ephemeral" mode.
+//
+// SLICE 0 backward-compat: if the configured path doesn't exist but
+// the legacy migrator-era path (/var/lib/migrator/jobs.json) does,
+// we load from the legacy path and write going forward to the new
+// path. Logs a one-shot migration line so the operator sees it
+// happened.
 //
 // Jobs that were Running or Pending at the moment the previous process
 // died are marked as JobError on load with the reason "interrupted by
@@ -125,17 +150,34 @@ func (m *JobManager) SetStateFile(path string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.stateFileLoaded {
+		// Already loaded once — refuse to re-read from disk (would
+		// clobber any jobs submitted since the first call). Allow the
+		// path to be updated for the write side only if it matches
+		// what we already set; ignore mismatches.
+		return
+	}
+	m.stateFileLoaded = true
 	m.stateFile = path
 	data, err := os.ReadFile(path)
+	if err != nil && os.IsNotExist(err) && path != legacyStateFile {
+		// Fall back to the pre-rename location for one-release compat.
+		legacyData, legacyErr := os.ReadFile(legacyStateFile)
+		if legacyErr == nil {
+			log.Printf("manager: state file %s missing; migrating job history from legacy path %s (will write to new path going forward)", path, legacyStateFile)
+			data = legacyData
+			err = nil
+		}
+	}
 	if err != nil {
 		if !os.IsNotExist(err) {
-			log.Printf("migrator: read state file %s: %v", path, err)
+			log.Printf("manager: read state file %s: %v", path, err)
 		}
 		return
 	}
 	var s persistedState
 	if err := json.Unmarshal(data, &s); err != nil {
-		log.Printf("migrator: parse state file %s: %v (starting fresh)", path, err)
+		log.Printf("manager: parse state file %s: %v (starting fresh)", path, err)
 		return
 	}
 	for _, j := range s.Jobs {
@@ -157,7 +199,7 @@ func (m *JobManager) SetStateFile(path string) {
 		m.jobs[j.ID] = j
 	}
 	m.order = s.Order
-	log.Printf("migrator: loaded %d jobs from %s", len(m.jobs), path)
+	log.Printf("manager: loaded %d jobs from %s", len(m.jobs), path)
 }
 
 // saveStateLocked atomically writes the current jobs map + order to
@@ -196,20 +238,20 @@ func (m *JobManager) saveStateLocked() {
 	}
 	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
-		log.Printf("migrator: marshal state: %v", err)
+		log.Printf("manager: marshal state: %v", err)
 		return
 	}
 	tmp := m.stateFile + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(m.stateFile), 0o755); err != nil {
-		log.Printf("migrator: mkdir state dir: %v", err)
+		log.Printf("manager: mkdir state dir: %v", err)
 		return
 	}
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		log.Printf("migrator: write state tmp: %v", err)
+		log.Printf("manager: write state tmp: %v", err)
 		return
 	}
 	if err := os.Rename(tmp, m.stateFile); err != nil {
-		log.Printf("migrator: rename state: %v", err)
+		log.Printf("manager: rename state: %v", err)
 	}
 }
 

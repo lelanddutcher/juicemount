@@ -1,4 +1,4 @@
-package migrator
+package manager
 
 import (
 	"embed"
@@ -21,7 +21,7 @@ type API struct {
 	sourceRoots []string // allowable host paths under /browse
 	destMount   string   // user-facing prefix used in destination paths (e.g. /jfs)
 	adminKey    string   // empty = no auth
-	prefix      string   // route-mount prefix (e.g. "/migrator"); empty for standalone
+	prefix      string   // route-mount prefix (e.g. "/manager"); empty for standalone
 	fuseMount   string   // for ModeEmbedded dest-traversal check; empty in standalone
 	volName     string   // for ModeStandalone dest-validation
 }
@@ -32,12 +32,12 @@ type API struct {
 //
 //   - FUSEMount set → embedded mode. Writes go through the in-process
 //     juicefs FUSE mount at file:///<FUSEMount>/<path>. Used when the
-//     migrator runs inside juicemount-server which already has the
+//     manager runs inside juicemount-server which already has the
 //     volume mounted.
 //
 //   - MetaURL + VolName set → standalone mode. Writes go through
 //     jfs://<VolName>/<path> with VolName=MetaURL set as an env var
-//     (juicefs sync's URL-alias convention). Used when the migrator
+//     (juicefs sync's URL-alias convention). Used when the manager
 //     runs as its own container without a local FUSE mount.
 type Config struct {
 	JuiceFSBin  string   // path to juicefs binary (or "juicefs" for PATH lookup)
@@ -50,8 +50,8 @@ type Config struct {
 	StateFile   string   // optional JSON path for job-history persistence (empty = ephemeral)
 }
 
-// Register wires the migrator's routes onto an existing ServeMux at
-// the given prefix (e.g. "/migrator"). Returns the JobManager so
+// Register wires the manager's routes onto an existing ServeMux at
+// the given prefix (e.g. "/manager"). Returns the JobManager so
 // callers can attach lifecycle hooks (StopAll on shutdown).
 //
 // Static UI is served from <prefix>/, JSON API from <prefix>/api/...
@@ -92,6 +92,44 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
 	mux.Handle(prefix+"/", staticHandler)
 	return mgr
+}
+
+// RedirectMigrator returns an http.HandlerFunc that 301-redirects any
+// request under the legacy /migrator/* prefix to the corresponding
+// /manager/* path, preserving the request's path tail and query
+// string. SLICE 0 of the manager roadmap renamed the HTTP mount
+// prefix from /migrator/ to /manager/; this redirect is the one-
+// release compatibility shim so bookmarks, scripts, and Mac-side
+// shortcuts that still point at /migrator/ keep working.
+//
+// Permanent (301) so browsers and intermediaries can cache it; the
+// redirect target itself is stable across the compat period.
+func RedirectMigrator() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Strip the legacy prefix and re-attach the new one. We
+		// preserve the path tail verbatim (including a trailing
+		// slash) so /migrator/ → /manager/ and /migrator/api/sources
+		// → /manager/api/sources without surprises.
+		target := "/manager"
+		tail := strings.TrimPrefix(r.URL.Path, "/migrator")
+		if tail != "" {
+			target += tail
+		} else {
+			target += "/"
+		}
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+	}
+}
+
+// redirectMigrator is the method form bound to an API receiver. It
+// delegates to the package-level RedirectMigrator() — kept as a method
+// so future slices can attach instance state (e.g. metrics) without
+// changing the call site in jm5/main.go.
+func (a *API) redirectMigrator(w http.ResponseWriter, r *http.Request) {
+	RedirectMigrator()(w, r)
 }
 
 // auth wraps a handler with X-JuiceMount-Admin-Key check.
@@ -533,7 +571,7 @@ func sampleSourceFiles(root string, limit int) []string {
 
 // handleJobOps routes /api/jobs/{id} and /api/jobs/{id}/stream.
 // Uses a.prefix to strip the mount prefix in embedded mode — without
-// this, r.URL.Path is "/migrator/api/jobs/..." and TrimPrefix against
+// this, r.URL.Path is "/manager/api/jobs/..." and TrimPrefix against
 // "/api/jobs/" returns the whole path unchanged, causing every job-
 // specific endpoint to return 400. Caught by Rule 4 review.
 func (a *API) handleJobOps(w http.ResponseWriter, r *http.Request) {
