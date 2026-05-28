@@ -94,6 +94,13 @@
       initTrashOnce();
       refreshTrash();
     }
+    // SLICE 6: lazy-init Maintenance. Wires the per-card Run buttons
+    // and resumes any SSE stream that was open when the user
+    // navigated away — handled by re-reading active op state via
+    // GET /api/maintenance/{kind}.
+    if (name === 'maintenance') {
+      initMaintenanceOnce();
+    }
   }
 
   window.addEventListener('hashchange', route);
@@ -1313,6 +1320,150 @@
       el.hidden = true;
       el.classList.remove('ok');
     }, 4000);
+  }
+
+  // -------- Maintenance (SLICE 6) --------
+  // Five operational levers wrapping juicefs CLI subprocesses. Each
+  // card has a Run button; clicking it POSTs to /api/maintenance/{kind}
+  // (with kind-specific query params: ?dry_run=true for gc, ?path=…
+  // for warmup), then opens an EventSource on /api/maintenance/{kind}/stream
+  // for live output. The stream closes itself when the op finishes; we
+  // fetch the final snapshot via GET /api/maintenance/{kind} so the
+  // state pill reflects done/error.
+  const MAINTENANCE_KINDS = ['gc', 'fsck', 'warmup', 'cache-flush', 'compact-meta'];
+  const maintenanceState = {
+    inited: false,
+    streams: new Map(), // kind → EventSource
+  };
+
+  function initMaintenanceOnce() {
+    if (maintenanceState.inited) return;
+    maintenanceState.inited = true;
+    MAINTENANCE_KINDS.forEach((kind) => {
+      const card = document.querySelector(`.maintenance-card[data-kind="${kind}"]`);
+      if (!card) return;
+      const runBtn = card.querySelector('[data-action="run"]');
+      runBtn.addEventListener('click', () => runMaintenance(kind));
+      // Restore the last-known state on first paint so navigating away
+      // and back doesn't lose context. 404 is the normal "never ran"
+      // case; we swallow it and leave the idle state.
+      refreshMaintenanceState(kind).catch(() => {});
+    });
+  }
+
+  async function runMaintenance(kind) {
+    const card = document.querySelector(`.maintenance-card[data-kind="${kind}"]`);
+    if (!card) return;
+    const errEl = card.querySelector('[data-field="error"]');
+    errEl.hidden = true;
+    errEl.textContent = '';
+    const outEl = card.querySelector('[data-field="output"]');
+    outEl.textContent = '';
+    // Build the kind-specific query string. GC honors the dry-run
+    // checkbox; warmup forwards the optional path field. Other kinds
+    // take no params.
+    const params = new URLSearchParams();
+    if (kind === 'gc') {
+      const dry = card.querySelector('[data-field="dry-run"]');
+      if (dry && dry.checked) params.set('dry_run', 'true');
+    } else if (kind === 'warmup') {
+      const pathInput = card.querySelector('[data-field="path"]');
+      const p = (pathInput && pathInput.value || '').trim();
+      if (p) params.set('path', p);
+    }
+    const qs = params.toString();
+    const url = `/api/maintenance/${kind}${qs ? '?' + qs : ''}`;
+    try {
+      const op = await api('POST', url);
+      setMaintenanceState(card, op);
+      openMaintenanceStream(kind);
+    } catch (e) {
+      // 409 = same-kind already running. Surface it inline so the
+      // user knows to wait rather than mash the button.
+      const msg = (e && e.message) ? e.message : String(e);
+      errEl.textContent = msg;
+      errEl.hidden = false;
+    }
+  }
+
+  function openMaintenanceStream(kind) {
+    // Close any pre-existing stream for this kind (e.g. the user
+    // reran while a previous stream was still open).
+    const prior = maintenanceState.streams.get(kind);
+    if (prior) {
+      try { prior.close(); } catch (_) { /* ignore */ }
+    }
+    // EventSource can't set custom HTTP headers from JS, so we pass
+    // the admin key via ?key=... — same shim the /api/jobs/{id}/stream
+    // endpoint uses.
+    const streamPath = `/api/maintenance/${kind}/stream`;
+    const url = state.adminKey
+      ? `${BASE}${streamPath}?key=${encodeURIComponent(state.adminKey)}`
+      : `${BASE}${streamPath}`;
+    const es = new EventSource(url);
+    maintenanceState.streams.set(kind, es);
+    const card = document.querySelector(`.maintenance-card[data-kind="${kind}"]`);
+    const outEl = card.querySelector('[data-field="output"]');
+    es.onmessage = (ev) => {
+      try {
+        const line = JSON.parse(ev.data);
+        appendMaintenanceLine(outEl, line);
+      } catch (_) {
+        // Tolerate non-JSON payloads (shouldn't happen — the server
+        // always JSON-encodes — but never let a parse error crash
+        // the listener).
+      }
+    };
+    es.onerror = () => {
+      // The server closes the stream when the op finishes; the
+      // EventSource emits an error in that case. Pull the final
+      // snapshot so the state pill flips to done/error.
+      es.close();
+      maintenanceState.streams.delete(kind);
+      refreshMaintenanceState(kind).catch(() => {});
+    };
+  }
+
+  function appendMaintenanceLine(outEl, line) {
+    // Append a line + newline. Trim the head if the on-screen log
+    // exceeds the server-side cap so the DOM doesn't grow without
+    // bound for a noisy op.
+    const cap = 1000;
+    const cur = outEl.textContent.split('\n');
+    cur.push(line);
+    if (cur.length > cap) {
+      cur.splice(0, cur.length - cap, '[truncated]');
+    }
+    outEl.textContent = cur.join('\n');
+    // Auto-scroll to bottom so the latest output is visible.
+    outEl.scrollTop = outEl.scrollHeight;
+  }
+
+  async function refreshMaintenanceState(kind) {
+    const card = document.querySelector(`.maintenance-card[data-kind="${kind}"]`);
+    if (!card) return;
+    try {
+      const op = await api('GET', `/api/maintenance/${kind}`);
+      setMaintenanceState(card, op);
+      // Repaint the output panel with the captured snapshot so the
+      // user sees what happened on the previous run.
+      const outEl = card.querySelector('[data-field="output"]');
+      outEl.textContent = (op.output || []).join('\n');
+      outEl.scrollTop = outEl.scrollHeight;
+    } catch (_) {
+      // 404 = never ran; leave the idle defaults.
+    }
+  }
+
+  function setMaintenanceState(card, op) {
+    const stateEl = card.querySelector('[data-field="state"]');
+    stateEl.textContent = op.state || 'idle';
+    stateEl.dataset.state = op.state || 'idle';
+    const errEl = card.querySelector('[data-field="error"]');
+    if (op.error) {
+      errEl.textContent = op.error;
+      errEl.hidden = false;
+    }
   }
 
   // -------- Boot --------

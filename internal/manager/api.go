@@ -31,6 +31,11 @@ type API struct {
 	// (the handler defensively returns an "overview not configured"
 	// snapshot in that case rather than NPE'ing).
 	overview *overviewSource
+
+	// maintenance is the SLICE-6 per-kind subprocess runner. Nil only
+	// in unit tests that bypass Register; the maintenance handlers
+	// defensively return 501 in that case rather than NPE'ing.
+	maintenance *MaintenanceManager
 }
 
 // Config bundles the fields needed to construct + register the API.
@@ -139,6 +144,28 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mux.HandleFunc(prefix+"/api/trash/delete", a.auth(a.handleTrashDelete))
 	mux.HandleFunc(prefix+"/api/trash/empty", a.auth(a.handleTrashEmpty))
 	mux.HandleFunc(prefix+"/api/trash/config", a.auth(a.handleTrashConfig))
+	// SLICE 6: Maintenance tab — five operational levers wrapping
+	// juicefs CLI subprocesses with SSE-streamed live output. Each
+	// kind has its own mutex (one op per kind at a time, 409 if
+	// busy); different kinds run concurrently. Stream endpoints
+	// live under .../{kind}/stream and are dispatched by a single
+	// catch-all handler — the trailing "/stream" suffix selects the
+	// SSE path inside handleMaintenanceRoute.
+	a.maintenance = newMaintenanceManager(cfg.JuiceFSBin, cfg.FUSEMount, overviewMeta, cfg.DestMount)
+	mux.HandleFunc(prefix+"/api/maintenance/gc", a.auth(a.handleMaintenanceGC))
+	mux.HandleFunc(prefix+"/api/maintenance/fsck", a.auth(a.handleMaintenanceFSCK))
+	mux.HandleFunc(prefix+"/api/maintenance/warmup", a.auth(a.handleMaintenanceWarmup))
+	mux.HandleFunc(prefix+"/api/maintenance/cache-flush", a.auth(a.handleMaintenanceCacheFlush))
+	mux.HandleFunc(prefix+"/api/maintenance/compact-meta", a.auth(a.handleMaintenanceCompactMeta))
+	// Per-kind SSE stream endpoints. Registered explicitly per kind
+	// (rather than as a single /api/maintenance/ catch-all) because
+	// http.ServeMux already routes the bare-kind POST handlers above
+	// at exact paths — a tree-mounted prefix would intercept those.
+	mux.HandleFunc(prefix+"/api/maintenance/gc/stream", a.auth(a.handleMaintenanceStreamGC))
+	mux.HandleFunc(prefix+"/api/maintenance/fsck/stream", a.auth(a.handleMaintenanceStreamFSCK))
+	mux.HandleFunc(prefix+"/api/maintenance/warmup/stream", a.auth(a.handleMaintenanceStreamWarmup))
+	mux.HandleFunc(prefix+"/api/maintenance/cache-flush/stream", a.auth(a.handleMaintenanceStreamCacheFlush))
+	mux.HandleFunc(prefix+"/api/maintenance/compact-meta/stream", a.auth(a.handleMaintenanceStreamCompactMeta))
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
