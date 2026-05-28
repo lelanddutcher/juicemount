@@ -559,7 +559,7 @@ Migration tab destination picker can choose a profile by name.
 ### SLICE 5 — Backups (schedules)
 
 **ID:** `slice-5-schedules`
-**Status:** CODE COMPLETE (commit e54afc6, CI green, deploying with the post-sync chmod fix)
+**Status:** COMPLETE (commit e54afc6 + post-sync chmod fix ebb96fa; deployed 2026-05-28, image revision ebb96fa117e5 live; /api/schedules returns presets + empty array; scheduler ready to fire jobs once destinations are configured)
 **Depends on:** slice-4 (destinations)
 **Blocks:** none
 
