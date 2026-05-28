@@ -623,7 +623,7 @@ Each schedule fires a normal Job through the existing pipeline.
 ### SLICE 6 — Storage maintenance
 
 **ID:** `slice-6-maintenance`
-**Status:** NOT STARTED
+**Status:** CODE COMPLETE (deploy + live validation deferred until GHCR juicemount-manager package visibility is flipped to Public — currently 401 on pull; commit afa885d, image built and pushed)
 **Depends on:** slice-0
 **Blocks:** none
 
