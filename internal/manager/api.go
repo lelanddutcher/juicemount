@@ -53,6 +53,14 @@ type API struct {
 	// tick. Lifecycle: Register starts it after both dests and the
 	// JobManager are wired; mgr.StopAll() drains it on shutdown.
 	schedules *scheduleStoreImpl
+
+	// settings is the SLICE-8 Settings store (per-job defaults, theme,
+	// log retention, admin-key rotation). Nil in tests that bypass
+	// Register; handlers return 503. The store delegates rotation to
+	// the destinations store via rotateAdminKeyOnStore — keeps the
+	// crypto surface in destinations.go + crypto.go untouched and the
+	// settings file purely orchestration.
+	settings *settingsStoreImpl
 }
 
 // Config bundles the fields needed to construct + register the API.
@@ -211,6 +219,17 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	sched.Start(context.Background())
 	mux.HandleFunc(prefix+"/api/schedules", a.auth(a.handleSchedules))
 	mux.HandleFunc(prefix+"/api/schedules/", a.auth(a.handleScheduleItem))
+	// SLICE 8: Settings tab — per-job defaults, theme, log retention,
+	// admin-key rotation. The store wires its persistence callback to
+	// SaveState; rotation re-encrypts every destination via
+	// rotateAdminKeyOnStore (settings.go) and the same callback flushes
+	// the new ciphertext to disk. Auth-wrapped like every other endpoint.
+	settingsStore := newSettingsStore()
+	a.settings = settingsStore
+	settingsStore.SetOnChange(mgr.SaveState)
+	mgr.SetSettings(settingsStore)
+	mux.HandleFunc(prefix+"/api/settings", a.auth(a.handleSettings))
+	mux.HandleFunc(prefix+"/api/settings/rotate-admin-key", a.auth(a.handleRotateAdminKey))
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))

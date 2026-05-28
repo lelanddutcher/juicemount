@@ -146,6 +146,20 @@ type JobManager struct {
 	// doesn't drop persisted schedules.
 	schedules        scheduleStore
 	pendingSchedules []scheduleState
+
+	// settings is the SLICE-8 hook for the per-instance Settings store
+	// (per-job defaults, theme, log retention, etc.). Same lifecycle
+	// pattern as destinations/schedules — Register attaches the store
+	// after construction and the persistence callback writes back
+	// through SaveState on every mutation.
+	//
+	// pendingSettings buffers the row loaded by SetStateFile when no
+	// store was attached yet. SetSettings drains it the moment one is
+	// wired in. Without this buffer the normal Register order
+	// (SetStateFile, then SetSettings) would silently drop the
+	// persisted settings on startup.
+	settings        settingsStore
+	pendingSettings *settingsState
 }
 
 // destinationStore is the minimum surface JobManager needs to keep the
@@ -165,6 +179,16 @@ type scheduleStore interface {
 	snapshot() []scheduleState
 	load(rows []scheduleState)
 	Stop()
+}
+
+// settingsStore is the SLICE-8 counterpart. Same shape as
+// destinationStore — opaque to JobManager so settings.go owns its own
+// persistence/lifecycle. snapshot returns a pointer (not a value) so a
+// nil result means "no settings configured yet, omit from state file"
+// — matches the persistedState.Settings pointer + omitempty contract.
+type settingsStore interface {
+	snapshot() *settingsState
+	load(s *settingsState)
 }
 
 // persistedState is what we serialize to disk. Mirrors the in-memory
@@ -187,6 +211,13 @@ type persistedState struct {
 	// identically. Schema version stays at 2 because v2 readers tolerate
 	// unknown keys (Go's json.Unmarshal leaves them at zero values).
 	Schedules []scheduleState `json:"schedules,omitempty"`
+	// SLICE 8: per-instance Settings. Pointer + omitempty so that a v1
+	// or unseeded v2 state file (no settings key) decodes to nil. The
+	// Settings handler treats nil as "use code defaults" — GET returns
+	// the hard-coded defaults rather than a half-populated row. The
+	// first PUT materializes a settingsState and from that point on the
+	// state file carries the configured values.
+	Settings *settingsState `json:"settings,omitempty"`
 }
 
 // NewJobManager constructs a JobManager. juicefsBin is the path to
@@ -298,6 +329,15 @@ func (m *JobManager) SetStateFile(path string) {
 	} else {
 		m.pendingSchedules = s.Schedules
 	}
+	// SLICE 8: same pattern for settings. The settingsStore.load
+	// contract distinguishes nil (no settings persisted yet — use code
+	// defaults) from a non-nil row, so we pass s.Settings through
+	// without materializing a zero value here.
+	if m.settings != nil {
+		m.settings.load(s.Settings)
+	} else {
+		m.pendingSettings = s.Settings
+	}
 	// Log v1→v2 schema upgrades distinctly so an operator can spot
 	// them in startup logs without diffing the state file.
 	if s.SchemaVersion == 0 {
@@ -347,6 +387,25 @@ func (m *JobManager) SetSchedules(s scheduleStore) {
 	}
 }
 
+// SetSettings attaches the settings store. Mirrors SetDestinations /
+// SetSchedules — drains any pending row the state-file loader buffered
+// before the store was attached. nil pending stays nil (the store's
+// load contract treats nil as "no settings configured yet").
+func (m *JobManager) SetSettings(s settingsStore) {
+	m.mu.Lock()
+	m.settings = s
+	pending := m.pendingSettings
+	m.pendingSettings = nil
+	m.mu.Unlock()
+	if s != nil {
+		// Always call load — even with nil pending — so the store sees
+		// the canonical startup signal exactly once. The store treats
+		// nil as "use code defaults"; identical to the loader path
+		// when no settings key was in the state file.
+		s.load(pending)
+	}
+}
+
 // saveStateLocked atomically writes the current jobs map + order to
 // stateFile. Caller must hold m.mu (any level). Best-effort — logs
 // errors but never blocks the caller; persistence is convenience, not
@@ -375,6 +434,16 @@ func (m *JobManager) saveStateLocked() {
 		out.Schedules = m.schedules.snapshot()
 	} else if m.pendingSchedules != nil {
 		out.Schedules = append([]scheduleState(nil), m.pendingSchedules...)
+	}
+	// SLICE 8: persist settings if a store is wired, else round-trip
+	// any pending row so an early save (e.g. before SetSettings has
+	// fired in Register's ordering window) doesn't blank the settings
+	// key. Same round-trip discipline as destinations/schedules.
+	if m.settings != nil {
+		out.Settings = m.settings.snapshot()
+	} else if m.pendingSettings != nil {
+		cp := *m.pendingSettings
+		out.Settings = &cp
 	}
 	for id, j := range m.jobs {
 		j.mu.Lock()
