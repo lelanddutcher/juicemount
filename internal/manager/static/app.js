@@ -118,6 +118,14 @@
       initBackupsOnce();
       refreshBackups();
     }
+    // SLICE 8: lazy-init Settings. Loads current settings from the
+    // server + applies the persisted theme on first activation; the
+    // form populates each time the tab is shown so out-of-band edits
+    // (jmctl, another browser) are reflected.
+    if (name === 'settings') {
+      initSettingsOnce();
+      refreshSettings();
+    }
   }
 
   window.addEventListener('hashchange', route);
@@ -2079,6 +2087,162 @@
       const w = $('#backups-warning');
       w.textContent = e.message || String(e);
       w.hidden = false;
+    }
+  }
+
+  // -------- Settings (SLICE 8) --------
+  // Wired to GET/PUT /api/settings and POST /api/settings/rotate-admin-key.
+  // The rotate flow is the high-risk surface — the backend implements a
+  // verify-before-rewrite contract that wrong-old-key returns 401 without
+  // touching state. The UI surfaces that contract directly via a typed
+  // "current key" prompt.
+
+  let settingsInited = false;
+  let lastLoadedSettings = null;
+
+  function initSettingsOnce() {
+    if (settingsInited) return;
+    settingsInited = true;
+    // Apply the persisted theme from localStorage immediately so the page
+    // doesn't flash during the GET round-trip. The server-side value
+    // overwrites it on first load (server defaults win on fresh boot).
+    const cachedTheme = localStorage.getItem('jm-theme');
+    if (cachedTheme) applyTheme(cachedTheme);
+
+    $('#settings-save').addEventListener('click', saveSettings);
+    $('#settings-revert').addEventListener('click', () => {
+      if (lastLoadedSettings) populateSettingsForm(lastLoadedSettings);
+    });
+    $('#settings-rotate').addEventListener('click', rotateAdminKey);
+    // Live-apply the theme so the user sees the change before saving.
+    $$('input[name="settings-theme"]').forEach((r) => {
+      r.addEventListener('change', () => applyTheme(r.value));
+    });
+  }
+
+  function applyTheme(theme) {
+    // 'system' = let the @media (prefers-color-scheme) rule decide.
+    // 'dark' / 'light' = force a data-theme attribute the CSS reads.
+    const root = document.documentElement;
+    if (theme === 'dark' || theme === 'light') {
+      root.setAttribute('data-theme', theme);
+    } else {
+      root.removeAttribute('data-theme');
+    }
+    localStorage.setItem('jm-theme', theme);
+  }
+
+  async function refreshSettings() {
+    try {
+      const data = await api('GET', '/api/settings');
+      lastLoadedSettings = data;
+      populateSettingsForm(data);
+      applyTheme(data.theme || 'system');
+    } catch (err) {
+      const el = $('#settings-error');
+      el.textContent = 'Load failed: ' + err.message;
+      el.hidden = false;
+    }
+  }
+
+  function populateSettingsForm(data) {
+    const d = data.job_defaults || {};
+    $('#settings-preserve-structure').checked = !!d.preserve_structure;
+    $('#settings-preserve-times').checked = !!d.preserve_times;
+    $('#settings-skip-junk').checked = !!d.skip_junk;
+    $('#settings-verify').checked = !!d.verify;
+    $('#settings-threads').value = d.threads || 10;
+    $('#settings-bw-limit').value = d.bw_limit || 0;
+    $('#settings-log-retention').value = data.log_retention_lines || 1000;
+    const theme = data.theme || 'system';
+    const radio = document.querySelector(`input[name="settings-theme"][value="${theme}"]`);
+    if (radio) radio.checked = true;
+  }
+
+  function collectSettingsForm() {
+    const theme = (document.querySelector('input[name="settings-theme"]:checked') || {}).value || 'system';
+    return {
+      theme,
+      log_retention_lines: Math.max(100, Math.min(10000, parseInt($('#settings-log-retention').value, 10) || 1000)),
+      destinations_redacted: true,
+      job_defaults: {
+        preserve_structure: $('#settings-preserve-structure').checked,
+        preserve_times:     $('#settings-preserve-times').checked,
+        skip_junk:          $('#settings-skip-junk').checked,
+        verify:             $('#settings-verify').checked,
+        dry_run:            false,
+        threads:            Math.max(1, Math.min(64, parseInt($('#settings-threads').value, 10) || 10)),
+        bw_limit:           Math.max(0, parseInt($('#settings-bw-limit').value, 10) || 0),
+        excludes:           null,
+        includes:           null,
+      },
+    };
+  }
+
+  async function saveSettings() {
+    $('#settings-error').hidden = true;
+    $('#settings-saved').hidden = true;
+    try {
+      const body = collectSettingsForm();
+      const data = await api('PUT', '/api/settings', body);
+      lastLoadedSettings = data;
+      populateSettingsForm(data);
+      $('#settings-saved').hidden = false;
+      setTimeout(() => { $('#settings-saved').hidden = true; }, 2500);
+    } catch (err) {
+      const el = $('#settings-error');
+      el.textContent = 'Save failed: ' + err.message;
+      el.hidden = false;
+    }
+  }
+
+  async function rotateAdminKey() {
+    const oldKey = $('#settings-rotate-old').value;
+    const newKey = $('#settings-rotate-new').value;
+    const newKeyConfirm = $('#settings-rotate-new-confirm').value;
+    const status = $('#settings-rotate-status');
+    status.hidden = false;
+    status.className = 'settings-rotate-status';
+    if (!oldKey || !newKey) {
+      status.classList.add('error');
+      status.textContent = 'Both current and new admin keys are required.';
+      return;
+    }
+    if (newKey !== newKeyConfirm) {
+      status.classList.add('error');
+      status.textContent = 'New admin key does not match confirmation.';
+      return;
+    }
+    if (newKey === oldKey) {
+      status.classList.add('error');
+      status.textContent = 'New admin key must differ from the current key.';
+      return;
+    }
+    if (!confirm(
+      'Rotate admin key now?\n\n' +
+      'This re-encrypts every saved Destination under the new key.\n' +
+      'After this succeeds, you MUST update JM_ADMIN_KEY on the container env and restart, ' +
+      'otherwise the next restart will fail to decrypt destinations.'
+    )) {
+      status.hidden = true;
+      return;
+    }
+    try {
+      const res = await api('POST', '/api/settings/rotate-admin-key', { old_key: oldKey, new_key: newKey });
+      // Wipe the form fields so they don't sit in browser memory.
+      $('#settings-rotate-old').value = '';
+      $('#settings-rotate-new').value = '';
+      $('#settings-rotate-new-confirm').value = '';
+      status.classList.add('success');
+      const count = (res && typeof res.rotated === 'number') ? res.rotated : 0;
+      status.textContent = `Rotated ${count} destination(s). NEXT: update JM_ADMIN_KEY in the container env and restart the juicemount-manager service.`;
+    } catch (err) {
+      status.classList.add('error');
+      if (err.message && err.message.includes('401')) {
+        status.textContent = 'Verification failed — the supplied current admin key is incorrect. State file unchanged.';
+      } else {
+        status.textContent = 'Rotation failed: ' + (err.message || err);
+      }
     }
   }
 

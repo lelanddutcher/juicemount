@@ -584,12 +584,98 @@
         </div>
       </section>
 
-      <!-- Settings tab (placeholder; SLICE 8). -->
-      <section data-tab="settings" class="tab-pane" hidden>
-        <div class="placeholder">
+      <!-- Settings tab — wired to GET/PUT /api/settings and POST
+           /api/settings/rotate-admin-key. -->
+      <section data-tab="settings" class="tab-pane settings-pane" hidden>
+        <div class="settings-header">
           <h2>Settings</h2>
-          <p>Per-job defaults, admin-key rotation, log retention, theme. Coming soon.</p>
+          <p class="hint">Per-job defaults, admin-key rotation, log retention, theme.</p>
         </div>
+
+        <p id="settings-error" class="error" hidden></p>
+        <p id="settings-saved" class="settings-saved" hidden>Saved.</p>
+
+        <fieldset class="settings-section">
+          <legend>Theme</legend>
+          <label class="opt">
+            <input type="radio" name="settings-theme" value="system" checked>
+            <span><strong>System</strong><em>Follow the operating system's appearance.</em></span>
+          </label>
+          <label class="opt">
+            <input type="radio" name="settings-theme" value="dark">
+            <span><strong>Dark</strong><em>Always dark, regardless of OS.</em></span>
+          </label>
+          <label class="opt">
+            <input type="radio" name="settings-theme" value="light">
+            <span><strong>Light</strong><em>Always light, regardless of OS.</em></span>
+          </label>
+        </fieldset>
+
+        <fieldset class="settings-section">
+          <legend>Job defaults</legend>
+          <p class="hint">The toggle state new migration jobs ship with — overrideable per-job in the Migrations tab.</p>
+          <label class="opt">
+            <input type="checkbox" id="settings-preserve-structure">
+            <span><strong>Preserve folder structure 1:1</strong></span>
+          </label>
+          <label class="opt">
+            <input type="checkbox" id="settings-preserve-times">
+            <span><strong>Preserve file permissions</strong>
+              <em>OFF by default — Mac access usually breaks under source uid/mode preservation. See the chmod-on-sync fix in OPEN_BUGS QA-37 lineage.</em></span>
+          </label>
+          <label class="opt">
+            <input type="checkbox" id="settings-skip-junk">
+            <span><strong>Skip junk files</strong>
+              <em>.DS_Store, ._*, Thumbs.db, .sync.ffs_db, etc.</em></span>
+          </label>
+          <label class="opt">
+            <input type="checkbox" id="settings-verify">
+            <span><strong>Verify after sync (--check-all)</strong>
+              <em>~2× read I/O. Off by default for routine incrementals.</em></span>
+          </label>
+          <label class="field">
+            <span>Default threads</span>
+            <input id="settings-threads" type="number" min="1" max="64" value="10">
+          </label>
+          <label class="field">
+            <span>Default bandwidth limit (MB/s; 0 = unlimited)</span>
+            <input id="settings-bw-limit" type="number" min="0" value="0">
+          </label>
+        </fieldset>
+
+        <fieldset class="settings-section">
+          <legend>Retention</legend>
+          <label class="field">
+            <span>Log retention (lines) — bounded [100, 10000]</span>
+            <input id="settings-log-retention" type="number" min="100" max="10000" value="1000">
+          </label>
+        </fieldset>
+
+        <div class="settings-actions">
+          <button id="settings-save" type="button">Save settings</button>
+          <button id="settings-revert" type="button">Revert</button>
+        </div>
+
+        <fieldset class="settings-section settings-danger">
+          <legend>Admin key rotation</legend>
+          <p class="hint">Re-encrypts every saved Destination under a new admin key. <strong>After success, you MUST update <code>JM_ADMIN_KEY</code> in the container env and restart</strong> — the in-memory key stays on the OLD value until restart so the on-disk state stays decryptable through the rotation window. Wrong old key returns 401 without touching state (verify-before-rewrite contract).</p>
+          <label class="field">
+            <span>Current admin key (old)</span>
+            <input id="settings-rotate-old" type="password" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>New admin key</span>
+            <input id="settings-rotate-new" type="password" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>Confirm new admin key</span>
+            <input id="settings-rotate-new-confirm" type="password" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="settings-actions">
+            <button id="settings-rotate" type="button" class="danger">Rotate admin key</button>
+          </div>
+          <p id="settings-rotate-status" class="settings-rotate-status" hidden></p>
+        </fieldset>
       </section>
     </main>
   </div>
