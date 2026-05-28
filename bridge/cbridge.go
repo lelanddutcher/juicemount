@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,6 +73,15 @@ var (
 	// metadata host alive at all." Items 3-5 of the offline-
 	// resilience plan consume its state and OnChange callback.
 	globalReach *health.Reachability
+
+	// Spool architecture (Option 2 / slices A-E). Set when
+	// JM_SPOOL_ENABLE=1 at startup. Both nil → spool path is fully
+	// dormant and the existing fdPool/FUSE write+read path runs
+	// unchanged. Stop tears the drainer down with a 30 s deadline
+	// before closing the spool store, then nils both globals so
+	// /spool returns 503 between Stop and the next Start.
+	globalSpool   *jmnfs.SpoolStore
+	globalDrainer *jmnfs.Drainer
 )
 
 // ServerConfig is the JSON configuration passed from Swift.
@@ -373,6 +383,72 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		jmlog.Warn("pin store open failed (offline-pin disabled)", "error", err.Error())
 	}
 
+	// Spool wiring (Option 2). Env-gated by JM_SPOOL_ENABLE so the
+	// pre-spool behavior is preserved by default until the rollout
+	// completes (docs/ROADMAP/option-2-spool.md section 9). When
+	// enabled, O_CREATE writes route through the spool (slice C) and
+	// reads consult the spool index before metadata/FUSE (slice D);
+	// when disabled, the handler's spool field stays nil and the
+	// pre-spool writeFile / cachedFile paths run unchanged.
+	if os.Getenv("JM_SPOOL_ENABLE") == "1" {
+		spoolDir := os.Getenv("JM_SPOOL_DIR")
+		if spoolDir == "" {
+			home, err := os.UserHomeDir()
+			if err != nil || home == "" {
+				// Sandboxed-process fallback — without this, an empty
+				// home string would prefix to `/Library/...`, silently
+				// redirecting the spool to the filesystem root.
+				spoolDir = filepath.Join(os.TempDir(), "juicemount-spool")
+				jmlog.Warn("UserHomeDir failed; spool dir fell back to tmp",
+					"dir", spoolDir, "error", fmt.Sprintf("%v", err))
+			} else {
+				spoolDir = filepath.Join(home, "Library", "Application Support", "JuiceMount", "spool")
+			}
+		}
+		// Capacity: env override → default 50 GiB. Reviewer HIGH fix:
+		// JM_SPOOL_SIZE_GB=0 (or any value < 1) was silently treated
+		// as "use default 50 GiB", giving the OPPOSITE of what a user
+		// who set 0 to disable buffering would expect. Now we warn
+		// explicitly and keep the default so the user knows the env
+		// var was ignored.
+		spoolCapacity := int64(50) << 30
+		if s := os.Getenv("JM_SPOOL_SIZE_GB"); s != "" {
+			if v, err := strconv.ParseInt(s, 10, 64); err != nil || v < 1 {
+				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using 50 GiB default",
+					"raw", s)
+			} else {
+				spoolCapacity = v << 30
+			}
+		}
+		if err := metadata.InitSpoolSchema(store.DB()); err != nil {
+			jmlog.Warn("spool schema init failed (spool disabled)", "error", err.Error())
+		} else {
+			meta := metadata.NewSpoolStore(store.DB())
+			if spool, err := jmnfs.NewSpoolStore(spoolDir, spoolCapacity, meta); err != nil {
+				jmlog.Warn("spool store open failed (spool disabled)",
+					"dir", spoolDir, "error", err.Error())
+			} else {
+				drainer, err := jmnfs.NewDrainer(spool, jmnfs.DrainerConfig{
+					FuseRoot: cfg.FUSEPath,
+				})
+				if err != nil {
+					jmlog.Warn("drainer construct failed (spool disabled)", "error", err.Error())
+					spool.Stop()
+				} else {
+					globalSpool = spool
+					globalDrainer = drainer
+					srv.Handler().SetSpool(spool, drainer)
+					drainer.Start()
+					used, total := spool.Capacity()
+					jmlog.Info("spool ready",
+						"dir", spoolDir,
+						"capacity_gb", float64(total)/(1<<30),
+						"used_bytes", used)
+				}
+			}
+		}
+	}
+
 	// Mount NFS at the user-visible mount point (e.g. /Volumes/zpool) so
 	// Finder can browse it. This requires sudo, which we obtain via an
 	// AppleScript "with administrator privileges" prompt the user accepts once.
@@ -429,6 +505,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/stop": handleStopHTTP,
 			// A2 — post-mount self-test. GET returns cached result; POST reruns.
 			"/self-test": handleSelfTestHTTP,
+			// Spool status (Option 2 / slice E). Returns pending-files
+			// count, pending bytes, in-flight drains, capacity used,
+			// and per-entry details. 503 when the spool is disabled
+			// (JM_SPOOL_ENABLE != 1) or hasn't been wired yet.
+			"/spool": handleSpoolHTTP,
 			// Phase B observability: net/http/pprof routes for live
 			// goroutine/heap/cpu/trace dumps. pprof.Index serves
 			// /debug/pprof/goroutine, /debug/pprof/heap, etc. via the
@@ -576,6 +657,8 @@ func stopServerLocked() {
 	pinStore := globalPinStore
 	prefetcher := globalPrefetcher
 	reach := globalReach
+	spool := globalSpool
+	drainer := globalDrainer
 	globalMetrics = nil
 	globalMonitor = nil
 	globalServer = nil
@@ -586,6 +669,8 @@ func stopServerLocked() {
 	globalPinStore = nil
 	globalPrefetcher = nil
 	globalReach = nil
+	globalSpool = nil
+	globalDrainer = nil
 	globalMu.Unlock()
 
 	// Now run the slow shutdown work on the snapshots, no lock held.
@@ -599,8 +684,21 @@ func stopServerLocked() {
 		monitor.Stop()
 	}
 	if server != nil {
+		// StopHandler tears down drainer + spool internally (slice C
+		// integration), but we re-snapshot the globals above and
+		// fall through to redundant Stop calls below as belt-and-
+		// suspenders for the case where SetSpool was bypassed for
+		// some reason — the global is the durable handle.
 		server.Handler().StopHandler()
 		server.Stop()
+	}
+	if drainer != nil {
+		// Belt-and-suspenders: handler StopHandler already drained
+		// this 30 s above. Calling Stop again is idempotent.
+		drainer.Stop(5 * time.Second)
+	}
+	if spool != nil {
+		spool.Stop()
 	}
 	if cache != nil {
 		cache.Stop()
@@ -1628,6 +1726,40 @@ func handleCacheStatusHTTP(w http.ResponseWriter, r *http.Request) {
 	defer NFSServerFreeString(cstr)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(C.GoString(cstr)))
+}
+
+// handleSpoolHTTP returns the live spool state for menu bar / Manager
+// UI consumption. 503 when the spool isn't wired (JM_SPOOL_ENABLE=0
+// or pre-Start / post-Stop).
+//
+// Response shape (GET):
+//
+//	{
+//	  "enabled":         true,
+//	  "pending_files":   12,
+//	  "pending_bytes":   3400000000,
+//	  "in_progress":     4,
+//	  "succeeded":       142,
+//	  "failed":          0,
+//	  "quarantined":     0,
+//	  "capacity_used":   3400000000,
+//	  "capacity_total":  53687091200,
+//	  "entries":         [
+//	    { "path": "...", "size": ..., "drain_state": "draining",
+//	      "drain_attempts": 0, "last_error": "" },
+//	    ...
+//	  ]
+//	}
+//
+// The `entries` array is capped at 200 rows (most recent first) to
+// keep menu-bar payloads responsive on a 1 Hz poll. Older rows live
+// in SQLite for audit but are not returned here.
+func handleSpoolHTTP(w http.ResponseWriter, r *http.Request) {
+	globalMu.Lock()
+	spool := globalSpool
+	drainer := globalDrainer
+	globalMu.Unlock()
+	jmnfs.WriteSpoolStatusJSON(w, spool, drainer)
 }
 
 // handleVerifyPinsHTTP re-enqueues every pinned-Ready file for prefetch.
