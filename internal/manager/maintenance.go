@@ -446,10 +446,13 @@ func (a *API) handleMaintenanceGC(w http.ResponseWriter, r *http.Request) {
 	}
 	dryRun := r.URL.Query().Get("dry_run") == "true"
 	argv := []string{a.maintenance.binOrDefault(), "gc", a.maintenance.metaURL}
-	if dryRun {
-		// juicefs gc --dry-run reports reclaimable bytes without
-		// touching object storage. Matches the SLICE-6 spec.
-		argv = append(argv, "--dry-run")
+	if !dryRun {
+		// juicefs 1.3.x convention: `gc` without flags = scan-only
+		// dry-run (reports leaked objects without touching storage);
+		// `gc --delete` = actually reclaim. There is NO --dry-run flag
+		// (passing it FATALs). Inverted: dryRun is the default, we
+		// only add --delete when the user explicitly opts in.
+		argv = append(argv, "--delete")
 	}
 	op, err := a.maintenance.tryStart(MaintenanceGC, argv)
 	if err != nil {
