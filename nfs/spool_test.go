@@ -16,22 +16,29 @@ import (
 
 func newTestSpoolStore(t *testing.T, capacity int64) *SpoolStore {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "spool.db")
+	return newTestSpoolStoreTB(t, capacity)
+}
+
+// newTestSpoolStoreTB is the testing.TB variant so benchmarks and
+// tests share construction.
+func newTestSpoolStoreTB(tb testing.TB, capacity int64) *SpoolStore {
+	tb.Helper()
+	dbPath := filepath.Join(tb.TempDir(), "spool.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		t.Fatalf("open db: %v", err)
+		tb.Fatalf("open db: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	tb.Cleanup(func() { _ = db.Close() })
 	if _, err := db.Exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;`); err != nil {
-		t.Fatalf("pragma: %v", err)
+		tb.Fatalf("pragma: %v", err)
 	}
 	if err := metadata.InitSpoolSchema(db); err != nil {
-		t.Fatalf("schema: %v", err)
+		tb.Fatalf("schema: %v", err)
 	}
 	meta := metadata.NewSpoolStore(db)
-	store, err := NewSpoolStore(t.TempDir(), capacity, meta)
+	store, err := NewSpoolStore(tb.TempDir(), capacity, meta)
 	if err != nil {
-		t.Fatalf("new spool store: %v", err)
+		tb.Fatalf("new spool store: %v", err)
 	}
 	return store
 }

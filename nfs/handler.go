@@ -799,6 +799,23 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 	}
 	filename = strings.TrimPrefix(filename, "/")
 
+	// Slice D: spool shadow. If a writer just landed bytes for this
+	// path AND the drainer hasn't copied them to FUSE yet, the entry
+	// lives only in the in-memory spool index (the metadata store
+	// has nothing yet, FUSE has nothing yet). Without this short-
+	// circuit, Stat would fall through to FUSE and return ENOENT
+	// for an actively-being-written file.
+	//
+	// QA-35 perf-discipline: the empty-spool Lookup is 8.4 ns
+	// (measured in slice A benchmarks). Adding it BEFORE the
+	// writeSizes lock + metadata lookup keeps the hot path's
+	// per-RPC tax at a no-op when no writes are in flight.
+	if jfs.handler.spool != nil {
+		if e, ok := jfs.handler.spool.LookupActive(filename); ok {
+			return spoolFileInfoForEntry(path.Base(filename), e), nil
+		}
+	}
+
 	// Fast rejection for macOS metadata patterns that never exist on
 	// JuiceFS. Eliminates ~1/3 of LOOKUPs from Finder.
 	//
@@ -1015,6 +1032,16 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 	}
 	filename = strings.TrimPrefix(filename, "/")
 
+	// Slice D: spool shadow. Same QA-35-disciplined pre-check Stat does
+	// — empty-spool lookup is ~8 ns and gates the lookup before the
+	// macOS-metadata filter so an in-flight file with one of those
+	// base names is still served from spool. (Unlikely but valid.)
+	if jfs.handler.spool != nil {
+		if e, ok := jfs.handler.spool.LookupActive(filename); ok {
+			return spoolFileInfoForEntry(path.Base(filename), e), nil
+		}
+	}
+
 	// Mirror Stat's macOS metadata filter — see lines 770-779 there.
 	// Keeps Lstat and Stat behaviorally identical for these names so
 	// the fast-path can never reach LookupByPath for a path that Stat
@@ -1144,11 +1171,34 @@ func (jfs *juiceFS) Open(filename string) (billy.File, error) {
 func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	filename = strings.TrimPrefix(filename, "/")
 
-	// Look up the entry to get inode and size for cache reads
-	e := jfs.handler.store.LookupByPath(filename)
-
 	// Detect write intent
 	isWrite := flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0
+
+	// Slice D: spool shadow for the READ path. If the requested file
+	// is currently in the spool index (a writer's bytes are durable on
+	// our local SSD but haven't yet been copied to FUSE by the drainer),
+	// serve reads from the spool file directly. This closes the slice-C
+	// "briefly invisible" gap.
+	//
+	// Write opens (O_CREATE / O_RDWR / O_WRONLY) bypass this and fall
+	// through to the existing write-path branches below — the write
+	// integration in slice C already routes O_CREATE through the spool.
+	//
+	// QA-35 perf-discipline: the empty-spool Lookup is 8.4 ns
+	// (benchmarked in slice A). Adding it here BEFORE the metadata
+	// lookup keeps the read-OpenFile hot path's per-RPC overhead at
+	// a no-op when no writes are in flight.
+	if !isWrite && jfs.handler.spool != nil {
+		if sentry, ok := jfs.handler.spool.LookupActive(filename); ok {
+			return &spoolReadFile{
+				name:  filename,
+				entry: sentry,
+			}, nil
+		}
+	}
+
+	// Look up the entry to get inode and size for cache reads
+	e := jfs.handler.store.LookupByPath(filename)
 
 	// Offline-mode gate: refuse OPEN of un-pinned files when offline.
 	// This is the strict guarantee — we don't let kernel page cache or
@@ -1290,6 +1340,22 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			if err != nil {
 				return nil, err
 			}
+			// Slice D: assign a synthetic inode at OpenWrite so
+			// Stat/Lstat shadow returns the SAME inode for the
+			// lifetime of the spool entry. Without this, two
+			// successive Stat calls during the same writing session
+			// could get different inodes if FUSE-fallback ever fired
+			// in between — and the NFS handle would go stale.
+			// SetInode is idempotent (once-set semantics) so a
+			// concurrent re-OpenWrite for the same path returning
+			// the existing entry won't overwrite.
+			inode := uint64(0)
+			if e != nil {
+				inode = e.Inode
+			} else {
+				inode = jfs.handler.nextSyntheticInode()
+			}
+			sentry.SetInode(inode)
 			// Slice C does not carry a metadata.Entry through the
 			// spool path — the inode + metadata-store entry are
 			// owned by the eventual drain into FUSE (which triggers

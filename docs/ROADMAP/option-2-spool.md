@@ -1,6 +1,6 @@
 # JuiceMount Spool — Option 2
 
-**Status:** IN PROGRESS — Slice C COMPLETE 2026-05-28 (CI green at 170ecbb)
+**Status:** IN PROGRESS — Slice D COMPLETE 2026-05-28 (CI pending)
 **Type:** Foundational architecture change
 **Scope:** ~1 week implementation + 2–3 days hardening/testing
 **Branch:** `production-hardening` (continues on it; not a separate branch)
@@ -9,7 +9,7 @@
 - [x] **Slice A** — Spool primitives + SQLite index — COMPLETE 2026-05-28
 - [x] **Slice B** — Drainer goroutine — COMPLETE 2026-05-28
 - [x] **Slice C** — Write-path integration — COMPLETE 2026-05-28
-- [ ] Slice D — Read-path 3-tier lookup
+- [x] **Slice D** — Read-path 3-tier lookup — COMPLETE 2026-05-28
 - [ ] Slice E — Manager UI + menu bar surfaces
 - [ ] Slice F — Crash recovery + shutdown semantics
 - [ ] Slice G — Integrity hardening
