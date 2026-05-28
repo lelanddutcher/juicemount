@@ -72,6 +72,21 @@ func TestMaintenancePerKindMutex(t *testing.T) {
 	// Release the first op; wait for it to finish.
 	close(release)
 	waitForState(t, op1, MaintenanceDone, 2*time.Second)
+	// state=Done is set before the goroutine's `defer mu.Unlock()`
+	// fires — so a tryStart call right after waitForState can race
+	// the deferred unlock and see errKindBusy. Wait specifically for
+	// mm.active[kind] to clear, which the goroutine does between
+	// setting Done and releasing the per-kind mutex.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mm.mu.Lock()
+		active := mm.active[MaintenanceGC]
+		mm.mu.Unlock()
+		if active == nil {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 
 	// Third gc start should now succeed — the mutex was released.
 	op3, err := mm.tryStart(MaintenanceGC, []string{"juicefs", "gc", "redis://x"})

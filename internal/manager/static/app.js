@@ -101,6 +101,14 @@
     if (name === 'maintenance') {
       initMaintenanceOnce();
     }
+    // SLICE 4: lazy-init Destinations. Loads the saved-destinations
+    // list and wires the kind-picker → dynamic-fields swap. Returning
+    // to the tab refreshes the list so any out-of-band CRUD (from
+    // another browser, jmctl, etc.) is reflected.
+    if (name === 'destinations') {
+      initDestinationsOnce();
+      refreshDestinations();
+    }
   }
 
   window.addEventListener('hashchange', route);
@@ -1465,6 +1473,300 @@
       errEl.hidden = false;
     }
   }
+
+  // -------- Destinations (SLICE 4) --------
+  // CRUD for encrypted-at-rest remote-endpoint profiles. Form lives
+  // in the right column; the saved-profiles list lives in the left
+  // column. The kind picker swaps the visible input fields so the
+  // form only ever shows kind-relevant credentials.
+  //
+  // Editing: clicking Edit on a row populates the form with the
+  // profile's name/kind; credential values come back as "<set>"
+  // placeholders so the user can either RE-ENTER each field (to
+  // change it) or leave them blank to keep the existing value.
+  // Submitting an edit without re-entering values means the user
+  // wanted "no-op" on those fields — we send empty strings, and the
+  // backend's validateConfig will reject empty required fields, which
+  // is correct: editing forces the operator to re-enter credentials
+  // intentionally. (Slice-8's settings tab will add a "decrypt and
+  // pre-fill" flow for true edit-in-place.)
+  const destState = {
+    inited: false,
+    list: [],
+    editingName: null, // null = creating; string = editing this name
+  };
+
+  // Per-kind field specs. Each entry: array of {key, label, type,
+  // placeholder, optional}. The order is the display order in the form.
+  // Keep keys aligned with destinations.go's validateConfig.
+  const DEST_KIND_FIELDS = {
+    file: [
+      { key: 'path', label: 'Absolute path on the host', type: 'text', placeholder: '/external/backups' },
+    ],
+    s3: [
+      { key: 'endpoint',   label: 'Endpoint (https://...)', type: 'text', placeholder: 'https://s3.amazonaws.com' },
+      { key: 'bucket',     label: 'Bucket',                 type: 'text', placeholder: 'my-bucket' },
+      { key: 'access_key', label: 'Access key',             type: 'text' },
+      { key: 'secret_key', label: 'Secret key',             type: 'password' },
+      { key: 'region',     label: 'Region (optional)',      type: 'text', optional: true, placeholder: 'us-east-1' },
+    ],
+    b2: [
+      { key: 'endpoint',   label: 'Endpoint (https://...)', type: 'text', placeholder: 'https://s3.us-west-002.backblazeb2.com' },
+      { key: 'bucket',     label: 'Bucket',                 type: 'text' },
+      { key: 'access_key', label: 'Key ID',                 type: 'text' },
+      { key: 'secret_key', label: 'Application key',        type: 'password' },
+    ],
+    sftp: [
+      { key: 'host',        label: 'Host',                          type: 'text', placeholder: 'sftp.example.com' },
+      { key: 'port',        label: 'Port (default 22)',             type: 'text', optional: true, placeholder: '22' },
+      { key: 'user',        label: 'User',                          type: 'text' },
+      { key: 'password',    label: 'Password (or use key)',         type: 'password', optional: true },
+      { key: 'private_key', label: 'Private key PEM (or password)', type: 'textarea', optional: true },
+      { key: 'path',        label: 'Path (optional)',               type: 'text', optional: true, placeholder: '/backups' },
+    ],
+    webdav: [
+      { key: 'endpoint', label: 'Endpoint URL',          type: 'text', placeholder: 'https://dav.example.com/remote.php/webdav' },
+      { key: 'user',     label: 'User (optional)',       type: 'text', optional: true },
+      { key: 'password', label: 'Password (optional)',   type: 'password', optional: true },
+    ],
+    jfs: [
+      { key: 'meta_url', label: 'Meta URL (redis://...)', type: 'text', placeholder: 'redis://10.0.0.5:6379/1' },
+      { key: 'volume',   label: 'Volume name (default "jfs")', type: 'text', optional: true, placeholder: 'jfs' },
+    ],
+  };
+
+  function initDestinationsOnce() {
+    if (destState.inited) return;
+    destState.inited = true;
+    const kindSel = $('#dest-kind');
+    kindSel.addEventListener('change', () => renderDestConfigFields(kindSel.value, {}));
+    renderDestConfigFields(kindSel.value, {});
+    $('#dest-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      saveDestination();
+    });
+    $('#dest-cancel').addEventListener('click', () => cancelDestEdit());
+  }
+
+  function renderDestConfigFields(kind, prefill) {
+    const wrap = $('#dest-config-fields');
+    wrap.innerHTML = '';
+    const fields = DEST_KIND_FIELDS[kind] || [];
+    for (const f of fields) {
+      const lab = document.createElement('label');
+      lab.className = 'field';
+      const span = document.createElement('span');
+      span.textContent = f.label;
+      lab.appendChild(span);
+      let input;
+      if (f.type === 'textarea') {
+        input = document.createElement('textarea');
+        input.rows = 4;
+      } else {
+        input = document.createElement('input');
+        input.type = f.type === 'password' ? 'password' : 'text';
+      }
+      input.dataset.configKey = f.key;
+      if (f.placeholder) input.placeholder = f.placeholder;
+      if (prefill && prefill[f.key]) input.value = prefill[f.key];
+      lab.appendChild(input);
+      wrap.appendChild(lab);
+    }
+  }
+
+  async function refreshDestinations() {
+    try {
+      const data = await api('GET', '/api/destinations');
+      destState.list = data.destinations || [];
+      renderDestList();
+      populateSavedDestDropdown();
+    } catch (e) {
+      const w = $('#dest-warning');
+      w.textContent = e.message || String(e);
+      w.hidden = false;
+    }
+  }
+
+  function renderDestList() {
+    const ul = $('#dest-list');
+    ul.innerHTML = '';
+    if (destState.list.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'dest-empty-hint';
+      li.textContent = 'No destinations configured yet.';
+      ul.appendChild(li);
+      return;
+    }
+    for (const d of destState.list) {
+      const li = document.createElement('li');
+      li.className = 'dest-row';
+      const head = document.createElement('div');
+      head.className = 'dest-row-head';
+      const nm = document.createElement('strong');
+      nm.textContent = d.name;
+      const kind = document.createElement('span');
+      kind.className = 'dest-kind-pill';
+      kind.textContent = d.kind;
+      head.appendChild(nm);
+      head.appendChild(kind);
+      li.appendChild(head);
+      // Show the redacted config keys so the operator sees what's set
+      // without revealing values.
+      const cfg = document.createElement('div');
+      cfg.className = 'dest-row-cfg';
+      const keys = Object.keys(d.config || {}).sort();
+      cfg.textContent = keys.length ? keys.join(', ') + ' configured' : '(no config)';
+      li.appendChild(cfg);
+      const actions = document.createElement('div');
+      actions.className = 'dest-row-actions';
+      const edit = document.createElement('button');
+      edit.type = 'button';
+      edit.textContent = 'Edit';
+      edit.addEventListener('click', () => beginEditDest(d));
+      const test = document.createElement('button');
+      test.type = 'button';
+      test.textContent = 'Test';
+      test.addEventListener('click', () => testDestination(d.name, test));
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.textContent = 'Delete';
+      del.className = 'danger';
+      del.addEventListener('click', () => deleteDestination(d.name));
+      actions.appendChild(edit);
+      actions.appendChild(test);
+      actions.appendChild(del);
+      li.appendChild(actions);
+      ul.appendChild(li);
+    }
+  }
+
+  function beginEditDest(d) {
+    destState.editingName = d.name;
+    $('#dest-form-title').textContent = `Edit destination: ${d.name}`;
+    $('#dest-name').value = d.name;
+    $('#dest-name').readOnly = true;
+    $('#dest-kind').value = d.kind;
+    renderDestConfigFields(d.kind, {});
+    $('#dest-cancel').hidden = false;
+    const hint = $('#dest-flash');
+    hint.textContent = 'Re-enter every required field — credentials are not pre-filled (redacted at rest).';
+    hint.hidden = false;
+  }
+
+  function cancelDestEdit() {
+    destState.editingName = null;
+    $('#dest-form-title').textContent = 'Add destination';
+    $('#dest-name').value = '';
+    $('#dest-name').readOnly = false;
+    renderDestConfigFields($('#dest-kind').value, {});
+    $('#dest-cancel').hidden = true;
+    $('#dest-flash').hidden = true;
+    $('#dest-error').hidden = true;
+  }
+
+  async function saveDestination() {
+    const errEl = $('#dest-error');
+    const flashEl = $('#dest-flash');
+    errEl.hidden = true;
+    const name = $('#dest-name').value.trim();
+    const kind = $('#dest-kind').value;
+    const cfg = {};
+    document.querySelectorAll('#dest-config-fields [data-config-key]').forEach((el) => {
+      cfg[el.dataset.configKey] = el.value;
+    });
+    try {
+      if (destState.editingName) {
+        await api('PUT', `/api/destinations/${encodeURIComponent(destState.editingName)}`, {
+          name: destState.editingName, kind, config: cfg,
+        });
+      } else {
+        await api('POST', '/api/destinations', { name, kind, config: cfg });
+      }
+      cancelDestEdit();
+      flashEl.textContent = 'Destination saved.';
+      flashEl.hidden = false;
+      setTimeout(() => { flashEl.hidden = true; }, 3000);
+      await refreshDestinations();
+    } catch (e) {
+      errEl.textContent = e.message || String(e);
+      errEl.hidden = false;
+    }
+  }
+
+  async function testDestination(name, btn) {
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Testing…';
+    try {
+      await api('POST', `/api/destinations/${encodeURIComponent(name)}/test`);
+      btn.textContent = 'OK';
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+    } catch (e) {
+      btn.textContent = 'Failed';
+      const w = $('#dest-warning');
+      w.textContent = `Test ${name}: ${e.message || e}`;
+      w.hidden = false;
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 4000);
+    }
+  }
+
+  async function deleteDestination(name) {
+    if (!confirm(`Delete destination "${name}"? This removes the saved profile but does not touch the remote endpoint.`)) {
+      return;
+    }
+    try {
+      await api('DELETE', `/api/destinations/${encodeURIComponent(name)}`);
+      await refreshDestinations();
+    } catch (e) {
+      const w = $('#dest-warning');
+      w.textContent = e.message || String(e);
+      w.hidden = false;
+    }
+  }
+
+  // populateSavedDestDropdown fills the Migrations-tab "Saved
+  // destination" <select> with the current saved profiles. Picking a
+  // profile fills the dest-input with "<kind>://<name>" form; the
+  // backend recognizes that prefix and resolves the named profile
+  // server-side at submission time. (Slice-4 ships the dropdown; the
+  // server-side resolve hooks the new ToSyncURI in a follow-up commit
+  // once the migration request pipeline is reviewed.)
+  function populateSavedDestDropdown() {
+    const sel = $('#saved-dest-select');
+    if (!sel) return;
+    const current = sel.value;
+    sel.innerHTML = '';
+    const blank = document.createElement('option');
+    blank.value = '';
+    blank.textContent = '— typed path —';
+    sel.appendChild(blank);
+    for (const d of destState.list) {
+      const opt = document.createElement('option');
+      opt.value = `${d.kind}://${d.name}`;
+      opt.textContent = `${d.name} (${d.kind})`;
+      sel.appendChild(opt);
+    }
+    // Restore prior selection if still present.
+    if (Array.from(sel.options).some((o) => o.value === current)) {
+      sel.value = current;
+    }
+  }
+
+  // Wire the saved-destination dropdown so picking a profile fills
+  // the path input with the <scheme>://<name> reference form. The
+  // dest input's userEdited flag toggles to true so the source-pick
+  // suggester doesn't overwrite the user's deliberate choice.
+  document.addEventListener('change', (e) => {
+    if (e.target && e.target.id === 'saved-dest-select') {
+      const val = e.target.value;
+      if (val) {
+        const input = $('#dest-input');
+        input.value = val;
+        input.dataset.userEdited = 'true';
+        updateDestPreview();
+      }
+    }
+  });
 
   // -------- Boot --------
   // route() reads location.hash, falls back to DEFAULT_TAB

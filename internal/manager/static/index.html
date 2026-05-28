@@ -154,6 +154,19 @@
               <span>Selected source</span>
               <code id="selected-source" class="readonly">(nothing selected yet)</code>
             </label>
+            <!-- SLICE 4: saved-destination dropdown. Sits ABOVE the
+                 free-text dest path so users can either (a) pick a
+                 saved profile by name, or (b) type a path directly.
+                 Picking a profile fills the path input with the
+                 <scheme>://<name> form the backend resolves at submit
+                 time. The dropdown stays empty (just the "—" option)
+                 if no destinations are configured. -->
+            <label class="field">
+              <span>Saved destination (optional)</span>
+              <select id="saved-dest-select">
+                <option value="">— typed path —</option>
+              </select>
+            </label>
             <label class="field">
               <span>Destination path</span>
               <input id="dest-input" type="text" placeholder="/jfs/Film Projects/Leland TikToks" autocomplete="off" spellcheck="false">
@@ -306,11 +319,61 @@
         </div>
       </section>
 
-      <!-- Destinations tab (placeholder; SLICE 4). -->
-      <section data-tab="destinations" class="tab-pane" hidden>
-        <div class="placeholder">
+      <!-- Destinations tab (SLICE 4). Named, encrypted-at-rest
+           profiles for remote endpoints. Plaintext credentials never
+           appear in API responses — every field shows "<set>" once
+           configured. Add/Edit form sits on the right; the list of
+           saved destinations is on the left with per-row Test and
+           Delete buttons. -->
+      <section data-tab="destinations" class="tab-pane dest-pane" hidden>
+        <div class="dest-header">
           <h2>Destinations</h2>
-          <p>Saved remote-endpoint profiles (S3, B2, SFTP, WebDAV, JFS). Coming soon.</p>
+          <p class="hint">
+            Saved remote-endpoint profiles for migrations and (soon)
+            scheduled backups. Credentials are encrypted at rest using
+            an AES-256-GCM key derived from <code>JM_ADMIN_KEY</code>.
+            Rotating that variable invalidates every saved destination
+            (re-encryption flow lands in Settings).
+          </p>
+          <p id="dest-warning" class="error" hidden></p>
+        </div>
+        <div class="dest-layout">
+          <aside class="dest-list-wrap">
+            <h3>Saved profiles</h3>
+            <ul id="dest-list" class="dest-list">
+              <li class="dest-empty-hint">No destinations configured yet.</li>
+            </ul>
+          </aside>
+          <div class="dest-form-wrap">
+            <h3 id="dest-form-title">Add destination</h3>
+            <form id="dest-form" autocomplete="off" spellcheck="false">
+              <label class="field">
+                <span>Name (a-z, 0-9, -, _; unique)</span>
+                <input id="dest-name" type="text" required>
+              </label>
+              <label class="field">
+                <span>Kind</span>
+                <select id="dest-kind">
+                  <option value="file">file (local path)</option>
+                  <option value="s3">s3 (AWS / MinIO / Wasabi)</option>
+                  <option value="b2">b2 (Backblaze)</option>
+                  <option value="sftp">sftp (SSH)</option>
+                  <option value="webdav">webdav (HTTP)</option>
+                  <option value="jfs">jfs (second JuiceFS volume)</option>
+                </select>
+              </label>
+              <!-- Per-kind config field area. JS swaps the visible
+                   block based on the kind dropdown so the form stays
+                   compact and only relevant fields are shown. -->
+              <div id="dest-config-fields" class="dest-config-fields"></div>
+              <div class="dest-form-actions">
+                <button type="submit" id="dest-save">Save destination</button>
+                <button type="button" id="dest-cancel" hidden>Cancel edit</button>
+              </div>
+              <p id="dest-error" class="error" hidden></p>
+              <p id="dest-flash" class="dest-flash" hidden></p>
+            </form>
+          </div>
         </div>
       </section>
 

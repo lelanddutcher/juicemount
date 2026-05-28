@@ -102,14 +102,50 @@ type JobManager struct {
 	jobs   map[string]*Job
 	order  []string
 	active *Job
+
+	// destinations is the SLICE-4 hook for the encrypted-at-rest
+	// destinations store. Nil until SetDestinations wires one in. When
+	// non-nil, saveStateLocked asks the store for its on-disk rows and
+	// SetStateFile hands over any v1/v2 destinations slice it loaded.
+	//
+	// The interface keeps state.go and destinations.go in the same
+	// package without forcing JobManager to import a concrete
+	// DestinationStore type — Go's structural interface satisfaction
+	// avoids the circular reference that would otherwise crop up.
+	destinations destinationStore
+
+	// pendingDestinations buffers rows loaded by SetStateFile when no
+	// destinations store was attached yet. SetDestinations drains it
+	// into the store the moment one is wired in. Without this buffer
+	// the normal Register order (SetStateFile, then SetDestinations)
+	// would silently drop every persisted destination on startup.
+	pendingDestinations []destinationsState
+}
+
+// destinationStore is the minimum surface JobManager needs to keep the
+// destinations slice in sync with the on-disk state file. Implemented
+// by destinationStore in destinations.go.
+type destinationStore interface {
+	// snapshot returns the encrypted-at-rest rows to persist.
+	snapshot() []destinationsState
+	// load installs the destinations slice read from disk on startup.
+	load(rows []destinationsState)
 }
 
 // persistedState is what we serialize to disk. Mirrors the in-memory
 // shape but only the JSON-tagged fields of Job (no runtime mutex /
 // listener slices). order preserves submission order across restarts.
+//
+// SLICE 4 extends this with schema_version + destinations (see state.go
+// and destinations.go). v1 files have no schema_version and no
+// destinations field; the json decoder leaves them at the zero value
+// and we treat that as v1. On save we always write schema_version=2 so
+// reading an old file and writing it back implicitly upgrades it.
 type persistedState struct {
-	Jobs  map[string]*Job `json:"jobs"`
-	Order []string        `json:"order"`
+	SchemaVersion int                 `json:"schema_version,omitempty"`
+	Jobs          map[string]*Job     `json:"jobs"`
+	Order         []string            `json:"order"`
+	Destinations  []destinationsState `json:"destinations,omitempty"`
 }
 
 // NewJobManager constructs a JobManager. juicefsBin is the path to
@@ -205,7 +241,49 @@ func (m *JobManager) SetStateFile(path string) {
 		m.jobs[j.ID] = j
 	}
 	m.order = s.Order
+	// SLICE 4: hand any destinations rows from the loaded state to the
+	// destinations store if one's already attached. If none is attached
+	// yet (typical — SetStateFile usually runs before SetDestinations
+	// in Register), the rows stay buffered in m.pendingDestinations
+	// until SetDestinations wires up.
+	if m.destinations != nil {
+		m.destinations.load(s.Destinations)
+	} else {
+		m.pendingDestinations = s.Destinations
+	}
+	// Log v1→v2 schema upgrades distinctly so an operator can spot
+	// them in startup logs without diffing the state file.
+	if s.SchemaVersion == 0 {
+		log.Printf("manager: state file %s is v1 (no schema_version); will upgrade to v%d on next save", path, schemaVersion)
+	}
 	log.Printf("manager: loaded %d jobs from %s", len(m.jobs), path)
+}
+
+// SaveState atomically writes the current in-memory state (jobs +
+// destinations snapshot) to the state file. Safe to call from any
+// goroutine — acquires m.mu internally. No-op when no state file was
+// configured. Used by the destinations store as the persistence
+// callback after every CRUD mutation.
+func (m *JobManager) SaveState() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.saveStateLocked()
+}
+
+// SetDestinations attaches the destinations store to the JobManager so
+// (a) saveStateLocked can persist its rows on every state change, and
+// (b) any rows already loaded from disk via SetStateFile get handed
+// over. Called once during Register after both the JobManager and the
+// destinations store are constructed.
+func (m *JobManager) SetDestinations(d destinationStore) {
+	m.mu.Lock()
+	m.destinations = d
+	pending := m.pendingDestinations
+	m.pendingDestinations = nil
+	m.mu.Unlock()
+	if d != nil && pending != nil {
+		d.load(pending)
+	}
 }
 
 // saveStateLocked atomically writes the current jobs map + order to
@@ -220,8 +298,17 @@ func (m *JobManager) saveStateLocked() {
 	// half-written field. The outer m.mu (caller-held) already
 	// excludes concurrent map writes.
 	out := persistedState{
-		Jobs:  make(map[string]*Job, len(m.jobs)),
-		Order: append([]string(nil), m.order...),
+		SchemaVersion: schemaVersion,
+		Jobs:          make(map[string]*Job, len(m.jobs)),
+		Order:         append([]string(nil), m.order...),
+	}
+	if m.destinations != nil {
+		out.Destinations = m.destinations.snapshot()
+	} else if m.pendingDestinations != nil {
+		// Round-trip: if a v1/v2 file was loaded before any destinations
+		// store was attached, keep the rows intact in the next write so
+		// an early save doesn't wipe them.
+		out.Destinations = append([]destinationsState(nil), m.pendingDestinations...)
 	}
 	for id, j := range m.jobs {
 		j.mu.Lock()

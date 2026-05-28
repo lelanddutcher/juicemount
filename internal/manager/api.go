@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -36,6 +37,13 @@ type API struct {
 	// in unit tests that bypass Register; the maintenance handlers
 	// defensively return 501 in that case rather than NPE'ing.
 	maintenance *MaintenanceManager
+
+	// dests is the SLICE-4 destinations store. Nil in unit tests that
+	// bypass Register; handlers return 503 in that case rather than
+	// NPE'ing. Wired by Register after the JobManager exists so the
+	// persistence callback can flow saveState() through on every
+	// mutation.
+	dests *destinationStoreImpl
 }
 
 // Config bundles the fields needed to construct + register the API.
@@ -166,6 +174,21 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mux.HandleFunc(prefix+"/api/maintenance/warmup/stream", a.auth(a.handleMaintenanceStreamWarmup))
 	mux.HandleFunc(prefix+"/api/maintenance/cache-flush/stream", a.auth(a.handleMaintenanceStreamCacheFlush))
 	mux.HandleFunc(prefix+"/api/maintenance/compact-meta/stream", a.auth(a.handleMaintenanceStreamCompactMeta))
+	// SLICE 4: Destinations tab — encrypted-at-rest profiles for
+	// remote sync endpoints. The store derives an AES-256 key from
+	// JM_ADMIN_KEY via HKDF; when adminKey is empty the handlers
+	// return 503. Persistence callback flows mutations through to
+	// the JobManager's state file (one source of truth on disk).
+	store, err := newDestinationStore(cfg.AdminKey)
+	if err != nil {
+		log.Printf("manager: destinations store init failed: %v (Destinations tab will be disabled)", err)
+	} else {
+		a.dests = store
+		store.SetOnChange(mgr.SaveState)
+		mgr.SetDestinations(store)
+	}
+	mux.HandleFunc(prefix+"/api/destinations", a.auth(a.handleDestinations))
+	mux.HandleFunc(prefix+"/api/destinations/", a.auth(a.handleDestinationItem))
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
@@ -236,9 +259,22 @@ func (a *API) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		got := r.Header.Get("X-JuiceMount-Admin-Key")
 		if got == "" {
-			got = r.URL.Query().Get("key")
+			// Query-string fallback only for the EventSource path
+			// (browser API can't set custom headers on SSE). All other
+			// requests MUST use the header — the query-string path
+			// ends up in proxy access logs and browser history.
+			// Security-reviewer flagged this; the limited fallback is
+			// the project's current accepted tradeoff for streaming.
+			if strings.HasSuffix(r.URL.Path, "/stream") {
+				got = r.URL.Query().Get("key")
+			}
 		}
-		if got != a.adminKey {
+		// Constant-time compare so a LAN attacker can't recover the
+		// key one character at a time via response timing. crypto/subtle
+		// ConstantTimeCompare returns 1 on equal, 0 on different or
+		// different lengths. Empty `got` reliably mismatches a
+		// non-empty configured key.
+		if subtle.ConstantTimeCompare([]byte(got), []byte(a.adminKey)) != 1 {
 			http.Error(w, "missing or invalid X-JuiceMount-Admin-Key", http.StatusUnauthorized)
 			return
 		}
