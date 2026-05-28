@@ -389,7 +389,7 @@ No knobs; all signal.
 ### SLICE 3 — Trash
 
 **ID:** `slice-3-trash`
-**Status:** NOT STARTED
+**Status:** CODE COMPLETE (deploy + live validation deferred while user is mid-copy on production TrueNAS; commit eba9b7a, image published, awaiting redeploy authorization)
 **Depends on:** slice-0
 **Blocks:** none
 
