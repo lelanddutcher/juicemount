@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -176,6 +177,86 @@ func (s *SpoolStore) Meta() *metadata.SpoolStore { return s.meta }
 // must close them first. Idempotent.
 func (s *SpoolStore) Stop() {
 	s.closed.Store(true)
+}
+
+// MarkDrainComplete is the success path for the drainer (slice B). It
+// marks the SQL row done; ONLY on SQL success does it remove the spool
+// file from disk, release the capacity reservation, and evict the
+// in-memory index entry.
+//
+// nfsPath/spoolFile/size come from the metadata.SpoolRow the drainer
+// claimed; the drainer never touches the *SpoolEntry directly (it may
+// no longer exist if the writer process restarted between Close and
+// drain).
+//
+// HIGH-2 fix (slice B reviewer): on SQL failure we MUST NOT delete the
+// spool file or release capacity. Doing so converts a retryable
+// transient SQLite error (busy, WAL checkpoint, disk full on meta
+// partition) into irrecoverable data loss for a successfully-drained
+// file. The caller (drainOne) sees the SQL error and calls
+// failTransient, which retries. Slice F's boot scrubber covers crashes
+// between SQL success and the post-SQL cleanup (in that narrow window
+// the file exists on disk + capacity stays counted, harmless).
+func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size int64) error {
+	if err := s.meta.MarkDone(id); err != nil {
+		return err
+	}
+	if rmErr := os.Remove(spoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
+		log.Printf("spool: drain complete %d: remove %s: %v", id, spoolFile, rmErr)
+	}
+	s.releaseCapacity(size)
+	if e, ok := s.index.Lookup(nfsPath); ok && e.id == id {
+		s.index.DeleteIfMatches(nfsPath, e)
+	}
+	return nil
+}
+
+// MarkDrainRetry is the transient-failure path: bumps drain_attempts +
+// last_error and resets the row to ready so the dispatcher picks it up
+// again after backoff. Caller is responsible for the backoff delay.
+func (s *SpoolStore) MarkDrainRetry(id int64, reason string) error {
+	if err := s.meta.IncrementAttempts(id, reason); err != nil {
+		return err
+	}
+	return s.meta.ResetToReady(id)
+}
+
+// QuarantineDrain is the SHA-mismatch path: marks the SQL row failed
+// THEN moves the spool file to a quarantine subdir (preserving forensic
+// state), releases the capacity reservation, and evicts the index entry.
+// The manifest log (slice G) will record the quarantine event with
+// timestamps + the mismatched SHAs.
+//
+// Ordering (HIGH-2 follow-on fix): MarkFailed runs BEFORE the rename.
+// If SQL fails, the spool file stays in its original location and the
+// row remains in `draining` state — the drainer's next attempt will
+// re-detect the SHA mismatch and call QuarantineDrain again. If we
+// renamed first then SQL-failed, the file would be in quarantine/ but
+// the row's spool_file path would point to the original (now missing)
+// location; slice F's scrubber would treat it as an orphan and
+// failPermanent, losing the forensic copy.
+//
+// The quarantined file is left on disk. Operators can inspect/recover/
+// delete it manually.
+func (s *SpoolStore) QuarantineDrain(id int64, nfsPath, spoolFile string, size int64, reason string) error {
+	if err := s.meta.MarkFailed(id, reason); err != nil {
+		return err
+	}
+	quarantineDir := filepath.Join(s.root, "quarantine")
+	if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
+		log.Printf("spool: quarantine mkdir: %v", err)
+		// Continue — the SQL row is already failed; best-effort the
+		// file move and the cleanup below.
+	}
+	dest := filepath.Join(quarantineDir, filepath.Base(spoolFile))
+	if err := os.Rename(spoolFile, dest); err != nil && !os.IsNotExist(err) {
+		log.Printf("spool: quarantine move %s→%s: %v", spoolFile, dest, err)
+	}
+	s.releaseCapacity(size)
+	if e, ok := s.index.Lookup(nfsPath); ok && e.id == id {
+		s.index.DeleteIfMatches(nfsPath, e)
+	}
+	return nil
 }
 
 // signalReady notifies the drainer that a new ready entry exists.

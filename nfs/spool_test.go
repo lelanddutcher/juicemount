@@ -488,6 +488,59 @@ func TestSpoolSetDrainerWakeConcurrentlyWithSignal(t *testing.T) {
 // underlying os.OpenFile fails after Insert, the SQL row must be DELETED
 // (not MarkFailed-ed) so a retry on the same path doesn't grow
 // spool_entries unboundedly under persistent disk failure.
+// TestSpoolMarkDrainCompleteSQLFailurePreservesData covers reviewer
+// HIGH-2 on slice B: if MarkDone fails, the spool file MUST remain on
+// disk and capacity MUST NOT be released, so the next drain attempt
+// can retry from the same data. Silently deleting on SQL failure would
+// convert a transient SQLite error into permanent data loss for a
+// fully-drained file.
+//
+// We provoke a real SQL failure by closing the underlying db connection
+// before MarkDrainComplete is called.
+func TestSpoolMarkDrainCompleteSQLFailurePreservesData(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "spool.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := metadata.InitSpoolSchema(db); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	meta := metadata.NewSpoolStore(db)
+	s, err := NewSpoolStore(t.TempDir(), 0, meta)
+	if err != nil {
+		t.Fatalf("new spool: %v", err)
+	}
+
+	e, _ := s.OpenWrite("/precious.bin")
+	payload := []byte("priceless ProRes 4K frames")
+	_, _ = e.WriteAt(payload, 0)
+	_ = e.Close()
+	_, _ = meta.MarkDraining(e.ID())
+
+	usedBefore, _ := s.Capacity()
+	if usedBefore != int64(len(payload)) {
+		t.Fatalf("used=%d, want %d", usedBefore, len(payload))
+	}
+
+	// Force SQL failure by closing the underlying db.
+	_ = db.Close()
+
+	err = s.MarkDrainComplete(e.ID(), "/precious.bin", e.SpoolFilePath(), int64(len(payload)))
+	if err == nil {
+		t.Fatalf("expected MarkDrainComplete to return SQL error on closed db")
+	}
+
+	// CRITICAL invariants on SQL failure:
+	usedAfter, _ := s.Capacity()
+	if usedAfter != usedBefore {
+		t.Errorf("capacity changed on SQL failure: before=%d after=%d (DATA LOSS BUG)", usedBefore, usedAfter)
+	}
+	if _, statErr := os.Stat(e.SpoolFilePath()); statErr != nil {
+		t.Errorf("spool file removed on SQL failure (DATA LOSS BUG): %v", statErr)
+	}
+}
+
 // TestSpoolStopRefusesOpenWrite covers the closed-store error path —
 // after Stop, OpenWrite must return an error rather than silently
 // accepting writes that the drainer will never process.
