@@ -182,7 +182,7 @@ Every slice MUST pass:
 ### SLICE 0 — Rename + tab nav scaffold
 
 **ID:** `slice-0-rename`
-**Status:** CODE COMPLETE (deploy + live validation deferred while user is mid-copy on production TrueNAS; commit db2b531, image published, awaiting redeploy authorization)
+**Status:** COMPLETE (commit db2b531, deployed 2026-05-28, container `ix-juicemount-juicemount-manager-1` healthy, sidebar + 7 tabs serving at port 30190 root)
 **Depends on:** none
 **Blocks:** every other slice (foundation)
 
@@ -275,7 +275,7 @@ tab still working end-to-end. Zero feature change.
 ### SLICE 1 — Bidirectional migrations
 
 **ID:** `slice-1-bidirectional`
-**Status:** CODE COMPLETE (deploy + live validation deferred while user is mid-copy on production TrueNAS; commit d84e495, image published, awaiting redeploy authorization)
+**Status:** COMPLETE (commit d84e495, deployed 2026-05-28, Direction picker live in Migrations tab; browser smoke pending user confirmation)
 **Depends on:** slice-0
 **Blocks:** slice-4 (destinations layout reuses Direction picker)
 
@@ -339,7 +339,7 @@ Into JuiceFS (today), Out of JuiceFS, JuiceFS-to-JuiceFS.
 ### SLICE 2 — Overview dashboard
 
 **ID:** `slice-2-overview`
-**Status:** CODE COMPLETE (deploy + live validation deferred while user is mid-copy on production TrueNAS; commit 32d2d29, image published, awaiting redeploy authorization)
+**Status:** COMPLETE with caveats (commit 32d2d29, deployed 2026-05-28; /api/overview live, redis+jobs cards green, MinIO card shows "minioURL not configured" — JM_MINIO_URL env not applied to live compose during in-place patch, follow-up patch needed; volume card shows "juicefs status failed exit 1" — likely the standalone container's juicefs version doesn't support --json on status, needs version detection)
 **Depends on:** slice-0
 **Blocks:** none
 
@@ -389,7 +389,7 @@ No knobs; all signal.
 ### SLICE 3 — Trash
 
 **ID:** `slice-3-trash`
-**Status:** CODE COMPLETE (deploy + live validation deferred while user is mid-copy on production TrueNAS; commit eba9b7a, image published, awaiting redeploy authorization)
+**Status:** COMPLETE (commit eba9b7a, deployed 2026-05-28, /api/trash/config returns days=-1 recommended=7 — UI can prompt user to enable retention)
 **Depends on:** slice-0
 **Blocks:** none
 
@@ -623,7 +623,7 @@ Each schedule fires a normal Job through the existing pipeline.
 ### SLICE 6 — Storage maintenance
 
 **ID:** `slice-6-maintenance`
-**Status:** CODE COMPLETE (deploy + live validation deferred until GHCR juicemount-manager package visibility is flipped to Public — currently 401 on pull; commit afa885d, image built and pushed)
+**Status:** COMPLETE (commit afa885d, deployed 2026-05-28 after GHCR juicemount-manager package visibility flipped to Public; 5 levers wired, SSE streams ready, per-kind mutex live)
 **Depends on:** slice-0
 **Blocks:** none
 
