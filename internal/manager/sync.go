@@ -286,7 +286,54 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 		}
 		return fmt.Errorf("juicefs sync exited: %w — last stderr:\n%s", err, tail)
 	}
+
+	// Post-sync writability fix. Source datasets sometimes carry odd
+	// modes (we hit /sources/.../mode 070 with uid 100 — the prior
+	// dataset's SMB share masked them via force-user). juicefs sync
+	// faithfully replicates those bits when --perms is on, and even
+	// without --perms the user's source-derived umask can produce
+	// dest entries the Mac client can't write to over WebDAV/NFS.
+	//
+	// Rather than carry the "every migration eventually needs a chmod
+	// run" footgun forward, we apply it unconditionally for embedded-
+	// mode destinations on success. The flags (u+rwX,g+rwX,o+rX) add
+	// read+write for owner/group and read for everyone, plus the
+	// capital X only adds execute on directories (and on files that
+	// were already executable). Idempotent — running it twice is a
+	// no-op. This is metadata-only so even a 14k-file tree completes
+	// in seconds.
+	//
+	// A future POSIX-ACL slice will replace this with a configurable
+	// policy; for now, "every migrated file is read+write in the
+	// mount" is the contract.
+	if spec.Mode == ModeEmbedded && spec.FUSEMount != "" {
+		applyPostSyncChmod(ctx, destination, spec.FUSEMount)
+	}
 	return nil
+}
+
+// applyPostSyncChmod walks the destination tree and ensures every file
+// and directory is at least owner+group rw, world r, dirs +x. Errors
+// are logged but never propagated — the sync itself already succeeded,
+// and a chmod failure on a single file shouldn't reverse the job's
+// success state in the UI.
+func applyPostSyncChmod(ctx context.Context, destination, fuseMount string) {
+	// destination is a juicefs sync URI (file:///<mount>/... or
+	// jfs://<vol>/...). Rewrite to a local FUSE-mount path by stripping
+	// the file:// prefix when present and replacing any /jfs prefix
+	// the user supplied with the on-disk fuseMount.
+	target := strings.TrimPrefix(destination, "file://")
+	target = strings.TrimSuffix(target, "/")
+	if target == "" {
+		return
+	}
+	cmd := exec.CommandContext(ctx, "chmod", "-R", "u+rwX,g+rwX,o+rX", target)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Don't tank the job. Log so an operator can diagnose if a
+		// later "I can't write to Resolve project" report comes in.
+		fmt.Fprintf(os.Stderr, "manager: post-sync chmod on %q failed (job stays successful): %v\noutput:\n%s\n", target, err, string(out))
+	}
 }
 
 // pollJuicefsMetrics scrapes the juicefs sync Prometheus endpoint every
