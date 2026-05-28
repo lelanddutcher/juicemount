@@ -212,6 +212,122 @@ func TestNormalizeDestURIJFS(t *testing.T) {
 	}
 }
 
+// TestNormalizeAnyURI exercises the SLICE-1 dispatcher that picks the
+// right scheme based on the incoming string's prefix:
+//
+//   - "<word>://..."  → passthrough (matchSlash only)
+//   - "/jfs/..."      → file:///<FUSEMount>/... (when fuseMount set)
+//   - "/<other>"      → file:///<other>
+//   - empty fuseMount → /jfs/... falls back to file:///jfs/... (the
+//     branch documented as "the caller shouldn't be giving us a /jfs
+//     path in standalone mode" — defensive)
+func TestNormalizeAnyURI(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        string
+		fuseMount string
+		preserve  bool
+		want      string
+	}{
+		// In direction: host source path → file:// host URL.
+		{"host source preserve=true", "/sources/oldzpool/Foo", "/mnt/juicefs", true, "file:///sources/oldzpool/Foo/"},
+		{"host source preserve=false", "/sources/oldzpool/Foo", "/mnt/juicefs", false, "file:///sources/oldzpool/Foo"},
+
+		// Out direction: /jfs/... source → file:///<FUSEMount>/...
+		{"jfs source preserve=true", "/jfs/Film Projects", "/mnt/juicefs", true, "file:///mnt/juicefs/Film Projects/"},
+		{"jfs source preserve=false", "/jfs/Film Projects", "/mnt/juicefs", false, "file:///mnt/juicefs/Film Projects"},
+		{"jfs root preserve=true", "/jfs", "/mnt/juicefs", true, "file:///mnt/juicefs/"},
+		{"jfs root preserve=false", "/jfs", "/mnt/juicefs", false, "file:///mnt/juicefs"},
+		{"jfs source FUSE-mount trailing slash absorbed", "/jfs/foo", "/mnt/juicefs/", true, "file:///mnt/juicefs/foo/"},
+
+		// Existing URL schemes pass through.
+		{"s3 URL passthrough", "s3://bucket/path", "/mnt/juicefs", true, "s3://bucket/path/"},
+		{"file URL passthrough", "file:///raw/path", "/mnt/juicefs", false, "file:///raw/path"},
+		{"jfs URL passthrough", "jfs://zpool/x", "/mnt/juicefs", true, "jfs://zpool/x/"},
+
+		// Whitespace stripped (matches normalizeSourceURI behavior).
+		{"whitespace stripped", "  /sources/foo  ", "/mnt/juicefs", true, "file:///sources/foo/"},
+
+		// Standalone mode (empty fuseMount): /jfs/... falls through to
+		// the file:// host-path branch — operator misuse, but the
+		// helper returns a parseable string rather than panicking.
+		{"jfs source no FUSE mount", "/jfs/foo", "", true, "file:///jfs/foo/"},
+
+		// Bare relative path: falls through unchanged (caller is
+		// expected to reject these before calling).
+		{"relative path passthrough", "foo/bar", "/mnt/juicefs", true, "foo/bar/"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeAnyURI(tc.in, tc.fuseMount, tc.preserve)
+			if got != tc.want {
+				t.Errorf("normalizeAnyURI(%q, %q, %v) = %q, want %q",
+					tc.in, tc.fuseMount, tc.preserve, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateDirectionPair covers the matrix of allowed and forbidden
+// (direction, src, dst) tuples. The SLICE-1 doc calls out the two
+// must-reject rules specifically:
+//   - DirectionOut MUST forbid dest under /jfs (that's an In, not an
+//     Out)
+//   - DirectionIn MUST forbid dest outside /jfs
+//
+// DirectionBetween always returns the "Configure a second JuiceFS
+// destination first" stub error in SLICE 1 — the actual two-volume
+// wiring lands in SLICE 4.
+func TestValidateDirectionPair(t *testing.T) {
+	cases := []struct {
+		name      string
+		dir       Direction
+		src       string
+		dst       string
+		wantErr   bool
+		errSubstr string // optional substring the error must contain
+	}{
+		// DirectionIn happy paths.
+		{"in: host→jfs", DirectionIn, "/sources/foo", "/jfs/bar", false, ""},
+		{"in: host→jfs root", DirectionIn, "/sources/foo", "/jfs", false, ""},
+		{"in default (empty dir): host→jfs", "", "/sources/foo", "/jfs/bar", false, ""},
+
+		// DirectionIn rejects dest outside /jfs.
+		{"in: host→host (rejected)", DirectionIn, "/sources/foo", "/external/bar", true, "direction=in requires destination under /jfs"},
+		{"in: jfs→jfs (rejected — that's between)", DirectionIn, "/jfs/foo", "/jfs/bar", true, "direction=in source must be a host path"},
+
+		// DirectionOut happy path.
+		{"out: jfs→host", DirectionOut, "/jfs/foo", "/external/bar", false, ""},
+		{"out: jfs root→host", DirectionOut, "/jfs", "/external/bar", false, ""},
+
+		// DirectionOut rejects dest under /jfs (would be an In).
+		{"out: jfs→jfs (rejected)", DirectionOut, "/jfs/foo", "/jfs/bar", true, "destination cannot be under /jfs"},
+		{"out: host→host (rejected)", DirectionOut, "/sources/foo", "/external/bar", true, "direction=out requires source under /jfs"},
+
+		// DirectionBetween — always the stub error in SLICE 1.
+		{"between: jfs→jfs (stub)", DirectionBetween, "/jfs/foo", "/jfs/bar", true, "Configure a second JuiceFS destination"},
+		{"between: host→jfs (also rejected)", DirectionBetween, "/sources/foo", "/jfs/bar", true, "requires both source and destination under /jfs"},
+
+		// Unknown direction.
+		{"unknown direction", Direction("sideways"), "/sources/foo", "/jfs/bar", true, "unknown direction"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDirectionPair(tc.dir, tc.src, tc.dst)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if tc.errSubstr != "" && !strings.Contains(err.Error(), tc.errSubstr) {
+					t.Errorf("error %q does not contain %q", err.Error(), tc.errSubstr)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestMatchSlashSrcDstConsistency(t *testing.T) {
 	// The whole point of matchSlash is to guarantee src and dst agree
 	// on the trailing slash — juicefs sync FATALs otherwise.

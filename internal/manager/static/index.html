@@ -39,15 +39,39 @@
         </div>
       </section>
 
-      <!-- Migrations tab — the only functional tab in SLICE 0.
-           Wraps the entire pre-slice-0 three-pane migrator UI in a
-           single section so the existing JS init code can hook
-           the same DOM ids it always has. -->
+      <!-- Migrations tab — the only functional tab in SLICE 0,
+           expanded in SLICE 1 with a Direction toggle (Into JuiceFS /
+           Out of JuiceFS / JuiceFS-to-JuiceFS). Wraps the entire pre-
+           slice-0 three-pane migrator UI in a single section so the
+           existing JS init code can hook the same DOM ids it always
+           has. -->
       <section data-tab="migrations" class="tab-pane migrations-pane" hidden>
+        <!-- Direction picker (SLICE 1). Drives which root the source
+             browser starts in (/sources for In, /jfs for Out/Between)
+             and which combos the backend accepts. JuiceFS-to-JuiceFS
+             is a stub until SLICE 4 ships the Destinations tab; the
+             radio is selectable so users can see the helpful message
+             pointing them there. -->
+        <fieldset class="direction-picker">
+          <legend>Direction</legend>
+          <label class="direction-opt">
+            <input type="radio" name="direction" value="in" checked>
+            <span><strong>Into JuiceFS</strong> <em>Import from a host path into /jfs</em></span>
+          </label>
+          <label class="direction-opt">
+            <input type="radio" name="direction" value="out">
+            <span><strong>Out of JuiceFS</strong> <em>Export /jfs contents to a host path</em></span>
+          </label>
+          <label class="direction-opt">
+            <input type="radio" name="direction" value="between">
+            <span><strong>JuiceFS to JuiceFS</strong> <em>Sync between two JuiceFS volumes (requires a second destination — slice-4)</em></span>
+          </label>
+        </fieldset>
+
         <div class="three-pane">
           <section class="pane source">
             <h2>1 · Source</h2>
-            <p class="hint">Browse a source root and pick a directory to migrate.</p>
+            <p class="hint" id="source-hint">Browse a source root and pick a directory to migrate.</p>
             <div id="source-roots" class="source-roots">Loading…</div>
             <div id="browser" class="browser" hidden>
               <div class="browser-bar">

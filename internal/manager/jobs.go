@@ -56,9 +56,15 @@ type Job struct {
 	// pane, passed through on job creation. Used by the frontend to
 	// render a real % progress bar (vs an indeterminate placeholder).
 	// 0 means "unknown" — frontend falls back to indeterminate display.
-	TotalBytes int64         `json:"total_bytes"`
-	Last       ProgressEvent `json:"last"`
-	Error      string        `json:"error,omitempty"`
+	TotalBytes int64 `json:"total_bytes"`
+	// Direction the job was created in (in/out/between). Persisted so
+	// resume after a restart re-submits with the correct direction
+	// rather than relying on path-based inference (which breaks for
+	// Between once slice-4 lands). Empty/missing on records written
+	// before slice-1 — caller treats empty as DirectionIn.
+	Direction Direction     `json:"direction,omitempty"`
+	Last      ProgressEvent `json:"last"`
+	Error     string        `json:"error,omitempty"`
 
 	// runtime-only — not serialized
 	cancel    context.CancelFunc `json:"-"`
@@ -230,6 +236,7 @@ func (m *JobManager) saveStateLocked() {
 			StartedAt:   j.StartedAt,
 			FinishedAt:  j.FinishedAt,
 			TotalBytes:  j.TotalBytes,
+			Direction:   j.Direction,
 			Last:        j.Last,
 			Error:       j.Error,
 		}
@@ -266,7 +273,10 @@ func (m *JobManager) SetRunner(fn SyncFunc) {
 // no active job, kicks it off immediately on a background goroutine.
 // totalBytes is the pre-computed source size (from the UI's preview
 // scan); pass 0 for unknown.
-func (m *JobManager) Submit(source, destination string, opts SyncOptions, totalBytes int64) (*Job, error) {
+func (m *JobManager) Submit(source, destination string, opts SyncOptions, totalBytes int64, direction Direction) (*Job, error) {
+	if direction == "" {
+		direction = DirectionIn
+	}
 	id := newJobID()
 	j := &Job{
 		ID:          id,
@@ -276,6 +286,7 @@ func (m *JobManager) Submit(source, destination string, opts SyncOptions, totalB
 		State:       JobPending,
 		CreatedAt:   time.Now().UnixMilli(),
 		TotalBytes:  totalBytes,
+		Direction:   direction,
 	}
 	m.mu.Lock()
 	m.jobs[id] = j
