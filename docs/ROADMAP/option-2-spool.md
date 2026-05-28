@@ -1,6 +1,6 @@
 # JuiceMount Spool — Option 2
 
-**Status:** IN PROGRESS — Slice G COMPLETE 2026-05-28 (CI pending) — Slices A-G shipped; integrity audit log live at spool/manifest.log. Swift UI deferrals carry forward.
+**Status:** ALL SLICES COMPLETE — A through H shipped 2026-05-28. Architecture is feature-complete behind JM_SPOOL_ENABLE=1. Remaining work: Swift menu bar UI + Manager web UI (data contract via /spool already stable), live soak testing.
 **Type:** Foundational architecture change
 **Scope:** ~1 week implementation + 2–3 days hardening/testing
 **Branch:** `production-hardening` (continues on it; not a separate branch)
@@ -13,7 +13,7 @@
 - [x] **Slice E** — Runtime wiring + /spool HTTP endpoint — COMPLETE 2026-05-28 (Swift menu bar + Manager web UI deferred)
 - [x] **Slice F** — Crash recovery + boot scrubber — COMPLETE 2026-05-28 (App.swift quit dialog deferred)
 - [x] **Slice G** — Integrity audit log — COMPLETE 2026-05-28
-- [ ] Slice H — Preferences + WAN mode polish
+- [x] **Slice H** — WAN mode polish (JM_WAN_MODE / JM_MAX_UPLOADS) — COMPLETE 2026-05-28 (Swift Preferences pane deferred)
 
 ---
 
