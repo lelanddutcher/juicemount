@@ -84,7 +84,11 @@ Plus earlier sub-fix: Lua SCAN MATCH tightened from `d*` to `d[0-9]*` to exclude
 
 ### QA-37 — Finder write errors -36 / 100060 + non-local throughput on small files
 
-**Status:** OPEN, logged 2026-05-28 from live testing.
+**Status:** PARTIAL, logged 2026-05-28 from live testing.
+- Slice B (FDPool keyspace split) — COMMITTED 2026-05-28 (929909f), CI in flight.
+  Fixes the -36/EBADF error class. See commit message for full diff context.
+- Slice A (async UpdateSize + debounced publishEvent) — DESIGNED, awaiting user
+  ack before implementation. See "Slice A design" subsection below.
 
 **Symptom:**
 - Writing or copying to `/Volumes/zpool` from Finder occasionally errors with
@@ -143,6 +147,83 @@ cache-resident afterward via `jmctl pin-status`.
 in roughly the time of a local-SSD copy (same order of magnitude, allowing
 for cache-write overhead), with zero -36 / 100060 errors. The data shows up
 fully in JuiceFS afterward and reads back at local speed.
+
+#### Slice B — fdpool keyspace split (LANDED 2026-05-28, 929909f)
+
+**Root cause:** `nfs/fdpool.go` keyed by bare `path`. `Stat()` would do
+`fdPool.Get(path)` and cache an RDONLY fd. A subsequent WRITE RPC calling
+`fdPool.GetWrite(path, O_RDWR|O_CREATE, perm)` found the cached RDONLY fd
+and returned it; the next `WriteAt` EBADF'd → Finder -36 / Cocoa 100060.
+
+**Fix:** keyed by `fdKey{path, write}` so read and write fds live in
+independent slots. `HasOpenRefs` now checks both slots (QA-35 active-holder
+gate covers writers too).
+
+**Pre-merge testing:** read-path regression tests green
+(TestNFSReadFile, TestNFSReadLargeFile, TestReadahead*, TestNFSFDPoolStats,
+TestNFSCreateAndReadLarger). Three new FDPool tests cover slot isolation,
+wrong-slot noop, and N=16 concurrent GetWrite race under `-race`. Code
+reviewer signed off after 2 HIGH items addressed (stale comment + missing
+race test).
+
+**Live validation still needed (post-deploy):**
+- Repro the original -36 error from a Finder copy on the deployed image.
+  Slice B should eliminate the EBADF class entirely.
+- Confirm no read-cache regression: DaVinci playback of a fully-cached
+  4 K MP4 with a parallel write in progress.
+
+#### Slice A — async UpdateSize + debounced publishEvent (DESIGN, AWAITING ACK)
+
+**Suspected throughput root cause (H2 from original triage):** every WRITE
+RPC's `writeFile.Close` at `nfs/handler.go:~1690` does a synchronous
+`store.UpdateSize` (SQLite UPDATE under `writeMu`) + spawns a `publishEvent`
+goroutine that PUBLISH'es to Redis. On a 2000+ file Finder copy, this
+serializes all concurrent writers on `writeMu` and floods Redis subscribers
+with one event per RPC (potentially thousands per file at 64 KB RPCs).
+
+**Proposed design:**
+
+1. **Batched size flusher.** New `nfs/size_flusher.go`. Adds
+   `sizeFlushPending map[path]{size, mtime, inode}` + a 500 ms ticker
+   goroutine. `writeFile.Close` enqueues into this map (MAX merge on
+   concurrent updates per path) instead of calling `store.UpdateSize`
+   directly. Flusher snapshots the map under lock, clears it, releases the
+   lock, then issues SQLite UPDATEs in batch. Final flush on
+   `StopHandler`.
+
+2. **publishEvent debounce.** New
+   `lastPublished map[path]time.Time` + 1 s window. `writeFile.Close` skips
+   publish if within window. ONLY for the per-Close create/update event;
+   rename/delete/other publishers untouched.
+
+**Cache-correctness invariants preserved:**
+- `writeSizes` map is the truth source during writes (handler.go:990-998
+  already prefers it over SQLite size on Lstat; same for Stat). Stat/Lstat
+  during the debounce window see the new size from `writeSizes`, not
+  from stale SQLite. **No read-path code touched.**
+- `pathCache` update inside `UpdateSize` still happens during the flusher
+  pass — just delayed by up to 500 ms. Acceptable because writeSizes
+  shadows it for fresh writes.
+
+**Trade-off accepted:**
+- Crash-window durability: if the process crashes between `writeFile.Close`
+  and the next flusher tick, the SQLite size for in-flight writes is lost.
+  On restart, `writeSizes` is gone and SQLite returns the stale size.
+  Next write to the file fixes it. Risk: low (rare crash, recoverable),
+  worth the ~10x-100x write-throughput gain on small-file bursts.
+
+**Tests to add pre-merge:**
+- Read-after-write sees the new size within the debounce window
+  (writeSizes invariant).
+- Concurrent writes to the same path coalesce into a single SQLite UPDATE.
+- `StopHandler` flushes all pending writes.
+- DaVinci playback regression check on fully-cached 4 K MP4 with parallel
+  500 MB write in progress (user's specific concern).
+
+**ASK FOR USER:** before implementing Slice A, please confirm:
+(a) the crash-window trade-off is acceptable, and
+(b) the 500 ms / 1 s windows are reasonable defaults (configurable later
+via env if needed).
 
 ---
 
