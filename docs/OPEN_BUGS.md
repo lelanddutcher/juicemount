@@ -82,6 +82,121 @@ Plus earlier sub-fix: Lua SCAN MATCH tightened from `d*` to `d[0-9]*` to exclude
 
 ---
 
+### QA-37 — Finder write errors -36 / 100060 + non-local throughput on small files
+
+**Status:** OPEN, logged 2026-05-28 from live testing.
+
+**Symptom:**
+- Writing or copying to `/Volumes/zpool` from Finder occasionally errors with
+  **Error code -36** (`ioErr`, macOS POSIX write failure surfaced through the
+  Finder File Manager).
+- Some operations error with **100060** (likely a Cocoa
+  `NSFileWriteUnknownError` or related Finder file-coordination code; not a
+  standard POSIX errno — need to trace the exact origin in JuiceMount.app
+  logs or `console.app` at the time of failure).
+- For files small enough to be fully covered by the local SSD cache
+  (`< 1 GB`, well under the configured `--cache-size 100000` = 100 GB), write
+  throughput is NOT at "local SSD" speed — the user observes network-bound
+  behavior even when the buffer/cache should absorb the entire payload.
+
+**Why it matters:** the Dropbox-style write model (see P2) is contingent on
+exactly this case working — small/medium writes must land in the local
+buffer/cache and ack to Finder at SSD speed, with the upload happening
+asynchronously in the background. If -36 / 100060 errors fire mid-write,
+the cache is being bypassed or the write path is going synchronous to the
+S3 backend. Two distinct symptoms (errors AND non-local throughput) make me
+suspect they share a root cause around how juicefs's `--writeback` /
+`--buffer-size` interact with the NFS gateway's `WRITE` RPCs.
+
+**Hypotheses:**
+
+1. **NFS write commit semantics** — NFS clients on macOS issue
+   `NFSPROC_WRITE` with `stable=DATA_SYNC` for some patterns (Finder
+   metadata writes, Resolve project saves). The handler may be honoring
+   `DATA_SYNC` synchronously, forcing a flush all the way to MinIO before
+   ACK, defeating the cache. Check `nfs/handler.go` write path for the
+   `commit` flag handling.
+
+2. **Buffer overflow under burst** — `juicefs mount --buffer-size 4096`
+   (4 GB) might be filling under a sustained burst, blocking new writes
+   until pages drain. Look for `juicefs_staging_block_bytes` saturation
+   in `/cache-status`.
+
+3. **POSIX → NFS error translation** — `-36 ioErr` in NFS land typically
+   surfaces from a downstream EIO. The mapping in `nfs/handler.go` might
+   be returning `NFS3ERR_IO` (= EIO) for transient backend errors that
+   should retry transparently.
+
+4. **100060 is JuiceMount.app's own log code, not POSIX** — search
+   `app/JuiceMount/Sources/.../Logging.swift` for the literal `100060`
+   to see which path emits it. Probably a specific error category for
+   "write rejected by NFS server" or similar.
+
+**Smallest viable next step:** add structured logging to `nfs/handler.go`
+WRITE path that records `stable`, `count`, `time-on-cache-vs-time-on-network`,
+and the resulting NFS reply code. Reproduce by copying a 500 MB file from
+the Mac into `/Volumes/zpool` and noting (a) wall-clock time vs the same
+copy to a local SSD, (b) any errors, (c) whether the file is fully
+cache-resident afterward via `jmctl pin-status`.
+
+**Validation criteria for fix:** 500 MB write to `/Volumes/zpool` finishes
+in roughly the time of a local-SSD copy (same order of magnitude, allowing
+for cache-write overhead), with zero -36 / 100060 errors. The data shows up
+fully in JuiceFS afterward and reads back at local speed.
+
+---
+
+### QA-38 — Menu bar shows persistent "offline / disconnected" while mount is online
+
+**Status:** OPEN, logged 2026-05-28 from live testing.
+
+**Symptom:** JuiceMount menu-bar app's status indicator reports
+"offline" / "disconnected" persistently, even though `/Volumes/zpool` is
+mounted and operational (writes/reads round-trip through the NFS gateway
+successfully).
+
+**Why it matters:** the status indicator is the user's primary signal of
+JM's health. If it lies, the user either ignores the status (eroding all
+future warnings — boy-who-cried-wolf) or assumes the mount is broken and
+forces a stop/start, causing churn the system didn't need.
+
+**Hypotheses:**
+
+1. **`ServerController.status` reads a stale value** — the menu bar polls
+   either a Combine publisher or a direct `health/fuse.go` query that
+   isn't getting invalidated when the mount transitions back to healthy.
+
+2. **Health monitor consecutive-failure threshold sticky** — `health/fuse.go`
+   may be holding a "degraded" state past the point where the underlying
+   check is reporting healthy (QA-33 raised this threshold to 3 consecutive
+   failures; the reverse — clearing degraded state — may need its own
+   threshold or it sticks).
+
+3. **Online detector is keyed on the wrong signal** — if "online" is
+   defined as "Redis reachable AND MinIO reachable AND FUSE mounted" and
+   any of those three reports stale data from a cached HTTP probe, the
+   aggregate stays "offline" even after the mount itself is fine.
+
+4. **macOS reachability framework lag** — `Network.framework` /
+   `SCNetworkReachability` can hold stale `notSatisfied` state through
+   a brief network blip; the JM app may be trusting that signal as
+   gospel.
+
+**Smallest viable next step:** read
+`app/JuiceMount/Sources/JuiceMount/UI/MenuBarController.swift` and
+`Core/ServerController.swift` to find which Combine publisher / `@Published`
+property the status icon binds to. Add structured-log entries on every
+transition (`"status: \(old) -> \(new), trigger: \(reason)"`) and reproduce
+by checking the menu bar against `mount | grep fuse-internal` over a
+10-minute window.
+
+**Validation criteria for fix:** menu bar status follows the actual mount
+state with at most a 10-second lag in either direction. No "phantom
+disconnected" states when the mount is provably up via `mount` + a
+round-trip write/read test.
+
+---
+
 ### Watchdog tolerance edge case
 **Status:** open follow-up to QA-33.
 
