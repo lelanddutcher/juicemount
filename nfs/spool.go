@@ -50,6 +50,11 @@ type SpoolStore struct {
 	// signalReady can't race on the func pointer.
 	wakeMu      sync.RWMutex
 	wakeDrainer func()
+
+	// manifest is the append-only JSONL audit log under <root>/manifest.log.
+	// May be nil if open failed at construction; that case becomes a
+	// no-op for the audit path (drain still proceeds normally).
+	manifest *manifestWriter
 }
 
 // NewSpoolStore creates the spool root if it doesn't exist and returns an
@@ -70,12 +75,19 @@ func NewSpoolStore(root string, capacity int64, meta *metadata.SpoolStore) (*Spo
 	if err := os.MkdirAll(filesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("spool: mkdir %s: %w", filesDir, err)
 	}
-	return &SpoolStore{
+	s := &SpoolStore{
 		root:     root,
 		capacity: capacity,
 		meta:     meta,
 		index:    NewSpoolIndex(),
-	}, nil
+	}
+	if mw, err := newManifestWriter(root); err != nil {
+		// Non-fatal — manifest is audit-only. Log and proceed.
+		log.Printf("spool: manifest writer disabled: %v", err)
+	} else {
+		s.manifest = mw
+	}
+	return s, nil
 }
 
 // SetDrainerWake registers a callback invoked when an entry transitions
@@ -179,7 +191,14 @@ func (s *SpoolStore) Meta() *metadata.SpoolStore { return s.meta }
 // must close them first. Idempotent.
 func (s *SpoolStore) Stop() {
 	s.closed.Store(true)
+	if s.manifest != nil {
+		_ = s.manifest.Close()
+	}
 }
+
+// Manifest returns the audit log writer, or nil if it failed to open.
+// Exposed for tests and for the drainer (which appends per disposition).
+func (s *SpoolStore) Manifest() *manifestWriter { return s.manifest }
 
 // RecoveryReport summarizes what the boot scrubber did. Returned by
 // RecoverOnBoot for log aggregation + admin UX.
@@ -397,6 +416,31 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 	if e, ok := s.index.Lookup(nfsPath); ok && e.id == id {
 		s.index.DeleteIfMatches(nfsPath, e)
 	}
+	if s.manifest != nil {
+		var (
+			shaHex      string
+			shaUnknown  bool
+		)
+		if row, gerr := s.meta.Get(id); gerr == nil && row != nil && len(row.SHA256) > 0 {
+			shaHex = fmt.Sprintf("%x", row.SHA256)
+		} else {
+			shaUnknown = true
+		}
+		if appendErr := s.manifest.Append(ManifestRecord{
+			Event:             ManifestEventDrainDone,
+			Path:              nfsPath,
+			SpoolFile:         spoolFile,
+			Size:              size,
+			SHA256Hex:         shaHex,
+			SHA256Unavailable: shaUnknown,
+		}); appendErr != nil {
+			// AUDIT LOSS — the drain succeeded but the audit trail
+			// no longer reflects it. Operator should investigate
+			// (manifest disk full, permission change, etc).
+			log.Printf("spool: AUDIT LOSS manifest append done id=%d path=%s: %v",
+				id, nfsPath, appendErr)
+		}
+	}
 	return nil
 }
 
@@ -444,6 +488,33 @@ func (s *SpoolStore) QuarantineDrain(id int64, nfsPath, spoolFile string, size i
 	s.releaseCapacity(size)
 	if e, ok := s.index.Lookup(nfsPath); ok && e.id == id {
 		s.index.DeleteIfMatches(nfsPath, e)
+	}
+	if s.manifest != nil {
+		var (
+			shaHex     string
+			shaUnknown bool
+		)
+		if row, gerr := s.meta.Get(id); gerr == nil && row != nil && len(row.SHA256) > 0 {
+			shaHex = fmt.Sprintf("%x", row.SHA256)
+		} else {
+			shaUnknown = true
+		}
+		if appendErr := s.manifest.Append(ManifestRecord{
+			Event:             ManifestEventQuarantine,
+			Path:              nfsPath,
+			SpoolFile:         dest,
+			Size:              size,
+			SHA256Hex:         shaHex,
+			SHA256Unavailable: shaUnknown,
+			Reason:            reason,
+		}); appendErr != nil {
+			// AUDIT LOSS — the quarantine event happened but the
+			// audit trail lost it. This is the most serious manifest
+			// failure mode because quarantine is the integrity
+			// failure case the log exists to document.
+			log.Printf("spool: AUDIT LOSS manifest append quarantine id=%d path=%s reason=%q: %v",
+				id, nfsPath, reason, appendErr)
+		}
 	}
 	return nil
 }
