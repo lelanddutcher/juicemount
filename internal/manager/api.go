@@ -1,9 +1,11 @@
 package manager
 
 import (
+	"context"
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -44,6 +46,13 @@ type API struct {
 	// persistence callback can flow saveState() through on every
 	// mutation.
 	dests *destinationStoreImpl
+
+	// schedules is the SLICE-5 Backups store + scheduler. Nil in tests
+	// that bypass Register; handlers return 503. The store owns the
+	// robfig/cron engine and the goroutine that fires Submit() at each
+	// tick. Lifecycle: Register starts it after both dests and the
+	// JobManager are wired; mgr.StopAll() drains it on shutdown.
+	schedules *scheduleStoreImpl
 }
 
 // Config bundles the fields needed to construct + register the API.
@@ -189,6 +198,19 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	}
 	mux.HandleFunc(prefix+"/api/destinations", a.auth(a.handleDestinations))
 	mux.HandleFunc(prefix+"/api/destinations/", a.auth(a.handleDestinationItem))
+	// SLICE 5: Backups tab — cron-scheduled jobs that reuse the saved
+	// destination profiles. The scheduler is a goroutine inside
+	// scheduleStoreImpl owned by a robfig/cron engine; Register kicks
+	// it off after both the JobManager and the destinations store are
+	// fully wired. mgr.StopAll() (called on shutdown by jm5/main.go)
+	// drains the engine.
+	sched := newScheduleStore(mgr, a.dests, cfg.FUSEMount)
+	a.schedules = sched
+	sched.SetOnChange(mgr.SaveState)
+	mgr.SetSchedules(sched)
+	sched.Start(context.Background())
+	mux.HandleFunc(prefix+"/api/schedules", a.auth(a.handleSchedules))
+	mux.HandleFunc(prefix+"/api/schedules/", a.auth(a.handleScheduleItem))
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
@@ -459,6 +481,18 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	source := strings.TrimSpace(req.Source)
 	dest := strings.TrimSpace(req.Destination)
 
+	// SLICE-5 wires up the saved-destination dropdown the Migrations
+	// tab's JS sets to "<kind>://<name>". When dest matches that shape
+	// AND the name exists in the destinations store, resolve it here
+	// to a fully-formed sync URI + env vars, then submit directly via
+	// SubmitWithEnv (bypassing the path-based validation the
+	// host-path branch needs). This is the slice-4 deferred wiring
+	// the spec called out.
+	if name, ok := parseSavedDestRef(dest); ok {
+		a.submitSavedDestination(w, source, name, req, dir)
+		return
+	}
+
 	// Reject scheme-prefixed strings on both sides. SLICE 0 only checked
 	// destinations; SLICE 1 adds the same protection on the source side
 	// because Out / Between sources are user-provided too (the user
@@ -546,6 +580,166 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, job)
+}
+
+// parseSavedDestRef recognizes the "<kind>://<name>" form the SLICE-4
+// Migrations-tab dropdown sets into #dest-input. Returns (name, true)
+// when the prefix matches a known destination kind. Used by
+// handleMigrate to dispatch to the saved-destination submit path.
+//
+// We intentionally do NOT check the destinations store from inside
+// parseSavedDestRef — the store lookup happens in
+// submitSavedDestination so the error surface (404 vs malformed) stays
+// clean.
+func parseSavedDestRef(dest string) (string, bool) {
+	i := strings.Index(dest, "://")
+	if i <= 0 {
+		return "", false
+	}
+	scheme := dest[:i]
+	if _, ok := destinationKinds[scheme]; !ok {
+		return "", false
+	}
+	name := dest[i+3:]
+	// Slice-4 destination names are URL-segment-safe; anything else is
+	// not a saved-destination reference (and a free-text URL with that
+	// shape would fail validateDestinationName).
+	if err := validateDestinationName(name); err != nil {
+		return "", false
+	}
+	return name, true
+}
+
+// submitSavedDestination resolves a destination profile by name and
+// submits a job whose destination URI + env are derived from that
+// profile. Source is the user-supplied host or /jfs path (validated
+// the same way ad-hoc submits are). On success, returns 202 with the
+// new Job object — identical to the host-path submit path.
+//
+// This is the slice-4 deferred wiring the SLICE-5 spec asked for so
+// the Migrations dropdown and Backups schedules submit jobs against
+// saved destinations through the same code path.
+func (a *API) submitSavedDestination(w http.ResponseWriter, source, name string, req migrateRequest, dir Direction) {
+	if a.dests == nil {
+		http.Error(w, "destinations subsystem not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	if !strings.HasPrefix(source, "/") {
+		http.Error(w, "source must be an absolute path", http.StatusBadRequest)
+		return
+	}
+	cleaned := filepath.Clean(source)
+	switch dir {
+	case DirectionIn, "":
+		if !a.pathAllowed(cleaned) {
+			http.Error(w, "source outside permitted source roots", http.StatusForbidden)
+			return
+		}
+	case DirectionOut, DirectionBetween:
+		if !a.jfsPathAllowed(cleaned) {
+			http.Error(w, "source outside /jfs (FUSE mount)", http.StatusForbidden)
+			return
+		}
+	}
+	d, err := a.dests.getPlaintext(name)
+	if err != nil {
+		if errors.Is(err, errDestinationNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	opts := DefaultSyncOptions()
+	if req.Options != nil {
+		opts = *req.Options
+	}
+	destURI, env, err := d.ToSyncURI(opts.PreserveStructure)
+	if err != nil {
+		http.Error(w, "destination resolve: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	job, err := a.jobs.SubmitWithEnv(cleaned, destURI, opts, req.TotalBytes, dir, "", env)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job)
+	// Best-effort scrub of the in-memory plaintext config now that we've
+	// pulled out the URI + env. Go's GC doesn't promise prompt zeroing;
+	// this limits incidental exposure from a coredump captured mid-
+	// handler. The env slice itself is intentionally NOT scrubbed — the
+	// JobManager holds it for the lifetime of the job.
+	for k := range d.Config {
+		d.Config[k] = ""
+	}
+}
+
+// resolveSavedDestination renders the /api/resolve-destination preview
+// response for a saved-destination reference. Mirrors the host-path
+// branch but emits a "DestinationURL = <kind>://<name> profile" line
+// rather than the literal sync URI (which would leak the bucket /
+// endpoint to the API response). Example mappings still come from the
+// host-side source walk so users can see what's about to be uploaded.
+func (a *API) resolveSavedDestination(w http.ResponseWriter, source, name string, dir Direction, preserveStructure bool) {
+	if a.dests == nil {
+		http.Error(w, "destinations subsystem not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	if !strings.HasPrefix(source, "/") {
+		http.Error(w, "source must be an absolute path", http.StatusBadRequest)
+		return
+	}
+	cleaned := filepath.Clean(source)
+	switch dir {
+	case DirectionIn, "":
+		if !a.pathAllowed(cleaned) {
+			http.Error(w, "source outside permitted source roots", http.StatusForbidden)
+			return
+		}
+	case DirectionOut, DirectionBetween:
+		if !a.jfsPathAllowed(cleaned) {
+			http.Error(w, "source outside /jfs (FUSE mount)", http.StatusForbidden)
+			return
+		}
+	}
+	if !a.dests.exists(name) {
+		http.Error(w, "destination not found: "+name, http.StatusNotFound)
+		return
+	}
+	srcURL := normalizeAnyURI(cleaned, a.fuseMount, preserveStructure)
+	// We deliberately do NOT call ToSyncURI here — that would force a
+	// decryption + return a URI that, while not carrying credentials in
+	// its argv form, still names the remote endpoint. Preview is a UI
+	// affordance, not a place to leak the live URI. Surfacing the
+	// profile name and kind is enough for the user to confirm the
+	// right destination is picked.
+	walkRoot := cleaned
+	dmClean := filepath.Clean(a.destMount)
+	if dir == DirectionOut && a.fuseMount != "" {
+		rel := strings.TrimPrefix(cleaned, dmClean)
+		walkRoot = strings.TrimSuffix(a.fuseMount, "/") + rel
+	}
+	samples := sampleSourceFiles(walkRoot, maxResolveExamples)
+	mappings := make([]exampleMapping, 0, len(samples))
+	for _, s := range samples {
+		displayPath := s
+		if dir == DirectionOut && a.fuseMount != "" {
+			displayPath = cleaned + strings.TrimPrefix(s, walkRoot)
+		}
+		rel := strings.TrimPrefix(s, walkRoot)
+		rel = strings.TrimPrefix(rel, "/")
+		mappings = append(mappings, exampleMapping{
+			SourcePath: displayPath,
+			DestPath:   "[saved] " + name + ":" + rel,
+		})
+	}
+	writeJSON(w, http.StatusOK, resolveDestResponse{
+		SourceURL:       srcURL,
+		DestinationURL:  "saved://" + name,
+		ExampleMappings: mappings,
+		Info:            "Files will be uploaded to the saved destination profile \"" + name + "\". Credentials are resolved at submit time and passed to juicefs sync via environment variables.",
+	})
 }
 
 func (a *API) handleListJobs(w http.ResponseWriter, r *http.Request) {
@@ -715,6 +909,15 @@ func (a *API) handleResolveDestination(w http.ResponseWriter, r *http.Request) {
 	}
 	source := strings.TrimSpace(req.Source)
 	dest := strings.TrimSpace(req.Destination)
+	// SLICE-5 saved-destination preview path: when the dest field is a
+	// "<kind>://<name>" dropdown selection, render a preview that shows
+	// the resolved sync URI (with credentials redacted) so the user can
+	// confirm the right profile is picked before hitting Start. The
+	// example-mapping walk still uses the source path on disk.
+	if name, ok := parseSavedDestRef(dest); ok {
+		a.resolveSavedDestination(w, source, name, dir, req.PreserveStructure)
+		return
+	}
 	// Reject URL-scheme strings on both sides — same protection as
 	// handleMigrate, so the preview shows the same constraints.
 	if i := strings.Index(source, "://"); i > 0 && i < 10 {

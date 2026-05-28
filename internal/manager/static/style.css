@@ -1084,6 +1084,85 @@ main {
   font-size: 0.85rem;
 }
 
+/* SLICE 5 — Backups (cron schedules) */
+.backups-pane { padding: 1.5rem; }
+.backups-header h2 { margin: 0 0 0.5rem; font-size: 1.4rem; }
+.backups-header .hint { margin: 0 0 1rem; color: var(--text-muted); font-size: 0.92rem; }
+.backups-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(380px, 1.4fr);
+  gap: 1.5rem;
+}
+.backups-list-wrap h3, .backups-form-wrap h3 { margin: 0 0 0.75rem; font-size: 1.05rem; }
+.backups-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+.backups-empty-hint { color: var(--text-muted); font-style: italic; padding: 0.5rem 0; }
+.backups-row {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.backups-row.paused { opacity: 0.7; }
+.backups-row-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.backups-cron-pill {
+  background: rgba(0, 0, 0, 0.18);
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+}
+.backups-paused-pill {
+  background: rgba(255, 149, 0, 0.18);
+  color: var(--running);
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.backups-row-meta, .backups-row-times {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+.backups-row-times { font-style: italic; }
+.backups-history summary { cursor: pointer; font-size: 0.85rem; color: var(--text-muted); }
+.backups-history ul {
+  list-style: none;
+  padding: 0.4rem 0 0 1rem;
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.backups-history li { padding: 0.15rem 0; border-bottom: 1px dashed var(--border); }
+.backups-history li:last-child { border-bottom: none; }
+.backups-row-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.backups-row-actions button { font-size: 0.85rem; padding: 0.2rem 0.6rem; }
+.backups-form-wrap form { display: flex; flex-direction: column; gap: 0.6rem; max-width: 540px; }
+.backups-form-wrap .field { display: flex; flex-direction: column; gap: 0.2rem; }
+.backups-form-wrap .field span { font-size: 0.85rem; color: var(--text-muted); }
+.backups-form-wrap input[type="text"],
+.backups-form-wrap input[type="number"],
+.backups-form-wrap select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.35rem 0.55rem;
+  color: var(--text);
+  font: inherit;
+}
+.backups-form-wrap fieldset.options {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.8rem;
+  margin: 0;
+}
+.backups-form-wrap fieldset.options legend { font-size: 0.85rem; color: var(--text-muted); padding: 0 0.3rem; }
+.backups-form-wrap .opt { display: flex; gap: 0.4rem; align-items: flex-start; font-size: 0.88rem; padding: 0.2rem 0; }
+.backups-form-actions { display: flex; gap: 0.5rem; }
+
 footer {
   text-align: center;
   padding: 1rem;

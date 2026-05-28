@@ -377,11 +377,108 @@
         </div>
       </section>
 
-      <!-- Backups tab (placeholder; SLICE 5). -->
-      <section data-tab="backups" class="tab-pane" hidden>
-        <div class="placeholder">
+      <!-- Backups tab (SLICE 5). Cron-scheduled jobs that reuse the
+           saved destination profiles from the Destinations tab. The
+           scheduler is a robfig/cron engine inside the manager; each
+           tick fires Submit() which creates a normal Job in the
+           Migrations tab job list (annotated with the schedule_name).
+           Pausing a schedule keeps the row but removes the cron entry
+           so further firings stop until resumed. -->
+      <section data-tab="backups" class="tab-pane backups-pane" hidden>
+        <div class="backups-header">
           <h2>Backups</h2>
-          <p>Cron-scheduled syncs reusing the migration engine. Coming soon.</p>
+          <p class="hint">
+            Cron-scheduled syncs against your saved destination profiles.
+            Each fire creates a normal job you can watch in the Migrations
+            tab. Configure destinations first; schedules reference them by name.
+          </p>
+          <p id="backups-warning" class="error" hidden></p>
+        </div>
+        <div class="backups-layout">
+          <aside class="backups-list-wrap">
+            <h3>Schedules</h3>
+            <ul id="backups-list" class="backups-list">
+              <li class="backups-empty-hint">No schedules configured yet.</li>
+            </ul>
+          </aside>
+          <div class="backups-form-wrap">
+            <h3 id="backups-form-title">Add schedule</h3>
+            <form id="backups-form" autocomplete="off" spellcheck="false">
+              <label class="field">
+                <span>Name (a-z, 0-9, -, _; unique)</span>
+                <input id="backups-name" type="text" required>
+              </label>
+              <label class="field">
+                <span>Source path (absolute)</span>
+                <input id="backups-source" type="text" placeholder="/sources/Films" required>
+              </label>
+              <label class="field">
+                <span>Direction</span>
+                <select id="backups-direction">
+                  <option value="in">Into JuiceFS</option>
+                  <option value="out">Out of JuiceFS</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Destination profile</span>
+                <select id="backups-destination" required>
+                  <option value="">— pick a destination —</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Destination sub-path (optional)</span>
+                <input id="backups-dest-path" type="text" placeholder="optional/sub/path">
+              </label>
+              <label class="field">
+                <span>Schedule preset</span>
+                <select id="backups-preset">
+                  <option value="">— custom cron below —</option>
+                  <option value="nightly-2am">Nightly at 2:00 AM (0 2 * * *)</option>
+                  <option value="weekly-sun-3am">Weekly Sunday 3:00 AM (0 3 * * 0)</option>
+                  <option value="hourly">Hourly (0 * * * *)</option>
+                  <option value="every-6-hours">Every 6 hours (0 */6 * * *)</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Cron expression (5 fields: m h dom mon dow)</span>
+                <input id="backups-cron" type="text" placeholder="0 2 * * *" required>
+              </label>
+              <fieldset class="options">
+                <legend>Sync options</legend>
+                <label class="opt">
+                  <input type="checkbox" id="backups-opt-preserve-structure" checked>
+                  <span><strong>Preserve folder structure 1:1</strong></span>
+                </label>
+                <label class="opt">
+                  <input type="checkbox" id="backups-opt-skip-junk" checked>
+                  <span><strong>Skip OS metadata files</strong></span>
+                </label>
+                <label class="opt">
+                  <input type="checkbox" id="backups-opt-dry-run">
+                  <span><strong>Dry run</strong></span>
+                </label>
+                <label class="field">
+                  <span>Parallel threads</span>
+                  <input id="backups-opt-threads" type="number" min="1" max="64" value="10">
+                </label>
+              </fieldset>
+              <label class="field">
+                <span>Retain history (last N runs)</span>
+                <input id="backups-retain" type="number" min="1" max="1000" value="20">
+              </label>
+              <label class="opt">
+                <input type="checkbox" id="backups-paused">
+                <span><strong>Paused</strong>
+                  <em>OFF = scheduler fires at each tick. ON = preserved but skipped.</em></span>
+              </label>
+              <div class="backups-form-actions">
+                <button type="submit" id="backups-save">Save schedule</button>
+                <button type="button" id="backups-cancel" hidden>Cancel edit</button>
+              </div>
+              <p id="backups-error" class="error" hidden></p>
+              <p id="backups-flash" class="dest-flash" hidden></p>
+            </form>
+          </div>
         </div>
       </section>
 

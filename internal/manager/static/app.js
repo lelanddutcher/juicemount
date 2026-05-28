@@ -109,6 +109,15 @@
       initDestinationsOnce();
       refreshDestinations();
     }
+    // SLICE 5: lazy-init Backups. The Backups tab depends on the
+    // destinations list (the dropdown lists profile names), so the
+    // first activation triggers a destinations refresh too. Returning
+    // to the tab re-fetches schedules so any out-of-band CRUD or
+    // recently-fired runs are reflected.
+    if (name === 'backups') {
+      initBackupsOnce();
+      refreshBackups();
+    }
   }
 
   window.addEventListener('hashchange', route);
@@ -1767,6 +1776,311 @@
       }
     }
   });
+
+  // ---------------------------------------------------------------
+  // SLICE 5: Backups (cron-scheduled jobs)
+  // ---------------------------------------------------------------
+  const backupsState = {
+    inited: false,
+    list: [],
+    editingName: null,
+  };
+
+  function initBackupsOnce() {
+    if (backupsState.inited) return;
+    backupsState.inited = true;
+    $('#backups-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      saveBackup();
+    });
+    $('#backups-cancel').addEventListener('click', () => cancelBackupEdit());
+    // Picking a preset fills the raw cron field — users can still edit
+    // afterwards if they want a custom schedule. Empty preset reverts
+    // to whatever was in the input previously.
+    $('#backups-preset').addEventListener('change', (e) => {
+      const presets = {
+        'nightly-2am':    '0 2 * * *',
+        'weekly-sun-3am': '0 3 * * 0',
+        'hourly':         '0 * * * *',
+        'every-6-hours':  '0 */6 * * *',
+      };
+      const v = e.target.value;
+      if (v && presets[v]) {
+        $('#backups-cron').value = presets[v];
+      }
+    });
+  }
+
+  async function refreshBackups() {
+    try {
+      // Fetch destinations first so the dropdown is populated whether
+      // or not the user has visited the Destinations tab. This is a
+      // small extra call but keeps the Backups tab self-contained.
+      const dests = await api('GET', '/api/destinations');
+      const destList = (dests && dests.destinations) || [];
+      populateBackupsDestSelect(destList);
+
+      const data = await api('GET', '/api/schedules');
+      backupsState.list = data.schedules || [];
+      renderBackupsList();
+    } catch (e) {
+      const w = $('#backups-warning');
+      w.textContent = e.message || String(e);
+      w.hidden = false;
+    }
+  }
+
+  function populateBackupsDestSelect(destList) {
+    const sel = $('#backups-destination');
+    const current = sel.value;
+    sel.innerHTML = '';
+    const blank = document.createElement('option');
+    blank.value = '';
+    blank.textContent = '— pick a destination —';
+    sel.appendChild(blank);
+    for (const d of destList) {
+      const opt = document.createElement('option');
+      opt.value = d.name;
+      opt.textContent = `${d.name} (${d.kind})`;
+      sel.appendChild(opt);
+    }
+    if (Array.from(sel.options).some((o) => o.value === current)) {
+      sel.value = current;
+    }
+  }
+
+  function renderBackupsList() {
+    const ul = $('#backups-list');
+    ul.innerHTML = '';
+    if (backupsState.list.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'backups-empty-hint';
+      li.textContent = 'No schedules configured yet.';
+      ul.appendChild(li);
+      return;
+    }
+    for (const s of backupsState.list) {
+      const li = document.createElement('li');
+      li.className = 'backups-row';
+      if (s.paused) li.classList.add('paused');
+
+      const head = document.createElement('div');
+      head.className = 'backups-row-head';
+      const nm = document.createElement('strong');
+      nm.textContent = s.name;
+      head.appendChild(nm);
+      const cronPill = document.createElement('code');
+      cronPill.className = 'backups-cron-pill';
+      cronPill.textContent = s.cron;
+      head.appendChild(cronPill);
+      if (s.paused) {
+        const p = document.createElement('span');
+        p.className = 'backups-paused-pill';
+        p.textContent = 'paused';
+        head.appendChild(p);
+      }
+      li.appendChild(head);
+
+      const meta = document.createElement('div');
+      meta.className = 'backups-row-meta';
+      const src = s.source && s.source.path ? s.source.path : '?';
+      const dst = s.destination && s.destination.name ? s.destination.name : '?';
+      meta.textContent = `${src} → ${dst}`;
+      li.appendChild(meta);
+
+      const times = document.createElement('div');
+      times.className = 'backups-row-times';
+      const last = s.last_run ? new Date(s.last_run).toLocaleString() : '—';
+      const next = s.next_run && !s.paused ? new Date(s.next_run).toLocaleString() : '—';
+      times.textContent = `last: ${last} · next: ${next}`;
+      li.appendChild(times);
+
+      if (s.history && s.history.length) {
+        const hist = document.createElement('details');
+        hist.className = 'backups-history';
+        const sum = document.createElement('summary');
+        sum.textContent = `History (${s.history.length})`;
+        hist.appendChild(sum);
+        const hul = document.createElement('ul');
+        for (const h of s.history) {
+          const hl = document.createElement('li');
+          const when = h.started_at ? new Date(h.started_at).toLocaleString() : '—';
+          let txt = `${when} — ${h.state}`;
+          if (h.job_id) txt += ` (job ${h.job_id})`;
+          if (h.error) txt += ` — ${h.error}`;
+          hl.textContent = txt;
+          hul.appendChild(hl);
+        }
+        hist.appendChild(hul);
+        li.appendChild(hist);
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'backups-row-actions';
+      const edit = document.createElement('button');
+      edit.type = 'button';
+      edit.textContent = 'Edit';
+      edit.addEventListener('click', () => beginEditBackup(s));
+      const runNow = document.createElement('button');
+      runNow.type = 'button';
+      runNow.textContent = 'Run now';
+      runNow.addEventListener('click', () => runBackupNow(s.name, runNow));
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.textContent = s.paused ? 'Resume' : 'Pause';
+      toggle.addEventListener('click', () => togglePauseBackup(s));
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.textContent = 'Delete';
+      del.className = 'danger';
+      del.addEventListener('click', () => deleteBackup(s.name));
+      actions.appendChild(edit);
+      actions.appendChild(runNow);
+      actions.appendChild(toggle);
+      actions.appendChild(del);
+      li.appendChild(actions);
+
+      ul.appendChild(li);
+    }
+  }
+
+  function beginEditBackup(s) {
+    backupsState.editingName = s.name;
+    $('#backups-form-title').textContent = `Edit schedule: ${s.name}`;
+    $('#backups-name').value = s.name;
+    $('#backups-name').readOnly = true;
+    $('#backups-source').value = (s.source && s.source.path) || '';
+    $('#backups-direction').value = (s.source && s.source.direction) || 'in';
+    $('#backups-destination').value = (s.destination && s.destination.name) || '';
+    $('#backups-dest-path').value = (s.destination && s.destination.path) || '';
+    $('#backups-cron').value = s.cron || '';
+    $('#backups-preset').value = '';
+    const opts = s.options || {};
+    $('#backups-opt-preserve-structure').checked = !!opts.preserve_structure;
+    $('#backups-opt-skip-junk').checked = !!opts.skip_junk;
+    $('#backups-opt-dry-run').checked = !!opts.dry_run;
+    $('#backups-opt-threads').value = opts.threads || 10;
+    $('#backups-retain').value = s.retain_history || 20;
+    $('#backups-paused').checked = !!s.paused;
+    $('#backups-cancel').hidden = false;
+  }
+
+  function cancelBackupEdit() {
+    backupsState.editingName = null;
+    $('#backups-form-title').textContent = 'Add schedule';
+    $('#backups-name').value = '';
+    $('#backups-name').readOnly = false;
+    $('#backups-source').value = '';
+    $('#backups-direction').value = 'in';
+    $('#backups-destination').value = '';
+    $('#backups-dest-path').value = '';
+    $('#backups-cron').value = '';
+    $('#backups-preset').value = '';
+    $('#backups-opt-preserve-structure').checked = true;
+    $('#backups-opt-skip-junk').checked = true;
+    $('#backups-opt-dry-run').checked = false;
+    $('#backups-opt-threads').value = 10;
+    $('#backups-retain').value = 20;
+    $('#backups-paused').checked = false;
+    $('#backups-cancel').hidden = true;
+    $('#backups-error').hidden = true;
+    $('#backups-flash').hidden = true;
+  }
+
+  async function saveBackup() {
+    const errEl = $('#backups-error');
+    const flashEl = $('#backups-flash');
+    errEl.hidden = true;
+    const name = $('#backups-name').value.trim();
+    const body = {
+      name,
+      source: {
+        path: $('#backups-source').value.trim(),
+        direction: $('#backups-direction').value,
+      },
+      destination: {
+        name: $('#backups-destination').value,
+        path: $('#backups-dest-path').value.trim(),
+      },
+      options: {
+        preserve_structure: $('#backups-opt-preserve-structure').checked,
+        skip_junk:          $('#backups-opt-skip-junk').checked,
+        dry_run:            $('#backups-opt-dry-run').checked,
+        threads:            Math.max(1, parseInt($('#backups-opt-threads').value, 10) || 10),
+      },
+      cron: $('#backups-cron').value.trim(),
+      retain_history: Math.max(1, parseInt($('#backups-retain').value, 10) || 20),
+      paused: $('#backups-paused').checked,
+    };
+    try {
+      if (backupsState.editingName) {
+        await api('PUT', `/api/schedules/${encodeURIComponent(backupsState.editingName)}`, body);
+      } else {
+        await api('POST', '/api/schedules', body);
+      }
+      cancelBackupEdit();
+      flashEl.textContent = 'Schedule saved.';
+      flashEl.hidden = false;
+      setTimeout(() => { flashEl.hidden = true; }, 3000);
+      await refreshBackups();
+    } catch (e) {
+      errEl.textContent = e.message || String(e);
+      errEl.hidden = false;
+    }
+  }
+
+  async function runBackupNow(name, btn) {
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Running…';
+    try {
+      await api('POST', `/api/schedules/${encodeURIComponent(name)}/run`);
+      btn.textContent = 'Submitted';
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; refreshBackups(); }, 1500);
+    } catch (e) {
+      btn.textContent = 'Failed';
+      const w = $('#backups-warning');
+      w.textContent = `Run ${name}: ${e.message || e}`;
+      w.hidden = false;
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 4000);
+    }
+  }
+
+  async function togglePauseBackup(s) {
+    // Send the full body with paused flipped. Preserve every other
+    // field so the PUT doesn't drop options/cron/etc.
+    const body = {
+      name: s.name,
+      source: s.source,
+      destination: s.destination,
+      options: s.options,
+      cron: s.cron,
+      retain_history: s.retain_history || 20,
+      paused: !s.paused,
+    };
+    try {
+      await api('PUT', `/api/schedules/${encodeURIComponent(s.name)}`, body);
+      await refreshBackups();
+    } catch (e) {
+      const w = $('#backups-warning');
+      w.textContent = e.message || String(e);
+      w.hidden = false;
+    }
+  }
+
+  async function deleteBackup(name) {
+    if (!confirm(`Delete schedule "${name}"? In-flight jobs already submitted by this schedule will continue to run.`)) {
+      return;
+    }
+    try {
+      await api('DELETE', `/api/schedules/${encodeURIComponent(name)}`);
+      await refreshBackups();
+    } catch (e) {
+      const w = $('#backups-warning');
+      w.textContent = e.message || String(e);
+      w.hidden = false;
+    }
+  }
 
   // -------- Boot --------
   // route() reads location.hash, falls back to DEFAULT_TAB

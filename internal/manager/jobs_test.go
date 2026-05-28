@@ -10,16 +10,16 @@ import (
 )
 
 // Mock SyncFuncs for deterministic test paths.
-func runnerForeverUntilCanceled(ctx context.Context, _ string, _ RunSyncSpec, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
+func runnerForeverUntilCanceled(ctx context.Context, _ string, _ RunSyncSpec, _, _ string, _ SyncOptions, _ []string, _ chan<- ProgressEvent) error {
 	<-ctx.Done()
 	return context.Canceled
 }
 
-func runnerErrorImmediately(_ context.Context, _ string, _ RunSyncSpec, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
+func runnerErrorImmediately(_ context.Context, _ string, _ RunSyncSpec, _, _ string, _ SyncOptions, _ []string, _ chan<- ProgressEvent) error {
 	return errors.New("simulated sync failure")
 }
 
-func runnerSucceedImmediately(_ context.Context, _ string, _ RunSyncSpec, _, _ string, _ SyncOptions, _ chan<- ProgressEvent) error {
+func runnerSucceedImmediately(_ context.Context, _ string, _ RunSyncSpec, _, _ string, _ SyncOptions, _ []string, _ chan<- ProgressEvent) error {
 	return nil
 }
 

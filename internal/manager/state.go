@@ -61,3 +61,43 @@ type destinationsState struct {
 // value, the same struct deserializes both v1 (no schema_version) and
 // v2 files. The loader logs the v1→v2 upgrade once per startup so the
 // operator can grep for it.
+
+// scheduleState is the persisted form of a SLICE-5 Backups schedule.
+// Stored at the persistedState.Schedules slice (extends the v2 schema —
+// schema_version stays at 2 because v1 readers already tolerate unknown
+// top-level keys via Go's json.Unmarshal "missing field = zero value"
+// behavior).
+//
+// All credential-bearing fields live on the referenced destination
+// profile (resolved at fire time via the destinations store), NOT on
+// the schedule itself. The schedule only carries the destination NAME
+// — a non-secret reference — so the schedule row is safe to persist
+// in plaintext alongside the rest of the state file.
+//
+// History is bounded by RetainHistory (per-schedule cap, default 20)
+// and stored as a small list of HistoryEntry rows so the Backups tab
+// can render "last N runs" without scanning the entire job list.
+type scheduleState struct {
+	Name          string               `json:"name"`
+	Source        SourceSpec           `json:"source"`
+	Destination   DestinationRef       `json:"destination"`
+	Options       SyncOptions          `json:"options"`
+	Cron          string               `json:"cron"`
+	Paused        bool                 `json:"paused,omitempty"`
+	RetainHistory int                  `json:"retain_history,omitempty"`
+	LastRun       int64                `json:"last_run,omitempty"`
+	NextRun       int64                `json:"next_run,omitempty"`
+	History       []scheduleHistoryRow `json:"history,omitempty"`
+}
+
+// scheduleHistoryRow is one persisted entry in a schedule's run log.
+// Kept compact — just the job id (so the UI can deep-link into the
+// Migrations tab) plus the terminal state and timestamps. The full job
+// record lives in the JobManager's jobs map.
+type scheduleHistoryRow struct {
+	JobID      string `json:"job_id"`
+	State      string `json:"state"`
+	StartedAt  int64  `json:"started_at"`
+	FinishedAt int64  `json:"finished_at,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
