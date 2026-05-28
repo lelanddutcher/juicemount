@@ -120,9 +120,15 @@ type RunSyncSpec struct {
 // Source is always given a trailing slash when PreserveStructure is
 // true (rsync "copy contents" semantic).
 //
+// extraEnv carries SLICE-5 destination-profile credentials (and the
+// SLICE-4 saved-destination resolution path) as KEY=VALUE pairs that
+// merge into the subprocess environment. Caller is responsible for
+// keeping the slice secret — RunSync never logs it. Pass nil when no
+// extra env is needed (the typical ad-hoc UI path).
+//
 // Emits ProgressEvent on `progress` each time juicefs writes a
 // recognized progress line. Blocks until juicefs exits or ctx cancels.
-func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, progress chan<- ProgressEvent) error {
+func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, extraEnv []string, progress chan<- ProgressEvent) error {
 	// SLICE 1: route the source through normalizeAnyURI so /jfs/...
 	// sources (Out direction) get rewritten to file:///<FUSEMount>/...
 	// — same kernel-mount path the destination side uses for In. For
@@ -132,7 +138,10 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	src := normalizeAnyURI(source, spec.FUSEMount, opts.PreserveStructure)
 
 	var dst string
-	var extraEnv []string
+	// Start from a copy of the caller-supplied env so we don't mutate
+	// the slice owned by the JobManager. The spec-derived env (the
+	// ModeStandalone URL alias) appends to this.
+	modeEnv := append([]string(nil), extraEnv...)
 	switch spec.Mode {
 	case ModeStandalone:
 		// SLICE 1: an Out-direction destination is a host path (e.g.
@@ -148,7 +157,7 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 			dst = normalizeDestURIJFS(destination, spec.VolName, opts.PreserveStructure)
 			// juicefs sync's URL syntax: env var name = URL alias. So
 			// for jfs://zpool/... we set zpool=redis://...
-			extraEnv = append(extraEnv, spec.VolName+"="+spec.MetaURL)
+			modeEnv = append(modeEnv, spec.VolName+"="+spec.MetaURL)
 		} else {
 			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
 		}
@@ -219,11 +228,13 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	args = append(args, src, dst)
 
 	cmd := exec.CommandContext(ctx, juicefsBin, args...)
-	// Inherit parent env (PATH, HOME, TMPDIR) then add any mode-
-	// specific vars (the URL-alias env for ModeStandalone). Replacing
-	// Env outright would leave juicefs without PATH for its child
-	// processes (e.g. the temp-dir resolution it does on macOS).
-	cmd.Env = append(os.Environ(), extraEnv...)
+	// Inherit parent env (PATH, HOME, TMPDIR) then add the merged env:
+	// the mode-derived vars (URL alias for ModeStandalone) PLUS any
+	// caller-supplied env (SLICE-4/5 destination-profile credentials
+	// like ACCESS_KEY, SECRET_KEY, SFTP_PASSWORD). Replacing Env
+	// outright would leave juicefs without PATH for its child processes
+	// (e.g. the temp-dir resolution it does on macOS).
+	cmd.Env = append(os.Environ(), modeEnv...)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {

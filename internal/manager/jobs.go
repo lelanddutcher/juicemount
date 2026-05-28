@@ -62,20 +62,39 @@ type Job struct {
 	// rather than relying on path-based inference (which breaks for
 	// Between once slice-4 lands). Empty/missing on records written
 	// before slice-1 — caller treats empty as DirectionIn.
-	Direction Direction     `json:"direction,omitempty"`
-	Last      ProgressEvent `json:"last"`
-	Error     string        `json:"error,omitempty"`
+	Direction Direction `json:"direction,omitempty"`
+	// ScheduleName is the SLICE-5 annotation for jobs the scheduler
+	// goroutine submits. Empty for ad-hoc UI-driven jobs. The Migrations
+	// tab UI uses this to render a "scheduled by <name>" tag so users
+	// can distinguish ad-hoc imports from recurring backups in the same
+	// job list.
+	ScheduleName string        `json:"schedule_name,omitempty"`
+	Last         ProgressEvent `json:"last"`
+	Error        string        `json:"error,omitempty"`
 
 	// runtime-only — not serialized
 	cancel    context.CancelFunc `json:"-"`
 	listeners []chan ProgressEvent
 	mu        sync.Mutex
+	// extraEnv carries credential-bearing KEY=VALUE pairs derived from
+	// a saved destination profile. NEVER serialized — surviving a
+	// process restart would defeat the encrypted-at-rest design from
+	// SLICE 4. After a crash, scheduled jobs that were running re-fire
+	// on the next tick (and re-derive env from the live profile).
+	extraEnv []string
 }
 
 // SyncFunc is the signature of a "run one sync" implementation. The
 // default is RunSync (which invokes `juicefs sync` via exec). Tests
 // override this to mock the subprocess.
-type SyncFunc func(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, progress chan<- ProgressEvent) error
+//
+// extraEnv carries additional KEY=VALUE pairs that the runner appends
+// to cmd.Env at exec time. SLICE-5 uses this to ship destination-profile
+// credentials (ACCESS_KEY, SECRET_KEY, SFTP_PASSWORD, etc.) into the
+// juicefs sync subprocess WITHOUT putting them on argv — secrets in
+// argv would leak to any local user via `ps aux`. Pre-SLICE-5 callers
+// pass nil; the runner treats nil and empty identically.
+type SyncFunc func(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, extraEnv []string, progress chan<- ProgressEvent) error
 
 // JobManager owns all jobs in this process. Single-worker for v1.
 type JobManager struct {
@@ -120,6 +139,13 @@ type JobManager struct {
 	// the normal Register order (SetStateFile, then SetDestinations)
 	// would silently drop every persisted destination on startup.
 	pendingDestinations []destinationsState
+
+	// schedules is the SLICE-5 hook for the cron-scheduled Backups
+	// store. Same pattern as destinations — opaque interface, plus a
+	// pending buffer so SetStateFile-then-SetSchedules in Register
+	// doesn't drop persisted schedules.
+	schedules        scheduleStore
+	pendingSchedules []scheduleState
 }
 
 // destinationStore is the minimum surface JobManager needs to keep the
@@ -130,6 +156,15 @@ type destinationStore interface {
 	snapshot() []destinationsState
 	// load installs the destinations slice read from disk on startup.
 	load(rows []destinationsState)
+}
+
+// scheduleStore is the SLICE-5 counterpart. Same shape as
+// destinationStore — opaque to JobManager so the schedules.go file
+// owns its own persistence/lifecycle.
+type scheduleStore interface {
+	snapshot() []scheduleState
+	load(rows []scheduleState)
+	Stop()
 }
 
 // persistedState is what we serialize to disk. Mirrors the in-memory
@@ -146,6 +181,12 @@ type persistedState struct {
 	Jobs          map[string]*Job     `json:"jobs"`
 	Order         []string            `json:"order"`
 	Destinations  []destinationsState `json:"destinations,omitempty"`
+	// SLICE 5: cron-scheduled Backups. omitempty so a fresh install
+	// without schedules doesn't pollute the state file with an empty
+	// array — the loader treats missing == nil == zero schedules
+	// identically. Schema version stays at 2 because v2 readers tolerate
+	// unknown keys (Go's json.Unmarshal leaves them at zero values).
+	Schedules []scheduleState `json:"schedules,omitempty"`
 }
 
 // NewJobManager constructs a JobManager. juicefsBin is the path to
@@ -251,6 +292,12 @@ func (m *JobManager) SetStateFile(path string) {
 	} else {
 		m.pendingDestinations = s.Destinations
 	}
+	// SLICE 5: same dance for schedules. SetSchedules drains the buffer.
+	if m.schedules != nil {
+		m.schedules.load(s.Schedules)
+	} else {
+		m.pendingSchedules = s.Schedules
+	}
 	// Log v1→v2 schema upgrades distinctly so an operator can spot
 	// them in startup logs without diffing the state file.
 	if s.SchemaVersion == 0 {
@@ -286,6 +333,20 @@ func (m *JobManager) SetDestinations(d destinationStore) {
 	}
 }
 
+// SetSchedules attaches the schedule store. Mirrors SetDestinations —
+// drains any pending rows the state-file loader buffered before the
+// store was attached.
+func (m *JobManager) SetSchedules(s scheduleStore) {
+	m.mu.Lock()
+	m.schedules = s
+	pending := m.pendingSchedules
+	m.pendingSchedules = nil
+	m.mu.Unlock()
+	if s != nil && pending != nil {
+		s.load(pending)
+	}
+}
+
 // saveStateLocked atomically writes the current jobs map + order to
 // stateFile. Caller must hold m.mu (any level). Best-effort — logs
 // errors but never blocks the caller; persistence is convenience, not
@@ -310,22 +371,31 @@ func (m *JobManager) saveStateLocked() {
 		// an early save doesn't wipe them.
 		out.Destinations = append([]destinationsState(nil), m.pendingDestinations...)
 	}
+	if m.schedules != nil {
+		out.Schedules = m.schedules.snapshot()
+	} else if m.pendingSchedules != nil {
+		out.Schedules = append([]scheduleState(nil), m.pendingSchedules...)
+	}
 	for id, j := range m.jobs {
 		j.mu.Lock()
 		// Shallow copy by value so we don't serialize the mutex.
+		// extraEnv is deliberately NOT carried over — that field is
+		// runtime-only (it holds plaintext credentials) and persisting
+		// it would defeat the encrypted-at-rest design from SLICE 4.
 		snap := Job{
-			ID:          j.ID,
-			Source:      j.Source,
-			Destination: j.Destination,
-			Options:     j.Options,
-			State:       j.State,
-			CreatedAt:   j.CreatedAt,
-			StartedAt:   j.StartedAt,
-			FinishedAt:  j.FinishedAt,
-			TotalBytes:  j.TotalBytes,
-			Direction:   j.Direction,
-			Last:        j.Last,
-			Error:       j.Error,
+			ID:           j.ID,
+			Source:       j.Source,
+			Destination:  j.Destination,
+			Options:      j.Options,
+			State:        j.State,
+			CreatedAt:    j.CreatedAt,
+			StartedAt:    j.StartedAt,
+			FinishedAt:   j.FinishedAt,
+			TotalBytes:   j.TotalBytes,
+			Direction:    j.Direction,
+			ScheduleName: j.ScheduleName,
+			Last:         j.Last,
+			Error:        j.Error,
 		}
 		j.mu.Unlock()
 		out.Jobs[id] = &snap
@@ -361,19 +431,36 @@ func (m *JobManager) SetRunner(fn SyncFunc) {
 // totalBytes is the pre-computed source size (from the UI's preview
 // scan); pass 0 for unknown.
 func (m *JobManager) Submit(source, destination string, opts SyncOptions, totalBytes int64, direction Direction) (*Job, error) {
+	return m.SubmitWithEnv(source, destination, opts, totalBytes, direction, "", nil)
+}
+
+// SubmitWithEnv is the SLICE-5 variant of Submit that accepts extra env
+// vars (destination-profile credentials) and an optional scheduleName
+// annotation. extraEnv flows through to the runner via Job.extraEnv (a
+// runtime-only field — never persisted, so a restart-then-resume cycle
+// doesn't carry secrets across process boundaries). scheduleName is
+// stored on the persisted Job so the UI can group scheduled jobs by
+// their schedule.
+//
+// All ad-hoc UI-driven jobs go through Submit (which forwards with
+// nil env + empty schedule); SLICE-5 schedules and SLICE-4 saved-
+// destination migrations go through SubmitWithEnv.
+func (m *JobManager) SubmitWithEnv(source, destination string, opts SyncOptions, totalBytes int64, direction Direction, scheduleName string, extraEnv []string) (*Job, error) {
 	if direction == "" {
 		direction = DirectionIn
 	}
 	id := newJobID()
 	j := &Job{
-		ID:          id,
-		Source:      source,
-		Destination: destination,
-		Options:     opts,
-		State:       JobPending,
-		CreatedAt:   time.Now().UnixMilli(),
-		TotalBytes:  totalBytes,
-		Direction:   direction,
+		ID:           id,
+		Source:       source,
+		Destination:  destination,
+		Options:      opts,
+		State:        JobPending,
+		CreatedAt:    time.Now().UnixMilli(),
+		TotalBytes:   totalBytes,
+		Direction:    direction,
+		ScheduleName: scheduleName,
+		extraEnv:     extraEnv,
 	}
 	m.mu.Lock()
 	m.jobs[id] = j
@@ -513,13 +600,19 @@ func (m *JobManager) Subscribe(id string) (<-chan ProgressEvent, func(), bool) {
 }
 
 // StopAll cancels every active and pending job. Called on shutdown.
+// Also drains the SLICE-5 scheduler (if any) so an in-flight cron tick
+// doesn't strand the process.
 func (m *JobManager) StopAll() {
 	m.mu.RLock()
+	sched := m.schedules
 	ids := make([]string, 0, len(m.jobs))
 	for id := range m.jobs {
 		ids = append(ids, id)
 	}
 	m.mu.RUnlock()
+	if sched != nil {
+		sched.Stop()
+	}
 	for _, id := range ids {
 		m.Cancel(id)
 	}
@@ -550,8 +643,14 @@ func (m *JobManager) run(j *Job) {
 	runner := m.runner
 	spec := m.spec
 	m.mu.RUnlock()
+	// Snapshot the extra env under j.mu so a racing Cancel/StopAll can't
+	// observe a half-written slice. extraEnv is set once at Submit time
+	// and never mutated, so the snapshot is safe to read concurrently.
+	j.mu.Lock()
+	extraEnv := j.extraEnv
+	j.mu.Unlock()
 	go func() {
-		done <- runner(ctx, m.juicefsBin, spec, j.Source, j.Destination, j.Options, progress)
+		done <- runner(ctx, m.juicefsBin, spec, j.Source, j.Destination, j.Options, extraEnv, progress)
 		close(progress)
 	}()
 
