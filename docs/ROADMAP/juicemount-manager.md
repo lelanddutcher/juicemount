@@ -465,7 +465,7 @@ restorable interface. Re-enable trash retention by default.
 ### SLICE 4 — Destinations
 
 **ID:** `slice-4-destinations`
-**Status:** NOT STARTED
+**Status:** CODE COMPLETE (deploy + live validation in progress; commit aa21e5a, image published)
 **Depends on:** slice-0; encryption design from §3.2 finalized
 **Blocks:** slice-5 (schedules require destinations)
 **Reviewer gate:** `everything-claude-code:security-reviewer`
