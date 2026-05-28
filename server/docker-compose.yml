@@ -168,6 +168,7 @@ services:
       JM_SOURCE_ROOTS: "/sources"
       JM_ADMIN_KEY: ""               # EDIT — set to a 32+ char random string for prod
       JM_STATE_FILE: "/var/lib/manager/state.json"   # persists job history + future control-plane state across container restart
+      JM_MINIO_URL: "http://minio:9000"              # SLICE 2: Overview MinIO liveness probe target (internal docker DNS)
     ports:
       - "30190:8080"                 # web UI
     volumes:
