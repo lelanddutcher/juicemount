@@ -87,6 +87,13 @@
     } else {
       stopOverviewPolling();
     }
+    // SLICE 3: lazy-init Trash on first activation. Subsequent
+    // activations call refreshTrash() so the list reflects any
+    // out-of-band deletions/restores since the user last viewed it.
+    if (name === 'trash') {
+      initTrashOnce();
+      refreshTrash();
+    }
   }
 
   window.addEventListener('hashchange', route);
@@ -924,6 +931,388 @@
     const h = Math.floor(m / 60);
     const mm = m % 60;
     return h + 'h' + String(mm).padStart(2, '0') + 'm';
+  }
+
+  // -------- Trash (SLICE 3) --------
+  // JuiceFS .trash/ subtree browser + restore/delete UI.
+  // Retention knob calls `juicefs config --trash-days N` via the
+  // server. Empty Trash is gated by a typed-confirmation modal AND
+  // the server-side X-Confirm-Empty: yes header — belt + suspenders
+  // so a hijacked client UI can't slip an empty-trash past the
+  // server without the explicit operator gesture.
+  //
+  // Pagination: ?offset=&limit=, default limit 100, server caps at
+  // 1000. The "Load more" button bumps offset by the page size.
+  // We keep the in-memory list cumulative so multi-page restores
+  // don't have to re-scan from page 1.
+  const TRASH_PAGE_SIZE = 100;
+  const trashState = {
+    inited: false,
+    entries: [],          // cumulative across "load more" pages
+    total: 0,
+    offset: 0,
+    truncated: false,
+    selected: new Set(),  // entry.path → selected
+    lastSelectedIndex: -1, // for shift-click range select
+  };
+
+  function initTrashOnce() {
+    if (trashState.inited) return;
+    trashState.inited = true;
+    $('#trash-refresh').addEventListener('click', () => {
+      trashState.entries = [];
+      trashState.offset = 0;
+      trashState.selected.clear();
+      refreshTrash();
+    });
+    $('#trash-load-more').addEventListener('click', () => loadMoreTrash());
+    $('#trash-bulk-restore').addEventListener('click', () => bulkRestoreTrash());
+    $('#trash-bulk-delete').addEventListener('click', () => bulkDeleteTrash());
+    $('#trash-empty').addEventListener('click', () => showTrashEmptyModal());
+    $('#trash-modal-cancel').addEventListener('click', () => hideTrashEmptyModal());
+    $('#trash-modal-confirm').addEventListener('input', (e) => {
+      $('#trash-modal-go').disabled = e.target.value !== 'DELETE';
+    });
+    $('#trash-modal-go').addEventListener('click', () => emptyTrashConfirmed());
+    $('#trash-retention-select').addEventListener('change', (e) => {
+      setTrashRetention(parseInt(e.target.value, 10));
+    });
+    // Load the current retention setting once on first activation.
+    loadTrashConfig();
+  }
+
+  async function refreshTrash() {
+    // Reset cumulative state on full refresh.
+    trashState.entries = [];
+    trashState.offset = 0;
+    trashState.selected.clear();
+    await loadTrashPage();
+  }
+
+  async function loadMoreTrash() {
+    trashState.offset += TRASH_PAGE_SIZE;
+    await loadTrashPage();
+  }
+
+  async function loadTrashPage() {
+    const err = $('#trash-error');
+    err.hidden = true;
+    const list = $('#trash-list');
+    if (trashState.entries.length === 0) {
+      list.innerHTML = '<li class="trash-empty-hint">Loading…</li>';
+    }
+    try {
+      const url = `/api/trash/list?offset=${trashState.offset}&limit=${TRASH_PAGE_SIZE}`;
+      const data = await api('GET', url);
+      const page = data.entries || [];
+      trashState.entries = trashState.entries.concat(page);
+      trashState.total = data.total || 0;
+      trashState.truncated = !!data.truncated;
+      renderTrashList();
+    } catch (e) {
+      // 501 — standalone mode (no FUSE mount). Show the user a
+      // helpful message instead of a raw error pill.
+      const msg = (e && e.message) || String(e);
+      err.textContent = msg;
+      err.hidden = false;
+      list.innerHTML = '<li class="trash-empty-hint">Trash unavailable in this deployment mode.</li>';
+    }
+  }
+
+  // renderTrashList groups entries by deleted-at date and renders
+  // one <li class="trash-row"> per entry. Group headers (date) are
+  // <li class="trash-group-head"> so the entire list stays a single
+  // flat UL — keeps the shift-click range-select simple (each row
+  // has a stable index in the displayed order).
+  function renderTrashList() {
+    const list = $('#trash-list');
+    list.innerHTML = '';
+    if (trashState.entries.length === 0) {
+      list.innerHTML = '<li class="trash-empty-hint">Trash is empty.</li>';
+      $('#trash-count').textContent = '0';
+      $('#trash-bytes').textContent = '0 B';
+      $('#trash-truncated').hidden = true;
+      $('#trash-load-more').hidden = true;
+      updateTrashBulkButtons();
+      return;
+    }
+    // Group by yyyy-mm-dd of DeletedAt.
+    const byDate = new Map();
+    let totalBytes = 0;
+    for (const e of trashState.entries) {
+      totalBytes += (e.size || 0);
+      const d = new Date(e.deleted_at || 0);
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      const key = `${yyyy}-${mm}-${dd}`;
+      if (!byDate.has(key)) byDate.set(key, []);
+      byDate.get(key).push(e);
+    }
+    const sortedKeys = Array.from(byDate.keys()).sort().reverse();
+    let rowIndex = 0;
+    for (const key of sortedKeys) {
+      const head = document.createElement('li');
+      head.className = 'trash-group-head';
+      head.textContent = `Deleted ${key}`;
+      list.appendChild(head);
+      for (const e of byDate.get(key)) {
+        const li = document.createElement('li');
+        li.className = 'trash-row';
+        li.dataset.path = e.path;
+        li.dataset.rowIndex = String(rowIndex++);
+        if (trashState.selected.has(e.path)) li.classList.add('selected');
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = trashState.selected.has(e.path);
+        cb.addEventListener('click', (evt) => onTrashRowSelect(e, li, evt));
+        li.appendChild(cb);
+
+        const path = document.createElement('span');
+        path.className = 'trash-path';
+        path.textContent = e.original_path || e.path;
+        path.title = e.path;
+        li.appendChild(path);
+
+        const size = document.createElement('span');
+        size.className = 'trash-size';
+        size.textContent = formatBytes(e.size || 0);
+        li.appendChild(size);
+
+        const actions = document.createElement('span');
+        actions.className = 'trash-row-actions';
+        const restore = document.createElement('button');
+        restore.type = 'button';
+        restore.textContent = 'Restore';
+        restore.addEventListener('click', () => restoreOne(e));
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.textContent = 'Delete';
+        del.className = 'danger';
+        del.addEventListener('click', () => deleteOne(e));
+        actions.appendChild(restore);
+        actions.appendChild(del);
+        li.appendChild(actions);
+
+        list.appendChild(li);
+      }
+    }
+    const prefix = trashState.truncated ? '≥' : '';
+    $('#trash-count').textContent = prefix + trashState.total.toLocaleString();
+    $('#trash-bytes').textContent = prefix + formatBytes(totalBytes);
+    $('#trash-truncated').hidden = !trashState.truncated;
+    $('#trash-load-more').hidden = trashState.entries.length >= trashState.total;
+    updateTrashBulkButtons();
+  }
+
+  function onTrashRowSelect(entry, li, evt) {
+    const rows = $$('#trash-list .trash-row');
+    const idx = rows.indexOf(li);
+    // Shift-click range select. Stops at the prior anchor so a
+    // user can extend a selection without losing the anchor.
+    if (evt.shiftKey && trashState.lastSelectedIndex >= 0) {
+      const start = Math.min(idx, trashState.lastSelectedIndex);
+      const end = Math.max(idx, trashState.lastSelectedIndex);
+      for (let i = start; i <= end; i++) {
+        const r = rows[i];
+        if (!r) continue;
+        const p = r.dataset.path;
+        trashState.selected.add(p);
+        r.classList.add('selected');
+        const c = r.querySelector('input[type=checkbox]');
+        if (c) c.checked = true;
+      }
+    } else {
+      const cb = li.querySelector('input[type=checkbox]');
+      if (cb && cb.checked) {
+        trashState.selected.add(entry.path);
+        li.classList.add('selected');
+      } else {
+        trashState.selected.delete(entry.path);
+        li.classList.remove('selected');
+      }
+      trashState.lastSelectedIndex = idx;
+    }
+    updateTrashBulkButtons();
+  }
+
+  function updateTrashBulkButtons() {
+    const has = trashState.selected.size > 0;
+    $('#trash-bulk-restore').disabled = !has;
+    $('#trash-bulk-delete').disabled = !has;
+  }
+
+  async function restoreOne(entry) {
+    try {
+      const r = await api('POST', '/api/trash/restore', { path: entry.path });
+      removeEntryLocally(entry.path);
+      renderTrashList();
+      // Surface the final restored-at path so the user knows where
+      // it landed (especially if collision-rename triggered).
+      const msg = r && r.restored_at ? `Restored → ${r.restored_at}` : 'Restored.';
+      showTrashFlash(msg);
+    } catch (e) {
+      showTrashError('Restore failed: ' + (e.message || e));
+    }
+  }
+
+  async function deleteOne(entry) {
+    if (!confirm(`Permanently delete ${entry.original_path || entry.path}?\n\nThis cannot be undone.`)) {
+      return;
+    }
+    try {
+      await api('POST', '/api/trash/delete', { path: entry.path });
+      removeEntryLocally(entry.path);
+      renderTrashList();
+    } catch (e) {
+      showTrashError('Delete failed: ' + (e.message || e));
+    }
+  }
+
+  async function bulkRestoreTrash() {
+    const targets = Array.from(trashState.selected);
+    if (targets.length === 0) return;
+    let okCount = 0;
+    let failCount = 0;
+    for (const p of targets) {
+      try {
+        await api('POST', '/api/trash/restore', { path: p });
+        removeEntryLocally(p);
+        okCount++;
+      } catch (e) {
+        console.error('bulk restore failed for', p, e);
+        failCount++;
+      }
+    }
+    renderTrashList();
+    showTrashFlash(`Restored ${okCount} item(s)${failCount ? `, ${failCount} failed` : ''}.`);
+  }
+
+  async function bulkDeleteTrash() {
+    const targets = Array.from(trashState.selected);
+    if (targets.length === 0) return;
+    if (!confirm(`Permanently delete ${targets.length} selected item(s)?\n\nThis cannot be undone.`)) {
+      return;
+    }
+    let okCount = 0;
+    let failCount = 0;
+    for (const p of targets) {
+      try {
+        await api('POST', '/api/trash/delete', { path: p });
+        removeEntryLocally(p);
+        okCount++;
+      } catch (e) {
+        console.error('bulk delete failed for', p, e);
+        failCount++;
+      }
+    }
+    renderTrashList();
+    showTrashFlash(`Deleted ${okCount} item(s)${failCount ? `, ${failCount} failed` : ''}.`);
+  }
+
+  function removeEntryLocally(path) {
+    trashState.entries = trashState.entries.filter((e) => e.path !== path);
+    trashState.selected.delete(path);
+    if (trashState.total > 0) trashState.total--;
+  }
+
+  function showTrashEmptyModal() {
+    $('#trash-modal-count').textContent = trashState.total.toLocaleString();
+    let totalBytes = 0;
+    for (const e of trashState.entries) totalBytes += (e.size || 0);
+    $('#trash-modal-bytes').textContent = formatBytes(totalBytes);
+    $('#trash-modal-confirm').value = '';
+    $('#trash-modal-go').disabled = true;
+    $('#trash-modal-error').hidden = true;
+    $('#trash-empty-modal').hidden = false;
+    setTimeout(() => $('#trash-modal-confirm').focus(), 50);
+  }
+
+  function hideTrashEmptyModal() {
+    $('#trash-empty-modal').hidden = true;
+  }
+
+  async function emptyTrashConfirmed() {
+    const err = $('#trash-modal-error');
+    err.hidden = true;
+    try {
+      // The X-Confirm-Empty: yes header is the server-side gate. We
+      // attach it here ALONGSIDE the typed-confirm in the modal so
+      // the operator can't accidentally fire this from a curl one-
+      // liner without the explicit header.
+      const headers = authHeaders();
+      headers['X-Confirm-Empty'] = 'yes';
+      const r = await fetch(BASE + '/api/trash/empty', { method: 'POST', headers });
+      if (!r.ok) {
+        const msg = await r.text();
+        throw new Error(msg.trim() || `${r.status} ${r.statusText}`);
+      }
+      const data = await r.json();
+      hideTrashEmptyModal();
+      showTrashFlash(`Emptied trash: ${(data.count || 0).toLocaleString()} item(s), ${formatBytes(data.bytes || 0)} freed.`);
+      await refreshTrash();
+    } catch (e) {
+      err.textContent = e.message || String(e);
+      err.hidden = false;
+    }
+  }
+
+  async function loadTrashConfig() {
+    try {
+      const cfg = await api('GET', '/api/trash/config');
+      const cur = $('#trash-retention-current');
+      if (cfg.error) {
+        cur.textContent = `current: (${cfg.error})`;
+      } else if (cfg.days < 0) {
+        cur.textContent = 'current: unknown';
+      } else {
+        cur.textContent = `current: ${cfg.days} day(s)`;
+        // Sync the drop-down. If the current value isn't in our
+        // choices list, the select shows blank — fine, the user
+        // can still pick a new one.
+        const sel = $('#trash-retention-select');
+        const match = Array.from(sel.options).find((o) => parseInt(o.value, 10) === cfg.days);
+        if (match) sel.value = match.value;
+      }
+    } catch (e) {
+      const err = $('#trash-retention-error');
+      err.textContent = 'Failed to load retention: ' + (e.message || e);
+      err.hidden = false;
+    }
+  }
+
+  async function setTrashRetention(days) {
+    const err = $('#trash-retention-error');
+    err.hidden = true;
+    try {
+      await api('PUT', '/api/trash/config', { days: days });
+      await loadTrashConfig();
+      showTrashFlash(`Retention set to ${days} day(s).`);
+    } catch (e) {
+      err.textContent = 'Failed to set retention: ' + (e.message || e);
+      err.hidden = false;
+    }
+  }
+
+  function showTrashError(msg) {
+    const el = $('#trash-error');
+    el.textContent = msg;
+    el.hidden = false;
+  }
+
+  // showTrashFlash uses the same #trash-error element for a brief
+  // success pill — color set inline via a transient .ok class so
+  // we don't have to introduce a second toast element.
+  function showTrashFlash(msg) {
+    const el = $('#trash-error');
+    el.textContent = msg;
+    el.hidden = false;
+    el.classList.add('ok');
+    setTimeout(() => {
+      el.hidden = true;
+      el.classList.remove('ok');
+    }, 4000);
   }
 
   // -------- Boot --------

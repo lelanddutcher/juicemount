@@ -232,11 +232,77 @@
         </div>
       </section>
 
-      <!-- Trash tab (placeholder; SLICE 3). -->
-      <section data-tab="trash" class="tab-pane" hidden>
-        <div class="placeholder">
+      <!-- Trash tab (SLICE 3). JuiceFS .trash/ tree as a browsable +
+           restorable interface. The Trash subtree lives INSIDE the
+           JuiceFS volume so its size counts against the volume's
+           used space — we make this LOUD in the header banner. -->
+      <section data-tab="trash" class="tab-pane trash-pane" hidden>
+        <div class="trash-header">
           <h2>Trash</h2>
-          <p>Browse and restore files in JuiceFS's <code>.trash/</code>. Coming soon.</p>
+          <p class="trash-banner">
+            <strong>Heads up:</strong> Trash lives <em>inside</em> the JuiceFS volume.
+            Deleted files retained here count against your volume capacity until
+            either the retention window expires or you empty the trash manually.
+          </p>
+          <div class="trash-controls">
+            <label class="trash-retention">
+              <span>Retention</span>
+              <select id="trash-retention-select">
+                <option value="0">0 — disabled (immediate purge)</option>
+                <option value="1">1 day</option>
+                <option value="7">7 days (recommended)</option>
+                <option value="30">30 days</option>
+                <option value="90">90 days</option>
+                <option value="365">365 days</option>
+              </select>
+              <span id="trash-retention-current" class="hint">current: —</span>
+            </label>
+            <div class="trash-actions">
+              <button id="trash-refresh" type="button">Refresh</button>
+              <button id="trash-bulk-restore" type="button" disabled>Restore selected</button>
+              <button id="trash-bulk-delete" type="button" disabled>Delete selected</button>
+              <button id="trash-empty" type="button" class="danger">Empty trash…</button>
+            </div>
+          </div>
+          <p id="trash-retention-error" class="error" hidden></p>
+          <p class="trash-summary">
+            <span id="trash-count">—</span> items
+            (<span id="trash-bytes">—</span>)
+            <span id="trash-truncated" class="hint" hidden>· scan capped — totals are lower bounds</span>
+          </p>
+        </div>
+
+        <div class="trash-list-wrap">
+          <ul id="trash-list" class="trash-list">
+            <li class="trash-empty-hint">Loading…</li>
+          </ul>
+          <div class="trash-pager">
+            <button id="trash-load-more" type="button" hidden>Load more</button>
+          </div>
+        </div>
+
+        <p id="trash-error" class="error" hidden></p>
+
+        <!-- Empty-trash typed-confirmation modal. Hidden by default;
+             showTrashEmptyModal() unhides it and focuses the input.
+             Server-side gate (X-Confirm-Empty header) is the actual
+             safety net — this modal is the operator-facing prompt. -->
+        <div id="trash-empty-modal" class="trash-modal" hidden>
+          <div class="trash-modal-inner" role="dialog" aria-labelledby="trash-modal-title">
+            <h3 id="trash-modal-title">Empty Trash</h3>
+            <p>
+              This permanently deletes <strong id="trash-modal-count">—</strong>
+              items (<strong id="trash-modal-bytes">—</strong>) from JuiceFS.
+              <strong>This cannot be undone.</strong>
+            </p>
+            <p>To confirm, type <code>DELETE</code> below:</p>
+            <input id="trash-modal-confirm" type="text" autocomplete="off" spellcheck="false">
+            <div class="trash-modal-actions">
+              <button id="trash-modal-cancel" type="button">Cancel</button>
+              <button id="trash-modal-go" type="button" class="danger" disabled>Empty Trash</button>
+            </div>
+            <p id="trash-modal-error" class="error" hidden></p>
+          </div>
         </div>
       </section>
 

@@ -128,6 +128,17 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// so a hung Redis doesn't break the entire dashboard. Auth-wrapped
 	// like every other endpoint (no auth bypass).
 	mux.HandleFunc(prefix+"/api/overview", a.auth(a.handleOverview))
+	// SLICE 3: Trash tab — list/restore/delete/empty/config.
+	// /api/trash/empty enforces a typed-confirmation header
+	// (X-Confirm-Empty: yes) server-side so a typo'd curl can't wipe
+	// a week of retention; /api/trash/config GET reads the current
+	// --trash-days value and PUT updates it via `juicefs config`.
+	// All endpoints are auth-wrapped like every other manager route.
+	mux.HandleFunc(prefix+"/api/trash/list", a.auth(a.handleTrashList))
+	mux.HandleFunc(prefix+"/api/trash/restore", a.auth(a.handleTrashRestore))
+	mux.HandleFunc(prefix+"/api/trash/delete", a.auth(a.handleTrashDelete))
+	mux.HandleFunc(prefix+"/api/trash/empty", a.auth(a.handleTrashEmpty))
+	mux.HandleFunc(prefix+"/api/trash/config", a.auth(a.handleTrashConfig))
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))

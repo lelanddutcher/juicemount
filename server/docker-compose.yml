@@ -103,9 +103,17 @@ services:
           echo "[precheck-5] already formatted"; exit 0
         fi
         echo "[format] running juicefs format with bucket=$$JM_BUCKET_URL"
+        # SLICE 3 default: --trash-days 7. New installs ship with
+        # JuiceFS's built-in trash retention on so the Manager UI's
+        # Trash tab has a useful default window. Existing installs
+        # that formatted with --trash-days 0 need the one-time
+        # `juicefs config <metaURL> --trash-days 7` call documented
+        # in server/INSTALL-TrueNAS.md (the format command is
+        # idempotent-skipped on subsequent boots, so flipping this
+        # value here does NOT auto-migrate old volumes).
         juicefs format --storage minio --bucket "$$JM_BUCKET_URL" \
           --access-key "$$MINIO_ROOT_USER" --secret-key "$$MINIO_ROOT_PASSWORD" \
-          --trash-days 0 "$$JM_META_URL" "$$JM_VOL_NAME" || { echo "[format] FAIL" >&2; exit 6; }
+          --trash-days 7 "$$JM_META_URL" "$$JM_VOL_NAME" || { echo "[format] FAIL" >&2; exit 6; }
 
   # ── juicefs: live FUSE mount + WebDAV ────────────────────────────
   juicefs:
