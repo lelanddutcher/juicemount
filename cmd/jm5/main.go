@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -229,6 +230,25 @@ func main() {
 					jmlog.Warn("drainer construct failed (spool disabled)", "error", err.Error())
 					ss.Stop()
 				} else {
+					// Slice F: boot-time scrubber. MUST run BEFORE
+					// drainer.Start so it doesn't race with workers.
+					recCtx, recCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					recReport, recErr := ss.RecoverOnBoot(recCtx)
+					recCancel()
+					if recErr != nil {
+						jmlog.Warn("spool boot scrubber failed (proceeding anyway)",
+							"error", recErr.Error())
+					} else if recReport.OrphanFilesDeleted > 0 || recReport.OrphanRowsFailed > 0 ||
+						recReport.WritingFailedRows > 0 || recReport.DrainingReset > 0 ||
+						recReport.ReadyResumed > 0 {
+						jmlog.Info("spool boot recovery",
+							"orphan_files_deleted", recReport.OrphanFilesDeleted,
+							"orphan_rows_failed", recReport.OrphanRowsFailed,
+							"writing_failed", recReport.WritingFailedRows,
+							"draining_reset", recReport.DrainingReset,
+							"ready_resumed", recReport.ReadyResumed)
+					}
+
 					srv.Handler().SetSpool(ss, dr)
 					dr.Start()
 					spoolStore = ss

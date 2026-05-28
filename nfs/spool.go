@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -178,6 +179,193 @@ func (s *SpoolStore) Meta() *metadata.SpoolStore { return s.meta }
 // must close them first. Idempotent.
 func (s *SpoolStore) Stop() {
 	s.closed.Store(true)
+}
+
+// RecoveryReport summarizes what the boot scrubber did. Returned by
+// RecoverOnBoot for log aggregation + admin UX.
+type RecoveryReport struct {
+	// OrphanFilesDeleted: files in the spool dir with no SQL row →
+	// removed. Cleans up half-created files from a crash between
+	// metadata.Insert and the first WriteAt.
+	OrphanFilesDeleted int
+
+	// OrphanRowsFailed: SQL rows in `ready` or `draining` state whose
+	// spool file is no longer on disk → MarkFailed (no data to retry).
+	OrphanRowsFailed int
+
+	// WritingFailedRows: rows in `writing` state at boot time. The
+	// partial spool file is unsafe to resume (NFS client doesn't know
+	// the in-flight WRITEs aren't durable) → MarkFailed + delete the
+	// partial file.
+	WritingFailedRows int
+
+	// DrainingReset: rows in `draining` state with spool file present
+	// → ResetToReady so the drainer re-attempts the copy.
+	DrainingReset int
+
+	// ReadyResumed: rows in `ready` state with spool file present →
+	// accounted against the capacity counter; drainer will pick them
+	// up on next Start. No SQL state change.
+	ReadyResumed int
+}
+
+// RecoverOnBoot reconciles on-disk spool files against the SQL index.
+// Call once after NewSpoolStore + InitSpoolSchema and BEFORE
+// drainer.Start, ideally as part of the same critical section as
+// SetSpool — the method is NOT safe to run concurrently with active
+// writers or the drainer.
+//
+// State transition rules:
+//
+//	file orphan (no SQL row)        → delete file
+//	row.writing  → mark failed + delete (best-effort) the partial file
+//	row.ready    → file present  : add bytes to capacity counter, leave state
+//	             → file missing  : mark failed
+//	row.draining → file present  : reset to ready (drainer retries)
+//	             → file missing  : mark failed
+//	row.done, row.failed         : no action (terminal states; done rows are
+//	                               audit, failed rows are operator-actionable)
+//
+// Files inside spool_root/quarantine/ are forensic state preserved by
+// the drainer's SHA-mismatch path; they are NOT touched here.
+//
+// The in-memory index (s.index) is NOT repopulated. `writing`-state
+// entries are gone (we marked them failed); reads of those paths will
+// fall through to FUSE. `ready`/`draining` paths haven't reached FUSE
+// yet either, so reads briefly return ENOENT until the drainer copies
+// them in. Same window as slice C's known limitation.
+//
+// Errors from ListAll or ReadDir are returned; per-row state-transition
+// errors are logged but do not abort the reconciliation.
+func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) {
+	var report RecoveryReport
+
+	// Slice-F reviewer HIGH fix: enforce the no-concurrent-drainer
+	// invariant at runtime. wakeDrainer is set exactly once by
+	// drainer.Start via SetDrainerWake; if it's already non-nil here,
+	// the drainer is alive and a concurrent releaseCapacity /
+	// tryReserveCapacity will race with our Store(0) below. Panic
+	// rather than silently corrupt the counter.
+	s.wakeMu.RLock()
+	wakeSet := s.wakeDrainer != nil
+	s.wakeMu.RUnlock()
+	if wakeSet {
+		panic("nfs/spool: RecoverOnBoot called after drainer.Start — must run before SetSpool/Start")
+	}
+
+	// Reset the capacity counter before re-accounting. Idempotent
+	// recovery: a second call must produce the same `used` value as
+	// the first, not a doubled one. Safe because the guard above
+	// proves no drainer / writer is mutating s.used concurrently.
+	s.used.Store(0)
+
+	rows, err := s.meta.ListAll()
+	if err != nil {
+		return report, fmt.Errorf("recover: list rows: %w", err)
+	}
+
+	// Build the set of file paths SQL knows about so we can detect
+	// orphan files in one pass.
+	expectedFiles := make(map[string]struct{}, len(rows))
+	for _, r := range rows {
+		expectedFiles[r.SpoolFile] = struct{}{}
+	}
+
+	// Scan the files dir. We deliberately do NOT recurse — the
+	// quarantine subdir (sibling under spool_root) is left alone, and
+	// the files dir is flat.
+	filesDir := filepath.Join(s.root, SpoolFilesSubdir)
+	actualFiles := make(map[string]bool)
+	if dirents, err := os.ReadDir(filesDir); err == nil {
+		for _, d := range dirents {
+			if d.IsDir() {
+				continue
+			}
+			full := filepath.Join(filesDir, d.Name())
+			actualFiles[full] = true
+			if _, ok := expectedFiles[full]; !ok {
+				if rmErr := os.Remove(full); rmErr == nil {
+					report.OrphanFilesDeleted++
+					log.Printf("spool recover: orphan file deleted: %s", full)
+				} else {
+					log.Printf("spool recover: orphan file remove failed: %s: %v", full, rmErr)
+				}
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		// Note: missing files dir is fine on fresh install. Other
+		// errors (permission etc) are unusual; log + continue with
+		// SQL reconciliation only.
+		log.Printf("spool recover: readdir %s: %v", filesDir, err)
+	}
+
+	// Reconcile per-row.
+	for _, r := range rows {
+		if ctx.Err() != nil {
+			return report, ctx.Err()
+		}
+		fileExists := actualFiles[r.SpoolFile]
+		switch r.DrainState {
+		case metadata.DrainWriting:
+			if mErr := s.meta.MarkFailed(r.ID, "writing-state row recovered after crash (partial spool file unsafe to resume)"); mErr != nil {
+				log.Printf("spool recover: mark writing→failed %d: %v", r.ID, mErr)
+				continue
+			}
+			if fileExists {
+				if rmErr := os.Remove(r.SpoolFile); rmErr != nil {
+					log.Printf("spool recover: writing partial file remove %s: %v", r.SpoolFile, rmErr)
+				}
+			}
+			report.WritingFailedRows++
+
+		case metadata.DrainReady:
+			if !fileExists {
+				if mErr := s.meta.MarkFailed(r.ID, "ready-state row missing spool file after crash"); mErr != nil {
+					log.Printf("spool recover: mark ready→failed %d: %v", r.ID, mErr)
+					continue
+				}
+				report.OrphanRowsFailed++
+			} else {
+				// File present; ready state preserved. Account bytes.
+				s.used.Add(r.Size)
+				report.ReadyResumed++
+			}
+
+		case metadata.DrainDraining:
+			if !fileExists {
+				if mErr := s.meta.MarkFailed(r.ID, "draining-state row missing spool file after crash"); mErr != nil {
+					log.Printf("spool recover: mark draining→failed %d: %v", r.ID, mErr)
+					continue
+				}
+				report.OrphanRowsFailed++
+			} else {
+				if rErr := s.meta.ResetToReady(r.ID); rErr != nil {
+					log.Printf("spool recover: reset draining→ready %d: %v", r.ID, rErr)
+					continue
+				}
+				s.used.Add(r.Size)
+				report.DrainingReset++
+			}
+
+		case metadata.DrainDone, metadata.DrainFailed:
+			// Terminal — no state transition. But the spool file
+			// must not survive: `done` rows had their file removed by
+			// MarkDrainComplete; `failed` rows from a writing-state
+			// crash above MAY have left a partial file when our
+			// best-effort os.Remove failed. Without this cleanup, a
+			// stale file paired to a terminal SQL row stays in
+			// expectedFiles indefinitely and the orphan-scan above
+			// never reclaims it. Code-reviewer slice-F HIGH fix.
+			if fileExists {
+				if rmErr := os.Remove(r.SpoolFile); rmErr != nil {
+					log.Printf("spool recover: terminal-row stale file remove %s: %v", r.SpoolFile, rmErr)
+				}
+			}
+		}
+	}
+
+	log.Printf("spool recover: %+v", report)
+	return report, nil
 }
 
 // MarkDrainComplete is the success path for the drainer (slice B). It

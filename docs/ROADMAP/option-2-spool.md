@@ -1,6 +1,6 @@
 # JuiceMount Spool — Option 2
 
-**Status:** IN PROGRESS — Slice E COMPLETE 2026-05-28 (CI green at c10e0da) — Slices A-E shipped; spool live runtime + /spool endpoint. Swift menu bar + Manager web UI deferred to follow-on commits.
+**Status:** IN PROGRESS — Slice F COMPLETE 2026-05-28 (CI pending) — Slices A-F shipped; boot scrubber + crash recovery live. Swift menu bar / quit dialog + Manager web UI deferred to follow-on commits.
 **Type:** Foundational architecture change
 **Scope:** ~1 week implementation + 2–3 days hardening/testing
 **Branch:** `production-hardening` (continues on it; not a separate branch)
@@ -11,7 +11,7 @@
 - [x] **Slice C** — Write-path integration — COMPLETE 2026-05-28
 - [x] **Slice D** — Read-path 3-tier lookup — COMPLETE 2026-05-28
 - [x] **Slice E** — Runtime wiring + /spool HTTP endpoint — COMPLETE 2026-05-28 (Swift menu bar + Manager web UI deferred)
-- [ ] Slice F — Crash recovery + shutdown semantics
+- [x] **Slice F** — Crash recovery + boot scrubber — COMPLETE 2026-05-28 (App.swift quit dialog deferred)
 - [ ] Slice G — Integrity hardening
 - [ ] Slice H — Preferences + WAN mode polish
 
