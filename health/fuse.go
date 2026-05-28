@@ -241,6 +241,26 @@ func (fm *FUSEManager) Mount() error {
 		"--prefetch", "3",   // prefetch 3 blocks ahead
 		"-o", "nobrowse",    // hide from Finder (MNT_DONTBROWSE flag)
 	)
+
+	// Slice H — WAN mode. JuiceFS default --max-uploads is 20; on a
+	// high-RTT path (Tailscale, cellular, distant MinIO) 20 concurrent
+	// PUTs is the throughput cap and the upload pipe stays
+	// underutilized. JM_WAN_MODE=1 bumps it to 64 — bandwidth-delay-
+	// product math: at 100 ms RTT, 20×4MB chunks = 80 MB in flight
+	// (~6 Gbps if uplink could deliver); 64×4MB = 256 MB in flight,
+	// enough headroom for typical home/cellular uplinks where the
+	// pipe is the real cap, not concurrency.
+	//
+	// Off by default. On a LAN, 20 is already over-saturating, more
+	// makes no difference and may worsen tail latency.
+	if os.Getenv("JM_WAN_MODE") == "1" {
+		args = append(args, "--max-uploads", "64")
+	}
+	if v := os.Getenv("JM_MAX_UPLOADS"); v != "" {
+		// Direct override wins over WAN mode for operators that want
+		// to tune themselves.
+		args = append(args, "--max-uploads", v)
+	}
 	if fm.cfg.CacheDir != "" {
 		args = append(args, "--cache-dir", fm.cfg.CacheDir)
 	}
