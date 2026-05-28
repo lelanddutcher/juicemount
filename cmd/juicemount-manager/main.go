@@ -1,6 +1,6 @@
-// juicemount-migrator is a standalone wrapper around the
-// internal/migrator package. It exists for users who run the
-// migrator as its own container — typically because they're NOT
+// juicemount-manager is a standalone wrapper around the
+// internal/manager package. It exists for users who run the
+// manager as its own container — typically because they're NOT
 // running juicemount-server on the same host (e.g. TrueNAS users
 // who only have MinIO + Redis + a vanilla juicefs container with
 // the NFS gateway running on their Mac).
@@ -11,7 +11,7 @@
 //     --meta redis://host:port/N --vol-name zpool
 //     Writes go via jfs://<vol-name>/<path>; juicefs sync talks to
 //     Redis + MinIO directly. Requires network reachability to both.
-//     The migrator container has no FUSE mount of its own.
+//     The manager container has no FUSE mount of its own.
 //
 //   Embedded-style, FUSE-mounted:
 //     --fuse-mount /jfs
@@ -20,9 +20,9 @@
 //     Use this when juicefs sync needs to inherit a pre-existing
 //     mount (e.g. shared with juicemount-server).
 //
-// For users running juicemount-server on the host, the migrator is
-// automatically embedded — set --migrator-source-roots when launching
-// jm5 and the UI mounts at /migrator/ on the existing metrics port.
+// For users running juicemount-server on the host, the manager is
+// automatically embedded — set --manager-source-roots when launching
+// jm5 and the UI mounts at /manager/ on the existing metrics port.
 package main
 
 import (
@@ -35,7 +35,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lelanddutcher/juicemount/internal/migrator"
+	"github.com/lelanddutcher/juicemount/internal/manager"
 )
 
 var version = "dev"
@@ -47,7 +47,7 @@ func main() {
 	metaURL := flag.String("meta", "", "Standalone-mode Redis URL (e.g. redis://192.168.0.197:30179/1). Mutually exclusive with --fuse-mount.")
 	volName := flag.String("vol-name", "zpool", "Standalone-mode JuiceFS volume name (used in jfs:// destination URIs)")
 	destMount := flag.String("dest-mount", "/jfs", "User-facing destination prefix shown in the UI")
-	sourceRoots := flag.String("source-roots", "/sources", "Comma-separated host paths the migrator may browse from")
+	sourceRoots := flag.String("source-roots", "/sources", "Comma-separated host paths the manager may browse from")
 	adminKey := flag.String("admin-key", os.Getenv("JM_ADMIN_KEY"), "Admin key for X-JuiceMount-Admin-Key auth (empty = disabled)")
 	stateFile := flag.String("state-file", os.Getenv("JM_STATE_FILE"), "Optional JSON path for job-history persistence (empty = jobs lost on restart). Bind-mount the dir to make history survive container churn.")
 	flag.Parse()
@@ -67,7 +67,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	cfg := migrator.Config{
+	cfg := manager.Config{
 		JuiceFSBin:  *juicefsBin,
 		FUSEMount:   *fuseMount, // embedded mode if non-empty
 		MetaURL:     *metaURL,   // standalone mode if non-empty
@@ -77,7 +77,7 @@ func main() {
 		AdminKey:    *adminKey,
 		StateFile:   *stateFile,
 	}
-	mgr := migrator.Register(mux, "", cfg)
+	mgr := manager.Register(mux, "", cfg)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -89,7 +89,7 @@ func main() {
 	if *fuseMount != "" {
 		mode = "embedded (file://)"
 	}
-	log.Printf("juicemount-migrator %s starting on %s [mode: %s]", version, *addr, mode)
+	log.Printf("juicemount-manager %s starting on %s [mode: %s]", version, *addr, mode)
 	log.Printf("  juicefs:      %s", *juicefsBin)
 	if *fuseMount != "" {
 		log.Printf("  fuse-mount:   %s", *fuseMount)

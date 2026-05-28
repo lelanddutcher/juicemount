@@ -21,20 +21,21 @@ Note their full paths (e.g., `/mnt/tank/juicemount/bucket`).
 **Optional — for migrating existing data**: if you have an existing
 dataset full of media you want to copy into JuiceMount (so the JuiceFS
 volume becomes your single source of truth), note its full path too.
-The migrator service exposes it read-only inside the container so the
+The manager service exposes it read-only inside the container so the
 copy can't damage the source. You can add multiple.
 
-Also create one small dataset for migrator state (job history JSON):
+Also create one small dataset for manager state (job history JSON
+plus future control-plane state):
 
 | Dataset | What it holds | Sized for |
 |---|---|---|
-| `migrator-state` | JSON file of job history + resume targets | <1 MB; any pool fine |
+| `manager-state` | JSON file of job history, settings, destinations, schedules | <1 MB; any pool fine |
 
 Generate a strong MinIO password and JuiceMount admin key:
 
 ```
 openssl rand -base64 24   # for MINIO_ROOT_PASSWORD
-openssl rand -hex 32      # for JM_ADMIN_KEY (used to gate /migrator UI)
+openssl rand -hex 32      # for JM_ADMIN_KEY (used to gate /manager UI)
 ```
 
 Note your TrueNAS LAN IP — your Mac will need to reach this address
@@ -192,13 +193,18 @@ services:
           redis://redis:6379/1 0.0.0.0:80 &
         wait
 
-  # ─── juicemount-migrator: copy existing data into JuiceFS via web UI ─
+  # ─── juicemount-manager: control-plane web UI for the JuiceFS volume ─
+  # (Renamed from juicemount-migrator in SLICE 0 of the manager
+  # roadmap. The legacy juicemount-migrator image tag is still
+  # published for one release as a compat alias — but new installs
+  # should use juicemount-manager.)
+  #
   # Browse host paths under /sources, pick a destination under /jfs,
   # watch live progress with real % bar (driven by juicefs's Prometheus
   # metrics). Bind-mount as many existing datasets read-only as you
   # want. Omit this service entirely if you have no existing data.
-  juicemount-migrator:
-    image: ghcr.io/lelanddutcher/juicemount-migrator:production-hardening
+  juicemount-manager:
+    image: ghcr.io/lelanddutcher/juicemount-manager:production-hardening
     pull_policy: always
     restart: unless-stopped
     depends_on:
@@ -209,7 +215,7 @@ services:
       JM_VOL_NAME: "zpool"
       JM_SOURCE_ROOTS: "/sources"
       JM_ADMIN_KEY: CHANGEME_ADMIN_KEY        # !!! EDIT — 32+ random chars; empty = LAN-only
-      JM_STATE_FILE: "/var/lib/migrator/jobs.json"   # job history persists across restart
+      JM_STATE_FILE: "/var/lib/manager/state.json"   # state persists across restart
     ports:
       - "30190:8080"                          # web UI
     volumes:
@@ -217,10 +223,31 @@ services:
       # Each becomes a browsable source root in the UI.
       - CHANGEME_SOURCE_PATH:/sources/<your-source-name>:ro
       # Small writable mount for the JSON state file. Without this,
-      # job history vanishes on container restart (no Resume button
+      # state vanishes on container restart (no Resume button
       # available for canceled jobs after a redeploy).
-      - CHANGEME_STATE_PATH:/var/lib/migrator
+      - CHANGEME_STATE_PATH:/var/lib/manager
 ```
+
+## Upgrading from juicemount-migrator (SLICE 0 rename)
+
+If you previously installed JuiceMount with the `juicemount-migrator`
+image tag, SLICE 0 of the manager roadmap renamed the binary, image,
+HTTP prefix, and state-file path. The transition is one-release
+backward-compatible:
+
+- Both `juicemount-manager:production-hardening` and the legacy
+  `juicemount-migrator:production-hardening` image tags publish from CI.
+  Existing apps with `pull_policy: always` on the migrator tag keep
+  working.
+- HTTP requests to `/migrator/*` are 301-redirected to `/manager/*`.
+- The container reads `/var/lib/migrator/jobs.json` as a fallback if
+  `/var/lib/manager/state.json` doesn't exist yet, then writes going
+  forward to the new path. A one-shot log line announces the
+  migration. To carry job history forward, additionally bind-mount the
+  old `migrator-state` dataset at `/var/lib/migrator` (read-only is
+  fine).
+
+The migrator alias is dropped two releases after slice-0 ships.
 
 ## After install
 
@@ -237,12 +264,12 @@ Then click Save. The Mac NFS volume mounts at `/Volumes/zpool`.
 
 - MinIO Console: `http://<truenas-ip>:30152`
 - WebDAV (Finder Cmd+K): `http://<truenas-ip>:30180`
-- Migrator web UI: `http://<truenas-ip>:30190` (if you included the service)
+- Manager web UI: `http://<truenas-ip>:30190` (if you included the service)
 
 ## Migrating existing data
 
-The migrator UI at `:30190` lets you copy from any bind-mounted source
-root into the JuiceFS volume:
+The manager UI at `:30190` → Migrations tab lets you copy from any
+bind-mounted source root into the JuiceFS volume:
 
 1. Click a source root (e.g. `/sources/oldzpool`), drill into the folder
    to migrate.

@@ -18,7 +18,7 @@ The stack:
 | `minio`               | S3-compatible object store for JuiceFS chunks | 30151 (S3), 30152 (console) |
 | `juicefs-init`        | One-shot pre-flight + first-time volume format | —    |
 | `juicefs`             | Live FUSE mount + WebDAV (browse / smoke test) | 30180 |
-| `juicemount-migrator` | Copy-into-JuiceFS web UI                       | 30190 |
+| `juicemount-manager`  | Control-plane web UI (migrations, trash, backups, maintenance, settings) | 30190 |
 
 The Mac JuiceMount.app drives this stack via:
 - Redis URL: `redis://<host>:30179/1`
@@ -43,13 +43,17 @@ docker compose logs juicefs-init   # confirms first-time format
 
 ## Migrating existing data
 
-The included `juicemount-migrator` service exposes a web UI at port
-30190 that copies data from any bind-mounted source directory into
-the JuiceFS volume.
+The included `juicemount-manager` service exposes a web UI at port
+30190 with a Migrations tab that copies data from any bind-mounted
+source directory into the JuiceFS volume. (SLICE 0 renamed the
+service from `juicemount-migrator` — the legacy image tag still
+publishes for one release as a compat alias and `/migrator/*` URLs
+301-redirect to `/manager/*`.)
 
 1. Bind-mount each existing dataset read-only at `/sources/<name>`
-   in the `juicemount-migrator` service.
-2. Open `http://<host>:30190/` in a browser.
+   in the `juicemount-manager` service.
+2. Open `http://<host>:30190/` in a browser (Migrations tab is the
+   default route).
 3. Browse the source root, pick a folder, hit Start.
 
 Features:
@@ -102,8 +106,8 @@ Take a backup first.
 - **`MINIO_ROOT_PASSWORD` is the master key.** Generate via
   `openssl rand -base64 24`. Anyone with this password can read every
   byte in the volume.
-- **Migrator admin key (`JM_ADMIN_KEY`)** gates write access to the
-  migrator's HTTP API. Empty = LAN-only / no auth (fine for a home
+- **Manager admin key (`JM_ADMIN_KEY`)** gates write access to the
+  manager's HTTP API. Empty = LAN-only / no auth (fine for a home
   TrueNAS). Generate via `openssl rand -hex 32` for anything internet-
   reachable.
 
@@ -115,7 +119,7 @@ Take a backup first.
 | `juicefs-init` exited 4               | MinIO credentials empty, whitespace, or placeholder |
 | `juicefs-init` exited 5               | `JM_BUCKET_URL` missing `http://` |
 | `juicefs-init` exited 6               | `juicefs format` errored — read the log for the JuiceFS-side reason |
-| Migrator copy reports "0 files / 0 B" | Stale image — pull `ghcr.io/lelanddutcher/juicemount-migrator:production-hardening` and redeploy |
+| Manager copy reports "0 files / 0 B" | Stale image — pull `ghcr.io/lelanddutcher/juicemount-manager:production-hardening` and redeploy |
 | Mac can't open copied files           | Source had restrictive perms; either un-tick Preserve permissions before migrating, or `chmod -R u+rwX,g+rwX,o+rX` on the destination |
 
 Use `docker compose logs <service>` for the full output of any

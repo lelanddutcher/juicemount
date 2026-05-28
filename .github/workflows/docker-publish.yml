@@ -4,9 +4,14 @@
 #   - push to main / production-hardening  → tags: <branch>, <branch>-<sha>
 #   - tag push matching v*.*.*             → tags: <version>, latest
 #
-# Two images are published in parallel as a matrix job:
+# Three images are published in parallel as a matrix job:
 #   ghcr.io/<owner>/juicemount-server    NFSv3 gateway daemon
-#   ghcr.io/<owner>/juicemount-migrator  data-migration sidecar
+#   ghcr.io/<owner>/juicemount-manager   data-migration / control-plane web UI (new name)
+#   ghcr.io/<owner>/juicemount-migrator  legacy alias of juicemount-manager
+#                                        (SLICE 0 compat tag; both images are
+#                                        built from server/juicemount-manager/Dockerfile
+#                                        for the transition period — drop after
+#                                        two releases per docs/ROADMAP/juicemount-manager.md §3.6).
 #
 # Multi-arch (amd64 + arm64) so the same images run on Intel + Apple
 # Silicon TrueNAS hosts and on Synology/QNAP ARM-based NAS units.
@@ -37,10 +42,18 @@ jobs:
         include:
           - name: juicemount-server
             dockerfile: server/juicemount-server/Dockerfile
-            description: NFSv3 gateway for JuiceFS — self-hosted media editing (includes embedded migrator UI)
+            description: NFSv3 gateway for JuiceFS — self-hosted media editing (includes embedded manager UI)
+          - name: juicemount-manager
+            dockerfile: server/juicemount-manager/Dockerfile
+            description: JuiceMount control-plane web UI (migrations, trash, backups, maintenance, settings)
+          # SLICE 0 compat alias: same Dockerfile, published as the
+          # pre-rename image name so TrueNAS apps with pull_policy:
+          # always on the migrator tag keep working through the
+          # transition. Drop this matrix entry two releases after
+          # slice-0 ships (see docs/ROADMAP/juicemount-manager.md §3.6).
           - name: juicemount-migrator
-            dockerfile: server/juicemount-migrator/Dockerfile
-            description: Standalone data-migration container (juicefs sync + web UI)
+            dockerfile: server/juicemount-manager/Dockerfile
+            description: DEPRECATED — legacy alias of juicemount-manager; drop after two releases
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -90,7 +103,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Per-image GHA cache scope so the two matrix jobs don't
-          # invalidate each other's layers.
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+          # Per-image GHA cache scope so the matrix jobs don't
+          # invalidate each other's layers. juicemount-manager and
+          # juicemount-migrator share the same Dockerfile so they
+          # share a cache scope — saves one full build during the
+          # compat period.
+          cache-from: type=gha,scope=${{ matrix.dockerfile }}
+          cache-to: type=gha,scope=${{ matrix.dockerfile }},mode=max

@@ -1,6 +1,11 @@
-// JuiceMount Migrator — vanilla JS UI. No frameworks, no build step.
-// Embedded mode: served from /migrator/ inside juicemount-server, so
+// JuiceMount Manager — vanilla JS UI. No frameworks, no build step.
+// Embedded mode: served from /manager/ inside juicemount-server, so
 // all API paths must be relative to the page's base path.
+//
+// SLICE 0 layout: a sidebar selects one of several <section
+// data-tab="..."> panes via hash-routes (#/overview, #/migrations,
+// #/trash, ...). The Migrations pane is the only functional one in
+// this slice; every other entry shows a "Coming soon" placeholder.
 
 (() => {
   'use strict';
@@ -8,7 +13,7 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-  // Base path = the dir part of the current URL (e.g. /migrator/ → /migrator).
+  // Base path = the dir part of the current URL (e.g. /manager/ → /manager).
   // All /api/... calls are prefixed with this so the same JS works under
   // any deployment prefix.
   const BASE = (() => {
@@ -17,6 +22,63 @@
     return trimmed || '';
   })();
   const apiURL = (p) => BASE + '/api' + p;
+
+  // ---------------------------------------------------------------
+  // Hash routing
+  // ---------------------------------------------------------------
+  // The sidebar entries are plain anchors with href="#/<name>"; the
+  // browser updates location.hash on click and fires the hashchange
+  // event we listen for. Default route is #/migrations because it's
+  // the only functional tab in SLICE 0 — landing the user anywhere
+  // else would be confusing.
+  //
+  // Trade-off (per §3.3 of the manager roadmap): hash-routes vs.
+  // History API. Hash-routes win because the static handler in Go
+  // doesn't need to know about every route — every URL still resolves
+  // to the same index.html and the JS picks the section.
+  const TABS = [
+    'overview',
+    'migrations',
+    'trash',
+    'destinations',
+    'backups',
+    'maintenance',
+    'settings',
+  ];
+  const DEFAULT_TAB = 'migrations';
+
+  // route reads location.hash, normalizes it, and shows the matching
+  // tab. Unknown / empty / malformed hashes fall back to DEFAULT_TAB.
+  // Also rewrites location.hash so the URL bar reflects the resolved
+  // route (so a bookmark of #/ becomes #/migrations).
+  function route() {
+    const raw = (location.hash || '').replace(/^#\/?/, '').split('?')[0];
+    const name = TABS.includes(raw) ? raw : DEFAULT_TAB;
+    if (location.hash !== '#/' + name) {
+      // Use replaceState so this normalization doesn't pollute the
+      // back-button history with an extra entry.
+      history.replaceState(null, '', '#/' + name);
+    }
+    showTab(name);
+  }
+
+  // showTab swaps which <section data-tab="X"> is visible and marks
+  // the corresponding sidebar link as active. Also runs the lazy-init
+  // hook for Migrations on first activation — subsequent activations
+  // are cheap (just unhiding the same DOM).
+  function showTab(name) {
+    $$('.tab-pane').forEach((el) => {
+      el.hidden = el.dataset.tab !== name;
+    });
+    $$('.sidebar a[data-tab-link]').forEach((a) => {
+      a.classList.toggle('active', a.dataset.tabLink === name);
+    });
+    if (name === 'migrations') {
+      initMigrationsOnce();
+    }
+  }
+
+  window.addEventListener('hashchange', route);
 
   // -------- State --------
   const state = {
@@ -518,21 +580,38 @@
     }[c]));
   }
 
-  // -------- Boot --------
-  (async () => {
-    try {
-      await loadSources();
-      await loadJobs();
-      if (state.adminKey) {
-        $('#auth-state').textContent = 'Admin key configured';
+  // -------- Migrations tab lazy init --------
+  // The migrator API endpoints (sources, jobs, etc.) are network
+  // calls; we don't want them firing for users who navigate straight
+  // to a placeholder tab. initMigrationsOnce guards against repeat
+  // initialization when the user toggles between tabs.
+  let migrationsInited = false;
+  function initMigrationsOnce() {
+    if (migrationsInited) return;
+    migrationsInited = true;
+    (async () => {
+      try {
+        await loadSources();
+        await loadJobs();
+        if (state.adminKey) {
+          $('#auth-state').textContent = 'Admin key configured';
+        }
+      } catch (err) {
+        $('#error').textContent = 'Failed to initialize: ' + err.message;
+        $('#error').hidden = false;
       }
-    } catch (err) {
-      $('#error').textContent = 'Failed to initialize: ' + err.message;
-      $('#error').hidden = false;
-    }
-  })();
+    })();
+    // Re-poll jobs list periodically to catch new entries created
+    // out-of-band (e.g. from another browser tab or jmctl). Interval
+    // starts only after first activation so placeholder tabs don't
+    // fire useless requests.
+    setInterval(loadJobs, 10000);
+  }
 
-  // Re-poll jobs list periodically to catch new entries created
-  // out-of-band (e.g. from another browser tab or jmctl).
-  setInterval(loadJobs, 10000);
+  // -------- Boot --------
+  // route() reads location.hash, falls back to DEFAULT_TAB
+  // (#/migrations), and shows the matching <section data-tab>.
+  // showTab → initMigrationsOnce, so visiting the page with the
+  // default route immediately fires the migrator boot path.
+  route();
 })();

@@ -1,6 +1,13 @@
-/* JuiceMount Migrator — minimal, system-native look. Matches the
+/* JuiceMount Manager — minimal, system-native look. Matches the
    JuiceMount Mac app's design language: SF fonts, light/dark friendly,
-   no framework dependencies, no external CSS. */
+   no framework dependencies, no external CSS.
+
+   SLICE 0 added a sidebar layout: the page is now a two-column grid
+   (sidebar + main). The Migrations tab keeps the original three-pane
+   inner layout (source / destination / jobs) so the existing JS
+   wiring against those DOM ids doesn't have to change. Future
+   slices' tabs use the .placeholder helper or roll their own layout
+   inside a <section data-tab>. */
 
 :root {
   color-scheme: light dark;
@@ -62,17 +69,125 @@ header h1 {
   font-size: 0.95rem;
 }
 
+/* Two-column layout: sidebar (fixed-ish) + main content. Sidebar
+   collapses to a horizontal strip on narrow viewports so the tab
+   nav stays reachable on iPad / phone. */
+.layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 0;
+  max-width: 1600px;
+  margin: 0 auto;
+  min-height: calc(100vh - 180px);
+}
+
+.sidebar {
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border);
+  padding: 1.25rem 0;
+}
+
+.sidebar-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.sidebar-list li { margin: 0; }
+
+.sidebar-list a {
+  display: block;
+  padding: 0.55rem 1.25rem;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 0.95rem;
+  font-weight: 500;
+  border-left: 3px solid transparent;
+}
+
+.sidebar-list a:hover {
+  background: var(--accent-bg);
+}
+
+.sidebar-list a.active {
+  background: var(--accent-bg);
+  border-left-color: var(--accent);
+  color: var(--accent);
+}
+
+@media (max-width: 720px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding: 0.5rem 0.5rem;
+    overflow-x: auto;
+  }
+  .sidebar-list {
+    display: flex;
+    flex-direction: row;
+    gap: 0.25rem;
+  }
+  .sidebar-list a {
+    padding: 0.35rem 0.75rem;
+    border-left: none;
+    border-bottom: 3px solid transparent;
+    white-space: nowrap;
+  }
+  .sidebar-list a.active {
+    border-left: none;
+    border-bottom-color: var(--accent);
+  }
+}
+
 main {
+  padding: 1.5rem;
+}
+
+/* Migrations tab keeps the original three-column inner grid. Tabs
+   that don't use the three-pane layout (placeholders, future
+   single-column dashboards) inherit the natural flow. */
+.three-pane {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   gap: 1rem;
-  padding: 1.5rem;
-  max-width: 1400px;
-  margin: 0 auto;
 }
 
-@media (max-width: 1000px) {
-  main { grid-template-columns: 1fr; }
+@media (max-width: 1100px) {
+  .three-pane { grid-template-columns: 1fr; }
+}
+
+/* Coming-soon placeholder shown by every non-Migrations tab in
+   SLICE 0. Calm, centered, gives the user a clear "this is real
+   but not built yet" signal. */
+.placeholder {
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 3rem 1.5rem;
+  text-align: center;
+  color: var(--text-muted);
+  background: var(--bg-elev);
+}
+
+.placeholder h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.4rem;
+  color: var(--text);
+}
+
+.placeholder p {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.placeholder code {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  background: var(--bg);
+  padding: 0.05rem 0.35rem;
+  border-radius: 4px;
 }
 
 .pane {

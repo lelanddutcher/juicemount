@@ -1,8 +1,10 @@
-package migrator
+package manager
 
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -216,6 +218,45 @@ func TestJobManagerGetMissing(t *testing.T) {
 	}
 	if _, _, ok := m.Subscribe("nope"); ok {
 		t.Errorf("Subscribe for missing ID should return ok=false")
+	}
+}
+
+func TestSetStateFileIdempotent(t *testing.T) {
+	// Guards against the rename-era regression: a defensive second
+	// SetStateFile call MUST NOT re-read the on-disk snapshot, or
+	// jobs submitted between the two calls would be clobbered by
+	// the stale serialized state.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte(`{"schema_version":1,"jobs":{"j1":{"id":"j1","source":"/s","destination":"/d","state":"done","created_at":1}},"order":["j1"]}`), 0o600); err != nil {
+		t.Fatalf("write seed state: %v", err)
+	}
+
+	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
+	m.SetStateFile(path)
+	if got := m.Get("j1"); got == nil {
+		t.Fatalf("first SetStateFile didn't load seed job")
+	}
+
+	// Add a NEW job in-memory that doesn't exist on disk yet.
+	live, err := m.Submit("/new-src", "/new-dst", DefaultSyncOptions(), 0)
+	if err != nil {
+		t.Fatalf("Submit live job: %v", err)
+	}
+
+	// Truncate the state file on disk (simulate stale snapshot) then
+	// call SetStateFile again. If the guard is broken, the live job
+	// would disappear from m.jobs.
+	if err := os.WriteFile(path, []byte(`{"schema_version":1,"jobs":{},"order":[]}`), 0o600); err != nil {
+		t.Fatalf("truncate state: %v", err)
+	}
+	m.SetStateFile(path)
+
+	if got := m.Get(live.ID); got == nil {
+		t.Errorf("second SetStateFile clobbered live job %s (idempotency guard regressed)", live.ID)
+	}
+	if got := m.Get("j1"); got == nil {
+		t.Errorf("second SetStateFile dropped originally-loaded job j1")
 	}
 }
 
