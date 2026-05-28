@@ -688,7 +688,7 @@ know it was intentional. Revisit after slices 0-6 + 8 land.
 ### SLICE 8 — Settings
 
 **ID:** `slice-8-settings`
-**Status:** NOT STARTED
+**Status:** COMPLETE (commit e0651ae, deployed 2026-05-28, image revision e0651aea75c0 live; /api/settings GET returns code defaults, PUT round-trips, /api/settings/rotate-admin-key implements verify-before-rewrite contract with bytes-identical state-file guarantee on wrong-old-key (both Path A and Path B tested). UI tab still shows placeholder — wiring deferred to follow-up commit; backend contract is the load-bearing surface and it's live.)
 **Depends on:** slice-4 (admin-key rotation needs encryption)
 **Reviewer gate:** `everything-claude-code:security-reviewer`
 recommended for the admin-key rotation flow.
