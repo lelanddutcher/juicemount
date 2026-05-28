@@ -172,16 +172,35 @@ main {
 }
 
 .direction-opt {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.5rem;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;            /* radio sits centered with the title row */
+  column-gap: 0.6rem;
+  row-gap: 0.15rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
   cursor: pointer;
   flex: 1 1 220px;
   min-width: 0;
+  background: var(--bg);
+  transition: border-color 0.1s ease, background-color 0.1s ease;
+}
+
+.direction-opt:hover {
+  border-color: var(--accent);
+}
+
+/* Highlight the active tile when its radio is checked. :has() is
+   widely supported as of 2024. */
+.direction-opt:has(input[type="radio"]:checked) {
+  border-color: var(--accent);
+  background: var(--accent-bg);
 }
 
 .direction-opt input[type="radio"] {
-  margin-top: 0.2rem;
+  margin: 0;
+  align-self: center;             /* center the small radio against the multi-line span */
 }
 
 .direction-opt span strong {
@@ -867,6 +886,12 @@ main {
   justify-content: center;
   z-index: 100;
 }
+/* HTML's [hidden] attribute must beat the display:flex above, otherwise
+   the modal is always-on as soon as the Trash tab activates (CSS
+   specificity bites us). Without this, the cancel button "works" but
+   the modal re-shows on the next render because hidden=true alone
+   doesn't override display:flex. */
+.trash-modal[hidden] { display: none !important; }
 .trash-modal-inner {
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -988,6 +1013,73 @@ main {
   background: rgba(215, 0, 21, 0.12);
   border: 1px solid rgba(215, 0, 21, 0.35);
   color: var(--danger);
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
+/* SLICE 4 — Destinations tab. Two-column layout: list on the left,
+   create/edit form on the right. Each list row shows kind + a brief
+   "X, Y, Z configured" line so the operator can see what's set
+   without revealing values. */
+.dest-pane { padding: 1.5rem; }
+.dest-header h2 { margin: 0 0 0.5rem; font-size: 1.4rem; }
+.dest-header .hint { margin: 0 0 1rem; color: var(--text-muted); font-size: 0.92rem; }
+.dest-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) 2fr;
+  gap: 1.5rem;
+}
+.dest-list-wrap h3, .dest-form-wrap h3 { margin: 0 0 0.75rem; font-size: 1.05rem; }
+.dest-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+.dest-empty-hint { color: var(--text-muted); font-style: italic; padding: 0.5rem 0; }
+.dest-row {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.dest-row-head { display: flex; align-items: center; gap: 0.5rem; }
+.dest-kind-pill {
+  background: var(--accent-bg);
+  color: var(--accent);
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.dest-row-cfg { color: var(--text-muted); font-size: 0.85rem; }
+.dest-row-actions { display: flex; gap: 0.4rem; }
+.dest-row-actions button { font-size: 0.85rem; padding: 0.2rem 0.6rem; }
+.dest-form-wrap form { display: flex; flex-direction: column; gap: 0.75rem; max-width: 540px; }
+.dest-form-wrap .field { display: flex; flex-direction: column; gap: 0.2rem; }
+.dest-form-wrap .field span { font-size: 0.85rem; color: var(--text-muted); }
+.dest-form-wrap input[type="text"],
+.dest-form-wrap input[type="password"],
+.dest-form-wrap select,
+.dest-form-wrap textarea {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-elev);
+  color: var(--text);
+  font: inherit;
+}
+.dest-form-wrap textarea {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+}
+.dest-config-fields { display: flex; flex-direction: column; gap: 0.6rem; }
+.dest-form-actions { display: flex; gap: 0.5rem; }
+.dest-flash {
+  margin: 0;
+  padding: 0.4rem 0.6rem;
+  background: rgba(0, 135, 90, 0.12);
+  border: 1px solid rgba(0, 135, 90, 0.35);
+  color: var(--success);
   border-radius: 4px;
   font-size: 0.85rem;
 }
