@@ -15,9 +15,19 @@ const (
 // FDPool manages a pool of reusable file descriptors for JuiceFS FUSE reads.
 // Opening files on JuiceFS FUSE is expensive (~60ms); this pool amortizes
 // that cost across many pread() calls on the same file.
+//
+// QA-37 fix: keyed by {path, write} so a previously-opened read fd does
+// NOT get reused for a write call. Pre-fix, GetWrite would silently
+// return a cached O_RDONLY fd if Get had opened one earlier (e.g. via
+// Stat), and the next WriteAt would EBADF — surfacing to Finder as -36.
+type fdKey struct {
+	path  string
+	write bool
+}
+
 type FDPool struct {
 	mu      sync.Mutex
-	entries map[string]*poolEntry
+	entries map[fdKey]*poolEntry
 	stopCh  chan struct{}
 }
 
@@ -29,17 +39,21 @@ type poolEntry struct {
 
 func NewFDPool() *FDPool {
 	p := &FDPool{
-		entries: make(map[string]*poolEntry),
+		entries: make(map[fdKey]*poolEntry),
 		stopCh:  make(chan struct{}),
 	}
 	go p.evictLoop()
 	return p
 }
 
-// Get returns a pooled fd for the given path, opening it if necessary.
+// Get returns a pooled read-only fd for the given path, opening it if
+// necessary. The returned fd MUST NOT be used for writes; use GetWrite
+// for that and Release/ReleaseWrite accordingly so the read+write fds
+// stay segregated.
 func (p *FDPool) Get(path string) (*os.File, error) {
+	k := fdKey{path: path, write: false}
 	p.mu.Lock()
-	if entry, ok := p.entries[path]; ok {
+	if entry, ok := p.entries[k]; ok {
 		entry.lastUsed = time.Now()
 		entry.refCount++
 		fd := entry.fd
@@ -55,7 +69,7 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 
 	p.mu.Lock()
 	// Double-check under lock — another goroutine may have inserted
-	if entry, ok := p.entries[path]; ok {
+	if entry, ok := p.entries[k]; ok {
 		entry.lastUsed = time.Now()
 		entry.refCount++
 		existingFD := entry.fd
@@ -63,7 +77,7 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 		fd.Close() // close the one we just opened
 		return existingFD, nil
 	}
-	p.entries[path] = &poolEntry{
+	p.entries[k] = &poolEntry{
 		fd:       fd,
 		lastUsed: time.Now(),
 		refCount: 1,
@@ -72,10 +86,13 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 	return fd, nil
 }
 
-// GetWrite returns a pooled fd for writing, opening with the given flags if necessary.
+// GetWrite returns a pooled fd for writing, opening with the given flags
+// if necessary. Lives in its own keyspace slot (write=true) so a
+// previously-cached read fd never satisfies a write call.
 func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, error) {
+	k := fdKey{path: path, write: true}
 	p.mu.Lock()
-	if entry, ok := p.entries[path]; ok {
+	if entry, ok := p.entries[k]; ok {
 		entry.lastUsed = time.Now()
 		entry.refCount++
 		fd := entry.fd
@@ -90,7 +107,7 @@ func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, er
 	}
 
 	p.mu.Lock()
-	if entry, ok := p.entries[path]; ok {
+	if entry, ok := p.entries[k]; ok {
 		entry.lastUsed = time.Now()
 		entry.refCount++
 		existingFD := entry.fd
@@ -98,7 +115,7 @@ func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, er
 		fd.Close()
 		return existingFD, nil
 	}
-	p.entries[path] = &poolEntry{
+	p.entries[k] = &poolEntry{
 		fd:       fd,
 		lastUsed: time.Now(),
 		refCount: 1,
@@ -107,29 +124,48 @@ func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, er
 	return fd, nil
 }
 
-// Release decrements the refcount for a path.
+// Release decrements the refcount for a path on the READ-side slot.
+// Use ReleaseWrite for fds obtained via GetWrite.
 func (p *FDPool) Release(path string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if entry, ok := p.entries[path]; ok {
+	if entry, ok := p.entries[fdKey{path: path, write: false}]; ok {
+		entry.refCount--
+	}
+}
+
+// ReleaseWrite decrements the refcount for a path on the WRITE-side slot.
+func (p *FDPool) ReleaseWrite(path string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if entry, ok := p.entries[fdKey{path: path, write: true}]; ok {
 		entry.refCount--
 	}
 }
 
 // HasOpenRefs returns true if there is at least one outstanding Get
-// without a matching Release for `path` — i.e. somebody currently
-// holds a FD on this file.
+// or GetWrite without a matching Release for `path` — i.e. somebody
+// currently holds a FD (read OR write) on this file.
 //
 // QA-35 (2026-05-26): used by juiceFS.Stat to skip the phantom-purge
 // FUSE Lstat gate when an active reader holds the file open. If a FD
 // is open, the file is not a phantom — the reader proves it exists.
 // Eliminates a per-metadata-RPC FUSE round-trip during sustained
 // reads of a held file (Resolve playback, Finder Quick Look, etc.).
+//
+// QA-37: after the read/write keyspace split, check BOTH slots — an
+// active writer is just as good as an active reader for proving the
+// file isn't a phantom.
 func (p *FDPool) HasOpenRefs(path string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	entry, ok := p.entries[path]
-	return ok && entry.refCount > 0
+	if entry, ok := p.entries[fdKey{path: path, write: false}]; ok && entry.refCount > 0 {
+		return true
+	}
+	if entry, ok := p.entries[fdKey{path: path, write: true}]; ok && entry.refCount > 0 {
+		return true
+	}
+	return false
 }
 
 func (p *FDPool) evictLoop() {

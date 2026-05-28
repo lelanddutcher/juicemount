@@ -836,11 +836,15 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 				// firing at ~52s into a 512 MiB write.
 			} else if jfs.handler.fdPool != nil && jfs.handler.fdPool.HasOpenRefs(jfs.fullPath(filename)) {
 				// QA-35 (2026-05-26): NEVER purge a file with an active
-				// READER. fdPool.HasOpenRefs returns true when at least
-				// one outstanding Get holds a FD on this path. The
-				// typical phantom-purge trigger is ENOENT from Lstat
-				// during a transient juicefs staging-block upload spike;
-				// an active reader rules that out as the explanation.
+				// reader OR writer. fdPool.HasOpenRefs returns true when
+				// at least one outstanding Get OR GetWrite holds a FD on
+				// this path (read AND write slots checked post-QA-37).
+				// Either is proof the file is not a phantom — if anything
+				// holds a FD, the kernel keeps the inode alive and ENOENT
+				// from Lstat must be transient. The typical phantom-purge
+				// trigger is ENOENT from Lstat during a transient juicefs
+				// staging-block upload spike; an active holder rules that
+				// out as the explanation.
 				//
 				// Trade-off: this is a heuristic, NOT a proof of dentry
 				// existence. The kernel keeps the inode alive while a
@@ -1640,8 +1644,14 @@ func (f *writeFile) Close() error {
 	// every WRITE RPC, so syncing here would flush to MinIO on every RPC.
 	// Instead, rely on JuiceFS's writeback buffer and its own flush timing.
 	// Release fd back to pool instead of closing (avoids reopen on next RPC).
+	//
+	// QA-37: writeFile lives in the write-side keyspace slot, so it MUST
+	// call ReleaseWrite (not Release). The latter drops refCount on the
+	// read slot and would (a) leak the write slot's refcount, blocking
+	// eviction of the write fd, and (b) under-count read-slot refs if a
+	// reader is concurrently active — corrupting the active-reader gate.
 	if f.fdPool != nil {
-		f.fdPool.Release(f.fusePath)
+		f.fdPool.ReleaseWrite(f.fusePath)
 	} else {
 		f.File.Close()
 	}
