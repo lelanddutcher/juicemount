@@ -339,7 +339,7 @@ Into JuiceFS (today), Out of JuiceFS, JuiceFS-to-JuiceFS.
 ### SLICE 2 — Overview dashboard
 
 **ID:** `slice-2-overview`
-**Status:** NOT STARTED
+**Status:** CODE COMPLETE (deploy + live validation deferred while user is mid-copy on production TrueNAS; commit 32d2d29, image published, awaiting redeploy authorization)
 **Depends on:** slice-0
 **Blocks:** none
 
