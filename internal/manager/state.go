@@ -101,3 +101,28 @@ type scheduleHistoryRow struct {
 	FinishedAt int64  `json:"finished_at,omitempty"`
 	Error      string `json:"error,omitempty"`
 }
+
+// settingsState is the persisted form of the SLICE-8 Settings struct.
+// Stored at the persistedState.Settings field as a POINTER so that a
+// state file with no `settings` key (every install before slice-8)
+// decodes to nil and the loader can distinguish "never configured" from
+// "configured to all-zero values". A nil settings pointer means "use
+// code defaults"; the Settings handler materializes those on GET.
+//
+// Schema stays at v2 (extending within v2 — same convention as
+// schedules, since older readers tolerate unknown keys via Go's
+// json.Unmarshal "missing field = zero value" behavior).
+//
+// All fields here are plaintext / non-secret. The admin key itself is
+// NEVER stored — only the operator's running JM_ADMIN_KEY env var
+// holds it, and rotation re-encrypts every destination under a new
+// HKDF-derived key without persisting either the old or new admin key
+// to disk. DestinationsRedacted is a UX hint (whether the Destinations
+// tab should default to redacted-list view) — informational, not a
+// security boundary.
+type settingsState struct {
+	JobDefaults          SyncOptions `json:"job_defaults"`
+	Theme                string      `json:"theme"`
+	LogRetentionLines    int         `json:"log_retention_lines"`
+	DestinationsRedacted bool        `json:"destinations_redacted,omitempty"`
+}
