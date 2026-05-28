@@ -92,6 +92,12 @@
     previewAbort: null,
     destPreviewAbort: null,
     destPreviewTimer: null,
+    // SLICE 1: which Direction the user has picked. Drives which
+    // browse endpoint the source picker hits, what the dest input
+    // placeholder shows, and which Direction value goes on the
+    // POST /api/migrate body. Default "in" matches the pre-SLICE-1
+    // behavior so the page boots into the familiar workflow.
+    direction: 'in',
     // Last computed source-preview totals for the current selection.
     // Passed into the job on submit so the progress bar can show real %
     // instead of an indeterminate placeholder.
@@ -133,14 +139,39 @@
     renderSourceRoots();
   }
 
+  // sourceRootsForDirection returns the list of root paths the
+  // source-picker should surface for the active Direction. For
+  // DirectionIn that's the configured /sources/... mounts; for
+  // DirectionOut / DirectionBetween it's a single entry — the
+  // JuiceFS volume root (/jfs). Keeps the UI flow identical across
+  // directions: pick a root, then browse into it.
+  function sourceRootsForDirection() {
+    if (state.direction === 'in') return state.sourceRoots;
+    // Out / Between: the only valid source root is the JuiceFS volume.
+    return [state.destMount];
+  }
+
+  // browseEndpointForPath returns the right /api/browse... endpoint
+  // for a path. /jfs/... paths hit the SLICE-1 /api/browse-jfs handler;
+  // everything else hits the original /api/browse. The split keeps the
+  // backend's pathAllowed checks tight (each handler validates against
+  // exactly one root).
+  function browseEndpointForPath(path) {
+    if (path === state.destMount || path.startsWith(state.destMount + '/')) {
+      return '/api/browse-jfs';
+    }
+    return '/api/browse';
+  }
+
   function renderSourceRoots() {
     const wrap = $('#source-roots');
     wrap.innerHTML = '';
-    if (state.sourceRoots.length === 0) {
+    const roots = sourceRootsForDirection();
+    if (roots.length === 0) {
       wrap.textContent = '(no source roots configured)';
       return;
     }
-    for (const root of state.sourceRoots) {
+    for (const root of roots) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'source-root-btn';
@@ -153,12 +184,14 @@
   // -------- Browser --------
   async function browseInto(path, btn) {
     $$('.source-root-btn').forEach((b) => b.classList.toggle('active', b === btn));
-    state.activeRoot = state.sourceRoots.find((r) => path.startsWith(r)) || path;
+    const roots = sourceRootsForDirection();
+    state.activeRoot = roots.find((r) => path === r || path.startsWith(r + '/')) || path;
     await listDir(path);
   }
 
   async function listDir(path) {
-    const data = await api('GET', `/api/browse?path=${encodeURIComponent(path)}`);
+    const endpoint = browseEndpointForPath(path);
+    const data = await api('GET', `${endpoint}?path=${encodeURIComponent(path)}`);
     state.cwd = data.path;
     state.selectedPath = path;
     updateSelectedDisplay();
@@ -224,26 +257,44 @@
       updateDestPreview();
       return;
     }
-    // Strip the longest-matching source-root prefix so the destination
-    // mirrors the source tree without leaking the bind-mount name
-    // (e.g. /sources/oldzpool/Foo/Bar → /jfs/Foo/Bar, not
-    // /jfs/imported/<timestamp>-Bar). The user can still edit it.
-    let rel = source;
-    let match = '';
-    for (const root of state.sourceRoots) {
-      if ((source === root || source.startsWith(root + '/')) && root.length > match.length) {
-        match = root;
+    // SLICE 1: destination shape depends on Direction:
+    //   - In: strip source-root prefix, prepend destMount (/jfs/...)
+    //   - Out: strip destMount prefix from source, prepend the first
+    //     configured source-root (so /jfs/Film → /sources/.../Film).
+    //     The user can still edit.
+    //   - Between: stub — leave blank; the validation flow surfaces
+    //     the Destinations-tab message when they hit Start.
+    if (state.direction === 'in') {
+      let rel = source;
+      let match = '';
+      for (const root of state.sourceRoots) {
+        if ((source === root || source.startsWith(root + '/')) && root.length > match.length) {
+          match = root;
+        }
       }
-    }
-    if (match) {
-      rel = source.slice(match.length);
-      if (source === match) {
-        // Edge: user picked the root itself — fall back to its basename.
-        rel = '/' + (match.split('/').filter(Boolean).pop() || 'imported');
+      if (match) {
+        rel = source.slice(match.length);
+        if (source === match) {
+          rel = '/' + (match.split('/').filter(Boolean).pop() || 'imported');
+        }
       }
+      if (!rel.startsWith('/')) rel = '/' + rel;
+      input.value = state.destMount + rel;
+    } else if (state.direction === 'out') {
+      let rel = source;
+      if (source === state.destMount) {
+        rel = '/exported';
+      } else if (source.startsWith(state.destMount + '/')) {
+        rel = source.slice(state.destMount.length);
+      }
+      if (!rel.startsWith('/')) rel = '/' + rel;
+      const firstHostRoot = state.sourceRoots[0] || '/external';
+      input.value = firstHostRoot + rel;
+    } else {
+      // direction === 'between' — placeholder only; submission will
+      // surface the SLICE-4 message.
+      input.value = '';
     }
-    if (!rel.startsWith('/')) rel = '/' + rel;
-    input.value = state.destMount + rel;
     updateDestPreview();
   }
 
@@ -259,6 +310,42 @@
     listDir(parent);
   });
 
+  // -------- Direction --------
+  // SLICE 1: hash-route stays on Migrations; the Direction picker
+  // is a sub-control of the Migrations tab. Changing it resets the
+  // active selection (source roots differ between In/Out) and
+  // rerenders the picker. Submit-time the Direction value goes on
+  // the POST body so handleMigrate can apply the right shape rules.
+  function onDirectionChange() {
+    const sel = document.querySelector('input[name="direction"]:checked');
+    if (!sel) return;
+    state.direction = sel.value;
+    // Adjust the source-pane hint so users know which root the
+    // picker is browsing.
+    const hint = $('#source-hint');
+    if (state.direction === 'in') {
+      hint.textContent = 'Browse a source root and pick a directory to import into JuiceFS.';
+    } else if (state.direction === 'out') {
+      hint.textContent = 'Pick a directory inside /jfs to export to a host path.';
+    } else {
+      hint.textContent = 'Pick a directory inside /jfs to copy to a second JuiceFS volume (Destinations tab, slice-4).';
+    }
+    // Clear the current selection; the previous source root may not
+    // even be visible under the new Direction.
+    state.activeRoot = null;
+    state.cwd = null;
+    state.selectedPath = null;
+    $('#browser').hidden = true;
+    $('#preview').hidden = true;
+    $('#dest-preview').hidden = true;
+    $('#dest-input').value = '';
+    $('#dest-input').dataset.userEdited = 'false';
+    $('#start-btn').disabled = true;
+    updateSelectedDisplay();
+    renderSourceRoots();
+  }
+  $$('input[name="direction"]').forEach((r) => r.addEventListener('change', onDirectionChange));
+
   // -------- Migrate --------
   $('#start-btn').addEventListener('click', async () => {
     const dest = $('#dest-input').value.trim();
@@ -268,6 +355,7 @@
       const job = await api('POST', '/api/migrate', {
         source: state.selectedPath,
         destination: dest,
+        direction: state.direction,
         options: collectOptions(),
         // Pass the preview's scanned bytes total. If the scan was
         // truncated we still send it — the bar will overshoot 100%
@@ -329,6 +417,7 @@
         body: JSON.stringify({
           source: state.selectedPath,
           destination: dest,
+          direction: state.direction,
           preserve_structure: $('#opt-preserve-structure').checked,
         }),
         signal: state.destPreviewAbort.signal,
@@ -543,10 +632,27 @@
     const entry = state.jobs.get(id);
     if (!entry) return;
     const orig = entry.job;
+    // SLICE 1: prefer the persisted direction (now stored on Job since
+    // the slice-1 reviewer fix). Falls back to path inference only for
+    // pre-SLICE-1 records that lack the field. Backend also defaults
+    // empty → "in", so this is belt-and-suspenders for the UI.
+    let dir = orig.direction || '';
+    if (!dir) {
+      dir = 'in';
+      if (orig.source && (orig.source === state.destMount || orig.source.startsWith(state.destMount + '/'))) {
+        dir = 'out';
+      }
+    }
+    // Sync the UI radio to the resumed job's direction so the picker
+    // doesn't lie about the new job's direction immediately after submit.
+    state.direction = dir;
+    const radio = document.querySelector(`input[name="direction"][value="${dir}"]`);
+    if (radio) radio.checked = true;
     try {
       const job = await api('POST', '/api/migrate', {
         source: orig.source,
         destination: orig.destination,
+        direction: dir,
         options: orig.options,
         total_bytes: orig.total_bytes || 0,
       });

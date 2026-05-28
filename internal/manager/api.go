@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -82,6 +83,12 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	}
 	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
 	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))
+	// SLICE 1: /api/browse-jfs walks the JuiceFS FUSE mount tree.
+	// Needed when the user picks DirectionOut / DirectionBetween in
+	// the Migrations tab — the source picker browses /jfs/ instead of
+	// /sources/. Path-traversal guard is the same pathAllowed pattern,
+	// only checked against the fuseMount root.
+	mux.HandleFunc(prefix+"/api/browse-jfs", a.auth(a.handleBrowseJFS))
 	mux.HandleFunc(prefix+"/api/preview", a.auth(a.handlePreview))
 	mux.HandleFunc(prefix+"/api/resolve-destination", a.auth(a.handleResolveDestination))
 	mux.HandleFunc(prefix+"/api/migrate", a.auth(a.handleMigrate))
@@ -175,6 +182,91 @@ func (a *API) handleSources(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleBrowseJFS lists entries inside the JuiceFS FUSE mount tree.
+// SLICE 1 introduces this for DirectionOut / DirectionBetween, where
+// the source picker browses /jfs/ instead of /sources/.
+//
+// The user-facing path the UI shows starts with a.destMount (e.g.
+// /jfs/...); on the wire to juicefs sync this is rewritten via
+// normalizeAnyURI to file:///<FUSEMount>/... so the kernel mount
+// handles the actual reads. handleBrowseJFS performs the same
+// rewrite for its own os.ReadDir call — the dest-mount prefix is
+// virtual, not a real path the manager process can stat. In
+// standalone mode (no FUSE mount), browsing the JuiceFS tree from
+// inside the manager isn't supported and the handler returns 501.
+//
+// Path traversal: jfsPathAllowed is the gate; same pattern as
+// handleBrowse uses pathAllowed.
+//
+// Hidden entries are filtered out — matches handleBrowse's policy
+// and avoids surfacing the .trash/ subtree here (that's SLICE 3's
+// territory, with restore semantics that handleBrowseJFS shouldn't
+// duplicate).
+func (a *API) handleBrowseJFS(w http.ResponseWriter, r *http.Request) {
+	if a.fuseMount == "" {
+		http.Error(w, "browsing the JuiceFS tree requires embedded mode (FUSE mount)", http.StatusNotImplemented)
+		return
+	}
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		// Default to the volume root so the UI can boot the browser
+		// without first knowing where /jfs lives. Mirrors the
+		// "default to root" behavior /api/sources clients use.
+		path = a.destMount
+	}
+	if !a.jfsPathAllowed(path) {
+		http.Error(w, "path outside the JuiceFS volume", http.StatusForbidden)
+		return
+	}
+	// Rewrite the /jfs/... user-facing prefix to the on-disk FUSE
+	// mount path before stat'ing. Inverse of what the UI does when
+	// the user clicks an entry: client sees /jfs/foo, server stats
+	// /<FUSEMount>/foo.
+	dmClean := filepath.Clean(a.destMount)
+	cleaned := filepath.Clean(path)
+	rel := strings.TrimPrefix(cleaned, dmClean)
+	rel = strings.TrimPrefix(rel, "/")
+	fuse := strings.TrimSuffix(a.fuseMount, "/")
+	real := fuse
+	if rel != "" {
+		real = fuse + "/" + rel
+	}
+	entries, err := os.ReadDir(real)
+	if err != nil {
+		// Don't echo err.Error() — it contains the FUSE-resolved
+		// absolute path, which leaks the internal mount layout to
+		// authenticated clients. Log server-side, return generic.
+		log.Printf("manager: browse-jfs ReadDir(%q) failed: %v", real, err)
+		http.Error(w, "cannot list directory", http.StatusBadRequest)
+		return
+	}
+	type entry struct {
+		Name  string `json:"name"`
+		IsDir bool   `json:"is_dir"`
+		Size  int64  `json:"size"`
+	}
+	out := make([]entry, 0, len(entries))
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, entry{
+			Name:  e.Name(),
+			IsDir: e.IsDir(),
+			Size:  info.Size(),
+		})
+	}
+	// Return the user-facing path (the /jfs-prefixed form) so the UI
+	// can build the next browse URL by appending "/<entry.name>"
+	// without knowing the FUSE-mount path. The user-facing tree stays
+	// the only thing the UI ever sees.
+	writeJSON(w, http.StatusOK, map[string]any{"path": cleaned, "entries": out})
+}
+
 // handleBrowse lists entries under ?path=... and resolves the path
 // against the configured sourceRoots to prevent directory traversal.
 func (a *API) handleBrowse(w http.ResponseWriter, r *http.Request) {
@@ -221,9 +313,15 @@ func (a *API) handleBrowse(w http.ResponseWriter, r *http.Request) {
 // missing fields fall back to DefaultSyncOptions(). TotalBytes is the
 // pre-computed source size from the UI's preview pane and drives the
 // progress bar's % display — 0 means "unknown, show indeterminate."
+//
+// Direction (SLICE 1) selects In / Out / Between. Empty string is
+// treated as DirectionIn for backwards compatibility with pre-SLICE-1
+// clients (jmctl scripts, existing UI bundles in the field, etc.) that
+// don't know about the field.
 type migrateRequest struct {
 	Source      string       `json:"source"`
 	Destination string       `json:"destination"`
+	Direction   Direction    `json:"direction,omitempty"`
 	Options     *SyncOptions `json:"options,omitempty"`
 	TotalBytes  int64        `json:"total_bytes,omitempty"`
 }
@@ -242,44 +340,99 @@ func (a *API) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source and destination are required", http.StatusBadRequest)
 		return
 	}
-	if !a.pathAllowed(req.Source) {
-		http.Error(w, "source outside permitted source roots", http.StatusForbidden)
-		return
+	dir := req.Direction
+	if dir == "" {
+		// Default for pre-SLICE-1 clients. validateDirectionPair also
+		// recognizes "" as DirectionIn; setting it explicitly here keeps
+		// later logic that switches on dir from needing the same check.
+		dir = DirectionIn
 	}
-	// Destination security gates (Rule 4 HIGH findings):
-	//   1. Reject any user-supplied URL scheme. Only path-style
-	//      destinations are accepted; the runner converts them to
-	//      file:// or jfs:// internally. Otherwise a client with
-	//      the admin key could exfiltrate to s3://attacker-bucket/.
-	//   2. Reject any path containing `..` segments. Clean the path
-	//      and verify it still starts with destMount. Otherwise
-	//      "/jfs/../../../tmp/evil" escapes the JuiceFS volume into
-	//      the host filesystem.
+
+	source := strings.TrimSpace(req.Source)
 	dest := strings.TrimSpace(req.Destination)
-	if i := strings.Index(dest, "://"); i > 0 && i < 10 {
-		http.Error(w, "destination must be a path under "+a.destMount+", not a URL", http.StatusBadRequest)
+
+	// Reject scheme-prefixed strings on both sides. SLICE 0 only checked
+	// destinations; SLICE 1 adds the same protection on the source side
+	// because Out / Between sources are user-provided too (the user
+	// picks a /jfs/... path in the browser).
+	if i := strings.Index(source, "://"); i > 0 && i < 10 {
+		http.Error(w, "source must be a path, not a URL", http.StatusBadRequest)
 		return
 	}
-	if dest == "" || !strings.HasPrefix(dest, "/") {
+	if i := strings.Index(dest, "://"); i > 0 && i < 10 {
+		http.Error(w, "destination must be a path, not a URL", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(source, "/") {
+		http.Error(w, "source must be an absolute path", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(dest, "/") {
 		http.Error(w, "destination must be an absolute path", http.StatusBadRequest)
 		return
 	}
-	cleaned := filepath.Clean(dest)
+
+	// Path-traversal guard for both sides. filepath.Clean removes `..`
+	// segments; we then verify the cleaned path still starts with the
+	// expected root (destMount for /jfs sides, any sourceRoot for host
+	// sides). Without this, "/jfs/../../tmp/evil" would escape the
+	// volume into the host filesystem. Mirrors SLICE-0's destination
+	// check, but applied symmetrically.
+	source = filepath.Clean(source)
+	dest = filepath.Clean(dest)
 	dmClean := filepath.Clean(a.destMount)
-	if cleaned != dmClean && !strings.HasPrefix(cleaned, dmClean+"/") {
-		http.Error(w, "destination must be under "+a.destMount+" (no parent-dir traversal)", http.StatusForbidden)
+
+	// Direction-shape gate. Calls validateDirectionPair on the cleaned
+	// paths so the rules see the canonical form (no /jfs/../foo
+	// bypass).
+	if err := validateDirectionPair(dir, source, dest); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	// At this point `cleaned` is safe: absolute, no `..`, under destMount.
-	dest = cleaned
-	if dest == dmClean {
-		dest = filepath.Join(dmClean, "imported", time.Now().UTC().Format("20060102-150405"))
+
+	switch dir {
+	case DirectionIn:
+		if !a.pathAllowed(source) {
+			http.Error(w, "source outside permitted source roots", http.StatusForbidden)
+			return
+		}
+		if dest != dmClean && !strings.HasPrefix(dest, dmClean+"/") {
+			http.Error(w, "destination must be under "+a.destMount+" (no parent-dir traversal)", http.StatusForbidden)
+			return
+		}
+		if dest == dmClean {
+			dest = filepath.Join(dmClean, "imported", time.Now().UTC().Format("20060102-150405"))
+		}
+	case DirectionOut:
+		// Source is /jfs/... — validate against the FUSE mount root.
+		if !a.jfsPathAllowed(source) {
+			http.Error(w, "source outside /jfs (FUSE mount)", http.StatusForbidden)
+			return
+		}
+		// Destination is an external host path. Reuse the existing
+		// pathAllowed (which gates against sourceRoots) — the same
+		// bind-mounts that are valid sources of an In are valid
+		// targets of an Out. Operators can add or restrict mounts by
+		// editing the source-roots config.
+		if !a.pathAllowed(dest) {
+			http.Error(w, "destination outside permitted roots (Out direction writes to a configured source-root mount)", http.StatusForbidden)
+			return
+		}
+	case DirectionBetween:
+		// Unreachable: validateDirectionPair returns an error for
+		// DirectionBetween in SLICE 1 (the "Configure a second JuiceFS
+		// destination first" stub). The switch case is here for the
+		// future SLICE-4 wiring; for now the validate call above
+		// already returned 400.
+		http.Error(w, "JuiceFS-to-JuiceFS migrations land in slice-4", http.StatusNotImplemented)
+		return
 	}
+
 	opts := DefaultSyncOptions()
 	if req.Options != nil {
 		opts = *req.Options
 	}
-	job, err := a.jobs.Submit(req.Source, dest, opts, req.TotalBytes)
+	job, err := a.jobs.Submit(source, dest, opts, req.TotalBytes, dir)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -305,10 +458,25 @@ func (a *API) handlePreview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path is required", http.StatusBadRequest)
 		return
 	}
-	if !a.pathAllowed(path) {
+	// SLICE 1: previews for DirectionOut start at a /jfs/... path the
+	// host filesystem can't stat directly. Rewrite to the FUSE-mount
+	// path before the os.Stat call; the user-facing reply is the same
+	// (numbers don't change). Path-traversal guard switches helper
+	// based on which root the request targets.
+	statPath := path
+	if a.jfsPathAllowed(path) {
+		if a.fuseMount == "" {
+			http.Error(w, "previewing /jfs requires embedded mode (FUSE mount)", http.StatusNotImplemented)
+			return
+		}
+		dmClean := filepath.Clean(a.destMount)
+		rel := strings.TrimPrefix(filepath.Clean(path), dmClean)
+		statPath = strings.TrimSuffix(a.fuseMount, "/") + rel
+	} else if !a.pathAllowed(path) {
 		http.Error(w, "path outside permitted source roots", http.StatusForbidden)
 		return
 	}
+	path = statPath
 	type preview struct {
 		Files       int64            `json:"files"`
 		Directories int64            `json:"directories"`
@@ -387,10 +555,13 @@ func (a *API) handlePreview(w http.ResponseWriter, r *http.Request) {
 }
 
 // resolveDestRequest mirrors the JSON body of POST /api/resolve-destination.
+// Direction (SLICE 1) controls which side gets the host-path-vs-/jfs
+// check; empty string defaults to DirectionIn for backwards compat.
 type resolveDestRequest struct {
-	Source            string `json:"source"`
-	Destination       string `json:"destination"`
-	PreserveStructure bool   `json:"preserve_structure"`
+	Source            string    `json:"source"`
+	Destination       string    `json:"destination"`
+	Direction         Direction `json:"direction,omitempty"`
+	PreserveStructure bool      `json:"preserve_structure"`
 }
 
 // exampleMapping describes one source→destination path pair for the
@@ -430,51 +601,115 @@ func (a *API) handleResolveDestination(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "source and destination are required", http.StatusBadRequest)
 		return
 	}
-	if !a.pathAllowed(req.Source) {
-		http.Error(w, "source outside permitted source roots", http.StatusForbidden)
+	dir := req.Direction
+	if dir == "" {
+		dir = DirectionIn
+	}
+	source := strings.TrimSpace(req.Source)
+	dest := strings.TrimSpace(req.Destination)
+	// Reject URL-scheme strings on both sides — same protection as
+	// handleMigrate, so the preview shows the same constraints.
+	if i := strings.Index(source, "://"); i > 0 && i < 10 {
+		http.Error(w, "source must be a path, not a URL", http.StatusBadRequest)
 		return
 	}
-	// Reject URL-scheme destinations and `..` traversal so the preview
-	// shows the same constraints /api/migrate enforces — users get
-	// immediate feedback instead of discovering the rejection at submit.
-	dest := strings.TrimSpace(req.Destination)
 	if i := strings.Index(dest, "://"); i > 0 && i < 10 {
-		http.Error(w, "destination must be a path under "+a.destMount+", not a URL", http.StatusBadRequest)
+		http.Error(w, "destination must be a path, not a URL", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(source, "/") {
+		http.Error(w, "source must be an absolute path", http.StatusBadRequest)
 		return
 	}
 	if !strings.HasPrefix(dest, "/") {
 		http.Error(w, "destination must be an absolute path", http.StatusBadRequest)
 		return
 	}
-	cleaned := filepath.Clean(dest)
+	source = filepath.Clean(source)
+	dest = filepath.Clean(dest)
 	dmClean := filepath.Clean(a.destMount)
-	if cleaned != dmClean && !strings.HasPrefix(cleaned, dmClean+"/") {
-		http.Error(w, "destination must be under "+a.destMount, http.StatusForbidden)
+
+	if err := validateDirectionPair(dir, source, dest); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	dest = cleaned
+
+	switch dir {
+	case DirectionIn:
+		if !a.pathAllowed(source) {
+			http.Error(w, "source outside permitted source roots", http.StatusForbidden)
+			return
+		}
+		if dest != dmClean && !strings.HasPrefix(dest, dmClean+"/") {
+			http.Error(w, "destination must be under "+a.destMount, http.StatusForbidden)
+			return
+		}
+	case DirectionOut:
+		if !a.jfsPathAllowed(source) {
+			http.Error(w, "source outside /jfs (FUSE mount)", http.StatusForbidden)
+			return
+		}
+		if !a.pathAllowed(dest) {
+			http.Error(w, "destination outside permitted roots", http.StatusForbidden)
+			return
+		}
+	case DirectionBetween:
+		// Unreachable: validateDirectionPair already returned the
+		// "configure a second JuiceFS destination first" stub error.
+		http.Error(w, "JuiceFS-to-JuiceFS preview lands in slice-4", http.StatusNotImplemented)
+		return
+	}
 
 	// Resolve to the exact URL forms RunSync will use, via the same
-	// normalize helpers — no JS-side replica that could drift.
-	srcURL := normalizeSourceURI(req.Source, req.PreserveStructure)
+	// normalize helpers — no JS-side replica that could drift. Source
+	// runs through normalizeAnyURI so /jfs/... sources (Out) get the
+	// FUSE-mount rewrite; In direction sources fall through to the
+	// plain file:// branch identically to normalizeSourceURI.
+	srcURL := normalizeAnyURI(source, a.fuseMount, req.PreserveStructure)
 	var destURL string
-	if a.fuseMount != "" {
-		destURL = normalizeDestURIEmbedded(dest, a.fuseMount, req.PreserveStructure)
-	} else {
-		destURL = normalizeDestURIJFS(dest, a.volName, req.PreserveStructure)
+	switch dir {
+	case DirectionIn:
+		if a.fuseMount != "" {
+			destURL = normalizeDestURIEmbedded(dest, a.fuseMount, req.PreserveStructure)
+		} else {
+			destURL = normalizeDestURIJFS(dest, a.volName, req.PreserveStructure)
+		}
+	case DirectionOut:
+		// Out-direction dest is a host path, not a JuiceFS path.
+		destURL = normalizeAnyURI(dest, "", req.PreserveStructure)
 	}
 
 	// Sample up to maxExamples files from the source tree. For a single
 	// file, the sample is just that file. For a directory, walk shallow-
 	// first and stop at maxExamples to keep the preview snappy.
-	samples := sampleSourceFiles(req.Source, maxResolveExamples)
+	//
+	// For DirectionOut, the source the UI shows is a /jfs/... path but
+	// sampleSourceFiles needs to os.ReadDir on the actual FUSE-mount
+	// path. We walk the FUSE-mount form and then rewrite the sampled
+	// paths back to the /jfs/... shape so the UI's preview block
+	// matches the path the user picked. Without this the preview would
+	// either fail to stat (no such file in the host filesystem) or
+	// leak the FUSE-mount path into the UI.
+	walkRoot := source
+	if dir == DirectionOut && a.fuseMount != "" {
+		rel := strings.TrimPrefix(source, dmClean)
+		walkRoot = strings.TrimSuffix(a.fuseMount, "/") + rel
+	}
+	samples := sampleSourceFiles(walkRoot, maxResolveExamples)
 	mappings := make([]exampleMapping, 0, len(samples))
 	for _, s := range samples {
+		// Map the FUSE-mount-rooted sample back to the user-facing
+		// /jfs/... prefix for the UI. For In, walkRoot == source so
+		// the substitution is a no-op.
+		displayPath := s
+		if dir == DirectionOut && a.fuseMount != "" {
+			displayPath = source + strings.TrimPrefix(s, walkRoot)
+		}
 		// rel is source-relative; same string is also the destination
 		// suffix when preserve_structure=true (1:1 mapping). For
 		// preserve_structure=false, juicefs sync prepends the source
 		// basename, so the destination gains an extra path segment.
-		rel := strings.TrimPrefix(s, req.Source)
+		rel := strings.TrimPrefix(s, walkRoot)
 		rel = strings.TrimPrefix(rel, "/")
 		var destPath string
 		if req.PreserveStructure {
@@ -482,18 +717,18 @@ func (a *API) handleResolveDestination(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// flatten-by-basename: juicefs sync without trailing slash
 			// puts contents at <dst>/<basename-of-src>/<rel>.
-			base := filepath.Base(req.Source)
+			base := filepath.Base(source)
 			destPath = filepath.Join(dest, base, rel)
 		}
 		mappings = append(mappings, exampleMapping{
-			SourcePath: s,
+			SourcePath: displayPath,
 			DestPath:   destPath,
 		})
 	}
 
 	info := "Files will be copied 1:1, preserving the folder structure under the source."
 	if !req.PreserveStructure {
-		info = "Files will be placed under " + dest + "/" + filepath.Base(req.Source) + "/ — juicefs sync adds the source's basename as a parent directory in this mode."
+		info = "Files will be placed under " + dest + "/" + filepath.Base(source) + "/ — juicefs sync adds the source's basename as a parent directory in this mode."
 	}
 
 	writeJSON(w, http.StatusOK, resolveDestResponse{
@@ -667,6 +902,27 @@ func (a *API) handleStatic(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css")
 	}
 	_, _ = w.Write(data)
+}
+
+// jfsPathAllowed returns true iff `p` is the JuiceFS user-facing
+// prefix (a.destMount, e.g. "/jfs") or under it. Used for the
+// SLICE-1 /api/browse-jfs handler and the DirectionOut source check
+// — both need to confirm a user-supplied path resolves inside the
+// JuiceFS volume rather than escaping to the host filesystem.
+//
+// Implementation note: we deliberately do NOT EvalSymlinks here.
+// The JuiceFS FUSE mount exposes a virtual tree managed by the
+// kernel + juicefs daemon; any symlinks inside it are user data,
+// not host-filesystem links. The traversal protection comes from
+// the filepath.Clean+prefix check, same pattern handleMigrate uses
+// for its destination guard. The /jfs prefix itself is a fixed
+// virtual path; nothing on the host filesystem owns it, so symlink
+// resolution outside the kernel mount can't change what /jfs
+// refers to.
+func (a *API) jfsPathAllowed(p string) bool {
+	cleaned := filepath.Clean(p)
+	dm := filepath.Clean(a.destMount)
+	return cleaned == dm || strings.HasPrefix(cleaned, dm+"/")
 }
 
 // pathAllowed returns true iff `p` is under one of the configured

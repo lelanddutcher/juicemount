@@ -23,6 +23,38 @@ import (
 // is safe.
 const juicefsMetricsAddr = "127.0.0.1:9567"
 
+// Direction is the migration direction selected in the UI's Migrations
+// tab. SLICE 1 of the manager roadmap adds Out-of-JuiceFS and JuiceFS-
+// to-JuiceFS migrations alongside the existing Into-JuiceFS behavior.
+//
+// Direction governs:
+//   - which root the source browser starts in (/sources for In, /jfs
+//     for Out and Between)
+//   - whether the destination must be (DirectionIn) or must not be
+//     (DirectionOut) inside the JuiceFS volume — see
+//     validateDirectionPair
+//   - whether the source URI is run through the file:// helper (In/Out)
+//     or the JuiceFS-volume helper (Between, once slice-4 lands)
+//
+// DirectionIn is the default for backwards compatibility with clients
+// that don't set the field on POST /api/migrate.
+type Direction string
+
+const (
+	// DirectionIn — source is a host path under /sources/..., dest is
+	// under /jfs/.... This is the pre-SLICE-1 behavior.
+	DirectionIn Direction = "in"
+	// DirectionOut — source is under /jfs/... (the FUSE mount tree),
+	// dest is a host path outside /jfs. Used for exporting JuiceFS
+	// contents to an external disk or share.
+	DirectionOut Direction = "out"
+	// DirectionBetween — both source and dest are JuiceFS volumes.
+	// SLICE 1 stubs this with a "configure a second destination first"
+	// message; lights up fully in SLICE 4 once the Destinations tab
+	// can identify a second JuiceFS volume by profile name.
+	DirectionBetween Direction = "between"
+)
+
 // SyncOptions controls per-job behavior. Tier-1/2/3 features in the
 // foolproofing roadmap map directly onto these fields.
 type SyncOptions struct {
@@ -91,18 +123,49 @@ type RunSyncSpec struct {
 // Emits ProgressEvent on `progress` each time juicefs writes a
 // recognized progress line. Blocks until juicefs exits or ctx cancels.
 func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, destination string, opts SyncOptions, progress chan<- ProgressEvent) error {
-	src := normalizeSourceURI(source, opts.PreserveStructure)
+	// SLICE 1: route the source through normalizeAnyURI so /jfs/...
+	// sources (Out direction) get rewritten to file:///<FUSEMount>/...
+	// — same kernel-mount path the destination side uses for In. For
+	// the pre-SLICE-1 case (source under /sources/...) normalizeAnyURI
+	// falls through to the file:// branch, identical to what
+	// normalizeSourceURI returned.
+	src := normalizeAnyURI(source, spec.FUSEMount, opts.PreserveStructure)
 
 	var dst string
 	var extraEnv []string
 	switch spec.Mode {
 	case ModeStandalone:
-		dst = normalizeDestURIJFS(destination, spec.VolName, opts.PreserveStructure)
-		// juicefs sync's URL syntax: env var name = URL alias. So for
-		// jfs://zpool/... we set zpool=redis://...
-		extraEnv = append(extraEnv, spec.VolName+"="+spec.MetaURL)
+		// SLICE 1: an Out-direction destination is a host path (e.g.
+		// /external/backups/...), so route it through normalizeAnyURI
+		// rather than the JuiceFS-specific helper. Standalone-mode
+		// In destinations under /jfs/... still get the jfs:// scheme
+		// because that branch of normalizeAnyURI passes them through
+		// to the file:// rewrite path only when FUSEMount is set
+		// (which standalone mode does not set) — so the helper falls
+		// through to file:// for /external/... paths, and we keep
+		// the explicit jfs:// helper for /jfs/... destinations.
+		if strings.HasPrefix(strings.TrimSpace(destination), "/jfs") {
+			dst = normalizeDestURIJFS(destination, spec.VolName, opts.PreserveStructure)
+			// juicefs sync's URL syntax: env var name = URL alias. So
+			// for jfs://zpool/... we set zpool=redis://...
+			extraEnv = append(extraEnv, spec.VolName+"="+spec.MetaURL)
+		} else {
+			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
+		}
 	default: // ModeEmbedded
-		dst = normalizeDestURIEmbedded(destination, spec.FUSEMount, opts.PreserveStructure)
+		// SLICE 1 split: /jfs/... destinations go through the FUSE-
+		// mount rewrite (normalizeDestURIEmbedded), Out-direction
+		// host-path destinations go through normalizeAnyURI which
+		// passes them through as file://<host-path>. Without this
+		// split, normalizeDestURIEmbedded would prepend the FUSE
+		// mount to an Out-direction destination like /external/foo
+		// and silently write outside the intended target.
+		trimmed := strings.TrimSpace(destination)
+		if strings.HasPrefix(trimmed, "/jfs") {
+			dst = normalizeDestURIEmbedded(destination, spec.FUSEMount, opts.PreserveStructure)
+		} else {
+			dst = normalizeAnyURI(destination, "", opts.PreserveStructure)
+		}
 	}
 
 	threads := opts.Threads
@@ -526,12 +589,146 @@ var junkPatterns = []string{
 // normalizeSourceURI converts a user-provided source string into the
 // form juicefs sync expects. Routes through matchSlash so src and dst
 // agree on the rsync trailing-slash convention.
+//
+// NOTE: this helper only knows the In-direction shape (any absolute
+// path → file://). SLICE 1 adds normalizeAnyURI as the higher-level
+// dispatcher that picks the right helper based on the path's scheme
+// or prefix; normalizeSourceURI is kept as the In-direction back-end
+// (and the SLICE-0 callers that didn't yet need direction awareness).
 func normalizeSourceURI(s string, preserveStructure bool) string {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "/") {
 		s = "file://" + s
 	}
 	return matchSlash(s, preserveStructure)
+}
+
+// normalizeAnyURI dispatches a user-supplied URI to the correct
+// scheme-specific helper. SLICE 1 needs this because the migration
+// source can now be:
+//
+//   - a host path under /sources/... (In or Between's host-stub side)
+//     → file:///sources/...
+//   - a path under /jfs/... (Out / Between)
+//     → file:///<FUSEMount>/... when running in embedded mode
+//   - a raw URL with a scheme (file://, s3://, jfs://, ...)
+//     → passed through verbatim, only trailing-slash adjusted
+//
+// The /jfs branch is intentionally rewritten to file:///<FUSEMount>/...
+// rather than jfs://<vol>/... so juicefs sync sees the in-process FUSE
+// mount the manager already has open. This matches what
+// normalizeDestURIEmbedded does on the destination side — both ends
+// of a same-volume sync therefore go through the same kernel mount,
+// which is the cheapest path (no Redis round-trip per file lookup).
+//
+// fuseMount is the in-process FUSE mount path; pass "" if the manager
+// is running in standalone mode (in which case /jfs/... is treated as
+// an unrecognized path and falls back to the file:// helper). Callers
+// in embedded mode should always pass cfg.FUSEMount.
+//
+// preserveStructure controls trailing slash, same semantics as
+// normalizeSourceURI and the destination helpers.
+func normalizeAnyURI(s string, fuseMount string, preserveStructure bool) string {
+	s = strings.TrimSpace(s)
+	// Scheme passthrough — any "<word>://..." string is treated as an
+	// already-formed URL. matchSlash still applies so src/dst agree.
+	if i := strings.Index(s, "://"); i > 0 && i < 10 {
+		return matchSlash(s, preserveStructure)
+	}
+	// /jfs/... is the user-facing prefix for the JuiceFS volume tree.
+	// Rewrite to file:///<FUSEMount>/... so the existing embedded-mode
+	// machinery (no Redis round-trip) handles the read. Falls back to
+	// the file:// helper if fuseMount is empty (standalone mode) — in
+	// which case the caller likely shouldn't be giving us a /jfs path
+	// in the first place; the destination helpers already document
+	// this asymmetry.
+	if fuseMount != "" {
+		fuse := strings.TrimSuffix(fuseMount, "/")
+		if strings.HasPrefix(s, "/jfs/") {
+			rel := s[len("/jfs"):]
+			return matchSlash("file://"+fuse+rel, preserveStructure)
+		}
+		if s == "/jfs" {
+			return matchSlash("file://"+fuse, preserveStructure)
+		}
+	}
+	// Everything else with a leading slash → file:// host path.
+	if strings.HasPrefix(s, "/") {
+		return matchSlash("file://"+s, preserveStructure)
+	}
+	// Bare relative paths get passed through; juicefs sync will reject
+	// them with a clear error. Defensive — handleMigrate already
+	// requires absolute paths so this branch is unreachable in normal
+	// flow.
+	return matchSlash(s, preserveStructure)
+}
+
+// validateDirectionPair enforces the source/destination shape rules
+// for each Direction. Called by handleMigrate before submission so
+// the user gets a clear 4xx rather than discovering the bad combo
+// when juicefs sync FATALs.
+//
+// Rules:
+//
+//   - DirectionIn: source is a host path (already validated by
+//     pathAllowed against sourceRoots), destination MUST be inside
+//     the JuiceFS volume (/jfs/...). Rejecting external destinations
+//     keeps the In semantics ("import" — data lands in JuiceFS).
+//
+//   - DirectionOut: source is /jfs/..., destination MUST NOT be
+//     inside /jfs. A dest under /jfs would actually be a same-volume
+//     copy (logically an In or Between, depending on second-volume
+//     setup) and is rejected with a clear message rather than
+//     silently doing the wrong thing.
+//
+//   - DirectionBetween: both sides must be /jfs/... paths. SLICE 1
+//     surfaces a stub error pointing the user at the Destinations
+//     tab; SLICE 4 wires this through to a named second-volume
+//     profile.
+//
+// Path-traversal guards (filepath.Clean check against `..` segments)
+// are applied by the caller via the same logic that already protects
+// /api/migrate's destination — that's not in scope for this helper,
+// which only enforces *direction* shape.
+func validateDirectionPair(dir Direction, src, dst string) error {
+	src = strings.TrimSpace(src)
+	dst = strings.TrimSpace(dst)
+	// pathUnderJFS returns true if p starts with /jfs (treating "/jfs"
+	// alone and "/jfs/..." as both "inside the volume").
+	pathUnderJFS := func(p string) bool {
+		return p == "/jfs" || strings.HasPrefix(p, "/jfs/")
+	}
+	switch dir {
+	case DirectionIn, "":
+		// Empty Direction defaults to In for backwards compat with
+		// pre-SLICE-1 clients (the JS field is new).
+		if !pathUnderJFS(dst) {
+			return fmt.Errorf("direction=in requires destination under /jfs (got %q)", dst)
+		}
+		if pathUnderJFS(src) {
+			return fmt.Errorf("direction=in source must be a host path, not /jfs/... (got %q) — use direction=between for JuiceFS-to-JuiceFS", src)
+		}
+	case DirectionOut:
+		if !pathUnderJFS(src) {
+			return fmt.Errorf("direction=out requires source under /jfs (got %q)", src)
+		}
+		if pathUnderJFS(dst) {
+			return fmt.Errorf("direction=out destination cannot be under /jfs (got %q) — that's an Into-JuiceFS copy, switch to direction=in", dst)
+		}
+	case DirectionBetween:
+		if !pathUnderJFS(src) || !pathUnderJFS(dst) {
+			return fmt.Errorf("direction=between requires both source and destination under /jfs (got src=%q dst=%q)", src, dst)
+		}
+		// SLICE-1 stub: a single-volume JuiceFS install can't
+		// distinguish two distinct /jfs roots. This message lights
+		// the user at the right path forward — SLICE 4 turns the
+		// Destinations tab into the place to register the second
+		// volume by name.
+		return fmt.Errorf("Configure a second JuiceFS destination first (Destinations tab)")
+	default:
+		return fmt.Errorf("unknown direction %q (expected in|out|between)", dir)
+	}
+	return nil
 }
 
 // normalizeDestURIJFS translates a UI-supplied destination into a
