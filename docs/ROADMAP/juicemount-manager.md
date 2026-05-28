@@ -275,7 +275,7 @@ tab still working end-to-end. Zero feature change.
 ### SLICE 1 — Bidirectional migrations
 
 **ID:** `slice-1-bidirectional`
-**Status:** NOT STARTED
+**Status:** CODE COMPLETE (deploy + live validation deferred while user is mid-copy on production TrueNAS; commit d84e495, image published, awaiting redeploy authorization)
 **Depends on:** slice-0
 **Blocks:** slice-4 (destinations layout reuses Direction picker)
 
