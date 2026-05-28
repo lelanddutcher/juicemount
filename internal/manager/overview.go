@@ -2,6 +2,7 @@ package manager
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -252,11 +253,12 @@ func (s *overviewSource) realProbeVolume(ctx context.Context) VolumeStatusSectio
 	if bin == "" {
 		bin = "juicefs"
 	}
-	// `juicefs status` prints a human-readable banner on stderr and
-	// the JSON document on stdout. We attach --json explicitly; older
-	// 1.0-line versions printed JSON by default but never harmed the
-	// flag, and the current 1.3.x line requires the flag.
-	cmd := exec.CommandContext(ctx, bin, "status", "--json", s.metaURL)
+	// `juicefs status` emits JSON on stdout by default in 1.3.x — it
+	// does NOT accept --json (verified against ce-v1.3.1: FATAL
+	// "unknown option: --json"). The INFO banner lines go to stderr;
+	// we only consume stdout. parseJuicefsStatusJSON tolerantly finds
+	// the first `{` in case a future version prepends anything.
+	cmd := exec.CommandContext(ctx, bin, "status", s.metaURL)
 	out, err := cmd.Output()
 	if err != nil {
 		// Surface a short, operator-friendly message — the full stderr
@@ -276,6 +278,13 @@ func parseJuicefsStatusJSON(raw []byte) VolumeStatusSection {
 	// sub-object (volume metadata) and "Sessions" list. The fields
 	// we surface live on the root: UsedSpace, AvailableSpace, FilesCount
 	// in 1.3.x; some 1.2.x builds named them used_space etc.
+	//
+	// Tolerantly skip any leading non-JSON output (some juicefs
+	// versions interleave warnings on stdout despite the INFO banner
+	// being on stderr). Find the first `{` and parse from there.
+	if idx := bytes.IndexByte(raw, '{'); idx > 0 {
+		raw = raw[idx:]
+	}
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return VolumeStatusSection{Error: "parse juicefs status JSON: " + err.Error()}
