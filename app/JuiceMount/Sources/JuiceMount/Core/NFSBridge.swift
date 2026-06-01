@@ -32,6 +32,8 @@ public enum NFSBridge {
         public var logFile: String
         public var logLevel: String
         public var bucketOverride: String
+        public var spoolEnable: Bool
+        public var spoolSizeGB: Int
 
         enum CodingKeys: String, CodingKey {
             case redisURL = "redis_url"
@@ -44,6 +46,8 @@ public enum NFSBridge {
             case logFile = "log_file"
             case logLevel = "log_level"
             case bucketOverride = "bucket_override"
+            case spoolEnable = "spool_enable"
+            case spoolSizeGB = "spool_size_gb"
         }
 
         public init(
@@ -56,7 +60,9 @@ public enum NFSBridge {
             metricsAddr: String = "127.0.0.1:11050",
             logFile: String = "",
             logLevel: String = "info",
-            bucketOverride: String = ""
+            bucketOverride: String = "",
+            spoolEnable: Bool = false,
+            spoolSizeGB: Int = 50
         ) {
             self.redisURL = redisURL
             self.fusePath = fusePath
@@ -68,6 +74,8 @@ public enum NFSBridge {
             self.logFile = logFile
             self.logLevel = logLevel
             self.bucketOverride = bucketOverride
+            self.spoolEnable = spoolEnable
+            self.spoolSizeGB = spoolSizeGB
         }
     }
 
@@ -252,6 +260,86 @@ public enum NFSBridge {
             defer { sem.signal() }
             guard let data else { return }
             result = try? JSONDecoder().decode(OfflineState.self, from: data)
+        }.resume()
+        sem.wait()
+        session.finishTasksAndInvalidate()
+        return result
+    }
+
+    // MARK: - Write spool (Option 2)
+    //
+    // Mirrors `nfs.SpoolStatusResponse` on the Go side, served at `/spool`
+    // on the metrics port. The endpoint returns 503 with `enabled:false`
+    // when the spool is off (JM_SPOOL_ENABLE != 1) — the body still decodes,
+    // so a non-nil `SpoolStatus{enabled:false}` means "reachable but off",
+    // whereas nil means the metrics server itself was unreachable.
+
+    public struct SpoolEntryView: Codable, Equatable, Identifiable {
+        public var path: String = ""
+        public var size: Int64 = 0
+        public var drainState: String = ""
+        public var drainAttempts: Int = 0
+        public var lastError: String?
+        public var updatedAtUnix: Int64 = 0
+
+        // Identity for ForEach: path + last-update so a re-queued path
+        // (same name, new generation) gets a fresh row rather than animating
+        // a stale one.
+        public var id: String { "\(path)|\(updatedAtUnix)" }
+
+        enum CodingKeys: String, CodingKey {
+            case path, size
+            case drainState = "drain_state"
+            case drainAttempts = "drain_attempts"
+            case lastError = "last_error"
+            case updatedAtUnix = "updated_at_unix"
+        }
+    }
+
+    public struct SpoolStatus: Codable, Equatable {
+        public var enabled: Bool = false
+        public var error: String?
+        public var pendingFiles: Int = 0
+        public var pendingBytes: Int64 = 0
+        public var inProgress: Int64 = 0
+        public var succeeded: Int64 = 0
+        public var failed: Int64 = 0
+        public var quarantined: Int64 = 0
+        public var capacityUsed: Int64 = 0
+        public var capacityTotal: Int64 = 0
+        public var entries: [SpoolEntryView] = []
+
+        /// True when there is active or queued upload work to surface.
+        public var hasActivity: Bool { pendingFiles > 0 || inProgress > 0 }
+
+        enum CodingKeys: String, CodingKey {
+            case enabled, error
+            case pendingFiles = "pending_files"
+            case pendingBytes = "pending_bytes"
+            case inProgress = "in_progress"
+            case succeeded, failed, quarantined
+            case capacityUsed = "capacity_used"
+            case capacityTotal = "capacity_total"
+            case entries
+        }
+    }
+
+    /// Fetch the write-spool status from the local metrics server. Blocking
+    /// — call from a background queue. Endpoint: `/spool` (GET). Returns nil
+    /// only when the metrics server is unreachable; an enabled:false body
+    /// (HTTP 503) still decodes to a non-nil value.
+    public static func spoolStatus(metricsAddr: String = "127.0.0.1:11050") -> SpoolStatus? {
+        guard let url = URL(string: "http://\(metricsAddr)/spool") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 2
+        let sem = DispatchSemaphore(value: 0)
+        var result: SpoolStatus?
+        let session = loopbackSession()
+        session.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            result = try? JSONDecoder().decode(SpoolStatus.self, from: data)
         }.resume()
         sem.wait()
         session.finishTasksAndInvalidate()

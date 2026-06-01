@@ -66,6 +66,20 @@ public final class Preferences {
         didSet { save() }
     }
 
+    /// Enable the write spool (Option 2): writes land on local SSD and ack
+    /// immediately, then drain into JuiceFS in the background — making large
+    /// copies feel local even over a slow WAN. Sets the `JM_SPOOL_ENABLE`
+    /// env var that the Go core reads at server start, so it takes effect on
+    /// the next (re)start. Off by default during rollout.
+    public var spoolEnabled: Bool {
+        didSet { save() }
+    }
+    /// Local-SSD spool capacity in GB (`JM_SPOOL_SIZE_GB`). Writes are
+    /// refused with a clean ENOSPC once the spool fills; default 50.
+    public var spoolCapacityGB: Int {
+        didSet { save() }
+    }
+
     public init(
         volumeName: String = "zpool",
         mountPoint: String = "/Volumes/zpool",
@@ -80,7 +94,9 @@ public final class Preferences {
         startAtLogin: Bool = false,
         showSearchHotkey: Bool = true,
         offlineNotificationsEnabled: Bool = false,
-        s3EndpointOverride: String = ""
+        s3EndpointOverride: String = "",
+        spoolEnabled: Bool = false,
+        spoolCapacityGB: Int = 50
     ) {
         self.volumeName = volumeName
         self.mountPoint = mountPoint
@@ -96,6 +112,8 @@ public final class Preferences {
         self.showSearchHotkey = showSearchHotkey
         self.offlineNotificationsEnabled = offlineNotificationsEnabled
         self.s3EndpointOverride = s3EndpointOverride
+        self.spoolEnabled = spoolEnabled
+        self.spoolCapacityGB = spoolCapacityGB
     }
 
     public static func defaultDBPath() -> String {
@@ -138,7 +156,9 @@ public final class Preferences {
             metricsAddr: metricsAddr,
             logFile: Self.defaultLogPath(),
             logLevel: "info",
-            bucketOverride: s3EndpointOverride
+            bucketOverride: s3EndpointOverride,
+            spoolEnable: spoolEnabled,
+            spoolSizeGB: spoolCapacityGB
         )
     }
 
@@ -153,6 +173,7 @@ public final class Preferences {
         case startAtLogin, showSearchHotkey
         case offlineNotificationsEnabled
         case s3EndpointOverride
+        case spoolEnabled, spoolCapacityGB
     }
 
     public static func load() -> Preferences {
@@ -171,7 +192,9 @@ public final class Preferences {
             startAtLogin:      d.bool(forKey: Key.startAtLogin.rawValue),
             showSearchHotkey:  d.object(forKey: Key.showSearchHotkey.rawValue) as? Bool ?? true,
             offlineNotificationsEnabled: d.bool(forKey: Key.offlineNotificationsEnabled.rawValue),
-            s3EndpointOverride: d.string(forKey: Key.s3EndpointOverride.rawValue) ?? ""
+            s3EndpointOverride: d.string(forKey: Key.s3EndpointOverride.rawValue) ?? "",
+            spoolEnabled:       d.bool(forKey: Key.spoolEnabled.rawValue),
+            spoolCapacityGB:    d.object(forKey: Key.spoolCapacityGB.rawValue) as? Int ?? 50
         )
     }
 
@@ -191,5 +214,7 @@ public final class Preferences {
         d.set(showSearchHotkey, forKey: Key.showSearchHotkey.rawValue)
         d.set(offlineNotificationsEnabled, forKey: Key.offlineNotificationsEnabled.rawValue)
         d.set(s3EndpointOverride, forKey: Key.s3EndpointOverride.rawValue)
+        d.set(spoolEnabled, forKey: Key.spoolEnabled.rawValue)
+        d.set(spoolCapacityGB, forKey: Key.spoolCapacityGB.rawValue)
     }
 }

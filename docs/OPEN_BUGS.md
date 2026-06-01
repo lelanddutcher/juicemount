@@ -32,6 +32,18 @@ Plus earlier sub-fix: Lua SCAN MATCH tightened from `d*` to `d[0-9]*` to exclude
 
 ## P1 — known bug under specific workload
 
+### QA-37 — Delete during spool drain resurrects the file (writes feel local, deletes don't stick)
+
+**Status:** OPEN, found + reproduced 2026-06-01 (this Mac, 10GbE LAN, build with write-spool enabled).
+
+**Symptom:** Deleting a file while its spooled copy is still draining to JuiceFS/MinIO returns success, but the drainer then writes the file back — it reappears. Reproduced deterministically: write 20×256 KB files, immediately delete all 20 (NFS REMOVE returns 0 errors); as the spool drains `pending → 0`, all 20 files reappear. **Control:** deleting the same files *after* the drain settles holds correctly (0 reappear) — so it is specifically a delete↔drain race, not a delete bug. Also observed incidentally: an `os.rmdir` "succeeded" yet the directory + files were back moments later.
+
+**Why it matters:** A real editing workflow — copy a folder then remove some files, or write-then-delete render temp files — can leave "deleted" data on the vault, and storage isn't reclaimed. Silent: the client believes the delete succeeded. This is a direct gap in the Option-2 write-spool coordination.
+
+**Root cause (likely):** the NFS REMOVE path (`nfs/handler.go`) deletes the JuiceFS/metadata entry but does not cancel/remove the pending spool entry, so `nfs/drainer.go` later drains the spooled copy back into JuiceFS, re-materializing the file (and its parent dir).
+
+**Smallest viable next step:** on delete, look up and remove/tombstone any active or pending spool entry for that path, and have the drainer re-check existence (or honor a tombstone) before writing. Add a regression test using the repro above (write → immediate delete → assert absent after drain settles).
+
 ### ~~QA-32 follow-up — 1,577 STALE events during pin-coverage-verify~~
 **Status:** ✓ CLOSED 2026-05-25 by commit 6fa28cf. Re-ran the workload post-QA-32 (build 6fa28cf vs original 88ccee8): **0 STALE events (was 1577)**. The pin-guard added to the OpenFile phantom-purge path in QA-32 was the fix — that path was bypassing Layer C, allowing the cascade.
 
@@ -371,6 +383,104 @@ Everything else in tier 3 depends on durable job state.
 The QA-30 three-layer guard (Layer C pin guard, Layer A FUSE Lstat verify, Layer B recently-evicted shadow) treats a symptom: pin store and metadata store both hold truth about "what's cached" without a shared invariant. Every new bug class in this area (QA-32, QA-34, the pin-coverage-verify STALE storm) traces back to that asymmetry. Right long-term fix is one source of truth.
 
 **Trigger:** when adding a fourth layer to the guard would be required, that's the signal we've over-patched and need the redesign.
+
+---
+
+## Spool (Option 2) — wired live 2026-05-28; backend code review follow-ups
+
+A backend code review found the spool was **inert on the live write path**: the
+write branch was gated on `os.O_CREATE`, but NFS CREATE calls `fs.Create` and
+NFS WRITE calls `OpenFile(O_RDWR)` — neither sets `O_CREATE`, so with
+`JM_SPOOL_ENABLE=1` real Finder writes still bypassed the spool entirely
+(Finding 1). Fixed this cycle: `juiceFS.Create` routes new files to the spool;
+`juiceFS.OpenFile` routes WRITE RPCs to the spool for any path with an active
+entry; per-RPC `Close` no longer finalizes (NFS closes after every RPC) —
+finalize is driven by an idle sweeper, mirroring `FDPool.evictLoop`. Certified
+by `TestSpoolInterceptsNFSCreateWriteSequence` (drives the real CREATE+WRITE
+call shapes; red pre-fix, green post-fix). Also fixed in the same pass:
+reopen-of-finalized-entry write error (Finding 2, via OpenWrite block-wait) and
+`MarkDrainComplete` un-index-before-remove ordering (Finding 3).
+
+### P1 — Server-side ZFS volume growing ~1 TB/month with no activity
+**Symptom (user, 2026-05-28):** the TrueNAS box hosting JuiceMount's MinIO/JuiceFS
+backend grows up to ~1 TB/month even when idle — a "unique write-size problem."
+**Likely causes (cheapest first):** (1) JuiceFS slice/garbage accumulation —
+chunks not reclaimed after rewrites/deletes; (2) writeback rewriting whole
+chunks on small edits (write amplification); (3) ZFS snapshots retaining
+churned blocks; (4) orphaned `delSlices`/`delfiles` not GC'd (cf. QA-34's Lua
+key class). **Smallest viable next step (server-side):** compare `juicefs info`
+logical size vs MinIO bucket size vs `zfs list -o used,logicalused`; run
+`juicefs gc` (dry-run) and `zfs list -t snapshot`; correlate growth windows
+with write activity. Separate from the client-side spool fix — file under its
+own investigation.
+
+### P2 — Spool: post-crash-recovery can still dup-drain to one dest (Finding 4 residual)
+`RecoverOnBoot` re-accounts `ready`/`draining` rows but does NOT repopulate the
+in-memory index. So a same-path rewrite AFTER a crash (before the recovered
+entry drains) misses `LookupActive`, creates a second spool entry, and both
+drain to the same FUSE dest. The normal (non-recovery) path is safe — OpenWrite
+block-waits on a still-draining entry. **Next step:** repopulate the index for
+`ready`/`draining` rows in `RecoverOnBoot` so OpenWrite's block-wait sees them,
+or serialize drains per `nfs_path` in the drainer. Rare (needs crash + immediate
+same-path rewrite).
+
+### P2 — Spool: in-flight truncate hits narrow `spoolWriteFile.Truncate` (Finding 6-adjacent)
+Now that the spool is live, a SETATTR size-change (truncate) on a file still in
+the spool routes to `spoolWriteFile.Truncate`, which only supports
+truncate-to-0-on-fresh. Arbitrary truncate of an in-flight spooled file errors.
+Common Finder copy flow is unaffected (no mid-write truncate). **Next step:**
+support `ftruncate` on the on-disk spool file (adjust `writtenEnd` +
+invalidate the streaming hash), or finalize-and-fall-back.
+
+### P2 — Spool: error→NFS-status mapping + atomic-save (temp+rename)
+`ErrSpoolFull`/`ErrSpoolBusy` currently surface as generic `OpenFile` errors
+(onWrite maps them to NFS3ERR_ACCESS) rather than NOSPC / JUKEBOX(DELAY).
+Separately, an atomic-save app that writes a temp file then `rename()`s it will
+hit `juiceFS.Rename`, which `os.Rename`s on FUSE — but an undrained spool temp
+isn't in FUSE yet, so the rename fails. **Next step:** map the spool errors to
+proper NFS statuses; make `juiceFS.Rename` finalize+drain (or wait for) a
+spool entry on the old path before renaming.
+
+### P3 — Spool: `writeSizes` map grows unbounded (Finding 5, pre-existing)
+`handler.writeSizes` is written per WRITE and never pruned (sticky by QA-16
+design). A long-uptime, heavy-write session leaks one entry per distinct path
+ever written. Not spool-specific but worsened by spool workloads. **Next step:**
+lazily prune a path's entry once its size is confirmed in SQLite and no active
+writer holds it (bounded sweep).
+
+### ✓ FIXED 2026-05-29 — `busy_timeout` not applied to all pooled connections
+Surfaced by the spool concurrent-drain integration test. `metadata.Open` set
+`PRAGMA busy_timeout=30000` via `db.Exec`, which configures only ONE of the 8
+pooled connections. The entries store hid this via its single `writeMu`; the
+spool store's independent `writeMu` did not, so a spool write + an entries
+write on two different pooled connections → `SQLITE_BUSY` immediately (no
+wait) under the drainer's 4 concurrent workers. Fix: `busy_timeout` moved to
+the DSN (`?_pragma=busy_timeout(30000)`), which modernc applies to EVERY
+connection. App-wide improvement; metadata + spool tests green under `-race`.
+
+### P3 — `metadata.Store.UpdateSize` mutates the cached `*Entry` in place (data race)
+`-race` caught it via the spool test: `UpdateSize` writes `e.Size`/`e.Mtime`
+under `s.mu` (store.go:731), but `juiceFS.Stat` reads `e.Size` and does
+`clone := *e` WITHOUT `s.mu` (handler.go:976). Write-under-lock + read-without-
+lock is a race. **Pre-existing** — the legacy `writeFile.Close` → `UpdateSize`
+path hits it too; my `onSpoolDrained` calling `UpdateSize` from the drainer's
+worker pool (concurrent with NFS Stats) just makes it reliably reachable.
+**Effectively benign in production** (aligned int64 reads are atomic on
+arm64/amd64, so no torn value — worst case a momentarily-inconsistent FileInfo
+that self-corrects), but it's real and `-race`-flagged. **Fix options:** (a)
+copy-on-write in `UpdateSize` — build a new `*Entry`, mutate the copy, swap it
+into pathCache/inodeCache/childrenIdx under `s.mu` so lock-free readers holding
+the old pointer never observe a mutation; or (b) a `LookupByPathSnapshot` that
+returns a value copy under `s.mu.RLock`, used by `Stat`. The integration test
+serializes around it (reads only when the drainer is idle) so it stays green;
+this entry tracks the proper fix.
+
+### Validation owed — enable `JM_SPOOL_ENABLE=1` end-to-end
+The fix is unit-certified at the handler↔spool seam. Still owed: the deferred
+live soak — real NFS mount + FUSE + MinIO over Tailscale/LAN, confirming the
+2 GB Finder copy acks fast, the menu-bar/Manager surfaces pending count, and
+the drainer empties at MinIO pace. This is the original Slice acceptance test
+(`scripts/qa-suite/30-spool-soak.sh`).
 
 ---
 

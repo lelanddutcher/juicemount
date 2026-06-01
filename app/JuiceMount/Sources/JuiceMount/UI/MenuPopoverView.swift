@@ -56,6 +56,10 @@ struct MenuPopoverView: View {
             healthSection
             Divider()
             cacheSection
+            if let sp = server.spoolStatus, sp.enabled {
+                Divider()
+                pendingUploadsSection
+            }
             Divider()
             actionsSection
         }
@@ -608,6 +612,121 @@ struct MenuPopoverView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+
+    /// "Pending uploads" surface for the write spool (Option 2). The body
+    /// gates this on `server.spoolStatus?.enabled`, so it only appears when
+    /// the spool is on. Shows queue depth + bytes, in-flight count, the first
+    /// few in-flight files, spool disk fill, and cumulative drained / failed /
+    /// quarantined counters. Reads `server.spoolStatus`, refreshed on the same
+    /// cadence as cache status by `ServerController.refreshCacheStatus()`.
+    @ViewBuilder
+    private var pendingUploadsSection: some View {
+        if let s = server.spoolStatus, s.enabled {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Image(systemName: "arrow.up.circle")
+                        .foregroundStyle(.secondary)
+                    Text("Pending Uploads")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if !s.hasActivity {
+                        Text("idle")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                if s.hasActivity {
+                    HStack {
+                        Text("\(s.pendingFiles) waiting · \(formatBytes(s.pendingBytes))")
+                            .font(.caption)
+                        Spacer()
+                        if s.inProgress > 0 {
+                            HStack(spacing: 3) {
+                                Image(systemName: "arrow.up.circle.fill")
+                                Text("\(s.inProgress) uploading")
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
+                        }
+                    }
+
+                    // First few in-flight files (server returns newest-first).
+                    ForEach(s.entries.prefix(4)) { e in
+                        HStack(spacing: 6) {
+                            Image(systemName: drainStateIcon(e.drainState))
+                                .foregroundStyle(drainStateColor(e.drainState))
+                                .font(.caption2)
+                            Text(URL(fileURLWithPath: e.path).lastPathComponent)
+                                .font(.caption2)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Text(formatBytes(e.size))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if s.entries.count > 4 {
+                        Text("+ \(s.entries.count - 4) more")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                } else {
+                    Text("All uploads drained — writes are caught up with your storage.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+
+                // Spool disk fill.
+                if s.capacityTotal > 0 {
+                    ProgressView(value: Double(min(s.capacityUsed, s.capacityTotal)),
+                                 total: Double(s.capacityTotal))
+                        .progressViewStyle(.linear)
+                    Text("Spool \(formatBytes(s.capacityUsed)) / \(formatBytes(s.capacityTotal))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                // Cumulative counters (only the non-zero ones).
+                if s.succeeded > 0 || s.failed > 0 || s.quarantined > 0 {
+                    HStack(spacing: 10) {
+                        if s.succeeded > 0 {
+                            Text("✓ \(s.succeeded) uploaded").foregroundStyle(.green)
+                        }
+                        if s.failed > 0 {
+                            Text("✗ \(s.failed) failed").foregroundStyle(.red)
+                        }
+                        if s.quarantined > 0 {
+                            Text("⚠ \(s.quarantined) quarantined").foregroundStyle(.orange)
+                        }
+                    }
+                    .font(.caption2)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+    }
+
+    private func drainStateIcon(_ state: String) -> String {
+        switch state {
+        case "writing":  return "pencil.circle"
+        case "ready":    return "clock"
+        case "draining": return "arrow.up.circle.fill"
+        case "failed":   return "exclamationmark.triangle.fill"
+        default:         return "circle"
+        }
+    }
+
+    private func drainStateColor(_ state: String) -> Color {
+        switch state {
+        case "draining": return .blue
+        case "failed":   return .red
+        default:         return .gray
+        }
     }
 
     /// Single-line self-test indicator (Phase A2). Shows e.g.

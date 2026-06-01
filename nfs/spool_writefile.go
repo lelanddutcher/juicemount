@@ -149,22 +149,22 @@ func (f *spoolWriteFile) Truncate(size int64) error {
 	return fmt.Errorf("spoolWriteFile.Truncate: arbitrary truncation (size=%d) not supported in slice C", size)
 }
 
-// Close finalizes the spool entry, then releases the active-writer
-// refcount.
+// Close ends this per-RPC write handle. It releases the spool entry's
+// handle refcount WITHOUT finalizing, then drops the active-writer count.
 //
-// Reviewer fix (slice C HIGH-1): decActiveWriter is deferred, NOT
-// called inline before entry.Close. This achieves both correctness
-// goals at once:
-//   - The phantom-purge gate stays UP throughout entry.Close (fsync +
-//     SQL MarkReady). A concurrent Stat that fires during the close
-//     window sees an active writer and skips phantom-purge — no
-//     transient ENOENT during Finder save/close.
-//   - A panic anywhere inside entry.Close still triggers the deferred
-//     dec, so the refcount is leak-free even under abnormal exit.
+// Why not finalize here: NFS issues OpenFile→WriteAt→Close on EVERY WRITE
+// RPC (internal/nfs/nfs_onwrite.go), so finalizing on close would end the
+// file after the first 1 MB chunk. Instead the spool's idle sweeper
+// (SpoolStore.StartSweeper → finalizeIfIdle) finalizes the entry once the
+// writer has gone quiescent — fsync, finalize the streaming SHA, mark the
+// SQL row `ready`, and signal the drainer. This is the same idle-eviction
+// model FDPool uses for the legacy write path's pooled fds.
 //
-// entry.Close itself: fsyncs the spool file, finalizes the streaming
-// SHA, marks the SQL row `ready`, and signals the drainer.
+// decActiveWriter is deferred (slice C HIGH-1): the QA-19 phantom-purge gate
+// stays up through ReleaseHandle, and a panic still drops the active-writer
+// count, so it's leak-free under abnormal exit.
 func (f *spoolWriteFile) Close() error {
 	defer f.handler.decActiveWriter(f.name)
-	return f.entry.Close()
+	f.entry.ReleaseHandle()
+	return nil
 }

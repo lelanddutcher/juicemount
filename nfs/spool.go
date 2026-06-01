@@ -27,6 +27,12 @@ const SpoolFilesSubdir = "files"
 // the RPC boundary so the client sees a clean ENOSPC.
 var ErrSpoolFull = errors.New("spool: capacity full")
 
+// ErrSpoolBusy is returned by OpenWrite when a previous entry for the same
+// path was finalized but is still draining and did not clear within the
+// bounded wait. The handler maps this to a retryable NFS status so the
+// client retries (by which point the drain has almost always completed).
+var ErrSpoolBusy = errors.New("spool: path busy (prior entry still draining)")
+
 // SpoolStore is the high-level write-spool API.
 //
 // Owns:
@@ -123,58 +129,141 @@ func (s *SpoolStore) Index() *SpoolIndex { return s.index }
 // semantics so a single Finder copy's multi-RPC write lifecycle reuses
 // one spool file.
 func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
-	if s.closed.Load() {
-		return nil, fmt.Errorf("spool: store is closed")
-	}
-	s.openMu.Lock()
-	defer s.openMu.Unlock()
+	// reopenPoll/reopenMaxWait bound the rare wait for the case where a
+	// PREVIOUS entry for this exact path was finalized but the drainer
+	// hasn't evicted it yet. Reusing a finalized entry would error
+	// (write-to-closed); creating a SECOND live entry would race two drains
+	// to the same FUSE dest (Finding 4). So we wait for the drain to evict
+	// it, then create fresh. The common path — no entry, or an active
+	// `writing` entry to reuse — never waits.
+	const reopenPoll = 10 * time.Millisecond
+	const reopenMaxWait = 30 * time.Second
+	var waited time.Duration
 
-	if existing, ok := s.index.Lookup(nfsPath); ok {
-		existing.refcount.Add(1)
-		return existing, nil
-	}
+	for {
+		if s.closed.Load() {
+			return nil, fmt.Errorf("spool: store is closed")
+		}
+		s.openMu.Lock()
 
-	if s.capacity > 0 && s.used.Load() >= s.capacity {
-		return nil, ErrSpoolFull
-	}
+		if existing, ok := s.index.Lookup(nfsPath); ok {
+			existing.mu.Lock()
+			if !existing.closed {
+				// Active writing entry: a per-RPC reopen during the same
+				// write session, or the create→first-write transition.
+				// Reuse it; bump the handle count and touch lastWrite so
+				// the sweeper won't finalize it out from under this open.
+				existing.refcount++
+				existing.lastWrite.Store(time.Now().UnixNano())
+				existing.mu.Unlock()
+				s.openMu.Unlock()
+				return existing, nil
+			}
+			// Finalized-but-not-yet-drained entry holds this path. Don't
+			// reuse (writes would fail) and don't create a competing entry
+			// (dup drain). Wait for the drainer to evict it.
+			existing.mu.Unlock()
+			s.openMu.Unlock()
+			if waited >= reopenMaxWait {
+				return nil, ErrSpoolBusy
+			}
+			time.Sleep(reopenPoll)
+			waited += reopenPoll
+			continue
+		}
 
-	// Spool file basename: SHA-256(nfs_path) hex prefix + a microsecond
-	// timestamp. SHA prefix avoids filesystem-path-character issues
-	// (slashes, spaces, unicode). Timestamp suffix avoids collisions on
-	// rapid re-opens after a Delete.
-	h := sha256.Sum256([]byte(nfsPath))
-	basename := hex.EncodeToString(h[:8]) + fmt.Sprintf("-%d", time.Now().UnixMicro())
-	spoolFile := filepath.Join(s.root, SpoolFilesSubdir, basename)
+		// No entry for this path — create a fresh one under openMu.
+		if s.capacity > 0 && s.used.Load() >= s.capacity {
+			s.openMu.Unlock()
+			return nil, ErrSpoolFull
+		}
 
-	id, err := s.meta.Insert(nfsPath, spoolFile)
-	if err != nil {
-		return nil, err
-	}
+		// Spool file basename: SHA-256(nfs_path) hex prefix + a microsecond
+		// timestamp. SHA prefix avoids filesystem-path-character issues
+		// (slashes, spaces, unicode). Timestamp suffix avoids collisions on
+		// rapid re-opens after a Delete.
+		h := sha256.Sum256([]byte(nfsPath))
+		basename := hex.EncodeToString(h[:8]) + fmt.Sprintf("-%d", time.Now().UnixMicro())
+		spoolFile := filepath.Join(s.root, SpoolFilesSubdir, basename)
 
-	f, err := os.OpenFile(spoolFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		// Roll back the SQL insert. We DELETE rather than MarkFailed:
-		// nothing happened on disk to preserve, and leaving a `failed`
-		// row would let a persistent disk failure (full / permissions)
-		// grow spool_entries unboundedly because LookupByPath ignores
-		// failed rows and every retry would Insert a new one.
-		_ = s.meta.Delete(id)
-		return nil, fmt.Errorf("spool: open file: %w", err)
-	}
+		id, err := s.meta.Insert(nfsPath, spoolFile)
+		if err != nil {
+			s.openMu.Unlock()
+			return nil, err
+		}
 
-	entry := &SpoolEntry{
-		id:        id,
-		nfsPath:   nfsPath,
-		spoolFile: spoolFile,
-		file:      f,
-		hasher:    sha256.New(),
-		hashValid: true,
-		store:     s,
+		f, err := os.OpenFile(spoolFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			// Roll back the SQL insert. We DELETE rather than MarkFailed:
+			// nothing happened on disk to preserve, and leaving a `failed`
+			// row would let a persistent disk failure (full / permissions)
+			// grow spool_entries unboundedly because LookupByPath ignores
+			// failed rows and every retry would Insert a new one.
+			_ = s.meta.Delete(id)
+			s.openMu.Unlock()
+			return nil, fmt.Errorf("spool: open file: %w", err)
+		}
+
+		entry := &SpoolEntry{
+			id:        id,
+			nfsPath:   nfsPath,
+			spoolFile: spoolFile,
+			file:      f,
+			hasher:    sha256.New(),
+			hashValid: true,
+			store:     s,
+			refcount:  1,
+		}
+		entry.lastWrite.Store(time.Now().UnixNano())
+		s.index.Insert(nfsPath, entry)
+		s.openMu.Unlock()
+		return entry, nil
 	}
-	entry.lastWrite.Store(time.Now().UnixNano())
-	entry.refcount.Store(1)
-	s.index.Insert(nfsPath, entry)
-	return entry, nil
+}
+
+// sweepOnce finalizes every active `writing` entry that has no open write
+// handles and has been quiescent for at least `idle`. Returns the number
+// finalized. This is the NFS-compatible replacement for "finalize on Close":
+// the per-RPC write path releases handles without finalizing, and this sweep
+// (run on a timer by StartSweeper, or directly in tests) ends the file once
+// the writer goes idle. Mirrors FDPool.evictLoop.
+func (s *SpoolStore) sweepOnce(idle time.Duration) int {
+	entries := s.index.Snapshot()
+	n := 0
+	for _, e := range entries {
+		if e.finalizeIfIdle(idle) {
+			n++
+		}
+	}
+	return n
+}
+
+// StartSweeper launches the background idle-finalize loop and returns a stop
+// function. idle is how long an entry must be quiescent (no open handles, no
+// writes) before it is finalized and handed to the drainer; tick is the scan
+// cadence. Defaults: idle=3s, tick=1s. Safe to call once.
+func (s *SpoolStore) StartSweeper(idle, tick time.Duration) (stop func()) {
+	if idle <= 0 {
+		idle = 3 * time.Second
+	}
+	if tick <= 0 {
+		tick = 1 * time.Second
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(tick)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				s.sweepOnce(idle)
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // LookupActive returns the in-memory index entry for nfsPath if one
@@ -409,12 +498,18 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 	if err := s.meta.MarkDone(id); err != nil {
 		return err
 	}
-	if rmErr := os.Remove(spoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
-		log.Printf("spool: drain complete %d: remove %s: %v", id, spoolFile, rmErr)
-	}
-	s.releaseCapacity(size)
+	// Finding 3 fix: evict the in-memory index entry BEFORE removing the
+	// spool file. New reads then miss the index and fall through to FUSE
+	// (where the drained bytes now live) instead of resolving to the spool
+	// and opening a file we're about to delete (ENOENT). Readers already
+	// holding an fd are unaffected by the unlink (open-then-unlink Unix
+	// semantics).
 	if e, ok := s.index.Lookup(nfsPath); ok && e.id == id {
 		s.index.DeleteIfMatches(nfsPath, e)
+	}
+	s.releaseCapacity(size)
+	if rmErr := os.Remove(spoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
+		log.Printf("spool: drain complete %d: remove %s: %v", id, spoolFile, rmErr)
 	}
 	if s.manifest != nil {
 		var (
@@ -617,7 +712,17 @@ type SpoolEntry struct {
 	hashValid bool
 	closed    bool
 
-	refcount atomic.Int32 // OpenWrite returns same entry for concurrent opens; closed when this hits 0
+	// refcount is the number of live write handles for this entry (one per
+	// in-flight spoolWriteFile). Guarded by mu. OpenWrite increments on
+	// create/reuse; ReleaseHandle and Close decrement.
+	//
+	// CRITICAL: finalize is NOT triggered by refcount hitting zero. NFS does
+	// OpenFile→WriteAt→Close on every WRITE RPC (internal/nfs/nfs_onwrite.go),
+	// so a finalize-on-refcount-zero would end the file after the first 1 MB
+	// chunk. Finalize is instead driven by the idle sweeper (finalizeIfIdle)
+	// once refcount==0 and the entry has been quiescent — mirroring how
+	// FDPool.evictLoop handles the same per-RPC open/close churn for fds.
+	refcount int
 	store    *SpoolStore
 }
 
@@ -761,18 +866,70 @@ func (e *SpoolEntry) OpenForRead() (*os.File, error) {
 	return f, nil
 }
 
-// Close flushes + fsyncs the spool file, finalizes the SHA-256, and
-// transitions the SQL row to ready. The drainer is signaled.
+// Close releases one write handle. If it was the last handle, the entry is
+// finalized immediately (fsync + SHA + mark-ready + signal drainer). This
+// preserves the direct-API semantics existing callers and tests rely on
+// (OpenWrite → WriteAt → Close finalizes).
 //
-// Refcount-aware: if other OpenWrite callers hold this entry, Close
-// decrements the refcount and returns immediately; the last caller does
-// the actual flush + mark-ready.
+// The NFS per-RPC write path does NOT use Close — it uses ReleaseHandle, so
+// per-RPC closes don't finalize, and the idle sweeper finalizes once the
+// writer is quiescent. See the refcount field doc for why.
 func (e *SpoolEntry) Close() error {
-	if n := e.refcount.Add(-1); n > 0 {
+	e.mu.Lock()
+	if e.refcount > 0 {
+		e.refcount--
+	}
+	if e.refcount > 0 {
+		e.mu.Unlock()
 		return nil
 	}
+	return e.finalizeLocked() // releases e.mu
+}
 
+// ReleaseHandle drops one write handle WITHOUT finalizing. Used by the NFS
+// per-RPC write path (spoolWriteFile.Close): NFS closes the file after every
+// WRITE RPC, so finalizing here would end the file after the first chunk.
+// The idle sweeper (finalizeIfIdle) finalizes once refcount==0 and quiescent.
+func (e *SpoolEntry) ReleaseHandle() {
 	e.mu.Lock()
+	if e.refcount > 0 {
+		e.refcount--
+	}
+	e.mu.Unlock()
+}
+
+// Finalize finalizes the entry unconditionally (if not already finalized).
+// Exposed for an explicit end-of-write trigger (e.g. a future NFS COMMIT
+// hook) and for tests. The sweeper uses finalizeIfIdle instead.
+func (e *SpoolEntry) Finalize() error {
+	e.mu.Lock()
+	return e.finalizeLocked() // releases e.mu
+}
+
+// finalizeIfIdle finalizes iff the entry has no open handles AND has been
+// quiescent for at least idle. Returns true if it finalized. This is the
+// sweeper's entry point. Taking e.mu around the refcount + closed check makes
+// it mutually exclusive with OpenWrite's reuse path (which also takes e.mu
+// before incrementing refcount), so the sweeper can never finalize an entry
+// a concurrent reopen is about to write to.
+func (e *SpoolEntry) finalizeIfIdle(idle time.Duration) bool {
+	e.mu.Lock()
+	if e.closed || e.refcount != 0 {
+		e.mu.Unlock()
+		return false
+	}
+	if time.Since(time.Unix(0, e.lastWrite.Load())) < idle {
+		e.mu.Unlock()
+		return false
+	}
+	_ = e.finalizeLocked() // releases e.mu
+	return true
+}
+
+// finalizeLocked performs the finalize. MUST be called with e.mu held; it
+// releases e.mu before the SQL MarkReady + drainer signal (so we never hold
+// the entry lock across SQL).
+func (e *SpoolEntry) finalizeLocked() error {
 	if e.closed {
 		e.mu.Unlock()
 		return nil

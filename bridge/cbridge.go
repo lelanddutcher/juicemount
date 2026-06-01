@@ -96,6 +96,14 @@ type ServerConfig struct {
 	LogFile        string `json:"log_file"`
 	LogLevel       string `json:"log_level"`
 	BucketOverride string `json:"bucket_override"`
+	// Spool (Option 2). Passed from the Swift app via this config JSON —
+	// the env var (JM_SPOOL_ENABLE) does NOT work for the embedded
+	// c-archive because Go snapshots os.Environ at runtime init, so a
+	// host-side setenv() after that is invisible to os.Getenv. The CLI
+	// (cmd/jm5) still uses the env var, set before the process starts so
+	// it's in the startup snapshot. SpoolSizeGB < 1 means "use default".
+	SpoolEnable bool `json:"spool_enable"`
+	SpoolSizeGB int  `json:"spool_size_gb"`
 }
 
 //export NFSServerStart
@@ -206,12 +214,22 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				FreeSpaceRatio: "0.01",
 				BucketOverride: cfg.BucketOverride,
 			})
-			if err := fm.Mount(); err != nil {
-				jmlog.Error("juicefs FUSE mount failed", "error", err.Error())
-				return C.CString(fmt.Sprintf("error: juicefs FUSE mount: %v", err))
-			}
+			// Start the watchdog and register globalFUSE UNCONDITIONALLY —
+			// even if the initial mount fails (a transient backend blip at
+			// launch). Pre-2026-05-29 this returned before StartMonitor() on
+			// failure, so a launch-time error — especially on a restart that
+			// had just Stopped the previous watchdog (see line ~208) — left the
+			// app with NO FUSE self-heal at all. The watchdog retries once the
+			// backend is reachable; registering globalFUSE keeps a later retry
+			// from leaking a second monitor goroutine.
+			mountErr := fm.Mount()
 			fm.StartMonitor()
 			globalFUSE = fm
+			if mountErr != nil {
+				jmlog.Error("juicefs FUSE mount failed at launch — watchdog will keep retrying once the backend is reachable",
+					"error", mountErr.Error())
+				return C.CString(fmt.Sprintf("error: juicefs FUSE mount: %v", mountErr))
+			}
 			// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
 			// the *effective* config from the mount, not the user input —
 			// otherwise the user reads "100 GiB" and is confused why the
@@ -390,7 +408,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// reads consult the spool index before metadata/FUSE (slice D);
 	// when disabled, the handler's spool field stays nil and the
 	// pre-spool writeFile / cachedFile paths run unchanged.
-	if os.Getenv("JM_SPOOL_ENABLE") == "1" {
+	if cfg.SpoolEnable || os.Getenv("JM_SPOOL_ENABLE") == "1" {
 		spoolDir := os.Getenv("JM_SPOOL_DIR")
 		if spoolDir == "" {
 			home, err := os.UserHomeDir()
@@ -412,7 +430,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// explicitly and keep the default so the user knows the env
 		// var was ignored.
 		spoolCapacity := int64(50) << 30
-		if s := os.Getenv("JM_SPOOL_SIZE_GB"); s != "" {
+		if cfg.SpoolSizeGB >= 1 {
+			spoolCapacity = int64(cfg.SpoolSizeGB) << 30
+		} else if s := os.Getenv("JM_SPOOL_SIZE_GB"); s != "" {
 			if v, err := strconv.ParseInt(s, 10, 64); err != nil || v < 1 {
 				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using 50 GiB default",
 					"raw", s)

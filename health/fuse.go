@@ -297,6 +297,7 @@ func (fm *FUSEManager) Mount() error {
 		}
 	}
 	log.Printf("[fuse] mounting JuiceFS: %s %s", fm.cfg.JuiceFSBin, strings.Join(logArgs, " "))
+	jmlog.Info("mounting juicefs", "bin", fm.cfg.JuiceFSBin, "args", strings.Join(logArgs, " "))
 
 	// `juicefs mount -d` daemonizes and returns quickly in the happy path,
 	// but can hang on certain backend failures (e.g. unreachable Redis
@@ -656,12 +657,22 @@ func (fm *FUSEManager) unmountLocked() {
 	pgrepCtx, pgrepCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	procs, _ := exec.CommandContext(pgrepCtx, "pgrep", "-f", "juicefs mount.*"+filepath.Base(fm.cfg.MountPoint)).Output()
 	pgrepCancel()
+	killed := 0
 	for _, line := range strings.Split(strings.TrimSpace(string(procs)), "\n") {
 		if line != "" {
 			killCtx, killCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			_ = exec.CommandContext(killCtx, "kill", "-9", line).Run()
 			killCancel()
+			killed++
 		}
+	}
+	if killed > 0 {
+		// Visibility into the one destructive action in this subsystem. This
+		// pattern also matches juicefs's own `-d` supervisor, so a kill here
+		// removes JuiceFS's self-heal too — only acceptable on an explicit
+		// remount/stop, never as a reaction to a transient stall.
+		jmlog.Warn("unmount: SIGKILL'd juicefs processes for mountpoint",
+			"count", killed, "mountpoint", fm.cfg.MountPoint)
 	}
 	time.Sleep(500 * time.Millisecond)
 
@@ -694,33 +705,40 @@ func (fm *FUSEManager) unmountLocked() {
 	}
 }
 
-// monitorLoop checks mount health periodically and remounts if needed.
+// monitorLoop checks mount health periodically and remounts ONLY when the
+// JuiceFS process tree is genuinely gone.
 //
-// QA-33 (2026-05-25): require multiple consecutive unhealthy checks
-// before remounting. A single 5-second stat timeout in checkFUSE looks
-// identical to "JuiceFS is dead" but is actually the common case during
-// sustained big-file writes — the FUSE-side flush can stall the stat
-// syscall for 10-30s while a 4-MiB chunk uploads to MinIO under wifi
-// pressure. The pre-QA-33 code killed-and-restarted juicefs on a single
-// stall, which (a) dropped 30+ seconds of writes during the restart
-// window, and (b) made the "Dropbox-style local-disk-speed write"
-// architecture impossible because every sustained write got murdered
-// mid-flight.
+// Design (2026-05-29 audit). There are two layers of self-heal and they
+// must not fight:
 //
-// Fast-path exception: if the juicefs PID is actually gone (process
-// died, was OOM-killed, segfaulted), remount immediately — that IS the
-// scenario the watchdog was originally for.
+//  1. JuiceFS's own `-d` supervisor: `juicefs mount -d` spawns a watchdog
+//     process that restarts the mount child if it crashes. This is the
+//     first and best line of recovery — it re-establishes the FUSE session
+//     cleanly and knows how to talk to the kernel.
+//  2. This loop: the app-side backstop for when JuiceFS's own supervisor has
+//     itself exhausted its retries and exited (the whole tree is dead).
+//
+// The pre-2026-05-29 code remounted after 3 consecutive unhealthy checks
+// EVEN WHILE juicefs was still alive. On a flapping backend link that was
+// catastrophic: it `kill -9`'d a live-but-slow daemon — and because the kill
+// pattern matches `juicefs mount.*<mountpoint>`, it ALSO killed JuiceFS's own
+// supervisor — then thrashed mount/unmount until macFUSE wedged with
+// "init: 19=operation not supported by device", a kernel state only a full
+// app restart clears. Observed live: juicefs SIGKILL'd mid-slow-PUT, never
+// recovered, mount dead with no log trace.
+//
+// New policy: while ANY juicefs process is alive, NEVER remount — report the
+// staleness and wait for juicefs's supervisor + backend recovery to clear it.
+// Only when the process tree is gone do we own recovery. All decisions log via
+// jmlog (the rotating juicemount.log), not log.Printf → the app's /dev/null
+// stdout — the old channel made this safety-critical loop invisible.
 func (fm *FUSEManager) monitorLoop() {
 	defer close(fm.done)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	// QA-33: 3 consecutive failures × 10s tick = 30s of sustained
-	// unhealthiness before remount. A slow flush completes well inside
-	// that window; a genuinely-dead daemon doesn't.
-	const remountAfterNFailures = 3
-
-	consecutiveFailures := 0
+	consecutiveFailures := 0  // ticks where the mount is stale AND juicefs is gone
+	staleWhileAliveTicks := 0 // ticks where the mount is stale but juicefs is alive
 	for {
 		select {
 		case <-fm.stopCh:
@@ -731,37 +749,58 @@ func (fm *FUSEManager) monitorLoop() {
 			fm.mu.Unlock()
 
 			if healthy {
-				if consecutiveFailures > 0 {
-					log.Printf("[fuse] mount recovered after %d failed checks", consecutiveFailures)
+				if consecutiveFailures > 0 || staleWhileAliveTicks > 0 {
+					jmlog.Info("fuse mount recovered",
+						"after_dead_remount_attempts", consecutiveFailures,
+						"stale_while_alive_ticks", staleWhileAliveTicks)
 					consecutiveFailures = 0
+					staleWhileAliveTicks = 0
 				}
 				continue
 			}
 
-			consecutiveFailures++
-
-			// Fast-path: if the daemon is genuinely gone (not just slow),
-			// don't wait for the threshold — remount immediately.
-			juicefsAlive := isJuiceFSProcessAlive()
-			if !juicefsAlive {
-				log.Printf("[fuse] juicefs process gone — remounting immediately (attempt %d)", consecutiveFailures)
-			} else if consecutiveFailures < remountAfterNFailures {
-				log.Printf("[fuse] mount unhealthy (check %d/%d); juicefs PID alive, deferring remount in case the daemon is just slow",
-					consecutiveFailures, remountAfterNFailures)
+			// The mount is unhealthy. Decide WHY before acting — killing a
+			// live-but-slow juicefs is what drove the macFUSE remount thrash.
+			if isJuiceFSProcessAlive() {
+				// juicefs (and its own supervisor) is alive — the mount is
+				// merely slow/stale, almost always a flapping backend link.
+				// Do NOT kill+remount: that destroys juicefs's own recovery
+				// and thrashes macFUSE. Report and wait.
+				staleWhileAliveTicks++
+				consecutiveFailures = 0
+				// Rate-limit: first stale tick, then ~once a minute.
+				if staleWhileAliveTicks == 1 || staleWhileAliveTicks%6 == 0 {
+					jmlog.Warn("fuse mount stale but juicefs alive — deferring to juicefs's own supervisor, not remounting",
+						"stale_ticks", staleWhileAliveTicks,
+						"hint", "transient backend/link stall; an app-side remount here would kill juicefs's supervisor and thrash macFUSE")
+				}
 				continue
-			} else {
-				log.Printf("[fuse] mount unhealthy for %d consecutive checks — remounting", consecutiveFailures)
 			}
 
+			// juicefs is genuinely GONE — its own supervisor exhausted its
+			// retries and exited. App-side recovery is now the only option.
+			staleWhileAliveTicks = 0
+			consecutiveFailures++
+			jmlog.Warn("juicefs process tree gone — app-side remount",
+				"attempt", consecutiveFailures)
+
 			if err := fm.Mount(); err != nil {
-				log.Printf("[fuse] remount failed: %v", err)
-				// Exponential backoff: after repeated failures, slow down
-				if consecutiveFailures > 3 {
+				jmlog.Error("fuse remount failed",
+					"attempt", consecutiveFailures, "error", err.Error())
+				// A persistent failure here is usually the macFUSE
+				// "operation not supported by device" kernel wedge, which
+				// only a full app restart clears — back off hard rather than
+				// thrash the kernel further.
+				if strings.Contains(err.Error(), "operation not supported") {
+					jmlog.Error("macFUSE refused the mount — kernel FUSE state is wedged; a full app restart is required to clear it",
+						"detail", "repeated mount/unmount churn exhausted macFUSE")
+				}
+				if consecutiveFailures >= 3 {
 					backoff := time.Duration(consecutiveFailures) * 10 * time.Second
 					if backoff > 2*time.Minute {
 						backoff = 2 * time.Minute
 					}
-					log.Printf("[fuse] backing off %v before next attempt", backoff)
+					jmlog.Warn("fuse remount backing off", "backoff_sec", int(backoff.Seconds()))
 					select {
 					case <-fm.stopCh:
 						return
@@ -769,6 +808,7 @@ func (fm *FUSEManager) monitorLoop() {
 					}
 				}
 			} else {
+				jmlog.Info("fuse remount succeeded", "after_attempts", consecutiveFailures)
 				consecutiveFailures = 0
 			}
 		}

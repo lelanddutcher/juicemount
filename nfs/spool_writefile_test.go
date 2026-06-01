@@ -175,10 +175,12 @@ func TestSpoolWriteFileTruncateZeroOnFreshIsNoop(t *testing.T) {
 	}
 }
 
-// TestSpoolWriteFileCloseFinalizesEntry verifies that the file's
-// Close triggers the spool entry's full lifecycle: fsync, SHA finalize,
-// SQL row → ready.
-func TestSpoolWriteFileCloseFinalizesEntry(t *testing.T) {
+// TestSpoolWriteFileCloseDoesNotFinalize verifies the NFS-compatible
+// lifecycle: a per-RPC spoolWriteFile.Close releases the handle but does
+// NOT finalize the entry (NFS closes after every WRITE RPC, so finalizing
+// on close would end the file after the first chunk). Finalize happens via
+// the idle sweeper once the writer is quiescent.
+func TestSpoolWriteFileCloseDoesNotFinalize(t *testing.T) {
 	s := newTestSpoolStore(t, 0)
 	handler := minimalHandlerForTest()
 	defer handler.StopHandler()
@@ -197,9 +199,19 @@ func TestSpoolWriteFileCloseFinalizesEntry(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	// SHA should be set (sequential write).
+	// Per-RPC Close must NOT have finalized — the writer might still send
+	// more WRITE RPCs to the same path.
+	if e.SHA256() != nil {
+		t.Errorf("per-RPC Close should not finalize the entry (SHA set prematurely)")
+	}
+
+	// The idle sweeper finalizes once the handle is released and the entry
+	// is quiescent. sweepOnce(0) forces it deterministically.
+	if n := s.sweepOnce(0); n != 1 {
+		t.Fatalf("sweepOnce finalized %d entries, want 1", n)
+	}
 	if e.SHA256() == nil {
-		t.Errorf("SHA should be finalized after close")
+		t.Errorf("SHA should be finalized after the idle sweep")
 	}
 }
 

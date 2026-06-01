@@ -1,5 +1,60 @@
 # JuiceMount6 Changelog
 
+## 2026-05-28 — Write spool (Option 2): local-SSD write intermediary
+
+A foundational write-path change, behind `JM_SPOOL_ENABLE` (default off). Interposes
+a JuiceMount-owned write spool on local SSD **between the NFS handler and JuiceFS's
+raw staging**, so Finder writes ack the moment they're durable on local SSD
+(`fsync()`) and a background drainer copies them into JuiceFS at MinIO's pace. Fixes
+the WAN write cliff — 2 GB / 600-file Finder copies over Tailscale had hit ~2-hour
+ETAs (~280 KB/s) because JuiceFS back-pressures on a RAM-tracked `--buffer-size`
+budget even with 700+ GB of disk headroom. This is the Dropbox / LucidLink / Suite
+write model, without forking JuiceFS. All 8 slices CI-green on `production-hardening`
+(mirrored to `main`).
+
+### What landed (slices A–H)
+
+- **Spool primitives + SQLite index** (`nfs/spool.go`, `nfs/spool_index.go`,
+  `metadata/spool_schema.go`, `metadata/spool_store.go`). `spool_entries` table in the
+  existing metadata DB (shares its WAL + `writeMu`); capacity cap with atomic CAS
+  reservation (default 50 GiB); refcounted `SpoolEntry` with streaming SHA-256.
+- **Drainer** (`nfs/drainer.go`). Single dispatcher + bounded worker pool (default 4);
+  `ListReady → MarkDraining → copy-to-FUSE → SHA-verify → MarkDrainComplete`.
+  Exponential-backoff retry (out-of-worker timer so a slot isn't held during backoff),
+  `MaxAttempts` 5 → `failed`; SHA mismatch → quarantine (never deleted).
+- **Write-path integration** (`nfs/handler.go`, `nfs/spool_writefile.go`). `O_CREATE`
+  routes through `spoolWriteFile`; acks at local SSD speed. nil-spool = unchanged
+  `writeFile` path.
+- **Read-path 3-tier lookup** (`nfs/handler.go`, `nfs/spool_readfile.go`). `spoolReadFile`
+  + Stat/Lstat shadow serve not-yet-drained files from the spool. QA-35 perf-gated:
+  empty-spool lookup benchmarked ~8 ns.
+- **Runtime wiring + `GET /spool`** (`bridge/cbridge.go`, `cmd/jm5/main.go`,
+  `nfs/spool_status.go`). Live pending/in-progress/failed/quarantined + per-entry list
+  on the control plane (port 11050); 503 when disabled.
+- **Crash recovery** (`SpoolStore.RecoverOnBoot`, `nfs/spool_recover_test.go`). Boot
+  scrubber reconciles on-disk files vs SQL rows: orphan cleanup, `writing`→failed,
+  `draining`→ready, capacity re-accounting. Runs before `drainer.Start`.
+- **Integrity audit log** (`nfs/spool_manifest.go`). Append-only `manifest.log` with
+  SHA-256 + timestamp for every drain-done and quarantine event. SHA-256 verified at
+  three hops: streaming on write, on drain-read, and at-rest through FUSE after copy.
+- **WAN-mode polish** (`health/fuse.go`). `JM_WAN_MODE=1` raises JuiceFS `--max-uploads`
+  20 → 64; `JM_MAX_UPLOADS=<n>` overrides directly. `--buffer-size` stays at the QA-33
+  value of 4096 — the spool, not a bigger RAM buffer, absorbs the write burst.
+
+### Configuration
+
+`JM_SPOOL_ENABLE=1` to opt in. `JM_SPOOL_DIR` (default
+`~/Library/Application Support/JuiceMount/spool/`), `JM_SPOOL_SIZE_GB` (default 50),
+`JM_WAN_MODE`, `JM_MAX_UPLOADS`. Rollback: set `JM_SPOOL_ENABLE=0` and restart.
+
+### Deferred (not in this change)
+
+Swift menu-bar "Pending uploads" section + icon badge, Manager web-UI tile,
+`App.swift` graceful-quit dialog, Preferences "Sync & Upload" pane, 24-hour live soak.
+The `/spool` JSON contract is stable, so these can land independently.
+
+Full design + architecture: `docs/ROADMAP/option-2-spool.md`, `ARCHITECTURE_juicemount.md` § 15.
+
 ## 2026-05-13 — Phase A+B+C: production safeguards landed in parallel
 
 Three agents working in parallel landed the next batch of production-readiness

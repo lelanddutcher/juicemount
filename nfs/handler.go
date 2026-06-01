@@ -88,8 +88,9 @@ type JuiceMountHandler struct {
 	// lookup. Files written via spool are temporarily invisible to
 	// reads until the drainer copies them to FUSE (documented
 	// limitation in docs/ROADMAP/option-2-spool.md).
-	spool   *SpoolStore
-	drainer *Drainer
+	spool            *SpoolStore
+	drainer          *Drainer
+	spoolSweeperStop func() // stops the idle-finalize sweeper; set by SetSpool
 }
 
 type verifierData struct {
@@ -252,25 +253,54 @@ func (h *JuiceMountHandler) isPinnedReady(canonicalPath string) bool {
 	return h.pinStore.IsPinnedReady(canonicalPath)
 }
 
-// SetSpool attaches the JuiceMount-side write spool and its drainer.
+// SetSpool attaches the JuiceMount-side write spool and its drainer, and
+// starts the idle-finalize sweeper.
 //
-// When set (non-nil), juiceFS.OpenFile routes O_CREATE writes through
-// the spool instead of directly through the fdPool/FUSE path. This
-// decouples Finder write ack from MinIO upload completion — writes
-// land on local SSD via spool, drainer copies to FUSE asynchronously.
+// When set (non-nil): juiceFS.Create routes new files through the spool, and
+// juiceFS.OpenFile routes subsequent WRITE RPCs to the spool for any path
+// with an active spool entry — decoupling Finder write ack from MinIO upload
+// completion (writes land on local SSD; the drainer copies to FUSE in the
+// background). Pre-spool behavior is preserved when nil: the legacy
+// Create/writeFile/fdPool path runs unchanged. Gated by JM_SPOOL_ENABLE at
+// the call sites (cmd/jm5/main.go, bridge/cbridge.go).
 //
-// Pre-spool behavior is preserved when this is nil: the existing
-// writeFile path runs unchanged. This is the JM_SPOOL_ENABLE rollout
-// gate per the slice-C plan; callers (cmd/jm5/main.go, bridge/
-// cbridge.go) check the env var and skip SetSpool when disabled.
-//
-// Slice C scope: write path only. The read path does NOT consult the
-// spool here — slice D adds the 3-tier read lookup. Until slice D
-// ships, files newly written via spool are briefly invisible to
-// subsequent reads until the drainer copies them to FUSE.
+// Must be called before drainer.Start (it registers the drain-complete
+// callback, which worker goroutines read).
 func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 	h.spool = spool
 	h.drainer = drainer
+	if drainer != nil {
+		// Post-drain hook: once a spooled file lands in FUSE, sync its real
+		// size into the metadata cache and publish a create event — the
+		// spool analogue of writeFile.Close's UpdateSize+publishEvent, which
+		// the spool path can't do at write time because the bytes aren't in
+		// FUSE yet. Without this, Stat reports the Create-time size 0 until
+		// the next Redis reconcile.
+		drainer.SetOnDrainComplete(h.onSpoolDrained)
+	}
+	if spool != nil {
+		// NFS closes the file after every WRITE RPC, so finalize is driven
+		// by quiescence (idle sweeper), not by Close. Stopped in StopHandler.
+		h.spoolSweeperStop = spool.StartSweeper(0, 0)
+	}
+}
+
+// onSpoolDrained runs after the drainer copies a spooled file into FUSE. It
+// updates the metadata cache with the real size and publishes a create event
+// so other JuiceMount clients see the file. Inode/local_only are left to the
+// normal Redis reconcile (identical to the legacy create lifecycle).
+func (h *JuiceMountHandler) onSpoolDrained(nfsPath string, size int64) {
+	now := time.Now()
+	if size > 0 {
+		_ = h.store.UpdateSize(nfsPath, size, now)
+	}
+	inode := uint64(0)
+	if e := h.store.LookupByPath(nfsPath); e != nil {
+		inode = e.Inode
+	}
+	h.publishEvent(metadata.MetadataEvent{
+		Op: "create", Path: nfsPath, Size: size, Mtime: now.Unix(), Inode: inode,
+	})
 }
 
 // SetRedisClient attaches a Redis client for publishing metadata events.
@@ -470,6 +500,9 @@ func (h *JuiceMountHandler) evictStaleVerifiers(ttl time.Duration) {
 // spool, and the spool's index/db are still needed during the drainer
 // drain-window. Old fdPool and verifierStop sweep after that.
 func (h *JuiceMountHandler) StopHandler() {
+	if h.spoolSweeperStop != nil {
+		h.spoolSweeperStop() // stop finalizing new entries before draining down
+	}
 	if h.drainer != nil {
 		h.drainer.Stop(30 * time.Second)
 	}
@@ -1329,56 +1362,41 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	fullPath := jfs.fullPath(filename)
 
 	if isWrite {
-		// Spool-routed path (Option 2, slice C): O_CREATE writes go
-		// through the spool so Finder ack happens at local SSD speed
-		// regardless of MinIO/FUSE backpressure. Scoped to O_CREATE
-		// only — in-place RDWR opens of existing files keep the
-		// fdPool/FUSE path so this slice doesn't change behavior for
-		// editors that re-save existing files.
-		if jfs.handler.spool != nil && flag&os.O_CREATE != 0 {
-			sentry, err := jfs.handler.spool.OpenWrite(filename)
-			if err != nil {
-				return nil, err
+		// Spool-routed write (Option 2): route to the spool ONLY when this
+		// path already has an active spool entry (created via juiceFS.Create
+		// and not yet drained). NFS WRITE RPCs arrive as OpenFile(O_RDWR)
+		// with NO O_CREATE (internal/nfs/nfs_onwrite.go), so the spool keys
+		// off the index — keying off O_CREATE made the spool unreachable
+		// over NFS entirely (Finding 1). A path with NO spool entry is an
+		// in-place modify of a file that already lives in FUSE; that MUST
+		// stay on the legacy fdPool path so the drainer never truncates it
+		// via os.Create.
+		if jfs.handler.spool != nil {
+			if _, active := jfs.handler.spool.LookupActive(filename); active {
+				sentry, err := jfs.handler.spool.OpenWrite(filename)
+				if err != nil {
+					return nil, err
+				}
+				// Keep the synthetic inode stable for the entry's lifetime
+				// (Stat/Lstat shadow + NFS handle). SetInode is idempotent;
+				// the inode was already assigned at Create time, so this is
+				// normally a no-op — the fallback only fires for the unusual
+				// case of an indexed entry with no inode yet.
+				if sentry.Inode() == 0 {
+					inode := jfs.handler.nextSyntheticInode()
+					if e != nil {
+						inode = e.Inode
+					}
+					sentry.SetInode(inode)
+				}
+				// QA-19 phantom-purge gate; released in spoolWriteFile.Close.
+				jfs.handler.incActiveWriter(filename)
+				return &spoolWriteFile{
+					name:    filename,
+					entry:   sentry,
+					handler: jfs.handler,
+				}, nil
 			}
-			// Slice D: assign a synthetic inode at OpenWrite so
-			// Stat/Lstat shadow returns the SAME inode for the
-			// lifetime of the spool entry. Without this, two
-			// successive Stat calls during the same writing session
-			// could get different inodes if FUSE-fallback ever fired
-			// in between — and the NFS handle would go stale.
-			// SetInode is idempotent (once-set semantics) so a
-			// concurrent re-OpenWrite for the same path returning
-			// the existing entry won't overwrite.
-			inode := uint64(0)
-			if e != nil {
-				inode = e.Inode
-			} else {
-				inode = jfs.handler.nextSyntheticInode()
-			}
-			sentry.SetInode(inode)
-			// Slice C does not carry a metadata.Entry through the
-			// spool path — the inode + metadata-store entry are
-			// owned by the eventual drain into FUSE (which triggers
-			// the publishEvent that the existing writeFile path
-			// emits). Slice E will surface in-flight entries to the
-			// UI via the spool index, not the metadata store.
-			//
-			// Orphan recovery: if the process is SIGKILLed after
-			// spool.OpenWrite but before spoolWriteFile.Close, the
-			// SQL row sits in `writing` state with the spool file
-			// half-written. Slice F's boot scrubber reaps these.
-			// Until slice F ships, an orphan-writing-row check at
-			// jm5 boot is a known TODO.
-			//
-			// QA-19: same phantom-purge gate as the legacy write
-			// path. spoolWriteFile.Close calls decActiveWriter via
-			// a defer so the gate stays up through entry.Close.
-			jfs.handler.incActiveWriter(filename)
-			return &spoolWriteFile{
-				name:    filename,
-				entry:   sentry,
-				handler: jfs.handler,
-			}, nil
 		}
 
 		fd, err := jfs.handler.fdPool.GetWrite(fullPath, flag, perm)
@@ -1419,8 +1437,33 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 
 func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 	filename = strings.TrimPrefix(filename, "/")
+	now := time.Now()
 
-	// Create on FUSE
+	// Spool-routed create (Option 2). The CREATE RPC is the new-file entry
+	// point (internal/nfs/nfs_oncreate.go calls fs.Create). When the spool
+	// is enabled we open a spool entry instead of creating the file on FUSE;
+	// the drainer materializes it in FUSE later. We STILL insert the
+	// metadata entry (same synthetic inode as the legacy path) so the NFS
+	// handle resolves via ToHandle/FromHandle and the file appears in
+	// directory listings immediately. Stat/Lstat/READ are shadowed by the
+	// spool index (real growing size) until the drainer lands the file, at
+	// which point onSpoolDrained syncs the final size into this entry.
+	if jfs.handler.spool != nil {
+		inode := jfs.handler.nextSyntheticInode()
+		e := metadata.MakeEntry(filename, false, 0, now, inode)
+		e.LocalOnly = true
+		jfs.handler.store.Insert(e)
+
+		sentry, err := jfs.handler.spool.OpenWrite(filename)
+		if err != nil {
+			return nil, err
+		}
+		sentry.SetInode(inode)
+		jfs.handler.incActiveWriter(filename)
+		return &spoolWriteFile{name: filename, entry: sentry, handler: jfs.handler}, nil
+	}
+
+	// Legacy path: create directly on FUSE.
 	fullPath := jfs.fullPath(filename)
 	f, err := os.Create(fullPath)
 	if err != nil {
@@ -1428,7 +1471,6 @@ func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 	}
 
 	// Insert into SQLite immediately with local_only flag
-	now := time.Now()
 	e := metadata.MakeEntry(filename, false, 0, now, jfs.handler.nextSyntheticInode())
 	e.LocalOnly = true
 	jfs.handler.store.Insert(e)

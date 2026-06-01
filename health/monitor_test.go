@@ -77,6 +77,83 @@ func TestFUSEMountCheck(t *testing.T) {
 	}
 }
 
+// TestFUSEDebounceSuppressesFlap certifies the anti-flap hysteresis: a single
+// unhealthy blip must not flip the reported FUSE status (that strobing was the
+// user-visible bug), while a sustained outage does, and recovery is immediate.
+func TestFUSEDebounceSuppressesFlap(t *testing.T) {
+	cfg := Config{
+		RedisURL: "127.0.0.1:6379",
+		MinIOURL: "http://127.0.0.1:9000",
+		FUSEPath: fusePath(t),
+	}
+	m := New(cfg)
+
+	healthy := func() ComponentStatus {
+		return ComponentStatus{Healthy: true, LastCheck: time.Now(), Message: "ok"}
+	}
+	unhealthy := func() ComponentStatus {
+		return ComponentStatus{Healthy: false, LastCheck: time.Now(), Message: "stat timed out (wedged FUSE mount)"}
+	}
+
+	// Initialize debounced state as healthy.
+	if got := m.debounceFUSE(healthy()); !got.Healthy {
+		t.Fatalf("initial healthy probe should report healthy, got %+v", got)
+	}
+
+	// A single unhealthy blip must NOT flip the reported status — anti-flap.
+	if got := m.debounceFUSE(unhealthy()); !got.Healthy {
+		t.Fatalf("single unhealthy blip should stay reported-healthy, got degraded: %+v", got)
+	}
+
+	// One healthy probe resets the streak; the link is flapping, not down.
+	if got := m.debounceFUSE(healthy()); !got.Healthy {
+		t.Fatalf("recovery probe should report healthy, got %+v", got)
+	}
+
+	// A SUSTAINED outage — FUSEFlapToDegraded consecutive unhealthy probes —
+	// must flip the reported status to degraded and surface the real reason.
+	var last ComponentStatus
+	for i := 0; i < FUSEFlapToDegraded; i++ {
+		last = m.debounceFUSE(unhealthy())
+	}
+	if last.Healthy {
+		t.Fatalf("after %d consecutive unhealthy probes, status should be degraded, got healthy: %+v",
+			FUSEFlapToDegraded, last)
+	}
+	if last.Message == "" {
+		t.Fatal("degraded status should surface the raw reason message, got empty")
+	}
+
+	// Recovery is immediate on the first healthy probe.
+	if got := m.debounceFUSE(healthy()); !got.Healthy {
+		t.Fatalf("first healthy probe after outage should recover immediately, got %+v", got)
+	}
+}
+
+// TestFUSEDebounceAlternatingNeverDegrades drives the classic strobe pattern
+// (bad, good, bad, good…). A link that passes every other probe is working
+// enough — it must never be reported degraded, since that up/down/up/down
+// flicker is exactly what we're killing.
+func TestFUSEDebounceAlternatingNeverDegrades(t *testing.T) {
+	cfg := Config{
+		RedisURL: "127.0.0.1:6379",
+		MinIOURL: "http://127.0.0.1:9000",
+		FUSEPath: fusePath(t),
+	}
+	m := New(cfg)
+	m.debounceFUSE(ComponentStatus{Healthy: true, LastCheck: time.Now(), Message: "ok"})
+	for i := 0; i < 10; i++ {
+		bad := m.debounceFUSE(ComponentStatus{Healthy: false, LastCheck: time.Now(), Message: "blip"})
+		if !bad.Healthy {
+			t.Fatalf("iteration %d: alternating pattern flipped to degraded — strobe not suppressed", i)
+		}
+		good := m.debounceFUSE(ComponentStatus{Healthy: true, LastCheck: time.Now(), Message: "ok"})
+		if !good.Healthy {
+			t.Fatalf("iteration %d: healthy probe reported degraded", i)
+		}
+	}
+}
+
 func TestStatusReturnsCorrectState(t *testing.T) {
 	cfg := Config{
 		RedisURL: "127.0.0.1:6379",

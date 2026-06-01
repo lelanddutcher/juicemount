@@ -220,6 +220,34 @@ struct PreferencesWindowView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section {
+                Toggle("Enable write spool", isOn: $preferences.spoolEnabled)
+                    .onChange(of: preferences.spoolEnabled) { _, _ in
+                        // The Go core reads JM_SPOOL_ENABLE only at start, so
+                        // a running server must restart to pick up the change.
+                        if isRunningLike { server.restart() }
+                    }
+                LabeledContent("Spool Capacity") {
+                    HStack {
+                        TextField("50", value: $preferences.spoolCapacityGB, format: .number)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 80)
+                        Text("GB")
+                        Slider(value: Binding(
+                            get: { Double(preferences.spoolCapacityGB) },
+                            set: { preferences.spoolCapacityGB = Int($0) }
+                        ), in: 10...500, step: 10)
+                    }
+                    .disabled(!preferences.spoolEnabled)
+                }
+            } header: {
+                Text("Write Spool (Background Uploads)").font(.headline)
+            } footer: {
+                Text("Writes land on local SSD and are acknowledged immediately, then upload to your storage in the background — large copies feel local even over a slow link. Toggling restarts the server; pending uploads show in the menu-bar popover.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Spacer()
             restartHint
         }

@@ -46,6 +46,11 @@ public final class ServerController {
     ///     un-pinned files are refused.
     public private(set) var offlineState: NFSBridge.OfflineState = NFSBridge.OfflineState()
 
+    /// Latest write-spool status (Option 2). Nil until the first fetch, or
+    /// when the metrics server is unreachable. The popover's "Pending
+    /// uploads" section reads this and renders only when `.enabled`.
+    public private(set) var spoolStatus: NFSBridge.SpoolStatus?
+
     public var preferences: Preferences
 
     private let log = Logger(subsystem: "com.juicemount.app", category: "ServerController")
@@ -85,7 +90,10 @@ public final class ServerController {
         guard case .idle = state else { return }
         state = .starting
         let cfg = preferences.toServerConfig()
-        log.info("Starting server with mount \(cfg.mountPoint, privacy: .public)")
+        // Spool (Option 2) settings travel in the config JSON (cfg.spoolEnable
+        // / spoolSizeGB), NOT via env: Go snapshots os.Environ at c-archive
+        // init, so a host-side setenv() after that is invisible to os.Getenv.
+        log.info("Starting server with mount \(cfg.mountPoint, privacy: .public) (spool=\(self.preferences.spoolEnabled, privacy: .public))")
         workQueue.async { [weak self] in
             guard let self else { return }
             do {
@@ -224,9 +232,13 @@ public final class ServerController {
             // modes. Pass the optional through and let the MainActor
             // side decide whether to apply or keep last-known state.
             let o: NFSBridge.OfflineState? = NFSBridge.offlineState(metricsAddr: metricsAddr)
+            let sp: NFSBridge.SpoolStatus? = NFSBridge.spoolStatus(metricsAddr: metricsAddr)
             Task { @MainActor in
                 guard let self else { return }
                 self.cacheStatus = s
+                // Spool status: keep last-known on a nil (unreachable) fetch,
+                // same rationale as offlineState below.
+                if let sp { self.spoolStatus = sp }
 
                 if let o {
                     let prevAuto = self.offlineState.auto_offline
