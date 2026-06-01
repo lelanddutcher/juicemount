@@ -74,6 +74,15 @@ var (
 	// resilience plan consume its state and OnChange callback.
 	globalReach *health.Reachability
 
+	// Auto-offline debounce (2026-06-01). A brief network blip (a few seconds
+	// of cold-dial failures) must NOT flip the app to "offline" — that
+	// contradicts the still-healthy Redis/MinIO/FUSE components (which ride
+	// through the same blip on warm pooled connections) and jars the user. We
+	// wait for offlineEngageDelay of CONTINUOUS unreachability before engaging
+	// offline mode; recovery is instant. Guarded by offlineEngageMu.
+	offlineEngageMu    sync.Mutex
+	offlineEngageTimer *time.Timer
+
 	// Spool architecture (Option 2 / slices A-E). Set when
 	// JM_SPOOL_ENABLE=1 at startup. Both nil → spool path is fully
 	// dormant and the existing fdPool/FUSE write+read path runs
@@ -83,6 +92,16 @@ var (
 	globalSpool   *jmnfs.SpoolStore
 	globalDrainer *jmnfs.Drainer
 )
+
+// offlineEngageDelay is how long the backend must be CONTINUOUSLY unreachable
+// (on top of globalReach's ~4s detection) before auto-offline engages. Sized
+// to ride out the brief LAN/Tailscale blips that trip a cold-dial probe but
+// not the warm-connection health checks — keeping the menu bar from flapping
+// to "offline" on a 2-6s hiccup. Total engage latency ≈ 22s end-to-end.
+//
+// Recovery is NOT debounced: the moment reachability returns, the pending
+// engage is cancelled and any active auto-offline is lifted immediately.
+var offlineEngageDelay = 18 * time.Second
 
 // ServerConfig is the JSON configuration passed from Swift.
 type ServerConfig struct {
@@ -226,9 +245,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			fm.StartMonitor()
 			globalFUSE = fm
 			if mountErr != nil {
-				jmlog.Error("juicefs FUSE mount failed at launch — watchdog will keep retrying once the backend is reachable",
+				// Launch-time mount failed — almost always a transient backend
+				// blip during startup. Do NOT abort startup: the watchdog
+				// (started above) brings FUSE up once the backend is reachable.
+				// Returning here used to leave the app HALF-STARTED — juicefs
+				// recovering in the background but NFS, the metrics/control
+				// server, and the spool never started, so /Volumes/zpool never
+				// mounted and the app looked dead (observed 2026-06-01 under a
+				// blippy link). Continue instead: the app comes up fully,
+				// un-pinned reads fail-fast until FUSE is ready, and the mount
+				// self-heals.
+				jmlog.Error("juicefs FUSE mount failed at launch — continuing startup; watchdog will mount it once the backend is reachable",
 					"error", mountErr.Error())
-				return C.CString(fmt.Sprintf("error: juicefs FUSE mount: %v", mountErr))
 			}
 			// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
 			// the *effective* config from the mount, not the user input —
@@ -281,34 +309,52 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if reachAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL); reachAddr != "" {
 		globalReach = health.NewReachability(reachAddr)
 		globalReach.OnChange(func(reachable bool, reason string) {
+			offlineEngageMu.Lock()
+			defer offlineEngageMu.Unlock()
 			if reachable {
+				// Cancel any pending offline-engage and lift auto-offline at
+				// once. Recovery is intentionally NOT debounced — the moment
+				// the route is back we want un-pinned reads flowing again. The
+				// user-intent flag (SetOffline) is untouched.
+				if offlineEngageTimer != nil {
+					offlineEngageTimer.Stop()
+					offlineEngageTimer = nil
+				}
 				jmlog.Info("network path to backend recovered",
 					"target", reachAddr, "reason", reason)
-				// Lift the auto-offline flag. The user-intent flag
-				// (SetOffline) is untouched — if the user manually
-				// toggled offline, they stay offline.
 				pin.SetAutoOffline(false, "")
-				// Kick reconciliation immediately rather than waiting
-				// for the next periodic tick. The metadata authority
-				// is back; let downstream catch up fast.
-				//
-				// Shutdown safety: `rc` is the captured closure
-				// pointer to the RedisClient, never nilled (only
-				// globalRC is nilled). A late-arriving callback after
-				// rc.Stop() does a non-blocking send to syncNowCh —
-				// the channel isn't closed by Stop(), the reconcile
-				// loop has already exited so the buffered signal sits
-				// undrained, and the whole RedisClient eventually
-				// gets GC'd. No panic, no leak. Benign.
+				// Kick reconciliation immediately. Shutdown-safe: `rc` is the
+				// captured RedisClient pointer; a late callback after rc.Stop()
+				// does a non-blocking send to an undrained channel. Benign.
 				rc.TriggerSync()
 			} else {
-				jmlog.Warn("network path to backend lost",
-					"target", reachAddr, "reason", reason)
-				// Auto-engage offline mode. NFS handler (item #4)
-				// will read pin.IsOffline() in the read path and
-				// fail-fast un-pinned reads instead of letting them
-				// stall on kernel-NFS timeouts.
-				pin.SetAutoOffline(true, reason)
+				// DEBOUNCE: do NOT engage offline on a brief blip. Arm a timer;
+				// only engage if the backend is STILL unreachable after
+				// offlineEngageDelay of continuous failure. A 2-6s blip (which
+				// the warm-connection health checks ride straight through)
+				// recovers long before this fires, so the app never shows a
+				// spurious "offline" while Redis/MinIO/FUSE all read OK.
+				if offlineEngageTimer != nil {
+					offlineEngageTimer.Stop()
+				}
+				jmlog.Warn("network path to backend lost — deferring offline engage",
+					"target", reachAddr, "reason", reason,
+					"engage_after", offlineEngageDelay.String())
+				capturedReason := reason
+				offlineEngageTimer = time.AfterFunc(offlineEngageDelay, func() {
+					offlineEngageMu.Lock()
+					defer offlineEngageMu.Unlock()
+					if globalReach.Reachable() {
+						return // recovered during the debounce window — no-op
+					}
+					jmlog.Warn("backend unreachable for sustained window — engaging offline mode",
+						"target", reachAddr, "reason", capturedReason,
+						"sustained", offlineEngageDelay.String())
+					// NFS handler reads pin.IsOffline() in the read path to
+					// fail-fast un-pinned reads instead of stalling on
+					// kernel-NFS timeouts.
+					pin.SetAutoOffline(true, capturedReason)
+				})
 			}
 		})
 		globalReach.Start()

@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -693,16 +694,75 @@ func (fm *FUSEManager) unmountLocked() {
 	// runBoundedCommand handles the timeout + reaping internally.
 	done := make(chan struct{})
 	go func() {
-		runBoundedCommand(60*time.Second, "umount", "-f", fm.cfg.MountPoint)
+		// `diskutil unmount force` is more reliable than `umount -f` for a
+		// WEDGED macFUSE mount: `umount -f` of a dead-daemon mount can hang in
+		// the kernel indefinitely (observed 2026-06-01 — only diskutil cleared
+		// it), whereas diskutil tears the FUSE device down cleanly. Try
+		// diskutil first; fall back to `umount -f` only if the entry survives.
+		runBoundedCommand(30*time.Second, "diskutil", "unmount", "force", fm.cfg.MountPoint)
+		if fm.stillInMountTable() {
+			runBoundedCommand(30*time.Second, "umount", "-f", fm.cfg.MountPoint)
+		}
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(65 * time.Second):
-		// Safety net: even if runBoundedCommand hangs (shouldn't,
-		// it has its own ctx deadline), don't pin fm.mu forever.
-		jmlog.Warn("unmountLocked: umount goroutine did not return in 65s, proceeding anyway")
+		// Safety net: even if a bounded command hangs (shouldn't, each has its
+		// own ctx deadline), don't pin fm.mu forever.
+		jmlog.Warn("unmountLocked: unmount goroutine did not return in 65s, proceeding anyway")
 	}
+}
+
+// stillInMountTable reports whether fm.cfg.MountPoint appears in the kernel
+// mount table. Pure-read, bounded; unlike isMountedLocked it does NOT probe
+// responsiveness (a wedged mount still appears here), so it's the right check
+// for "did the unmount actually remove the entry".
+func (fm *FUSEManager) stillInMountTable() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "mount").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), fm.cfg.MountPoint)
+}
+
+// FUSEStaleEscalateTicks is the number of CONTINUOUS "stale but juicefs alive"
+// monitor ticks (10s each) the watchdog tolerates before escalating to a
+// last-resort remount. 9 ticks ≈ 90s: long enough that brief flapping never
+// reaches it (the counter resets on any recovery), short enough that a
+// genuinely stuck backend connection doesn't leave the mount wedged for many
+// minutes. Var, not const, so tests can shorten it.
+var FUSEStaleEscalateTicks = 9
+
+// backendReachable does a cheap TCP dial to the metadata (Redis) host to
+// decide whether a remount could even succeed. Mirrors the reachability
+// monitor's probe so the watchdog does NOT kill+remount juicefs during a real
+// backend outage (where a fresh mount would just fail and churn). Best-effort:
+// returns true (optimistic — don't block escalation) if the host can't be
+// parsed.
+func (fm *FUSEManager) backendReachable() bool {
+	hostPort := redisHostPort(fm.cfg.RedisURL)
+	if hostPort == "" {
+		return true
+	}
+	conn, err := net.DialTimeout("tcp", hostPort, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// redisHostPort extracts "host:port" from a redis URL (redis://host:port/db).
+// Returns "" if it can't be parsed.
+func redisHostPort(redisURL string) string {
+	u, err := url.Parse(redisURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
 }
 
 // monitorLoop checks mount health periodically and remounts ONLY when the
@@ -763,11 +823,36 @@ func (fm *FUSEManager) monitorLoop() {
 			// live-but-slow juicefs is what drove the macFUSE remount thrash.
 			if isJuiceFSProcessAlive() {
 				// juicefs (and its own supervisor) is alive — the mount is
-				// merely slow/stale, almost always a flapping backend link.
-				// Do NOT kill+remount: that destroys juicefs's own recovery
-				// and thrashes macFUSE. Report and wait.
+				// stale, usually a flapping/blipping backend link. Default to
+				// deferring (no kill, no macFUSE thrash). BUT juicefs's own
+				// supervisor only restarts the mount child on a CRASH, not on a
+				// stuck backend connection: a blip can leave juicefs's
+				// connection wedged with FUSE stat hanging indefinitely
+				// (observed 2026-06-01 — a 7-minute continuous wedge with zero
+				// self-recovery). So after a SUSTAINED continuous wedge,
+				// escalate to a remount as a last resort — but ONLY when the
+				// backend is actually reachable (a fresh mount can't succeed
+				// during a real outage, where deferring is correct). The
+				// counter resets the instant the mount recovers, so brief
+				// flapping never accumulates to the threshold.
 				staleWhileAliveTicks++
 				consecutiveFailures = 0
+				if staleWhileAliveTicks >= FUSEStaleEscalateTicks {
+					if fm.backendReachable() {
+						jmlog.Warn("fuse wedged but juicefs alive for a sustained window + backend reachable — escalating to remount (last resort)",
+							"stale_ticks", staleWhileAliveTicks)
+						if err := fm.Mount(); err != nil {
+							jmlog.Error("fuse escalation remount failed", "error", err.Error())
+						} else {
+							jmlog.Info("fuse escalation remount succeeded", "after_stale_ticks", staleWhileAliveTicks)
+						}
+						staleWhileAliveTicks = 0
+					} else {
+						jmlog.Warn("fuse wedged + juicefs alive, but backend unreachable — deferring (a remount cannot succeed during a real outage)",
+							"stale_ticks", staleWhileAliveTicks)
+					}
+					continue
+				}
 				// Rate-limit: first stale tick, then ~once a minute.
 				if staleWhileAliveTicks == 1 || staleWhileAliveTicks%6 == 0 {
 					jmlog.Warn("fuse mount stale but juicefs alive — deferring to juicefs's own supervisor, not remounting",
