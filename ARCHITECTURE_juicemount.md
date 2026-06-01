@@ -1,6 +1,6 @@
 # JuiceMount Architecture Document
 
-**Last updated:** 2026-05-08 (production-hardening branch)
+**Last updated:** 2026-05-28 (production-hardening branch; write spool added — see § 15)
 **Repo:** `github.com/lelanddutcher/juicemount` (private)
 **Module:** `github.com/lelanddutcher/juicemount`
 **Go version:** 1.26.1
@@ -139,7 +139,9 @@ Key flags: `rsize/wsize=1MB` for throughput, `actimeo=3600` to maximize macOS
 attribute caching (1 hour), `soft,intr` so hung NFS doesn't freeze Finder.
 
 ### `nfs/` -- NFS handler and file I/O
-**Files:** `handler.go`, `server.go`, `fdpool.go`, `readahead.go`, `membuf.go`
+**Files:** `handler.go`, `server.go`, `fdpool.go`, `readahead.go`, `membuf.go`,
+plus the write-spool files (`spool.go`, `spool_index.go`, `spool_writefile.go`,
+`spool_readfile.go`, `spool_status.go`, `spool_manifest.go`, `drainer.go`) — see § 15.
 
 This is the core package. It implements the `go-nfs` Handler interface:
 
@@ -161,7 +163,13 @@ This is the core package. It implements the `go-nfs` Handler interface:
 
 - **`writeFile`** -- Write-path file wrapper. Tracks `writtenEnd` for size
   reporting, publishes metadata events on close, skips `Sync()` to rely on
-  JuiceFS writeback.
+  JuiceFS writeback. The default path when the spool is disabled.
+
+- **`spoolWriteFile` / `spoolReadFile`** -- Spool-routed file wrappers used
+  when the write spool is enabled (`JM_SPOOL_ENABLE=1`). `O_CREATE` writes land
+  on a local-SSD spool file and ack immediately; reads of a not-yet-drained
+  file are served from the spool. nil-spool falls back to the `writeFile` /
+  `cachedFile` paths above. See § 15.
 
 - **`FDPool`** -- Pools open file descriptors to avoid the 60ms cost of
   opening files on JuiceFS FUSE. Entries auto-evict after 2 minutes idle.
@@ -368,6 +376,12 @@ NFS response (data + post_op_attr)
 ```
 
 ### Write Path (NFS WRITE RPC)
+
+> **Note (2026-05-28):** with the write spool enabled (`JM_SPOOL_ENABLE=1`),
+> `O_CREATE` writes are intercepted *before* this path and routed to a
+> local-SSD spool that acks immediately; a background drainer later performs
+> the FUSE write shown below. See § 15. The flow below is the spool-disabled
+> (default) path — and is also exactly what the drainer replays into FUSE.
 
 ```
 Finder WRITE(handle, offset, data, stability)
@@ -966,8 +980,9 @@ Tests in `nfs/canonicalize_test.go`.
 What the menu-bar app launches:
 ```
 juicefs mount redis://127.0.0.1:6379/1 ~/.juicemount/fuse-internal \
-  -d --no-usage-report --writeback --buffer-size 1024 --prefetch 3 \
-  -o nobrowse --cache-size <auto> --free-space-ratio 0.01
+  -d --no-usage-report --writeback --buffer-size 4096 --prefetch 3 \
+  -o nobrowse --cache-size <auto> --free-space-ratio 0.01 \
+  [--max-uploads 64]   # only when JM_WAN_MODE=1 (or JM_MAX_UPLOADS=<n>); default 20
 ```
 
 `--cache-size` is **auto-expanded** at mount time:
@@ -1206,3 +1221,292 @@ ls /Volumes/zpool/
 # Check metadata count
 sqlite3 ~/.juicemount/metadata.db "SELECT COUNT(*) FROM entries;"
 ```
+
+---
+
+## 15. Write Spool (Option 2) — the local-SSD write intermediary (added 2026-05-28)
+
+This section documents the write-spool subsystem layered on top of §1–§14. It
+is the write-path analogue of §11's pin/offline read subsystem: the difference
+between "writes feel fast on a wired LAN" and "writes feel like local SSD even
+over Tailscale or cellular." It is gated by `JM_SPOOL_ENABLE=1`; when disabled,
+the handler's `spool` field is nil and §4's direct-to-FUSE write path runs
+unchanged. Slice-by-slice design history lives in `docs/ROADMAP/option-2-spool.md`.
+
+### 15.1 The problem and the durability boundary
+
+JuiceFS gates sustained writes on a RAM-tracked uploader budget
+(`--buffer-size`). Once the in-flight upload queue exceeds that budget the
+`WriteAt` syscall blocks — so a 2 GB Finder copy over a slow link drains at
+upload speed (observed ~280 KB/s on Tailscale → ~2-hour ETAs) even though
+`rawstaging/` has hundreds of GB of disk headroom. Raising `--buffer-size`
+steals RAM from the editor's NLE project caches.
+
+The spool moves the **durability checkpoint one step earlier**:
+
+- **Without spool:** durable when JuiceFS's `rawstaging/` write completes —
+  still inside JuiceFS's domain, subject to its flow control.
+- **With spool:** durable when our spool file's `fsync()` completes — inside
+  JuiceMount's domain, on local SSD.
+
+Both are local-SSD-resident; the spool boundary lets us ACK to Finder *before*
+JuiceFS sees the bytes. A background drainer then feeds JuiceFS at MinIO's pace.
+This is the model Dropbox Smart Sync, LucidLink, and Suite use under the hood —
+achieved here without forking JuiceFS's flow control.
+
+### 15.2 Components
+
+```
+   NFS WRITE RPC (O_CREATE)                         NFS READ RPC
+            │                                            │
+            ▼                                            ▼
+   handler.OpenFile(write)                     handler.OpenFile(read)
+            │                                            │
+            ▼                                  spool.LookupActive(path)?
+   spool.OpenWrite(path)  ──────────┐          ├─ hit  → spoolReadFile (local SSD)
+            │                       │          └─ miss → cacheReader/readahead/
+            ▼                       │                     memBuf/FUSE  (§4 path)
+   spoolWriteFile.WriteAt ── streaming SHA-256
+            │  (local SSD file under <spool>/files/)
+            ▼
+   Close → fsync → meta.MarkReady → signalReady ──────────┐
+                                                          ▼
+                                          ┌──────────── Drainer ───────────┐
+                                          │ dispatcher + N workers (def 4)  │
+                                          │ ListReady → MarkDraining        │
+                                          │ copy spool→FUSE (1 MiB buf)     │
+                                          │ verify SHA-256 (stream + at-rest)│
+                                          │ MarkDrainComplete → rm spool file│
+                                          └────────────────┬────────────────┘
+                                                           ▼
+                                              FUSE → rawstaging → MinIO
+                                                       (JuiceFS, at its pace)
+```
+
+- **`SpoolStore`** (`nfs/spool.go`) — owns the spool root on local SSD
+  (`<root>/files/` for spool files, `<root>/quarantine/` for SHA-mismatched
+  files, `<root>/manifest.log` for the audit trail), the in-memory index, the
+  SQLite-backed durable index, and the capacity budget. Capacity is reserved
+  with an atomic compare-and-swap loop so concurrent writers on different
+  entries can never both pass the cap check and over-fill.
+
+- **`SpoolEntry`** (`nfs/spool.go`) — one in-flight or pending-upload file.
+  Holds the write fd plus a streaming `sha256.Hash`. Refcounted so a single
+  Finder copy's multi-RPC `OpenWrite → WriteAt… → Close` lifecycle reuses one
+  spool file (mirrors FDPool same-path dedupe). Detects out-of-order `WriteAt`
+  (offset < current `writtenEnd`): when seen, the streaming hash is marked
+  invalid and the drainer re-hashes from disk instead of trusting it. Carries a
+  synthetic inode (set once by the handler) so Stat/Lstat report a stable value
+  during the file's spool lifetime.
+
+- **`SpoolIndex`** (`nfs/spool_index.go`) — `map[path]*SpoolEntry` under an
+  `RWMutex`. The read hot path takes a read-lock O(1) lookup; QA-35-disciplined
+  (empty-spool lookup benchmarked ~8 ns, well under the 100 ns budget).
+
+- **`metadata.SpoolStore` + `spool_entries` table** (`metadata/spool_store.go`,
+  `metadata/spool_schema.go`) — the durable index. Lives in the *same* SQLite
+  database as the `entries` cache, sharing its WAL and `writeMu`. One row per
+  in-flight/pending file (see schema in §15.8). This is what survives a process
+  restart and drives crash recovery.
+
+- **`Drainer`** (`nfs/drainer.go`) — a single dispatcher goroutine + a bounded
+  worker pool (default 4). Sleeps on a wake signal (`signalReady` on each
+  `Close`), with a 30 s poll fallback for missed signals. Per row: atomically
+  claims via `MarkDraining`, copies the spool file into the FUSE mount with a
+  1 MiB buffer, SHA-verifies, then `MarkDrainComplete` (which deletes the spool
+  file only after the SQL row is `done`).
+
+- **`manifestWriter`** (`nfs/spool_manifest.go`) — append-only JSONL audit log
+  at `<root>/manifest.log`; records every drain-done and quarantine event with
+  the path, size, and SHA-256. Non-fatal if it fails to open (audit-only).
+
+### 15.3 Write flow
+
+```
+Finder/Premiere WRITE → handler.OpenFile(O_CREATE)
+  │  (spool != nil && O_CREATE set)
+  ▼
+spool.OpenWrite(filename)
+  ├─ index hit → refcount++ and reuse (same-path reopen)
+  ├─ capacity exhausted → ErrSpoolFull → NFS3ERR_NOSPC
+  └─ else: meta.Insert(row, state=writing) + O_EXCL create <root>/files/<hash>-<ts>
+  ▼
+return spoolWriteFile (handler also SetInode + tracks active-writer)
+  │
+  ▼  per WRITE RPC:
+spoolWriteFile.WriteAt → entry.WriteAt(p, off)
+  ├─ CAS-reserve capacity for any new bytes (ErrSpoolFull if over cap)
+  ├─ file.WriteAt(p, off)
+  └─ fold p into streaming SHA-256 (unless an out-of-order write invalidated it)
+  │
+  ▼  on Close (last refcount):
+entry.Close → fsync + close fd → finalize SHA → meta.MarkReady(size, sha) → signalReady()
+  ▼
+NFS response: OK (durable on local SSD; Finder considers the write complete)
+```
+
+The spool file basename is `hex(SHA-256(nfs_path))[:8] + "-" + unixMicros` — the
+hash prefix avoids filesystem-character issues with the NFS path (slashes,
+spaces, unicode), the timestamp suffix avoids collisions on rapid re-opens.
+
+### 15.4 Read flow (3-tier + Stat/Lstat shadow)
+
+The read path gains one tier *in front of* the existing §4 read path:
+
+```
+handler.OpenFile(read) → spool.LookupActive(filename)
+  ├─ hit  → spoolReadFile.ReadAt (pread on the local-SSD spool file)
+  └─ miss → existing cachedFile path: memBuf → cache.Reader → FUSE
+```
+
+This closes slice C's "just-written file is briefly invisible until drained"
+limitation: between `Close` and the drainer's copy-into-FUSE, the bytes live
+only in the spool, so reads are served from there. `Stat` and `Lstat` apply the
+same shadow — when a path is in the spool index they report the entry's live
+`writtenEnd` and `lastWrite` mtime (same shadowing rule §5.9's `writeSizes`
+established), so a file being written reports a growing size in real time rather
+than 0 / 1970-epoch. The miss case is the unchanged hot path — the index lookup
+is the ~8 ns QA-35-gated cost noted above.
+
+### 15.5 Drainer dispositions
+
+For each claimed row the worker (`drainOne`) ends in exactly one disposition:
+
+- **Success:** copy completes, size matches, SHA-256 matches (both the
+  spool-read stream and the at-rest re-read through FUSE) → `MarkDrainComplete`
+  marks the row `done`, removes the spool file, releases capacity, evicts the
+  index entry, appends a manifest record.
+- **Transient failure** (mkdir/open/create/copy/close error, size mismatch, or
+  a SQL error from `MarkDrainComplete`): `MarkDrainRetry` bumps `drain_attempts`
+  + `last_error` and resets the row to `ready`. Exponential backoff
+  (`base 1 s << (attempts-1)`, capped 30 s) is scheduled via a **separate timer
+  goroutine** — the worker frees its semaphore slot immediately rather than
+  sleeping on it. After `MaxAttempts` (default 5) → permanent `failed`.
+- **SHA mismatch** (a bit flip on the spool SSD, or corruption through FUSE):
+  `QuarantineDrain` marks the row `failed`, moves the spool file to
+  `<root>/quarantine/`, releases capacity, and logs a manifest quarantine event.
+  Retrying a bit flip would only re-detect it, so the file is preserved for
+  forensics and never deleted.
+
+`MarkDrainComplete` is ordered so a transient SQL failure can never convert a
+successfully-drained file into data loss: the SQL `MarkDone` runs first, and
+only on its success is the spool file removed and capacity released.
+
+### 15.6 Crash recovery (`SpoolStore.RecoverOnBoot`)
+
+The boot scrubber runs once at startup, after `NewSpoolStore`/`InitSpoolSchema`
+and **before** `drainer.Start` (it asserts the no-concurrent-drainer invariant
+and panics if violated). It reconciles on-disk spool files against the SQL rows:
+
+| Situation | Action |
+|-----------|--------|
+| File on disk, no SQL row | delete the orphan file |
+| Row `writing` (crash mid-write) | `MarkFailed` + delete the partial file — the NFS client doesn't know its in-flight WRITEs weren't durable, so resume is unsafe |
+| Row `ready`, file present | re-account bytes against the capacity counter; leave state (drainer picks it up) |
+| Row `ready`/`draining`, file missing | `MarkFailed` (no data to retry) |
+| Row `draining`, file present | `ResetToReady` so the drainer re-attempts; re-account bytes |
+| Row `done`/`failed`, stale file present | remove the stale file (terminal rows keep no file) |
+
+The capacity counter is reset to 0 and rebuilt from the surviving `ready`/
+`draining` rows, so recovery is idempotent. The in-memory index is *not*
+repopulated — recovered paths haven't reached FUSE yet, so reads briefly return
+ENOENT until the drainer copies them in (same window as slice C).
+
+### 15.7 Integrity discipline
+
+SHA-256 is enforced at every hop:
+
+1. **On write:** computed streaming as bytes land in the spool file. Invalidated
+   (and re-derived from disk by the drainer) if any out-of-order `WriteAt`
+   arrives.
+2. **On drain-read:** the bytes read back out of the spool file are re-hashed
+   and compared to the recorded SHA → catches a spool-SSD bit flip.
+3. **At rest in FUSE:** after the copy, the destination is re-read *through the
+   FUSE mount* and re-hashed → catches corruption introduced by the FUSE/JuiceFS
+   writeback in flight. (Performed only for sequential writes, where a trusted
+   reference SHA exists; out-of-order writes rely on the manifest log instead.)
+
+Cost is ~1 GB/s on Apple Silicon NEON — negligible against 80–500 MB/s NVMe and
+the one extra sequential read per drained file. The append-only `manifest.log`
+records the SHA + timestamp for every drain-done and quarantine, as a
+tamper-evident audit trail.
+
+### 15.8 Capacity and SQLite schema
+
+Capacity defaults to 50 GiB (`JM_SPOOL_SIZE_GB`), 0 = unlimited. Reservation is
+incremental per `WriteAt` (we don't know a file's final size in advance); an
+overflowing write returns `ErrSpoolFull`, which the handler maps to
+`NFS3ERR_NOSPC` so Finder shows a clean "disk full."
+
+```sql
+CREATE TABLE IF NOT EXISTS spool_entries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    nfs_path        TEXT NOT NULL,
+    spool_file      TEXT NOT NULL UNIQUE,
+    size            INTEGER NOT NULL DEFAULT 0,
+    sha256          BLOB,
+    drain_state     TEXT NOT NULL CHECK(drain_state IN
+                      ('writing','ready','draining','done','failed')),
+    drain_attempts  INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spool_drain_state ON spool_entries(drain_state);
+CREATE INDEX IF NOT EXISTS idx_spool_path        ON spool_entries(nfs_path);
+```
+
+Canonical `drain_state` transitions: `writing→ready` (clean close),
+`writing→failed` (crash, via scrubber), `ready→draining` (claimed),
+`draining→done` (drained + verified), `draining→ready` (interrupted, via
+scrubber), `draining→failed` (attempts exhausted), `failed→ready` (operator
+manual retry).
+
+### 15.9 Configuration and JuiceFS interaction
+
+All env-gated (parsed identically by the Swift bridge in `bridge/cbridge.go` and
+the CLI in `cmd/jm5/main.go`):
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `JM_SPOOL_ENABLE` | `0` (off) | `1` enables the spool; otherwise the §4 direct-to-FUSE write path runs |
+| `JM_SPOOL_DIR` | `~/Library/Application Support/JuiceMount/spool/` (Darwin; `$TMPDIR/…` fallback) | spool root directory |
+| `JM_SPOOL_SIZE_GB` | `50` | capacity cap in GiB; values < 1 are ignored |
+| `JM_WAN_MODE` | off | `1` raises JuiceFS `--max-uploads` 20 → 64 (more parallel PUTs to cover bandwidth-delay product on a fat WAN pipe) |
+| `JM_MAX_UPLOADS` | unset | direct `--max-uploads <n>` override; wins over `JM_WAN_MODE` |
+
+Note the spool does **not** require bumping JuiceFS `--buffer-size` (it stays at
+the QA-33 value of 4096); the spool absorbs the write burst, and the drainer
+feeds JuiceFS at a steady pace. `JM_WAN_MODE` / `JM_MAX_UPLOADS` tune the
+*drain-to-MinIO* side, not the Finder-facing write side.
+
+### 15.10 HTTP control plane
+
+`GET /spool` on the metrics/control server (port 11050) returns the live spool
+state for the menu bar + Manager UI. `503` when the spool is disabled, `500`
+(with a partial body) on SQL error, `200` on the happy path:
+
+```json
+{ "enabled": true, "pending_files": 12, "pending_bytes": 3400000000,
+  "in_progress": 4, "succeeded": 880, "failed": 0, "quarantined": 0,
+  "capacity_used": 3400000000, "capacity_total": 53687091200,
+  "entries": [ { "path": "...", "size": ..., "drain_state": "draining",
+                 "drain_attempts": 0, "updated_at_unix": ... } ] }
+```
+
+The entry list is capped at 200 newest rows to keep the 1 Hz menu-bar poll cheap.
+
+### 15.11 What's deferred (not yet shipped)
+
+The data contract above is stable, but these consumer surfaces are not yet built:
+the Swift menu-bar "Pending uploads" section + icon badge, the Manager web-UI
+tile, the `App.swift` graceful-quit-with-pending-uploads dialog, the Preferences
+"Sync & Upload" pane, and the 24-hour live soak test.
+
+### 15.12 Rollback
+
+`JM_SPOOL_ENABLE=0` (the default) reverts to the existing `writeFile` path; the
+spool directory is unused and no behavior changes. Spool files persisted from a
+prior enabled run remain on disk and are drained on the next enabled start (the
+SQL index drives the drainer). After a clean soak the flag is intended to flip
+to default-on, with the env var retained as the rollback lever.

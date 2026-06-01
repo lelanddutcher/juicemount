@@ -303,10 +303,29 @@ func Open(dbPath string) (*Store, error) {
 func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	// For in-memory databases with multiple connections, use shared cache
 	// so all connections see the same database.
+	dsn := dbPath
 	if dbPath == ":memory:" {
-		dbPath = "file::memory:?mode=memory&cache=shared"
+		dsn = "file::memory:?mode=memory&cache=shared"
 	}
-	db, err := sql.Open("sqlite", dbPath)
+
+	// busy_timeout MUST be a DSN pragma, not an Exec'd one. Pragmas set via
+	// db.Exec(pragmas) apply only to the single pooled connection that ran
+	// them; with SetMaxOpenConns(8) the other connections lack busy_timeout.
+	// The entries store hides this because its own writeMu serializes all its
+	// writes (never two concurrent writers). But metadata.SpoolStore holds an
+	// INDEPENDENT write mutex over this same DB, so a spool write and an
+	// entries write can land on two different pooled connections at once — and
+	// a connection without busy_timeout returns SQLITE_BUSY immediately
+	// instead of waiting. modernc applies a DSN _pragma to EVERY connection it
+	// opens, which is exactly what cross-store write safety needs (surfaced by
+	// the spool concurrent-drain integration test, 2026-05-29).
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	dsn += sep + "_pragma=busy_timeout(30000)"
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}

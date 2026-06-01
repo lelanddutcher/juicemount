@@ -46,11 +46,14 @@ You'll see a small drive icon appear in your menu bar. Click it to open the popo
 │  │  • JuiceFS FUSE manager      │    │
 │  │  • SSD cache reader          │    │
 │  │  • Memory buffer             │    │
+│  │  • Write spool + drainer     │    │
 │  └──────────────────────────────┘    │
 └─────────────────────────────────────┘
 ```
 
 The menu bar app and the Go core run **in the same process**. There's no IPC overhead — function calls cross language via the C ABI.
+
+The Go stack also runs the **write spool + drainer** (Option 2) when `JM_SPOOL_ENABLE=1` — see `ARCHITECTURE_juicemount.md` § 15. Its menu-bar surface (a *Pending uploads* section + an icon badge) is not yet wired; pending-upload status is currently exposed on the control plane at `127.0.0.1:11050/spool`.
 
 ## Features
 

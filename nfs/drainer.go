@@ -52,6 +52,13 @@ type Drainer struct {
 	inFlight sync.WaitGroup
 
 	metrics DrainerMetrics
+
+	// onDrainComplete, if set, is invoked after a row successfully drains to
+	// FUSE (post-MarkDrainComplete). Set once via SetOnDrainComplete BEFORE
+	// Start; the handler uses it to sync the drained file's real size into
+	// the metadata cache. Worker goroutines read it after Start, so
+	// set-before-Start provides the happens-before (no lock needed).
+	onDrainComplete func(nfsPath string, size int64)
 }
 
 // DrainerConfig controls drainer behavior. Zero values fall back to
@@ -170,6 +177,12 @@ func (d *Drainer) Stop(deadline time.Duration) bool {
 // Metrics returns the live counter struct. Caller may read fields
 // concurrently with worker activity.
 func (d *Drainer) Metrics() *DrainerMetrics { return &d.metrics }
+
+// SetOnDrainComplete registers a callback invoked once per successful drain,
+// after the row is marked done. Must be called BEFORE Start.
+func (d *Drainer) SetOnDrainComplete(fn func(nfsPath string, size int64)) {
+	d.onDrainComplete = fn
+}
 
 // wakeNonBlocking is the callback handed to SpoolStore.SetDrainerWake.
 // Sends on the notify channel without blocking — if the dispatcher is
@@ -381,6 +394,9 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 	d.metrics.DrainsSucceeded.Add(1)
 	d.metrics.BytesDrained.Add(n)
+	if d.onDrainComplete != nil {
+		d.onDrainComplete(row.NFSPath, row.Size)
+	}
 }
 
 // failTransient: retryable failure path. Bumps attempts, schedules a

@@ -101,6 +101,16 @@ type HealthMonitor struct {
 	remountFn       func() error // optional: called to remount the NFS volume
 	nfsStaleStreak  int          // consecutive failed NFS checks
 	lastRemountAt   time.Time    // last successful remount time
+
+	// FUSE health debounce (anti-flap). The raw checkFUSE probe flips on
+	// every backend-link blip; reporting that verbatim strobes the menu bar.
+	// Require several consecutive unhealthy raw checks before flipping the
+	// REPORTED FUSE state to degraded; recover on the first healthy check.
+	// Guarded by mu.
+	fuseRawUnhealthyStreak int
+	fuseRawHealthyStreak   int
+	fuseDebounced          ComponentStatus
+	fuseDebouncedInit      bool
 }
 
 // Tunables for NFS auto-remount. Exposed as vars so tests can override.
@@ -116,6 +126,15 @@ var (
 	// NFSStatTimeout bounds an os.Stat() probe of the NFS mount point.
 	// If the syscall hangs longer than this, the mount is considered stale.
 	NFSStatTimeout = 5 * time.Second
+
+	// FUSEFlapToDegraded is the number of consecutive unhealthy raw FUSE
+	// probes (10s apart) required before the REPORTED FUSE status flips to
+	// degraded. Anti-flap: a few-second backend-link blip stalls the FUSE
+	// stat and would otherwise strobe the menu-bar indicator up/down every
+	// tick. Recovery is immediate (one healthy probe). The watchdog in
+	// health/fuse.go has its own, separate liveness logic — this only
+	// smooths the reported UI state.
+	FUSEFlapToDegraded = 3
 
 	// forceUnmountFn is the function used to force-unmount a stale mount.
 	// Replaceable so tests can avoid invoking `sudo`.
@@ -230,6 +249,11 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 		fuseStatus.Message = "suppressed (network grace period)"
 		jmlog.Debug("fuse error suppressed during network grace period")
 	}
+
+	// Anti-flap: smooth the reported FUSE status so a few-second backend-link
+	// blip doesn't strobe the menu bar. (Functional outage detection is the
+	// reachability monitor's job; this is purely the reported UI indicator.)
+	fuseStatus = m.debounceFUSE(fuseStatus)
 
 	// Track NFS staleness streaks and trigger auto-remount when needed.
 	m.handleNFSAutoRemount(nfsStatus.Healthy)
@@ -367,6 +391,49 @@ func forceUnmount(mountPoint string) error {
 		return fmt.Errorf("umount -f %s: %v: %s", mountPoint, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// debounceFUSE applies hysteresis to the raw FUSE probe so a transient
+// backend-link blip doesn't strobe the reported status. The reported state
+// flips to degraded only after FUSEFlapToDegraded consecutive unhealthy raw
+// probes; it recovers on the first healthy probe. When degraded, the message
+// tracks the raw probe so the underlying reason is still surfaced.
+func (m *HealthMonitor) debounceFUSE(raw ComponentStatus) ComponentStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.fuseDebouncedInit {
+		m.fuseDebounced = raw
+		m.fuseDebouncedInit = true
+		if raw.Healthy {
+			m.fuseRawHealthyStreak = 1
+		} else {
+			m.fuseRawUnhealthyStreak = 1
+		}
+		return m.fuseDebounced
+	}
+
+	if raw.Healthy {
+		m.fuseRawHealthyStreak++
+		m.fuseRawUnhealthyStreak = 0
+		// Recover immediately on a healthy probe.
+		if !m.fuseDebounced.Healthy {
+			m.fuseDebounced = raw
+		}
+	} else {
+		m.fuseRawUnhealthyStreak++
+		m.fuseRawHealthyStreak = 0
+		// Flip to degraded only after a sustained unhealthy streak.
+		if m.fuseDebounced.Healthy && m.fuseRawUnhealthyStreak >= FUSEFlapToDegraded {
+			m.fuseDebounced = raw
+		}
+	}
+
+	// Keep LastCheck fresh so liveness-of-the-probe is still visible even
+	// while the debounced Healthy bit is held steady.
+	out := m.fuseDebounced
+	out.LastCheck = raw.LastCheck
+	return out
 }
 
 // connStateFor derives the connection state from previous state and health transitions.

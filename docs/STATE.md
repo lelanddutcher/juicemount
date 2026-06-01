@@ -9,6 +9,24 @@ unblocked item is.
 
 ---
 
+## Write spool (Option 2) — ✅ SHIPPED 2026-05-28 (behind `JM_SPOOL_ENABLE`)
+
+All 8 slices (A–H) CI-green on `production-hardening` (mirrored to `main`). A
+local-SSD write spool interposed between the NFS handler and JuiceFS's raw
+staging: Finder writes ack at local-SSD speed; a background drainer copies into
+JuiceFS with SHA-256 verified at every hop (write → drain-read → at-rest in
+FUSE), retrying transient failures and quarantining bit flips. Boot scrubber
+recovers in-flight state across crashes. Gated by `JM_SPOOL_ENABLE` (default
+off); disabled = the prior direct-to-FUSE write path, unchanged.
+
+This closes the WAN write cliff that motivated it (2 GB Tailscale Finder copies
+at ~280 KB/s / ~2-hour ETAs). Canonical record + slice-by-slice plan:
+`docs/ROADMAP/option-2-spool.md`. Architecture: `ARCHITECTURE_juicemount.md`
+§ 15. **Deferred:** Swift menu-bar UI + badge, Manager web-UI tile, `App.swift`
+quit dialog, Preferences "Sync & Upload" pane, and the 24-hour live soak test.
+
+---
+
 ## QA findings (pending investigation)
 
 User-reported issues from live use, not yet diagnosed or assigned to

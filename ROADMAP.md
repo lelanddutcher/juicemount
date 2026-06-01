@@ -2,8 +2,8 @@
 
 **Goal:** Native macOS menu bar app for video editors. Self-hosted JuiceFS-backed shared storage that feels like a local SSD to Premiere, Resolve, FCPX, and Finder. Cellular-capable via offline pinning.
 
-**Last updated:** 2026-05-08
-**Active branch:** `production-hardening`
+**Last updated:** 2026-05-28
+**Active branch:** `production-hardening` (mirrored to `main`)
 
 ---
 
@@ -148,6 +148,32 @@ What's verified live:
 - Stale FUSE: kill juicefs process clears kernel mount; FUSEManager handles this on Stop / re-Start.
 - Redis unreachable >5 min: surfaced via popover health row + structured-log warnings.
 - Verify-and-repair recovery for files marked Failed during a transient FUSE outage.
+
+---
+
+## Write spool (Option 2) — ✅ shipped 2026-05-28 (behind `JM_SPOOL_ENABLE`)
+
+A foundational write-path change landed after Phase 3: a JuiceMount-owned **write spool on local SSD, interposed between the NFS handler and JuiceFS's raw staging**. Writes ack the moment the data is durable on the user's local SSD (`fsync()`), and a background drainer copies into JuiceFS at MinIO's pace. This is the Dropbox / LucidLink / Suite write model — a local-durability boundary with async upload — achieved without forking JuiceFS's `--buffer-size`-gated flow control.
+
+**Why:** live 2 GB / 600-file Finder copies over Tailscale hit ~2-hour ETAs (~280 KB/s) because JuiceFS back-pressures on a RAM-tracked budget even with 700+ GB of disk headroom in `rawstaging/`. Bumping `--buffer-size` steals RAM from DaVinci/Premiere project caches. The spool decouples Finder's "write complete" from the MinIO upload entirely.
+
+**Shipped — all 8 slices CI-green:**
+- **A** Spool primitives + SQLite `spool_entries` index (capacity cap, streaming SHA-256, refcounted entries)
+- **B** Drainer goroutine (single dispatcher + bounded worker pool, exponential-backoff retry, SHA-mismatch quarantine)
+- **C** Write-path integration (`O_CREATE` routes through `spoolWriteFile`; ack at local SSD speed)
+- **D** Read-path 3-tier lookup (`spoolReadFile` + Stat/Lstat shadow; QA-35 perf-gated, empty-spool lookup ~8 ns)
+- **E** Runtime wiring + `GET /spool` control-plane endpoint (port 11050)
+- **F** Crash-recovery boot scrubber (`RecoverOnBoot`: orphan cleanup, `writing`→failed, `draining`→ready, capacity re-accounting)
+- **G** Integrity audit log (append-only `manifest.log`; drain-done + quarantine events with SHA-256)
+- **H** WAN-mode polish (`JM_WAN_MODE` / `JM_MAX_UPLOADS` raise JuiceFS `--max-uploads` 20 → 64)
+
+**Integrity discipline:** SHA-256 computed streaming on write, re-verified when the drainer reads the spool file, and re-verified at-rest through the FUSE mount after copy. Mismatch → quarantine (file moved aside, never deleted), surfaced via the manifest log.
+
+**Rollout:** gated by `JM_SPOOL_ENABLE` (default off). Disabled = the original direct-to-FUSE `writeFile` path, unchanged. Flip to default-on after a clean soak.
+
+**Deferred (not yet shipped):** Swift menu-bar "Pending uploads" section + icon badge, Manager web-UI tile, `App.swift` graceful-quit dialog, Preferences "Sync & Upload" pane, and the 24-hour live soak test. The `/spool` JSON data contract is stable, so those surfaces can land independently.
+
+Full design + slice-by-slice plan: `docs/ROADMAP/option-2-spool.md`. Architecture: `ARCHITECTURE_juicemount.md` § 15.
 
 ---
 

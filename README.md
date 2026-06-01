@@ -2,8 +2,8 @@
 
 A native macOS menu-bar app that makes JuiceFS-backed shared storage feel like a local SSD to Premiere, DaVinci Resolve, Final Cut, and Finder. Self-hosted, cellular-capable, no recurring fees.
 
-**Last updated:** 2026-05-25
-**Active branch:** `production-hardening`
+**Last updated:** 2026-05-28
+**Active branch:** `production-hardening` (mirrored to `main`)
 
 ---
 
@@ -13,6 +13,7 @@ Mounts a Redis + S3 (MinIO / B2 / R2) backed JuiceFS volume at `/Volumes/zpool` 
 
 - **Browse 100 K+ entries instantly** via SQLite metadata cache + FTS5 trigram search.
 - **Read pinned media at LAN / SSD speed** (200+ MB/s sustained, 4.6 MB total network traffic on a 200 MiB read of a cached file).
+- **Write at local-SSD speed even over WAN** *(opt-in, `JM_SPOOL_ENABLE=1`)* — a JuiceMount-owned write spool on local SSD acks Finder writes the moment they're durable locally, then drains into JuiceFS in the background at the network's pace. SHA-256 verified at every hop.
 - **Toggle offline mode** for cellular: pinned files keep working, un-pinned reads fail in <100 ms instead of beachballing.
 - **Pin folders for offline** via popover button or Finder right-click → Services.
 - **Auto-expand JuiceFS cache** to 85% of disk, with `--free-space-ratio 0.01` so the disk is genuinely the cache.
@@ -73,7 +74,7 @@ JuiceMount6/
 ├── cmd/jm5/                   — headless server CLI (long-running NFS server)
 ├── cmd/juicemount/            — control client CLI (talks to running app via HTTP)
 │
-├── nfs/                       — NFS handler, read/write paths, fd pool, readahead, membuf
+├── nfs/                       — NFS handler, read/write paths, fd pool, readahead, membuf, write spool + drainer
 ├── metadata/                  — SQLite store + Redis sync + FTS5 search
 ├── cache/                     — Direct SSD cache reader (Priority 2 read path)
 ├── health/                    — FUSEManager, monitor loop, network watcher
@@ -123,6 +124,27 @@ For full detail see `ARCHITECTURE_juicemount.md` § 11 (pin/prefetcher/offline-m
 
 ---
 
+## How a write happens (with the spool enabled)
+
+```
+Premiere / Finder writes /Volumes/zpool/Project/render.mov
+        ↓
+NFS WRITE RPC → handler.OpenFile(O_CREATE) → spool.OpenWrite
+        ↓
+write bytes to a file on local SSD  ← streaming SHA-256
+        ↓
+Close → fsync → mark "ready" → ACK to Finder   (durable + fast; no wait on MinIO)
+        ↓
+[background] drainer: copy spool file → JuiceFS FUSE → rawstaging → MinIO
+             re-verify SHA-256 at the FUSE hop, then delete the spool file
+```
+
+The spool is the **intermediary between the NFS mount and JuiceFS's raw staging**. It moves the durability checkpoint one step earlier — to our `fsync()` on local SSD — so Finder sees "write complete" without waiting for the upload. This is the Dropbox / LucidLink / Suite write model, achieved without forking JuiceFS's flow control. Reads of a just-written file are served from the spool until the drainer copies it through (3-tier read lookup: spool → cache/readahead/memBuf → FUSE).
+
+Opt-in via `JM_SPOOL_ENABLE=1`; when disabled, writes use the original direct-to-FUSE path unchanged. For full detail see `ARCHITECTURE_juicemount.md` § 15 (write spool) and `docs/ROADMAP/option-2-spool.md`.
+
+---
+
 ## Configuration
 
 Edit Preferences in the app, or set defaults via:
@@ -132,6 +154,7 @@ Edit Preferences in the app, or set defaults via:
 - **Metrics / control plane:** `127.0.0.1:11050`
 - **SSD cache:** auto-expanded to 85% of disk (user pref is a floor)
 - **Memory buffer:** 2 GiB default, files <128 MiB
+- **Write spool (opt-in):** `JM_SPOOL_ENABLE=1` to enable. `JM_SPOOL_DIR` (default `~/Library/Application Support/JuiceMount/spool/`), `JM_SPOOL_SIZE_GB` (default 50). `JM_WAN_MODE=1` raises JuiceFS `--max-uploads` 20 → 64; `JM_MAX_UPLOADS=<n>` overrides directly. Live status at `127.0.0.1:11050/spool`.
 
 Logs:
 - App: `~/Library/Logs/JuiceMount/juicemount.log` (JSON, 16 MB × 5 rotation)
@@ -239,6 +262,8 @@ before deploy. Audit trail in `docs/STATE.md`.
 ## Status
 
 Phase 1 ✅ stability + polish · Phase 2 ✅ menu-bar app · Phase 3 ✅ production hardening (this branch)
+
+**Write spool (Option 2)** ✅ shipped 2026-05-28 behind `JM_SPOOL_ENABLE` — the local-SSD write intermediary (above) that makes Finder writes ack instantly and drain to JuiceFS in the background, fixing the WAN write cliff (2 GB Finder copies over Tailscale had hit 2-hour ETAs). All 8 slices (A–H) are CI-green: spool primitives + SQLite index, drainer, write-path, 3-tier read lookup, runtime wiring + `/spool` endpoint, crash-recovery scrubber, integrity audit log, WAN-mode polish. Server-side + control-plane complete; menu-bar and Manager UI surfaces and live soak testing are deferred. See `ROADMAP.md` and `docs/ROADMAP/option-2-spool.md`.
 
 **Phase 4 — workflow features for video creatives** — see `ROADMAP.md` and `VISION/feature-roadmap-ranked.md`. Top three:
 1. Codec-aware Quick Look proxies (R3D / ARRI / BRAW / ProRes RAW) — 2–3 weeks to ship

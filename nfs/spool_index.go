@@ -86,3 +86,16 @@ func (idx *SpoolIndex) Len() int {
 	idx.mu.RUnlock()
 	return n
 }
+
+// Snapshot returns a slice of the currently-indexed entries. Used by the
+// idle sweeper so it can finalize entries without holding the index lock
+// across the (fsync + SQL) finalize work.
+func (idx *SpoolIndex) Snapshot() []*SpoolEntry {
+	idx.mu.RLock()
+	out := make([]*SpoolEntry, 0, len(idx.byPath))
+	for _, e := range idx.byPath {
+		out = append(out, e)
+	}
+	idx.mu.RUnlock()
+	return out
+}
