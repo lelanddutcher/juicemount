@@ -57,6 +57,23 @@ public final class ServerController {
     private let workQueue = DispatchQueue(label: "com.juicemount.work", qos: .userInitiated)
     private var pollTask: Task<Void, Never>?
 
+    /// Heartbeat: updated at the top of every poll-loop iteration. The recovery
+    /// watchdog uses it to detect a stalled/dead poll loop.
+    private var lastPollTickAt = Date()
+
+    /// Independent recovery path (2026-06-01). The main `workQueue` is SERIAL,
+    /// so a single hung cgo call — e.g. a parked Go-side lock under disk-full /
+    /// FUSE-wedge pressure — wedges it, which freezes the stats path, the
+    /// in-loop `runStuckStateBackstop`, AND offline refresh all at once. That
+    /// leaves the menu bar stuck on "Disconnected"/offline even though the Go
+    /// HTTP `/health` endpoint is still healthy and responding. (The cure used
+    /// to be: quit and relaunch.) This Timer + dedicated queue run the recovery
+    /// probe over HTTP, independent of `workQueue`, so the UI can always climb
+    /// back out. A Timer (not a Task) is used deliberately: it can't be
+    /// silently cancelled/suspended along with the poll loop.
+    private let recoveryQueue = DispatchQueue(label: "com.juicemount.recovery", qos: .utility)
+    private var recoveryTimer: Timer?
+
     /// True once the first offline-state fetch has completed. Used to
     /// suppress the transition notification on the very first refresh
     /// — without this, an app launch into a wake-from-sleep-offline
@@ -359,9 +376,12 @@ public final class ServerController {
 
     private func startPolling() {
         pollTask?.cancel()
+        lastPollTickAt = Date()
+        startRecoveryWatchdog()
         pollTask = Task { [weak self] in
             var tick = 0
             while !Task.isCancelled {
+                self?.lastPollTickAt = Date()   // heartbeat for the recovery watchdog
                 self?.refreshStats()
                 // QA-23 fix (2026-05-18): the offline/cache state was only
                 // refreshing on UI events (popover open, toggle click). After
@@ -432,6 +452,59 @@ public final class ServerController {
                     // Refresh ancillary state too so the popover doesn't
                     // keep showing "Offline · disconnected M:SS" against
                     // an offline_state that's also stale.
+                    self.refreshCacheStatus()
+                default:
+                    return
+                }
+            }
+        }
+    }
+
+    /// Reliable, workQueue-independent recovery watchdog (2026-06-01). Fires on
+    /// a Timer (not the poll Task) and probes `/health` over HTTP on a dedicated
+    /// queue. If the UI is stuck in .disconnected/.degraded while the Go server
+    /// reports healthy, it forces the state back to .running — even when the
+    /// serial workQueue (and thus the in-loop backstop + stats path) is wedged.
+    /// It also revives the poll loop if its heartbeat has gone stale. This is
+    /// the backstop the QA-26 backstop needed: that one runs *inside* the poll
+    /// loop, so if the loop wedges it dies with it.
+    private func startRecoveryWatchdog() {
+        guard recoveryTimer == nil else { return }
+        recoveryTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.recoveryTick() }
+        }
+    }
+
+    @MainActor
+    private func recoveryTick() {
+        let stuck: Bool
+        switch state {
+        case .disconnected, .degraded: stuck = true
+        default:                       stuck = false
+        }
+        guard stuck else { return }
+
+        // If the poll loop's heartbeat is stale, it stalled/died — revive it.
+        // Safe: startPolling cancels the old Task first and refreshes the
+        // heartbeat, so this won't thrash on every tick.
+        let staleSec = Int(Date().timeIntervalSince(lastPollTickAt))
+        if staleSec > 15 {
+            log.warning("recovery watchdog: poll loop heartbeat stale (\(staleSec, privacy: .public)s) — restarting it")
+            startPolling()
+        }
+
+        // Probe /health on an INDEPENDENT queue (never the serial workQueue,
+        // which may be wedged) and force-recover if the backend is healthy.
+        let metricsAddr = preferences.metricsAddr
+        recoveryQueue.async { [weak self] in
+            guard let probe = NFSBridge.healthProbe(metricsAddr: metricsAddr), probe.healthy else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                switch self.state {
+                case .disconnected, .degraded:
+                    self.log.warning("recovery watchdog: /health healthy while UI=\(self.state.displayLabel, privacy: .public) — forcing .running (workQueue-independent)")
+                    self.state = .running
+                    self.stuckTicks = 0
                     self.refreshCacheStatus()
                 default:
                     return
