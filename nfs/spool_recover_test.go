@@ -229,7 +229,7 @@ func TestRecoverOnBootDoneAndFailedIgnored(t *testing.T) {
 	idDone, _ := s.Meta().Insert("/done.bin", filepath.Join(s.Root(), SpoolFilesSubdir, "d1"))
 	_ = s.Meta().MarkReady(idDone, 10, nil)
 	_, _ = s.Meta().MarkDraining(idDone)
-	_ = s.Meta().MarkDone(idDone)
+	_, _ = s.Meta().MarkDone(idDone)
 
 	idFailed, _ := s.Meta().Insert("/failed.bin", filepath.Join(s.Root(), SpoolFilesSubdir, "f1"))
 	_ = s.Meta().MarkFailed(idFailed, "pre-existing failure")

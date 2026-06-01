@@ -1553,6 +1553,14 @@ func (jfs *juiceFS) Remove(filename string) error {
 		jfs.handler.memBuf.Invalidate(filename)
 	}
 
+	// QA-37: cancel any in-flight spool entry FIRST, so a pending or
+	// mid-flight drain can't resurrect the file we're about to delete. A
+	// drain already copying to FUSE undoes its write when it finds the row
+	// gone at MarkDrainComplete.
+	if jfs.handler.spool != nil {
+		jfs.handler.spool.CancelForDelete(filename)
+	}
+
 	// Delete from SQLite first (immediate visibility)
 	e := jfs.handler.store.LookupByPath(filename)
 	jfs.handler.store.Delete(filename)

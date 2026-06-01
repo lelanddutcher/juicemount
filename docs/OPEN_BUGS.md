@@ -32,9 +32,11 @@ Plus earlier sub-fix: Lua SCAN MATCH tightened from `d*` to `d[0-9]*` to exclude
 
 ## P1 — known bug under specific workload
 
-### QA-37 — Delete during spool drain resurrects the file (writes feel local, deletes don't stick)
+### ~~QA-37 — Delete during spool drain resurrects the file (writes feel local, deletes don't stick)~~
 
-**Status:** OPEN, found + reproduced 2026-06-01 (this Mac, 10GbE LAN, build with write-spool enabled).
+**Status:** ✓ FIXED 2026-06-01. The NFS REMOVE path now cancels any in-flight spool entry before the drainer can resurrect it: `nfs/handler.go Remove` calls `SpoolStore.CancelForDelete` (evict index entry + `metadata.DeleteActiveByPath` deletes the writing/ready/draining row(s) under `writeMu` + remove spool file + release capacity). `metadata.MarkDone` now returns rows-affected and `nfs.MarkDrainComplete` returns `(done bool, _)`; a drain that finds its row cancelled (`done==false`) undoes its FUSE write (`os.Remove(dest)`) instead of completing. The DELETE and the drainer's MarkDone are serialized by `writeMu`, so exactly one of {complete, cancel} wins and the loser observes the resolved state. Regression tests in `nfs/spool_delete_race_test.go` (RED→GREEN: before-drain cancel + in-flight `draining`-state cancel), green under `-race`. **Live-verified** on the real mount: write 20 files + immediate delete mid-drain → 0 resurrected (was: all 20 reappeared).
+
+**Original report —** found + reproduced 2026-06-01 (this Mac, 10GbE LAN, build with write-spool enabled).
 
 **Symptom:** Deleting a file while its spooled copy is still draining to JuiceFS/MinIO returns success, but the drainer then writes the file back — it reappears. Reproduced deterministically: write 20×256 KB files, immediately delete all 20 (NFS REMOVE returns 0 errors); as the spool drains `pending → 0`, all 20 files reappear. **Control:** deleting the same files *after* the drain settles holds correctly (0 reappear) — so it is specifically a delete↔drain race, not a delete bug. Also observed incidentally: an `os.rmdir` "succeeded" yet the directory + files were back moments later.
 

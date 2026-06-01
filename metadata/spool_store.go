@@ -113,20 +113,74 @@ func (s *SpoolStore) MarkDraining(id int64) (bool, error) {
 	return n > 0, nil
 }
 
-// MarkDone transitions draining→done. Drainer calls this after the FUSE
-// copy + SHA verify succeed.
-func (s *SpoolStore) MarkDone(id int64) error {
+// MarkDone transitions a row to done and reports whether a row was actually
+// updated. The WHERE clause is by id only, so any row that still exists (in
+// any state) is marked done and reported true. The one case that returns
+// false is a row DELETED out from under the drainer: the NFS delete path
+// cancels in-flight spool entries (QA-37, DeleteActiveByPath), and the drainer
+// uses a false return to know it must UNDO its FUSE write rather than
+// resurrect a file the user already deleted.
+func (s *SpoolStore) MarkDone(id int64) (bool, error) {
 	now := time.Now().Unix()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.db.Exec(
+	res, err := s.db.Exec(
 		`UPDATE spool_entries SET drain_state=?, updated_at=? WHERE id=?`,
 		DrainDone, now, id,
 	)
 	if err != nil {
-		return fmt.Errorf("spool mark done %d: %w", id, err)
+		return false, fmt.Errorf("spool mark done %d: %w", id, err)
 	}
-	return nil
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// DeleteActiveByPath removes every non-terminal (writing/ready/draining) row
+// for nfsPath and returns the rows it removed, so the caller can clean up the
+// associated spool files + capacity reservations. Terminal rows (done/failed)
+// are left for the audit trail / GC.
+//
+// This is the SQL half of the QA-37 delete↔drain fix. Every spool state
+// transition (MarkDraining, MarkDone, …) takes writeMu, so holding it across
+// the SELECT+DELETE makes the cancel atomic with respect to an in-flight
+// drain: a concurrent MarkDraining/MarkDone either committed before this call
+// (and is observed by the SELECT) or blocks until after the DELETE (and then
+// finds 0 rows). No row can be half-claimed across the cancel.
+func (s *SpoolStore) DeleteActiveByPath(nfsPath string) ([]*SpoolRow, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.db.Query(
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		 FROM spool_entries WHERE nfs_path=? AND drain_state IN ('writing','ready','draining')`,
+		nfsPath,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("spool delete-active-by-path select %q: %w", nfsPath, err)
+	}
+	var out []*SpoolRow
+	for rows.Next() {
+		r, scanErr := scanSpoolRow(rows.Scan)
+		if scanErr != nil {
+			rows.Close()
+			return nil, scanErr
+		}
+		out = append(out, r)
+	}
+	errRows := rows.Err()
+	rows.Close()
+	if errRows != nil {
+		return nil, errRows
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	if _, err := s.db.Exec(
+		`DELETE FROM spool_entries WHERE nfs_path=? AND drain_state IN ('writing','ready','draining')`,
+		nfsPath,
+	); err != nil {
+		return out, fmt.Errorf("spool delete-active-by-path delete %q: %w", nfsPath, err)
+	}
+	return out, nil
 }
 
 // MarkFailed transitions any state → failed with an attempt-counter bump

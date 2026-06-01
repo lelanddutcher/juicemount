@@ -375,7 +375,8 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		}
 	}
 
-	if err := d.spool.MarkDrainComplete(row.ID, row.NFSPath, row.SpoolFile, row.Size); err != nil {
+	done, err := d.spool.MarkDrainComplete(row.ID, row.NFSPath, row.SpoolFile, row.Size)
+	if err != nil {
 		// Reviewer fix (slice B follow-on): MarkDrainComplete promises
 		// the caller will retry on SQL failure. Doing so here means a
 		// transient SQLite error (busy, WAL checkpoint) doesn't strand
@@ -390,6 +391,14 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		// version. Best-effort removal here closes that window.
 		_ = os.Remove(dest)
 		d.failTransient(row, fmt.Errorf("mark drain complete: %w", err))
+		return
+	}
+	if !done {
+		// The NFS layer deleted this path while we were draining (QA-37):
+		// the spool row was cancelled out from under us. Undo the FUSE write
+		// so the delete sticks instead of resurrecting the file.
+		_ = os.Remove(dest)
+		log.Printf("drainer: row %d (%s) cancelled mid-drain (deleted) — undid FUSE write", row.ID, row.NFSPath)
 		return
 	}
 	d.metrics.DrainsSucceeded.Add(1)

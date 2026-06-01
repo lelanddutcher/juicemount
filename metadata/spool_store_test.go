@@ -93,7 +93,7 @@ func TestSpoolStoreLifecycle(t *testing.T) {
 		t.Fatalf("second MarkDraining should not re-claim a draining row")
 	}
 
-	if err := s.MarkDone(id); err != nil {
+	if _, err := s.MarkDone(id); err != nil {
 		t.Fatalf("mark done: %v", err)
 	}
 	row, _ = s.Get(id)
@@ -121,7 +121,7 @@ func TestSpoolStoreLookupByPathReturnsLatest(t *testing.T) {
 	id1, _ := s.Insert("/dup.mov", "/spool/files/a")
 	_ = s.MarkReady(id1, 100, nil)
 	_, _ = s.MarkDraining(id1)
-	_ = s.MarkDone(id1) // done rows are excluded from LookupByPath
+	_, _ = s.MarkDone(id1) // done rows are excluded from LookupByPath
 
 	id2, _ := s.Insert("/dup.mov", "/spool/files/b")
 
@@ -183,7 +183,7 @@ func TestSpoolStorePendingStats(t *testing.T) {
 	id3, _ := s.Insert("/c", "/spool/files/c")
 	_ = s.MarkReady(id3, 300, nil)
 	_, _ = s.MarkDraining(id3)
-	_ = s.MarkDone(id3) // excluded from pending
+	_, _ = s.MarkDone(id3) // excluded from pending
 
 	pending, bytes, err := s.PendingStats()
 	if err != nil {
@@ -239,14 +239,14 @@ func TestSpoolStoreDeleteDone(t *testing.T) {
 	idOldDone, _ := s.Insert("/old-done", "/spool/files/o1")
 	_ = s.MarkReady(idOldDone, 10, nil)
 	_, _ = s.MarkDraining(idOldDone)
-	_ = s.MarkDone(idOldDone)
+	_, _ = s.MarkDone(idOldDone)
 	// Force its updated_at to the past.
 	_, _ = db.Exec(`UPDATE spool_entries SET updated_at=0 WHERE id=?`, idOldDone)
 
 	idNewDone, _ := s.Insert("/new-done", "/spool/files/o2")
 	_ = s.MarkReady(idNewDone, 10, nil)
 	_, _ = s.MarkDraining(idNewDone)
-	_ = s.MarkDone(idNewDone)
+	_, _ = s.MarkDone(idNewDone)
 
 	idOldReady, _ := s.Insert("/old-ready", "/spool/files/o3")
 	_ = s.MarkReady(idOldReady, 10, nil)

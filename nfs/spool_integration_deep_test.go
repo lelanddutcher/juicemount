@@ -284,7 +284,7 @@ func TestSpoolReopenWhileDrainingBlocksThenFresh(t *testing.T) {
 	}
 
 	// Simulate the drainer completing: evicts the entry from the index.
-	if err := s.MarkDrainComplete(e1.ID(), e1.NFSPath(), e1.SpoolFilePath(), e1.WrittenEnd()); err != nil {
+	if _, err := s.MarkDrainComplete(e1.ID(), e1.NFSPath(), e1.SpoolFilePath(), e1.WrittenEnd()); err != nil {
 		t.Fatalf("MarkDrainComplete: %v", err)
 	}
 

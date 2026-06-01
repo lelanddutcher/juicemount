@@ -533,7 +533,7 @@ func TestSpoolMarkDrainCompleteSQLFailurePreservesData(t *testing.T) {
 	// Force SQL failure by closing the underlying db.
 	_ = db.Close()
 
-	err = s.MarkDrainComplete(e.ID(), "/precious.bin", e.SpoolFilePath(), int64(len(payload)))
+	_, err = s.MarkDrainComplete(e.ID(), "/precious.bin", e.SpoolFilePath(), int64(len(payload)))
 	if err == nil {
 		t.Fatalf("expected MarkDrainComplete to return SQL error on closed db")
 	}
