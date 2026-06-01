@@ -115,7 +115,7 @@ func TestManifestRecordsDrainDoneViaMarkDrainComplete(t *testing.T) {
 	}
 	_, _ = s.Meta().MarkDraining(e.ID())
 
-	if err := s.MarkDrainComplete(e.ID(), e.NFSPath(), e.SpoolFilePath(), 5); err != nil {
+	if _, err := s.MarkDrainComplete(e.ID(), e.NFSPath(), e.SpoolFilePath(), 5); err != nil {
 		t.Fatalf("MarkDrainComplete: %v", err)
 	}
 

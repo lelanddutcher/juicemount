@@ -494,9 +494,18 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 // failTransient, which retries. Slice F's boot scrubber covers crashes
 // between SQL success and the post-SQL cleanup (in that narrow window
 // the file exists on disk + capacity stays counted, harmless).
-func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size int64) error {
-	if err := s.meta.MarkDone(id); err != nil {
-		return err
+func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size int64) (bool, error) {
+	done, err := s.meta.MarkDone(id)
+	if err != nil {
+		return false, err
+	}
+	if !done {
+		// The row was cancelled (deleted) while this drain was in flight:
+		// the NFS layer deleted nfsPath (QA-37). Do NOT remove the spool
+		// file, release capacity, or write a manifest "done" record here —
+		// CancelForDelete already owns that cleanup. A false return tells the
+		// drainer to undo the FUSE write it just made.
+		return false, nil
 	}
 	// Finding 3 fix: evict the in-memory index entry BEFORE removing the
 	// spool file. New reads then miss the index and fall through to FUSE
@@ -536,7 +545,43 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 				id, nfsPath, appendErr)
 		}
 	}
-	return nil
+	return true, nil
+}
+
+// CancelForDelete cancels any in-flight spool entry for nfsPath so a pending
+// or mid-flight drain cannot resurrect a file the NFS layer is deleting
+// (QA-37). It evicts the in-memory index entry, deletes the SQL row(s), and
+// removes the spool file(s) + capacity reservation. Safe to call when no
+// entry exists (no-op).
+//
+// Race handling: a drain already past its os.Open of the spool file will
+// finish copying to FUSE, then find its row gone at MarkDrainComplete (which
+// returns done=false) and undo the FUSE write. DeleteActiveByPath's DELETE and
+// the drainer's MarkDone are serialized by SpoolStore.writeMu, so exactly one
+// of {complete, cancel} wins and the loser observes the resolved state.
+func (s *SpoolStore) CancelForDelete(nfsPath string) {
+	// Evict the index entry first so concurrent reads/opens miss the spool
+	// and fall through to FUSE.
+	e, indexed := s.index.Lookup(nfsPath)
+	if indexed {
+		s.index.DeleteIfMatches(nfsPath, e)
+	}
+	rows, err := s.meta.DeleteActiveByPath(nfsPath)
+	if err != nil {
+		log.Printf("spool: cancel-for-delete %q: %v", nfsPath, err)
+	}
+	for _, r := range rows {
+		sz := r.Size
+		if indexed && e.id == r.ID && e.WrittenEnd() > sz {
+			// `writing`-state rows persist size=0 until finalize; the live
+			// entry knows the bytes actually reserved against capacity.
+			sz = e.WrittenEnd()
+		}
+		s.releaseCapacity(sz)
+		if rmErr := os.Remove(r.SpoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("spool: cancel-for-delete remove %s: %v", r.SpoolFile, rmErr)
+		}
+	}
 }
 
 // MarkDrainRetry is the transient-failure path: bumps drain_attempts +
