@@ -62,9 +62,11 @@ Plus earlier sub-fix: Lua SCAN MATCH tightened from `d*` to `d[0-9]*` to exclude
 
 **Smallest viable next step:** instrument the QA-28 redirect path with a counter (`inode_redirects_total`, `alias_inode_drops_total`). Re-run pin-coverage-verify with the counter visible. If the drop count climbs in lockstep with STALE events, we've found the leak. Fix is to extend Layer B's shadow map to also park aliases on eviction.
 
-### QA-36 — Mac client stuck after long network outage (≥1h); won't reconnect on its own
+### ~~QA-36 — Mac client stuck after long network outage (≥1h); won't reconnect on its own~~
 
-**Status:** OPEN, logged 2026-05-26. Reproduced live (this Mac, build da46708, between 18:43 and 20:30 EDT). Workaround verified.
+**Status:** ✓ FIXED 2026-06-01, verified against a controlled outage repro. The fix is the FUSE-escalation path in commit `9910f34` (`health/fuse.go monitorLoop`): when the mount is wedged + juicefs is alive + the backend is reachable for a sustained window, the watchdog escalates to a kill+remount of juicefs — exactly the "force a full teardown+respawn of the juicefs subprocess when the network returns" this ticket's smallest-viable-next-step prescribed. **Live verification (2026-06-01):** blocked the Mac→Redis+MinIO path at the TrueNAS for 6 minutes (past the reconnect-backoff window). The app engaged offline + wedged FUSE WITHOUT thrashing juicefs (watchdog deferred: "backend unreachable — a remount cannot succeed during a real outage"). On restore: `21:23:13 network path to backend recovered` → `escalating to remount (last resort)` → `21:23:17 fuse escalation remount succeeded`. **The juicefs connection did NOT self-heal — confirming the stuck-pool was real — so the escalation kill+remount was needed and did the job.** Full recovery (healthy=True, fuse=ok, offline=False) in ~15s, no manual restart (acceptance bar was 60s). Recovery-watchdog `dedc700` is the UI-side backstop.
+
+**Original report (preserved) —** logged 2026-05-26. Reproduced live (this Mac, build da46708, between 18:43 and 20:30 EDT). Workaround verified.
 
 **Symptom:** When the LAN path from the Mac to the TrueNAS box is broken for an extended period (~1.5h in this incident), JuiceMount enters a state it cannot recover from automatically even after the network comes back. UI reports "Server is in error." Log shows:
 
@@ -241,9 +243,11 @@ via env if needed).
 
 ---
 
-### QA-38 — Menu bar shows persistent "offline / disconnected" while mount is online
+### ~~QA-38 — Menu bar shows persistent "offline / disconnected" while mount is online~~
 
-**Status:** OPEN, logged 2026-05-28 from live testing.
+**Status:** ✓ FIXED 2026-06-01 (commit `dedc700`). Root cause: every UI-recovery path in `ServerController` (stats, the QA-26 `runStuckStateBackstop`, offline-state refresh) ran through ONE serial `workQueue`; under extreme pressure (disk 100% full + FUSE wedged) a hung cgo call parked that queue, freezing all recovery — and the backstop meant to climb out of `.disconnected` ran *inside* the wedged poll loop, so it died with it. The cure was quit-and-relaunch. Fix: an independent recovery watchdog — a reliable `Timer` (not the cancellable poll Task) that probes `/health` over HTTP on a dedicated queue (never `workQueue`) and forces `.running` when the backend reports healthy, plus a poll-loop heartbeat to revive a stalled loop. Bypassing `workQueue` entirely means the UI can always reconverge. **Verified:** during the QA-36 6-min-outage test (2026-06-01) the UI tracked the backend state cleanly with no phantom-stuck, recovering with the backend in ~15s; user also confirms the bug has been absent since the fix landed.
+
+**Original report (preserved) —** logged 2026-05-28 from live testing.
 
 **Symptom:** JuiceMount menu-bar app's status indicator reports
 "offline" / "disconnected" persistently, even though `/Volumes/zpool` is
