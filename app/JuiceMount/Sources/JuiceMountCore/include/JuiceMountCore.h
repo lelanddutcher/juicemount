@@ -34,6 +34,10 @@ char* NFSServerCacheStatus(void);
 char* NFSServerSetOffline(int on);
 int NFSServerIsOffline(void);
 
+// Logging — bridge a Swift-side line into the Go rotating file log
+// (~/Library/Logs/JuiceMount/juicemount.log), prefixed "[swift]".
+void NFSServerLog(char* msg);
+
 // Memory management — every char* returned by the above must be freed with this
 void NFSServerFreeString(char* s);
 
