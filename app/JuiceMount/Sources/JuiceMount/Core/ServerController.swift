@@ -74,6 +74,11 @@ public final class ServerController {
     private let recoveryQueue = DispatchQueue(label: "com.juicemount.recovery", qos: .utility)
     private var recoveryTimer: Timer?
 
+    /// Set when the user explicitly stops the server (Stop / Stop Mount) or a
+    /// restart soft-stops it; cleared on start(). The recovery watchdog respects
+    /// it so it never resurrects a server that's intentionally down.
+    private var userStopRequested = false
+
     /// True once the first offline-state fetch has completed. Used to
     /// suppress the transition notification on the very first refresh
     /// — without this, an app launch into a wake-from-sleep-offline
@@ -99,6 +104,11 @@ public final class ServerController {
             // running, not just to the start() path.
             startPolling()
         }
+        // Always run the recovery watchdog from launch — even if the server
+        // isn't started yet, or a later start() fails — so a stuck .idle/.error
+        // can never become permanent. It no-ops unless a fresh /health probe
+        // proves the backend is actually up.
+        startRecoveryWatchdog()
     }
 
     // MARK: - Lifecycle
@@ -106,6 +116,7 @@ public final class ServerController {
     public func start() {
         guard case .idle = state else { return }
         state = .starting
+        userStopRequested = false
         let cfg = preferences.toServerConfig()
         // Spool (Option 2) settings travel in the config JSON (cfg.spoolEnable
         // / spoolSizeGB), NOT via env: Go snapshots os.Environ at c-archive
@@ -139,6 +150,7 @@ public final class ServerController {
 
     public func stop(completion: (@MainActor () -> Void)? = nil) {
         log.info("Stopping server (full unmount)")
+        userStopRequested = true
         pollTask?.cancel()
         pollTask = nil
         workQueue.async { [weak self] in
@@ -157,6 +169,7 @@ public final class ServerController {
     /// disappears from Finder; the backend stays warm.
     public func stopMount(completion: (@MainActor () -> Void)? = nil) {
         log.info("Stopping mount + draining sync (FUSE stays alive)")
+        userStopRequested = true
         pollTask?.cancel()
         pollTask = nil
         workQueue.async { [weak self] in
@@ -174,6 +187,7 @@ public final class ServerController {
     /// — the user-facing Stop button uses the hard `stop()` above.
     private func softStop(completion: (@MainActor () -> Void)? = nil) {
         log.info("Soft-stopping server (mounts preserved)")
+        userStopRequested = true
         pollTask?.cancel()
         pollTask = nil
         workQueue.async { [weak self] in
@@ -477,38 +491,46 @@ public final class ServerController {
 
     @MainActor
     private func recoveryTick() {
-        let stuck: Bool
-        switch state {
-        case .disconnected, .degraded: stuck = true
-        default:                       stuck = false
-        }
-        guard stuck else { return }
+        // Respect an explicit user stop — never resurrect a server the user
+        // deliberately stopped. Cleared on start().
+        guard !userStopRequested else { return }
 
-        // If the poll loop's heartbeat is stale, it stalled/died — revive it.
-        // Safe: startPolling cancels the old Task first and refreshes the
-        // heartbeat, so this won't thrash on every tick.
-        let staleSec = Int(Date().timeIntervalSince(lastPollTickAt))
-        if staleSec > 15 {
-            log.warning("recovery watchdog: poll loop heartbeat stale (\(staleSec, privacy: .public)s) — restarting it")
-            startPolling()
+        let staleHeartbeat = Int(Date().timeIntervalSince(lastPollTickAt)) > 15
+        let uiStuck: Bool
+        switch state {
+        case .running, .syncing: uiStuck = false   // good/transient — leave it
+        default:                 uiStuck = true     // .idle/.starting/.error/.disconnected/.degraded
         }
+        // Nothing to do if the loop is ticking AND the UI already looks running.
+        guard staleHeartbeat || uiStuck else { return }
 
         // Probe /health on an INDEPENDENT queue (never the serial workQueue,
-        // which may be wedged) and force-recover if the backend is healthy.
+        // which may be wedged). If it doesn't come back healthy, the server is
+        // genuinely down/stopped — do nothing, so a real .idle/.error is left
+        // alone. If it IS healthy while the UI isn't running, the UI has
+        // diverged from reality: a sticky .idle/.error that updateStateFromStats
+        // refuses to overwrite, or a .disconnected the poll loop stopped
+        // touching. Reconverge it — this is the case the previous watchdog
+        // missed (it only covered .disconnected/.degraded).
         let metricsAddr = preferences.metricsAddr
         recoveryQueue.async { [weak self] in
             guard let probe = NFSBridge.healthProbe(metricsAddr: metricsAddr), probe.healthy else { return }
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, !self.userStopRequested else { return }
+                if Int(Date().timeIntervalSince(self.lastPollTickAt)) > 15 {
+                    NFSBridge.appLog("recovery watchdog: poll loop heartbeat stale — restarting it")
+                    self.startPolling()
+                }
                 switch self.state {
-                case .disconnected, .degraded:
-                    self.log.warning("recovery watchdog: /health healthy while UI=\(self.state.displayLabel, privacy: .public) — forcing .running (workQueue-independent)")
+                case .running, .syncing:
+                    break
+                default:
+                    NFSBridge.appLog("recovery watchdog: /health healthy but UI=\(self.state.displayLabel) — forcing .running")
+                    self.log.warning("recovery watchdog: /health healthy but UI=\(self.state.displayLabel, privacy: .public) — forcing .running")
                     self.state = .running
                     self.stuckTicks = 0
-                    self.refreshCacheStatus()
-                default:
-                    return
                 }
+                self.refreshCacheStatus()
             }
         }
     }

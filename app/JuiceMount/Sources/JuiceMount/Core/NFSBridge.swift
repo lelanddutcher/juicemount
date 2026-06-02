@@ -447,6 +447,16 @@ public enum NFSBridge {
         }
     }
 
+    /// Bridge a one-line message into the Go-side rotating file log
+    /// (~/Library/Logs/JuiceMount/juicemount.log). os.Logger info/warning lines
+    /// are NOT persisted to `log show`, which kept the Swift state machine
+    /// invisible across rounds of the stuck-offline bug. This routes key
+    /// UI-state events into the same log everything else uses (prefixed
+    /// "[swift]"). Cheap — a buffered file write on the Go side.
+    public static func appLog(_ message: String) {
+        message.withMutableCString { NFSServerLog($0) }
+    }
+
     // MARK: - Lifecycle
 
     /// Start the NFS server with the given configuration. Returns the bound listen address.

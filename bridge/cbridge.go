@@ -1735,6 +1735,18 @@ func NFSServerIsOffline() C.int {
 	return 0
 }
 
+// NFSServerLog bridges a Swift-side line into the Go rotating file log
+// (~/Library/Logs/JuiceMount/juicemount.log). The Swift app's os.Logger
+// info/warning lines are NOT persisted to `log show`, which made the UI state
+// machine invisible across several rounds of the stuck-offline bug. Routing key
+// UI-state events through here puts them in the same log everything else uses,
+// prefixed "[swift]" for easy grepping.
+//
+//export NFSServerLog
+func NFSServerLog(msg *C.char) {
+	jmlog.Info("[swift] " + C.GoString(msg))
+}
+
 // translateMountToFUSE turns "/Volumes/zpool/foo" into "<fuseRoot>/foo".
 func translateMountToFUSE(p, mountRoot, fuseRoot string) string {
 	if mountRoot == "" || fuseRoot == "" {
