@@ -42,7 +42,12 @@ type FUSEConfig struct {
 	MountPoint string // e.g. ~/.juicemount/fuse-internal
 	CacheDir   string // e.g. ~/.juicefs/cache (empty = JuiceFS default)
 	CacheSize  string // e.g. "100000" in MiB (empty = JuiceFS default ~100 GiB)
-	JuiceFSBin string // e.g. /opt/homebrew/bin/juicefs (auto-detected if empty)
+	// PinnedBytes is the total size of all pinned files, in bytes. The
+	// cache-size policy (see Mount) grows the cache to at least this so pinned
+	// content never LRU-evicts. 0 = unknown / no pins (cache-size stays at the
+	// user's configured value).
+	PinnedBytes int64
+	JuiceFSBin  string // e.g. /opt/homebrew/bin/juicefs (auto-detected if empty)
 
 	// FreeSpaceRatio is the fraction of cache-volume free space JuiceFS keeps
 	// reserved (won't cache when below). Default in JuiceFS is 0.1 (10%) which
@@ -143,66 +148,59 @@ func (fm *FUSEManager) Mount() error {
 		}
 	}
 
-	// Auto-size the JuiceFS cache to actually use the disk we have.
-	//
-	// The Swift app defaults ssdCacheGB to 100 GB. That's a nonsensical cap
-	// for a video editor — pinning a single 158 GB project blows past it
-	// instantly, and JuiceFS starts evicting blocks the user just paid to
-	// download. Symptom: pinned files marked Ready, cache directory full,
-	// but Resolve still pulls every other block from S3 because LRU keeps
-	// rotating.
-	//
-	// Policy: cache-size = max(user_configured, current_cache_used,
-	//                           total_disk - 20% headroom).
-	//
-	// We add the *current_cache_used* term because if JuiceFS is already
-	// holding 99 GB on disk, we must allow it to keep that much; otherwise
-	// JuiceFS would start evicting on first access. We use total_disk * 0.8
-	// rather than free_disk because free shrinks AS the cache grows — using
-	// the conservative free number locks us into a cap that's smaller than
-	// the cache will actually be allowed to grow to (free-space-ratio
-	// enforces the real ceiling at write time).
+	// Cache-size policy (2026-06-08). Replaces the prior "max(configured, 85%
+	// of disk)" auto-expansion, which IGNORED the user's configured size — it
+	// treated the app setting as a FLOOR and grew the cache to fill the disk
+	// (observed: 90 GB configured → 787 GB), with --free-space-ratio as the
+	// only real limit. New policy:
+	//   1. RESPECT the user's configured cache-size.
+	//   2. Grow it ONLY as far as needed to keep the pinned set fully cached
+	//      (fm.cfg.PinnedBytes) — so a 158 GB pinned project doesn't LRU-evict
+	//      the blocks the user paid to download (the original concern), without
+	//      blowing the cache past what's actually pinned.
+	//   3. NEVER squeeze the cache/boot disk below a hard 10 GiB free floor — a
+	//      near-full boot disk causes system-wide instability. The nominal
+	//      cache-size is clamped to (total − 10 GiB), and --free-space-ratio is
+	//      raised so JuiceFS dynamically keeps ≥10 GiB free at write time (the
+	//      REAL guarantee: it also covers OTHER files filling the disk after
+	//      mount, which a static cap cannot).
+	const cacheFreeFloorBytes = int64(10) << 30 // 10 GiB
 	if total, err := volumeTotalBytes("/"); err == nil && total > 0 {
-		ceilingGB := int64(float64(total)/(1<<30) * 0.85) // 85% of total disk
-		var configuredGB int64
-		fmt.Sscanf(fm.cfg.CacheSize, "%d", &configuredGB)
-		configuredGB = configuredGB / 1024 // CacheSize is in MiB; convert to GiB
+		var configuredMiB int64
+		fmt.Sscanf(fm.cfg.CacheSize, "%d", &configuredMiB)
+		configuredBytes := configuredMiB << 20 // MiB → bytes
 
-		// Don't shrink below what's already in cache — otherwise eviction
-		// fires on the very first read.
-		var currentUsedGB int64
-		if home, err := os.UserHomeDir(); err == nil {
-			cacheGlob := filepath.Join(home, ".juicefs", "cache")
-			if entries, err := os.ReadDir(cacheGlob); err == nil {
-				for _, e := range entries {
-					if !e.IsDir() {
-						continue
-					}
-					var st syscall.Statfs_t
-					if syscall.Statfs(filepath.Join(cacheGlob, e.Name()), &st) != nil {
-						continue
-					}
-					// Best-effort: use du-equivalent via a walk would be slow.
-					// Instead query allocation directly via Statfs's used fields.
-					// Falls through if we can't tell.
-				}
-			}
+		// (1)+(2): respect configured; grow only to fit the pinned set.
+		desired := configuredBytes
+		if fm.cfg.PinnedBytes > desired {
+			desired = fm.cfg.PinnedBytes
 		}
 
-		targetGB := ceilingGB
-		if currentUsedGB > targetGB {
-			targetGB = currentUsedGB
+		// (3) clamp: never set cache-size above (disk total − 10 GiB floor).
+		if maxForFloor := total - cacheFreeFloorBytes; maxForFloor > 0 && desired > maxForFloor {
+			desired = maxForFloor
 		}
-		if configuredGB > targetGB {
-			targetGB = configuredGB // user wanted more; respect it
+
+		if newMiB := desired >> 20; newMiB > 0 && newMiB != configuredMiB {
+			fm.cfg.CacheSize = fmt.Sprintf("%d", newMiB)
+			jmlog.Info("cache-size resolved",
+				"configured_gb", configuredBytes>>30,
+				"pinned_gb", fm.cfg.PinnedBytes>>30,
+				"effective_gb", desired>>30,
+				"disk_total_gb", total>>30,
+				"reason", "max(configured, pinned) clamped to keep >=10GiB free")
 		}
-		if targetGB > configuredGB {
-			fm.cfg.CacheSize = fmt.Sprintf("%d", targetGB*1024) // back to MiB
-			jmlog.Info("cache-size auto-expanded",
-				"configured_gb", configuredGB,
-				"target_gb", targetGB,
-				"ceiling_gb", ceilingGB,
-				"reason", "85% of total disk; free-space-ratio enforces real ceiling at write time")
+
+		// Raise --free-space-ratio so JuiceFS keeps >= 10 GiB free dynamically
+		// (the absolute floor that prevents boot-disk starvation). max() so we
+		// never weaken an already-stricter configured ratio.
+		floorRatio := float64(cacheFreeFloorBytes) / float64(total)
+		var curRatio float64
+		fmt.Sscanf(fm.cfg.FreeSpaceRatio, "%f", &curRatio)
+		if floorRatio > curRatio {
+			fm.cfg.FreeSpaceRatio = fmt.Sprintf("%.4f", floorRatio)
+			jmlog.Info("free-space-ratio raised to enforce 10 GiB free floor",
+				"ratio", fmt.Sprintf("%.4f", floorRatio), "disk_total_gb", total>>30)
 		}
 	}
 
@@ -223,9 +221,9 @@ func (fm *FUSEManager) Mount() error {
 	}
 	args = append(args,
 		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
-		"-d",                // daemon mode
+		"-d", // daemon mode
 		"--no-usage-report",
-		"--writeback",       // enable writeback for write performance
+		"--writeback", // enable writeback for write performance
 		// QA-33 (2026-05-25): bumped --buffer-size 1024 → 4096 (4 GiB).
 		// Vision: writes to /Volumes/zpool should sustain at local SSD
 		// speed; uploads to MinIO happen async in background; cache
@@ -239,8 +237,8 @@ func (fm *FUSEManager) Mount() error {
 		// (data not yet durable in S3): ≤4 GiB; the on-disk cache holds
 		// the persistent copy until upload completes.
 		"--buffer-size", "4096", // 4 GiB
-		"--prefetch", "3",   // prefetch 3 blocks ahead
-		"-o", "nobrowse",    // hide from Finder (MNT_DONTBROWSE flag)
+		"--prefetch", "3", // prefetch 3 blocks ahead
+		"-o", "nobrowse", // hide from Finder (MNT_DONTBROWSE flag)
 	)
 
 	// Slice H — WAN mode. JuiceFS default --max-uploads is 20; on a
@@ -257,6 +255,40 @@ func (fm *FUSEManager) Mount() error {
 	if os.Getenv("JM_WAN_MODE") == "1" {
 		args = append(args, "--max-uploads", "64")
 	}
+	// Metadata caching. JuiceFS defaults the attr/entry/dir-entry caches to 1s,
+	// so any cold or 1s-expired FUSE metadata access re-validates against Redis
+	// — a full RTT, and the dominant navigation cost (≈82% of FUSE op time was
+	// `lookup` in profiling). A modest cache (default 5s on LAN, 60s on WAN)
+	// cuts that round-trip chatter — which ALSO shrinks the window in which a
+	// transient backend/link blip can wedge a FUSE op (the cause of the Finder
+	// "not responding" reports). `--negative-entry-cache` caches NEGATIVE
+	// lookups so the storm of `._*` AppleDouble probes (~18k ENOENT observed)
+	// stops re-hitting Redis on every miss.
+	//
+	// SAFETY (audited 2026-06-08): JuiceMount serves Stat/ReadDir from its
+	// SQLite mirror first — FUSE is fallback-only (ARCHITECTURE:152) — and the
+	// kernel NFS client already serves attrs up to actimeo=3600s stale, so a
+	// few-seconds FUSE cache changes nothing user-visible. The only consumer of
+	// FUSE metadata freshness is the phantom-purge / reconcile-prune Lstat
+	// (handler.go phantom-purge, redis.go prune): a longer cache only makes
+	// those LAZIER, the strictly-safe direction — those were OVER-aggressive
+	// bugs (QA-19/30/32/35), never under-aggressive. JuiceMount's own writes
+	// update SQLite directly and don't depend on FUSE-cache freshness. 60s is
+	// reserved for WAN to keep the worst-case phantom-linger ≤5s on LAN.
+	// Tunable via JM_META_CACHE_SECS.
+	metaTTL := "5s"
+	if os.Getenv("JM_WAN_MODE") == "1" {
+		metaTTL = "60s"
+	}
+	if v := os.Getenv("JM_META_CACHE_SECS"); v != "" {
+		metaTTL = v
+	}
+	args = append(args,
+		"--attr-cache", metaTTL,
+		"--entry-cache", metaTTL,
+		"--dir-entry-cache", metaTTL,
+		"--negative-entry-cache", metaTTL,
+	)
 	if v := os.Getenv("JM_MAX_UPLOADS"); v != "" {
 		// Direct override wins over WAN mode for operators that want
 		// to tune themselves.
@@ -445,8 +477,8 @@ func (fm *FUSEManager) tailJuiceFSLog() {
 
 	type aggKey struct{ pattern string }
 	type aggState struct {
-		count    int
-		firstAt  time.Time
+		count     int
+		firstAt   time.Time
 		lastFlush time.Time
 	}
 	agg := map[aggKey]*aggState{}
@@ -964,9 +996,9 @@ func DetectJuiceFSCacheDir() string {
 // at startup, which is fine.
 func logVolumeCapacityBreakdown(volume string) {
 	type capStats struct {
-		totalBytes        int64
-		freeBytes         int64
-		importantBytes    int64
+		totalBytes         int64
+		freeBytes          int64
+		importantBytes     int64
 		opportunisticBytes int64
 	}
 	var c capStats

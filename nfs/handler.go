@@ -382,16 +382,35 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 		fusePath = h.fusePath
 	}
 
+	readStart := time.Now()
 	dirEntries, err := os.ReadDir(fusePath)
 	if err != nil {
 		return
 	}
+	// A slow directory read is a self-calibrating signal that we're on a
+	// high-latency link (cellular / Tailscale / distant backend). It gates the
+	// recursive subdir fan-out below — see the comment at that loop.
+	readElapsed := time.Since(readStart)
 
 	toInsert := make([]*metadata.Entry, 0, len(dirEntries))
 	var subdirs []string
 	for _, de := range dirEntries {
+		// Skip AppleDouble/._ sidecars in the scan: they're filtered out of
+		// NFS listings anyway, and each one is a wasted FUSE round-trip
+		// (lookup → ENOENT) on a remote link. NOTE: only skipped in this
+		// directory-SCAN path; the per-path Stat the kernel uses after a
+		// create still lets ._* through (QA-13).
+		if strings.HasPrefix(de.Name(), "._") {
+			continue
+		}
 		info, err := de.Info()
 		if err != nil {
+			// Don't fail the scan on one bad entry. This only skips ADDING a
+			// new mirror row; a child already in the mirror is untouched (we
+			// never delete here), so a transient stat failure can't erase a
+			// known file from listings.
+			jmlog.Debug("prefetch: stat failed for child, skipping insert",
+				"dir", dirname, "name", de.Name(), "error", err.Error())
 			continue
 		}
 		var inode uint64
@@ -421,9 +440,31 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 		h.store.BulkInsert(toInsert, 500)
 	}
 
-	// Prefetch one level of subdirectories, bounded by the semaphore.
-	// Non-blocking acquire — if all workers are busy, skip that subdir.
+	// Gate the recursive subdir fan-out (remote folder-nav perf fix). The
+	// directory the user actually navigated to was just refreshed above (one
+	// round-trip). The recursion below PRE-WARMS subdirs they haven't opened
+	// yet — a LAN-only optimization that turns into a link flood on
+	// cellular/WAN: one folder open was measured triggering ~680 sequential
+	// FUSE→Redis round-trips, ~100 ms each on cellular. Skip the fan-out when:
+	//   - we're offline (user or auto): a backend scan can't/shouldn't run, or
+	//   - the link is slow: readElapsed is well above warm-LAN readdir times
+	//     (single-digit ms) and well below cellular RTT.
+	const prefetchSlowLinkThreshold = 35 * time.Millisecond
+	if pin.IsOffline() || readElapsed > prefetchSlowLinkThreshold {
+		if readElapsed > prefetchSlowLinkThreshold {
+			jmlog.Debug("prefetch: high-latency link — skipping subdir fan-out",
+				"dir", dirname, "readdir_ms", readElapsed.Milliseconds())
+		}
+		return
+	}
+
+	// Fast link: still skip any subdir whose children are ALREADY mirrored —
+	// re-reading a subtree we already hold is pure redundant round-trips even
+	// on LAN. Bounded by the semaphore; non-blocking acquire.
 	for _, sub := range subdirs {
+		if kids, _ := h.store.ListChildren(sub); len(kids) > 0 {
+			continue // already mirrored — nothing to warm
+		}
 		h.prefetchMu.Lock()
 		_, already := h.prefetched[sub]
 		h.prefetchMu.Unlock()
@@ -1168,6 +1209,13 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	for _, de := range dirEntries {
 		info, err := de.Info()
 		if err != nil {
+			// Log rather than silently dropping. A stat failure here (e.g. a
+			// transient hiccup on a high-latency link) omits the entry from the
+			// returned listing, which presents to the user as a folder that
+			// "didn't fully load." macOS then caches that partial result for up
+			// to acdirmax, so it persists until the cache expires or a refresh.
+			jmlog.Debug("readdir: stat failed for child — omitting from cold listing",
+				"dir", dirname, "name", de.Name(), "error", err.Error())
 			continue
 		}
 		infos = append(infos, info)

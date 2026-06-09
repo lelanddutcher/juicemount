@@ -226,12 +226,25 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				globalFUSE = nil
 				oldFM.Stop()
 			}
+			// Pre-read total pinned bytes so the cache-size policy can grow the
+			// cache just enough to keep the pinned set resident. The pin store
+			// proper is opened post-mount (~L413); this brief read-only open is
+			// best-effort — 0 on any error just means "respect the configured
+			// cache size."
+			var pinnedBytes int64
+			if ps, perr := pin.Open(pinStorePath(cfg.DBPath)); perr == nil {
+				if agg, aerr := ps.AggregateStats(); aerr == nil {
+					pinnedBytes = agg.TotalBytes
+				}
+				ps.Close()
+			}
 			fm := health.NewFUSEManager(health.FUSEConfig{
 				RedisURL:       cfg.RedisURL,
 				MountPoint:     cfg.FUSEPath,
 				CacheSize:      cfg.CacheSize,
 				FreeSpaceRatio: "0.01",
 				BucketOverride: cfg.BucketOverride,
+				PinnedBytes:    pinnedBytes,
 			})
 			// Start the watchdog and register globalFUSE UNCONDITIONALLY —
 			// even if the initial mount fails (a transient backend blip at
@@ -578,7 +591,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// — chunks are immutable, in-flight reads via open fds keep
 			// working, next access just misses and refetches.
 			"/cache-clear": handleCacheClearHTTP,
-			"/verify-pins":  handleVerifyPinsHTTP,
+			"/verify-pins": handleVerifyPinsHTTP,
 			// In-app rescue when the kernel mount table is wedged. Runs the
 			// privileged `umount -f -t nfs` via AppleScript; user enters
 			// their admin password once. Returns JSON with the result.
@@ -951,14 +964,14 @@ func NFSServerIsRunning() C.int {
 
 // StatsResult is the JSON stats returned to Swift.
 type StatsResult struct {
-	Running        bool    `json:"running"`
-	EntryCount     int     `json:"entry_count"`
-	LastSyncMs     int64   `json:"last_sync_ms"`
-	LastSyncTime   string  `json:"last_sync_time"`
-	ServerAddr     string  `json:"server_addr"`
-	HealthRedis    bool    `json:"health_redis"`
-	HealthMinIO    bool    `json:"health_minio"`
-	HealthFUSE     bool    `json:"health_fuse"`
+	Running      bool   `json:"running"`
+	EntryCount   int    `json:"entry_count"`
+	LastSyncMs   int64  `json:"last_sync_ms"`
+	LastSyncTime string `json:"last_sync_time"`
+	ServerAddr   string `json:"server_addr"`
+	HealthRedis  bool   `json:"health_redis"`
+	HealthMinIO  bool   `json:"health_minio"`
+	HealthFUSE   bool   `json:"health_fuse"`
 }
 
 //export NFSServerStats
@@ -1012,6 +1025,7 @@ func NFSServerFreeString(s *C.char) {
 // NFSServerMetrics returns the same JSON payload exposed at /metrics.
 // Useful for the menu bar app when the HTTP server isn't reachable
 // (e.g. when metrics-addr is disabled or behind a firewall).
+//
 //export NFSServerMetrics
 func NFSServerMetrics() *C.char {
 	snap := metrics.Default().Snapshot()
@@ -1020,6 +1034,7 @@ func NFSServerMetrics() *C.char {
 }
 
 // SyncNow triggers an immediate metadata reconciliation.
+//
 //export NFSServerSyncNow
 func NFSServerSyncNow() *C.char {
 	// Snapshot RC under the lock, release, then run the (slow) SyncOnce
@@ -1043,12 +1058,12 @@ func NFSServerSyncNow() *C.char {
 
 // SearchResult is the JSON search result returned to Swift.
 type SearchResult struct {
-	Path      string `json:"path"`
-	Name      string `json:"name"`
-	IsDir     bool   `json:"is_dir"`
-	Size      int64  `json:"size"`
-	Mtime     string `json:"mtime"`
-	Rank      float64 `json:"rank"`
+	Path  string  `json:"path"`
+	Name  string  `json:"name"`
+	IsDir bool    `json:"is_dir"`
+	Size  int64   `json:"size"`
+	Mtime string  `json:"mtime"`
+	Rank  float64 `json:"rank"`
 }
 
 // NFSServerSearch performs a full-text search on filenames.
@@ -1056,6 +1071,7 @@ type SearchResult struct {
 // limit: max results (0 = default 50)
 // parentPath: scope to subtree (empty = search all)
 // Returns JSON array of SearchResult, or "error: ..." on failure.
+//
 //export NFSServerSearch
 func NFSServerSearch(query *C.char, limit C.int, parentPath *C.char) *C.char {
 	// Snapshot store under the lock; release; run the FTS query without
@@ -1107,7 +1123,7 @@ func NFSServerSearch(query *C.char, limit C.int, parentPath *C.char) *C.char {
 // The mount commands themselves stay scoped to /bin/mkdir + /sbin/mount_nfs
 // so a minimal sudoers entry suffices:
 //
-//     %admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /bin/mkdir
+//	%admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /bin/mkdir
 //
 // Two separate sudo invocations (mkdir then mount_nfs) so each is a
 // single recognized command — wrapping in `sh -c "..."` would require
@@ -1283,12 +1299,12 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 // anyway.
 //
 // Strategy (cheapest first):
-//   1. `diskutil unmount` — works without sudo, doesn't pop a password
-//      prompt. Succeeds in the common case.
-//   2. `diskutil unmount force` — non-interactive force; still no sudo.
-//   3. `umount -f -t nfs` via AppleScript with administrator privileges —
-//      the only thing that can dislodge a truly wedged kernel mount entry.
-//      Prompts for password.
+//  1. `diskutil unmount` — works without sudo, doesn't pop a password
+//     prompt. Succeeds in the common case.
+//  2. `diskutil unmount force` — non-interactive force; still no sudo.
+//  3. `umount -f -t nfs` via AppleScript with administrator privileges —
+//     the only thing that can dislodge a truly wedged kernel mount entry.
+//     Prompts for password.
 //
 // Returns true iff the mount is gone by the time we return.
 func unmountNFS(mountPoint string) bool {
@@ -1597,7 +1613,9 @@ func pinStorePath(metadataDBPath string) string {
 // state is a process-wide registry, and recreating workers on every Stop/
 // Start would lose in-flight prefetches.)
 var globalPinCtxOnce sync.Once
-var globalPinCtxBox struct{ ctx interface{ Done() <-chan struct{} } } // lazy init
+var globalPinCtxBox struct {
+	ctx interface{ Done() <-chan struct{} }
+} // lazy init
 
 // globalPinCtx returns the context. Use a closure to avoid pulling in
 // context globally where it isn't needed.
@@ -1615,17 +1633,17 @@ func globalPinCtx() context.Context {
 
 type bgCtx struct{}
 
-func (bgCtx) Done() <-chan struct{}                   { return nil }
-func (bgCtx) Err() error                              { return nil }
-func (bgCtx) Value(key any) any                       { return nil }
-func (bgCtx) Deadline() (time.Time, bool)             { return time.Time{}, false }
+func (bgCtx) Done() <-chan struct{}       { return nil }
+func (bgCtx) Err() error                  { return nil }
+func (bgCtx) Value(key any) any           { return nil }
+func (bgCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
 
 // PinResult is the JSON returned to Swift after a Pin call.
 type PinResult struct {
-	OK         bool   `json:"ok"`
+	OK          bool   `json:"ok"`
 	FilesPinned int    `json:"files_pinned"`
-	BytesTotal int64  `json:"bytes_total"`
-	Error      string `json:"error,omitempty"`
+	BytesTotal  int64  `json:"bytes_total"`
+	Error       string `json:"error,omitempty"`
 }
 
 // NFSServerPin pins a file or directory tree for offline availability.
@@ -1688,10 +1706,10 @@ func NFSServerUnpin(rootPath *C.char) *C.char {
 
 // CacheStatus is the JSON returned by NFSServerCacheStatus.
 type CacheStatus struct {
-	Aggregate  pin.AggregateStats `json:"aggregate"`
-	Roots      []pin.RootSummary  `json:"roots"`
-	LiveStats  pin.LiveStats      `json:"live"`
-	OfflineMode bool              `json:"offline_mode"`
+	Aggregate   pin.AggregateStats `json:"aggregate"`
+	Roots       []pin.RootSummary  `json:"roots"`
+	LiveStats   pin.LiveStats      `json:"live"`
+	OfflineMode bool               `json:"offline_mode"`
 }
 
 //export NFSServerCacheStatus
@@ -1705,7 +1723,7 @@ func NFSServerCacheStatus() *C.char {
 	globalMu.Unlock()
 
 	if pinStore == nil {
-		return jsonStr(CacheStatus{OfflineMode: pin.IsOffline()})
+		return jsonStr(CacheStatus{OfflineMode: pin.IsOffline(), Roots: []pin.RootSummary{}})
 	}
 	cs := CacheStatus{OfflineMode: pin.IsOffline()}
 	if a, err := pinStore.AggregateStats(); err == nil {
@@ -1716,6 +1734,14 @@ func NFSServerCacheStatus() *C.char {
 	}
 	if prefetcher != nil {
 		cs.LiveStats = prefetcher.LiveStats()
+	}
+	// Never emit `"roots": null`: a nil Go slice marshals to JSON null, which the
+	// Swift CacheStatus decoder historically choked on (valueNotFound aborted the
+	// whole decode → offline_mode silently read as false → offline toggle stuck
+	// whenever nothing was pinned). Emit [] so the contract is clean for every
+	// consumer. PinRoots can return (nil, nil) when there are no pins.
+	if cs.Roots == nil {
+		cs.Roots = []pin.RootSummary{}
 	}
 	return jsonStr(cs)
 }
@@ -1884,12 +1910,12 @@ func handleVerifyPinsHTTP(w http.ResponseWriter, r *http.Request) {
 		"queue_overflow", report.QueueOverflow,
 		"bytes_gb", fmt.Sprintf("%.1f", float64(report.Bytes)/(1<<30)))
 	data, _ := json.Marshal(map[string]any{
-		"ok":              true,
-		"total_pinned":    report.TotalPinned,
-		"reenqueued":      report.Reenqueued,
-		"queue_overflow":  report.QueueOverflow,
-		"bytes_gb":        float64(report.Bytes) / (1 << 30),
-		"note":            report.Note,
+		"ok":             true,
+		"total_pinned":   report.TotalPinned,
+		"reenqueued":     report.Reenqueued,
+		"queue_overflow": report.QueueOverflow,
+		"bytes_gb":       float64(report.Bytes) / (1 << 30),
+		"note":           report.Note,
 	})
 	w.Write(data)
 }
@@ -2223,9 +2249,9 @@ type SelfTestResult struct {
 	// it in self-test means Swift can show a degraded status icon and
 	// the user notices BEFORE they try to copy a real project file
 	// and have it fail silently.
-	WriteOK    bool   `json:"write_ok"`
-	WriteMs    int64  `json:"write_ms"`
-	WriteHint  string `json:"write_hint,omitempty"`
+	WriteOK   bool   `json:"write_ok"`
+	WriteMs   int64  `json:"write_ms"`
+	WriteHint string `json:"write_hint,omitempty"`
 
 	// B.6 (2026-05-17): first-byte read latency in milliseconds.
 	// Distinct signal from MBPerSec — measures round-trip latency

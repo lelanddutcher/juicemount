@@ -183,9 +183,15 @@ type Registry struct {
 }
 
 // HealthSnapshot is the JSON-friendly payload returned by /health.
+//
+// `components` deliberately has NO `,omitempty`: handleHealth normalizes a nil
+// map to {} before encoding, so the field is ALWAYS a JSON object — never null
+// and never absent. A null or missing `components` makes the Swift HealthProbe
+// decoder throw and abort the entire decode (the same class of bug as
+// CacheStatus roots:null — the stuck offline toggle).
 type HealthSnapshot struct {
 	Healthy    bool              `json:"healthy"`
-	Components map[string]string `json:"components,omitempty"`
+	Components map[string]string `json:"components"`
 	Reason     string            `json:"reason,omitempty"`
 }
 
@@ -262,12 +268,12 @@ type Snapshot struct {
 
 // RPCSnapshot is the per-RPC JSON shape.
 type RPCSnapshot struct {
-	Count   uint64  `json:"count"`
-	MeanUs  float64 `json:"mean_us"`
-	MaxUs   uint64  `json:"max_us"`
-	P50Us   float64 `json:"p50_us"`
-	P95Us   float64 `json:"p95_us"`
-	P99Us   float64 `json:"p99_us"`
+	Count  uint64  `json:"count"`
+	MeanUs float64 `json:"mean_us"`
+	MaxUs  uint64  `json:"max_us"`
+	P50Us  float64 `json:"p50_us"`
+	P95Us  float64 `json:"p95_us"`
+	P99Us  float64 `json:"p99_us"`
 }
 
 // Snapshot builds a self-contained metrics view.
@@ -406,6 +412,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// No provider yet — assume healthy if the server is up.
 		snap = HealthSnapshot{Healthy: true}
+	}
+	// Never emit a null or absent `components`: a nil Go map marshals to JSON
+	// null, which makes the Swift HealthProbe decoder throw valueNotFound and
+	// abort the whole decode (same root cause as CacheStatus roots:null — the
+	// stuck offline toggle). Normalize to an empty object so the JSON is always
+	// `"components": {}` for the fn==nil and monitor-stopped paths.
+	if snap.Components == nil {
+		snap.Components = map[string]string{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

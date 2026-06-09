@@ -141,6 +141,35 @@ public enum NFSBridge {
         public var roots: [RootSummary] = []
         public var live: LiveCacheStats = LiveCacheStats()
         public var offline_mode: Bool = false
+
+        public init() {}
+
+        private enum CodingKeys: String, CodingKey {
+            case aggregate, roots, live, offline_mode
+        }
+
+        /// Null/absence-tolerant decode. ROOT CAUSE of the long-standing
+        /// "offline toggle is write-only / can't turn off" bug (2026-06-03):
+        /// the Go cgo emits `"roots": null` whenever nothing is pinned (a nil
+        /// Go slice marshals to JSON null). Swift's *synthesized* Codable uses
+        /// `decode` (not `decodeIfPresent`) for non-optional properties and
+        /// ignores their default values — so a null `roots` threw
+        /// `valueNotFound`, aborting the ENTIRE decode. `NFSBridge.cacheStatus()`
+        /// then silently returned a default `CacheStatus()` whose `offline_mode`
+        /// is false. The `"offline_mode": true` sat right there in the JSON but
+        /// was never read. Result: with no pins, the Swift-side offline_mode was
+        /// hard-pinned false, so the toggle always showed "online" and every tap
+        /// sent setOffline(true) — offline could never be cleared from the UI.
+        /// (Verified: /tmp/cachestatus_proof.swift — OLD throws→false, NEW→true.)
+        /// decodeIfPresent + per-field defaults make every field tolerant of a
+        /// null or missing value so `offline_mode` is always read correctly.
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.aggregate = try c.decodeIfPresent(AggregateStats.self, forKey: .aggregate) ?? AggregateStats()
+            self.roots = try c.decodeIfPresent([RootSummary].self, forKey: .roots) ?? []
+            self.live = try c.decodeIfPresent(LiveCacheStats.self, forKey: .live) ?? LiveCacheStats()
+            self.offline_mode = try c.decodeIfPresent(Bool.self, forKey: .offline_mode) ?? false
+        }
     }
 
     public struct PinResult: Codable {
@@ -176,7 +205,17 @@ public enum NFSBridge {
         guard let cstr = NFSServerCacheStatus() else { return CacheStatus() }
         defer { NFSServerFreeString(cstr) }
         let json = String(cString: cstr)
-        return (try? JSONDecoder().decode(CacheStatus.self, from: Data(json.utf8))) ?? CacheStatus()
+        do {
+            return try JSONDecoder().decode(CacheStatus.self, from: Data(json.utf8))
+        } catch {
+            // Surface decode failures LOUDLY rather than silently returning a
+            // default CacheStatus (offline_mode=false). A silent default here is
+            // exactly how the roots:null decode bug stayed invisible across many
+            // sessions while the offline toggle appeared stuck. With the
+            // null-tolerant CacheStatus.init(from:) this should never fire.
+            appLog("cacheStatus decode failed — returning default, offline state may be wrong: \(error)")
+            return CacheStatus()
+        }
     }
 
     public static func setOffline(_ on: Bool) {
@@ -222,9 +261,31 @@ public enum NFSBridge {
     /// decode error, non-200 status). Successful nil-`reason` + `healthy`
     /// means "Go thinks every backend is up right now."
     public struct HealthProbe: Codable, Equatable {
-        public var healthy: Bool
-        public var components: [String: String]
+        public var healthy: Bool = false
+        public var components: [String: String] = [:]
         public var reason: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case healthy, components, reason
+        }
+
+        /// Null/absence-tolerant decode. Same root cause as the long-standing
+        /// CacheStatus.roots:null bug (see `CacheStatus.init(from:)`): the Go
+        /// `/health` handler builds `components` from a Go map that is nil
+        /// before the health provider is wired up or after the monitor stops,
+        /// and a nil Go map marshals to JSON `null` (or, under `,omitempty`,
+        /// the key is dropped entirely). Swift's *synthesized* Codable uses
+        /// `decode` (not `decodeIfPresent`) for the non-optional `components`,
+        /// so a null OR a missing key throws (valueNotFound / keyNotFound) and
+        /// aborts the ENTIRE decode — silently discarding the `healthy` flag the
+        /// caller actually reads. `decodeIfPresent` + defaults make every field
+        /// tolerant of a null/missing value. (Go side also normalizes to `{}`.)
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.healthy = try c.decodeIfPresent(Bool.self, forKey: .healthy) ?? false
+            self.components = try c.decodeIfPresent([String: String].self, forKey: .components) ?? [:]
+            self.reason = try c.decodeIfPresent(String.self, forKey: .reason)
+        }
     }
 
     public static func healthProbe(metricsAddr: String = "127.0.0.1:11050") -> HealthProbe? {
@@ -238,7 +299,15 @@ public enum NFSBridge {
         session.dataTask(with: req) { data, _, _ in
             defer { sem.signal() }
             guard let data else { return }
-            result = try? JSONDecoder().decode(HealthProbe.self, from: data)
+            // Log decode failures rather than swallowing them with `try?` —
+            // a silent failure here is exactly how the roots:null decode bug
+            // hid for so long (see `cacheStatus()`). nil is still returned
+            // (= "/health unreachable or unparseable"), now with a log line.
+            do {
+                result = try JSONDecoder().decode(HealthProbe.self, from: data)
+            } catch {
+                appLog("healthProbe decode failed — returning nil: \(error)")
+            }
         }.resume()
         sem.wait()
         session.finishTasksAndInvalidate()
@@ -322,6 +391,32 @@ public enum NFSBridge {
             case capacityTotal = "capacity_total"
             case entries
         }
+
+        /// Null/absence-tolerant decode. Same root cause as the long-standing
+        /// CacheStatus.roots:null bug (see `CacheStatus.init(from:)`): the Go
+        /// `/spool` handler returns `"entries": null` whenever the spool is
+        /// disabled — the COMMON case, since it is opt-in via JM_SPOOL_ENABLE=1
+        /// — or an early error path is taken, because a nil Go slice marshals
+        /// to JSON `null`. Swift's *synthesized* Codable uses `decode` (not
+        /// `decodeIfPresent`) for the non-optional `entries`, so that null
+        /// throws valueNotFound and aborts the ENTIRE decode — silently
+        /// discarding the `enabled` flag the UI reads to show spool state.
+        /// `decodeIfPresent` + defaults make every field tolerant of
+        /// null/missing. (Go side also emits `[]` instead of null.)
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+            self.error = try c.decodeIfPresent(String.self, forKey: .error)
+            self.pendingFiles = try c.decodeIfPresent(Int.self, forKey: .pendingFiles) ?? 0
+            self.pendingBytes = try c.decodeIfPresent(Int64.self, forKey: .pendingBytes) ?? 0
+            self.inProgress = try c.decodeIfPresent(Int64.self, forKey: .inProgress) ?? 0
+            self.succeeded = try c.decodeIfPresent(Int64.self, forKey: .succeeded) ?? 0
+            self.failed = try c.decodeIfPresent(Int64.self, forKey: .failed) ?? 0
+            self.quarantined = try c.decodeIfPresent(Int64.self, forKey: .quarantined) ?? 0
+            self.capacityUsed = try c.decodeIfPresent(Int64.self, forKey: .capacityUsed) ?? 0
+            self.capacityTotal = try c.decodeIfPresent(Int64.self, forKey: .capacityTotal) ?? 0
+            self.entries = try c.decodeIfPresent([SpoolEntryView].self, forKey: .entries) ?? []
+        }
     }
 
     /// Fetch the write-spool status from the local metrics server. Blocking
@@ -339,7 +434,14 @@ public enum NFSBridge {
         session.dataTask(with: req) { data, _, _ in
             defer { sem.signal() }
             guard let data else { return }
-            result = try? JSONDecoder().decode(SpoolStatus.self, from: data)
+            // Log decode failures rather than swallowing them with `try?` (see
+            // `cacheStatus()` and the roots:null root cause). nil is still
+            // returned (= "/spool unreachable or unparseable").
+            do {
+                result = try JSONDecoder().decode(SpoolStatus.self, from: data)
+            } catch {
+                appLog("spoolStatus decode failed — returning nil: \(error)")
+            }
         }.resume()
         sem.wait()
         session.finishTasksAndInvalidate()

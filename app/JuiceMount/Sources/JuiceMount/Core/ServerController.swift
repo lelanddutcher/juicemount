@@ -266,7 +266,16 @@ public final class ServerController {
             let sp: NFSBridge.SpoolStatus? = NFSBridge.spoolStatus(metricsAddr: metricsAddr)
             Task { @MainActor in
                 guard let self else { return }
+                // Observe Swift-side offline_mode transitions. This is the exact
+                // value the offline toggle reads; logging its transitions makes
+                // the cgo→Swift cache-status read path visible (the roots:null
+                // decode bug silently pinned it to false whenever nothing was
+                // pinned). Low noise — fires only on an actual change.
+                let prevOfflineMode = self.cacheStatus.offline_mode
                 self.cacheStatus = s
+                if s.offline_mode != prevOfflineMode {
+                    NFSBridge.appLog("offline_mode (swift decoded) \(prevOfflineMode) -> \(s.offline_mode), roots=\(s.roots.count)")
+                }
                 // Spool status: keep last-known on a nil (unreachable) fetch,
                 // same rationale as offlineState below.
                 if let sp { self.spoolStatus = sp }
@@ -296,8 +305,22 @@ public final class ServerController {
     /// cgo calls run on `workQueue` so the UI toggle doesn't freeze the
     /// popover under contention.
     public func setOffline(_ on: Bool) {
+        // OPTIMISTIC, synchronous UI update (2026-06-02 — fixes the
+        // write-only-ON bug). The popover's offline Toggle binds its `get` to
+        // cacheStatus.offline_mode. If we only republish that after the async
+        // cgo round-trip, SwiftUI re-reads the STALE (pre-tap) value the instant
+        // after the user's tap, snaps the switch back ON, and re-fires the
+        // binding — so an "off" tap never reaches NFSServerSetOffline (the log
+        // showed `on:true` ×N, `on:false` ×0; user_offline latched on forever).
+        // Reflecting the user's intent here, synchronously on MainActor, makes
+        // the control AND every offline indicator update immediately and breaks
+        // the feedback loop. The async block reconciles against the real flag.
+        cacheStatus.offline_mode = on
+        offlineState.offline = on
+        offlineState.user_offline = on
         let metricsAddr = preferences.metricsAddr
         workQueue.async { [weak self] in
+            NFSBridge.appLog("user setOffline(\(on))")
             NFSBridge.setOffline(on)
             let s = NFSBridge.cacheStatus()
             // See refreshCacheStatus for the nil-state rationale: keep

@@ -111,6 +111,10 @@ type HealthMonitor struct {
 	fuseRawHealthyStreak   int
 	fuseDebounced          ComponentStatus
 	fuseDebouncedInit      bool
+
+	// Throttle timestamp for wedge diagnostics (logWedgeDiagnostics).
+	// Guarded by mu.
+	lastWedgeDiagAt time.Time
 }
 
 // Tunables for NFS auto-remount. Exposed as vars so tests can override.
@@ -521,6 +525,7 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 		}
 	case <-time.After(5 * time.Second):
 		jmlog.Warn("fuse stat timed out (path likely wedged)", "path", m.cfg.FUSEPath)
+		go m.logWedgeDiagnostics("stat_timeout")
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "stat timed out (wedged FUSE mount)"}
 	}
 
@@ -554,8 +559,46 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 		return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 	case <-time.After(5 * time.Second):
 		jmlog.Warn("fuse mount unresponsive (stale)", "path", m.cfg.FUSEPath)
+		go m.logWedgeDiagnostics("readdir_unresponsive")
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "unresponsive (stale mount)"}
 	}
+}
+
+// logWedgeDiagnostics captures backend RTT + process liveness at the instant a
+// FUSE wedge is detected, so wedges can be correlated with backend/link events
+// (the TrueNAS ConnectX flap — docs/HANDOFF_truenas_connectx_flapping.md). It is
+// the diagnostic half of the Finder "not responding" investigation: a wedge
+// almost always coincides with a Redis/MinIO RTT spike, and this log is the
+// evidence to confirm it.
+//
+// QA-35 perf discipline: runs ONLY in the HealthMonitor goroutine (never on an
+// NFS RPC path), probes ONLY the backend sockets + process table — NEVER the
+// wedged mountpoint itself — bounds every probe, and is throttled to once per
+// minute so a sustained wedge cannot spam Redis/MinIO or flood the log.
+func (m *HealthMonitor) logWedgeDiagnostics(reason string) {
+	m.mu.Lock()
+	if !m.lastWedgeDiagAt.IsZero() && time.Since(m.lastWedgeDiagAt) < time.Minute {
+		m.mu.Unlock()
+		return
+	}
+	m.lastWedgeDiagAt = time.Now()
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	t0 := time.Now()
+	redisStatus := m.checkRedis(ctx)
+	redisMs := time.Since(t0).Milliseconds()
+	t1 := time.Now()
+	minioStatus := m.checkMinIO()
+	minioMs := time.Since(t1).Milliseconds()
+
+	jmlog.Warn("fuse wedge diagnostics",
+		"reason", reason,
+		"redis_ok", redisStatus.Healthy, "redis_probe_ms", redisMs, "redis_msg", redisStatus.Message,
+		"minio_ok", minioStatus.Healthy, "minio_probe_ms", minioMs, "minio_msg", minioStatus.Message,
+		"juicefs_alive", isJuiceFSProcessAlive(),
+	)
 }
 
 // checkNFS verifies the NFS mount is responsive. A simple os.Stat() can
