@@ -50,10 +50,19 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 		return SpoolStatusResponse{
 			Enabled: false,
 			Error:   "spool not enabled (set JM_SPOOL_ENABLE=1 to opt in)",
+			// Non-nil empty slice so the JSON is `"entries": []`, never null.
+			// A nil Go slice marshals to JSON null, which makes Swift's
+			// synthesized Codable throw valueNotFound and abort the whole
+			// decode (the CacheStatus roots:null root cause). This disabled
+			// branch is the COMMON case — the spool is opt-in.
+			Entries: []SpoolEntryView{},
 		}, nil
 	}
 
-	resp := SpoolStatusResponse{Enabled: true}
+	// Initialize Entries to a non-nil empty slice up front so even the early
+	// error returns below (pending-stats / list failures) emit `"entries": []`
+	// rather than null — same roots:null decode-abort guard as the branch above.
+	resp := SpoolStatusResponse{Enabled: true, Entries: []SpoolEntryView{}}
 
 	pendingFiles, pendingBytes, err := spool.Meta().PendingStats()
 	if err != nil {

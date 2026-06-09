@@ -15,7 +15,9 @@ struct MenuPopoverView: View {
     /// (see `ServerController.refreshCacheStatus`), never on MainActor.
     private var cacheStatus: NFSBridge.CacheStatus { server.cacheStatus }
     @State private var cacheTimer: Timer?
-    @State private var offlineToggleBusy = false
+    /// Local source of truth for the offline switch. Deliberately NOT a
+    /// derived binding over cacheStatus.offline_mode — see offlineToggle.
+    @State private var offlineSwitch = false
     @State private var diskFreeGB: Double = 0
     @State private var diskImportantGB: Double = 0
     @State private var diskTotalGB: Double = 0
@@ -929,26 +931,41 @@ struct MenuPopoverView: View {
     }
 
     private var offlineToggle: some View {
-        Toggle(isOn: Binding(
-            get: { cacheStatus.offline_mode },
-            set: { newValue in
-                // ServerController.setOffline dispatches both the
-                // NFSServerSetOffline cgo call and the follow-up
-                // cacheStatus refresh to workQueue. The toggle's
-                // visual state updates when cacheStatus republishes
-                // on MainActor.
-                offlineToggleBusy = true
-                server.setOffline(newValue)
-                offlineToggleBusy = false
-            }
-        )) {
+        // The switch binds to a LOCAL @State (offlineSwitch), NOT to a derived
+        // Binding(get:set:) over cacheStatus.offline_mode. The derived binding
+        // proved unfixable: under the poll loop's constant re-render churn,
+        // SwiftUI kept re-reading a stale `get` immediately after a tap, snapped
+        // the switch back, and re-fired `set` — the [swift] log showed it firing
+        // `setOffline(true)` ×21 and `setOffline(false)` ×0 across a test
+        // session (write-only-ON: offline could never be cleared from the UI,
+        // even with an optimistic synchronous update in setOffline).
+        //
+        // Binding to a local Bool makes each tap flip the switch
+        // DETERMINISTICALLY in both directions. `onChange(offlineSwitch)` writes
+        // the user's intent to the backend; the second `onChange` mirrors
+        // backend-initiated changes (auto-offline, an external curl) back into
+        // the switch. The `!= offline_mode` guards stop the two onChange
+        // handlers from echoing each other into a loop.
+        Toggle(isOn: $offlineSwitch) {
             Text("Offline")
                 .font(.caption2)
-                .foregroundStyle(cacheStatus.offline_mode ? .orange : .secondary)
+                .foregroundStyle(offlineSwitch ? .orange : .secondary)
         }
         .toggleStyle(.switch)
         .controlSize(.mini)
-        .help(cacheStatus.offline_mode
+        .onChange(of: offlineSwitch) { _, newValue in
+            // Only write when the user actually diverged from the backend.
+            // (When we sync the switch FROM the backend below, offline_mode
+            //  already equals newValue, so this no-ops — no echo write.)
+            guard newValue != server.cacheStatus.offline_mode else { return }
+            server.setOffline(newValue)
+        }
+        .onChange(of: server.cacheStatus.offline_mode) { _, backend in
+            // Reflect backend-driven changes without triggering a write.
+            if offlineSwitch != backend { offlineSwitch = backend }
+        }
+        .onAppear { offlineSwitch = server.cacheStatus.offline_mode }
+        .help(offlineSwitch
             ? "Offline: reads are served from local cache; un-cached requests fail fast instead of stalling the network."
             : "Online: cache misses transparently fall through to the backend. Toggle to use only what's already cached.")
     }
