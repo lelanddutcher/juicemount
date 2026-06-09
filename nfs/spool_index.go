@@ -79,6 +79,24 @@ func (idx *SpoolIndex) DeleteIfMatches(path string, want *SpoolEntry) bool {
 	return false
 }
 
+// Move re-keys `want` from oldPath to newPath under a single lock
+// acquisition, so concurrent Lookups never observe a window where the entry
+// is missing from both keys. Identity-checked like DeleteIfMatches: if
+// oldPath's slot no longer holds `want` (a newer writer rotated in), nothing
+// moves and false is returned. An existing entry at newPath is replaced —
+// rename-over-existing follows POSIX replace semantics, and the caller
+// (juiceFS.Rename) cancels any active destination entry first.
+func (idx *SpoolIndex) Move(oldPath, newPath string, want *SpoolEntry) bool {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if cur, ok := idx.byPath[oldPath]; !ok || cur != want {
+		return false
+	}
+	delete(idx.byPath, oldPath)
+	idx.byPath[newPath] = want
+	return true
+}
+
 // Len returns the current number of entries. O(1).
 func (idx *SpoolIndex) Len() int {
 	idx.mu.RLock()

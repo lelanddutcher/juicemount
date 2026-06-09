@@ -303,7 +303,9 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 				if errors.Is(err, os.ErrPermission) {
 					return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
 				}
-				return err
+				// Wrap: a raw error here would escape to the RPC error
+				// formatter as SYSTEM_ERR (no NFS body) → client EBADRPC.
+				return nfsStatusErrorFrom(err)
 			}
 		}
 	}
@@ -324,7 +326,7 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 				if errors.Is(err, os.ErrPermission) {
 					return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
 				}
-				return err
+				return nfsStatusErrorFrom(err)
 			}
 		}
 	}
@@ -336,16 +338,23 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 		if errors.Is(err, os.ErrPermission) {
 			return &NFSStatusError{NFSStatusAccess, err}
 		} else if err != nil {
-			return err
+			return nfsStatusErrorFrom(err)
 		}
+		// From here on fp MUST be closed on every path. The backing
+		// handler counts open write handles (JuiceMount's spool entries
+		// refcount them); a dropped handle blocks idle-finalize forever —
+		// the entry sits in `writing` state, never drains, and leaks its
+		// capacity reservation (Phase-1 BUG 2, 43 stuck entries).
 		if *s.SetSize > math.MaxInt64 {
+			_ = fp.Close()
 			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
 		}
 		if err := fp.Truncate(int64(*s.SetSize)); err != nil {
-			return err
+			_ = fp.Close()
+			return nfsStatusErrorFrom(err)
 		}
 		if err := fp.Close(); err != nil {
-			return err
+			return nfsStatusErrorFrom(err)
 		}
 	}
 
@@ -366,7 +375,7 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 				if errors.Is(err, os.ErrPermission) {
 					return &NFSStatusError{NFSStatusAccess, err}
 				}
-				return err
+				return nfsStatusErrorFrom(err)
 			}
 		}
 	}

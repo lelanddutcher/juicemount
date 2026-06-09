@@ -144,8 +144,11 @@ func TestSpoolWriteFileWriteAdvancesPos(t *testing.T) {
 	}
 }
 
-// TestSpoolWriteFileTruncateZeroOnFreshIsNoop verifies the narrow
-// Truncate support we ship in slice C.
+// TestSpoolWriteFileTruncateZeroOnFreshIsNoop covers the truncate shapes on
+// a fresh and a written entry. Phase 1 replaced slice C's truncate-to-0-on-
+// fresh-only restriction with full ftruncate support (SETATTR{size} against
+// spooled paths — fio preallocate, cp's final ftruncate); the broader resize
+// coverage lives in nfs/spool_setattr_test.go.
 func TestSpoolWriteFileTruncateZeroOnFreshIsNoop(t *testing.T) {
 	s := newTestSpoolStore(t, 0)
 	handler := minimalHandlerForTest()
@@ -167,11 +170,17 @@ func TestSpoolWriteFileTruncateZeroOnFreshIsNoop(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if err := wf.Truncate(0); err == nil {
-		t.Errorf("Truncate(0) on non-empty should error in slice C")
+	if err := wf.Truncate(0); err != nil {
+		t.Errorf("Truncate(0) on non-empty (O_TRUNC-style reset): %v", err)
 	}
-	if err := wf.Truncate(10); err == nil {
-		t.Errorf("Truncate(nonzero) should error in slice C")
+	if got := e.WrittenEnd(); got != 0 {
+		t.Errorf("WrittenEnd after truncate-to-zero = %d, want 0", got)
+	}
+	if err := wf.Truncate(10); err != nil {
+		t.Errorf("Truncate(nonzero) extend: %v", err)
+	}
+	if got := e.WrittenEnd(); got != 10 {
+		t.Errorf("WrittenEnd after extend = %d, want 10", got)
 	}
 }
 
@@ -249,7 +258,7 @@ func TestSpoolWriteFileWriteTracksHandlerSize(t *testing.T) {
 // requires a *metadata.Store).
 func minimalHandlerForTest() *JuiceMountHandler {
 	return &JuiceMountHandler{
-		writeSizes:     make(map[string]int64),
-		activeWriters:  make(map[string]int),
+		writeSizes:    make(map[string]int64),
+		activeWriters: make(map[string]int),
 	}
 }

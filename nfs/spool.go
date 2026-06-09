@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -32,6 +33,13 @@ var ErrSpoolFull = errors.New("spool: capacity full")
 // bounded wait. The handler maps this to a retryable NFS status so the
 // client retries (by which point the drain has almost always completed).
 var ErrSpoolBusy = errors.New("spool: path busy (prior entry still draining)")
+
+// DefaultStuckEscalationWindow is how long an entry may sit QUIESCENT (no
+// writes) with refcount>0 before the sweeper treats the handles as leaked
+// and force-finalizes the entry. Far above any legitimate gap between two
+// WRITE RPCs on one file (per-RPC handles live for the duration of a single
+// WriteAt), far below "stuck forever". See sweepOnce.
+const DefaultStuckEscalationWindow = 10 * time.Minute
 
 // SpoolStore is the high-level write-spool API.
 //
@@ -61,6 +69,13 @@ type SpoolStore struct {
 	// May be nil if open failed at construction; that case becomes a
 	// no-op for the audit path (drain still proceeds normally).
 	manifest *manifestWriter
+
+	// escalateAfter is the quiescence window after which a refcount>0
+	// entry is treated as handle-leaked and force-finalized by the
+	// sweeper. Set once at construction (DefaultStuckEscalationWindow);
+	// tests shorten it via SetStuckEscalationWindow before concurrency
+	// starts. <=0 disables escalation.
+	escalateAfter time.Duration
 }
 
 // NewSpoolStore creates the spool root if it doesn't exist and returns an
@@ -82,10 +97,11 @@ func NewSpoolStore(root string, capacity int64, meta *metadata.SpoolStore) (*Spo
 		return nil, fmt.Errorf("spool: mkdir %s: %w", filesDir, err)
 	}
 	s := &SpoolStore{
-		root:     root,
-		capacity: capacity,
-		meta:     meta,
-		index:    NewSpoolIndex(),
+		root:          root,
+		capacity:      capacity,
+		meta:          meta,
+		index:         NewSpoolIndex(),
+		escalateAfter: DefaultStuckEscalationWindow,
 	}
 	if mw, err := newManifestWriter(root); err != nil {
 		// Non-fatal — manifest is audit-only. Log and proceed.
@@ -227,11 +243,28 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 // the per-RPC write path releases handles without finalizing, and this sweep
 // (run on a timer by StartSweeper, or directly in tests) ends the file once
 // the writer goes idle. Mirrors FDPool.evictLoop.
+//
+// Escalation (Phase-1 BUG 2): an entry that still holds write handles
+// (refcount>0) but has been QUIESCENT far past s.escalateAfter can only be
+// the victim of a leaked handle — NFS per-RPC handles live for the duration
+// of a single WriteAt, so refcount>0 across minutes of zero writes means an
+// error path dropped a billy.File without Close. Pre-escalation behavior was
+// a silent skip forever: never finalized, never drained, capacity leaked,
+// path phantom-stat'able (43 entries × 5+ hours, 2026-06-08). The
+// escalation force-finalizes loudly — the bytes on the spool SSD are exactly
+// what a normal idle finalize would have persisted, so finalize+drain
+// preserves user data where a fail-and-discard would lose it. Genuinely
+// active long writes are immune: continuous writes keep lastWrite fresh, so
+// the entry is never quiescent for the full window.
 func (s *SpoolStore) sweepOnce(idle time.Duration) int {
 	entries := s.index.Snapshot()
 	n := 0
 	for _, e := range entries {
 		if e.finalizeIfIdle(idle) {
+			n++
+			continue
+		}
+		if e.escalateIfStuck(s.escalateAfter) {
 			n++
 		}
 	}
@@ -264,6 +297,13 @@ func (s *SpoolStore) StartSweeper(idle, tick time.Duration) (stop func()) {
 	}()
 	var once sync.Once
 	return func() { once.Do(func() { close(done) }) }
+}
+
+// SetStuckEscalationWindow overrides the quiescence window after which a
+// refcount>0 entry is force-finalized (DefaultStuckEscalationWindow). Test
+// hook — call before the sweeper or any writers start. <=0 disables.
+func (s *SpoolStore) SetStuckEscalationWindow(d time.Duration) {
+	s.escalateAfter = d
 }
 
 // LookupActive returns the in-memory index entry for nfsPath if one
@@ -513,7 +553,7 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 	// and opening a file we're about to delete (ENOENT). Readers already
 	// holding an fd are unaffected by the unlink (open-then-unlink Unix
 	// semantics).
-	if e, ok := s.index.Lookup(nfsPath); ok && e.id == id {
+	if e, ok := s.index.Lookup(nfsPath); ok && e.ID() == id {
 		s.index.DeleteIfMatches(nfsPath, e)
 	}
 	s.releaseCapacity(size)
@@ -522,8 +562,8 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 	}
 	if s.manifest != nil {
 		var (
-			shaHex      string
-			shaUnknown  bool
+			shaHex     string
+			shaUnknown bool
 		)
 		if row, gerr := s.meta.Get(id); gerr == nil && row != nil && len(row.SHA256) > 0 {
 			shaHex = fmt.Sprintf("%x", row.SHA256)
@@ -572,7 +612,7 @@ func (s *SpoolStore) CancelForDelete(nfsPath string) {
 	}
 	for _, r := range rows {
 		sz := r.Size
-		if indexed && e.id == r.ID && e.WrittenEnd() > sz {
+		if indexed && e.ID() == r.ID && e.WrittenEnd() > sz {
 			// `writing`-state rows persist size=0 until finalize; the live
 			// entry knows the bytes actually reserved against capacity.
 			sz = e.WrittenEnd()
@@ -582,6 +622,72 @@ func (s *SpoolStore) CancelForDelete(nfsPath string) {
 			log.Printf("spool: cancel-for-delete remove %s: %v", r.SpoolFile, rmErr)
 		}
 	}
+}
+
+// MigrateForRename re-keys every active spool entry under oldPath (the
+// exact path, plus — for directory renames — everything under oldPath+"/")
+// to the corresponding path under newPath: SQL row, in-memory index key,
+// entry identity, and therefore the eventual drain TARGET. Returns the
+// number of rows migrated. Phase-1 BUG 1: without this, juiceFS.Rename was
+// spool-blind — the old path kept "existing" via the LookupActive shadow
+// and the drainer later re-created the OLD path on FUSE (the QA-37
+// resurrection class, for rename).
+//
+// Per-state handling (decided atomically under meta.writeMu, inside
+// MigrateActivePaths):
+//   - writing / ready: the row's nfs_path is updated in place. The drain
+//     hasn't started (drainers read the path at claim time), so the queued
+//     copy simply lands at the new path.
+//   - draining: the in-flight worker already holds the OLD target. The row
+//     is DELETEd (the worker's MarkDrainComplete then returns done=false
+//     and it undoes its FUSE write — the QA-37 cancel contract) and a fresh
+//     `ready` row is inserted at the new path sharing the same spool file.
+//     The entry adopts the new row id so drain-complete eviction matches.
+//
+// openMu serializes against OpenWrite so a concurrent write RPC can't
+// create a second entry for either path mid-migration. Lock order:
+// openMu → meta.writeMu (released) → e.mu → index.mu — same direction as
+// OpenWrite, no cycles.
+func (s *SpoolStore) MigrateForRename(oldPath, newPath string) (int, error) {
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+
+	migs, err := s.meta.MigrateActivePaths(oldPath, newPath)
+	if err != nil {
+		return 0, err
+	}
+	requeued := false
+	for _, m := range migs {
+		if m.Requeued {
+			requeued = true
+		}
+		e, ok := s.index.Lookup(m.OldPath)
+		if !ok || e.ID() != m.OldID {
+			// Not in the index (e.g. a ready/draining row recovered by the
+			// boot scrubber, which doesn't repopulate the index) — the SQL
+			// migration alone is sufficient for those.
+			continue
+		}
+		e.adoptRename(m.NewPath, m.NewID)
+		s.index.Move(m.OldPath, m.NewPath, e)
+
+		// Close the eviction race: if a drain for this row completed in
+		// the window between the SQL commit and the index Move above, its
+		// MarkDrainComplete looked up the new path BEFORE the entry was
+		// there and evicted nothing — leaving a permanent stale shadow.
+		// Re-check the row's state and evict ourselves if it went
+		// terminal. DeleteIfMatches is identity-checked, so double
+		// eviction is harmless.
+		if row, gerr := s.meta.Get(m.NewID); gerr == nil && row != nil &&
+			(row.DrainState == metadata.DrainDone || row.DrainState == metadata.DrainFailed) {
+			s.index.DeleteIfMatches(m.NewPath, e)
+		}
+	}
+	if requeued {
+		// A fresh `ready` row exists; wake the drainer for it.
+		s.signalReady()
+	}
+	return len(migs), nil
 }
 
 // MarkDrainRetry is the transient-failure path: bumps drain_attempts +
@@ -626,7 +732,7 @@ func (s *SpoolStore) QuarantineDrain(id int64, nfsPath, spoolFile string, size i
 		log.Printf("spool: quarantine move %s→%s: %v", spoolFile, dest, err)
 	}
 	s.releaseCapacity(size)
-	if e, ok := s.index.Lookup(nfsPath); ok && e.id == id {
+	if e, ok := s.index.Lookup(nfsPath); ok && e.ID() == id {
 		s.index.DeleteIfMatches(nfsPath, e)
 	}
 	if s.manifest != nil {
@@ -771,11 +877,35 @@ type SpoolEntry struct {
 	store    *SpoolStore
 }
 
-// ID returns the SQLite spool_entries.id this entry is bound to.
-func (e *SpoolEntry) ID() int64 { return e.id }
+// ID returns the SQLite spool_entries.id this entry is bound to. Locked:
+// MigrateForRename can re-bind a draining entry to its requeued row's id
+// concurrently with drain-complete / cancel identity checks.
+func (e *SpoolEntry) ID() int64 {
+	e.mu.RLock()
+	id := e.id
+	e.mu.RUnlock()
+	return id
+}
 
-// NFSPath returns the in-mount path this entry shadows.
-func (e *SpoolEntry) NFSPath() string { return e.nfsPath }
+// NFSPath returns the in-mount path this entry shadows. Locked: the path is
+// re-keyed by MigrateForRename when the client renames an in-flight file.
+func (e *SpoolEntry) NFSPath() string {
+	e.mu.RLock()
+	p := e.nfsPath
+	e.mu.RUnlock()
+	return p
+}
+
+// adoptRename re-binds the entry to a new NFS path and (for requeued
+// draining rows) a new SQL row id. Called only by MigrateForRename, which
+// owns the corresponding index re-key; the two updates happen under openMu
+// so no concurrent OpenWrite can observe a half-migrated entry.
+func (e *SpoolEntry) adoptRename(newPath string, newID int64) {
+	e.mu.Lock()
+	e.nfsPath = newPath
+	e.id = newID
+	e.mu.Unlock()
+}
 
 // SpoolFilePath returns the on-disk path of the spool file.
 func (e *SpoolEntry) SpoolFilePath() string { return e.spoolFile }
@@ -893,6 +1023,54 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
+// Truncate resizes the spool file to size and moves writtenEnd to match.
+// This is the ftruncate path: NFS SETATTR{size} against an in-flight entry
+// routes here via spoolWriteFile.Truncate (fio preallocates with ftruncate
+// before writing; cp/copyfile ftruncates to the final size after writing).
+//
+// Capacity follows the resize: growth is CAS-reserved against the cap
+// (ErrSpoolFull on exceed, nothing changed), shrink releases the
+// difference. A same-size truncate is a no-op that PRESERVES the streaming
+// hash — that's cp's post-write ftruncate(dst, size==writtenEnd), the
+// dominant copy workload, and it must keep the drainer's SHA verification.
+// Any actual resize invalidates the streaming hash (the hasher saw the
+// write stream, not the post-truncate at-rest bytes); the drainer re-hashes
+// from disk in that case, same as out-of-order writes.
+func (e *SpoolEntry) Truncate(size int64) error {
+	if size < 0 {
+		return fmt.Errorf("spool: truncate to negative size %d", size)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed || e.file == nil {
+		return fmt.Errorf("spool: truncate on closed entry")
+	}
+	if size == e.writtenEnd {
+		return nil
+	}
+	if size > e.writtenEnd {
+		delta := size - e.writtenEnd
+		if !e.store.tryReserveCapacity(delta) {
+			return ErrSpoolFull
+		}
+		if err := e.file.Truncate(size); err != nil {
+			e.store.releaseCapacity(delta)
+			return fmt.Errorf("spool: truncate extend: %w", err)
+		}
+	} else {
+		if err := e.file.Truncate(size); err != nil {
+			return fmt.Errorf("spool: truncate shrink: %w", err)
+		}
+		e.store.releaseCapacity(e.writtenEnd - size)
+	}
+	e.writtenEnd = size
+	e.hashValid = false
+	// Truncate is writer activity: bump quiescence so the sweeper doesn't
+	// finalize between a client's ftruncate and its first WRITE.
+	e.lastWrite.Store(time.Now().UnixNano())
+	return nil
+}
+
 // OpenForRead returns a fresh read-only fd on the spool file. Caller
 // is responsible for closing it. Used by:
 //   - the drainer (slice B) to stream bytes into the FUSE mount
@@ -971,6 +1149,45 @@ func (e *SpoolEntry) finalizeIfIdle(idle time.Duration) bool {
 	return true
 }
 
+// escalateIfStuck force-finalizes an entry whose write handles leaked: it
+// holds refcount>0 but has been quiescent for at least `window`. Returns
+// true if it finalized. See sweepOnce for the full rationale. window<=0
+// disables. Loud by design — every escalation is a bug elsewhere (a dropped
+// billy.File), and the Warn is the operator's signal to find it.
+func (e *SpoolEntry) escalateIfStuck(window time.Duration) bool {
+	if window <= 0 {
+		return false
+	}
+	e.mu.Lock()
+	if e.closed || e.refcount == 0 {
+		e.mu.Unlock()
+		return false
+	}
+	idleFor := time.Since(time.Unix(0, e.lastWrite.Load()))
+	if idleFor < window {
+		e.mu.Unlock()
+		return false
+	}
+	leaked := e.refcount
+	id, path, size := e.id, e.nfsPath, e.writtenEnd
+	// Zero the refcount: the handles are gone (leaked), nothing will ever
+	// release them. finalizeLocked then runs the normal fsync + SHA +
+	// mark-ready path so the bytes drain like any other finalized entry.
+	e.refcount = 0
+	jmlog.Warn("spool: force-finalizing stuck entry — write handle(s) leaked",
+		"path", path,
+		"id", id,
+		"leaked_handles", leaked,
+		"quiescent", idleFor.Round(time.Second).String(),
+		"bytes", size,
+	)
+	if err := e.finalizeLocked(); err != nil { // releases e.mu
+		jmlog.Warn("spool: stuck-entry force-finalize failed",
+			"path", path, "id", id, "error", err.Error())
+	}
+	return true
+}
+
 // finalizeLocked performs the finalize. MUST be called with e.mu held; it
 // releases e.mu before the SQL MarkReady + drainer signal (so we never hold
 // the entry lock across SQL).
@@ -996,9 +1213,10 @@ func (e *SpoolEntry) finalizeLocked() error {
 	}
 	finalSize := e.writtenEnd
 	finalSha := e.sha256 // nil if streaming hash was invalidated; drainer re-hashes
+	finalID := e.id      // capture under mu: rename migration can re-bind id
 	e.mu.Unlock()
 
-	if err := e.store.meta.MarkReady(e.id, finalSize, finalSha); err != nil && firstErr == nil {
+	if err := e.store.meta.MarkReady(finalID, finalSize, finalSha); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	e.store.signalReady()
@@ -1020,11 +1238,12 @@ func (e *SpoolEntry) finalizeLocked() error {
 func (e *SpoolEntry) CloseAndDelete(reason string) error {
 	e.mu.Lock()
 	if e.closed {
+		nfsPath := e.nfsPath
 		e.mu.Unlock()
 		// Even if already closed via Close(), make sure we don't leave
 		// a stale index entry. DeleteIfMatches is safe: it only removes
 		// the entry if WE are the current holder of the path slot.
-		e.store.index.DeleteIfMatches(e.nfsPath, e)
+		e.store.index.DeleteIfMatches(nfsPath, e)
 		return nil
 	}
 	if e.file != nil {
@@ -1033,6 +1252,9 @@ func (e *SpoolEntry) CloseAndDelete(reason string) error {
 	}
 	path := e.spoolFile
 	written := e.writtenEnd
+	// Capture identity under mu — rename migration can re-bind id/nfsPath.
+	id := e.id
+	nfsPath := e.nfsPath
 	e.closed = true
 	e.mu.Unlock()
 
@@ -1042,9 +1264,9 @@ func (e *SpoolEntry) CloseAndDelete(reason string) error {
 	} else if err == nil {
 		e.store.releaseCapacity(written)
 	}
-	if err := e.store.meta.MarkFailed(e.id, reason); err != nil && firstErr == nil {
+	if err := e.store.meta.MarkFailed(id, reason); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	e.store.index.DeleteIfMatches(e.nfsPath, e)
+	e.store.index.DeleteIfMatches(nfsPath, e)
 	return firstErr
 }

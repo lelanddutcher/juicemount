@@ -63,9 +63,9 @@ type JuiceMountHandler struct {
 	verifiers  map[string]verifierData
 
 	// Directory prefetch tracking — prevents redundant prefetches
-	prefetchMu   sync.Mutex
-	prefetched   map[string]time.Time
-	prefetchSem  chan struct{} // limits concurrent prefetch goroutines
+	prefetchMu  sync.Mutex
+	prefetched  map[string]time.Time
+	prefetchSem chan struct{} // limits concurrent prefetch goroutines
 
 	// Verifier cleanup lifecycle
 	verifierStop chan struct{}
@@ -75,9 +75,9 @@ type JuiceMountHandler struct {
 	// on a single inode) collapses to one Lstat + one re-insert. The
 	// negative side caches recently-failed recoveries so we don't re-Lstat
 	// for a genuinely-gone inode on every retry within the same burst.
-	recoveryMu        sync.Mutex
-	recoveryInFlight  map[uint64]chan struct{}        // inode → done-when-closed
-	recoveryNegative  map[uint64]time.Time            // inode → expiry; if now < expiry, skip
+	recoveryMu       sync.Mutex
+	recoveryInFlight map[uint64]chan struct{} // inode → done-when-closed
+	recoveryNegative map[uint64]time.Time     // inode → expiry; if now < expiry, skip
 
 	// Spool routing (Option 2, slice C). When non-nil, O_CREATE writes
 	// are routed through the spool instead of going directly to FUSE,
@@ -180,17 +180,17 @@ func lstatWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, ok bool)
 func NewHandler(store *metadata.Store, fusePath string) *JuiceMountHandler {
 	fdPool := NewFDPool()
 	h := &JuiceMountHandler{
-		store:        store,
-		fusePath:     fusePath,
-		fdPool:       fdPool,
-		readahead:    NewReadaheadManager(fusePath, fdPool),
-		memBuf:       NewMemoryBuffer(DefaultMemBufThreshold, DefaultMemBufBudget),
+		store:         store,
+		fusePath:      fusePath,
+		fdPool:        fdPool,
+		readahead:     NewReadaheadManager(fusePath, fdPool),
+		memBuf:        NewMemoryBuffer(DefaultMemBufThreshold, DefaultMemBufBudget),
 		writeSizes:    make(map[string]int64),
 		activeWriters: make(map[string]int),
 		verifiers:     make(map[string]verifierData),
-		prefetched:   make(map[string]time.Time),
-		prefetchSem:  make(chan struct{}, 4), // max 4 concurrent prefetches
-		verifierStop: make(chan struct{}),
+		prefetched:    make(map[string]time.Time),
+		prefetchSem:   make(chan struct{}, 4), // max 4 concurrent prefetches
+		verifierStop:  make(chan struct{}),
 	}
 	go h.verifierCleanupLoop(60*time.Second, 5*time.Minute)
 	return h
@@ -359,6 +359,20 @@ func (h *JuiceMountHandler) hasActiveWriter(path string) bool {
 func (h *JuiceMountHandler) trackWriteSize(path string, size int64) {
 	h.writeSizeMu.Lock()
 	if cur, ok := h.writeSizes[path]; !ok || size > cur {
+		h.writeSizes[path] = size
+	}
+	h.writeSizeMu.Unlock()
+}
+
+// clampWriteSize forces the tracked size DOWN to size if the current
+// high-water mark exceeds it. Truncate is the one writer operation that is
+// an authoritative size statement rather than a positional contribution —
+// MAX semantics (trackWriteSize) would otherwise resurrect the stale
+// pre-truncate size in Stat after the spool entry drains. Concurrent writes
+// past the truncation point re-raise the mark via trackWriteSize as usual.
+func (h *JuiceMountHandler) clampWriteSize(path string, size int64) {
+	h.writeSizeMu.Lock()
+	if cur, ok := h.writeSizes[path]; ok && cur > size {
 		h.writeSizes[path] = size
 	}
 	h.writeSizeMu.Unlock()
@@ -576,8 +590,8 @@ func (h *JuiceMountHandler) Change(fs billy.Filesystem) billy.Change {
 
 // FSStat fills in filesystem statistics.
 func (h *JuiceMountHandler) FSStat(ctx context.Context, f billy.Filesystem, stat *nfslib.FSStat) error {
-	stat.TotalSize = 1 << 40  // 1TB
-	stat.FreeSize = 1 << 39   // 512GB
+	stat.TotalSize = 1 << 40 // 1TB
+	stat.FreeSize = 1 << 39  // 512GB
 	stat.AvailableSize = 1 << 39
 	stat.TotalFiles = 1 << 20
 	stat.FreeFiles = 1 << 19
@@ -1326,7 +1340,12 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 		}
 		jmlog.Debug("offline: allowing open of cached un-pinned file (probe hit)",
 			"in_mount", filename,
-			"inode", func() uint64 { if e != nil { return e.Inode }; return 0 }())
+			"inode", func() uint64 {
+				if e != nil {
+					return e.Inode
+				}
+				return 0
+			}())
 	}
 
 	// For read-only opens, try to use fd pool + cache reader
@@ -1463,11 +1482,11 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 		// gate in Stat() can see this writer is in flight.
 		jfs.handler.incActiveWriter(filename)
 		return &writeFile{
-			File:    fd,
-			name:    filename,
-			handler: jfs.handler,
-			entry:   entry,
-			fdPool:  jfs.handler.fdPool,
+			File:     fd,
+			name:     filename,
+			handler:  jfs.handler,
+			entry:    entry,
+			fdPool:   jfs.handler.fdPool,
 			fusePath: fullPath,
 		}, nil
 	}
@@ -1541,15 +1560,72 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	oldpath = strings.TrimPrefix(oldpath, "/")
 	newpath = strings.TrimPrefix(newpath, "/")
 
-	// Execute on FUSE
-	if err := os.Rename(jfs.fullPath(oldpath), jfs.fullPath(newpath)); err != nil {
-		return err
+	// Spool-aware rename (Phase-1 BUG 1). Order matters:
+	//
+	//  1. Cancel any active spool entry at the DESTINATION. POSIX rename
+	//     replaces dst; without the cancel, dst's old entry keeps shadowing
+	//     reads and its queued drain later overwrites the renamed file with
+	//     the replaced file's bytes (same hazard class as QA-37 deletes).
+	//  2. Migrate the SOURCE's active entry (and, for directory renames,
+	//     every entry under oldpath+"/") to the new path — index key, SQL
+	//     row, and drain target. This MUST happen before the FUSE rename:
+	//     once the migration commits, an in-flight drain that already
+	//     claimed the old target observes done=false at MarkDrainComplete
+	//     and undoes its FUSE write instead of resurrecting the old path.
+	//
+	// Migration failure fails the RPC: proceeding with a FUSE rename while
+	// the spool still targets the old path is exactly the silent-resurrect
+	// bug this exists to fix. The client retries cleanly.
+	migrated := 0
+	if jfs.handler.spool != nil {
+		// Cancel any active destination entry UNCONDITIONALLY (adversarial-
+		// review BUG C) — gating on LookupActive missed rows recovered at
+		// boot, which are deliberately NOT re-indexed (RecoverOnBoot): a
+		// rename over such a row left its stale drain queued, able to land
+		// after ours and overwrite the renamed file with the replaced file's
+		// bytes. CancelForDelete is a no-op when nothing exists (same
+		// unconditional pattern as Remove).
+		jfs.handler.spool.CancelForDelete(newpath)
+		n, err := jfs.handler.spool.MigrateForRename(oldpath, newpath)
+		if err != nil {
+			jmlog.Warn("rename: spool migration failed — failing RPC",
+				"old", oldpath, "new", newpath, "error", err.Error())
+			return err
+		}
+		migrated = n
 	}
 
-	// Invalidate memory buffer for old path
+	// Execute on FUSE. A purely-spooled file hasn't been drained yet, so it
+	// does not exist on FUSE — ENOENT here is the EXPECTED case when the
+	// spool migration moved entries, not a failure (the drain materializes
+	// the new path). Any other combination keeps the legacy contract:
+	// errors propagate (onRename maps them to NFS statuses).
+	if err := os.Rename(jfs.fullPath(oldpath), jfs.fullPath(newpath)); err != nil {
+		if !(migrated > 0 && os.IsNotExist(err)) {
+			return err
+		}
+	}
+
+	// Invalidate memory buffer for both ends: the old path is gone, and a
+	// replaced destination must not serve the pre-rename bytes from cache.
 	if jfs.handler.memBuf != nil {
 		jfs.handler.memBuf.Invalidate(oldpath)
+		jfs.handler.memBuf.Invalidate(newpath)
 	}
+
+	// Carry the in-flight write-size high-water mark across the rename so
+	// (a) Stat at the new path stays accurate for a file still being
+	// written, and (b) a FUTURE file created at the old path doesn't
+	// inherit a stale inflated size from the sticky map (QA-16 MAX
+	// semantics never shrink).
+	jfs.handler.writeSizeMu.Lock()
+	if sz, ok := jfs.handler.writeSizes[oldpath]; ok {
+		delete(jfs.handler.writeSizes, oldpath)
+		if cur, ok := jfs.handler.writeSizes[newpath]; !ok || sz > cur {
+			jfs.handler.writeSizes[newpath] = sz
+		}
+	}
+	jfs.handler.writeSizeMu.Unlock()
 
 	// Update in-memory cache FIRST (instant visibility for NFS stats).
 	// SQLite writes happen async — they may be blocked by BulkInsert,
@@ -1651,11 +1727,15 @@ func (jfs *juiceFS) MkdirAll(dirname string, perm os.FileMode) error {
 }
 
 // Remaining billy.Filesystem stubs
-func (jfs *juiceFS) Join(elem ...string) string          { return path.Join(elem...) }
-func (jfs *juiceFS) TempFile(dir, prefix string) (billy.File, error) { return nil, fmt.Errorf("not implemented") }
-func (jfs *juiceFS) Symlink(target, link string) error     { return fmt.Errorf("not supported") }
+func (jfs *juiceFS) Join(elem ...string) string { return path.Join(elem...) }
+func (jfs *juiceFS) TempFile(dir, prefix string) (billy.File, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+func (jfs *juiceFS) Symlink(target, link string) error    { return fmt.Errorf("not supported") }
 func (jfs *juiceFS) Readlink(link string) (string, error) { return "", fmt.Errorf("not supported") }
-func (jfs *juiceFS) Chroot(p string) (billy.Filesystem, error) { return nil, fmt.Errorf("not supported") }
+func (jfs *juiceFS) Chroot(p string) (billy.Filesystem, error) {
+	return nil, fmt.Errorf("not supported")
+}
 func (jfs *juiceFS) Root() string { return "/" }
 
 // juiceChange implements billy.Change for write operations.
@@ -1663,10 +1743,10 @@ type juiceChange struct {
 	handler *JuiceMountHandler
 }
 
-func (jc *juiceChange) Chmod(name string, mode os.FileMode) error              { return nil }
-func (jc *juiceChange) Chown(name string, uid, gid int) error                  { return nil }
-func (jc *juiceChange) Lchown(name string, uid, gid int) error                 { return nil }
-func (jc *juiceChange) Chtimes(name string, atime, mtime time.Time) error      { return nil }
+func (jc *juiceChange) Chmod(name string, mode os.FileMode) error         { return nil }
+func (jc *juiceChange) Chown(name string, uid, gid int) error             { return nil }
+func (jc *juiceChange) Lchown(name string, uid, gid int) error            { return nil }
+func (jc *juiceChange) Chtimes(name string, atime, mtime time.Time) error { return nil }
 
 // cachedFile implements billy.File with two-tier read path:
 // 1. Direct SSD pread (bypasses FUSE) — if cache reader is available and block is cached
@@ -1819,12 +1899,14 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
-func (f *cachedFile) Read(p []byte) (int, error)    { return f.fuseFD.Read(p) }
-func (f *cachedFile) Write(p []byte) (int, error)   { return f.fuseFD.Write(p) }
-func (f *cachedFile) Seek(offset int64, whence int) (int64, error) { return f.fuseFD.Seek(offset, whence) }
-func (f *cachedFile) Lock() error                    { return nil }
-func (f *cachedFile) Unlock() error                  { return nil }
-func (f *cachedFile) Truncate(size int64) error      { return f.fuseFD.Truncate(size) }
+func (f *cachedFile) Read(p []byte) (int, error)  { return f.fuseFD.Read(p) }
+func (f *cachedFile) Write(p []byte) (int, error) { return f.fuseFD.Write(p) }
+func (f *cachedFile) Seek(offset int64, whence int) (int64, error) {
+	return f.fuseFD.Seek(offset, whence)
+}
+func (f *cachedFile) Lock() error               { return nil }
+func (f *cachedFile) Unlock() error             { return nil }
+func (f *cachedFile) Truncate(size int64) error { return f.fuseFD.Truncate(size) }
 
 func (f *cachedFile) Close() error {
 	if f.closed {
@@ -1958,9 +2040,9 @@ type billyFile struct {
 	pinned bool
 }
 
-func (f *billyFile) Name() string { return f.name }
-func (f *billyFile) Lock() error  { return nil }
-func (f *billyFile) Unlock() error { return nil }
+func (f *billyFile) Name() string              { return f.name }
+func (f *billyFile) Lock() error               { return nil }
+func (f *billyFile) Unlock() error             { return nil }
 func (f *billyFile) Truncate(size int64) error { return f.File.Truncate(size) }
 
 // Read overrides *os.File.Read to enforce the read-time offline gate on
@@ -1985,11 +2067,11 @@ func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 // Finder doesn't show the red "no access" badge on the mount root.
 type rootDirInfo struct{}
 
-func (r *rootDirInfo) Name() string      { return "" }
-func (r *rootDirInfo) Size() int64       { return 0 }
-func (r *rootDirInfo) Mode() fs.FileMode { return fs.ModeDir | 0755 }
+func (r *rootDirInfo) Name() string       { return "" }
+func (r *rootDirInfo) Size() int64        { return 0 }
+func (r *rootDirInfo) Mode() fs.FileMode  { return fs.ModeDir | 0755 }
 func (r *rootDirInfo) ModTime() time.Time { return time.Now() }
-func (r *rootDirInfo) IsDir() bool       { return true }
+func (r *rootDirInfo) IsDir() bool        { return true }
 func (r *rootDirInfo) Sys() any {
 	return &syscall.Stat_t{
 		Ino:   1,

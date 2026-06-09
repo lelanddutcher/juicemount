@@ -55,8 +55,12 @@ func onSetAttr(ctx context.Context, w *response, userHandle Handler) error {
 
 	changer := userHandle.Change(fs)
 	if err := attrs.Apply(changer, fs, fs.Join(path...)); err != nil {
-		// Already an nfsstatuserror
-		return err
+		// Apply wraps its own failures, but belt-and-braces here: a raw
+		// error would fall through wccDataErrorFormatter to an RPC-level
+		// SYSTEM_ERR reply with no SETATTR3resfail body — macOS reports
+		// that as EBADRPC "RPC struct is bad" (Phase-1 BUG 4). Wrapping
+		// guarantees the reply carries status + wcc_data per RFC 1813.
+		return nfsStatusErrorFrom(err)
 	}
 
 	preAttr := ToFileAttribute(info, fullPath).AsCache()

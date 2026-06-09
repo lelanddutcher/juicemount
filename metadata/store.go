@@ -324,6 +324,19 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		sep = "&"
 	}
 	dsn += sep + "_pragma=busy_timeout(30000)"
+	// _txlock=immediate: every transaction takes SQLite's write lock at
+	// Begin() instead of upgrading at the first write statement. A DEFERRED
+	// tx that SELECTs and then UPDATEs can hit SQLITE_BUSY *immediately* on
+	// the upgrade — busy_timeout does NOT apply to a snapshot-stale upgrade
+	// (waiting would deadlock), so under concurrent writers the tx fails no
+	// matter how long the timeout is. Observed live (2026-06-09): rsync's
+	// temp-file rename → MigrateForRename's SELECT-then-UPDATE tx raced a
+	// drain-completion metadata write → BUSY → rename RPC failed → rsync
+	// aborted with EIO. Every Begin() in this codebase is a write batch
+	// (BulkInsert, prune, spool migration — reads use direct queries), so
+	// immediate costs nothing and makes Begin() serialize under the 30s
+	// busy_timeout, where contention belongs.
+	dsn += "&_txlock=immediate"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

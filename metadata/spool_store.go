@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // DrainState is the spool entry lifecycle state.
@@ -179,6 +180,130 @@ func (s *SpoolStore) DeleteActiveByPath(nfsPath string) ([]*SpoolRow, error) {
 		nfsPath,
 	); err != nil {
 		return out, fmt.Errorf("spool delete-active-by-path delete %q: %w", nfsPath, err)
+	}
+	return out, nil
+}
+
+// SpoolPathMigration describes one row moved by MigrateActivePaths.
+type SpoolPathMigration struct {
+	OldID    int64
+	NewID    int64 // == OldID unless Requeued
+	OldPath  string
+	NewPath  string
+	Requeued bool // draining row was cancelled + reinserted as a fresh ready row
+}
+
+// MigrateActivePaths is the SQL half of the rename↔spool fix (Phase-1
+// BUG 1). It re-points every active row whose nfs_path is oldPath — or
+// lives under oldPath+"/" (directory rename) — at the corresponding path
+// under newPath:
+//
+//	writing/ready → UPDATE nfs_path in place (drain not yet claimed; the
+//	                queued copy will target the new path)
+//	draining      → DELETE + INSERT a fresh `ready` row at the new path
+//	                sharing the same spool file. The in-flight drain then
+//	                observes done=false at MarkDone (rows-affected 0) and
+//	                undoes its FUSE write — the QA-37 cancel contract —
+//	                while the requeued row re-drains to the new target.
+//
+// Holding writeMu across the SELECT + mutations makes the migration atomic
+// with respect to MarkDraining/MarkDone/DeleteActiveByPath, exactly like
+// DeleteActiveByPath: a concurrent drain transition either committed before
+// (and is observed by the SELECT) or blocks until after (and then sees the
+// migrated/deleted state). The statements run in one transaction so a crash
+// can't split a directory rename's children across both prefixes.
+//
+// Prefix matching uses substr(), not LIKE, so paths containing '%' or '_'
+// can't over-match.
+func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMigration, error) {
+	if oldPath == "" || oldPath == newPath {
+		return nil, nil
+	}
+	now := time.Now().Unix()
+	prefix := oldPath + "/"
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("spool migrate-paths begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+
+	rows, err := tx.Query(
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		 FROM spool_entries
+		 WHERE drain_state IN ('writing','ready','draining')
+		   AND (nfs_path = ? OR substr(nfs_path, 1, ?) = ?)`,
+		// substr counts CHARACTERS, len() counts BYTES (adversarial-review
+		// BUG B): a multi-byte dir name ("vidéos/") made the byte length
+		// overshoot the rune count, so the prefix never matched and a
+		// unicode directory rename silently migrated zero children.
+		oldPath, utf8.RuneCountInString(prefix), prefix,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("spool migrate-paths select %q: %w", oldPath, err)
+	}
+	var active []*SpoolRow
+	for rows.Next() {
+		r, scanErr := scanSpoolRow(rows.Scan)
+		if scanErr != nil {
+			rows.Close()
+			return nil, scanErr
+		}
+		active = append(active, r)
+	}
+	errRows := rows.Err()
+	rows.Close()
+	if errRows != nil {
+		return nil, errRows
+	}
+	if len(active) == 0 {
+		return nil, nil
+	}
+
+	out := make([]SpoolPathMigration, 0, len(active))
+	for _, r := range active {
+		newRowPath := newPath + r.NFSPath[len(oldPath):]
+		m := SpoolPathMigration{OldID: r.ID, NewID: r.ID, OldPath: r.NFSPath, NewPath: newRowPath}
+
+		switch r.DrainState {
+		case DrainDraining:
+			if _, err := tx.Exec(`DELETE FROM spool_entries WHERE id=?`, r.ID); err != nil {
+				return nil, fmt.Errorf("spool migrate-paths cancel draining %d: %w", r.ID, err)
+			}
+			// created_at preserved so the requeued row keeps its FIFO
+			// position in ListReady; attempts carried (the cancelled
+			// attempt wasn't a data failure, but the budget shouldn't
+			// reset on rename either).
+			res, err := tx.Exec(
+				`INSERT INTO spool_entries (nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				newRowPath, r.SpoolFile, r.Size, r.SHA256, DrainReady, r.DrainAttempts, r.LastError, r.CreatedAt.Unix(), now,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("spool migrate-paths requeue %d: %w", r.ID, err)
+			}
+			newID, err := res.LastInsertId()
+			if err != nil {
+				return nil, fmt.Errorf("spool migrate-paths requeue lastid %d: %w", r.ID, err)
+			}
+			m.NewID = newID
+			m.Requeued = true
+
+		default: // writing, ready
+			if _, err := tx.Exec(
+				`UPDATE spool_entries SET nfs_path=?, updated_at=? WHERE id=?`,
+				newRowPath, now, r.ID,
+			); err != nil {
+				return nil, fmt.Errorf("spool migrate-paths update %d: %w", r.ID, err)
+			}
+		}
+		out = append(out, m)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("spool migrate-paths commit: %w", err)
 	}
 	return out, nil
 }

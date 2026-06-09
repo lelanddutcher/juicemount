@@ -137,16 +137,25 @@ func (f *spoolWriteFile) Seek(offset int64, whence int) (int64, error) {
 	return f.pos, nil
 }
 
-// Truncate is intentionally minimal: zero-size is a no-op on a fresh
-// entry; any other truncation returns an error. See type doc.
+// Truncate resizes the in-flight spool entry (Phase-1 BUG 3/4). NFS
+// SETATTR{size} routes here via SetFileAttributes.Apply for any spooled
+// path: fio preallocates with ftruncate before writing, and cp/copyfile
+// issues a final ftruncate(dst, size) after the data writes. The slice-C
+// stub rejected both, which failed cp with rc=1 and — because the raw error
+// escaped to the RPC formatter — surfaced to fio as EBADRPC "RPC struct is
+// bad". SpoolEntry.Truncate owns capacity accounting + hash invalidation.
 func (f *spoolWriteFile) Truncate(size int64) error {
-	if size == 0 {
-		if f.entry.WrittenEnd() > 0 {
-			return fmt.Errorf("spoolWriteFile.Truncate: nonzero-to-zero truncation not supported in slice C")
-		}
-		return nil
+	if err := f.entry.Truncate(size); err != nil {
+		return err
 	}
-	return fmt.Errorf("spoolWriteFile.Truncate: arbitrary truncation (size=%d) not supported in slice C", size)
+	// Keep the Stat-shadow bookkeeping coherent. trackWriteSize is
+	// MAX-only (QA-16), so an authoritative shrink must CLAMP the sticky
+	// high-water mark — otherwise, after the drain, Stat would resurrect
+	// the stale pre-truncate size from writeSizes forever.
+	if f.handler != nil {
+		f.handler.clampWriteSize(f.name, size)
+	}
+	return nil
 }
 
 // Close ends this per-RPC write handle. It releases the spool entry's
