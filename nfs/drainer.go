@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -37,11 +38,11 @@ import (
 // cache.Reader, readahead.Manager, memBuf, pin.Store). Per the slice
 // plan guardrails, it interacts only with the spool and the FUSE mount.
 type Drainer struct {
-	spool       *SpoolStore
-	fuseRoot    string
-	workers     int
-	maxAttempts int
-	backoffBase time.Duration
+	spool        *SpoolStore
+	fuseRoot     string
+	workers      int
+	maxAttempts  int
+	backoffBase  time.Duration
 	pollFallback time.Duration
 
 	sem    chan struct{}
@@ -253,6 +254,30 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 		// defensive — could happen after recovery).
 		return true
 	}
+
+	// Re-read the row AFTER the claim and drain from the fresh copy, never
+	// the ListReady snapshot (adversarial-review BUG A). The snapshot can be
+	// minutes stale under a worker backlog; a rename in that window updates
+	// a ready row's nfs_path IN PLACE (id and state unchanged), so a claim
+	// keyed only on (id, state=ready) succeeds and a snapshot-path drain
+	// would write to the OLD path — silently undoing the rename and leaving
+	// a dead index entry shadowing the new path. Post-claim the row is in
+	// `draining`, so any later migration takes the DELETE+requeue path and
+	// this drain's MarkDone observes done=false and undoes itself (QA-37
+	// contract) — making the re-read stable.
+	fresh, err := d.spool.Meta().Get(row.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Row deleted between claim and re-read (CancelForDelete) — nothing
+		// to drain; the cancel path owns file + capacity cleanup.
+		return true
+	}
+	if err != nil {
+		// Transient read failure: surrender the claim so the row is retried.
+		log.Printf("drainer: post-claim re-read %d: %v — returning to ready", row.ID, err)
+		_ = d.spool.Meta().ResetToReady(row.ID)
+		return true
+	}
+	row = fresh
 
 	// WaitGroup Add happens BEFORE sem to satisfy Stop's invariant
 	// (see fn doc above). The InFlight metric, by contrast, tracks
@@ -478,7 +503,6 @@ func (d *Drainer) quarantine(row *metadata.SpoolRow, reason string) {
 	}
 	d.metrics.Quarantined.Add(1)
 }
-
 
 // DrainOnceForTest runs a SINGLE ListReady scan, processes the rows
 // returned, and waits for them to complete. Test-only entry point —

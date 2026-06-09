@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 )
 
 // RPCError provides the error interface for errors thrown by
@@ -228,3 +229,34 @@ var (
 	wccDataErrorBody      = [8]byte{}
 	wccDataErrorFormatter = errFormatterWithBody(wccDataErrorBody[:])
 )
+
+// nfsStatusErrorFrom guarantees an error is reply-encodable at the NFS
+// level. A raw Go error that reaches errFormatterWithBody falls through to
+// ResponseCodeSystemError — an RPC-level SYSTEM_ERR reply with NO NFS status
+// or wcc/attr body — which the macOS client surfaces to applications as
+// EBADRPC "RPC struct is bad" (errno 72). RFC 1813 requires every SETATTR /
+// WRITE / CREATE reply, success OR failure, to carry its post-op body, so
+// every error leaving a handler must be an RPCError. Existing RPCErrors
+// (including *NFSStatusError) pass through untouched.
+func nfsStatusErrorFrom(err error) error {
+	// Unwrap to the CONCRETE *NFSStatusError rather than passing a wrapper
+	// through: errFormatterWithBody appends the mandatory post-op body via an
+	// exact type assertion `err.(*NFSStatusError)`, so an NFSStatusError
+	// wrapped in fmt.Errorf("%w: …") returned verbatim would encode a
+	// body-less reply — the EBADRPC shape this function exists to prevent.
+	var statusErr *NFSStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr
+	}
+	var rpcErr RPCError
+	if errors.As(err, &rpcErr) {
+		return err
+	}
+	if os.IsNotExist(err) {
+		return &NFSStatusError{NFSStatusNoEnt, err}
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return &NFSStatusError{NFSStatusAccess, err}
+	}
+	return &NFSStatusError{NFSStatusIO, err}
+}

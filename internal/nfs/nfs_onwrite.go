@@ -90,6 +90,10 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		Log.Errorf("write fallback: file %T missing WriteAt — RACE-PRONE; offset=%d", file, req.Offset)
 		if req.Offset > 0 {
 			if _, err := file.Seek(int64(req.Offset), io.SeekStart); err != nil {
+				// Phase-1 BUG 2: every error return after a successful
+				// OpenFile must Close — a dropped handle leaks the spool
+				// entry's refcount and the entry never finalizes/drains.
+				_ = file.Close()
 				return &NFSStatusError{NFSStatusIO, err}
 			}
 		}
@@ -97,6 +101,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	}
 	if err != nil {
 		Log.Errorf("Error writing: %v", err)
+		_ = file.Close() // Phase-1 BUG 2: see Seek-error comment above
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 	if err := file.Close(); err != nil {

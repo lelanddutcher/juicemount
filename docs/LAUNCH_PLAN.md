@@ -10,7 +10,10 @@ the orchestrator (Claude session) deploys, gates, and commits.
 2. `go test ./...` — no NEW failures vs the Phase-0 baseline catalog
    (`/tmp/jm-launch/baseline-go-test.txt`). Known env-dependent failures
    (need local Redis :6379 / MinIO :9000): TestMinIOHealthCheck,
-   TestStatusReturnsCorrectState, TestBillyFileOfflineGate, TestMemBuf*.
+   TestStatusReturnsCorrectState, TestBillyFileOfflineGate, TestMemBuf*
+   (×4). Flagged-unreliable in the Phase-0 capture (ran during the app
+   restart window; re-verify at the Phase-1 gate before counting either
+   way): TestBenchmarkSuite, TestFUSEMountCheck, TestRedisHealthCheck.
 3. Swift bundle builds: `JM_QUICK=1 ./scripts/build-app.sh --release`.
 4. Clean relaunch (quit → clear mounts → open → healthy ≤90s).
 5. **Byte-integrity (QA Rule 1)**: ≥10 MiB random file written through
@@ -38,3 +41,41 @@ an isolated worktree and rebase after N's commit. Merges stay serialized.
 
 ## Ledger (append per phase)
 <!-- phase / agent / changes / gate results / commit -->
+
+- **Phase 0** (2026-06-08): baseline commit e3aff46 (11 files, session
+  hardening work). go-test baseline captured (7 stable env-dependent
+  failures + 3 restart-contaminated, see gate note). App restarted:
+  RecoverOnBoot cleared all 43 stuck `writing` spool rows (pending 43→0,
+  capacity 66.6MB→0) — validates boot-recovery path. Backend QA leftovers
+  (.jmqa-finder-34595) purged via FUSE. Observation for Phase 2: /spool
+  still lists 46 historical entries with pending=0 (presentation). ✅
+- **Phase 1** (2026-06-08/09): write-path correctness. Agent fixed all 4
+  bugs (shared epicenter: SETATTR{size} → spool truncate stub → cp rc=1 +
+  EBADRPC XDR + the 43-handle leak; plus spool-blind Rename). 20 new
+  failing-first tests. Gate: build/vet/gofmt ✅; full sweep zero new
+  failures ✅ (the 3 restart-contaminated baseline entries now pass);
+  byte-integrity sha256 ✅ cp rc=0 ✅; live mv acid test FUSE-verified ✅;
+  QA 01-smoke 10/10 ✅, 02-finder 11/1 ✅ (the 1 = pre-existing burst-create
+  ETIMEDOUT, logged below), 06-concurrency 6/0 ✅. Adversarial review:
+  BLOCK → 3 fixes applied + 1 hardening: (A) drainer stale-snapshot claim
+  → post-claim row re-read (CRITICAL: rename racing a backlogged drain
+  silently undone); (B) MigrateActivePaths substr rune-vs-byte count
+  (unicode dir renames migrated zero children); (C) unconditional dst
+  CancelForDelete (post-restart rows invisible to the index gate);
+  (D) nfsStatusErrorFrom unwraps to concrete *NFSStatusError. A+B
+  regression tests added and NEGATIVE-CHECKED (each test proven to fail
+  with its fix reverted). Reviewer follow-ups deferred as non-blocking:
+  D-rollback-on-FUSE-rename-fail, late-SETATTR zero-clobber shape (E),
+  writeSizes dir-children carry (F), stale QuarantineDrain hygiene (G),
+  ErrSpoolFull→NFS3ERR_NOSPC mapping (H), escalation-test flake margin.
+  → gate finishing: relaunch + QA re-run, then commit.
+
+### New findings logged during Phase 1 gate (not regressions)
+- Burst-create ETIMEDOUT ~1/1000 under load (QA-29 stall class, newly
+  visible now that 02-finder runs past rsync) — candidate Phase 2/3.
+- cp -R exits 1 copying dir xattrs (NFSv3 no-xattr; data lands fine) —
+  launch-list item: AppleDouble/xattr story for dirs.
+- QA suite fragility: a phase script dying mid-run (set -e) writes no
+  .summary → run-all reports synthetic fail=99 and masks real results —
+  fix in Phase 5 prep.
+- /spool lists historical done rows with pending=0 (presentation) — Phase 2.
