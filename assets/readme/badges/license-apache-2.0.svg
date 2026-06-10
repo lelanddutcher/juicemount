@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="20" role="img" aria-label="license: Apache-2.0">
+  <title>license: Apache-2.0</title>
+  <path fill="#393839" d="M4 0h48v20H4a4 4 0 0 1-4-4V4a4 4 0 0 1 4-4z"/>
+  <path fill="#AACD58" d="M52 0h72a4 4 0 0 1 4 4v12a4 4 0 0 1-4 4H52z"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11">
+    <text x="26" y="14" textLength="40" text-anchor="middle" fill="#FAFDE8">license</text>
+    <text x="90" y="14" textLength="64" text-anchor="middle" fill="#1B102A">Apache-2.0</text>
+  </g>
+</svg>
