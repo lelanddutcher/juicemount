@@ -42,3 +42,4 @@ credentials.md
 
 # Claude Code
 .claude/
+/build/svg2png

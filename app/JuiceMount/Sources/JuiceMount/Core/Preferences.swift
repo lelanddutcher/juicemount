@@ -80,6 +80,15 @@ public final class Preferences {
         didSet { save() }
     }
 
+    /// LB-1 first-run gate. False until the user finishes (or explicitly
+    /// continues past) the setup-assistant welcome flow. While false, the
+    /// app shows the onboarding window at launch instead of auto-starting
+    /// into a dead-end "Disconnected". The window can be reopened any time
+    /// via the popover's "Setup Assistant…" item.
+    public var hasCompletedOnboarding: Bool {
+        didSet { save() }
+    }
+
     public init(
         volumeName: String = "zpool",
         mountPoint: String = "/Volumes/zpool",
@@ -96,7 +105,8 @@ public final class Preferences {
         offlineNotificationsEnabled: Bool = false,
         s3EndpointOverride: String = "",
         spoolEnabled: Bool = false,
-        spoolCapacityGB: Int = 50
+        spoolCapacityGB: Int = 50,
+        hasCompletedOnboarding: Bool = false
     ) {
         self.volumeName = volumeName
         self.mountPoint = mountPoint
@@ -114,6 +124,7 @@ public final class Preferences {
         self.s3EndpointOverride = s3EndpointOverride
         self.spoolEnabled = spoolEnabled
         self.spoolCapacityGB = spoolCapacityGB
+        self.hasCompletedOnboarding = hasCompletedOnboarding
     }
 
     public static func defaultDBPath() -> String {
@@ -174,10 +185,24 @@ public final class Preferences {
         case offlineNotificationsEnabled
         case s3EndpointOverride
         case spoolEnabled, spoolCapacityGB
+        case hasCompletedOnboarding
     }
 
     public static func load() -> Preferences {
         let d = defaults
+        // Upgrade migration (review P2-B): hasCompletedOnboarding didn't
+        // exist before the onboarding build, and `d.bool` defaults to false —
+        // which would turn EVERY existing, configured install into
+        // "first-run" after upgrade (no auto-start; a window demanding a
+        // click, brutal for headless/remote Macs). Evidence this machine ran
+        // JuiceMount before = its metadata DB exists on disk. Run once: the
+        // marker persists immediately.
+        if d.object(forKey: Key.hasCompletedOnboarding.rawValue) == nil {
+            let dbPath = ((d.string(forKey: Key.dbPath.rawValue) ?? defaultDBPath()) as NSString).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: dbPath) {
+                d.set(true, forKey: Key.hasCompletedOnboarding.rawValue)
+            }
+        }
         return Preferences(
             volumeName:        d.string(forKey: Key.volumeName.rawValue) ?? "zpool",
             mountPoint:        d.string(forKey: Key.mountPoint.rawValue) ?? "/Volumes/zpool",
@@ -194,7 +219,8 @@ public final class Preferences {
             offlineNotificationsEnabled: d.bool(forKey: Key.offlineNotificationsEnabled.rawValue),
             s3EndpointOverride: d.string(forKey: Key.s3EndpointOverride.rawValue) ?? "",
             spoolEnabled:       d.bool(forKey: Key.spoolEnabled.rawValue),
-            spoolCapacityGB:    d.object(forKey: Key.spoolCapacityGB.rawValue) as? Int ?? 50
+            spoolCapacityGB:    d.object(forKey: Key.spoolCapacityGB.rawValue) as? Int ?? 50,
+            hasCompletedOnboarding: d.bool(forKey: Key.hasCompletedOnboarding.rawValue)
         )
     }
 
@@ -216,5 +242,6 @@ public final class Preferences {
         d.set(s3EndpointOverride, forKey: Key.s3EndpointOverride.rawValue)
         d.set(spoolEnabled, forKey: Key.spoolEnabled.rawValue)
         d.set(spoolCapacityGB, forKey: Key.spoolCapacityGB.rawValue)
+        d.set(hasCompletedOnboarding, forKey: Key.hasCompletedOnboarding.rawValue)
     }
 }

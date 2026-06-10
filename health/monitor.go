@@ -98,9 +98,9 @@ type HealthMonitor struct {
 	done          chan struct{}
 
 	// NFS auto-remount state. Guarded by mu.
-	remountFn       func() error // optional: called to remount the NFS volume
-	nfsStaleStreak  int          // consecutive failed NFS checks
-	lastRemountAt   time.Time    // last successful remount time
+	remountFn      func() error // optional: called to remount the NFS volume
+	nfsStaleStreak int          // consecutive failed NFS checks
+	lastRemountAt  time.Time    // last successful remount time
 
 	// FUSE health debounce (anti-flap). The raw checkFUSE probe flips on
 	// every backend-link blip; reporting that verbatim strobes the menu bar.
@@ -612,19 +612,41 @@ func (m *HealthMonitor) checkNFS() ComponentStatus {
 		return ComponentStatus{Healthy: true, LastCheck: now, Message: "not configured"}
 	}
 
-	done := make(chan error, 1)
+	done := make(chan ComponentStatus, 1)
 	go func() {
-		_, err := os.Stat(m.cfg.NFSMountPoint)
-		done <- err
+		if _, err := os.Stat(m.cfg.NFSMountPoint); err != nil {
+			if os.IsNotExist(err) {
+				// Mount-point directory gone — nothing is mounted there.
+				// Distinct from "stale" so the UI can offer "Mount Now"
+				// (LB-2 state honesty) instead of a generic fault.
+				done <- ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted"}
+				return
+			}
+			jmlog.Debug("nfs stat failed", "mount_point", m.cfg.NFSMountPoint, "error", err.Error())
+			done <- ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stale: %v", err)}
+			return
+		}
+		// A successful stat is NOT enough: a plain directory left behind
+		// after an unmount stats fine too. Verify the kernel mount table
+		// actually lists the path (LB-2). Bounded — getfsstat can hang on
+		// a wedged entry; on table-read failure report stale rather than
+		// not-mounted so the UI doesn't offer a Mount Now that would fail
+		// against a busy mount point.
+		mounted, err := mountTableHas(m.cfg.NFSMountPoint, NFSStatTimeout)
+		if err != nil {
+			done <- ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stale: mount table unreadable: %v", err)}
+			return
+		}
+		if !mounted {
+			done <- ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted"}
+			return
+		}
+		done <- ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 	}()
 
 	select {
-	case err := <-done:
-		if err != nil {
-			jmlog.Debug("nfs stat failed", "mount_point", m.cfg.NFSMountPoint, "error", err.Error())
-			return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stale: %v", err)}
-		}
-		return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
+	case st := <-done:
+		return st
 	case <-time.After(NFSStatTimeout):
 		jmlog.Warn("nfs mount unresponsive (stat timed out)",
 			"mount_point", m.cfg.NFSMountPoint,
@@ -632,4 +654,23 @@ func (m *HealthMonitor) checkNFS() ComponentStatus {
 		)
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "unresponsive (stat timeout)"}
 	}
+}
+
+// mountTableHas reports whether path appears as a mount point in the
+// kernel mount table. Matches " on <path> (" so prefix-sharing paths
+// (/Volumes/zpool vs /Volumes/zpool2) can't false-positive. Bounded:
+// `mount` calls getfsstat(), which can hang in the kernel when the table
+// holds a wedged entry — on timeout (or any exec failure) an error is
+// returned and the caller decides how to degrade.
+func mountTableHas(path string, timeout time.Duration) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "mount").Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return false, fmt.Errorf("mount table query timed out after %s", timeout)
+		}
+		return false, err
+	}
+	return strings.Contains(string(out), " on "+path+" ("), nil
 }

@@ -7,6 +7,7 @@ struct MenuPopoverView: View {
     @Bindable var server: ServerController
     let onSearch: () -> Void
     let onPreferences: () -> Void
+    let onSetupAssistant: () -> Void
     let onQuit: () -> Void
 
     /// Computed mirror of `server.cacheStatus` — kept under the original
@@ -1231,42 +1232,173 @@ struct MenuPopoverView: View {
         ByteCountFormatter.string(fromByteCount: b, countStyle: .file)
     }
 
-    // MARK: - Header
+    // MARK: - Header (at-a-glance, Phase 3)
+    //
+    // Three glanceable elements — what the user ultimately needs to know:
+    //   (a) mount health: color dot + word from the SAME 4-state mapping
+    //       the menu-bar icon uses (ServerController.glanceState);
+    //   (b) cache: used vs free with a thin proportional bar;
+    //   (c) uploads: "N uploading · M queued", hidden when idle.
+    // Detail sections stay below.
+
+    /// Exact palette from the approved icon/state spec.
+    static let glanceAmber = Color(red: 0xEF / 255.0, green: 0x9F / 255.0, blue: 0x27 / 255.0)
+    static let glanceBlue  = Color(red: 0x37 / 255.0, green: 0x8A / 255.0, blue: 0xDD / 255.0)
+    static let glanceRed   = Color(red: 0xE2 / 255.0, green: 0x4B / 255.0, blue: 0x4A / 255.0)
 
     private var header: some View {
-        HStack(spacing: 10) {
-            statusDot
-            VStack(alignment: .leading, spacing: 2) {
-                Text("JuiceMount").font(.headline)
-                Text(headerSubtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                statusDot
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("JuiceMount").font(.headline)
+                    Text(headerSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(statusColor)
+                }
+                Spacer()
             }
-            Spacer()
+            cacheGlanceRow
+            uploadsGlanceRow
+            mountRemedyRow
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
 
-    /// Header subtitle. When offline-engaged, replaces the generic
-    /// state label with a clear "Offline · N pinned · disconnected
-    /// M:SS" string. The user-toggle and auto-engage cases use the
-    /// same shape but different reason text.
+    /// True for the states where a missing volume is a REMEDY situation
+    /// (server alive, Finder has nothing). Excludes .starting — the mount is
+    /// legitimately in flight then — and all stopped/fault states, where
+    /// Start (not Mount Now) is the correct action.
+    private var isRunningLikeForMountRemedy: Bool {
+        switch server.state {
+        case .running, .syncing, .degraded: return true
+        default: return false
+        }
+    }
+
+    /// LB-2 remedy row (review P1-A: the plumbing existed with no UI). Shown
+    /// only when the server runs but /Volumes/<name> is gone — the exact
+    /// state where every other indicator used to read "Connected".
+    @ViewBuilder
+    private var mountRemedyRow: some View {
+        if !server.volumeMounted, isRunningLikeForMountRemedy {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(Self.glanceAmber)
+                Text("Volume not mounted — Finder can't see your files")
+                    .font(.caption)
+                    .foregroundStyle(Self.glanceAmber)
+                Spacer()
+                Button {
+                    server.mountNow()
+                } label: {
+                    if server.mountNowInFlight {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("Mount Now").font(.caption)
+                    }
+                }
+                .disabled(server.mountNowInFlight)
+                .help("Re-mounts the volume via mount_nfs. May ask for your password once unless the scoped sudoers rule is installed.")
+            }
+        }
+    }
+
+    /// (b) "X cached · Y GB free" + a thin proportional bar of cached vs
+    /// free disk. Cached = pinned bytes actually resident (the number the
+    /// cache section details below); free = statfs free on the cache disk.
+    private var cacheGlanceRow: some View {
+        let cachedBytes = max(0, cacheStatus.aggregate.CachedBytes)
+        let freeBytes = Int64(max(0, diskFreeGB) * 1e9)
+        let total = Double(cachedBytes + freeBytes)
+        let fraction = total > 0 ? Double(cachedBytes) / total : 0
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Image(systemName: "internaldrive")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("\(formatBytes(cachedBytes)) cached · \(String(format: "%.0f", diskFreeGB)) GB free")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.secondary.opacity(0.18))
+                    Capsule()
+                        .fill(Color.accentColor.opacity(0.85))
+                        .frame(width: max(0, min(1, fraction)) * geo.size.width)
+                }
+            }
+            .frame(height: 3)
+        }
+    }
+
+    /// (c) Upload glance — "N uploading · M queued" plus compact failed/
+    /// stalled chips. Hidden entirely when the spool is off or idle with
+    /// nothing needing attention. `pending_files` counts writing+ready+
+    /// draining rows, so queued = pending − in-flight.
+    @ViewBuilder
+    private var uploadsGlanceRow: some View {
+        if let sp = server.spoolStatus, sp.enabled, sp.hasActivity || sp.needsAttention {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(Self.glanceBlue)
+                Text("\(sp.inProgress) uploading · \(max(0, sp.pendingFiles - Int(sp.inProgress))) queued")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if sp.failedFiles > 0 {
+                    Text("\(sp.failedFiles) failed")
+                        .font(.caption2)
+                        .foregroundStyle(Self.glanceRed)
+                }
+                if sp.stalledFiles > 0 {
+                    Text("\(sp.stalledFiles) stalled")
+                        .font(.caption2)
+                        .foregroundStyle(Self.glanceAmber)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    /// Header subtitle — the glance "word" from the shared 4-state mapping.
+    /// Offline-files mode keeps the rich "Offline · N pinned · disconnected
+    /// M:SS" string; the other states show the mapped word plus the reason
+    /// when there is one.
     private var headerSubtitle: String {
-        let off = server.offlineState
-        if !off.offline {
+        switch server.glanceState {
+        case .offlineFiles:
+            let off = server.offlineState
+            let pinned = server.cacheStatus.aggregate.ReadyFiles
+            if off.user_offline && !off.auto_offline {
+                return "Offline (you toggled it) · \(pinned) pinned available"
+            }
+            let elapsed = formatOfflineElapsed(seconds: off.since_sec)
+            if elapsed.isEmpty {
+                return "Offline · \(pinned) pinned available"
+            }
+            return "Offline · \(pinned) pinned · disconnected \(elapsed)"
+        case .healthy:
+            return "Healthy"
+        case .degraded:
+            // Running-but-unmounted is its own honest message (review B-gap:
+            // this used to fall through to .running's "Connected" — amber dot
+            // with a green word). The Mount Now remedy row sits right below.
+            if !server.volumeMounted, isRunningLikeForMountRemedy {
+                return "Volume not mounted"
+            }
+            // Keep the reason visible ("Degraded — Redis unreachable …",
+            // "Starting…").
             return server.state.displayLabel
+        case .fault:
+            return server.state.displayLabel
+        case .idle:
+            return "Not started"
         }
-        let pinned = server.cacheStatus.aggregate.ReadyFiles
-        if off.user_offline && !off.auto_offline {
-            return "Offline (you toggled it) · \(pinned) pinned available"
-        }
-        // Auto-engaged: show how long
-        let elapsed = formatOfflineElapsed(seconds: off.since_sec)
-        if elapsed.isEmpty {
-            return "Offline · \(pinned) pinned available"
-        }
-        return "Offline · \(pinned) pinned · disconnected \(elapsed)"
     }
 
     /// Formats N seconds as "M:SS" up to an hour, "H:MM:SS" beyond.
@@ -1291,21 +1423,14 @@ struct MenuPopoverView: View {
     }
 
     private var statusColor: Color {
-        // Offline trumps the state-driven color so the dot in the
-        // popover header agrees with the menu-bar icon. Otherwise the
-        // user sees a green dot in the popover and a blue dot in the
-        // menu bar at the same time, which is confusing.
-        if server.offlineState.offline {
-            return .blue
-        }
-        switch server.state {
-        case .idle:           return .gray
-        case .starting:       return .blue
-        case .running:        return .green
-        case .syncing:        return .blue
-        case .degraded:       return .yellow
-        case .disconnected:   return .red
-        case .error:          return .red
+        // Same 4-state mapping the menu-bar icon uses (and the exact spec
+        // palette) so the popover dot/word and the icon can never disagree.
+        switch server.glanceState {
+        case .healthy:      return .green
+        case .degraded:     return Self.glanceAmber
+        case .offlineFiles: return Self.glanceBlue
+        case .fault:        return Self.glanceRed
+        case .idle:         return .gray
         }
     }
 
@@ -1358,20 +1483,43 @@ struct MenuPopoverView: View {
     }
 
     // MARK: - Health section
+    //
+    // Phase 3: the per-component rows fold into a "Details" disclosure —
+    // the at-a-glance header already answers "is it healthy"; this is for
+    // the diagnosis case. Auto-expanded when something is actually down so
+    // the cause is one glance away.
+
+    @State private var healthDetailsExpanded = false
 
     private var healthSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Health")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 2)
-
-            healthRow(label: "Redis", healthy: server.stats.healthRedis)
-            healthRow(label: "MinIO", healthy: server.stats.healthMinIO)
-            healthRow(label: "FUSE",  healthy: server.stats.healthFUSE)
+        DisclosureGroup(isExpanded: $healthDetailsExpanded) {
+            VStack(alignment: .leading, spacing: 4) {
+                healthRow(label: "Redis", healthy: server.stats.healthRedis)
+                healthRow(label: "MinIO", healthy: server.stats.healthMinIO)
+                healthRow(label: "FUSE",  healthy: server.stats.healthFUSE)
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Text("Health details")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if !allComponentsHealthy {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(Self.glanceAmber)
+                }
+            }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
+        .onChange(of: allComponentsHealthy) { _, healthy in
+            if !healthy { healthDetailsExpanded = true }
+        }
+    }
+
+    private var allComponentsHealthy: Bool {
+        server.stats.healthRedis && server.stats.healthMinIO && server.stats.healthFUSE
     }
 
     private func healthRow(label: String, healthy: Bool) -> some View {
@@ -1439,6 +1587,15 @@ struct MenuPopoverView: View {
                 systemImage: "gear",
                 shortcut: "⌘,",
                 action: onPreferences
+            )
+
+            // LB-1: re-open the welcome/preflight checklist any time —
+            // the same window first-run shows. Useful after installing
+            // juicefs/macFUSE or fixing the backend.
+            ActionButton(
+                title: "Setup Assistant…",
+                systemImage: "checklist",
+                action: onSetupAssistant
             )
 
             // Phase B observability: bundle logs, control-plane snapshots,

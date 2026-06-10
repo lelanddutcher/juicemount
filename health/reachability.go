@@ -48,9 +48,9 @@ type dialer interface {
 // Reachability monitors whether a backend host:port is reachable from
 // this machine. Concurrent-safe; one instance per app process.
 type Reachability struct {
-	target      string
-	dialTimeout time.Duration
-	baseInterval time.Duration
+	target         string
+	dialTimeout    time.Duration
+	baseInterval   time.Duration
 	failsToOffline int // consecutive failures before flipping reachable→unreachable
 	passesToOnline int // consecutive successes before flipping unreachable→reachable
 
@@ -297,4 +297,3 @@ func (r *Reachability) applyResult(ok bool) {
 		}
 	}
 }
-

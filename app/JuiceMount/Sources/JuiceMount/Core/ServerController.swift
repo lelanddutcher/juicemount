@@ -51,6 +51,20 @@ public final class ServerController {
     /// uploads" section reads this and renders only when `.enabled`.
     public private(set) var spoolStatus: NFSBridge.SpoolStatus?
 
+    /// LB-2 state honesty: false when the server is running but the
+    /// user-visible NFS volume is NOT in the kernel mount table (the
+    /// health monitor's "nfs" component reports "not mounted" — see
+    /// health/monitor.go checkNFS). The UI surfaces "Volume not mounted"
+    /// + a Mount Now button off this instead of pretending all is well.
+    /// Defaults true and keeps last-known on probe failure so a flaky
+    /// metrics fetch can't flash a false "not mounted".
+    public private(set) var volumeMounted: Bool = true
+
+    /// True while a /mount-now round-trip is in flight (it can sit on the
+    /// macOS admin-password prompt). Drives the Mount Now button spinner
+    /// and double-click guard.
+    public private(set) var mountNowInFlight = false
+
     public var preferences: Preferences
 
     private let log = Logger(subsystem: "com.juicemount.app", category: "ServerController")
@@ -143,6 +157,12 @@ public final class ServerController {
                     self.log.error("Start failed: \(error.localizedDescription, privacy: .public)")
                     self.state = .error(error.localizedDescription)
                     self.lastError = error.localizedDescription
+                    // LB-2/S-1: a failed start must be ACTIONABLE, not a
+                    // silent slide into idle/error. The menu-bar fault
+                    // icon makes it visible; this makes it explainable
+                    // (cause heuristics + concrete next step + copyable
+                    // diagnostic).
+                    presentRemediation(.startFailed, rawError: error.localizedDescription)
                 }
             }
         }
@@ -264,6 +284,12 @@ public final class ServerController {
             // side decide whether to apply or keep last-known state.
             let o: NFSBridge.OfflineState? = NFSBridge.offlineState(metricsAddr: metricsAddr)
             let sp: NFSBridge.SpoolStatus? = NFSBridge.spoolStatus(metricsAddr: metricsAddr)
+            // LB-2: piggyback the NFS-mounted signal on the same tick —
+            // /health is a cached-snapshot read on the Go side (the
+            // monitor's 10 s loop does the actual probing), so this adds
+            // one loopback GET, no new polling loop and nothing on an NFS
+            // hot path.
+            let hp: NFSBridge.HealthProbe? = NFSBridge.healthProbe(metricsAddr: metricsAddr)
             Task { @MainActor in
                 guard let self else { return }
                 // Observe Swift-side offline_mode transitions. This is the exact
@@ -279,6 +305,20 @@ public final class ServerController {
                 // Spool status: keep last-known on a nil (unreachable) fetch,
                 // same rationale as offlineState below.
                 if let sp { self.spoolStatus = sp }
+
+                // NFS-mounted (LB-2). Only the monitor's explicit
+                // "not mounted" verdict flips this off — "stale"/"
+                // unresponsive" are a different condition (wedged mount,
+                // remedied by Force Eject, not Mount Now). Keep last-known
+                // when the probe is unreachable.
+                if let hp {
+                    let prevMounted = self.volumeMounted
+                    let nfsLabel = hp.components["nfs"] ?? ""
+                    self.volumeMounted = !nfsLabel.contains("not mounted")
+                    if prevMounted != self.volumeMounted {
+                        NFSBridge.appLog("volumeMounted \(prevMounted) -> \(self.volumeMounted) (nfs=\(nfsLabel))")
+                    }
+                }
 
                 if let o {
                     let prevAuto = self.offlineState.auto_offline
@@ -330,6 +370,34 @@ public final class ServerController {
                 self?.cacheStatus = s
                 if let o {
                     self?.offlineState = o
+                }
+            }
+        }
+    }
+
+    /// LB-2 "Mount Now": ask the control plane to re-run the NFS mount
+    /// for the configured mount point. Runs on a global queue — NEVER the
+    /// serial workQueue — because the Go side may block inside the macOS
+    /// admin-password prompt for as long as the user leaves it up, and
+    /// parking workQueue would freeze stats/cache polling (the exact
+    /// failure mode the recovery watchdog exists for).
+    public func mountNow() {
+        guard !mountNowInFlight else { return }
+        mountNowInFlight = true
+        let addr = preferences.metricsAddr
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = NFSBridge.mountNow(metricsAddr: addr)
+            Task { @MainActor in
+                guard let self else { return }
+                self.mountNowInFlight = false
+                if let result, result.ok {
+                    NFSBridge.appLog("mount-now ok (already_mounted=\(result.alreadyMounted))")
+                    self.volumeMounted = true
+                    self.refreshCacheStatus()
+                } else {
+                    let raw = result?.error ?? "control plane unreachable — is the server running?"
+                    NFSBridge.appLog("mount-now failed: \(raw)")
+                    presentRemediation(.mountFailed, rawError: raw)
                 }
             }
         }
@@ -619,6 +687,78 @@ public final class ServerController {
             state = .degraded("Redis unreachable — serving from cache")
         } else if !s.healthMinIO {
             state = .degraded("MinIO unreachable — reads may fail")
+        }
+    }
+}
+
+// MARK: - Glance state (approved icon/state spec, 2026-06-10)
+
+/// The four user-approved at-a-glance states (LAUNCH_PLAN "Approved
+/// icon/state spec") plus the quiet not-started case. Both the menu-bar
+/// icon (MenuBarController) and the popover header (MenuPopoverView)
+/// derive their color/word from THIS mapping so they can never disagree.
+///
+///   healthy      — green (original logo palette)
+///   degraded     — amber #EF9F27 (degraded / starting / recovering)
+///   offlineFiles — blue  #378ADD (offline-files-only mode, user or auto)
+///   fault        — red   #E24B4A (unreachable / start failed / FUSE down)
+///   idle         — healthy mark at reduced alpha ("not started" reads
+///                  quiet, not alarming)
+public enum GlanceState: Equatable {
+    case healthy
+    case degraded
+    case offlineFiles
+    case fault
+    case idle
+}
+
+public extension ServerController {
+    /// Single source of truth for the 4-state UI mapping. Priority:
+    ///
+    ///  1. fault  — .error/.disconnected. A real fault trumps everything,
+    ///     including offline mode: when FUSE/the server is down, even the
+    ///     offline-pinned files aren't being served.
+    ///  2. idle   — server deliberately not started. Checked before offline
+    ///     because any offlineState held while idle is stale (the metrics
+    ///     server that reports it is down).
+    ///  3. offlineFiles — offline engaged (user toggle or auto). Trumps
+    ///     degraded: an unreachable backend is the EXPECTED condition while
+    ///     offline, and the VISION spec colors it blue so users learn it's
+    ///     not a fault. (Same precedence the popover status dot has always
+    ///     used.)
+    ///  4. degraded — .degraded/.starting, or running with the volume NOT
+    ///     mounted (LB-2: the server is fine but Finder has nothing — amber,
+    ///     with "Mount Now" as the popover remedy).
+    ///  5. healthy  — .running/.syncing with the volume mounted.
+    var glanceState: GlanceState {
+        switch state {
+        case .error, .disconnected:
+            return .fault
+        case .idle:
+            return .idle
+        case .starting:
+            return offlineState.offline ? .offlineFiles : .degraded
+        case .degraded:
+            if !volumeMounted { return .degraded }
+            return offlineState.offline ? .offlineFiles : .degraded
+        case .running, .syncing:
+            if !volumeMounted { return .degraded }
+            return offlineState.offline ? .offlineFiles : .healthy
+        }
+    }
+
+    /// Short human word for the glance state — popover header + icon
+    /// accessibility label share it.
+    var glanceLabel: String {
+        switch glanceState {
+        case .healthy:      return "Healthy"
+        case .degraded:
+            if case .starting = state { return "Starting…" }
+            if !volumeMounted { return "Volume not mounted" }
+            return "Degraded"
+        case .offlineFiles: return "Offline files mode"
+        case .fault:        return state == .disconnected ? "Disconnected" : "Fault"
+        case .idle:         return "Not started"
         }
     }
 }

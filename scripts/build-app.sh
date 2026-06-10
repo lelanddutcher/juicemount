@@ -92,23 +92,96 @@ cp "$SWIFT_BIN" "$APP_BIN_DIR/JuiceMount"
 # Copy Info.plist
 cp "$SWIFT_PKG/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 
-# Copy app icon (use color logo for the dock-icon equivalent)
-if [ -f "$PROJECT_ROOT/logos/color.png" ]; then
-    # Convert PNG to .icns if iconutil is available, otherwise just copy
-    if command -v iconutil >/dev/null 2>&1 && command -v sips >/dev/null 2>&1; then
-        ICONSET="$BUILD_DIR/AppIcon.iconset"
-        rm -rf "$ICONSET"
-        mkdir -p "$ICONSET"
-        for size in 16 32 64 128 256 512; do
-            sips -z $size $size "$PROJECT_ROOT/logos/color.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null 2>&1 || true
-            sips -z $((size*2)) $((size*2)) "$PROJECT_ROOT/logos/color.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null 2>&1 || true
-        done
-        iconutil -c icns "$ICONSET" -o "$APP_RES_DIR/AppIcon.icns" 2>/dev/null || \
-            cp "$PROJECT_ROOT/logos/color.png" "$APP_RES_DIR/AppIcon.png"
+# --- Icon rendering (Phase 3 identity) -------------------------------------
+# Render the state-tinted citrus mark SVGs to menu-bar PNGs and the AppIcon
+# iconset from logos/color.svg. Zero external deps: NSImage loads SVG on
+# modern macOS, so scripts/svg2png.swift (compiled once here) does all the
+# rasterizing. EVERY failure path falls back to the previous behavior
+# (sips-resized logos/color.png) with a loud warning — the build must keep
+# working on a machine without the SVGs, without swiftc, or with a rendering
+# regression.
+YELLOW=$'\033[33m'
+RESET=$'\033[0m'
+
+SVG2PNG_BIN=""
+if [ -f "$PROJECT_ROOT/scripts/svg2png.swift" ] && command -v swiftc >/dev/null 2>&1; then
+    if swiftc -O "$PROJECT_ROOT/scripts/svg2png.swift" -o "$BUILD_DIR/svg2png" 2>/dev/null; then
+        SVG2PNG_BIN="$BUILD_DIR/svg2png"
     else
-        cp "$PROJECT_ROOT/logos/color.png" "$APP_RES_DIR/AppIcon.png"
+        echo "    ${YELLOW}WARNING: svg2png.swift failed to compile — falling back to PNG icon pipeline${RESET}"
+    fi
+else
+    echo "    ${YELLOW}WARNING: svg2png.swift or swiftc unavailable — falling back to PNG icon pipeline${RESET}"
+fi
+
+render_png() {
+    # render_png <in.svg> <out.png> <size>
+    [ -n "$SVG2PNG_BIN" ] && "$SVG2PNG_BIN" "$1" "$2" "$3" >/dev/null 2>&1
+}
+
+# Menu-bar state icons: 18pt @1x + 36px @2x per state, loaded at runtime by
+# MenuBarController (Contents/Resources/menubar/state-<state>[@2x].png).
+# All-or-nothing: a partial set would mix logo states with the SF-Symbol
+# fallback mid-session, so any failure removes the whole directory.
+MENUBAR_OK=1
+if [ -n "$SVG2PNG_BIN" ]; then
+    mkdir -p "$APP_RES_DIR/menubar"
+    for st in healthy degraded offline-files fault; do
+        SVG="$PROJECT_ROOT/logos/state-$st.svg"
+        if [ ! -f "$SVG" ] \
+           || ! render_png "$SVG" "$APP_RES_DIR/menubar/state-$st.png" 18 \
+           || ! render_png "$SVG" "$APP_RES_DIR/menubar/state-$st@2x.png" 36; then
+            MENUBAR_OK=0
+        fi
+    done
+else
+    MENUBAR_OK=0
+fi
+if [ "$MENUBAR_OK" = 1 ]; then
+    echo "    Menu-bar icons: 4 states rendered (18/36px) from logos/state-*.svg"
+else
+    rm -rf "$APP_RES_DIR/menubar"
+    echo "    ${YELLOW}WARNING: menu-bar state icons NOT rendered — app falls back to SF-Symbol icons${RESET}"
+fi
+
+# App icon: full iconset (16..1024) rendered from logos/color.svg so every
+# size is crisp vector output instead of a downsampled 512px PNG.
+APPICON_OK=0
+if [ -n "$SVG2PNG_BIN" ] && [ -f "$PROJECT_ROOT/logos/color.svg" ] && command -v iconutil >/dev/null 2>&1; then
+    ICONSET="$BUILD_DIR/AppIcon.iconset"
+    rm -rf "$ICONSET"
+    mkdir -p "$ICONSET"
+    APPICON_OK=1
+    for size in 16 32 128 256 512; do
+        render_png "$PROJECT_ROOT/logos/color.svg" "$ICONSET/icon_${size}x${size}.png" "$size" || APPICON_OK=0
+        render_png "$PROJECT_ROOT/logos/color.svg" "$ICONSET/icon_${size}x${size}@2x.png" "$((size*2))" || APPICON_OK=0
+    done
+    if [ "$APPICON_OK" = 1 ] && iconutil -c icns "$ICONSET" -o "$APP_RES_DIR/AppIcon.icns" 2>/dev/null; then
+        echo "    App icon: AppIcon.icns rendered from logos/color.svg (16..1024)"
+    else
+        APPICON_OK=0
     fi
 fi
+if [ "$APPICON_OK" != 1 ]; then
+    echo "    ${YELLOW}WARNING: SVG app-icon render failed — using legacy logos/color.png pipeline${RESET}"
+    # Legacy fallback: sips-resize logos/color.png into the iconset.
+    if [ -f "$PROJECT_ROOT/logos/color.png" ]; then
+        if command -v iconutil >/dev/null 2>&1 && command -v sips >/dev/null 2>&1; then
+            ICONSET="$BUILD_DIR/AppIcon.iconset"
+            rm -rf "$ICONSET"
+            mkdir -p "$ICONSET"
+            for size in 16 32 128 256 512; do
+                sips -z $size $size "$PROJECT_ROOT/logos/color.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null 2>&1 || true
+                sips -z $((size*2)) $((size*2)) "$PROJECT_ROOT/logos/color.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null 2>&1 || true
+            done
+            iconutil -c icns "$ICONSET" -o "$APP_RES_DIR/AppIcon.icns" 2>/dev/null || \
+                cp "$PROJECT_ROOT/logos/color.png" "$APP_RES_DIR/AppIcon.png"
+        else
+            cp "$PROJECT_ROOT/logos/color.png" "$APP_RES_DIR/AppIcon.png"
+        fi
+    fi
+fi
+# --- end icon rendering -----------------------------------------------------
 
 # Copy any SPM-bundled resources
 SPM_RES_BUNDLE="$SWIFT_PKG/.build/$SWIFT_CONFIG/JuiceMount_JuiceMount.bundle"

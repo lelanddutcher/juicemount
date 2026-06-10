@@ -14,6 +14,7 @@ final class MenuBarController: NSObject {
 
     private var searchWindow: NSWindow?
     private var preferencesWindow: NSWindow?
+    private var onboardingWindow: NSWindow?
     private var stateTimer: Timer?
 
     init(server: ServerController) {
@@ -43,16 +44,10 @@ final class MenuBarController: NSObject {
 
     private func configureStatusItem() {
         if let button = statusItem.button {
-            button.image = renderIcon(for: server.state,
-                                       selfTest: server.selfTest,
-                                       offlineState: server.offlineState)
-            // Initial state: no self-test result yet, so the icon is a plain
-            // template. The state-observation timer will recompute this each
-            // tick and toggle template mode off if a colored dot needs to show.
-            button.image?.isTemplate = true
             button.action = #selector(togglePopover(_:))
             button.target = self
         }
+        refreshIcon()
     }
 
     private func configurePopover() {
@@ -60,6 +55,7 @@ final class MenuBarController: NSObject {
             server: server,
             onSearch: { [weak self] in self?.openSearchWindow() },
             onPreferences: { [weak self] in self?.openPreferencesWindow() },
+            onSetupAssistant: { [weak self] in self?.openOnboardingWindow() },
             onQuit: { NSApplication.shared.terminate(nil) }
         )
         popover.contentViewController = NSHostingController(rootView: view)
@@ -74,31 +70,168 @@ final class MenuBarController: NSObject {
         stateTimer?.invalidate()
         stateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
-                self.statusItem.button?.image = self.renderIcon(
-                    for: self.server.state,
-                    selfTest: self.server.selfTest,
-                    offlineState: self.server.offlineState
-                )
-                // Template-mode is OFF whenever ANY colored dot is
-                // drawn — offline blue (iter 5), self-test yellow/red,
-                // or self-test error orange. Otherwise template mode
-                // stays on so macOS inverts the icon for dark menu
-                // bars as usual.
-                let offlineDot = self.server.offlineState.offline
-                let attention = self.server.selfTest?.isAttentionWorthy ?? false
-                self.statusItem.button?.image?.isTemplate = !(offlineDot || attention)
+                self?.refreshIcon()
             }
         }
     }
 
-    // MARK: - Icon rendering
+    // MARK: - Icon rendering (approved icon/state spec, 2026-06-10)
 
-    /// Build a small status icon using SF Symbols, optionally overlaying a
-    /// colored dot in the lower-right when the self-test result is non-green.
-    /// The base image is a template; when a dot is drawn we composite a
-    /// non-template image and disable template mode on the result.
-    private func renderIcon(
+    /// The four state-tinted citrus-mark assets rendered by build-app.sh
+    /// into Contents/Resources/menubar/. Raw value = PNG basename.
+    private enum IconAsset: String {
+        case healthy = "state-healthy"
+        case degraded = "state-degraded"
+        case offlineFiles = "state-offline-files"
+        case fault = "state-fault"
+    }
+
+    /// Cache of the loaded logo images, one per state. Loaded once from the
+    /// app bundle; nil entries are NOT cached so a missing asset re-probes
+    /// (cheap) and the SF-Symbol fallback stays in effect.
+    private var logoCache: [IconAsset: NSImage] = [:]
+
+    /// Recompute the status-item image from current server state. The icon
+    /// is the state-tinted logo when the rendered assets are bundled
+    /// (normal .app build), or the legacy SF-Symbol composite when they're
+    /// missing (bare `swift build` binary, or the build-script SVG render
+    /// fell back).
+    private func refreshIcon() {
+        guard let button = statusItem.button else { return }
+        let glance = server.glanceState
+        let uploads = uploadsActive
+
+        if let logo = logoImage(for: asset(for: glance)) {
+            // Color IS the signal: never let macOS template-invert it.
+            let alpha: CGFloat = (glance == .idle) ? 0.5 : 1.0
+            let image = compositeLogoIcon(logo, alpha: alpha, uploadBadge: uploads)
+            image.isTemplate = false
+            image.accessibilityDescription = accessibilityLabel(for: glance, uploads: uploads)
+            button.image = image
+            button.toolTip = accessibilityLabel(for: glance, uploads: uploads)
+        } else {
+            let image = renderLegacySymbolIcon(
+                for: server.state,
+                selfTest: server.selfTest,
+                offlineState: server.offlineState
+            )
+            image?.accessibilityDescription = accessibilityLabel(for: glance, uploads: uploads)
+            button.image = image
+        }
+    }
+
+    /// Upload-activity badge trigger: the spool is on and has queued or
+    /// in-flight drains, AND the server is in a state where draining can
+    /// actually progress. (After Stop, pending rows persist but nothing is
+    /// uploading — a badge then would lie.)
+    private var uploadsActive: Bool {
+        guard let sp = server.spoolStatus, sp.enabled else { return false }
+        guard sp.inProgress > 0 || sp.pendingFiles > 0 else { return false }
+        switch server.state {
+        case .running, .syncing, .degraded: return true
+        default: return false
+        }
+    }
+
+    private func asset(for glance: GlanceState) -> IconAsset {
+        switch glance {
+        case .healthy:      return .healthy
+        case .degraded:     return .degraded
+        case .offlineFiles: return .offlineFiles
+        case .fault:        return .fault
+        case .idle:         return .healthy  // drawn at 0.5 alpha by caller
+        }
+    }
+
+    private func accessibilityLabel(for glance: GlanceState, uploads: Bool) -> String {
+        var label: String
+        if glance == .degraded, case .degraded(let reason) = server.state {
+            label = "JuiceMount: Degraded — \(reason)"
+        } else {
+            label = "JuiceMount: \(server.glanceLabel)"
+        }
+        if uploads, let sp = server.spoolStatus {
+            let n = sp.pendingFiles + Int(sp.inProgress)
+            label += " · uploading \(n) file\(n == 1 ? "" : "s")"
+        }
+        return label
+    }
+
+    /// Load (and cache) one of the rendered logo PNGs from the app bundle.
+    /// build-app.sh writes Contents/Resources/menubar/state-<x>.png (18px)
+    /// and state-<x>@2x.png (36px); both reps are folded into one NSImage
+    /// at 18pt so AppKit picks the right one per display scale.
+    private func logoImage(for asset: IconAsset) -> NSImage? {
+        if let cached = logoCache[asset] { return cached }
+        guard let resURL = Bundle.main.resourceURL?.appendingPathComponent("menubar", isDirectory: true) else {
+            return nil
+        }
+        let pointSize = NSSize(width: 18, height: 18)
+        let image = NSImage(size: pointSize)
+        for name in ["\(asset.rawValue).png", "\(asset.rawValue)@2x.png"] {
+            let url = resURL.appendingPathComponent(name)
+            guard let data = try? Data(contentsOf: url),
+                  let rep = NSBitmapImageRep(data: data) else { continue }
+            // Point size 18 over 18/36 pixels marks the reps as @1x/@2x.
+            rep.size = pointSize
+            image.addRepresentation(rep)
+        }
+        guard !image.representations.isEmpty else { return nil }
+        logoCache[asset] = image
+        return image
+    }
+
+    /// Draw the logo into a padded canvas (same technique as the legacy
+    /// dot composite) applying the idle alpha and, when uploads are
+    /// active, a small blue bottom-right badge with a tiny up-arrow.
+    private func compositeLogoIcon(_ base: NSImage, alpha: CGFloat, uploadBadge: Bool) -> NSImage {
+        // Fast path: untouched logo keeps its @1x/@2x reps intact.
+        if alpha >= 1.0 && !uploadBadge { return base }
+
+        let baseSize = base.size
+        let canvas = NSImage(size: NSSize(width: baseSize.width + 2, height: baseSize.height + 2))
+        canvas.lockFocus()
+        defer { canvas.unlockFocus() }
+
+        base.draw(in: NSRect(x: 1, y: 1, width: baseSize.width, height: baseSize.height),
+                  from: .zero, operation: .sourceOver, fraction: alpha)
+
+        if uploadBadge {
+            // Blue circle + up-arrow, bottom-right — the corner the legacy
+            // status dot used, so muscle memory carries over.
+            let d: CGFloat = 8
+            let badgeRect = NSRect(
+                x: canvas.size.width - d - 0.5,
+                y: 0.5,
+                width: d,
+                height: d
+            )
+            NSColor.systemBlue.setFill()
+            NSBezierPath(ovalIn: badgeRect).fill()
+
+            let cx = badgeRect.midX
+            let cy = badgeRect.midY
+            let arrow = NSBezierPath()
+            arrow.lineWidth = 1.2
+            arrow.lineCapStyle = .round
+            arrow.lineJoinStyle = .round
+            // Stem.
+            arrow.move(to: NSPoint(x: cx, y: cy - 2.2))
+            arrow.line(to: NSPoint(x: cx, y: cy + 2.2))
+            // Chevron head.
+            arrow.move(to: NSPoint(x: cx - 1.7, y: cy + 0.6))
+            arrow.line(to: NSPoint(x: cx, y: cy + 2.3))
+            arrow.line(to: NSPoint(x: cx + 1.7, y: cy + 0.6))
+            NSColor.white.setStroke()
+            arrow.stroke()
+        }
+        return canvas
+    }
+
+    /// LEGACY fallback: SF-Symbol icon + colored status dot, used only when
+    /// the rendered logo assets aren't in the bundle. Template mode stays on
+    /// unless a colored dot is drawn (the pre-Phase-3 behavior).
+    private func renderLegacySymbolIcon(
         for state: ServerController.ServerState,
         selfTest: NFSBridge.SelfTestResult?,
         offlineState: NFSBridge.OfflineState
@@ -135,6 +268,9 @@ final class MenuBarController: NSObject {
             return selfTestDotColor(for: selfTest)
         }()
         guard let dotColor else {
+            // Plain symbol: template mode ON so macOS inverts it for dark
+            // menu bars as usual.
+            base.isTemplate = true
             return base
         }
 
@@ -160,6 +296,9 @@ final class MenuBarController: NSObject {
         )
         dotColor.setFill()
         NSBezierPath(ovalIn: dotRect).fill()
+        // A colored dot was drawn — template mode must be OFF or macOS
+        // would flatten the color away.
+        canvas.isTemplate = false
         return canvas
     }
 
@@ -210,6 +349,54 @@ final class MenuBarController: NSObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// LB-1 welcome / setup-assistant window. Opened automatically at
+    /// launch by AppDelegate when onboarding was never completed or a
+    /// critical preflight check fails; reopenable any time from the
+    /// popover. Continue marks onboarding complete and starts the server
+    /// if it isn't already running.
+    func openOnboardingWindow() {
+        if let window = onboardingWindow {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let view = OnboardingWindowView(server: server) { [weak self] in
+            guard let self else { return }
+            self.server.preferences.hasCompletedOnboarding = true
+            self.onboardingWindow?.close()
+            // Straight to normal startup — but never stack a second start
+            // on a server that's already up (e.g. assistant reopened later).
+            switch self.server.state {
+            case .idle:
+                if !NFSBridge.isRunning {
+                    self.server.start()
+                }
+            case .error, .disconnected:
+                // Review P2-A: Continue from a failed state used to silently
+                // no-op — the user fixed the backend, re-ran the checks
+                // (green), clicked Continue, and nothing happened. Drive the
+                // recovery the popover prescribes ("Stop everything, then
+                // Start") for them.
+                self.server.stop { [weak self] in
+                    self?.server.start()
+                }
+            default:
+                break // already starting/running — nothing to do
+            }
+        }
+        let hosting = NSHostingController(rootView: view)
+        let window = NSWindow(contentViewController: hosting)
+        window.title = "JuiceMount Setup"
+        window.styleMask = [.titled, .closable]
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.identifier = NSUserInterfaceItemIdentifier("OnboardingWindow")
+        onboardingWindow = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     func openPreferencesWindow() {
         if let window = preferencesWindow {
             window.makeKeyAndOrderFront(nil)
@@ -237,5 +424,6 @@ extension MenuBarController: NSWindowDelegate {
         guard let window = notification.object as? NSWindow else { return }
         if window === searchWindow { searchWindow = nil }
         if window === preferencesWindow { preferencesWindow = nil }
+        if window === onboardingWindow { onboardingWindow = nil }
     }
 }
