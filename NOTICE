@@ -1,0 +1,28 @@
+JuiceMount
+Copyright 2026 Leland Dutcher
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software derived from third-party projects:
+
+go-nfs (https://github.com/willscott/go-nfs)
+  Copyright go-nfs contributors.
+  Licensed under the Apache License, Version 2.0.
+  The NFS server implementation in internal/nfs/ is a fork of go-nfs
+  v0.0.3, modified for JuiceMount (Finder-tuned request handling,
+  connection tracking, write-spool integration, and related changes).
+
+go-nfs-client (https://github.com/willscott/go-nfs-client)
+  Copyright (c) 2017 VMware, Inc. All Rights Reserved.
+  Licensed under the BSD 2-Clause License.
+  Used as a library dependency for NFS RPC/XDR encoding.
+
+JuiceFS (https://github.com/juicedata/juicefs)
+  Copyright 2020 Juicedata, Inc.
+  Licensed under the Apache License, Version 2.0.
+  JuiceMount drives the separately-installed juicefs client binary and
+  builds on the JuiceFS data/metadata architecture; JuiceFS is not
+  bundled with this source distribution.
+
+Additional Go module dependencies retain their own licenses; see go.mod
+and each module's distribution for details.

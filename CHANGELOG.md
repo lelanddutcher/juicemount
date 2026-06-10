@@ -1,5 +1,87 @@
 # JuiceMount6 Changelog
 
+## 2026-06-10 — Launch hardening, Phase 4 (OSS publication hygiene)
+
+- **Apache-2.0.** `LICENSE` + `NOTICE` added (JuiceFS and go-nfs/go-nfs-client
+  attribution); README license section matches.
+- **Publication README** replaces the developer-oriented one (which moved to
+  `docs/dev-setup.md`): verified feature/requirement claims, honest
+  comparisons, author-attributed performance numbers.
+- **`scripts/uninstall.sh` (new):** stops the app, unmounts NFS/FUSE with a
+  refuses-to-rm-through-a-live-mount guard, inventories everything with sizes
+  before one confirmation, requires a separate explicit confirmation (or
+  `--delete-pending-uploads`) before touching a spool with un-uploaded files,
+  shows the JuiceFS chunk-cache size before offering to remove it, and
+  supports `--dry-run`/`--yes`. Refuses to run as root.
+- **LaunchAgent fixed:** `scripts/com.juicemount.agent.plist` now launches via
+  `open -a` (LaunchServices single-instance — can no longer double-launch
+  against the in-app "Start at login" toggle) and logs to
+  `~/Library/Logs/JuiceMount/agent.log` instead of world-readable /tmp.
+- Personal LAN IPs/paths scrubbed from CLI help strings, QA scripts (NAS IP is
+  now the `JM_QA_NAS_IP` env var), and example text; docs drift corrected
+  (spool opt-in is the Preferences toggle, sudoers examples include
+  `/sbin/umount`, Gatekeeper guidance modernized, MENU_BAR_APP reflects the
+  current UI, OPEN_BUGS closed out against the hardening commits).
+
+## 2026-06-08/10 — Launch hardening, Phases 1–3b (write-path correctness, spool durability + UX, identity/onboarding, preferences redesign)
+
+Four serialized hardening batches preparing the open-source launch
+(ledger: `docs/LAUNCH_PLAN.md`; commits `c29a19f`, `95882fc`, `848dd9e`,
+`b47834e`). User-visible summary:
+
+### Phase 1 — write-path correctness (`c29a19f`)
+- **Finder mv/rename is now spool-aware.** Renaming a file or folder whose
+  contents were still queued for upload previously broke the upload silently
+  (data landed at the old path or not at all); renames now migrate queued
+  spool entries, including a post-claim re-read that closes the race against
+  an in-flight drain.
+- **`cp` to the volume no longer exits 1** and truncate over NFS no longer
+  fails with "RPC struct is bad" — the SETATTR{size} path is implemented for
+  spooled files instead of stubbed.
+- Fixed a spool file-handle refcount leak that left entries permanently
+  "writing" after interrupted copies (the boot scrubber now also clears them).
+- SQLite write contention under rsync-style load fixed (`_txlock=immediate`);
+  stress run went from 2/5 failures to 0/10.
+
+### Phase 2 — spool durability + UX (`95882fc`)
+- **No more stranded uploads:** disabling the spool, quitting the app, or
+  Stop-Everything now waits for (or explicitly hands off) pending uploads
+  instead of silently orphaning them; "everything failed" no longer
+  auto-quits past the problem.
+- **Pending uploads UI:** the popover shows pending/in-flight counts, per-file
+  age and last error, stalled/failed badges, and Retry failed / Recover
+  stalled buttons (`GET /spool-recover?action=…` on the control plane).
+- `/spool` reporting corrected (live size for in-progress writes; done rows
+  no longer listed as pending).
+- A full spool now reports "disk full" (NFS3ERR_NOSPC) to Finder instead of
+  a generic I/O error.
+
+### Phase 3 — identity, onboarding, mount honesty (`848dd9e`, assets `e557a3d`)
+- **State-tinted menu-bar icon:** the citrus logo replaces the SF-Symbol
+  drive — green healthy, amber degraded, blue offline-files mode, red fault,
+  dimmed when idle — plus an upload-activity badge while drains run. Proper
+  app icon (AppIcon.icns) from the same mark.
+- **First-run Setup Assistant** with preflight checks (juicefs binary,
+  macFUSE, backend reachability) and guided errors; reachable later via
+  menu → Setup Assistant…. Existing configured installs are migrated as
+  already-onboarded (no surprise first-run window).
+- **Mount honesty:** NFS-mount state is part of the health model; the popover
+  shows "Volume not mounted" with a Mount Now remedy row (single-flight
+  `/mount-now` endpoint) instead of pretending all is well.
+- At-a-glance popover header: one-word health, cache-vs-free bar, uploads row.
+
+### Phase 3b — preferences redesign (`b47834e`)
+- Preferences rebuilt as four grouped tabs (General / Connection /
+  Cache & Storage / Maintenance) with sane sizing, clamped numeric fields,
+  and whitespace-stripped URL fields.
+- **Placebo settings eliminated:** memory-buffer budget, buffer file-size
+  limit, and reconcile interval are now actually wired end-to-end (defaults
+  byte-identical to before).
+- Volume name now derives the mount point; hardcoded `127.0.0.1:11050` /
+  mount-point strings removed from the UI (everything respects Preferences).
+- Reset Local Metadata Cache flow (soft-stop → delete → Start Now/Later;
+  pin database preserved).
+
 ## 2026-05-28 — Write spool (Option 2): local-SSD write intermediary
 
 A foundational write-path change, behind `JM_SPOOL_ENABLE` (default off). Interposes

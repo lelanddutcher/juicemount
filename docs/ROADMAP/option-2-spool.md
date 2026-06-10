@@ -1,6 +1,6 @@
 # JuiceMount Spool — Option 2
 
-**Status:** ALL SLICES COMPLETE — A through H shipped 2026-05-28. Architecture is feature-complete behind JM_SPOOL_ENABLE=1. Remaining work: Swift menu bar UI + Manager web UI (data contract via /spool already stable), live soak testing.
+**Status:** ALL SLICES COMPLETE — A through H shipped 2026-05-28. Architecture is feature-complete; opt-in via the app's Preferences toggle (JM_SPOOL_ENABLE=1 is CLI-only). Update 2026-06-10 (launch-hardening Phases 2–3b): Swift menu-bar UI shipped (Pending-uploads section, stalled/failed badges, /spool-recover actions, icon badge, quit/disable drain guards). Remaining: Manager web UI tile (data contract via /spool already stable), live soak testing.
 **Type:** Foundational architecture change
 **Scope:** ~1 week implementation + 2–3 days hardening/testing
 **Branch:** `production-hardening` (continues on it; not a separate branch)

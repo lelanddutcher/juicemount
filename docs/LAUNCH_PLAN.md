@@ -161,6 +161,30 @@ an isolated worktree and rebase after N's commit. Merges stay serialized.
   0 warnings ✅, zero hardcoded addrs ✅, live: integrity OK, 01-smoke
   10/10, 10-control-plane 16/16 ✅.
 
+- **Phase 4** (2026-06-10): OSS publication hygiene — all 6 items.
+  LICENSE (Apache-2.0, founder-decided) + NOTICE (go-nfs v0.0.3 Apache-2.0,
+  go-nfs-client BSD-2 VMware, JuiceFS external-binary — provenance
+  verified); publication README from the draft with all 17 VERIFY tags
+  resolved (dev content → docs/dev-setup.md); personal IP/path scrub of
+  shipping surfaces (JM_QA_NAS_IP env for netshape; secrets sweep CLEAN);
+  docs honesty pass (JM_SPOOL_ENABLE truth ×6 docs, sudoers+umount 4-way
+  agreement, MENU_BAR_APP rewritten to current UI, Gatekeeper modernized,
+  CHANGELOG phases 1-4, OPEN_BUGS closed against commits); uninstall.sh
+  (mountpoint-guarded, spool double-confirmation, --dry-run; live dry-run
+  caught the du-through-FUSE 15TB trap); LaunchAgent via open -a +
+  user-log path. Adversarial review: SHIP-WITH-FIXES → applied: README
+  exit-story corrected (bucket holds JuiceFS chunk format — "aws s3 sync,
+  done" was FALSE; now copy-from-volume/juicefs sync), "plain objects" +
+  "JuiceFS gateway" wording fixed, ARCHITECTURE "(private)" dropped,
+  STATE.md µs/ms unit labels fixed (p95 481µs), Gatekeeper line scoped to
+  macOS 15+, uninstall hardening (space-safe mount parsing, root +
+  empty-HOME guards, --help range), Phase-4 CHANGELOG entry. Review
+  verified: README ~55 claims clean otherwise, uninstall.sh NO data-loss
+  path, NOTICE accurate, sudoers 4-way match, CHANGELOG SHAs real.
+  Pre-publish checklist items left for the founder: decide whether
+  z-quarantine/ ships (internal junk, no secrets); capture the 7Gbit/s
+  test command for the methodology doc someday.
+
 ### New findings logged during Phase 1 gate (not regressions)
 - Burst-create ETIMEDOUT ~1/1000 under load (QA-29 stall class, newly
   visible now that 02-finder runs past rsync) — candidate Phase 2/3.

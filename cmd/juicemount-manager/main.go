@@ -7,18 +7,18 @@
 //
 // Two deployment modes are supported (pick one):
 //
-//   Standalone, no FUSE (default for this binary):
-//     --meta redis://host:port/N --vol-name zpool
-//     Writes go via jfs://<vol-name>/<path>; juicefs sync talks to
-//     Redis + MinIO directly. Requires network reachability to both.
-//     The manager container has no FUSE mount of its own.
+//	Standalone, no FUSE (default for this binary):
+//	  --meta redis://host:port/N --vol-name zpool
+//	  Writes go via jfs://<vol-name>/<path>; juicefs sync talks to
+//	  Redis + MinIO directly. Requires network reachability to both.
+//	  The manager container has no FUSE mount of its own.
 //
-//   Embedded-style, FUSE-mounted:
-//     --fuse-mount /jfs
-//     Writes go via file:///<fuse-mount>/<path>; the container must
-//     have the JuiceFS volume FUSE-mounted at /jfs before launch.
-//     Use this when juicefs sync needs to inherit a pre-existing
-//     mount (e.g. shared with juicemount-server).
+//	Embedded-style, FUSE-mounted:
+//	  --fuse-mount /jfs
+//	  Writes go via file:///<fuse-mount>/<path>; the container must
+//	  have the JuiceFS volume FUSE-mounted at /jfs before launch.
+//	  Use this when juicefs sync needs to inherit a pre-existing
+//	  mount (e.g. shared with juicemount-server).
 //
 // For users running juicemount-server on the host, the manager is
 // automatically embedded — set --manager-source-roots when launching
@@ -44,7 +44,7 @@ func main() {
 	addr := flag.String("listen", "0.0.0.0:8080", "HTTP listen address")
 	juicefsBin := flag.String("juicefs", "juicefs", "Path to juicefs binary (or just 'juicefs' for PATH lookup)")
 	fuseMount := flag.String("fuse-mount", "", "If set: embedded-mode FUSE mount path (writes via file:///<fuse-mount>/<path>). Mutually exclusive with --meta.")
-	metaURL := flag.String("meta", "", "Standalone-mode Redis URL (e.g. redis://192.168.0.197:30179/1). Mutually exclusive with --fuse-mount.")
+	metaURL := flag.String("meta", "", "Standalone-mode Redis URL (e.g. redis://<server-ip>:30179/1). Mutually exclusive with --fuse-mount.")
 	volName := flag.String("vol-name", "zpool", "Standalone-mode JuiceFS volume name (used in jfs:// destination URIs)")
 	destMount := flag.String("dest-mount", "/jfs", "User-facing destination prefix shown in the UI")
 	sourceRoots := flag.String("source-roots", "/sources", "Comma-separated host paths the manager may browse from")

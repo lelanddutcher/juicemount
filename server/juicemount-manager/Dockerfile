@@ -54,7 +54,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://localhost:8080/api/sources || exit 1
 
 # Default invocation: standalone mode. JM_META is REQUIRED at runtime
-# (e.g. JM_META=redis://192.168.0.197:30179/1). To switch to embedded
+# (e.g. JM_META=redis://<server-ip>:30179/1). To switch to embedded
 # mode, override with `command: ["--fuse-mount=/jfs"]` in compose AND
 # pre-mount the JuiceFS volume at /jfs (cap_add SYS_ADMIN, /dev/fuse).
 ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/juicemount-manager \

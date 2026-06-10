@@ -194,8 +194,8 @@ Two compounding causes in the NFS read path:
 - After Slice 2 (rsize=1M only): 50 MB/s
 - After full QA-31 (rsize + Stat fast-path + EOF fix): **226-571 MB/s**
 
-Server-side READ profile after QA-31: count=771, mean=242 ms, p50=304 ms,
-p95=481 ms, max=370 ms. p95 down from 3.4 s to 481 ms (~7× improvement),
+Server-side READ profile after QA-31: count=771, mean=242 µs, p50=304 µs,
+p95=481 µs, max=370 ms. p95 down from 3.4 ms to 481 µs (~7× improvement),
 max down from 3.45 s to 0.37 s (~9× improvement).
 
 Smoke 01-smoke.sh: 10 PASS / 0 FAIL.

@@ -311,7 +311,7 @@ func (fm *FUSEManager) Mount() error {
 		// positional <meta-url> <mountpoint> args. JuiceFS 1.3.1 accepts
 		// flags in this position (verified empirically via direct CLI
 		// invocation — `juicefs mount redis://... /mnt/test --bucket
-		// http://192.168.0.197:30151/zpool` mounts cleanly). If a future
+		// http://<server-ip>:30151/zpool` mounts cleanly). If a future
 		// JuiceFS version tightens its parser, this is the line to move
 		// — relocate the entire conditional-flag block to BEFORE the
 		// `mount, fm.cfg.RedisURL, fm.cfg.MountPoint` append above.

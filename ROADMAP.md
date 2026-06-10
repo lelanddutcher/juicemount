@@ -151,7 +151,7 @@ What's verified live:
 
 ---
 
-## Write spool (Option 2) — ✅ shipped 2026-05-28 (behind `JM_SPOOL_ENABLE`)
+## Write spool (Option 2) — ✅ shipped 2026-05-28 (opt-in, default off)
 
 A foundational write-path change landed after Phase 3: a JuiceMount-owned **write spool on local SSD, interposed between the NFS handler and JuiceFS's raw staging**. Writes ack the moment the data is durable on the user's local SSD (`fsync()`), and a background drainer copies into JuiceFS at MinIO's pace. This is the Dropbox / LucidLink / Suite write model — a local-durability boundary with async upload — achieved without forking JuiceFS's `--buffer-size`-gated flow control.
 
@@ -169,9 +169,9 @@ A foundational write-path change landed after Phase 3: a JuiceMount-owned **writ
 
 **Integrity discipline:** SHA-256 computed streaming on write, re-verified when the drainer reads the spool file, and re-verified at-rest through the FUSE mount after copy. Mismatch → quarantine (file moved aside, never deleted), surfaced via the manifest log.
 
-**Rollout:** gated by `JM_SPOOL_ENABLE` (default off). Disabled = the original direct-to-FUSE `writeFile` path, unchanged. Flip to default-on after a clean soak.
+**Rollout:** opt-in, default off. In the app the switch is **Preferences → Cache & Storage → Enable write spool** (the `JM_SPOOL_ENABLE` env var only works for the standalone `jm5` CLI, not the embedded app). Disabled = the original direct-to-FUSE `writeFile` path, unchanged. Flip to default-on after a clean soak.
 
-**Deferred (not yet shipped):** Swift menu-bar "Pending uploads" section + icon badge, Manager web-UI tile, `App.swift` graceful-quit dialog, Preferences "Sync & Upload" pane, and the 24-hour live soak test. The `/spool` JSON data contract is stable, so those surfaces can land independently.
+**Update (2026-06-10, launch-hardening Phases 2–3b):** the previously deferred UI surfaces shipped — Swift menu-bar "Pending uploads" popover section with stalled/failed badges + Retry/Recover actions (`/spool-recover`), the icon upload badge, graceful-quit drain guard, and the Preferences spool controls. Still open: Manager web-UI tile and the 24-hour live soak test. The `/spool` JSON data contract is stable.
 
 Full design + slice-by-slice plan: `docs/ROADMAP/option-2-spool.md`. Architecture: `ARCHITECTURE_juicemount.md` § 15.
 
