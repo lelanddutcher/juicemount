@@ -59,11 +59,11 @@ autonomous loop ("churn for several hours"), 2026-06-10.
 - [x] A. Brand style guide → docs/web/BRAND.md (palette w/ usage rules,
       type scale, logo usage/clearspace/don'ts, state-color semantics,
       voice examples good/bad, asset inventory)
-- [ ] B. Site scaffold → site/: tokens.css (brand tokens, light+dark),
+- [x] B. Site scaffold → site/: tokens.css (brand tokens, light+dark),
       base layout, index.html hero + nav + footer (per SITE_PLAN hero
       Option C: the scrub-3-seconds hook), responsive, no-JS-required
       baseline
-- [ ] C. Rent-vs-own calculator → site/calculator.html + js (per
+- [x] C. Rent-vs-own calculator → site/calculator.html + js (per
       INTERACTIVE_TOOL.md: payback months, 36-month simulation, honest
       "SaaS is cheaper for you" branch, shareable URL state,
       pricing.json dated 2026-06)
@@ -98,3 +98,4 @@ autonomous loop ("churn for several hours"), 2026-06-10.
 ## Journal
 <!-- loop appends: [date time] item — summary — commit -->
 - [2026-06-10 15:12] A — BRAND.md v1 (palette/type/mark/voice/assets) — this commit
+- [2026-06-10 16:05] B+C — site/ scaffold (tokens/site css, index hero Option C, zero-JS baseline) + calculator (725-line js, spec math verified 3.25mo, honest-branch live, URL state, pricing.json dated) — 1936 lines, all gates green. Deviations logged in agent report (payback=crossing-month not avg36; defaults=worked example). Nav links to compare/performance 404 until F/G.

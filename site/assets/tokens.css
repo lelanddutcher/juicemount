@@ -1,0 +1,180 @@
+/* ==========================================================================
+   JuiceMount design tokens — single source for web colors/type/space.
+   Contract: docs/web/BRAND.md (palette, tints, type scale, voice-adjacent
+   rules like mono numbers). Light = Cream/Ink, dark = Ink/Cream, switched
+   by prefers-color-scheme with a manual <html data-theme="light|dark">
+   override. No CDNs: fonts are local woff2 if present, else system stack.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   Fonts. Self-hosted files are OPTIONAL: drop the woff2 binaries into
+   site/assets/fonts/ with these exact names and they get picked up.
+   local() sources mean an installed Inter/JetBrains Mono is used without
+   any file request; absent both, the stack degrades to system fonts.
+     site/assets/fonts/Inter-Regular.woff2
+     site/assets/fonts/Inter-SemiBold.woff2
+     site/assets/fonts/JetBrainsMono-Regular.woff2
+     site/assets/fonts/JetBrainsMono-SemiBold.woff2
+   -------------------------------------------------------------------------- */
+@font-face {
+  font-family: "Inter";
+  src: local("Inter"), url("fonts/Inter-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Inter";
+  src: local("Inter SemiBold"), local("Inter"), url("fonts/Inter-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: local("JetBrains Mono"), url("fonts/JetBrainsMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: local("JetBrains Mono SemiBold"), local("JetBrains Mono"), url("fonts/JetBrainsMono-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  /* ---- palette (BRAND.md, do not add colors) ---------------------------- */
+  --juice-green: #AACD58; /* primary brand, healthy state, CTAs; never body text */
+  --pulp-ink:    #1B102A; /* near-black: body text on light, dark surfaces */
+  --rind-cream:  #FAFDE8; /* warm light surface; text on ink */
+  --amber:       #EF9F27; /* degraded/warning accent, sparingly */
+  --stream-blue: #378ADD; /* informational accent, links on light */
+  --fault-red:   #E24B4A; /* errors only, never decorative */
+  --slate:       #393839; /* secondary dark: muted text on light, borders on dark */
+
+  /* ---- derived tints (BRAND.md: mix base with page background —
+          8–12% for fills, 25–35% for borders). Implemented as alpha over
+          the page so the same token composites correctly on both themes. */
+  --tint-green:        rgba(170, 205, 88, 0.12);
+  --tint-green-border: rgba(170, 205, 88, 0.35);
+  --tint-blue:         rgba(55, 138, 221, 0.10);
+  --tint-blue-border:  rgba(55, 138, 221, 0.32);
+  --tint-amber:        rgba(239, 159, 39, 0.10);
+  --tint-amber-border: rgba(239, 159, 39, 0.35);
+  --tint-red:          rgba(226, 75, 74, 0.10);
+  --tint-red-border:   rgba(226, 75, 74, 0.32);
+  --tint-slate:        rgba(57, 56, 57, 0.08);
+  --tint-slate-border: rgba(57, 56, 57, 0.28);
+
+  /* ---- typography (scale: 15/17 body, 20 lead, 28 h3, 40 h2, 56–72 hero;
+          weights 400/600 only; 1.6 body, 1.1 display; tight display tracking) */
+  --font-sans: "Inter", -apple-system, "SF Pro Text", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --fs-small: 0.9375rem;            /* 15px — captions, nav, receipts */
+  --fs-body:  1.0625rem;            /* 17px — default body */
+  --fs-lead:  1.25rem;              /* 20px — lead paragraphs */
+  --fs-h3:    1.75rem;              /* 28px */
+  --fs-h2:    2.5rem;               /* 40px */
+  --fs-hero:  clamp(2.5rem, 1.5rem + 4.2vw, 4.25rem); /* 56–68px desktop, 40px floor on phones */
+  --fs-label: 0.71875rem;           /* 11.5px — the one small-caps exception */
+
+  --fw-text: 400;
+  --fw-head: 600;
+
+  --lh-body: 1.6;
+  --lh-display: 1.1;
+  --track-display: -0.015em;        /* −1% to −2% on display sizes */
+  --track-label: 0.06em;            /* +6% on small-caps labels */
+
+  /* ---- spacing / shape --------------------------------------------------- */
+  --space-1: 0.25rem;   /*  4px */
+  --space-2: 0.5rem;    /*  8px */
+  --space-3: 0.75rem;   /* 12px */
+  --space-4: 1rem;      /* 16px */
+  --space-5: 1.5rem;    /* 24px */
+  --space-6: 2rem;      /* 32px */
+  --space-7: 3rem;      /* 48px */
+  --space-8: 4rem;      /* 64px */
+  --space-9: 6rem;      /* 96px */
+
+  --radius-sm: 8px;
+  --radius: 12px;
+  --container: 1080px;
+  --ease: cubic-bezier(0, 0, 0.2, 1); /* 200ms ease-out, per BRAND.md motion */
+  --dur: 200ms;
+
+  /* ---- semantic, light theme (Cream page / Ink text) -------------------- */
+  color-scheme: light;
+  --bg: var(--rind-cream);
+  --surface: #ffffff;                       /* cards on cream */
+  --surface-2: rgba(27, 16, 42, 0.04);      /* quiet ink wash */
+  --text: var(--pulp-ink);
+  --text-muted: var(--slate);
+  --hairline: rgba(27, 16, 42, 0.25);       /* ink mixed into page at border strength */
+  --hairline-soft: rgba(27, 16, 42, 0.12);
+  --link: var(--stream-blue);               /* always underlined in site.css */
+  --accent: var(--juice-green);
+  --btn-primary-bg: var(--juice-green);
+  --btn-primary-text: var(--pulp-ink);      /* ink on green fills, per BRAND.md */
+  --chart-self: var(--juice-green);         /* JuiceMount line */
+  --chart-saas: var(--stream-blue);         /* comparison line: blue vs green, never green-vs-red */
+  --chart-grid: rgba(27, 16, 42, 0.10);
+  --focus-ring: var(--stream-blue);
+}
+
+/* ---- semantic, dark theme (Ink page / Cream text). Two hooks share one
+        definition each; keep the two blocks identical when editing. ------- */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: var(--pulp-ink);
+    --surface: rgba(250, 253, 232, 0.06);
+    --surface-2: rgba(250, 253, 232, 0.04);
+    --text: var(--rind-cream);
+    --text-muted: rgba(250, 253, 232, 0.72);
+    --hairline: rgba(250, 253, 232, 0.28);
+    --hairline-soft: rgba(250, 253, 232, 0.14);
+    --link: #6FB1EB;                        /* stream blue mixed toward cream for dark-bg contrast */
+    --chart-grid: rgba(250, 253, 232, 0.12);
+    --chart-saas: #6FB1EB;
+  }
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: var(--pulp-ink);
+  --surface: rgba(250, 253, 232, 0.06);
+  --surface-2: rgba(250, 253, 232, 0.04);
+  --text: var(--rind-cream);
+  --text-muted: rgba(250, 253, 232, 0.72);
+  --hairline: rgba(250, 253, 232, 0.28);
+  --hairline-soft: rgba(250, 253, 232, 0.14);
+  --link: #6FB1EB;
+  --chart-grid: rgba(250, 253, 232, 0.12);
+  --chart-saas: #6FB1EB;
+}
+
+/* --------------------------------------------------------------------------
+   Token-level utilities (the only classes that live in this file).
+   -------------------------------------------------------------------------- */
+
+/* Numbers that matter — throughput, latency, prices — set in mono. */
+.num,
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+/* Small-caps label: the single all-caps exception (11–12px, +6% tracking). */
+.label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-label);
+  font-weight: var(--fw-head);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
