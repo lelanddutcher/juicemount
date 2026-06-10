@@ -1,7 +1,7 @@
 # JuiceMount Architecture Document
 
-**Last updated:** 2026-05-28 (production-hardening branch; write spool added — see § 15)
-**Repo:** `github.com/lelanddutcher/juicemount` (private)
+**Last updated:** 2026-06-10 (launch-hardening campaign — see CHANGELOG)
+**Repo:** `github.com/lelanddutcher/juicemount`
 **Module:** `github.com/lelanddutcher/juicemount`
 **Go version:** 1.26.1
 **Active branch:** `production-hardening`
@@ -166,7 +166,8 @@ This is the core package. It implements the `go-nfs` Handler interface:
   JuiceFS writeback. The default path when the spool is disabled.
 
 - **`spoolWriteFile` / `spoolReadFile`** -- Spool-routed file wrappers used
-  when the write spool is enabled (`JM_SPOOL_ENABLE=1`). `O_CREATE` writes land
+  when the write spool is enabled (app: Preferences toggle → config JSON;
+  CLI: `JM_SPOOL_ENABLE=1`). `O_CREATE` writes land
   on a local-SSD spool file and ack immediately; reads of a not-yet-drained
   file are served from the spool. nil-spool falls back to the `writeFile` /
   `cachedFile` paths above. See § 15.
@@ -377,7 +378,8 @@ NFS response (data + post_op_attr)
 
 ### Write Path (NFS WRITE RPC)
 
-> **Note (2026-05-28):** with the write spool enabled (`JM_SPOOL_ENABLE=1`),
+> **Note (2026-05-28):** with the write spool enabled (Preferences toggle
+> in the app; `JM_SPOOL_ENABLE=1` for the CLI),
 > `O_CREATE` writes are intercepted *before* this path and routed to a
 > local-SSD spool that acks immediately; a background drainer later performs
 > the FUSE write shown below. See § 15. The flow below is the spool-disabled
@@ -1229,7 +1231,10 @@ sqlite3 ~/.juicemount/metadata.db "SELECT COUNT(*) FROM entries;"
 This section documents the write-spool subsystem layered on top of §1–§14. It
 is the write-path analogue of §11's pin/offline read subsystem: the difference
 between "writes feel fast on a wired LAN" and "writes feel like local SSD even
-over Tailscale or cellular." It is gated by `JM_SPOOL_ENABLE=1`; when disabled,
+over Tailscale or cellular." It is gated by the app's Preferences toggle
+(passed via the config JSON; `JM_SPOOL_ENABLE=1` works only for the
+standalone CLI, because the embedded Go runtime snapshots its environment
+before Swift code can set vars); when disabled,
 the handler's `spool` field is nil and §4's direct-to-FUSE write path runs
 unchanged. Slice-by-slice design history lives in `docs/ROADMAP/option-2-spool.md`.
 
@@ -1469,7 +1474,7 @@ the CLI in `cmd/jm5/main.go`):
 
 | Env var | Default | Effect |
 |---------|---------|--------|
-| `JM_SPOOL_ENABLE` | `0` (off) | `1` enables the spool; otherwise the §4 direct-to-FUSE write path runs |
+| `JM_SPOOL_ENABLE` | `0` (off) | `1` enables the spool (CLI only — the app uses its Preferences toggle, passed via config JSON); otherwise the §4 direct-to-FUSE write path runs |
 | `JM_SPOOL_DIR` | `~/Library/Application Support/JuiceMount/spool/` (Darwin; `$TMPDIR/…` fallback) | spool root directory |
 | `JM_SPOOL_SIZE_GB` | `50` | capacity cap in GiB; values < 1 are ignored |
 | `JM_WAN_MODE` | off | `1` raises JuiceFS `--max-uploads` 20 → 64 (more parallel PUTs to cover bandwidth-delay product on a fat WAN pipe) |
@@ -1505,7 +1510,8 @@ tile, the `App.swift` graceful-quit-with-pending-uploads dialog, the Preferences
 
 ### 15.12 Rollback
 
-`JM_SPOOL_ENABLE=0` (the default) reverts to the existing `writeFile` path; the
+Disabling the spool (app: Preferences toggle off; CLI: `JM_SPOOL_ENABLE=0`,
+the default) reverts to the existing `writeFile` path; the
 spool directory is unused and no behavior changes. Spool files persisted from a
 prior enabled run remain on disk and are drained on the next enabled start (the
 SQL index drives the drainer). After a clean soak the flag is intended to flip

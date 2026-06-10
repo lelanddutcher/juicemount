@@ -1,271 +1,230 @@
 # JuiceMount
 
-A native macOS menu-bar app that makes JuiceFS-backed shared storage feel like a local SSD to Premiere, DaVinci Resolve, Final Cut, and Finder. Self-hosted, cellular-capable, no recurring fees.
+**A LucidLink-style mounted volume for video editors — running entirely on hardware you own.**
 
-**Last updated:** 2026-05-28
-**Active branch:** `production-hardening` (mirrored to `main`)
+JuiceMount is a macOS menu-bar app that mounts shared storage at `/Volumes/<name>` and makes it behave the way editors need it to: scrub a 100 GB file and only the blocks you touch come over the wire, pin a project and keep cutting on a plane, drop a render on the volume and it lands on local SSD instantly while uploading in the background. The backend is a box you already have — a TrueNAS, a Synology, any Linux machine running Docker — not a storage contract.
+
+Built on [JuiceFS](https://github.com/juicedata/juicefs) (metadata in Redis, file data in JuiceFS's open, documented chunk format in MinIO or any S3-compatible store), re-exported locally through a Finder-tuned NFS server with an SQLite metadata cache, an SSD block cache, offline pinning, and a write spool.
+
+> **Status:** pre-1.0, macOS-only, self-hosted. If you want a managed service with support contracts, this is not that — see [What JuiceMount is not](#what-juicemount-is-not).
 
 ---
 
-## What it does
+## Why this exists
 
-Mounts a Redis + S3 (MinIO / B2 / R2) backed JuiceFS volume at `/Volumes/zpool` over a loopback NFS v3 server tuned for macOS Finder, with a SwiftUI menu-bar app for everything else.
+Storage for small video teams currently forces a three-way trade:
 
-- **Browse 100 K+ entries instantly** via SQLite metadata cache + FTS5 trigram search.
-- **Read pinned media at LAN / SSD speed** (200+ MB/s sustained, 4.6 MB total network traffic on a 200 MiB read of a cached file).
-- **Write at local-SSD speed even over WAN** *(opt-in, `JM_SPOOL_ENABLE=1`)* — a JuiceMount-owned write spool on local SSD acks Finder writes the moment they're durable locally, then drains into JuiceFS in the background at the network's pace. SHA-256 verified at every hop.
-- **Toggle offline mode** for cellular: pinned files keep working, un-pinned reads fail in <100 ms instead of beachballing.
-- **Pin folders for offline** via popover button or Finder right-click → Services.
-- **Auto-expand JuiceFS cache** to 85% of disk, with `--free-space-ratio 0.01` so the disk is genuinely the cache.
-- **Reclaim APFS purgeable space** (Time Machine local snapshots) at mount time and on-demand.
-- **Verify-and-repair** pinned coverage on Sync — re-prefetches anything JuiceFS evicted.
+1. **Block-streaming SaaS** (LucidLink, Suite, Shade, Aspect) gets you the magic mounted-drive workflow — and a per-seat, per-TB bill that scales with exactly the thing video generates most of. Your library lives inside their filesystem.
+2. **Self-hosted sync** (Nextcloud, Seafile, Mountain Duck) gets you ownership — but syncs whole files. Opening a 100 GB clip to check one shot means moving 100 GB. And in the author's testing these tools plateau around 0.8–1 Gbit/s even on a 10 GbE LAN.
+3. **Plain NFS/SMB to a NAS** gets you speed and ownership — and nothing else. No offline files, no cache, no WAN story, and Finder grinds on a 100 K-file library.
+
+JuiceMount is the missing combination: **partial-file streaming and Dropbox-style cache/offline semantics, at near-line-speed on your own LAN, against storage you own.** On the author's 10 GbE setup it sustains roughly 7 Gbit/s in both directions — the same hardware where Mountain Duck/Seafile-class tools capped near 1 Gbit/s in the same tests. (All performance claims here are the author's own measurements, not independent benchmarks — see [Performance](#performance).)
+
+There is no penalty for choosing the hybrid. That's the whole product.
+
+S3 and cloud collaboration platforms have their place — this exists because at video scale, cloud-storage pricing is brutal, and a small team shouldn't have to accept inferior infrastructure to afford speed.
+
+---
+
+## What you get
+
+All of the below is shipped and exercised in the current codebase (see [`ROADMAP.md`](ROADMAP.md) for validation status):
+
+- **Block-level partial reads.** Files are stored as chunked objects (JuiceFS). Scrubbing 3 seconds of a 100 GB OCF streams only those blocks — no full-file download, ever.
+- **Local SSD cache that respects your disk.** Set a cache size; JuiceMount grows it only as far as needed to keep your pinned content fully cached, and never squeezes the boot disk below a hard 10 GiB free floor. It also reclaims APFS purgeable space (Time Machine local snapshots) at mount time and on demand, so "disk full" usually isn't.
+- **Pin folders for offline.** From the menu-bar popover or Finder right-click → Services → *JuiceMount: Pin for Offline*. A prefetcher pulls every byte to local SSD; *Sync Now* runs verify-and-repair to re-fetch anything the cache evicted.
+- **Offline-files mode.** Flip one toggle (cellular, plane, NAS down): pinned files keep working at SSD speed; un-pinned reads fail in milliseconds instead of beachballing Finder for 30+ seconds.
+- **Write spool** *(opt-in: Preferences → Cache & Storage → Enable write spool)*. Writes ack the moment they're durable on local SSD, then trickle-upload to the server in the background at whatever the network allows — SHA-256-verified at every hop. A 2 GB Finder copy over a WAN feels like a local copy, and the popover shows pending uploads until they drain.
+- **Instant search across the whole library.** ⌘⇧F from any app (global hotkey, toggleable): SQLite FTS5 trigram index, results in tens of milliseconds across 100 K+ entries. Spacebar Quick Look, Enter to reveal in Finder, drag results straight into a Premiere/Resolve/FCPX timeline.
+- **Same absolute path on every machine.** Every editor mounts `/Volumes/<name>`, and metadata syncs through the shared Redis instance — project files reference media at identical paths, so a teammate's `.prproj`/`.drp`/`.fcpx` opens without relinking. This is the designed multi-machine workflow; note that heavy *simultaneous* multi-editor use hasn't been soak-tested yet (most QA to date is single-editor).
+- **A menu-bar app, not a daemon you babysit.** A state-tinted menu-bar icon (green healthy / amber degraded / blue offline-files / red fault) with an upload-activity badge, health detail for Redis/MinIO/FUSE/NFS, cache and pin progress, disk-pressure banners, structured JSON logs, and an HTTP control plane (`/metrics`, `/health`, `/pin`, `/offline`, `/spool`, `/mount-now`, …) for scripting.
+- **A server stack that's one `docker compose up`.** Redis + MinIO + a JuiceFS mount with WebDAV access + **JuiceMount Manager**, a web UI for migrating existing data into the volume plus trash, backups, maintenance, and settings tabs. Migration is the production-tested path (live progress, junk-file filtering, sequential job queue); the other tabs are newer. Production-tested install path for TrueNAS SCALE (paste-the-YAML), works on any Docker host.
+
+---
+
+## How it fits together
+
+```
+ YOUR MAC                                          YOUR SERVER (any Docker host)
+┌────────────────────────────────────────┐        ┌──────────────────────────────┐
+│ Premiere / Resolve / FCPX / Finder     │        │  docker compose up -d        │
+│            │                           │        │                              │
+│            ▼  NFS v3 (localhost only)  │        │  ┌─────────┐  ┌───────────┐  │
+│ ┌──────────────────────────────┐       │        │  │  Redis  │  │   MinIO   │  │
+│ │ JuiceMount.app               │       │  LAN / │  │ (file   │  │ (file     │  │
+│ │  • NFS server, Finder-tuned  │◄──────┼──WAN──►│  │  meta-  │  │  data as  │  │
+│ │  • SQLite metadata + search  │       │        │  │  data)  │  │  plain S3 │  │
+│ │  • SSD block cache + pins    │       │        │  └─────────┘  │  objects) │  │
+│ │  • write spool (opt-in)      │       │        │               └───────────┘  │
+│ │  • JuiceFS client (FUSE)     │       │        │  ┌────────────────────────┐  │
+│ └──────────────────────────────┘       │        │  │ JuiceMount Manager     │  │
+│            │                           │        │  │ web UI :30190          │  │
+│            ▼                           │        │  │ (migrate / maintain)   │  │
+│   /Volumes/<name>  ← editors work here │        │  └────────────────────────┘  │
+└────────────────────────────────────────┘        └──────────────────────────────┘
+```
+
+Reads are served in priority order: memory buffer (small files) → direct SSD-cache reads that bypass FUSE entirely → JuiceFS → your object store. Metadata (the thing Finder hammers hardest) never leaves local SQLite on the hot path — directory opens that take 3–10 s through raw FUSE complete in 15–120 ms. Full detail in [`ARCHITECTURE_juicemount.md`](ARCHITECTURE_juicemount.md).
+
+The object store can also be a cloud bucket (Backblaze B2, Cloudflare R2, Wasabi — anything S3-compatible that JuiceFS supports); Redis still runs on your box. Be honest with yourself about what's been proven, though: the self-hosted MinIO/TrueNAS path is the one this project's QA exercises; cloud buckets ride on JuiceFS's S3 support and haven't been part of JuiceMount's own test matrix.
+
+---
+
+## Requirements
+
+Honest list — this is a self-hosted system and there is a server side.
+
+**On the Mac (client):**
+
+- macOS 14 (Sonoma) or later (`Package.swift` targets `.macOS(.v14)`). Developed and tested on Apple Silicon; Intel Macs are untested (the build scripts produce host-architecture binaries, so an Intel build *should* work from source, but no one has verified it).
+- [macFUSE](https://macfuse.github.io/) — required by the JuiceFS client. The first-run Setup Assistant preflight checks that it's installed and walks you through it if not.
+- The `juicefs` binary (`brew install juicefs`; auto-detected from `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, then `$PATH`).
+- **An admin password prompt, once per session**, the first time JuiceMount mounts: macOS restricts `mount_nfs`/`umount` to root, so the app escalates through the standard macOS auth dialog (and macOS caches the authorization for the session). Optionally set up a [scoped passwordless-sudo rule](docs/dev-setup.md) (exactly `/sbin/mount_nfs`, `/sbin/umount`, `/bin/mkdir` — no shell, no wildcards) to remove the prompt entirely.
+- To build from source (currently the only way to get the app — no prebuilt/notarized DMG yet): Go 1.26+ and Xcode command-line tools (Swift 5.9+).
+
+**On the server (any of these):**
+
+- TrueNAS SCALE (the production-tested path — paste-the-YAML install, see [`server/INSTALL-TrueNAS.md`](server/INSTALL-TrueNAS.md)), or
+- Any Linux box / Synology DSM 7+ / laptop with Docker + Docker Compose.
+- Disk for two things: the MinIO object bucket (your actual media) and a small Redis dataset (metadata; AOF-persisted).
+- A LAN you trust — the stack's Redis and MinIO ports are LAN-exposed by default; firewall them if untrusted clients share the network (see [`server/README.md` § Security notes](server/README.md)).
+
+**Network:** anything from hotel Wi-Fi (with pinned files + the write spool) up to 10 GbE (where the throughput ceiling becomes your disks). For WAN use the author runs Tailscale; any VPN that gives the Mac a route to the Redis + MinIO ports works.
 
 ---
 
 ## Quick start
 
-```bash
-# Build (Go c-archive + Swift app + .app bundle + ad-hoc codesign)
-./scripts/build-app.sh
+### 1. Server (≈10 minutes)
 
-# Install
-./scripts/install.sh                  # to /Applications
-./scripts/install.sh --launchd        # also enable login auto-start
+```sh
+git clone https://github.com/lelanddutcher/juicemount
+cd juicemount/server
 
-# Launch
+# Edit docker-compose.yml: set the bind-mount paths for your disks
+# and a strong MINIO_ROOT_PASSWORD (openssl rand -base64 24).
+
+docker compose up -d
+docker compose ps                    # wait for all services healthy
+docker compose logs juicefs-init    # confirms first-time volume format
+```
+
+TrueNAS SCALE users: **Apps → Discover → ⋮ → Install via YAML**, paste the compose. Full walkthrough in [`server/INSTALL-TrueNAS.md`](server/INSTALL-TrueNAS.md).
+
+Already have terabytes on the NAS? Open the **JuiceMount Manager** web UI at `http://<server>:30190` and use the Migrations tab — live progress, junk-file filtering (`.DS_Store`, `._*`, `Thumbs.db`), sequential job queue.
+
+### 2. Mac
+
+```sh
+brew install juicefs
+brew install --cask macfuse          # approve the system extension if macOS asks
+
+git clone https://github.com/lelanddutcher/juicemount
+cd juicemount
+./scripts/build-app.sh               # Go c-archive + Swift app + codesign
+./scripts/install.sh                 # → /Applications  (add --launchd for login start)
 open /Applications/JuiceMount.app
-
-# Or run from the build dir without installing
-open ./build/JuiceMount.app
 ```
 
-The menu-bar drive icon appears. Click it for the popover.
+A locally built app is not quarantined, so Gatekeeper won't object. If you instead obtained a pre-built `JuiceMount.app` from someone else (it's unsigned/ad-hoc-signed), macOS will block it: either remove the quarantine flag with `xattr -d com.apple.quarantine /Applications/JuiceMount.app`, or launch once and approve it under **System Settings → Privacy & Security → Open Anyway** (the right-click-Open trick no longer bypasses Gatekeeper on macOS 15 and later).
 
-For headless / TrueNAS / Linux deployment without the menu bar app:
+On first launch the **Setup Assistant** opens automatically: it preflight-checks `juicefs`, macFUSE, and backend reachability, and walks you through pointing the app at your box (also reachable later via menu-bar icon → Setup Assistant…, or **Preferences → Connection**):
 
-```bash
-./scripts/build-cli.sh                # builds /tmp/jm5
-/tmp/jm5 --redis redis://127.0.0.1:6379/1 \
-         --mount /Volumes/zpool \
-         --listen 127.0.0.1:11049 \
-         --db /tmp/jm5.db \
-         --cache-size 100000
-```
+- **Redis URL:** `redis://<server>:30179/1`
+- **S3 endpoint override:** `http://<server>:30151/<bucket>` (only needed if the volume was formatted with a docker-internal hostname)
+
+(MinIO credentials live in the JuiceFS volume's format metadata in Redis — they don't need to be re-entered on the Mac.)
+
+Hit **Start**. Enter your admin password at the mount prompt (once per session). `/Volumes/<name>` appears in Finder; point your NLE's media browser at it and edit.
 
 ---
 
-## Repo layout
+## Performance
 
-```
-JuiceMount6/
-├── README.md                  ← you are here
-├── ROADMAP.md                 — phased status + Phase 4 next steps
-├── ARCHITECTURE_juicemount.md — system architecture, data flows
-├── MENU_BAR_APP.md            — popover features, keyboard shortcuts, troubleshooting
-├── CHANGELOG.md               — release notes
-├── credentials.md             — sensitive infra config (gitignored)
-│
-├── app/JuiceMount/            — Swift Package: menu-bar app
-│   └── Sources/
-│       ├── JuiceMountCore/    — C interop layer over libnfsd.h
-│       └── JuiceMount/        — App.swift, UI, ServerController, NFSBridge
-│
-├── bridge/cbridge.go          — Go c-archive exports (Start/Stop/Stats/Pin/Unpin/...)
-├── cmd/jm5/                   — headless server CLI (long-running NFS server)
-├── cmd/juicemount/            — control client CLI (talks to running app via HTTP)
-│
-├── nfs/                       — NFS handler, read/write paths, fd pool, readahead, membuf, write spool + drainer
-├── metadata/                  — SQLite store + Redis sync + FTS5 search
-├── cache/                     — Direct SSD cache reader (Priority 2 read path)
-├── health/                    — FUSEManager, monitor loop, network watcher
-│
-├── internal/
-│   ├── cache/pin/             — Pin store + prefetcher + verify-and-repair
-│   ├── jmlog/                 — Structured JSON logging with rotation
-│   ├── metrics/               — RPC counters, /metrics HTTP endpoint
-│   ├── nfs/                   — Vendored go-nfs fork
-│   └── nle/                   — Premiere/Resolve/FCPX project parsers
-│
-├── test/                      — Integration / e2e / workflow / benchmark tests (2026-03-31)
-├── scripts/                   — Build, install, codesign helpers
-├── logos/                     — Brand assets
-│
-├── VISION/                    — Strategic positioning, competitive, persona, roadmap, prototypes
-│   ├── STATE.md               — vision-loop status + implementation status
-│   ├── feature-roadmap-ranked.md
-│   ├── positioning.md, personas.md, brand-identity.md, gtm-strategy.md, ...
-│   ├── competitive/           — Suite, Shade, Iconik, Frame.io, Jellyfish, NAS vendors
-│   └── prototypes/            — Per-prototype writeups (01 codec, 02 backup, 03 offline-pin)
-│
-└── z-quarantine/              — Files set aside for review or removal
-    └── README.md              — what's there and why
-```
+All numbers below were **measured by the author on his own setup** (Apple-Silicon Mac ↔ TrueNAS SCALE over 10 GbE; methodology, workload scripts, and regression harness in [`docs/PERFORMANCE_METHODOLOGY.md`](docs/PERFORMANCE_METHODOLOGY.md)). They are honest measurements, not marketing benchmarks — your hardware will differ.
+
+| What | Measured |
+|---|---|
+| Sustained network throughput, 10 GbE LAN | ~7 Gbit/s up and down (author-measured) |
+| Cached read through the full NFS path (`dd`, 200 MiB) | **226–571 MB/s**, READ p95 481 µs |
+| Fully-cached 200 MiB sequential read | 431 MB/s with **4.6 MB** total network traffic |
+| Pinned 350 MB file read, network off | 215+ MB/s sustained |
+| Directory open, 100 K+-entry volume | 15–120 ms (3–10 s through raw FUSE) |
+| Filename search across ~131 K entries | ~29 ms |
+| Un-pinned read refusal in offline mode | 4–67 ms (vs. a 30 s NFS retry hang) |
+
+For comparison on the same 10 GbE link, Mountain Duck/Seafile-class mounted-bucket tools measured ~0.8–1 Gbit/s in the author's testing — they're bound by single-stream sync engines, not the network.
 
 ---
 
-## How a read happens
+## How it compares
 
-```
-Premiere / Resolve / Finder reads /Volumes/zpool/Project/clip.mov
-        ↓
-NFS RPC → 127.0.0.1:11049 → nfs/server.go → handler.OpenFile
-        ↓
-[offline mode + un-pinned?  → return EIO in ~6 ms]
-        ↓
-cachedFile.ReadAt(buf, off):
-        ├─ Priority 1: memBuf (small files: prproj, LUTs)
-        ├─ Priority 2: cache.Reader (direct pread on JuiceFS chunks/ — bypasses FUSE)
-        └─ Priority 3: fuseFD.ReadAt (FUSE → JuiceFS LRU → S3 backend on miss)
-```
+Two different categories claim to solve this; JuiceMount sits deliberately between them. Pricing below was checked **June 2026** from public pricing pages — verify before relying on it.
 
-When you pin a folder, the prefetcher walks it, opens each file via the FUSE mount, reads it in 1 MB chunks, and discards the bytes. The side effect is the bytes flowing through JuiceFS's download + cache pipeline. Subsequent reads hit Priority 2 or Priority 3 with no backend round-trip.
+**vs. storage SaaS for editors:**
 
-For full detail see `ARCHITECTURE_juicemount.md` § 11 (pin/prefetcher/offline-mode) and § 4 (data flows).
+| | **JuiceMount** | LucidLink | Suite | Shade | Aspect |
+|---|---|---|---|---|---|
+| Your files live | your hardware / your bucket | their cloud (AWS) | their cloud ($75/TB/mo) or BYO ($40/TB/mo) | their cloud | their cloud |
+| Partial-file streaming | ✅ block-level | ✅ | ✅ | ✅ (ShadeFS) | ✅ |
+| Offline pinned files | ✅ | ✅ | not clearly documented | not clearly documented | not clearly documented |
+| Pricing model | **$0 — bring your own hardware** | $7–27+/user/mo + $8/100 GB extra | $75/TB/mo, +$10/user after 5 | $29.75/seat/mo (500 GB active/seat) | free tier + custom enterprise |
+| Exhaustive metadata/AI search | roadmap (filename search today) | — | — | ✅ | ✅ |
+| Open source | ✅ | — | — | — | — |
+| Leave with your bytes intact | your hardware — copy from the mounted volume or `juicefs sync`; the bucket stays under your control | export required | export required | export required | export required |
 
----
+These products are good at things JuiceMount doesn't do: managed convenience, review/approval tools, AI semantic search, Windows clients, someone to call. If you want those and the bill works for you, use them.
 
-## How a write happens (with the spool enabled)
+**vs. self-hosted sync** (category behavior as of June 2026 — check current client docs, these tools evolve):
 
-```
-Premiere / Finder writes /Volumes/zpool/Project/render.mov
-        ↓
-NFS WRITE RPC → handler.OpenFile(O_CREATE) → spool.OpenWrite
-        ↓
-write bytes to a file on local SSD  ← streaming SHA-256
-        ↓
-Close → fsync → mark "ready" → ACK to Finder   (durable + fast; no wait on MinIO)
-        ↓
-[background] drainer: copy spool file → JuiceFS FUSE → rawstaging → MinIO
-             re-verify SHA-256 at the FUSE hop, then delete the spool file
-```
-
-The spool is the **intermediary between the NFS mount and JuiceFS's raw staging**. It moves the durability checkpoint one step earlier — to our `fsync()` on local SSD — so Finder sees "write complete" without waiting for the upload. This is the Dropbox / LucidLink / Suite write model, achieved without forking JuiceFS's flow control. Reads of a just-written file are served from the spool until the drainer copies it through (3-tier read lookup: spool → cache/readahead/memBuf → FUSE).
-
-Opt-in via `JM_SPOOL_ENABLE=1`; when disabled, writes use the original direct-to-FUSE path unchanged. For full detail see `ARCHITECTURE_juicemount.md` § 15 (write spool) and `docs/ROADMAP/option-2-spool.md`.
+| | **JuiceMount** | Nextcloud | Seafile | Mountain Duck |
+|---|---|---|---|---|
+| Open a 100 GB file to check one shot | streams the blocks you touch | syncs the file | fetches the file | fetches the file |
+| 10 GbE LAN throughput | ~7 Gbit/s (author-measured) | ~1 Gbit/s class | ~1 Gbit/s class | ~0.8–1 Gbit/s (author-measured) |
+| Offline files + fail-fast offline mode | ✅ | sync model | sync model | cache, no pin semantics |
+| Finder-native NLE workflow (identical paths, scrub-in-place) | ✅ | — | — | partial |
+| Cost | $0, OSS | $0, OSS | $0 community | $49 one-time |
 
 ---
 
-## Configuration
+## What JuiceMount is not
 
-Edit Preferences in the app, or set defaults via:
-- **Redis URL:** `redis://127.0.0.1:6379/1`
-- **Mount point:** `/Volumes/zpool`
-- **NFS listen:** `127.0.0.1:11049`
-- **Metrics / control plane:** `127.0.0.1:11050`
-- **SSD cache:** auto-expanded to 85% of disk (user pref is a floor)
-- **Memory buffer:** 2 GiB default, files <128 MiB
-- **Write spool (opt-in):** `JM_SPOOL_ENABLE=1` to enable. `JM_SPOOL_DIR` (default `~/Library/Application Support/JuiceMount/spool/`), `JM_SPOOL_SIZE_GB` (default 50). `JM_WAN_MODE=1` raises JuiceFS `--max-uploads` 20 → 64; `JM_MAX_UPLOADS=<n>` overrides directly. Live status at `127.0.0.1:11050/spool`.
+Stating this up front saves everyone time:
 
-Logs:
-- App: `~/Library/Logs/JuiceMount/juicemount.log` (JSON, 16 MB × 5 rotation)
-- JuiceFS daemon: `~/.juicefs/juicefs.log` (auto-tailed into the above with WARN aggregation)
+- **Not a SaaS.** No hosted offering, no accounts, no billing. You run the server.
+- **Not a review platform.** No browser viewer, comments, or approvals — Frame.io and friends own that lane and pair fine with this.
+- **Not AI media search.** Filename search is instant today; content-aware search (the thing Shade/Aspect/Iconik do well) is acknowledged roadmap, not a current feature.
+- **Not multi-OS.** macOS only today. The server side runs anywhere Docker does.
+- **Not a backup.** It's primary storage with a cache. Run real backups of the MinIO bucket and Redis — the Manager has backup-scheduling tooling, but the 3-2-1 discipline is yours.
+- **Not zero-ops.** A failed disk on your NAS is your failed disk. That's the deal that makes it free.
 
 ---
 
-## Recent: NFS read throughput restored after a wifi-triggered regression (2026-05-25)
+## Roadmap
 
-A user-reported regression — **DaVinci Resolve playback at <2 fps on
-cached 4K media** — led to discovering two compounding issues, one
-long-latent and one triggered by wifi instability, that together had
-collapsed NFS read throughput to **9.5 MB/s** against a healthy-system
-target of 200+ MB/s. Closed as QA-26 through QA-31.
+Next up (full ranked list in [`ROADMAP.md`](ROADMAP.md) and `VISION/feature-roadmap-ranked.md`):
 
-### What looked broken
-
-- DaVinci played fully-cached media at <2 fps.
-- Finder occasionally showed media as offline (red minus / ESTALE).
-- Big-file copies into the mount failed mid-transfer with Finder error
-  100060 (ETIMEDOUT) or 100070 (ESTALE).
-- "Sync Now" appeared to re-prefetch files that were already 100%
-  cached.
-
-### What was actually broken (three independent bugs interleaving)
-
-**1. Long-latent: per-NFS-RPC Stat amplification.** Every NFS READ RPC
-made two FUSE Stat round-trips (size-clamp in `nfs_onread.go:101` plus
-post-op attrs in `nfs_onread.go:203`), each going through the
-2-second-budgeted phantom-purge gate in `juiceFS.Stat`. The bug had
-been present for months and was latent because earlier workloads
-(small-file copy, Finder browsing) didn't sustain the high RPC rate
-that exposes the per-RPC cost. **DaVinci's scrub pattern was the
-first workload that stressed it.**
-
-**2. Wifi-triggered: metadata-sync cycles taking 17 s** under
-intermittent Redis reachability. That made all FUSE-side work slower,
-which made #1 worse. Also caused the prune logic (`PruneThreshold=2`
-cycles, ≤60 s window) to incorrectly mark still-present files for
-deletion when Redis SCAN returned incomplete results during a network
-blip.
-
-**3. Cache-correctness consequence of #2:** pruning a still-valid file
-removed `inodeCache[inode]`. Kernel-cached NFS handles then returned
-ESTALE → DaVinci treated fully-cached media as offline.
-
-### Why wifi was the trigger, not the cause
-
-- ~4-day session on a flaky AP with multiple reconnects.
-- Each wifi flip briefly broke Redis reachability (`no route to host`).
-- JuiceFS daemon crashed on Redis loss and restarted, re-syncing cold.
-- The metadata sync queue backed up, holding `writeMu` for seconds at
-  a time.
-- All NFS ops slowed; the per-RPC Stat amplification went from
-  "tolerable" to "lethal".
-
-**"We were stable" reflected lower stress, not better code.** The
-per-RPC Stat amplification had been there since the phantom-purge gate
-was added; previous workloads never sustained the RPC rate that made
-it visible.
-
-### Fixes shipped in this branch
-
-| ID    | Layer | Change |
-|-------|-------|--------|
-| QA-26 | Swift state machine | Ephemeral URLSession defeats post-wifi-switch connection rot; stuck-state backstop force-transitions popover from `.disconnected → .running` when `/health` is healthy. |
-| QA-27/28 | metadata cache | `evictPathOrphan` keeps `inodeCache` consistent under inode-reassignment WITHOUT breaking still-valid kernel handles (redirect, not delete). |
-| QA-29 | mount option | `timeo=10 → timeo=200` (10× per-RPC budget) so CREATE/WRITE under metadata-sync `writeMu` contention don't hit the kernel timeout. |
-| QA-30 Layer C | metadata + pin store | Pinned files are NEVER pruned or evicted, period. |
-| QA-30 Layer A | metadata sync | Per-path FUSE `Lstat` verifies prune candidates before deletion. Bounded 8-goroutine gate; >25% timeouts → bail cycle. `PruneThreshold` 2 → 10 (5-min buffer). |
-| QA-30 Layer B | nfs handler | Recently-evicted shadow map + singleflight recovery in `FromHandle` — if an inode goes missing and FUSE confirms the path still exists, the entry is restored on demand. |
-| QA-31 | nfs read path | `rsize` 256 KB → 1 MB (cuts RPC count 4×); `cachedFile.CachedInfo()` value-snapshot exposes Open-time metadata so `onRead` skips two FUSE Stat round-trips per RPC. EOF-underflow in size-clamp fixed. |
-
-### Measured impact — same cached MP4 via `dd 200M`
-
-| Stage                                            | Throughput     | READ p95    | READ max    |
-|--------------------------------------------------|----------------|-------------|-------------|
-| Pre-fix (rsize=256K + per-RPC Stat)              | 9.5 MB/s       | 3.4 s       | 3.45 s      |
-| After QA-31 Slice 2 (rsize=1MB only)             | 50 MB/s        | —           | —           |
-| After QA-31 Slice 3 (Stat fast-path + EOF fix)   | **226-571 MB/s** | **481 ms** | **370 ms**  |
-
-**Zero `FromHandle STALE` events** since QA-30 Layer C+A deploy.
-`01-smoke.sh` 10 PASS / 0 FAIL. All metadata/internal-nfs tests pass
-under `-race`.
-
-Five HIGH findings from two code-reviewer audit gates (QA-30 Layer
-C+A) and one audit gate (QA-30 Layer B + QA-31) were all resolved
-before deploy. Audit trail in `docs/STATE.md`.
-
-### Lessons
-
-- Wifi instability is a useful chaos-test for backend dependencies
-  but it can mask latent bugs as "environmental" — until a workload
-  arrives that exposes them.
-- Pin store and metadata store both holding truth about "what's
-  cached" without a single shared invariant is the root design issue
-  these three layers treat at the symptom level. A unified
-  pin-aware cache truth is on the followup list.
-- A 2-second-budgeted `Lstat` inside the per-RPC critical path is
-  always a latent throughput cliff. Per-RPC overhead must be
-  guarded with explicit per-handle caching (the QA-31 pattern).
+1. Codec-aware Quick Look proxies (R3D / ARRI / BRAW / ProRes RAW)
+2. Content-hash backup verification with a traffic-light inventory
+3. Bandwidth-aware automatic offline/streaming mode
 
 ---
 
-## Status
+## Built on JuiceFS — credit where due
 
-Phase 1 ✅ stability + polish · Phase 2 ✅ menu-bar app · Phase 3 ✅ production hardening (this branch)
+JuiceMount exists because [JuiceFS](https://github.com/juicedata/juicefs) (Apache-2.0, by [Juicedata](https://juicefs.com)) solved the hard distributed-filesystem problems — chunked object layout, Redis metadata engine, cache management — and proved them in production for years. JuiceMount is a macOS-native experience layer on top: the Finder-tuned NFS re-export, metadata caching, pinning, offline gates, the write spool, the menu-bar app, and the server packaging. The NFS server is a fork of [`willscott/go-nfs`](https://github.com/willscott/go-nfs) (Apache-2.0), vendored at `internal/nfs` and attributed in [`NOTICE`](NOTICE).
 
-**Write spool (Option 2)** ✅ shipped 2026-05-28 behind `JM_SPOOL_ENABLE` — the local-SSD write intermediary (above) that makes Finder writes ack instantly and drain to JuiceFS in the background, fixing the WAN write cliff (2 GB Finder copies over Tailscale had hit 2-hour ETAs). All 8 slices (A–H) are CI-green: spool primitives + SQLite index, drainer, write-path, 3-tier read lookup, runtime wiring + `/spool` endpoint, crash-recovery scrubber, integrity audit log, WAN-mode polish. Server-side + control-plane complete; menu-bar and Manager UI surfaces and live soak testing are deferred. See `ROADMAP.md` and `docs/ROADMAP/option-2-spool.md`.
+If JuiceFS itself fits your (non-video, non-macOS) problem, use it directly — it's excellent.
 
-**Phase 4 — workflow features for video creatives** — see `ROADMAP.md` and `VISION/feature-roadmap-ranked.md`. Top three:
-1. Codec-aware Quick Look proxies (R3D / ARRI / BRAW / ProRes RAW) — 2–3 weeks to ship
-2. Content-hash backup verification — 3–4 weeks including UI shell
-3. Auto-detect bandwidth-aware mode (manual offline-toggle is shipped)
+## License
+
+[Apache License 2.0](LICENSE). Third-party attributions (JuiceFS, go-nfs, go-nfs-client) are in [`NOTICE`](NOTICE); JuiceFS and go-nfs are likewise Apache-2.0, go-nfs-client is BSD-2-Clause.
+
+## Contributing
+
+- **Bugs:** open an issue with the diagnostic zip (menu-bar → Export Diagnostics) — it bundles logs, mount table, and backend health.
+- **Code:** one theme per PR — stability fixes never share a commit with features. Run `go vet ./...` and `go test -race` on touched packages; request-path changes get an adversarial review pass (see `docs/QA-procedure.md`).
+- **Testing on real hardware** is the most valuable contribution: different NAS vendors, network shapes, and NLE versions. Real Finder/Resolve/Premiere testing beats synthetic checks — that rule is earned, see the QA history in `docs/`.
+- **Developer setup** (passwordless mount for fast test cycles, headless CLI, config reference): [`docs/dev-setup.md`](docs/dev-setup.md).
+
+*Non-negotiables, so you don't waste a PR:* no telemetry without opt-in, no proprietary dependencies for self-hosters, no FileProviderExtension (ever — `docs/no-fileprovider.md` is the postmortem), reliability beats novelty.

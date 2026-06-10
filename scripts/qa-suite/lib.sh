@@ -29,6 +29,9 @@ if [ -z "${MOUNT:-}" ]; then
   fi
 fi
 export MOUNT
+# Repo root (scripts/qa-suite/ is two levels down) — used to find build
+# artifacts without hardcoding any developer-specific absolute path.
+export JM_REPO_ROOT="${JM_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export JM_METRICS_ADDR="${JM_METRICS_ADDR:-127.0.0.1:11050}"
 export FUSE_INTERNAL="${FUSE_INTERNAL:-$HOME/.juicemount/fuse-internal}"
 export ARTIFACTS_ROOT="${ARTIFACTS_ROOT:-/tmp/jm-qa-artifacts}"
@@ -197,7 +200,7 @@ restart_juicemount() {
     info "restarting JuiceMount…"
     pkill -TERM -f 'JuiceMount.app/Contents/MacOS/JuiceMount' 2>/dev/null
     sleep 3
-    open "/Users/LelandDutcher/Developer/JuiceMount6/build/JuiceMount.app"
+    open "$JM_REPO_ROOT/build/JuiceMount.app"
     sleep 5
     if wait_for_mount_back 60; then
         info "JuiceMount restarted and healthy"

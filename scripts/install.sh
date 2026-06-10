@@ -38,23 +38,34 @@ cp -R "$APP_SOURCE" "$APP_DEST"
 echo "    Installed: $APP_DEST"
 
 # Optionally install LaunchAgent
-if [ "$1" = "--launchd" ]; then
+if [ "${1:-}" = "--launchd" ]; then
     echo ""
     echo "==> Installing LaunchAgent..."
     mkdir -p "$HOME/Library/LaunchAgents"
+    # The agent logs here (launchd won't create parent directories itself).
+    mkdir -p "$HOME/Library/Logs/JuiceMount"
 
     # If already loaded, unload first
     if launchctl list | grep -q com.juicemount.agent; then
         launchctl unload "$LAUNCH_AGENT_DEST" 2>/dev/null || true
     fi
 
-    cp "$LAUNCH_AGENT_SRC" "$LAUNCH_AGENT_DEST"
+    # Substitute the user's home into the log paths (launchd does not
+    # expand env vars in StandardOutPath/StandardErrorPath).
+    sed "s|__HOME__|$HOME|g" "$LAUNCH_AGENT_SRC" > "$LAUNCH_AGENT_DEST"
     launchctl load "$LAUNCH_AGENT_DEST"
     echo "    Loaded: $LAUNCH_AGENT_DEST"
     echo "    JuiceMount will now start automatically at login."
+    echo ""
+    echo "    NOTE: the agent launches via 'open -a' (LaunchServices), so it"
+    echo "    cannot double-launch the app if the in-app 'Start at login'"
+    echo "    toggle is also on — but pick ONE mechanism to avoid confusion."
+    echo "    The in-app toggle is recommended for normal use; disable it in"
+    echo "    Preferences → General if you're managing startup with launchd."
 else
     echo ""
-    echo "    Tip: run with --launchd to also enable start-at-login via LaunchAgent."
+    echo "    Tip: run with --launchd to also enable start-at-login via LaunchAgent"
+    echo "         (intended for headless/managed setups)."
     echo "         Or use the in-app preference: JuiceMount → Preferences → General → Start at login"
 fi
 

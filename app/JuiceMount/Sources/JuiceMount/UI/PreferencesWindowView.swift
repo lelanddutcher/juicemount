@@ -429,7 +429,7 @@ struct PreferencesWindowView: View {
     /// Strip ALL whitespace (spaces, tabs, newlines) from URL / address
     /// fields. URLs and host:port pairs never contain whitespace, so this
     /// is always safe. Catches paste-with-stray-space accidents
-    /// (e.g. `redis://192.168.0.197: 30179/1`) that would otherwise
+    /// (e.g. `redis://10.0.0.5: 30179/1`) that would otherwise
     /// produce an unhelpful `juicefs mount: exit status 1` six layers down.
     private func stripWhitespace(_ s: String) -> String {
         return s.replacingOccurrences(

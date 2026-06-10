@@ -22,12 +22,20 @@ source "$SCRIPT_DIR/lib.sh"
 phase_init "08-netshape"
 
 # ---------------------------------------------------------------------------
-# Detect MinIO target
-BACKEND_HOST="${BACKEND_HOST:-192.168.0.212}"
+# Detect MinIO target.
+#
+# No default IP is baked in: set JM_QA_NAS_IP to your NAS/backend address
+# (used for both the MinIO and Redis targets when they live on the same
+# box), or set BACKEND_HOST / REDIS_HOST individually if your containers
+# sit on distinct IPs (e.g. separate macvlan addresses on TrueNAS).
+BACKEND_HOST="${BACKEND_HOST:-${JM_QA_NAS_IP:-}}"
 BACKEND_PORT="${BACKEND_PORT:-9000}"
-# 192.168.0.212 is the macvlan IP for the juicefs-minio container.
-# Earlier this defaulted to .197 (the SMB host); was a wrong guess.
-# Override with BACKEND_HOST env if your setup differs.
+if [ -z "$BACKEND_HOST" ]; then
+    warn "JM_QA_NAS_IP (or BACKEND_HOST) is not set — cannot determine the shaping target."
+    warn "set JM_QA_NAS_IP=<your NAS IP> (and optionally BACKEND_PORT/REDIS_HOST/REDIS_PORT) and re-run."
+    phase_report
+    exit 0
+fi
 log "shaping target: ${BACKEND_HOST}:${BACKEND_PORT}"
 
 # QA-22 (2026-05-25): Redis target for case 4. Auto-offline engages when
@@ -36,7 +44,7 @@ log "shaping target: ${BACKEND_HOST}:${BACKEND_PORT}"
 # detection if Redis was on a separate host (the typical TrueNAS layout
 # where the same box runs both, but as distinct containers/services on
 # different macvlan IPs). Resolve case 4 by blocking both ports.
-REDIS_HOST="${REDIS_HOST:-192.168.0.210}"
+REDIS_HOST="${REDIS_HOST:-${JM_QA_NAS_IP:-}}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 log "redis target (for case 4 only): ${REDIS_HOST}:${REDIS_PORT}"
 

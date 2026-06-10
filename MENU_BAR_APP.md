@@ -53,7 +53,7 @@ You'll see a small drive icon appear in your menu bar. Click it to open the popo
 
 The menu bar app and the Go core run **in the same process**. There's no IPC overhead — function calls cross language via the C ABI.
 
-The Go stack also runs the **write spool + drainer** (Option 2) when `JM_SPOOL_ENABLE=1` — see `ARCHITECTURE_juicemount.md` § 15. Its menu-bar surface (a *Pending uploads* section + an icon badge) is not yet wired; pending-upload status is currently exposed on the control plane at `127.0.0.1:11050/spool`.
+The Go stack also runs the **write spool + drainer** (Option 2) when enabled via **Preferences → Cache & Storage → Enable write spool** — see `ARCHITECTURE_juicemount.md` § 15. (The `JM_SPOOL_ENABLE=1` env var only works for the standalone `jm5` CLI, not the app — the embedded Go runtime snapshots its environment before Swift code runs.) Its menu-bar surface shipped with the spool-UX sprint: a *Pending uploads* popover section (pending/in-flight/stalled/failed counts, per-entry age + last error, **Retry failed** / **Recover stalled** buttons backed by `/spool-recover`) and an upload-activity badge on the menu-bar icon while drains are active. The same status is exposed on the control plane at `127.0.0.1:11050/spool`.
 
 ## Features
 
@@ -61,9 +61,10 @@ The Go stack also runs the **write spool + drainer** (Option 2) when `JM_SPOOL_E
 
 Click the menu bar icon to see:
 
-- **Status header** with green/yellow/red dot indicator
+- **At-a-glance header**: a one-word health state, a cache-vs-free-space bar, and an uploads row (pending count while the spool drains)
 - **Volume info**: mount point, total entries indexed, last sync time
-- **Health indicators** for Redis, MinIO, and FUSE
+- **Health indicators** for Redis, MinIO, FUSE, and the NFS mount — with a **Mount Now** remedy row (spinner + honest "Volume not mounted" subtitle) when the NFS volume needs a privileged re-mount
+- **Pending uploads** (spool enabled): counts, stalled/failed badges with age + last error, Retry failed / Recover stalled actions
 - **Cache section** (added 2026-05-08):
   - Offline mode toggle — flip to refuse un-pinned reads in <100 ms instead of waiting on a 30 s NFS-retry timeout. Useful on cellular, in airplane mode, or when the NAS is unreachable.
   - **Pin Folder for Offline…** button — opens a native folder picker rooted at the mount; selected folders are recursively scanned and queued for pre-cache.
@@ -79,19 +80,25 @@ Click the menu bar icon to see:
   - Start / Stop JuiceMount
   - Search Files... (⌘⇧F from anywhere)
   - Sync Now — runs metadata reconciliation AND verify-and-repair on the pin set (re-prefetches anything whose disk coverage might be incomplete)
+  - Setup Assistant… — re-opens the first-run onboarding window (preflight checks for `juicefs`, macFUSE, backend reachability)
   - Preferences...
   - Quit
 
-### Status States
+### Menu-Bar Icon & Status States
 
-| State | Icon | Meaning |
-|-------|------|---------|
-| Idle | externaldrive | Server not started |
-| Starting | externaldrive.badge.timemachine | Initial sync in progress |
-| Running | externaldrive.fill.badge.checkmark | All systems healthy |
-| Syncing | externaldrive.badge.timemachine | Periodic reconciliation |
-| Degraded | externaldrive.fill.badge.exclamationmark | Redis or MinIO unreachable |
-| Disconnected | externaldrive.fill.badge.xmark | FUSE down or NFS unmounted |
+The menu-bar icon is the JuiceMount citrus mark, **state-tinted** — the color is the signal (`isTemplate=false`):
+
+| Tint | Glance state | Meaning |
+|------|--------------|---------|
+| Green (original palette) | Healthy | All systems healthy |
+| Green at 50% opacity | Idle | Server not started |
+| Amber | Degraded | Running, but a backend (Redis/MinIO/FUSE/NFS) is unhealthy or recovering |
+| Blue | Offline-files mode | Pinned files served locally; un-pinned reads fail fast |
+| Red | Fault | Unreachable / start failed / disconnected |
+
+A small blue up-arrow **upload-activity badge** appears bottom-right of the mark while spool drains are active. If the rendered logo assets are missing from the bundle (bare `swift build` binary), the app falls back to the legacy SF-Symbol composite.
+
+The underlying server state machine has seven states: Idle, Starting, Running, Syncing, Degraded (with reason), Disconnected (FUSE down or NFS unmounted), and **Error** (start failed, with the failure message surfaced in the popover and the Setup Assistant offering a stop→start retry).
 
 ### Search Window (⌘⇧F)
 
@@ -107,12 +114,12 @@ The killer feature. Press the global hotkey or click "Search Files..." to open.
 
 ### Preferences Window
 
-Four tabs:
+Four tabs (Phase-3b redesign — grouped forms, fixed 600 pt width, clamped numeric fields, whitespace-stripped URL fields):
 
-- **General**: Volume name, mount point, start at login, search hotkey toggle
-- **Server**: Redis URL, NFS listen address, live health status
-- **Cache**: SSD cache size (10GB–2TB), memory buffer budget (128MB–16GB), buffer file size limit
-- **Advanced**: Reconcile interval, database path, reset metadata cache, restart server
+- **General**: start at login, global search hotkey toggle
+- **Connection**: volume name (the mount point derives from it), Redis URL, S3 endpoint override, advanced addresses (NFS listen, metrics/control-plane address)
+- **Cache & Storage**: SSD cache size, memory buffer budget + file-size threshold, write spool toggle + capacity
+- **Maintenance**: reconcile interval, Reset Local Metadata Cache (soft-stop → delete → Start Now/Later; pin database preserved), diagnostics export
 
 ## Keyboard Shortcuts
 
@@ -177,12 +184,14 @@ JuiceMount6/
 - Check Activity Monitor for "JuiceMount" process. If running but no icon, run `killall SystemUIServer` to refresh the menu bar.
 
 **"Damaged or unsigned" warning on launch**
-- Right-click the app and choose Open the first time. macOS Gatekeeper blocks ad-hoc-signed apps by default; this whitelists it.
+- Apps you build locally are not quarantined, so this shouldn't appear after `./scripts/build-app.sh`. It appears when the `.app` was *downloaded* (browser/AirDrop adds the quarantine attribute).
+- Fix: `xattr -d com.apple.quarantine /Applications/JuiceMount.app`, or launch once and approve under **System Settings → Privacy & Security → Open Anyway**. (The old right-click-Open trick no longer bypasses Gatekeeper on current macOS.)
 - For long-term, sign with a Developer ID: `codesign --force --sign "Developer ID Application: <your name>" --entitlements entitlements.plist --options runtime build/JuiceMount.app`
 
-**Server starts but Finder can't access /Volumes/zpool**
-- Check that the path isn't already mounted by something else: `mount | grep zpool`
-- Check the Preferences → Server tab for health status; Redis or MinIO may be down.
+**Server starts but Finder can't access the volume**
+- Check the popover's health section — if the NFS row shows "Volume not mounted", click **Mount Now** (privileged re-mount, may prompt once).
+- Check that the path isn't already mounted by something else: `mount | grep <volume-name>`
+- Redis or MinIO may be down — the popover health rows and the Setup Assistant's backend preflight both show this.
 
 **Search returns no results**
 - Click "Sync Now" in the popover. The FTS5 index rebuilds at the end of every sync.
@@ -207,12 +216,16 @@ The popover talks to the running app via in-process C calls, but the same operat
 | Route | Method | Purpose |
 |-------|--------|---------|
 | `/metrics` | GET | Prometheus-style RPC counters + latencies |
+| `/health` | GET | Backend health (Redis / MinIO / FUSE / NFS mount) |
 | `/cache-status` | GET | Pin aggregate, per-root, live prefetch, offline mode |
 | `/pin?path=...` | POST | Register a folder for offline pinning |
 | `/unpin?path=...` | POST | Remove from pin registry |
 | `/offline?on=1\|0` | GET | Toggle offline mode |
 | `/reclaim` | POST | Thin Time Machine local snapshots; returns freed bytes |
 | `/verify-pins` | POST | Mark every pinned-Ready/Failed entry Pending so prefetcher re-verifies coverage |
+| `/spool` | GET | Write-spool status: pending/in-flight/stalled/failed counts + per-entry detail |
+| `/spool-recover?action=retry-failed\|clear-stalled` | GET | Spool recovery actions |
+| `/mount-now` | GET | Privileged NFS re-mount (single-flight; 409 when already in progress) |
 
 ## Logging
 

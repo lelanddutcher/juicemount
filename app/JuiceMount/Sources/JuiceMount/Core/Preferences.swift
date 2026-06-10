@@ -58,7 +58,7 @@ public final class Preferences {
     /// formatted with a docker-internal hostname (e.g. `http://minio:9000/...`)
     /// that only resolves inside the docker network.
     ///
-    /// Example value: `http://192.168.0.197:30151/zpool`
+    /// Example value: `http://10.0.0.5:30151/zpool`
     ///
     /// Passed to `juicefs mount` as `--bucket <value>`, which takes
     /// precedence over the URL stored in Redis at format time.

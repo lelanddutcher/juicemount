@@ -5,40 +5,49 @@
     <key>Label</key>
     <string>com.juicemount.agent</string>
 
+    <!--
+      Launch through LaunchServices (`open -a`) rather than exec'ing the
+      binary directly. LaunchServices enforces single-instance for app
+      bundles, so this agent CANNOT double-launch JuiceMount when the
+      in-app "Start at login" toggle (SMAppService) is also enabled —
+      the second activation just focuses the existing instance.
+
+      Prefer ONE mechanism: the in-app toggle (Preferences → General →
+      Start at login) is the recommended path; this agent exists for
+      headless/managed setups. install.sh --launchd installs it.
+
+      Note: because `open` exits immediately, launchd cannot KeepAlive
+      the app from here (crash-relaunch is handled by the app's own
+      recovery + macOS login items, not this agent).
+    -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/JuiceMount.app/Contents/MacOS/JuiceMount</string>
+        <string>/usr/bin/open</string>
+        <string>-a</string>
+        <string>/Applications/JuiceMount.app</string>
+        <string>--hide</string>
     </array>
 
     <key>RunAtLoad</key>
     <true/>
 
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-        <key>Crashed</key>
-        <true/>
-    </dict>
-
     <key>ProcessType</key>
     <string>Interactive</string>
 
+    <!--
+      __HOME__ is substituted with the user's home directory by
+      scripts/install.sh at install time (launchd does not expand
+      environment variables in these keys). Logs land next to the app's
+      own logs instead of world-readable /tmp.
+    -->
     <key>StandardOutPath</key>
-    <string>/tmp/juicemount.log</string>
+    <string>__HOME__/Library/Logs/JuiceMount/agent.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/juicemount.err</string>
+    <string>__HOME__/Library/Logs/JuiceMount/agent.log</string>
 
-    <!-- Throttle: don't relaunch more than once per 10 seconds -->
+    <!-- Throttle: don't re-run more than once per 10 seconds -->
     <key>ThrottleInterval</key>
     <integer>10</integer>
-
-    <!-- Limit memory to keep the menu bar app lightweight even under leaks -->
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>10240</integer>
-    </dict>
 </dict>
 </plist>

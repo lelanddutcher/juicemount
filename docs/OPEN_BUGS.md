@@ -2,7 +2,61 @@
 
 **Purpose.** `docs/STATE.md` is the chronological closure log of QA findings (good for "what did we ship and when"). This doc is the forward-looking triage list — what's still open, ranked by user-impact, with the smallest-viable next step for each. Maintained as we find bugs and pruned as we close them.
 
-**Snapshot:** 2026-05-26 after commit `bd7eb8d` (TrueNAS-app loop closeout shipped); QA-36 logged.
+**Snapshot:** 2026-06-10 after launch-hardening Phases 1–3b (`c29a19f`, `95882fc`, `848dd9e`, `b47834e`); see the closure block below. Previous snapshot: 2026-05-26 after `bd7eb8d`.
+
+---
+
+## Closed in launch hardening, Phases 1–3b (2026-06-08/10)
+
+Fixed and gate-verified per `docs/LAUNCH_PLAN.md`; listed here so the
+entries below that referenced them read correctly:
+
+- **Rename spool-blind** (silent mv breakage; atomic-save temp+rename to a
+  spooled path) — ✓ Phase 1 `c29a19f`. `MigrateForRename` migrates active
+  spool entries on rename, incl. post-claim re-read vs racing drains and
+  rune-correct child-path migration.
+- **SETATTR truncate stub** (cp exits rc=1; ftruncate → "RPC struct is bad"
+  EBADRPC XDR) — ✓ Phase 1 `c29a19f`. Spooled files implement the
+  SETATTR{size} path.
+- **Stuck `writing` spool entries** (handle-refcount leak + sweeper silent
+  skip; 43 rows stuck on the live system) — ✓ Phase 1 `c29a19f`; boot
+  scrubber validated in Phase 0 (43 → 0).
+- **`/spool` reporting** (historical done rows listed with pending=0; no
+  live size for in-progress writes) — ✓ Phase 2 `95882fc` (WrittenEnd
+  overlay + relevance-filtered entries).
+- **ErrSpoolFull → generic error** — ✓ Phase 2 `95882fc`: now surfaces as
+  NFS3ERR_NOSPC ("disk full") via syscall.ENOSPC wrap.
+- **Spool-disable/quit stranding writes** (LB-3) — ✓ Phase 2 `95882fc`:
+  drain-wait guards on disable/quit/stop-everything; no auto-quit when
+  files failed.
+- **Offline/stuck-state UI honesty** — ✓ Phase 3 `848dd9e`: NFS-mount state
+  in the health model + Mount Now remedy (`/mount-now`, single-flighted in
+  3b), state-tinted icon, glance state machine.
+- **Preferences placebo settings** (LB-4: membuf budget, file limit,
+  reconcile interval did nothing) — ✓ Phase 3b `b47834e`: wired end-to-end,
+  defaults byte-identical, pinned by tests.
+- **Hardcoded `127.0.0.1:11050` ×6 + mount-point strings in the UI** (S-2)
+  — ✓ Phase 3 + 3b: all via Preferences.
+- **Reset-DB flow** (S-6) — ✓ Phase 3b `b47834e`: soft-stop → delete →
+  Start Now/Later, pin.db preserved.
+
+## New open follow-ups (logged from the launch-hardening ledger)
+
+- **Burst-create ETIMEDOUT ~1/1000 under load** (QA-29 stall class, newly
+  visible now that 02-finder runs past rsync). Phase-1 gate finding.
+- **`cp -R` exits 1 copying directory xattrs** (NFSv3 has no xattr support;
+  file data lands fine). Needs an AppleDouble/xattr story for directories.
+- **QA-suite fragility:** a phase script dying mid-run (`set -e`) writes no
+  `.summary` → `run-all.sh` reports synthetic fail=99 and masks real
+  results. Fix in Phase-5 prep.
+- **RecoverOnBoot vs Retry-failed design tension:** boot recovery deletes
+  failed rows' spool files, so an app restart kills the retryability the
+  Phase-2 "Retry failed" button offers. Needs a design decision (keep
+  failed files across restarts vs bounded GC).
+- **Legacy out-of-range stored preference values render unclamped until
+  edited** (Go maps ≤0 → defaults at runtime, so cosmetic only).
+- **Reconcile base >5 min inverts the backoff ladder** (validation range
+  caps at 3600 s; document or clamp the ladder).
 
 ---
 
@@ -369,15 +423,18 @@ Everything else in tier 3 depends on durable job state.
 
 ## P2 — user-vision deliverables (depend on P0)
 
-### Dropbox-style write model
-**Status:** designed but not deployed. Blocked on QA-34.
+### ~~Dropbox-style write model~~
+**Status:** ✓ SHIPPED. The write spool (Option 2, 2026-05-28) is the
+deliverable — local-SSD durability boundary + background drain — and the UI
+scope landed in launch-hardening Phase 2 (`95882fc`) / Phase 3 (`848dd9e`):
+pending-uploads popover section, upload-activity icon badge, and quit
+protection while uploads are pending. Remaining related work is tracked in
+the spool section below (Manager web-UI tile, 24-hour soak).
 
-**Scope** (3 separable commits):
-1. **JuiceFS config tuning** — once QA-34 is closed, evaluate whether `--buffer-size = cache-size` is feasible, or pick a sane "buffer = N × typical-render-size" middle ground based on real measurement.
-2. **Metrics surface** — wire JuiceFS prometheus `juicefs_staging_block_bytes` through JM's `/cache-status`. Already partially in place (jmctl can scrape).
-3. **Popover UI + quit-protection** — pending-upload section ("Background upload: 4.2 GB pending · ~3 min remaining"), menu-bar indicator state for "upload in progress," confirm-on-Quit when dirty bytes > 0.
-
-**Smallest viable next step (post-QA-34):** ship JuiceFS config change + measure. UI work waits until the underlying numbers are stable enough to render.
+Original scope (3 separable commits, preserved for history):
+1. **JuiceFS config tuning** — evaluate whether `--buffer-size = cache-size` is feasible (superseded: the spool absorbs write bursts on disk instead of RAM).
+2. **Metrics surface** — `juicefs_staging_block_bytes` through `/cache-status` (superseded by the richer `/spool` endpoint).
+3. **Popover UI + quit-protection** — shipped as described above.
 
 ---
 
@@ -430,22 +487,28 @@ block-waits on a still-draining entry. **Next step:** repopulate the index for
 or serialize drains per `nfs_path` in the drainer. Rare (needs crash + immediate
 same-path rewrite).
 
-### P2 — Spool: in-flight truncate hits narrow `spoolWriteFile.Truncate` (Finding 6-adjacent)
-Now that the spool is live, a SETATTR size-change (truncate) on a file still in
-the spool routes to `spoolWriteFile.Truncate`, which only supports
-truncate-to-0-on-fresh. Arbitrary truncate of an in-flight spooled file errors.
-Common Finder copy flow is unaffected (no mid-write truncate). **Next step:**
-support `ftruncate` on the on-disk spool file (adjust `writtenEnd` +
-invalidate the streaming hash), or finalize-and-fall-back.
+### ~~P2 — Spool: in-flight truncate hits narrow `spoolWriteFile.Truncate` (Finding 6-adjacent)~~
+**Status:** ✓ FIXED 2026-06-08/09, launch-hardening Phase 1 (`c29a19f`). The
+SETATTR{size} path is implemented for spooled files — this was the shared
+epicenter behind `cp` rc=1 and the "RPC struct is bad" (EBADRPC) XDR error.
+Failing-first regression tests landed with the fix.
 
-### P2 — Spool: error→NFS-status mapping + atomic-save (temp+rename)
-`ErrSpoolFull`/`ErrSpoolBusy` currently surface as generic `OpenFile` errors
-(onWrite maps them to NFS3ERR_ACCESS) rather than NOSPC / JUKEBOX(DELAY).
-Separately, an atomic-save app that writes a temp file then `rename()`s it will
-hit `juiceFS.Rename`, which `os.Rename`s on FUSE — but an undrained spool temp
-isn't in FUSE yet, so the rename fails. **Next step:** map the spool errors to
-proper NFS statuses; make `juiceFS.Rename` finalize+drain (or wait for) a
-spool entry on the old path before renaming.
+Original entry: a SETATTR size-change (truncate) on a file still in
+the spool routed to `spoolWriteFile.Truncate`, which only supported
+truncate-to-0-on-fresh; arbitrary truncate of an in-flight spooled file errored.
+
+### ~~P2 — Spool: error→NFS-status mapping + atomic-save (temp+rename)~~
+**Status:** ✓ FIXED across launch-hardening Phases 1–2. (a) Rename of a path
+with an active spool entry is handled by `MigrateForRename` (Phase 1,
+`c29a19f`) — atomic-save temp+rename works, including against a racing drain
+(post-claim re-read). (b) `ErrSpoolFull` now maps to NFS3ERR_NOSPC via a
+syscall.ENOSPC wrap (Phase 2, `95882fc`) so Finder shows "disk full" instead
+of a generic error.
+
+Original entry: `ErrSpoolFull`/`ErrSpoolBusy` surfaced as generic `OpenFile`
+errors (onWrite mapped them to NFS3ERR_ACCESS); an atomic-save app writing a
+temp file then `rename()`ing hit `juiceFS.Rename`, which `os.Rename`d on FUSE
+— but an undrained spool temp wasn't in FUSE yet, so the rename failed.
 
 ### P3 — Spool: `writeSizes` map grows unbounded (Finding 5, pre-existing)
 `handler.writeSizes` is written per WRITE and never pruned (sticky by QA-16
@@ -481,12 +544,16 @@ returns a value copy under `s.mu.RLock`, used by `Stat`. The integration test
 serializes around it (reads only when the drainer is idle) so it stays green;
 this entry tracks the proper fix.
 
-### Validation owed — enable `JM_SPOOL_ENABLE=1` end-to-end
-The fix is unit-certified at the handler↔spool seam. Still owed: the deferred
-live soak — real NFS mount + FUSE + MinIO over Tailscale/LAN, confirming the
-2 GB Finder copy acks fast, the menu-bar/Manager surfaces pending count, and
-the drainer empties at MinIO pace. This is the original Slice acceptance test
-(`scripts/qa-suite/30-spool-soak.sh`).
+### Validation owed — spool 24-hour live soak
+*(Updated 2026-06-10: the spool is now enabled via the app's Preferences
+toggle — `JM_SPOOL_ENABLE=1` is CLI-only — and has been live-exercised
+through the Phase 1–2 launch-hardening gates: byte-integrity, `/spool`
+contract, control-plane QA, live mv-during-drain. The menu-bar pending
+surface shipped in Phase 2.)* Still owed: the long soak — real NFS mount +
+FUSE + MinIO over Tailscale/LAN for 24 h, confirming the 2 GB Finder copy
+acks fast, the Manager web UI surfaces pending count (tile not yet built),
+and the drainer empties at MinIO pace. This is the original Slice acceptance
+test (`scripts/qa-suite/30-spool-soak.sh`).
 
 ---
 

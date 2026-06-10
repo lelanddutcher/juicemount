@@ -1221,10 +1221,11 @@ func NFSServerSearch(query *C.char, limit C.int, parentPath *C.char) *C.char {
 // probe fails, returns an error so the caller falls back to the
 // AppleScript admin-prompt path.
 //
-// The mount commands themselves stay scoped to /bin/mkdir + /sbin/mount_nfs
-// so a minimal sudoers entry suffices:
+// The mount commands themselves stay scoped to /bin/mkdir + /sbin/mount_nfs,
+// and the privileged unmount path (see unmountNFS) to /sbin/umount, so a
+// minimal sudoers entry suffices:
 //
-//	%admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /bin/mkdir
+//	%admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /sbin/umount, /bin/mkdir
 //
 // Two separate sudo invocations (mkdir then mount_nfs) so each is a
 // single recognized command — wrapping in `sh -c "..."` would require
@@ -1318,10 +1319,11 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 	// admin rights):
 	//
 	//     sudo visudo -f /etc/sudoers.d/juicemount-mount
-	//     # add this single line:
-	//     %admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /bin/mkdir
+	//     # add this single line (umount included so the privileged
+	//     # unmount path is covered too — see docs/dev-setup.md):
+	//     %admin ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /sbin/umount, /bin/mkdir
 	//     # or scope to a specific user:
-	//     # username ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /bin/mkdir
+	//     # username ALL=(ALL) NOPASSWD: /sbin/mount_nfs, /sbin/umount, /bin/mkdir
 	//
 	// With that in place, every subsequent JuiceMount launch mounts
 	// the NFS volume non-interactively. The same applies to the

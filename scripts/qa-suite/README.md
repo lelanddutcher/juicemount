@@ -59,8 +59,10 @@ Phase 08 (netshape) needs **passwordless sudo** for `pfctl` and `dnctl` — if s
 |-----|---------|---------|
 | `MOUNT` | `/Volumes/zpool-dev` | NFS mount path to test against |
 | `JM_METRICS_ADDR` | `127.0.0.1:11050` | JuiceMount HTTP metrics endpoint |
-| `BACKEND_HOST` | `192.168.0.197` | Backend MinIO IP (for shaping target) |
+| `JM_QA_NAS_IP` | *(required for 08-netshape)* | NAS/backend IP used as the default shaping + Redis-block target |
+| `BACKEND_HOST` | `$JM_QA_NAS_IP` | Backend MinIO IP (for shaping target), if distinct from the NAS IP |
 | `BACKEND_PORT` | `9000` | Backend MinIO port |
+| `REDIS_HOST` | `$JM_QA_NAS_IP` | Redis IP (08-netshape case 4), if distinct from the NAS IP |
 | `ENDURANCE_DURATION` | `1200` | Endurance phase length in seconds (1200 = 20 min) |
 | `ARTIFACTS_ROOT` | `/tmp/jm-qa-artifacts` | Artifact root |
 | `RUN_ID` | timestamp | Override the dated artifact subdir name |
