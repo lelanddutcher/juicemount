@@ -177,14 +177,39 @@ func lstatWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, ok bool)
 	}
 }
 
-func NewHandler(store *metadata.Store, fusePath string) *JuiceMountHandler {
+// HandlerOption customizes construction-time tuning of a handler.
+// Applied once in NewHandler — none of these mutate a live handler.
+type HandlerOption func(*handlerOptions)
+
+type handlerOptions struct {
+	memBufThreshold int64 // bytes; <= 0 → DefaultMemBufThreshold
+	memBufBudget    int64 // bytes; <= 0 → DefaultMemBufBudget
+}
+
+// WithMemBufLimits sets the memory-buffer file-size threshold and total
+// heap budget, in bytes. Values <= 0 keep the package defaults — callers
+// can pass an unset (zero) config value straight through (LB-4 back-compat
+// with config JSON written before these knobs existed).
+func WithMemBufLimits(thresholdBytes, budgetBytes int64) HandlerOption {
+	return func(o *handlerOptions) {
+		o.memBufThreshold = thresholdBytes
+		o.memBufBudget = budgetBytes
+	}
+}
+
+func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *JuiceMountHandler {
+	var ho handlerOptions
+	for _, opt := range opts {
+		opt(&ho)
+	}
 	fdPool := NewFDPool()
 	h := &JuiceMountHandler{
-		store:         store,
-		fusePath:      fusePath,
-		fdPool:        fdPool,
-		readahead:     NewReadaheadManager(fusePath, fdPool),
-		memBuf:        NewMemoryBuffer(DefaultMemBufThreshold, DefaultMemBufBudget),
+		store:     store,
+		fusePath:  fusePath,
+		fdPool:    fdPool,
+		readahead: NewReadaheadManager(fusePath, fdPool),
+		// NewMemoryBuffer maps <= 0 to the package defaults.
+		memBuf:        NewMemoryBuffer(ho.memBufThreshold, ho.memBufBudget),
 		writeSizes:    make(map[string]int64),
 		activeWriters: make(map[string]int),
 		verifiers:     make(map[string]verifierData),

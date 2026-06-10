@@ -47,7 +47,7 @@ const (
 
 // MetadataEvent represents a real-time metadata change published via Redis SUBSCRIBE.
 type MetadataEvent struct {
-	Op    string `json:"op"`    // "create", "update", "rename", "delete"
+	Op    string `json:"op"` // "create", "update", "rename", "delete"
 	Path  string `json:"path"`
 	Size  int64  `json:"size,omitempty"`
 	Mtime int64  `json:"mtime,omitempty"`
@@ -103,6 +103,19 @@ type RedisClient struct {
 func (rc *RedisClient) SetPathConfig(mountPoint, fuseRoot string) {
 	rc.mountPoint = strings.TrimRight(mountPoint, "/")
 	rc.fuseRoot = strings.TrimRight(fuseRoot, "/")
+}
+
+// SetReconcileInterval overrides the periodic reconcile cadence (LB-4:
+// the app's "Reconcile interval" preference, previously a placebo). Same
+// contract as SetPathConfig: must be called before Start — reconcileLoop
+// snapshots the value once at launch, so later writes are both racy and
+// ineffective. d <= 0 keeps DefaultReconcileInterval, letting callers
+// pass an unset (zero) config value straight through.
+func (rc *RedisClient) SetReconcileInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	rc.reconcileInterval = d
 }
 
 // lstatFunc is the type of the package-level Lstat hook. Aliased so we can
@@ -622,6 +635,7 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 //   - errKindOther: ambiguous or app-state errors (closed clients,
 //     context cancellations). Don't engage offline mode based on these
 //     alone.
+//
 // ConnErrKind classifies a connection-related error. Exported because
 // downstream items (network reachability monitor, offline-mode
 // auto-engage, NFS handler fail-fast, UI indicator) consume the
@@ -665,6 +679,7 @@ const (
 //     state, not a real failure).
 //   - Anything else with a timeout → backend (we got through but the
 //     backend didn't respond in time).
+//
 // ClassifyConnErr is the exported entry point. See classifyConnErr
 // for the implementation contract and behavior. Re-exported as a
 // thin wrapper so cross-package consumers (health/, pin/, nfs/) can
@@ -787,8 +802,10 @@ func min(a, b int) int {
 // with 'd' followed by a letter — `delfiles` (LIST) and `delSlices`
 // (LIST). HGETALL on a LIST returns WRONGTYPE, which we observed in
 // production as:
-//   reconciliation failed: redis EVAL: WRONGTYPE Operation against a
-//   key holding the wrong kind of value script: …, on @user_script:9
+//
+//	reconciliation failed: redis EVAL: WRONGTYPE Operation against a
+//	key holding the wrong kind of value script: …, on @user_script:9
+//
 // The error surfaces only when juicefs has accumulated del* entries
 // (post-delete cleanup pending) — typically after sustained writes,
 // which is exactly the QA-34 reproducer. Directory entries are
@@ -1089,7 +1106,7 @@ func (rc *RedisClient) syncMetadata() error {
 		"entries", len(redisEntries),
 		"upserted", len(toUpsert),
 		"pruned", len(toDelete),
-		"pinned_skipped", prunedPinned,        // QA-30 Layer C: pinned paths spared
+		"pinned_skipped", prunedPinned, // QA-30 Layer C: pinned paths spared
 		"fuse_present_skipped", prunedFUSEpresent, // QA-30 Layer A: FUSE-confirmed present
 		"pending_prune", pendingPrune,
 		"duration_ms", duration.Round(time.Millisecond).Milliseconds(),

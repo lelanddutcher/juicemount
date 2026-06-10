@@ -64,7 +64,7 @@ enum OnboardingPreflight {
         var report = PreflightReport()
         report.juicefsPath = juicefsCandidates.first {
             FileManager.default.isExecutableFile(atPath: $0)
-        }
+        } ?? pathLookup("juicefs")
         report.macFUSEInstalled = FileManager.default.fileExists(atPath: macFUSEBundlePath)
 
         switch parseRedisHostPort(redisURL) {
@@ -80,6 +80,24 @@ enum OnboardingPreflight {
             passwordlessSudoAvailable()
         }.value
         return report
+    }
+
+    /// PATH fallback mirroring health/fuse.go findJuiceFSBin's
+    /// exec.LookPath tier (Phase 3 review follow-up: without this, an
+    /// unconventional install passes the Go side's check at start but
+    /// fails the Swift preflight — the assistant blocks a launch that
+    /// would have worked). Searches the app process's PATH, same
+    /// semantics as Go's exec.LookPath, no subprocess needed.
+    static func pathLookup(_ binary: String) -> String? {
+        guard let pathEnv = ProcessInfo.processInfo.environment["PATH"],
+              !pathEnv.isEmpty else { return nil }
+        for dir in pathEnv.split(separator: ":") where !dir.isEmpty {
+            let candidate = "\(dir)/\(binary)"
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
     }
 
     /// Parses "redis://host:port/db" (or bare "host:port") into a dial

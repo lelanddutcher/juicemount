@@ -171,6 +171,63 @@ func TestMountNowFailureReportsError(t *testing.T) {
 		})
 }
 
+func TestMountNowSingleFlight(t *testing.T) {
+	// While one /mount-now is parked inside mount() (e.g. on the macOS
+	// admin-password prompt), a concurrent call must be rejected with 409
+	// — NOT stack a second password prompt. After the first completes,
+	// the gate must release so a later call goes through again.
+	entered := make(chan struct{}) // closed when mount() is reached
+	release := make(chan struct{}) // closed to let mount() return
+	mountCalls := 0
+	withMountNowEnv(t, "/Volumes/test-zpool",
+		func(string) bool { return false },
+		func(string, string) error {
+			mountCalls++
+			if mountCalls == 1 {
+				close(entered)
+				<-release
+			}
+			return nil
+		},
+		func() (string, bool) { return "127.0.0.1:11049", true },
+		func(t *testing.T) {
+			type result struct {
+				code int
+				body mountNowResp
+			}
+			firstDone := make(chan result, 1)
+			go func() {
+				code, body := doMountNow(t, "/mount-now")
+				firstDone <- result{code, body}
+			}()
+			<-entered // first request is now blocked inside mount()
+
+			code, body := doMountNow(t, "/mount-now")
+			if code != http.StatusConflict {
+				t.Fatalf("concurrent call: code = %d, want 409", code)
+			}
+			if body.OK || body.Error != "mount already in flight" {
+				t.Fatalf("concurrent call: body = %+v, want ok:false error:\"mount already in flight\"", body)
+			}
+
+			close(release)
+			first := <-firstDone
+			if first.code != http.StatusOK || !first.body.OK {
+				t.Fatalf("first call: code=%d body=%+v, want 200 ok:true", first.code, first.body)
+			}
+
+			// Gate released: a fresh call must be allowed through again.
+			// isMounted still reports false, so it reaches mount() (call #2).
+			code, body = doMountNow(t, "/mount-now")
+			if code != http.StatusOK || !body.OK {
+				t.Fatalf("post-release call: code=%d body=%+v, want 200 ok:true", code, body)
+			}
+			if mountCalls != 2 {
+				t.Fatalf("mount() called %d times, want 2 (blocked first + post-release)", mountCalls)
+			}
+		})
+}
+
 func TestMountNowLostRaceStillSuccess(t *testing.T) {
 	// mount() fails, but by the time we re-check, the volume IS mounted
 	// (concurrent auto-remount won the race) — that's success.

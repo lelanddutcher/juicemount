@@ -34,6 +34,12 @@ public enum NFSBridge {
         public var bucketOverride: String
         public var spoolEnable: Bool
         public var spoolSizeGB: Int
+        /// LB-4 (Phase 3b) tuning knobs. 0 means "Go-side default"
+        /// (2048 MB membuf budget / 128 MB file limit / 30 s reconcile)
+        /// so config JSON without these fields keeps prior behavior.
+        public var memoryBufferMB: Int
+        public var memBufFileLimitMB: Int
+        public var reconcileSeconds: Int
 
         enum CodingKeys: String, CodingKey {
             case redisURL = "redis_url"
@@ -48,6 +54,9 @@ public enum NFSBridge {
             case bucketOverride = "bucket_override"
             case spoolEnable = "spool_enable"
             case spoolSizeGB = "spool_size_gb"
+            case memoryBufferMB = "memory_buffer_mb"
+            case memBufFileLimitMB = "membuf_file_limit_mb"
+            case reconcileSeconds = "reconcile_seconds"
         }
 
         public init(
@@ -62,7 +71,10 @@ public enum NFSBridge {
             logLevel: String = "info",
             bucketOverride: String = "",
             spoolEnable: Bool = false,
-            spoolSizeGB: Int = 50
+            spoolSizeGB: Int = 50,
+            memoryBufferMB: Int = 0,
+            memBufFileLimitMB: Int = 0,
+            reconcileSeconds: Int = 0
         ) {
             self.redisURL = redisURL
             self.fusePath = fusePath
@@ -76,6 +88,9 @@ public enum NFSBridge {
             self.bucketOverride = bucketOverride
             self.spoolEnable = spoolEnable
             self.spoolSizeGB = spoolSizeGB
+            self.memoryBufferMB = memoryBufferMB
+            self.memBufFileLimitMB = memBufFileLimitMB
+            self.reconcileSeconds = reconcileSeconds
         }
     }
 

@@ -135,6 +135,32 @@ an isolated worktree and rebase after N's commit. Merges stay serialized.
   ✅, full sweep = 8 known env-dependent only ✅, swift 0 errors ✅,
   bundle pipeline produced 8 menubar PNGs + 498KB icns ✅.
 
+- **Phase 3b** (2026-06-10): preferences redesign sprint — all 5 items, no
+  stop-shorts. 4 grouped-Form tabs (General/Connection/Cache&Storage/
+  Maintenance), 600pt fixed width + per-tab heights, clamped numerics,
+  whitespace-stripped URLs, accurate effect-timing footers, personal-IP
+  example scrubbed. LB-4 placebo kills: membuf budget + file-limit +
+  reconcile interval wired end-to-end (variadic NewHandler option /
+  SetReconcileInterval pre-Start; byte-identical defaults, back-compat
+  pinned by tests incl. exact JSON keys); volumeName derives mountPoint
+  UI-side. S-2: zero hardcoded 11050/zpool strings left in popover (all
+  via prefs, MainActor-captured). S-6: Reset-DB = soft-stop → delete →
+  Start Now/Later, pin.db preserved. /mount-now single-flight (CAS, 409,
+  race-tested); health-details onAppear; preflight PATH fallback.
+  Adversarial review: SHIP-WITH-FIXES (cleanest phase — no criticals) →
+  applied: (1) name→mount derivation anchor survives clear-then-retype;
+  (2) DiagnosticsExporter routed through configured metricsAddr
+  (MainActor-captured at both call sites); (3) "."/".." volume names
+  rejected (privileged mount over /Volumes or /); (4) metricsAddr footer
+  notes stale-readout window; (5) fallback doc-comment corrected.
+  Review follow-ups deferred non-blocking: legacy out-of-range stored
+  values render unclamped until edited (Go maps ≤0→defaults, cosmetic);
+  reconcile base >5min inverts backoff (validation range caps at 3600s —
+  document); reset success alert on failed delete; cbridge→jmnfs field-
+  mapping pin test. Gate: build/vet ✅, all new tests ✅, swift 0 errors
+  0 warnings ✅, zero hardcoded addrs ✅, live: integrity OK, 01-smoke
+  10/10, 10-control-plane 16/16 ✅.
+
 ### New findings logged during Phase 1 gate (not regressions)
 - Burst-create ETIMEDOUT ~1/1000 under load (QA-29 stall class, newly
   visible now that 02-finder runs past rsync) — candidate Phase 2/3.

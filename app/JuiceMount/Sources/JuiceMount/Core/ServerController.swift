@@ -230,6 +230,17 @@ public final class ServerController {
         }
     }
 
+    /// S-6 Reset-DB flow: expose the soft-stop for maintenance work that
+    /// must run with the Go side fully torn down (metadata store CLOSED —
+    /// deleting SQLite files under a live server is a silent no-op) but
+    /// wants the FUSE/NFS mounts preserved so the follow-up start doesn't
+    /// re-prompt for an admin password. `completion` runs on MainActor
+    /// after teardown finishes; the server is left .idle for the caller
+    /// to optionally start().
+    public func softStopForMaintenance(completion: (@MainActor () -> Void)? = nil) {
+        softStop(completion: completion)
+    }
+
     public func syncNow() {
         // Allow sync from any "running-like" state, not just .running.
         guard isRunningLike else { return }

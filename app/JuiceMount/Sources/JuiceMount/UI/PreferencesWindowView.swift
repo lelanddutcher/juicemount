@@ -1,27 +1,39 @@
 import SwiftUI
 import UserNotifications
 
+/// Preferences window (Phase 3b redesign).
+///
+/// Layout principles:
+///   - One grouped Form per tab; Sections carry clear headers and a footer
+///     that states exactly WHEN each group takes effect (immediate vs next
+///     start vs full Stop → Start) — accurate to the actual plumbing:
+///     `Preferences.toServerConfig()` is read once in
+///     `ServerController.start()`, and Restart (soft-stop) keeps the
+///     JuiceFS daemon + Finder mount alive, so daemon-level settings only
+///     apply after a full Stop everything → Start.
+///   - Fixed 600 pt width; each tab declares its own content height so the
+///     window hugs the form (no scroll-within-scroll, no dead space). The
+///     hosting controller tracks the SwiftUI ideal size
+///     (see MenuBarController.openPreferencesWindow).
+///   - Numeric fields clamp to sane ranges on commit; URL/address fields
+///     strip ALL whitespace on change (un-trimmed URLs once cost a day —
+///     `juicefs mount: exit status 1` six layers down).
 struct PreferencesWindowView: View {
     @Bindable var preferences: Preferences
     @Bindable var server: ServerController
 
     @State private var selectedTab: Tab = .general
+    @State private var advancedAddressesExpanded = false
+    /// Last non-empty sanitized volume name — the comparison anchor for the
+    /// name→mount-point derivation (see deriveMountPoint).
+    @State private var derivationAnchor = ""
 
     enum Tab: String, CaseIterable, Identifiable {
-        case general = "General"
-        case server = "Server"
-        case cache = "Cache"
-        case advanced = "Advanced"
+        case general
+        case connection
+        case cacheStorage
+        case maintenance
         var id: Self { self }
-
-        var icon: String {
-            switch self {
-            case .general:  return "gearshape"
-            case .server:   return "network"
-            case .cache:    return "memorychip"
-            case .advanced: return "slider.horizontal.3"
-            }
-        }
     }
 
     var body: some View {
@@ -30,42 +42,37 @@ struct PreferencesWindowView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
                 .tag(Tab.general)
 
-            serverTab
-                .tabItem { Label("Server", systemImage: "network") }
-                .tag(Tab.server)
+            connectionTab
+                .tabItem { Label("Connection", systemImage: "network") }
+                .tag(Tab.connection)
 
-            cacheTab
-                .tabItem { Label("Cache", systemImage: "memorychip") }
-                .tag(Tab.cache)
+            cacheStorageTab
+                .tabItem { Label("Cache & Storage", systemImage: "internaldrive") }
+                .tag(Tab.cacheStorage)
 
-            advancedTab
-                .tabItem { Label("Advanced", systemImage: "slider.horizontal.3") }
-                .tag(Tab.advanced)
+            maintenanceTab
+                .tabItem { Label("Maintenance", systemImage: "wrench.and.screwdriver") }
+                .tag(Tab.maintenance)
         }
-        .padding(20)
-        .frame(width: 520, height: 480)
+        .frame(width: 600, height: idealHeight)
+    }
+
+    /// Per-tab content height so the window fits each form without dead
+    /// space. The grouped Form scrolls gracefully if a localized build
+    /// wraps a footer onto an extra line.
+    private var idealHeight: CGFloat {
+        switch selectedTab {
+        case .general:      return 360
+        case .connection:   return advancedAddressesExpanded ? 660 : 545
+        case .cacheStorage: return 610
+        case .maintenance:  return 500
+        }
     }
 
     // MARK: - General
 
     private var generalTab: some View {
         Form {
-            Section {
-                LabeledContent("Volume Name") {
-                    TextField("zpool", text: $preferences.volumeName)
-                        .textFieldStyle(.roundedBorder)
-                }
-                LabeledContent("Mount Point") {
-                    HStack {
-                        TextField("/Volumes/zpool", text: $preferences.mountPoint)
-                            .textFieldStyle(.roundedBorder)
-                        Button("Choose…") { chooseMountPoint() }
-                    }
-                }
-            } header: {
-                Text("Volume").font(.headline)
-            }
-
             Section {
                 Toggle("Start at login", isOn: $preferences.startAtLogin)
                     .onChange(of: preferences.startAtLogin) { _, newValue in
@@ -89,7 +96,7 @@ struct PreferencesWindowView: View {
                 // request authorization on the false→true edge — no
                 // point asking the system for permission until the user
                 // actually wants the notifications.
-                Toggle("Notify on auto-offline / recovery", isOn: $preferences.offlineNotificationsEnabled)
+                Toggle("Notify on auto-offline and recovery", isOn: $preferences.offlineNotificationsEnabled)
                     .onChange(of: preferences.offlineNotificationsEnabled) { _, newValue in
                         guard newValue else { return }
                         UNUserNotificationCenter.current().requestAuthorization(
@@ -103,121 +110,137 @@ struct PreferencesWindowView: View {
                         }
                     }
             } header: {
-                Text("Behavior").font(.headline)
+                Text("Behavior")
+            } footer: {
+                footnote("These settings apply immediately.")
             }
 
-            Spacer()
-            restartHint
+            Section {
+                LabeledContent("First-run checks and guided start") {
+                    Button("Open Setup Assistant…") {
+                        if let appDelegate = NSApp.delegate as? AppDelegate,
+                           let menuBar = appDelegate.menuBarController {
+                            menuBar.openOnboardingWindow()
+                        }
+                    }
+                }
+            } header: {
+                Text("Setup")
+            } footer: {
+                footnote("Re-runs the preflight checks (juicefs, macFUSE, backend reachability) and walks through any fixes.")
+            }
         }
         .formStyle(.grouped)
     }
 
-    // MARK: - Server
+    // MARK: - Connection
 
-    private var serverTab: some View {
+    private var connectionTab: some View {
         Form {
+            Section {
+                LabeledContent("Volume name") {
+                    TextField("zpool", text: $preferences.volumeName)
+                        .frame(width: 200)
+                        .multilineTextAlignment(.trailing)
+                        .onChange(of: preferences.volumeName) { oldName, newName in
+                            deriveMountPoint(oldName: oldName, newName: newName)
+                        }
+                }
+                LabeledContent("Mounts at") {
+                    Text(preferences.mountPoint)
+                        .font(.body.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            } header: {
+                Text("Volume")
+            } footer: {
+                footnote("The volume appears in Finder at /Volumes/<name>. Renaming applies after Stop everything → Start — Restart keeps the current Finder mount in place. A custom mount point can be set under Advanced addresses.")
+            }
+
             Section {
                 LabeledContent("Redis URL") {
                     TextField("redis://127.0.0.1:6379/1", text: $preferences.redisURL)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
+                        .font(.body.monospaced())
+                        .frame(width: 300)
+                        .multilineTextAlignment(.trailing)
                         .onChange(of: preferences.redisURL) { _, newValue in
                             let clean = stripWhitespace(newValue)
                             if clean != newValue { preferences.redisURL = clean }
                         }
                 }
-                LabeledContent("S3 Endpoint Override") {
-                    TextField("http://<truenas-ip>:30151/zpool", text: $preferences.s3EndpointOverride)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
+                LabeledContent("S3 endpoint override") {
+                    TextField("http://<server-ip>:9000/<bucket>", text: $preferences.s3EndpointOverride)
+                        .font(.body.monospaced())
+                        .frame(width: 300)
+                        .multilineTextAlignment(.trailing)
                         .onChange(of: preferences.s3EndpointOverride) { _, newValue in
                             let clean = stripWhitespace(newValue)
                             if clean != newValue { preferences.s3EndpointOverride = clean }
                         }
                 }
-                LabeledContent("NFS Listen Address") {
-                    TextField("127.0.0.1:11049", text: $preferences.nfsListenAddr)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
-                        .onChange(of: preferences.nfsListenAddr) { _, newValue in
-                            let clean = stripWhitespace(newValue)
-                            if clean != newValue { preferences.nfsListenAddr = clean }
-                        }
-                }
             } header: {
-                Text("Connection").font(.headline)
+                Text("Server")
             } footer: {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Redis stores JuiceFS metadata. The NFS listen address is the local NFS server endpoint that macOS mounts.")
-                    Text("S3 Endpoint Override: leave empty for direct-LAN setups. Set this when the server formatted JuiceFS with a docker-internal hostname your Mac can't resolve (typical for the TrueNAS app install). Example: http://192.168.0.197:30151/zpool")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                footnote("Redis stores the JuiceFS metadata this Mac syncs from. Leave the S3 override empty for direct-LAN setups; set it when the server formatted JuiceFS with a hostname this Mac can't resolve (typical for docker-internal names) — e.g. http://<server-ip>:9000/<bucket>. Applies on the next start; the background JuiceFS daemon re-reads these only after Stop everything → Start.")
             }
 
             Section {
-                LabeledContent("Health") {
-                    HStack(spacing: 14) {
-                        healthDot("Redis", healthy: server.stats.healthRedis)
-                        healthDot("MinIO", healthy: server.stats.healthMinIO)
-                        healthDot("FUSE",  healthy: server.stats.healthFUSE)
+                DisclosureGroup("Advanced addresses", isExpanded: $advancedAddressesExpanded) {
+                    LabeledContent("NFS listen address") {
+                        TextField("127.0.0.1:11049", text: $preferences.nfsListenAddr)
+                            .font(.body.monospaced())
+                            .frame(width: 200)
+                            .multilineTextAlignment(.trailing)
+                            .onChange(of: preferences.nfsListenAddr) { _, newValue in
+                                let clean = stripWhitespace(newValue)
+                                if clean != newValue { preferences.nfsListenAddr = clean }
+                            }
+                    }
+                    LabeledContent("Metrics address") {
+                        TextField("127.0.0.1:11050", text: $preferences.metricsAddr)
+                            .font(.body.monospaced())
+                            .frame(width: 200)
+                            .multilineTextAlignment(.trailing)
+                            .onChange(of: preferences.metricsAddr) { _, newValue in
+                                let clean = stripWhitespace(newValue)
+                                if clean != newValue { preferences.metricsAddr = clean }
+                            }
+                    }
+                    LabeledContent("Custom mount point") {
+                        HStack(spacing: 6) {
+                            TextField("/Volumes/zpool", text: $preferences.mountPoint)
+                                .font(.body.monospaced())
+                                .frame(width: 220)
+                                .multilineTextAlignment(.trailing)
+                            Button("Choose…") { chooseMountPoint() }
+                        }
                     }
                 }
-            } header: {
-                Text("Status").font(.headline)
+            } footer: {
+                footnote("Local loopback endpoints for the built-in NFS server and its control plane. The NFS listen address and mount point take effect after Stop everything → Start (the Finder mount must re-target them); the metrics address applies on the next start — Restart Server is enough. After editing the metrics address, health readouts in the popover pause until that restart.")
             }
-
-            Spacer()
-            restartHint
         }
         .formStyle(.grouped)
+        .onAppear { seedDerivationAnchor() }
     }
 
-    // MARK: - Cache
+    // MARK: - Cache & Storage
 
-    private var cacheTab: some View {
+    private var cacheStorageTab: some View {
         Form {
             Section {
-                LabeledContent("SSD Cache Size") {
-                    HStack {
-                        TextField("100", value: $preferences.ssdCacheGB, format: .number)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 80)
-                        Text("GB")
-                        Slider(value: Binding(
-                            get: { Double(preferences.ssdCacheGB) },
-                            set: { preferences.ssdCacheGB = Int($0) }
-                        ), in: 10...2000, step: 10)
-                    }
-                }
-
-                LabeledContent("Memory Buffer Budget") {
-                    HStack {
-                        TextField("2048", value: $preferences.memoryBufferMB, format: .number)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 80)
-                        Text("MB")
-                        Slider(value: Binding(
-                            get: { Double(preferences.memoryBufferMB) },
-                            set: { preferences.memoryBufferMB = Int($0) }
-                        ), in: 128...16384, step: 128)
-                    }
-                }
-
-                LabeledContent("Buffer Files Smaller Than") {
-                    HStack {
-                        TextField("128", value: $preferences.memBufFileLimitMB, format: .number)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 80)
-                        Text("MB")
-                    }
-                }
+                numericRow("SSD cache size", value: $preferences.ssdCacheGB,
+                           unit: "GB", range: 10...2000, fallback: 100)
+                numericRow("Memory buffer budget", value: $preferences.memoryBufferMB,
+                           unit: "MB", range: 128...16384, fallback: 2048)
+                numericRow("Buffer files smaller than", value: $preferences.memBufFileLimitMB,
+                           unit: "MB", range: 1...1024, fallback: 128)
             } header: {
-                Text("Cache Layers").font(.headline)
+                Text("Cache layers")
             } footer: {
-                Text("SSD cache stores file blocks via JuiceFS. Memory buffer is for small files (project files, LUTs) under the size threshold — eliminates syscalls.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                footnote("The SSD cache stores file blocks via JuiceFS (it may grow automatically to keep pinned files resident). The memory buffer serves small files (project files, LUTs) under the size threshold from RAM with zero syscalls. Memory-buffer changes apply on the next start — Restart Server is enough; the SSD cache size is read by the JuiceFS daemon, so Stop everything → Start to apply it.")
             }
 
             Section {
@@ -238,29 +261,23 @@ struct PreferencesWindowView: View {
                             checkPendingThenDisableSpool()
                         }
                     }
-                LabeledContent("Spool Capacity") {
-                    HStack {
-                        TextField("50", value: $preferences.spoolCapacityGB, format: .number)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 80)
-                        Text("GB")
-                        Slider(value: Binding(
-                            get: { Double(preferences.spoolCapacityGB) },
-                            set: { preferences.spoolCapacityGB = Int($0) }
-                        ), in: 10...500, step: 10)
-                    }
+                numericRow("Spool capacity", value: $preferences.spoolCapacityGB,
+                           unit: "GB", range: 10...500, fallback: 50)
                     .disabled(!preferences.spoolEnabled)
-                }
             } header: {
-                Text("Write Spool (Background Uploads)").font(.headline)
+                Text("Write spool (background uploads)")
             } footer: {
-                Text("Writes land on local SSD and are acknowledged immediately, then upload to your storage in the background — large copies feel local even over a slow link. Toggling restarts the server; pending uploads show in the menu-bar popover.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                footnote("Writes land on the local SSD and are acknowledged immediately, then upload in the background — large copies feel local even over a slow link. Pending uploads show in the menu-bar popover. The toggle restarts the server when needed; capacity changes apply on the next start.")
             }
 
-            Spacer()
-            restartHint
+            Section {
+                numericRow("Reconcile interval", value: $preferences.reconcileSeconds,
+                           unit: "seconds", range: 5...3600, fallback: 30)
+            } header: {
+                Text("Metadata sync")
+            } footer: {
+                footnote("How often the local metadata cache reconciles with Redis (real-time events arrive separately). Applies on the next start — Restart Server is enough.")
+            }
         }
         .formStyle(.grouped)
         // LB-3 stranded-writes guard dialogs. confirmationDialog matches the
@@ -300,113 +317,106 @@ struct PreferencesWindowView: View {
         }
     }
 
-    // MARK: - LB-3: spool-disable stranded-writes guard
+    // MARK: - Maintenance
 
-    @State private var showSpoolDisableDialog = false
-    @State private var spoolDisablePendingFiles = 0
-    @State private var spoolDisablePendingBytes: Int64 = 0
-    @State private var spoolDrainWaitActive = false
-    /// Set while we programmatically revert the toggle so onChange doesn't
-    /// treat the revert as a user-initiated enable (and restart again).
-    @State private var suppressSpoolToggleSideEffect = false
-
-    /// Fetch a FRESH pending snapshot off the main thread, then either
-    /// apply the disable directly (nothing pending) or raise the dialog.
-    private func checkPendingThenDisableSpool() {
-        Task {
-            // NFSBridge.spoolStatus is blocking HTTP — keep it off MainActor.
-            let sp = await Task.detached { NFSBridge.spoolStatus(metricsAddr: preferences.metricsAddr) }.value
-            await MainActor.run {
-                if let sp, sp.enabled, sp.hasActivity {
-                    spoolDisablePendingFiles = sp.pendingFiles
-                    spoolDisablePendingBytes = sp.pendingBytes
-                    showSpoolDisableDialog = true
-                } else {
-                    // Nothing pending (or spool already off server-side):
-                    // safe to restart with the spool disabled.
-                    server.restart()
-                }
-            }
-        }
-    }
-
-    private func revertSpoolToggleToEnabled() {
-        suppressSpoolToggleSideEffect = true
-        preferences.spoolEnabled = true
-        // Clear on the next runloop tick, after onChange has observed the
-        // revert with the suppression flag still up.
-        DispatchQueue.main.async { suppressSpoolToggleSideEffect = false }
-    }
-
-    private func formatBytesPrefs(_ bytes: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-    }
-
-    // MARK: - Advanced
-
-    private var advancedTab: some View {
+    private var maintenanceTab: some View {
         Form {
             Section {
-                LabeledContent("Reconcile Interval") {
-                    HStack {
-                        TextField("30", value: $preferences.reconcileSeconds, format: .number)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 80)
-                        Text("seconds")
-                    }
-                }
-                LabeledContent("Database Path") {
-                    HStack {
+                LabeledContent("Database file") {
+                    HStack(spacing: 6) {
                         TextField("", text: $preferences.dbPath)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.caption, design: .monospaced))
+                            .font(.caption.monospaced())
+                            .frame(width: 260)
+                            .multilineTextAlignment(.trailing)
                         Button("Choose…") { chooseDBPath() }
                     }
                 }
+                LabeledContent("Force a clean re-sync from Redis") {
+                    Button("Reset local metadata cache…", role: .destructive) {
+                        resetDatabase()
+                    }
+                    .disabled(!canResetDatabase)
+                    .help(resetDatabaseHelp)
+                }
             } header: {
-                Text("Tuning").font(.headline)
+                Text("Local database")
+            } footer: {
+                footnote("The metadata cache is a local SQLite mirror of Redis — resetting it is safe and rebuilds on the next start. Offline pins (pin.db) are never touched. Database-file changes apply on the next start — Restart Server is enough.")
             }
 
             Section {
-                Button(role: .destructive) {
-                    resetDatabase()
-                } label: {
-                    Label("Reset Local Metadata Cache", systemImage: "trash")
+                LabeledContent("Apply settings that need a restart") {
+                    Button("Restart Server") {
+                        server.restart()
+                    }
+                    .disabled(!isRunningLike)
                 }
-
-                Button {
-                    server.restart()
-                } label: {
-                    Label("Restart Server", systemImage: "arrow.triangle.2.circlepath")
+                LabeledContent("Backend health") {
+                    HStack(spacing: 14) {
+                        healthDot("Redis", healthy: server.stats.healthRedis)
+                        healthDot("MinIO", healthy: server.stats.healthMinIO)
+                        healthDot("FUSE",  healthy: server.stats.healthFUSE)
+                    }
                 }
             } header: {
-                Text("Maintenance").font(.headline)
+                Text("Server")
             } footer: {
-                Text("Resetting the local cache forces a full re-sync from Redis on next start. Useful if the cache has gotten out of sync with the server.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                footnote("Restart soft-stops and starts the server; the JuiceFS daemon and the Finder mount stay up throughout.")
             }
 
-            Spacer()
-            restartHint
+            Section {
+                LabeledContent("Logs, metrics, and system state for support") {
+                    Button("Export Diagnostics…") {
+                        exportDiagnostics()
+                    }
+                }
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                footnote("Saves a zipped bundle — nothing leaves this Mac unless you share the file.")
+            }
         }
         .formStyle(.grouped)
     }
 
     // MARK: - Shared bits
 
-    private var restartHint: some View {
-        Group {
-            if isRunningLike {
-                HStack(spacing: 6) {
-                    Image(systemName: "info.circle")
-                    Text("Most changes apply on next server restart.")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.top, 8)
+    /// Section footnote in the standard secondary-caption style.
+    private func footnote(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    /// A labeled numeric field with a trailing unit, clamped to `range` on
+    /// commit. Typing an out-of-range value snaps to the nearest bound.
+    /// `fallback` is only the placeholder text — a legacy out-of-range value
+    /// already stored in defaults renders as-is until this field is edited
+    /// (the clamp is write-through, not read-through); the Go side maps
+    /// nonsensical ≤0 tuning values to its own defaults, so such a value is
+    /// cosmetic here, never harmful downstream.
+    private func numericRow(_ label: String, value: Binding<Int>,
+                            unit: String, range: ClosedRange<Int>,
+                            fallback: Int) -> some View {
+        LabeledContent(label) {
+            HStack(spacing: 5) {
+                TextField("\(fallback)", value: clamped(value, range), format: .number)
+                    .frame(width: 70)
+                    .multilineTextAlignment(.trailing)
+                Text(unit)
+                    .foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// Clamping write-through binding: reads pass straight through, writes
+    /// snap into `range`. TextField(value:format:) commits on Enter/focus
+    /// loss, so this never fights the user mid-keystroke.
+    private func clamped(_ binding: Binding<Int>, _ range: ClosedRange<Int>) -> Binding<Int> {
+        Binding(
+            get: { binding.wrappedValue },
+            set: { binding.wrappedValue = min(max($0, range.lowerBound), range.upperBound) }
+        )
     }
 
     private var isRunningLike: Bool {
@@ -438,6 +448,55 @@ struct PreferencesWindowView: View {
         }
     }
 
+    // MARK: - LB-4: volume name → mount point derivation
+
+    /// Volume name is real now, the cheap way: editing it derives the
+    /// mount point "/Volumes/<name>" — but ONLY while the mount point is
+    /// still the derived value of the previous name, so a custom override
+    /// (Advanced addresses) is never clobbered. `mountPoint` stays the
+    /// single source of truth passed to the Go side.
+    ///
+    /// `derivationAnchor` (review 3b BUG 1): comparing against the
+    /// derivation of the IMMEDIATELY-previous field value broke the chain on
+    /// clear-then-retype — old="" derived "/Volumes/" which never matches,
+    /// permanently de-linking name from mount point. The anchor remembers
+    /// the last NON-EMPTY name (seeded in onAppear, from the mount point
+    /// itself when the stored name is empty), so the link survives an empty
+    /// intermediate state while a custom override still never matches.
+    private func deriveMountPoint(oldName: String, newName: String) {
+        let newClean = sanitizeVolumeName(newName)
+        let anchor = derivationAnchor.isEmpty ? sanitizeVolumeName(oldName) : derivationAnchor
+        guard !newClean.isEmpty else { return } // keep anchor for the retype
+        let oldDerived = "/Volumes/\(anchor)"
+        if preferences.mountPoint == oldDerived || preferences.mountPoint.isEmpty {
+            preferences.mountPoint = "/Volumes/\(newClean)"
+        }
+        derivationAnchor = newClean
+    }
+
+    /// Seed the derivation anchor when the Connection tab appears. When the
+    /// stored name is empty (e.g. cleared in a previous session), recover the
+    /// anchor from a "/Volumes/<x>"-shaped mount point so retyping re-links.
+    private func seedDerivationAnchor() {
+        let name = sanitizeVolumeName(preferences.volumeName)
+        if !name.isEmpty {
+            derivationAnchor = name
+        } else if preferences.mountPoint.hasPrefix("/Volumes/") {
+            derivationAnchor = String(preferences.mountPoint.dropFirst("/Volumes/".count))
+        }
+    }
+
+    /// Volume names become a path segment — strip path separators and
+    /// surrounding whitespace (inner spaces are legal: "/Volumes/My Pool").
+    /// "." and ".." are rejected outright (review 3b BUG 4: they would
+    /// derive /Volumes or / as the target of a privileged mount).
+    private func sanitizeVolumeName(_ s: String) -> String {
+        let cleaned = s.replacingOccurrences(of: "/", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned == "." || cleaned == ".." { return "" }
+        return cleaned
+    }
+
     private func chooseMountPoint() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -458,18 +517,188 @@ struct PreferencesWindowView: View {
         }
     }
 
+    // MARK: - S-6: reset local metadata cache
+
+    /// True while the stop → delete → offer-start sequence is running, so
+    /// the button can't double-fire and the user gets a why in the tooltip.
+    @State private var resetDBInFlight = false
+
+    private var canResetDatabase: Bool {
+        if resetDBInFlight { return false }
+        if case .starting = server.state { return false }
+        return true
+    }
+
+    private var resetDatabaseHelp: String {
+        if resetDBInFlight {
+            return "Reset in progress — waiting for the server to stop and the cache files to be deleted."
+        }
+        if case .starting = server.state {
+            return "The server is starting — wait for it to finish before resetting the cache."
+        }
+        return "Stops the server if it's running, deletes the local metadata cache, and offers to start again. Offline pins are kept."
+    }
+
+    /// S-6 (Phase 3b): the old flow unlinked the SQLite files under a
+    /// RUNNING server — the open file handle kept the data live, so it was
+    /// a silent no-op until some future restart the dialog never mentioned.
+    /// New flow: explain exactly what will happen → stop the server first
+    /// (soft-stop: the Go side closes the store; FUSE + the Finder mount
+    /// stay up, so no admin re-prompt) → delete metadata.db/-wal/-shm
+    /// (NOT pin.db — pins are a user contract for offline availability) →
+    /// offer "Start Now" / "Later".
     private func resetDatabase() {
+        let dbPath = preferences.dbPath
+        // Trust the Go-side truth, not the UI state machine: a degraded /
+        // disconnected UI can still have a live server holding the SQLite
+        // files open — exactly the silent no-op this flow exists to fix.
+        let serverIsRunning = NFSBridge.isRunning
+
         let alert = NSAlert()
-        alert.messageText = "Reset metadata cache?"
-        alert.informativeText = "The local SQLite cache at \(preferences.dbPath) will be deleted. The server will resync everything from Redis on next start. Files on the volume will not be affected."
+        alert.messageText = "Reset local metadata cache?"
+        var info = "The local metadata cache will be deleted:\n\(dbPath)\n\nIt is a mirror of the metadata in Redis and rebuilds on the next start. Files on the volume are not affected. Offline pins (pin.db) are NOT touched — pinned files stay available offline."
+        if serverIsRunning {
+            info += "\n\nThe server will stop first so the delete is real (deleting under a running server silently does nothing). The volume stays mounted but won't respond until the server starts again."
+        }
+        alert.informativeText = info
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: serverIsRunning ? "Stop and Reset" : "Reset")
         alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            try? FileManager.default.removeItem(atPath: preferences.dbPath)
-            // Also clean up WAL files
-            try? FileManager.default.removeItem(atPath: preferences.dbPath + "-wal")
-            try? FileManager.default.removeItem(atPath: preferences.dbPath + "-shm")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        resetDBInFlight = true
+        if serverIsRunning {
+            server.softStopForMaintenance { [self] in
+                deleteMetadataDBFiles(at: dbPath)
+                resetDBInFlight = false
+                offerStartAfterReset()
+            }
+        } else {
+            deleteMetadataDBFiles(at: dbPath)
+            resetDBInFlight = false
+            offerStartAfterReset()
+        }
+    }
+
+    private func deleteMetadataDBFiles(at path: String) {
+        // metadata.db plus SQLite WAL sidecars. pin.db is deliberately
+        // NOT in this list.
+        for suffix in ["", "-wal", "-shm"] {
+            try? FileManager.default.removeItem(atPath: path + suffix)
+        }
+    }
+
+    private func offerStartAfterReset() {
+        let done = NSAlert()
+        done.messageText = "Metadata cache reset"
+        if case .idle = server.state {
+            done.informativeText = "The local cache was deleted. Start the server now to rebuild it from Redis, or start later from the menu-bar popover."
+            done.addButton(withTitle: "Start Now")
+            done.addButton(withTitle: "Later")
+            if done.runModal() == .alertFirstButtonReturn {
+                server.start()
+            }
+        } else {
+            done.informativeText = "The local cache was deleted. It rebuilds from Redis the next time the server starts."
+            done.addButton(withTitle: "OK")
+            done.runModal()
+        }
+    }
+
+    // MARK: - LB-3: spool-disable stranded-writes guard
+
+    @State private var showSpoolDisableDialog = false
+    @State private var spoolDisablePendingFiles = 0
+    @State private var spoolDisablePendingBytes: Int64 = 0
+    @State private var spoolDrainWaitActive = false
+    /// Set while we programmatically revert the toggle so onChange doesn't
+    /// treat the revert as a user-initiated enable (and restart again).
+    @State private var suppressSpoolToggleSideEffect = false
+
+    /// Fetch a FRESH pending snapshot off the main thread, then either
+    /// apply the disable directly (nothing pending) or raise the dialog.
+    private func checkPendingThenDisableSpool() {
+        // Snapshot on MainActor; the detached task must not touch
+        // actor-isolated state (Swift 6 error-to-be).
+        let metricsAddr = preferences.metricsAddr
+        Task {
+            // NFSBridge.spoolStatus is blocking HTTP — keep it off MainActor.
+            let sp = await Task.detached { NFSBridge.spoolStatus(metricsAddr: metricsAddr) }.value
+            await MainActor.run {
+                if let sp, sp.enabled, sp.hasActivity {
+                    spoolDisablePendingFiles = sp.pendingFiles
+                    spoolDisablePendingBytes = sp.pendingBytes
+                    showSpoolDisableDialog = true
+                } else {
+                    // Nothing pending (or spool already off server-side):
+                    // safe to restart with the spool disabled.
+                    server.restart()
+                }
+            }
+        }
+    }
+
+    private func revertSpoolToggleToEnabled() {
+        suppressSpoolToggleSideEffect = true
+        preferences.spoolEnabled = true
+        // Clear on the next runloop tick, after onChange has observed the
+        // revert with the suppression flag still up.
+        DispatchQueue.main.async { suppressSpoolToggleSideEffect = false }
+    }
+
+    private func formatBytesPrefs(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    // MARK: - Diagnostics export
+
+    /// Same flow as the popover's exporter: NSSavePanel suggesting a
+    /// timestamped name on the Desktop, gathering work off the main thread.
+    private func exportDiagnostics() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = DiagnosticsExporter.suggestedFilename()
+        panel.title = "Export JuiceMount Diagnostics"
+        panel.message = "Save a zipped bundle of logs, metrics, and system state for support."
+        if let desktop = FileManager.default
+            .urls(for: .desktopDirectory, in: .userDomainMask)
+            .first
+        {
+            panel.directoryURL = desktop
+        }
+        panel.allowedContentTypes = [.zip]
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            return
+        }
+
+        // Capture on MainActor before the detached hop (preferences is
+        // MainActor-isolated).
+        let metricsAddr = server.preferences.metricsAddr
+        Task.detached(priority: .userInitiated) {
+            let exporter = DiagnosticsExporter(metricsAddr: metricsAddr)
+            do {
+                try await exporter.export(to: destination)
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "Diagnostics exported"
+                    alert.informativeText = "Saved to \(destination.path)"
+                    alert.alertStyle = .informational
+                    alert.addButton(withTitle: "Reveal in Finder")
+                    alert.addButton(withTitle: "OK")
+                    if alert.runModal() == .alertFirstButtonReturn {
+                        NSWorkspace.shared.activateFileViewerSelecting([destination])
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "Export failed"
+                    alert.informativeText = error.localizedDescription
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                }
+            }
         }
     }
 }
