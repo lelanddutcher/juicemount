@@ -104,9 +104,13 @@ struct MenuPopoverView: View {
     /// values intact rather than wiping to empty — same pattern the
     /// juicemount-watch observer uses.
     private func refreshSelfTest() {
+        // S-2: capture the configured control-plane address on MainActor
+        // BEFORE hopping to the global queue (preferences is MainActor-
+        // isolated state).
+        let metricsAddr = server.preferences.metricsAddr
         DispatchQueue.global(qos: .utility).async {
             // /health — 4 components
-            if let url = URL(string: "http://127.0.0.1:11050/health"),
+            if let url = URL(string: "http://\(metricsAddr)/health"),
                let data = try? Data(contentsOf: url),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let comps = obj["components"] as? [String: String] {
@@ -123,7 +127,7 @@ struct MenuPopoverView: View {
                 }
             }
             // /metrics — bytes_read delta → MB/s
-            if let url = URL(string: "http://127.0.0.1:11050/metrics"),
+            if let url = URL(string: "http://\(metricsAddr)/metrics"),
                let data = try? Data(contentsOf: url),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let br = (obj["bytes_read"] as? Int64) ?? (obj["bytes_read"] as? Double).map({ Int64($0) }) {
@@ -327,8 +331,9 @@ struct MenuPopoverView: View {
     /// via the live cache stats in the popover (pending counter rising,
     /// then ticking down as workers complete each file).
     private func triggerVerifyPins() {
+        let metricsAddr = server.preferences.metricsAddr
         DispatchQueue.global(qos: .userInitiated).async {
-            let url = URL(string: "http://127.0.0.1:11050/verify-pins")!
+            guard let url = URL(string: "http://\(metricsAddr)/verify-pins") else { return }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             URLSession.shared.dataTask(with: req) { data, _, err in
@@ -350,8 +355,12 @@ struct MenuPopoverView: View {
 
     private func triggerReclaim() {
         reclaimBusy = true
+        let metricsAddr = server.preferences.metricsAddr
         DispatchQueue.global(qos: .userInitiated).async {
-            let url = URL(string: "http://127.0.0.1:11050/reclaim")!
+            guard let url = URL(string: "http://\(metricsAddr)/reclaim") else {
+                DispatchQueue.main.async { reclaimBusy = false }
+                return
+            }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             let sem = DispatchSemaphore(value: 0)
@@ -404,8 +413,12 @@ struct MenuPopoverView: View {
     /// the cache stats row tick down to zero then back up.
     private func triggerClearCache() {
         cacheClearBusy = true
+        let metricsAddr = server.preferences.metricsAddr
         DispatchQueue.global(qos: .userInitiated).async {
-            let url = URL(string: "http://127.0.0.1:11050/cache-clear?keep-pinned=true")!
+            guard let url = URL(string: "http://\(metricsAddr)/cache-clear?keep-pinned=true") else {
+                DispatchQueue.main.async { cacheClearBusy = false }
+                return
+            }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             let sem = DispatchSemaphore(value: 0)
@@ -446,10 +459,14 @@ struct MenuPopoverView: View {
     /// then POSTs /force-eject on the control plane which triggers the
     /// AppleScript-with-admin path.
     private func forceEjectMount() {
+        // S-2: derive the mount point + control-plane address from
+        // preferences instead of hardcoding the developer's setup.
+        let mountPoint = server.preferences.mountPoint
+        let metricsAddr = server.preferences.metricsAddr
         let alert = NSAlert()
         alert.messageText = "Force Eject JuiceMount?"
         alert.informativeText = """
-            This will unmount /Volumes/zpool using a privileged kernel-level \
+            This will unmount \(mountPoint) using a privileged kernel-level \
             unmount. macOS will prompt for your administrator password.
 
             Use this only if Stop didn't work or Finder is hanging on the \
@@ -462,7 +479,7 @@ struct MenuPopoverView: View {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            guard let url = URL(string: "http://127.0.0.1:11050/force-eject") else { return }
+            guard let url = URL(string: "http://\(metricsAddr)/force-eject") else { return }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             // Long timeout — the AppleScript admin prompt may sit waiting
@@ -488,13 +505,13 @@ struct MenuPopoverView: View {
                 if ok {
                     let done = NSAlert()
                     done.messageText = "Mount Ejected"
-                    done.informativeText = "/Volumes/zpool is no longer in the kernel mount table. Finder should now be responsive."
+                    done.informativeText = "\(mountPoint) is no longer in the kernel mount table. Finder should now be responsive."
                     done.runModal()
                 } else {
                     showAlert(
                         title: "Force Eject Failed",
                         message: (errMsg ?? "Unknown error")
-                            + "\n\nA reboot, or `sudo umount -f -t nfs /Volumes/zpool` from a fresh terminal, will clear the wedge."
+                            + "\n\nA reboot, or `sudo umount -f -t nfs \(mountPoint)` from a fresh terminal, will clear the wedge."
                     )
                 }
             }
@@ -528,9 +545,11 @@ struct MenuPopoverView: View {
 
         // Off-main: shell-outs (pluginkit, fileproviderctl, ditto) plus
         // a couple of HTTP fetches can take several seconds. Don't freeze
-        // the popover.
+        // the popover. Capture the metrics address ON MainActor before the
+        // detached hop (preferences is MainActor-isolated).
+        let metricsAddr = server.preferences.metricsAddr
         Task.detached(priority: .userInitiated) {
-            let exporter = DiagnosticsExporter()
+            let exporter = DiagnosticsExporter(metricsAddr: metricsAddr)
             do {
                 try await exporter.export(to: destination)
                 await MainActor.run {
@@ -1513,6 +1532,13 @@ struct MenuPopoverView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        // Review follow-up (Phase 3b): .onChange only fires on EDGES — a
+        // component already down when the popover renders never triggers
+        // it, leaving the details collapsed exactly when they matter.
+        // Evaluate the initial state too.
+        .onAppear {
+            if !allComponentsHealthy { healthDetailsExpanded = true }
+        }
         .onChange(of: allComponentsHealthy) { _, healthy in
             if !healthy { healthDetailsExpanded = true }
         }

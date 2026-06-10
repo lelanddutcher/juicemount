@@ -129,6 +129,24 @@ type ServerConfig struct {
 	// it's in the startup snapshot. SpoolSizeGB < 1 means "use default".
 	SpoolEnable bool `json:"spool_enable"`
 	SpoolSizeGB int  `json:"spool_size_gb"`
+	// LB-4 (Phase 3b): tuning knobs that previously existed in the app's
+	// preferences UI but were consumed by nothing. All three are optional —
+	// 0 (or absent, for config JSON written by older app builds) preserves
+	// the previous hardcoded defaults exactly:
+	//   memory_buffer_mb      → nfs.DefaultMemBufBudget    (2048 MB)
+	//   membuf_file_limit_mb  → nfs.DefaultMemBufThreshold (128 MB)
+	//   reconcile_seconds     → metadata.DefaultReconcileInterval (30 s)
+	MemoryBufferMB    int `json:"memory_buffer_mb"`
+	MemBufFileLimitMB int `json:"membuf_file_limit_mb"`
+	ReconcileSeconds  int `json:"reconcile_seconds"`
+}
+
+// reconcileInterval resolves the config's reconcile cadence; 0 means
+// "keep the metadata package default" (SetReconcileInterval ignores
+// non-positive values, so passing 0 through is safe — this helper exists
+// so the contract is unit-testable without a live server).
+func (c ServerConfig) reconcileInterval() time.Duration {
+	return time.Duration(c.ReconcileSeconds) * time.Second
 }
 
 //export NFSServerStart
@@ -316,6 +334,10 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// valid files; SetPathConfig MUST happen before rc.Start launches the
 	// reconcile goroutine below.
 	rc.SetPathConfig(cfg.MountPoint, cfg.FUSEPath)
+	// LB-4: user-tunable reconcile cadence. Must land before rc.Start()
+	// (reconcileLoop snapshots the interval once); 0/absent keeps the
+	// 30 s default.
+	rc.SetReconcileInterval(cfg.reconcileInterval())
 
 	// [JM6 tier-1.8/1.9] Reachability monitor against the metadata
 	// host. Probes a cheap TCP dial at 2s cadence; transitions
@@ -412,6 +434,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	srv := jmnfs.NewServer(jmnfs.Config{
 		ListenAddr: cfg.ListenAddr,
 		FUSEPath:   cfg.FUSEPath,
+		// LB-4: membuf tuning from preferences. 0/absent → package
+		// defaults (2 GiB budget, 128 MB file limit) via NewMemoryBuffer's
+		// <= 0 fallback, so old config JSON behaves identically.
+		MemBufBudgetMB:    cfg.MemoryBufferMB,
+		MemBufFileLimitMB: cfg.MemBufFileLimitMB,
 	}, store)
 
 	if err := srv.Start(); err != nil {
@@ -2165,8 +2192,23 @@ var mountNowDeps = struct {
 // May block while macOS shows the admin-password prompt (the AppleScript
 // tier inside mountNFSWithPrompt) — callers should allow a generous
 // timeout, like the Swift force-eject caller does.
+//
+// Single-flight (Phase 3 review follow-up): mountNFSWithPrompt can sit on
+// the admin-password prompt for minutes; a second /mount-now arriving in
+// that window must NOT stack a second prompt (or race the first mount).
+// The Swift Mount Now button has its own in-flight guard, but the control
+// plane is reachable by curl/scripts/a second client, so the server
+// enforces it too: concurrent calls get 409 {"mount already in flight"}.
+var mountNowInFlight atomic.Bool
+
 func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if !mountNowInFlight.CompareAndSwap(false, true) {
+		w.WriteHeader(http.StatusConflict)
+		fmt.Fprint(w, `{"ok":false,"error":"mount already in flight"}`)
+		return
+	}
+	defer mountNowInFlight.Store(false)
 	globalMu.Lock()
 	mp := r.URL.Query().Get("path")
 	if mp == "" {

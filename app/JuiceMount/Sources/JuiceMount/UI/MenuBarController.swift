@@ -405,10 +405,14 @@ final class MenuBarController: NSObject {
         }
         let view = PreferencesWindowView(preferences: server.preferences, server: server)
         let hosting = NSHostingController(rootView: view)
+        // Phase 3b: track the SwiftUI ideal size so the window hugs each
+        // tab's content (the view declares a fixed 600 pt width and a
+        // per-tab height). No manual setContentSize — that fought the
+        // content and left either clipped controls or dead space.
+        hosting.sizingOptions = .preferredContentSize
         let window = NSWindow(contentViewController: hosting)
         window.title = "JuiceMount Preferences"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 520, height: 480))
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self

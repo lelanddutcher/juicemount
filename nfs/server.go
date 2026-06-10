@@ -16,6 +16,13 @@ import (
 type Config struct {
 	ListenAddr string // e.g. "127.0.0.1:11049"
 	FUSEPath   string // path to hidden JuiceFS FUSE mount
+
+	// LB-4 (Phase 3b): user-tunable memory-buffer limits, in MB to match
+	// the app preferences UI. 0 (or absent in the config JSON) keeps the
+	// package defaults (DefaultMemBufBudget / DefaultMemBufThreshold), so
+	// configs written by older app builds behave identically.
+	MemBufBudgetMB    int // total heap budget for buffered small files
+	MemBufFileLimitMB int // only files smaller than this are buffered
 }
 
 // Server wraps the go-nfs server with JuiceMount-specific configuration.
@@ -36,7 +43,12 @@ func NewServer(config Config, store *metadata.Store) *Server {
 
 // Start begins listening and serving NFS requests.
 func (s *Server) Start() error {
-	s.handler = NewHandler(s.store, s.config.FUSEPath)
+	// MB → bytes; 0 stays 0, which NewMemoryBuffer maps to its defaults.
+	s.handler = NewHandler(s.store, s.config.FUSEPath,
+		WithMemBufLimits(
+			int64(s.config.MemBufFileLimitMB)<<20,
+			int64(s.config.MemBufBudgetMB)<<20,
+		))
 
 	// Create a TCP listener with TCP_NODELAY
 	l, err := net.Listen("tcp", s.config.ListenAddr)

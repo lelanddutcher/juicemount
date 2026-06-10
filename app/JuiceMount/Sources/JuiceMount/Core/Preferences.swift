@@ -169,7 +169,12 @@ public final class Preferences {
             logLevel: "info",
             bucketOverride: s3EndpointOverride,
             spoolEnable: spoolEnabled,
-            spoolSizeGB: spoolCapacityGB
+            spoolSizeGB: spoolCapacityGB,
+            // LB-4: previously saved-but-ignored; now consumed by the Go
+            // side (membuf construction + reconcile loop) at server start.
+            memoryBufferMB: memoryBufferMB,
+            memBufFileLimitMB: memBufFileLimitMB,
+            reconcileSeconds: reconcileSeconds
         )
     }
 

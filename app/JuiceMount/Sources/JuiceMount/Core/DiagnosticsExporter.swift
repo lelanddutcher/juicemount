@@ -20,7 +20,16 @@ public final class DiagnosticsExporter {
     private let log = Logger(subsystem: "com.juicemount.app",
                              category: "DiagnosticsExporter")
 
-    public init() {}
+    /// Control-plane address for the HTTP snapshots (/health, /spool, …).
+    /// Review 3b BUG 2: this was hardcoded to 127.0.0.1:11050, so a custom
+    /// metrics address silently produced diagnostics bundles MISSING every
+    /// control-plane snapshot — exactly the configs where support needs them.
+    /// Callers pass preferences.metricsAddr (captured on MainActor).
+    private let metricsAddr: String
+
+    public init(metricsAddr: String = "127.0.0.1:11050") {
+        self.metricsAddr = metricsAddr
+    }
 
     public enum ExportError: Error {
         case stagingFailed(String)
@@ -157,7 +166,7 @@ public final class DiagnosticsExporter {
                                      into stage: URL,
                                      errors: inout [String]) {
         let dest = stage.appendingPathComponent(file)
-        guard let url = URL(string: "http://127.0.0.1:11050\(path)") else {
+        guard let url = URL(string: "http://\(metricsAddr)\(path)") else {
             errors.append("\(file): bad URL")
             return
         }
