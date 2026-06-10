@@ -82,67 +82,12 @@
           <p class="muted">Your NLE talks to a normal Finder volume. Behind it, the hot path stays local: a Finder-tuned NFS server on localhost, an SQLite metadata cache, an NVMe block cache with pinning and a write spool, and a JuiceFS client that keeps file data as plain S3 objects in MinIO on your box — metadata in Redis.</p>
         </div>
 
-        <!-- Placeholder figure: replaced by the full brand architecture diagram (sprint item D) -->
         <figure class="figure" id="arch-diagram">
-          <svg class="diagram" viewBox="0 0 760 320" role="img" aria-labelledby="arch-t arch-d" xmlns="http://www.w3.org/2000/svg">
-            <title id="arch-t">JuiceMount architecture, simplified</title>
-            <desc id="arch-d">Premiere, Resolve, FCPX, or Finder talk over local NFS to the JuiceMount app, which serves SQLite metadata and NVMe cache hits on the Mac and reaches through the JuiceFS client to Redis and MinIO running on your server.</desc>
-            <defs>
-              <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
-                <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-stroke)"></path>
-              </marker>
-            </defs>
-
-            <!-- groups -->
-            <rect class="d-group" x="16" y="40" width="472" height="232" rx="10"></rect>
-            <text class="d-grouplabel" x="28" y="62">Your Mac</text>
-            <rect class="d-group" x="536" y="40" width="208" height="232" rx="10"></rect>
-            <text class="d-grouplabel" x="548" y="62">Your server</text>
-
-            <!-- NLE -->
-            <rect class="d-box d-box-slate" x="36" y="99" width="108" height="120" rx="8"></rect>
-            <text x="90" y="130" text-anchor="middle">Premiere</text>
-            <text x="90" y="150" text-anchor="middle">Resolve</text>
-            <text x="90" y="170" text-anchor="middle">FCPX</text>
-            <text x="90" y="190" text-anchor="middle">Finder</text>
-
-            <!-- JuiceMount.app -->
-            <rect class="d-box d-box-green" x="196" y="84" width="164" height="150" rx="8"></rect>
-            <text class="d-title" x="278" y="110" text-anchor="middle">JuiceMount.app</text>
-            <text x="278" y="136" text-anchor="middle">NFS server (local)</text>
-            <text x="278" y="156" text-anchor="middle">SQLite metadata</text>
-            <text x="278" y="176" text-anchor="middle">NVMe block cache</text>
-            <text x="278" y="196" text-anchor="middle">write spool</text>
-
-            <!-- JuiceFS client -->
-            <rect class="d-box d-box-blue" x="396" y="120" width="80" height="78" rx="8"></rect>
-            <text x="436" y="146" text-anchor="middle">JuiceFS</text>
-            <text x="436" y="163" text-anchor="middle">client</text>
-            <text x="436" y="180" text-anchor="middle">(FUSE)</text>
-
-            <!-- server boxes -->
-            <rect class="d-box d-box-slate" x="556" y="96" width="168" height="56" rx="8"></rect>
-            <text class="d-title" x="640" y="117" text-anchor="middle">Redis</text>
-            <text x="640" y="136" text-anchor="middle">file metadata</text>
-            <rect class="d-box d-box-slate" x="556" y="176" width="168" height="72" rx="8"></rect>
-            <text class="d-title" x="640" y="198" text-anchor="middle">MinIO</text>
-            <text x="640" y="216" text-anchor="middle">file data as</text>
-            <text x="640" y="233" text-anchor="middle">plain S3 objects</text>
-            <text class="d-note" x="640" y="262" text-anchor="middle">docker compose up -d</text>
-
-            <!-- arrows -->
-            <line class="d-arrow" x1="149" y1="159" x2="191" y2="159" marker-start="url(#arrow)" marker-end="url(#arrow)"></line>
-            <text class="d-label" x="170" y="148" text-anchor="middle">NFS v3</text>
-            <line class="d-arrow" x1="365" y1="159" x2="391" y2="159" marker-start="url(#arrow)" marker-end="url(#arrow)"></line>
-            <text class="d-label" x="378" y="148" text-anchor="middle">FUSE</text>
-            <line class="d-arrow" x1="480" y1="150" x2="551" y2="128" marker-start="url(#arrow)" marker-end="url(#arrow)"></line>
-            <line class="d-arrow" x1="480" y1="168" x2="551" y2="206" marker-start="url(#arrow)" marker-end="url(#arrow)"></line>
-            <text class="d-label" x="516" y="166" text-anchor="middle">LAN / WAN</text>
-
-            <!-- flow note -->
-            <text class="d-note" x="380" y="306" text-anchor="middle">reads: NVMe cache first, stream the missing blocks · writes: spool, then background upload · pins: kept local</text>
-          </svg>
-          <figcaption>The read path in one line: metadata answers from local SQLite, cache hits stream from NVMe, and only the missing blocks cross the wire to your server. (Simplified view — the full architecture diagram is on its way.)</figcaption>
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="assets/arch-diagram-dark.svg">
+            <img class="diagram" src="assets/arch-diagram.svg" width="1200" height="640" alt="Architecture: Finder, Resolve, or Premiere open files on /Volumes/(name), mounted by the macOS NFS client from the JuiceMount NFS server running in the app on localhost. Three satellites keep the hot path local: an SQLite mirror answers Finder listings, an SSD cache with pins serves cached reads at NVMe speed, and a write spool acks writes locally then trickles them up. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your server, where MinIO or any S3 holds file data as plain objects and Redis holds file metadata. Reads stream only the blocks you touch; writes drain in the background at line speed. Both sides are hardware you own.">
+          </picture>
+          <figcaption>The read path in one line: metadata answers from local SQLite, cache hits stream from NVMe, and only the missing blocks cross the wire to your server.</figcaption>
         </figure>
 
         <dl class="fact-grid">

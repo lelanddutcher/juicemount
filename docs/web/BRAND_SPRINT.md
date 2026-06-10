@@ -67,7 +67,7 @@ autonomous loop ("churn for several hours"), 2026-06-10.
       INTERACTIVE_TOOL.md: payback months, 36-month simulation, honest
       "SaaS is cheaper for you" branch, shareable URL state,
       pricing.json dated 2026-06)
-- [ ] D. "How it works" architecture diagram SVG (brand-styled: Mac app
+- [x] D. "How it works" architecture diagram SVG (brand-styled: Mac app
       → NFS loopback → FUSE/JuiceFS → Redis+MinIO on your hardware;
       cache/spool/pin flows) → site/assets/ + embedded in README
 - [ ] E. README v2 graphics + detail: hero banner SVG (logo + one-liner,
@@ -99,3 +99,4 @@ autonomous loop ("churn for several hours"), 2026-06-10.
 <!-- loop appends: [date time] item — summary — commit -->
 - [2026-06-10 15:12] A — BRAND.md v1 (palette/type/mark/voice/assets) — this commit
 - [2026-06-10 16:05] B+C — site/ scaffold (tokens/site css, index hero Option C, zero-JS baseline) + calculator (725-line js, spec math verified 3.25mo, honest-branch live, URL state, pricing.json dated) — 1936 lines, all gates green. Deviations logged in agent report (payback=crossing-month not avg36; defaults=worked example). Nav links to compare/performance 404 until F/G.
+- [2026-06-10 16:40] D — arch-diagram light+dark SVGs (site/assets + assets/readme), index figure swapped to <picture>; orchestrator caught + fixed stale "plain objects" wording (Phase-4 A2 class) in all 4 variants before commit; svg2png render-verified + visually approved
