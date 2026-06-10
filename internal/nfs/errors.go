@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"syscall"
 )
 
 // RPCError provides the error interface for errors thrown by
@@ -257,6 +258,15 @@ func nfsStatusErrorFrom(err error) error {
 	}
 	if errors.Is(err, os.ErrPermission) {
 		return &NFSStatusError{NFSStatusAccess, err}
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		// "Disk full" must reach the client as NFS3ERR_NOSPC, not a
+		// generic I/O error — it's the difference between Finder saying
+		// "the disk is full" (actionable) and "an I/O error occurred"
+		// (panic-inducing). The write spool's capacity sentinel
+		// (nfs.ErrSpoolFull) wraps syscall.ENOSPC precisely so this
+		// match fires without this package importing nfs/ (cycle).
+		return &NFSStatusError{NFSStatusNoSPC, err}
 	}
 	return &NFSStatusError{NFSStatusIO, err}
 }

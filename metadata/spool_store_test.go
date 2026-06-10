@@ -283,7 +283,7 @@ func TestSpoolStoreMarkFailedBumpsAttempts(t *testing.T) {
 	id, _ := s.Insert("/x", "/spool/files/x")
 	_ = s.MarkReady(id, 100, nil)
 
-	if err := s.MarkFailed(id, "first try"); err != nil {
+	if _, err := s.MarkFailed(id, "first try"); err != nil {
 		t.Fatalf("mark failed: %v", err)
 	}
 	row, _ := s.Get(id)
@@ -298,7 +298,7 @@ func TestSpoolStoreMarkFailedBumpsAttempts(t *testing.T) {
 	}
 
 	_ = s.ResetToReady(id)
-	_ = s.MarkFailed(id, "second try")
+	_, _ = s.MarkFailed(id, "second try")
 	row, _ = s.Get(id)
 	if row.DrainAttempts != 2 {
 		t.Errorf("attempts after second fail=%d, want 2", row.DrainAttempts)

@@ -3,7 +3,9 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"syscall"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -82,6 +84,12 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 	file, err := fs.Create(newFilePath)
 	if err != nil {
 		Log.Errorf("Error Creating: %v", err)
+		// A CREATE against a full write spool (nfs.ErrSpoolFull wraps
+		// syscall.ENOSPC) must surface as NFS3ERR_NOSPC ("disk full"),
+		// not EACCES. Everything else keeps the legacy Access mapping.
+		if errors.Is(err, syscall.ENOSPC) {
+			return &NFSStatusError{NFSStatusNoSPC, err}
+		}
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 	if err := file.Close(); err != nil {

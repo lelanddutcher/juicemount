@@ -311,19 +311,46 @@ func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMig
 // MarkFailed transitions any state → failed with an attempt-counter bump
 // and an error message. Drainer uses this on retry exhaustion or SHA
 // mismatch; scrubber uses it for orphan recovery.
-func (s *SpoolStore) MarkFailed(id int64, errMsg string) error {
+// MarkFailed transitions a row to failed and reports whether a row was
+// actually updated. The bool matters for capacity accounting (adversarial-
+// review BUG 1): a row DELETED out from under the worker (CancelForDelete,
+// or a rename-requeue's DELETE+INSERT) has already had its reservation
+// released by whoever deleted it — releasing again on a 0-row UPDATE
+// double-releases, the cap under-counts, and the spool SSD can over-admit.
+// Callers must release capacity ONLY when this returns true.
+func (s *SpoolStore) MarkFailed(id int64, errMsg string) (bool, error) {
 	now := time.Now().Unix()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.db.Exec(
+	res, err := s.db.Exec(
 		`UPDATE spool_entries SET drain_state=?, drain_attempts=drain_attempts+1, last_error=?, updated_at=?
 		 WHERE id=?`,
 		DrainFailed, errMsg, now, id,
 	)
 	if err != nil {
-		return fmt.Errorf("spool mark failed %d: %w", id, err)
+		return false, fmt.Errorf("spool mark failed %d: %w", id, err)
 	}
-	return nil
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// HasNewerRowForPath reports whether any row exists for nfsPath with an id
+// greater than afterID, in ANY state. RetryFailed uses this as its staleness
+// guard (adversarial-review BUG 3): a failed row whose path has a NEWER row
+// must not be requeued — the newer row's bytes (drained, draining, or queued)
+// would be clobbered by the older spool file, silently replacing fresh
+// content with stale bytes. A newer row in any state means the user acted on
+// the path after the failure; the failed row is history, not work.
+func (s *SpoolStore) HasNewerRowForPath(nfsPath string, afterID int64) (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM spool_entries WHERE nfs_path=? AND id>?)`,
+		nfsPath, afterID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("spool has-newer-row %q: %w", nfsPath, err)
+	}
+	return exists, nil
 }
 
 // IncrementAttempts bumps the drain_attempts counter without changing state.
@@ -358,6 +385,31 @@ func (s *SpoolStore) ResetToReady(id int64) error {
 		return fmt.Errorf("spool reset ready %d: %w", id, err)
 	}
 	return nil
+}
+
+// ResetForRetry transitions a FAILED row back to ready with a fresh
+// attempt budget. Used by the operator-facing retry path
+// (/spool-recover?action=retry-failed): without zeroing drain_attempts
+// the drainer's next claim would immediately re-fail the row on its
+// "retry budget exhausted" check, making retry a no-op. last_error is
+// preserved for the audit trail until the next attempt overwrites it.
+// The WHERE guards on drain_state=failed so a concurrent drain
+// transition can't be clobbered; returns false if the row was not in
+// failed state.
+func (s *SpoolStore) ResetForRetry(id int64) (bool, error) {
+	now := time.Now().Unix()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.db.Exec(
+		`UPDATE spool_entries SET drain_state=?, drain_attempts=0, updated_at=?
+		 WHERE id=? AND drain_state=?`,
+		DrainReady, now, id, DrainFailed,
+	)
+	if err != nil {
+		return false, fmt.Errorf("spool reset for retry %d: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // Get returns the row for id, or sql.ErrNoRows if it doesn't exist.

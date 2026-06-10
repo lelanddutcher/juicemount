@@ -546,6 +546,21 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				}
 			}
 		}
+	} else {
+		// LB-3 defense in depth: starting with the spool DISABLED skips
+		// ALL spool wiring including boot recovery — any
+		// writing/ready/draining rows left by a previous spool-enabled
+		// run are stranded: bytes sit on the local SSD, never drain to
+		// the NAS, yet Finder already told the user "copied". The Swift
+		// preferences flow guards the toggle, but make the condition
+		// loudly visible in diagnostics regardless of how we got here.
+		// PendingStats errors (e.g. spool schema never created on this
+		// DB) mean "no spool history" and are deliberately ignored.
+		if pf, pb, statErr := metadata.NewSpoolStore(store.DB()).PendingStats(); statErr == nil && pf > 0 {
+			jmlog.Warn("SPOOL DISABLED WITH PENDING ENTRIES — files the user already saw \"copied\" are NOT on the NAS and will not upload until the write spool is re-enabled",
+				"stranded_files", pf,
+				"stranded_bytes", pb)
+		}
 	}
 
 	// Mount NFS at the user-visible mount point (e.g. /Volumes/zpool) so
@@ -609,6 +624,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// and per-entry details. 503 when the spool is disabled
 			// (JM_SPOOL_ENABLE != 1) or hasn't been wired yet.
 			"/spool": handleSpoolHTTP,
+			// Spool recovery actions (LB-5): ?action=retry-failed
+			// requeues failed rows whose spool file survives;
+			// ?action=clear-stalled force-finalizes leaked-handle
+			// writing entries (bytes preserved). Loopback-only GET,
+			// same mutation convention as /offline?on=….
+			"/spool-recover": handleSpoolRecoverHTTP,
 			// Phase B observability: net/http/pprof routes for live
 			// goroutine/heap/cpu/trace dumps. pprof.Index serves
 			// /debug/pprof/goroutine, /debug/pprof/heap, etc. via the
@@ -1868,14 +1889,20 @@ func handleCacheStatusHTTP(w http.ResponseWriter, r *http.Request) {
 //	  "quarantined":     0,
 //	  "capacity_used":   3400000000,
 //	  "capacity_total":  53687091200,
+//	  "stalled_files":   0,
+//	  "failed_files":    0,
+//	  "oldest_pending_age_sec": 42,
 //	  "entries":         [
 //	    { "path": "...", "size": ..., "drain_state": "draining",
-//	      "drain_attempts": 0, "last_error": "" },
+//	      "drain_attempts": 0, "last_error": "",
+//	      "age_sec": 42, "stalled": false },
 //	    ...
 //	  ]
 //	}
 //
-// The `entries` array is capped at 200 rows (most recent first) to
+// The `entries` array lists ACTIVE rows (writing/ready/draining, plus
+// still-relevant failed rows) newest-first, followed by a short
+// recently-done tail — not all-time history. Capped at 200 rows to
 // keep menu-bar payloads responsive on a 1 Hz poll. Older rows live
 // in SQLite for audit but are not returned here.
 func handleSpoolHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1884,6 +1911,57 @@ func handleSpoolHTTP(w http.ResponseWriter, r *http.Request) {
 	drainer := globalDrainer
 	globalMu.Unlock()
 	jmnfs.WriteSpoolStatusJSON(w, spool, drainer)
+}
+
+// handleSpoolRecoverHTTP is the operator-facing recovery action behind the
+// LB-5 stuck-spool UI affordance. Loopback-only GET with query params —
+// the same mutation convention as /offline?on=true.
+//
+//	GET /spool-recover?action=retry-failed
+//	    ResetForRetry every `failed` row whose spool file still exists on
+//	    disk (state→ready, fresh attempt budget) and wake the drainer.
+//	    Rows with no surviving data are skipped — never deletes user bytes.
+//
+//	GET /spool-recover?action=clear-stalled
+//	    Force-finalize stalled `writing` entries NOW via the Phase-1
+//	    escalation helper (leaked handles zeroed, fsync + SHA +
+//	    mark-ready) so their bytes drain like any normal finalize.
+//
+// Responses:
+//
+//	200 {"ok":true,"action":"retry-failed","recovered":N}
+//	400 {"ok":false,"error":"…"}   — missing/unknown action
+//	500 {"ok":false,"error":"…"}   — SQL failure during retry
+//	503 {"ok":false,"error":"…"}   — spool not enabled / not wired
+func handleSpoolRecoverHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	globalMu.Lock()
+	spool := globalSpool
+	globalMu.Unlock()
+	if spool == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"ok":false,"error":"spool not enabled"}`)
+		return
+	}
+	switch action := r.URL.Query().Get("action"); action {
+	case "retry-failed":
+		n, err := spool.RetryFailed()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+			return
+		}
+		jmlog.Info("spool-recover: retry-failed", "requeued", n)
+		fmt.Fprintf(w, `{"ok":true,"action":"retry-failed","recovered":%d}`, n)
+	case "clear-stalled":
+		n := spool.RecoverStalled()
+		jmlog.Info("spool-recover: clear-stalled", "finalized", n)
+		fmt.Fprintf(w, `{"ok":true,"action":"clear-stalled","recovered":%d}`, n)
+	default:
+		w.WriteHeader(http.StatusBadRequest)
+		msg := fmt.Sprintf("unknown action %q (want retry-failed | clear-stalled)", action)
+		fmt.Fprintf(w, `{"ok":false,"error":%q}`, msg)
+	}
 }
 
 // handleVerifyPinsHTTP re-enqueues every pinned-Ready file for prefetch.

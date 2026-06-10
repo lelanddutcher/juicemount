@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"time"
 
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -12,17 +14,27 @@ import (
 // by the menu bar app + Manager UI. Exported so the Swift JSON decoder
 // can reference the same key names via tags here.
 type SpoolStatusResponse struct {
-	Enabled       bool             `json:"enabled"`
-	Error         string           `json:"error,omitempty"`
-	PendingFiles  int              `json:"pending_files"`
-	PendingBytes  int64            `json:"pending_bytes"`
-	InProgress    int64            `json:"in_progress"`
-	Succeeded     int64            `json:"succeeded"`
-	Failed        int64            `json:"failed"`
-	Quarantined   int64            `json:"quarantined"`
-	CapacityUsed  int64            `json:"capacity_used"`
-	CapacityTotal int64            `json:"capacity_total"`
-	Entries       []SpoolEntryView `json:"entries"`
+	Enabled       bool   `json:"enabled"`
+	Error         string `json:"error,omitempty"`
+	PendingFiles  int    `json:"pending_files"`
+	PendingBytes  int64  `json:"pending_bytes"`
+	InProgress    int64  `json:"in_progress"`
+	Succeeded     int64  `json:"succeeded"`
+	Failed        int64  `json:"failed"`
+	Quarantined   int64  `json:"quarantined"`
+	CapacityUsed  int64  `json:"capacity_used"`
+	CapacityTotal int64  `json:"capacity_total"`
+	// StalledFiles counts listed entries flagged Stalled (see
+	// SpoolEntryView.Stalled). FailedFiles counts the listed failed
+	// rows — i.e. failed rows still relevant to the user (recoverable
+	// data on disk, or failed recently), not all-time history.
+	// OldestPendingAgeSec is the age of the oldest writing/ready/
+	// draining row, so the UI can say "queued · 2h" without timestamp
+	// math. All three are LB-5 stuck-spool affordance signals.
+	StalledFiles        int              `json:"stalled_files"`
+	FailedFiles         int              `json:"failed_files"`
+	OldestPendingAgeSec int64            `json:"oldest_pending_age_sec"`
+	Entries             []SpoolEntryView `json:"entries"`
 }
 
 // SpoolEntryView is a single row's worth of UI-facing state.
@@ -33,12 +45,39 @@ type SpoolEntryView struct {
 	DrainAttempts int    `json:"drain_attempts"`
 	LastError     string `json:"last_error,omitempty"`
 	UpdatedAtUnix int64  `json:"updated_at_unix"`
+	// AgeSec is now - updated_at, floored at 0.
+	AgeSec int64 `json:"age_sec"`
+	// Stalled means this entry is making no progress and won't without
+	// intervention: a `writing` row quiescent beyond the sweeper's
+	// escalation window (leaked handle — the sweeper will force-finalize
+	// it, and /spool-recover?action=clear-stalled does so immediately),
+	// or a ready/draining row whose drain_attempts already hit the
+	// drainer's retry ceiling (it will only fail-permanent on its next
+	// claim). Failed rows are NOT stalled — they get FailedFiles and the
+	// retry-failed action instead.
+	Stalled bool `json:"stalled"`
 }
 
 // SpoolStatusEntryCap caps the per-response entry list so menu-bar
 // payloads stay small on a 1 Hz poll. Older rows live in SQLite for
 // audit but are not returned via this endpoint.
 const SpoolStatusEntryCap = 200
+
+// SpoolStatusDoneTailWindow / SpoolStatusDoneTailCap bound the
+// "recently finished" tail appended after the active rows. Done rows
+// older than the window (or beyond the cap) are history — they live in
+// SQLite until DeleteDone GC, but listing them in /spool made the UI
+// show 46 rows with pending=0 (Phase-0 observation).
+const (
+	SpoolStatusDoneTailWindow = 5 * time.Minute
+	SpoolStatusDoneTailCap    = 10
+)
+
+// SpoolStatusFailedRetention is how long a failed row with NO
+// recoverable spool file stays listed (recent-error feedback). Failed
+// rows whose spool file still exists are always listed — they are
+// actionable via /spool-recover?action=retry-failed.
+const SpoolStatusFailedRetention = time.Hour
 
 // BuildSpoolStatus assembles the response struct from a live spool
 // store + drainer. Either may be nil — that combination is the
@@ -81,24 +120,117 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 		resp.Error = "list entries: " + listErr.Error()
 		// Continue — counters above are still useful for the UI.
 	}
+
+	// maxAttempts mirrors the drainer's retry ceiling for the
+	// attempts-exhausted stalled signal. With no drainer wired (status
+	// built between Stop and Start) fall back to the DrainerConfig
+	// default so the signal stays meaningful.
+	maxAttempts := 5
+	if drainer != nil {
+		maxAttempts = drainer.maxAttempts
+	}
+	// escalateAfter is read the same way the sweeper reads it: set once
+	// at construction (or by tests before concurrency starts).
+	escalate := spool.escalateAfter
+	now := time.Now()
+	ageOf := func(updatedAt time.Time) int64 {
+		sec := int64(now.Sub(updatedAt) / time.Second)
+		if sec < 0 {
+			sec = 0
+		}
+		return sec
+	}
+
 	views := make([]SpoolEntryView, 0)
+	doneTail := make([]SpoolEntryView, 0)
 	for _, r := range rows {
+		v := SpoolEntryView{
+			Path:          r.NFSPath,
+			Size:          r.Size,
+			DrainState:    string(r.DrainState),
+			DrainAttempts: r.DrainAttempts,
+			LastError:     r.LastError,
+			UpdatedAtUnix: r.UpdatedAt.Unix(),
+			AgeSec:        ageOf(r.UpdatedAt),
+		}
 		switch r.DrainState {
-		case metadata.DrainWriting, metadata.DrainReady, metadata.DrainDraining, metadata.DrainFailed:
-			views = append(views, SpoolEntryView{
-				Path:          r.NFSPath,
-				Size:          r.Size,
-				DrainState:    string(r.DrainState),
-				DrainAttempts: r.DrainAttempts,
-				LastError:     r.LastError,
-				UpdatedAtUnix: r.UpdatedAt.Unix(),
-			})
+		case metadata.DrainWriting, metadata.DrainReady, metadata.DrainDraining:
+			if r.DrainState == metadata.DrainWriting {
+				// `writing` rows persist size=0 until finalize; the live
+				// index entry knows the real high-water mark. Overlay it
+				// (the CancelForDelete pattern) so the UI never renders
+				// "Zero KB" for an entry holding real bytes, and fold the
+				// live bytes into pending_bytes so pending_files>0 with
+				// pending_bytes=0 can't recur. In-memory lookup only — no
+				// per-RPC cost, and /spool runs on the cold control plane.
+				if e, ok := spool.index.Lookup(r.NFSPath); ok && e.ID() == r.ID {
+					if we := e.WrittenEnd(); we > v.Size {
+						resp.PendingBytes += we - v.Size
+						v.Size = we
+					}
+					// Stalled: quiescent beyond the sweeper's escalation
+					// window — only a leaked handle looks like this (the
+					// same predicate escalateIfStuck enforces).
+					if escalate > 0 && now.Sub(e.LastWrite()) >= escalate {
+						v.Stalled = true
+					}
+				} else if escalate > 0 && now.Sub(r.UpdatedAt) >= escalate {
+					// A writing row with NO live index entry can never
+					// finalize (nothing holds it); flag once it's old.
+					v.Stalled = true
+				}
+			} else if r.DrainAttempts >= maxAttempts {
+				// Retry budget exhausted — the row will only transition
+				// to failed on its next claim; the UI should already be
+				// offering recovery.
+				v.Stalled = true
+			}
+			if v.Stalled {
+				resp.StalledFiles++
+			}
+			if v.AgeSec > resp.OldestPendingAgeSec {
+				resp.OldestPendingAgeSec = v.AgeSec
+			}
+			views = append(views, v)
+
+		case metadata.DrainFailed:
+			// Failed rows are listed only while RELEVANT: spool file
+			// still on disk (recoverable via retry-failed), or failed
+			// recently (error feedback). Ancient failures with no data
+			// are history, not UI rows. The os.Stat per failed row is
+			// fine here — cold control-plane path, capped row count.
+			fileExists := false
+			if r.SpoolFile != "" {
+				_, statErr := os.Stat(r.SpoolFile)
+				fileExists = statErr == nil
+			}
+			if fileExists || now.Sub(r.UpdatedAt) <= SpoolStatusFailedRetention {
+				resp.FailedFiles++
+				views = append(views, v)
+			}
+
+		case metadata.DrainDone:
+			// Recently-finished tail only (Phase-0 observation: 46
+			// historical done rows listed with pending=0). `succeeded`
+			// remains the all-time counter.
+			if now.Sub(r.UpdatedAt) <= SpoolStatusDoneTailWindow {
+				doneTail = append(doneTail, v)
+			}
 		}
 	}
-	// Newest-first by SQL id (ListAll preserves insert order; reverse).
-	for i, j := 0, len(views)-1; i < j; i, j = i+1, j-1 {
-		views[i], views[j] = views[j], views[i]
+	// Newest-first by SQL id (ListAll preserves insert order; reverse),
+	// active rows first, then the recently-done tail.
+	reverseViews := func(s []SpoolEntryView) {
+		for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+			s[i], s[j] = s[j], s[i]
+		}
 	}
+	reverseViews(views)
+	reverseViews(doneTail)
+	if len(doneTail) > SpoolStatusDoneTailCap {
+		doneTail = doneTail[:SpoolStatusDoneTailCap]
+	}
+	views = append(views, doneTail...)
 	if len(views) > SpoolStatusEntryCap {
 		views = views[:SpoolStatusEntryCap]
 	}

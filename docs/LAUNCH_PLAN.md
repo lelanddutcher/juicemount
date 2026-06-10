@@ -32,12 +32,28 @@ the orchestrator (Claude session) deploys, gates, and commits.
 | 0 | Baseline: commit session work, catalog go-test baseline, restart app (clears 43 stuck spool entries via RecoverOnBoot), purge QA leftovers | — | 00-precheck | ☐ |
 | 1 | **Write-path correctness**: rename spool-blind (handler.go:1540) → silent mv breakage; spool handle-refcount leak + sweeper silent skip (spool.go:962); cp rc=1; ftruncate "RPC struct is bad" (SETATTR path) | nfs/*, internal/nfs/*, metadata/spool_store.go | 01-smoke, 02-finder, 06-concurrency + wedge write-integrity | ☐ |
 | 2 | **Spool durability+UX**: stranded writes on spool-disable/quit (LB-3); stuck-spool UI affordance + last_error render + stalled detection + clear/retry endpoint (LB-5); /spool size overlay for writing rows | nfs/spool_status.go, nfs/drainer.go, bridge/cbridge.go, App.swift, PreferencesWindowView.swift, MenuPopoverView.swift | 01-smoke, 10-control-plane + manual spool scenario | ☐ |
-| 3 | **First-run + state honesty**: preflight (juicefs/macFUSE/backend) with guided errors (LB-1); NFS-mounted in state machine + Mount Now retry, wire EnableNFSRemount (LB-2); distinct error icon + .startFailed alert (S-1); de-hardcode 127.0.0.1:11050 ×6 + mount-point strings (S-2); Reset-DB stop→delete→restart flow (S-6) | Swift UI/Core, bridge/cbridge.go (status), health/monitor.go (remount wiring) | 01-smoke, 10-control-plane + manual first-run sims | ☐ |
-| 4 | **OSS hygiene**: placebo settings wired-or-deleted (LB-4); scrub personal IPs/paths from UI/CLI/scripts (S-5); docs honesty pass — README prereqs, spool docs, sudoers incl. umount, Gatekeeper (S-4); uninstall.sh (S-3); LaunchAgent consistency (P-2) | docs, README, scripts/, Preferences*.swift, cmd/ | 00-precheck, 01-smoke | ☐ |
+| 3 | **First-run + state honesty + identity** (expanded 2026-06-10 per user): onboarding/welcome flow for initial setup with preflight (juicefs/macFUSE/backend) + guided errors (LB-1); NFS-mounted in state machine + Mount Now retry, wire EnableNFSRemount (LB-2); menu-bar icon = Logos/ mark, state-tinted (green healthy / amber degraded / blue offline-files mode / red fault) + upload-activity badge, replacing SF-Symbol icons (S-1 folds in); app icon from Logos/color; simplified at-a-glance popover status (health · cache-vs-free · uploads); de-hardcode 127.0.0.1:11050 ×6 + mount-point strings (S-2); Reset-DB flow (S-6) | Swift UI/Core, Logos/, scripts/build-app.sh (icns), bridge/cbridge.go (status), health/monitor.go | 01-smoke, 10-control-plane + manual first-run sims | ☐ |
+| 3b | **Preferences redesign sprint** (user 2026-06-10): de-clutter + fix scaling/sizing; logical grouping; placebo settings wired-or-deleted here (LB-4 moves from ph.4) | PreferencesWindowView.swift, Preferences.swift | 01-smoke + manual | ☐ |
+| 4 | **OSS hygiene + README**: publication README (draft from web-track agent, merged + verified against actual behavior); scrub personal IPs/paths from UI/CLI/scripts (S-5); docs honesty pass — prereqs, spool docs, sudoers incl. umount, Gatekeeper (S-4); uninstall.sh (S-3); LaunchAgent consistency (P-2) | docs, README, scripts/, cmd/ | 00-precheck, 01-smoke | ☐ |
+| W | **Web presence track** (parallel, non-app): juicemount.com plan + content architecture + interactive tool concept; positioning vs Suite/Shade/Iconik/Aspect (BYO-storage, no contracts) and vs Nextcloud/MountainDuck/Seafile (partial-file streaming, ~7Gbit on 10GbE); cost story; JuiceFS foundation; JuiceMount Manager tie-in. NEW FILES ONLY (docs/web/, docs/README_DRAFT.md) | docs/web/ (new) | n/a (docs) | ✅ 2026-06-10: README_DRAFT.md + web/SITE_PLAN.md + web/INTERACTIVE_TOOL.md; ~17 VERIFY tags for the Phase-4 merge; **LICENSE FILE MISSING — founder decision needed (MIT vs Apache-2.0, deps are Apache-2.0)**; competitor pricing researched + dated |
 | 5 | **Full-suite final validation**: run-all (00–07, 09 short, 10–12; 08-netshape if sudo granted), wedge-tests ×4, test-offline-resilience.sh, crash-recover-test.sh; update OPEN_BUGS/CHANGELOG/STATE; final readiness report | — | everything | ☐ |
 
 Pipelining: while phase N is in gate/QA, phase N+1's agent may implement in
 an isolated worktree and rebase after N's commit. Merges stay serialized.
+
+## Approved icon/state spec (user-approved 2026-06-10, via mockup)
+- Menu-bar icon = the Logos/ citrus mark, state-tinted (isTemplate=false —
+  color IS the signal): **green = healthy** (original palette),
+  **yellow/amber #EF9F27 = degraded/recovering**, **blue #378ADD =
+  offline-files-only mode**, **red #E24B4A = unreachable/fault**.
+- Upload-activity badge: small circular badge (blue, up-arrow) bottom-right
+  of the mark while drains are active; pending count lives in the popover.
+- Assets: Logos/state-{healthy,degraded,offline-files,fault}.svg (generated
+  from color.svg by swapping the 5-green palette; verified 5 fills each).
+- Render pipeline (proven, zero deps): NSImage loads SVG on modern macOS —
+  /tmp/svg2png.swift pattern renders crisp 36px and 512px PNGs; fold into
+  scripts/build-app.sh for menu-bar @1x/@2x and the AppIcon.icns iconset.
+- App icon: Logos/color (healthy green) via the existing iconutil path.
 
 ## Ledger (append per phase)
 <!-- phase / agent / changes / gate results / commit -->
@@ -68,7 +84,31 @@ an isolated worktree and rebase after N's commit. Merges stay serialized.
   D-rollback-on-FUSE-rename-fail, late-SETATTR zero-clobber shape (E),
   writeSizes dir-children carry (F), stale QuarantineDrain hygiene (G),
   ErrSpoolFull→NFS3ERR_NOSPC mapping (H), escalation-test flake margin.
-  → gate finishing: relaunch + QA re-run, then commit.
+  Gate finale: rsync-under-load failure root-caused live (deferred-tx
+  SQLITE_BUSY upgrade in MigrateForRename racing drain-completion writes;
+  busy_timeout doesn't apply to snapshot-stale upgrades) → DSN
+  _txlock=immediate; before/after stress 2/5 fails → 0/10. ✅ COMMITTED
+  c29a19f.
+
+- **Phase 2** (2026-06-10): spool durability + UX. Agent delivered all 4
+  items (stranded-write guards on spool-disable/quit/stop-everything;
+  stuck-spool UI with last_error/age/stalled badges + retry/recover buttons;
+  /spool-recover endpoint; /spool reporting correctness incl. WrittenEnd
+  overlay + relevance-filtered entries; ErrSpoolFull→NFS3ERR_NOSPC via
+  syscall.ENOSPC wrap). Adversarial review: SHIP-WITH-FIXES → all applied:
+  (1) failPermanent/QuarantineDrain ownership-guarded capacity release
+  (MarkFailed returns rows-affected) + two-reservation exact-capacity tests,
+  negative-checked; (2) drain-wait views stop on failedFiles>0 (no
+  auto-quit/disable on "everything failed") + unreachable-server handling;
+  (3) RetryFailed HasNewerRowForPath staleness guard + test; (4) retry
+  reserve-before-reset ordering; (5) quit re-entrancy guards. Review
+  follow-ups deferred (non-blocking): RecoverStalled scope vs the 3
+  persistent stalled states; RecoverOnBoot deletes failed rows' files
+  (restart kills retryability — design decision); spool_entries GC timer;
+  WriteAt NOENT mapping note. Gate: build/vet/gofmt ✅; suite = only the 5
+  env-dependent fails ✅; -race clean ✅; swift 0 errors ✅; live: integrity
+  ✅, /spool fields ✅, /spool-recover contract ✅, QA 01-smoke 10/10 +
+  10-control-plane 16/16 ✅.
 
 ### New findings logged during Phase 1 gate (not regressions)
 - Burst-create ETIMEDOUT ~1/1000 under load (QA-29 stall class, newly

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
@@ -24,9 +25,13 @@ import (
 const SpoolFilesSubdir = "files"
 
 // ErrSpoolFull is returned by OpenWrite/WriteAt when the spool's capacity
-// cap would be exceeded. The handler translates this to NFS3ERR_NOSPC at
-// the RPC boundary so the client sees a clean ENOSPC.
-var ErrSpoolFull = errors.New("spool: capacity full")
+// cap would be exceeded. It WRAPS syscall.ENOSPC so the RPC boundary maps
+// it to NFS3ERR_NOSPC and clients see a clean, actionable "disk full"
+// instead of a generic I/O error: internal/nfs cannot import this package
+// (cycle), so the shared sentinel both layers agree on is the syscall
+// errno itself — nfsStatusErrorFrom matches it with errors.Is.
+// errors.Is(err, ErrSpoolFull) continues to work by identity.
+var ErrSpoolFull = fmt.Errorf("spool: capacity full: %w", syscall.ENOSPC)
 
 // ErrSpoolBusy is returned by OpenWrite when a previous entry for the same
 // path was finalized but is still draining and did not clear within the
@@ -455,7 +460,7 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 		fileExists := actualFiles[r.SpoolFile]
 		switch r.DrainState {
 		case metadata.DrainWriting:
-			if mErr := s.meta.MarkFailed(r.ID, "writing-state row recovered after crash (partial spool file unsafe to resume)"); mErr != nil {
+			if _, mErr := s.meta.MarkFailed(r.ID, "writing-state row recovered after crash (partial spool file unsafe to resume)"); mErr != nil {
 				log.Printf("spool recover: mark writing→failed %d: %v", r.ID, mErr)
 				continue
 			}
@@ -468,7 +473,7 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 
 		case metadata.DrainReady:
 			if !fileExists {
-				if mErr := s.meta.MarkFailed(r.ID, "ready-state row missing spool file after crash"); mErr != nil {
+				if _, mErr := s.meta.MarkFailed(r.ID, "ready-state row missing spool file after crash"); mErr != nil {
 					log.Printf("spool recover: mark ready→failed %d: %v", r.ID, mErr)
 					continue
 				}
@@ -481,7 +486,7 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 
 		case metadata.DrainDraining:
 			if !fileExists {
-				if mErr := s.meta.MarkFailed(r.ID, "draining-state row missing spool file after crash"); mErr != nil {
+				if _, mErr := s.meta.MarkFailed(r.ID, "draining-state row missing spool file after crash"); mErr != nil {
 					log.Printf("spool recover: mark draining→failed %d: %v", r.ID, mErr)
 					continue
 				}
@@ -718,7 +723,8 @@ func (s *SpoolStore) MarkDrainRetry(id int64, reason string) error {
 // The quarantined file is left on disk. Operators can inspect/recover/
 // delete it manually.
 func (s *SpoolStore) QuarantineDrain(id int64, nfsPath, spoolFile string, size int64, reason string) error {
-	if err := s.meta.MarkFailed(id, reason); err != nil {
+	transitioned, err := s.meta.MarkFailed(id, reason)
+	if err != nil {
 		return err
 	}
 	quarantineDir := filepath.Join(s.root, "quarantine")
@@ -731,7 +737,12 @@ func (s *SpoolStore) QuarantineDrain(id int64, nfsPath, spoolFile string, size i
 	if err := os.Rename(spoolFile, dest); err != nil && !os.IsNotExist(err) {
 		log.Printf("spool: quarantine move %s→%s: %v", spoolFile, dest, err)
 	}
-	s.releaseCapacity(size)
+	// Same ownership rule as failPermanent (adversarial-review BUG 1): a
+	// row deleted/requeued out from under this drain already had its
+	// reservation handled by that path — release only on a real transition.
+	if transitioned {
+		s.releaseCapacity(size)
+	}
 	if e, ok := s.index.Lookup(nfsPath); ok && e.ID() == id {
 		s.index.DeleteIfMatches(nfsPath, e)
 	}
@@ -805,11 +816,124 @@ func (s *SpoolStore) tryReserveCapacity(delta int64) bool {
 // releaseCapacity returns reserved bytes to the budget. Used when a
 // reserved write partially failed and the actual delta committed to
 // disk was less than reserved.
+//
+// Floored at zero via CAS: `used` represents bytes on the spool disk
+// and can never legitimately be negative. A release that would push it
+// below zero is an unbacked release (e.g. a row whose reservation was
+// dropped across a restart gets retried and later drains) — clamping
+// keeps the invariant instead of letting the counter wander negative
+// and silently widen the capacity budget.
 func (s *SpoolStore) releaseCapacity(delta int64) {
 	if delta <= 0 {
 		return
 	}
-	s.used.Add(-delta)
+	for {
+		cur := s.used.Load()
+		next := cur - delta
+		if next < 0 {
+			next = 0
+		}
+		if s.used.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
+// RetryFailed resets every FAILED row whose spool file still exists on
+// disk back to `ready` with a fresh attempt budget, re-reserves its
+// bytes against the capacity counter, and wakes the drainer. Rows whose
+// spool file is gone (boot-scrubbed writing rows, quarantined rows —
+// their file lives under quarantine/, not at spool_file) are skipped:
+// there is nothing to retry. Never deletes user bytes. Returns the
+// number of rows requeued.
+//
+// Capacity note: terminal rows are not part of the `used` budget
+// (failPermanent releases, RecoverOnBoot doesn't count failed rows), so
+// a retried row's bytes are re-added here. The add is unconditional
+// rather than tryReserveCapacity — an operator-initiated recovery must
+// not fail on the advisory cap; transient over-cap drains away as the
+// requeued rows complete.
+func (s *SpoolStore) RetryFailed() (int, error) {
+	rows, err := s.meta.ListAll()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	skippedStale := 0
+	for _, r := range rows {
+		if r.DrainState != metadata.DrainFailed || r.SpoolFile == "" {
+			continue
+		}
+		if _, statErr := os.Stat(r.SpoolFile); statErr != nil {
+			continue
+		}
+		// Staleness guard (adversarial-review BUG 3): a NEWER row for the
+		// same path — drained, in flight, or even failed-again — means the
+		// user acted on the path after this failure. Requeuing the old spool
+		// file would clobber newer bytes with stale ones (the drainer's SHA
+		// check validates integrity, not freshness). Skip; the row stays
+		// failed and ages out of the status view.
+		if newer, nErr := s.meta.HasNewerRowForPath(r.NFSPath, r.ID); nErr != nil {
+			log.Printf("spool: retry-failed newer-row check %d (%s): %v", r.ID, r.NFSPath, nErr)
+			continue
+		} else if newer {
+			skippedStale++
+			continue
+		}
+		// Reserve BEFORE the state transition (adversarial-review BUG 4):
+		// reset-then-reserve let a concurrent CancelForDelete release the
+		// not-yet-reserved bytes (clamped at 0) and the late Add then leaked
+		// `used` upward until restart. Reserve-then-reset keeps the counter
+		// owned by whichever side wins; on a lost reset, undo via the
+		// floored release.
+		if r.Size > 0 {
+			s.used.Add(r.Size)
+		}
+		ok, resetErr := s.meta.ResetForRetry(r.ID)
+		if resetErr != nil || !ok {
+			if r.Size > 0 {
+				s.releaseCapacity(r.Size)
+			}
+			if resetErr != nil {
+				log.Printf("spool: retry-failed reset %d (%s): %v", r.ID, r.NFSPath, resetErr)
+			}
+			continue
+		}
+		n++
+	}
+	if skippedStale > 0 {
+		jmlog.Warn("spool: retry-failed skipped stale rows (newer row exists for path)",
+			"skipped", skippedStale)
+	}
+	if n > 0 {
+		jmlog.Info("spool: retry-failed requeued rows", "count", n)
+		s.signalReady()
+	}
+	return n, nil
+}
+
+// RecoverStalled force-finalizes every stalled `writing` entry NOW
+// instead of waiting for the sweeper's next pass: entries with leaked
+// handles quiescent beyond the escalation window go through the same
+// escalateIfStuck path (refcount zeroed, fsync + SHA + mark-ready —
+// bytes preserved, never deleted), and quiescent refcount-0 entries are
+// finalized via the normal idle path. Returns the number of entries
+// finalized. This is the action behind
+// /spool-recover?action=clear-stalled.
+func (s *SpoolStore) RecoverStalled() int {
+	window := s.escalateAfter
+	if window <= 0 {
+		// Escalation disabled — nothing qualifies as stalled.
+		return 0
+	}
+	// sweepOnce(idle=window) finalizes refcount-0 entries idle ≥ window
+	// and escalates refcount>0 entries quiescent ≥ s.escalateAfter —
+	// exactly the stalled predicate /spool reports.
+	n := s.sweepOnce(window)
+	if n > 0 {
+		jmlog.Info("spool: recover-stalled force-finalized entries", "count", n)
+	}
+	return n
 }
 
 // SpoolEntry is one in-flight or pending-upload file. Holds a write fd to
@@ -1264,7 +1388,7 @@ func (e *SpoolEntry) CloseAndDelete(reason string) error {
 	} else if err == nil {
 		e.store.releaseCapacity(written)
 	}
-	if err := e.store.meta.MarkFailed(id, reason); err != nil && firstErr == nil {
+	if _, err := e.store.meta.MarkFailed(id, reason); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	e.store.index.DeleteIfMatches(nfsPath, e)

@@ -222,10 +222,21 @@ struct PreferencesWindowView: View {
 
             Section {
                 Toggle("Enable write spool", isOn: $preferences.spoolEnabled)
-                    .onChange(of: preferences.spoolEnabled) { _, _ in
-                        // The Go core reads JM_SPOOL_ENABLE only at start, so
+                    .onChange(of: preferences.spoolEnabled) { _, newValue in
+                        // The Go core reads the spool flag only at start, so
                         // a running server must restart to pick up the change.
-                        if isRunningLike { server.restart() }
+                        guard !suppressSpoolToggleSideEffect else { return }
+                        guard isRunningLike else { return }
+                        if newValue {
+                            server.restart()
+                        } else {
+                            // LB-3 stranded-writes guard: restarting with the
+                            // spool DISABLED skips ALL spool wiring including
+                            // boot recovery, so any not-yet-uploaded entries
+                            // would be orphaned forever — Finder already told
+                            // the user "copied". Check pending before applying.
+                            checkPendingThenDisableSpool()
+                        }
                     }
                 LabeledContent("Spool Capacity") {
                     HStack {
@@ -252,6 +263,83 @@ struct PreferencesWindowView: View {
             restartHint
         }
         .formStyle(.grouped)
+        // LB-3 stranded-writes guard dialogs. confirmationDialog matches the
+        // destructive-action idiom used elsewhere (Stop everything, Reset DB).
+        .confirmationDialog(
+            "\(spoolDisablePendingFiles) file\(spoolDisablePendingFiles == 1 ? "" : "s") (\(formatBytesPrefs(spoolDisablePendingBytes))) not yet uploaded",
+            isPresented: $showSpoolDisableDialog,
+            titleVisibility: .visible
+        ) {
+            Button("Upload now, then turn off") {
+                spoolDrainWaitActive = true
+            }
+            Button("Turn off anyway", role: .destructive) {
+                // The bytes stay on the local SSD and the rows stay in the
+                // index, but with the spool off nothing will ever upload
+                // them (the Go side logs a loud warning at start).
+                server.restart()
+            }
+            Button("Cancel", role: .cancel) {
+                revertSpoolToggleToEnabled()
+            }
+        } message: {
+            Text("Turning the write spool off skips its recovery at start, so files still waiting to upload would stay stranded on this Mac — even though Finder already reported them as copied. Upload them first, or keep the spool on.")
+        }
+        .sheet(isPresented: $spoolDrainWaitActive) {
+            SpoolDrainWaitView(
+                metricsAddr: preferences.metricsAddr,
+                onDrained: {
+                    spoolDrainWaitActive = false
+                    server.restart()
+                },
+                onCancel: {
+                    spoolDrainWaitActive = false
+                    revertSpoolToggleToEnabled()
+                }
+            )
+        }
+    }
+
+    // MARK: - LB-3: spool-disable stranded-writes guard
+
+    @State private var showSpoolDisableDialog = false
+    @State private var spoolDisablePendingFiles = 0
+    @State private var spoolDisablePendingBytes: Int64 = 0
+    @State private var spoolDrainWaitActive = false
+    /// Set while we programmatically revert the toggle so onChange doesn't
+    /// treat the revert as a user-initiated enable (and restart again).
+    @State private var suppressSpoolToggleSideEffect = false
+
+    /// Fetch a FRESH pending snapshot off the main thread, then either
+    /// apply the disable directly (nothing pending) or raise the dialog.
+    private func checkPendingThenDisableSpool() {
+        Task {
+            // NFSBridge.spoolStatus is blocking HTTP — keep it off MainActor.
+            let sp = await Task.detached { NFSBridge.spoolStatus(metricsAddr: preferences.metricsAddr) }.value
+            await MainActor.run {
+                if let sp, sp.enabled, sp.hasActivity {
+                    spoolDisablePendingFiles = sp.pendingFiles
+                    spoolDisablePendingBytes = sp.pendingBytes
+                    showSpoolDisableDialog = true
+                } else {
+                    // Nothing pending (or spool already off server-side):
+                    // safe to restart with the spool disabled.
+                    server.restart()
+                }
+            }
+        }
+    }
+
+    private func revertSpoolToggleToEnabled() {
+        suppressSpoolToggleSideEffect = true
+        preferences.spoolEnabled = true
+        // Clear on the next runloop tick, after onChange has observed the
+        // revert with the suppression flag still up.
+        DispatchQueue.main.async { suppressSpoolToggleSideEffect = false }
+    }
+
+    private func formatBytesPrefs(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     // MARK: - Advanced
@@ -382,6 +470,136 @@ struct PreferencesWindowView: View {
             // Also clean up WAL files
             try? FileManager.default.removeItem(atPath: preferences.dbPath + "-wal")
             try? FileManager.default.removeItem(atPath: preferences.dbPath + "-shm")
+        }
+    }
+}
+
+// MARK: - Spool drain-wait (LB-3)
+
+/// Small progress surface shown while we wait for the write spool to finish
+/// uploading. Polls `/spool` once a second and calls `onDrained` when the
+/// queue empties. Used by two stranded-write guards:
+///   - Preferences → "Upload now, then turn off" (spool-disable guard)
+///   - Quit → "Wait for uploads" (applicationShouldTerminate guard)
+struct SpoolDrainWaitView: View {
+    let metricsAddr: String
+    /// Optional extra escape hatch (the quit flow offers "Quit anyway").
+    var skipTitle: String?
+    var onSkip: (() -> Void)?
+    let onDrained: () -> Void
+    let onCancel: () -> Void
+
+    @State private var pendingFiles = 0
+    @State private var pendingBytes: Int64 = 0
+    @State private var inProgress: Int64 = 0
+    @State private var stalledFiles = 0
+    @State private var failedFiles = 0
+    @State private var hasFetched = false
+    /// Terminal states: the wait STOPPED without success. Auto-proceed must
+    /// never fire from these — "all the files failed" is not "all the files
+    /// uploaded" (adversarial-review BUG 2: with the NAS down, rows exhaust
+    /// retries and pending hits 0 BECAUSE everything failed; auto-proceeding
+    /// here quits/disables right on top of the stranding LB-3 exists to
+    /// prevent). The user decides explicitly.
+    @State private var endedWithFailures = false
+    @State private var serverUnreachable = false
+    @State private var nilStreak = 0
+
+    private var proceedTitle: String { skipTitle ?? "Continue anyway" }
+    private func proceedAnyway() { (onSkip ?? onDrained)() }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                if endedWithFailures || serverUnreachable {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                } else {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Text(endedWithFailures ? "Uploads finished with failures"
+                     : serverUnreachable ? "Can't reach the upload service"
+                     : "Uploading pending files…")
+                    .font(.headline)
+            }
+            if endedWithFailures {
+                Text("\(failedFiles) file\(failedFiles == 1 ? "" : "s") failed to upload — they remain only on this Mac. Use \"Retry failed\" in the menu-bar popover once the server is reachable, or continue and they stay parked in the local spool.")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            } else if serverUnreachable {
+                Text("The control plane stopped answering. The queue state is unknown — continuing may leave files un-uploaded.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if hasFetched {
+                Text("\(pendingFiles) file\(pendingFiles == 1 ? "" : "s") (\(ByteCountFormatter.string(fromByteCount: pendingBytes, countStyle: .file))) remaining\(inProgress > 0 ? " · \(inProgress) uploading now" : "")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Checking the upload queue…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if !endedWithFailures && !serverUnreachable && (stalledFiles + failedFiles) > 0 {
+                Label("\(stalledFiles + failedFiles) entr\(stalledFiles + failedFiles == 1 ? "y" : "ies") look stuck — this wait may not finish. Use \"Retry failed\" / \"Recover stalled\" in the menu-bar popover.", systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+            HStack {
+                Spacer()
+                if endedWithFailures || serverUnreachable {
+                    Button(proceedTitle, role: .destructive) { proceedAnyway() }
+                } else if let skipTitle, let onSkip {
+                    Button(skipTitle, role: .destructive) { onSkip() }
+                }
+                Button("Cancel") { onCancel() }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+        .task {
+            // 1 Hz poll until drained or the view goes away. The fetch is
+            // blocking HTTP, so it runs detached off MainActor.
+            while !Task.isCancelled {
+                let sp = await Task.detached { NFSBridge.spoolStatus(metricsAddr: metricsAddr) }.value
+                if Task.isCancelled { return }
+                if let sp {
+                    nilStreak = 0
+                    serverUnreachable = false
+                    pendingFiles = sp.pendingFiles
+                    pendingBytes = sp.pendingBytes
+                    inProgress = sp.inProgress
+                    stalledFiles = sp.stalledFiles
+                    failedFiles = sp.failedFiles
+                    hasFetched = true
+                    if sp.enabled && !sp.hasActivity {
+                        if sp.failedFiles > 0 {
+                            // Queue emptied by FAILURE, not success: stop and
+                            // make the user decide (BUG 2). No auto-proceed.
+                            endedWithFailures = true
+                            return
+                        }
+                        onDrained()
+                        return
+                    }
+                    if !sp.enabled {
+                        // Spool vanished server-side (e.g. server stopped):
+                        // nothing more to wait for here.
+                        onDrained()
+                        return
+                    }
+                } else {
+                    nilStreak += 1
+                    if nilStreak >= 5 {
+                        // ~5s of no answers: stop spinning forever on a dead
+                        // control plane; surface it and let the user decide.
+                        serverUnreachable = true
+                        return
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
         }
     }
 }
