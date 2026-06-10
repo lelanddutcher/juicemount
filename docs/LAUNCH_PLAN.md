@@ -185,6 +185,25 @@ an isolated worktree and rebase after N's commit. Merges stay serialized.
   z-quarantine/ ships (internal junk, no secrets); capture the 7Gbit/s
   test command for the methodology doc someday.
 
+- **Phase 5** (2026-06-10): full-suite final validation. Suite (11 phases,
+  62 min): **86 pass / 3 fail / 3 warn** — all 3 failures triaged to
+  non-regressions: 02-finder + 03-media = the known burst-create stall
+  (quantified ~2% at 20-way bursts; 100-copy controlled repro proved ZERO
+  md5 mismatches — failures are missing-with-error, never silent
+  corruption); 12-perf = suite bug (zero-pins no-op counted as breach).
+  04-fio 8/0 (pre-Phase-1 ftruncate failures now pass under full bench),
+  07-failure 7/0 (fault injection + self-heal), 09-endurance 3/0.
+  Wedges: write-integrity 8/8 ✅; fuse-hang PASS (0.65s kernel surrender,
+  28ms cached, 0.02s recovery) ✅; crash-recovery clean after real SIGKILL
+  (WAL reopened, zero errors; harness itself has an eval bug — filed) ✅;
+  **nfs-loopback-mid-shutdown FAILED its acceptance — real P1-INVESTIGATE
+  filed**: /stop with a 1.8GB read in flight wedged the read in
+  uninterruptible wait 3+ hours (no soft-mount surrender against the
+  stopped server); manual umount -f released it instantly; machine
+  recovered, app healthy. Deferred to an interactive session (need
+  sudo/pfctl with the founder present): 08-netshape, minio-down-mid-read,
+  test-offline-resilience. QA-suite harness bugs filed (4; one fixed).
+
 ### New findings logged during Phase 1 gate (not regressions)
 - Burst-create ETIMEDOUT ~1/1000 under load (QA-29 stall class, newly
   visible now that 02-finder runs past rsync) — candidate Phase 2/3.
