@@ -50,8 +50,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Auto-start the server on launch — saves the user a click.
         // If they want to manually control start/stop, they can quit and
         // start it from the popover instead. Most-common case is auto-start.
+        //
+        // LB-1 onboarding gate: instead of auto-starting into a dead-end
+        // "Disconnected", first-run (hasCompletedOnboarding == false) or a
+        // failing critical preflight (juicefs / macFUSE / backend) opens
+        // the setup-assistant window, which guides the fix and starts the
+        // server from its Continue button. When everything passes on an
+        // already-onboarded machine, startup proceeds exactly as before —
+        // the preflight file checks are instant and the TCP dial is bounded
+        // at 3 s, well inside the existing start budget.
         if !NFSBridge.isRunning {
-            server.start()
+            if !server.preferences.hasCompletedOnboarding {
+                menuBarController.openOnboardingWindow()
+            } else {
+                let redisURL = server.preferences.redisURL
+                Task { @MainActor in
+                    let report = await OnboardingPreflight.run(redisURL: redisURL)
+                    if report.criticalOK {
+                        server.start()
+                    } else {
+                        NFSBridge.appLog("launch preflight failed (juicefs=\(report.juicefsPath ?? "missing") macfuse=\(report.macFUSEInstalled) backend=\(report.backendReachable) \(report.backendDetail)) — opening setup assistant")
+                        self.menuBarController.openOnboardingWindow()
+                    }
+                }
+            }
         }
     }
 

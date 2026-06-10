@@ -110,6 +110,31 @@ an isolated worktree and rebase after N's commit. Merges stay serialized.
   ✅, /spool fields ✅, /spool-recover contract ✅, QA 01-smoke 10/10 +
   10-control-plane 16/16 ✅.
 
+- **Phase 3** (2026-06-10): UI sprint. Implementer died at session limit
+  AFTER finishing (no report; diff was the truth): state-tinted logo
+  menu-bar icon (approved spec incl. precedence + idle 0.5α + upload
+  badge, cached NSImages, SF-Symbol fallback) + AppIcon.icns pipeline in
+  build-app.sh (svg2png, all-or-nothing menubar dir, legacy fallback);
+  at-a-glance popover header (health word / cache-vs-free bar / uploads
+  row); onboarding assistant (431-line window, preflight juicefs+macFUSE+
+  backend dial, launch gate, Setup Assistant menu item); /mount-now
+  endpoint (5 tests) + NFS in /health + glance state machine.
+  Adversarial review: SHIP-WITH-FIXES → applied: (1) P1-A Mount Now UI
+  was never wired (review's "classic session-limit death") — remedy row +
+  spinner + honest "Volume not mounted" subtitle added; (2) P1-B
+  auto-remount disarmed BEFORE unmount in NFSServerShutdown/StopMount
+  (stop-window remount race → orphaned kernel mount, QA-27 class);
+  (3) P2-A assistant Continue from .error now drives stop→start instead
+  of silently no-opping; (4) P2-B upgrade migration: absent
+  hasCompletedOnboarding key + existing metadata.db ⇒ onboarded (no
+  first-run window on configured installs). Non-blocking follow-ups →
+  Phase 3b/4: preflight auto-retry while gate-blocked assistant open;
+  /mount-now server-side single-flight; health-details auto-expand
+  initial state; juicefs PATH-fallback drift; item-5 cleanups (6×
+  hardcoded 11050, Reset-DB flow). Gate: build/vet/gofmt ✅, bridge tests
+  ✅, full sweep = 8 known env-dependent only ✅, swift 0 errors ✅,
+  bundle pipeline produced 8 menubar PNGs + 498KB icns ✅.
+
 ### New findings logged during Phase 1 gate (not regressions)
 - Burst-create ETIMEDOUT ~1/1000 under load (QA-29 stall class, newly
   visible now that 02-finder runs past rsync) — candidate Phase 2/3.

@@ -24,10 +24,10 @@ type NetWatcher struct {
 	pollInterval time.Duration
 	callbacks    []NetChangeCallback
 
-	mu            sync.RWMutex
-	activeIface   string
-	lastChangeAt  time.Time
-	changeCount   int
+	mu           sync.RWMutex
+	activeIface  string
+	lastChangeAt time.Time
+	changeCount  int
 
 	stopCh   chan struct{}
 	stopOnce sync.Once

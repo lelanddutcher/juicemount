@@ -61,6 +61,12 @@ var (
 	globalFUSE      *health.FUSEManager
 	globalFUSEPath  string // remembered across Stop/Start so we can detect existing mount
 	globalMountPath string
+	// globalWantMountPoint is the CONFIGURED mount point from the last
+	// Start — unlike globalMountPath it is set even when the mount attempt
+	// failed, so /mount-now (LB-2) knows what to mount. Never cleared on
+	// stop: retrying against the last-configured path is exactly the
+	// recovery /mount-now exists for.
+	globalWantMountPoint string
 
 	// Pin / offline / prefetch globals
 	globalPinStore   *pin.Store
@@ -572,6 +578,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// fail because the mount point is busy and would prompt for a password
 	// for no reason.
 	if cfg.MountPoint != "" {
+		globalWantMountPoint = cfg.MountPoint
 		if isMounted(cfg.MountPoint) {
 			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
 			globalMountPath = cfg.MountPoint
@@ -630,6 +637,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// writing entries (bytes preserved). Loopback-only GET,
 			// same mutation convention as /offline?on=….
 			"/spool-recover": handleSpoolRecoverHTTP,
+			// LB-2 "Mount Now": re-runs the user-visible NFS mount for
+			// the configured mount point. No-op success when already
+			// mounted. Loopback-only GET, same mutation convention as
+			// /spool-recover. May block on the macOS admin prompt.
+			"/mount-now": handleMountNowHTTP,
 			// Phase B observability: net/http/pprof routes for live
 			// goroutine/heap/cpu/trace dumps. pprof.Index serves
 			// /debug/pprof/goroutine, /debug/pprof/heap, etc. via the
@@ -666,6 +678,27 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		FUSEPath:      cfg.FUSEPath,
 		NFSMountPoint: cfg.MountPoint,
 	})
+	// LB-2: auto-remount for a stale/unmounted NFS volume — the same hook
+	// the jm5 CLI has always wired. STRICTLY the non-interactive tier
+	// (passwordless sudo): an unattended health tick must never pop an
+	// admin-password dialog. Machines without the scoped sudoers entry get
+	// a logged failure here, and the user-facing recovery is the popover's
+	// "Mount Now" button (→ /mount-now → interactive prompt path).
+	// Deliberate Stop paths tear the monitor down, so auto-remount can't
+	// fight an intentional unmount.
+	if cfg.MountPoint != "" {
+		remountAddr := srv.Addr()
+		remountPoint := cfg.MountPoint
+		globalMonitor.EnableNFSRemount(func() error {
+			if err := mountNFSNonInteractive(remountAddr, remountPoint); err != nil {
+				return err
+			}
+			globalMu.Lock()
+			globalMountPath = remountPoint
+			globalMu.Unlock()
+			return nil
+		})
+	}
 	globalMonitor.Start()
 
 	// Expose health to /health endpoint. Capture the monitor in the
@@ -887,10 +920,22 @@ func stopServerLocked() {
 func NFSServerStopMount() {
 	globalMu.Lock()
 	mountPath := globalMountPath
+	mon := globalMonitor
 	// Mark mount-gone publicly so concurrent Stats / IsRunning read
 	// honest state during the slow unmount.
 	globalMountPath = ""
 	globalMu.Unlock()
+
+	// Disarm NFS auto-remount BEFORE unmounting (review P1-B): the
+	// monitor's 10s tick can land mid-unmount, see its stale-streak hit
+	// the threshold, and REMOUNT the volume this deliberate stop is
+	// tearing down — once the server then dies, that's an orphaned kernel
+	// NFS mount (the QA-27 60s-EIO Finder-hang class). The monitor itself
+	// is stopped later in stopServerLocked; only the remount callback must
+	// be neutered before the unmount window opens.
+	if mon != nil {
+		mon.EnableNFSRemount(nil)
+	}
 
 	// Step 1: unmount NFS while server is still alive so the kernel
 	// gets clean flush/getattr responses during the unmount handshake.
@@ -932,12 +977,20 @@ func NFSServerShutdown() {
 	globalMu.Lock()
 	mountPath := globalMountPath
 	fuse := globalFUSE
+	mon := globalMonitor
 	// Mark "shutting down" by nil-ing the publicly-observable fields. The
 	// snapshotted pointers stay valid for the unmount work below.
 	globalMountPath = ""
 	globalFUSE = nil
 	globalFUSEPath = ""
 	globalMu.Unlock()
+
+	// Disarm NFS auto-remount BEFORE the unmount window (review P1-B —
+	// see NFSServerStopMount for the full rationale): a monitor tick
+	// landing mid-unmount must not remount the volume we're shutting down.
+	if mon != nil {
+		mon.EnableNFSRemount(nil)
+	}
 
 	// Step 1: unmount NFS while the server is still alive (handler can
 	// satisfy any kernel flush/getattr during the unmount handshake). No
@@ -1183,85 +1236,43 @@ func runMountViaSudo(mountPoint, opts, host string) error {
 	return nil
 }
 
-func mountNFSWithPrompt(serverAddr, mountPoint string) error {
-	host := "127.0.0.1"
+// nfsMountArgs derives the mount_nfs host + options string from the NFS
+// server's listen address. Shared by the interactive (mountNFSWithPrompt)
+// and non-interactive (mountNFSNonInteractive) paths so the heavily-tuned
+// option string below can never fork between them.
+func nfsMountArgs(serverAddr string) (host, opts string) {
+	host = "127.0.0.1"
 	port := "11049"
 	if i := strings.LastIndex(serverAddr, ":"); i > 0 {
 		host = serverAddr[:i]
 		port = serverAddr[i+1:]
 	}
+	opts = nfsMountOpts(port)
+	return host, opts
+}
+
+// mountNFSNonInteractive re-runs the NFS mount via the passwordless-sudo
+// tier ONLY — it can never pop a dialog, so it's safe to call from
+// unattended contexts (the health monitor's auto-remount). No-op success
+// when already mounted. Machines without the scoped sudoers entry get an
+// error (logged by the caller); the user-facing recovery there is the
+// interactive "Mount Now" button → /mount-now → mountNFSWithPrompt.
+func mountNFSNonInteractive(serverAddr, mountPoint string) error {
+	if isMounted(mountPoint) {
+		return nil
+	}
+	host, opts := nfsMountArgs(serverAddr)
+	return runMountViaSudo(mountPoint, opts, host)
+}
+
+func mountNFSWithPrompt(serverAddr, mountPoint string) error {
+	host, opts := nfsMountArgs(serverAddr)
 
 	// If something else is already mounted at the mount point, refuse —
 	// don't trample over the user's data. They need to unmount first.
 	if isMounted(mountPoint) {
 		return fmt.Errorf("%s is already mounted (umount it first)", mountPoint)
 	}
-
-	// Timeout policy. Tuned for a localhost NFS server (us). The kernel
-	// client's timeo is in 0.1-second units, so timeo=200 means 20 s
-	// initial timeout; retrans=2 means at most 2 retries before returning
-	// EIO to the calling syscall. Worst-case dead-server detection: ~60 s.
-	//
-	// QA-29 (2026-05-21): bumped from timeo=100 (10 s) to timeo=200 (20 s).
-	// Under heavy folder-copy load (Editor Resource Vault with thousands
-	// of small files), per-RPC measurements showed CREATE max = 29.02 s
-	// while WRITE max stayed at 5.07 s. CREATE chains JuiceFS LOOKUP +
-	// Create + metadata.Store Insert — the SQLite writeMu contends with
-	// the reconcile loop's BulkInsert which holds the lock per 500-entry
-	// batch. The previous timeo=100 (~30 s budget) was right at the edge;
-	// any TCP RTT pushed CREATEs over the kernel's retransmit window and
-	// surfaced ETIMEDOUT to Finder as "operation can't be completed
-	// (error 100060)" mid-copy. timeo=200 gives ~60 s budget — comfortable
-	// margin for CREATE stalls during metadata sync.
-	//
-	// QA-27 (2026-05-21): bumped from timeo=10 (1 s) to timeo=100 (10 s)
-	// after measuring WRITE p99=1.88 s, worst=6.23 s when JuiceFS disk
-	// cache was 94% full. That fix covered WRITE-side stalls; QA-29 closes
-	// the CREATE-side gap.
-	//
-	// Why this matters: with the previous timeo=300,retrans=5 settings,
-	// when the JuiceMount user-space server died but the kernel mount
-	// table still had /Volumes/zpool registered, every stat() that landed
-	// on that path would wait 150 s before returning EIO. Finder, on
-	// launch, enumerates /Volumes/ to populate the sidebar — that
-	// enumeration includes a stat per mount, so Finder would hang for
-	// 150 s+. Force-quitting Finder didn't help because the relaunched
-	// process repeated the same enumeration. The user perceived "Finder
-	// won't launch."
-	//
-	// The tradeoff: real backend hiccups now surface as EIO after ~60 s
-	// instead of after ~150 s. For our localhost-only NFS path, that's
-	// the right policy — a 60 s blip is annoying, a 150 s blip looks
-	// indistinguishable from a system hang. (Original aggressive 3 s
-	// budget was too tight for big-file copy under JuiceFS writeback
-	// pressure; QA-27/QA-29 moved the dial to 60 s.)
-	// [QA-31] rsize=1048576 (1 MiB). Was 262144 (256 KiB).
-	//
-	// History: QA-31 (2026-05-25): bumped back to 1 MiB. Live
-	// measurement on a hot cached MP4 showed NFS throughput at 9.5
-	// MB/s vs FUSE-direct 1.3 GB/s — a 140× slowdown isolated to the
-	// per-NFS-RPC overhead (each READ RPC chains an Open via fdPool +
-	// two Stats via fs.Stat/tryStat which each go through JuiceFS's
-	// FUSE layer + cachedFile.ReadAt). At rsize=256 KiB this overhead
-	// fires 4× per MiB; bumping back to 1 MiB cuts the per-MiB
-	// overhead to a quarter immediately. The original reason to drop
-	// rsize was timeo=10's tight ~7s per-RPC budget; we're now at
-	// timeo=200 (60s budget) so 1 MiB even on a cold MinIO fetch is
-	// safely within budget.
-	//
-	// Earlier history: 2026-05-16 cold-read instrumentation showed
-	// individual NFS READ RPCs for 1 MiB chunks taking up to 4 s
-	// when JuiceFS-over-MinIO was slow. That problem was fixed at the
-	// timeout layer (QA-29 timeo=200) and is no longer the binding
-	// constraint. The server's internal 256-KiB subdivision in
-	// nfs_onread.go remains as a deadline-protection guarantee inside
-	// each NFS RPC; the OUTER kernel RPC can again be 1 MiB.
-	//
-	// Write size stays at 1 MiB — writes are sequential and the
-	// failure mode there is different.
-	opts := fmt.Sprintf(
-		"port=%s,mountport=%s,soft,intr,timeo=200,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
-		port, port)
 
 	// [JM6] Two-tier mount strategy.
 	//
@@ -1309,6 +1320,77 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 		return fmt.Errorf("osascript: %v\n%s", err, string(out))
 	}
 	return nil
+}
+
+// nfsMountOpts builds the mount_nfs -o option string for our loopback
+// NFS server listening on `port`.
+//
+// Timeout policy. Tuned for a localhost NFS server (us). The kernel
+// client's timeo is in 0.1-second units, so timeo=200 means 20 s
+// initial timeout; retrans=2 means at most 2 retries before returning
+// EIO to the calling syscall. Worst-case dead-server detection: ~60 s.
+//
+// QA-29 (2026-05-21): bumped from timeo=100 (10 s) to timeo=200 (20 s).
+// Under heavy folder-copy load (Editor Resource Vault with thousands
+// of small files), per-RPC measurements showed CREATE max = 29.02 s
+// while WRITE max stayed at 5.07 s. CREATE chains JuiceFS LOOKUP +
+// Create + metadata.Store Insert — the SQLite writeMu contends with
+// the reconcile loop's BulkInsert which holds the lock per 500-entry
+// batch. The previous timeo=100 (~30 s budget) was right at the edge;
+// any TCP RTT pushed CREATEs over the kernel's retransmit window and
+// surfaced ETIMEDOUT to Finder as "operation can't be completed
+// (error 100060)" mid-copy. timeo=200 gives ~60 s budget — comfortable
+// margin for CREATE stalls during metadata sync.
+//
+// QA-27 (2026-05-21): bumped from timeo=10 (1 s) to timeo=100 (10 s)
+// after measuring WRITE p99=1.88 s, worst=6.23 s when JuiceFS disk
+// cache was 94% full. That fix covered WRITE-side stalls; QA-29 closes
+// the CREATE-side gap.
+//
+// Why this matters: with the previous timeo=300,retrans=5 settings,
+// when the JuiceMount user-space server died but the kernel mount
+// table still had /Volumes/zpool registered, every stat() that landed
+// on that path would wait 150 s before returning EIO. Finder, on
+// launch, enumerates /Volumes/ to populate the sidebar — that
+// enumeration includes a stat per mount, so Finder would hang for
+// 150 s+. Force-quitting Finder didn't help because the relaunched
+// process repeated the same enumeration. The user perceived "Finder
+// won't launch."
+//
+// The tradeoff: real backend hiccups now surface as EIO after ~60 s
+// instead of after ~150 s. For our localhost-only NFS path, that's
+// the right policy — a 60 s blip is annoying, a 150 s blip looks
+// indistinguishable from a system hang. (Original aggressive 3 s
+// budget was too tight for big-file copy under JuiceFS writeback
+// pressure; QA-27/QA-29 moved the dial to 60 s.)
+// [QA-31] rsize=1048576 (1 MiB). Was 262144 (256 KiB).
+//
+// History: QA-31 (2026-05-25): bumped back to 1 MiB. Live
+// measurement on a hot cached MP4 showed NFS throughput at 9.5
+// MB/s vs FUSE-direct 1.3 GB/s — a 140× slowdown isolated to the
+// per-NFS-RPC overhead (each READ RPC chains an Open via fdPool +
+// two Stats via fs.Stat/tryStat which each go through JuiceFS's
+// FUSE layer + cachedFile.ReadAt). At rsize=256 KiB this overhead
+// fires 4× per MiB; bumping back to 1 MiB cuts the per-MiB
+// overhead to a quarter immediately. The original reason to drop
+// rsize was timeo=10's tight ~7s per-RPC budget; we're now at
+// timeo=200 (60s budget) so 1 MiB even on a cold MinIO fetch is
+// safely within budget.
+//
+// Earlier history: 2026-05-16 cold-read instrumentation showed
+// individual NFS READ RPCs for 1 MiB chunks taking up to 4 s
+// when JuiceFS-over-MinIO was slow. That problem was fixed at the
+// timeout layer (QA-29 timeo=200) and is no longer the binding
+// constraint. The server's internal 256-KiB subdivision in
+// nfs_onread.go remains as a deadline-protection guarantee inside
+// each NFS RPC; the OUTER kernel RPC can again be 1 MiB.
+//
+// Write size stays at 1 MiB — writes are sequential and the
+// failure mode there is different.
+func nfsMountOpts(port string) string {
+	return fmt.Sprintf(
+		"port=%s,mountport=%s,soft,intr,timeo=200,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
+		port, port)
 }
 
 // unmountNFS removes the NFS mount.
@@ -2041,6 +2123,93 @@ func handleForceEjectHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(500)
 	fmt.Fprintf(w, `{"ok":false,"mount_point":%q,"error":"unmount failed; mount may be wedged in kernel — reboot or 'sudo umount -f -t nfs %s' from a fresh terminal"}`, mp, mp)
+}
+
+// mountNowDeps are the side-effecting pieces of handleMountNowHTTP,
+// swappable so the handler's decision logic is unit-testable without a
+// live server or exec'ing mount(8) (same extract-the-handler discipline
+// as nfs.WriteSpoolStatusJSON). Production values are the real functions.
+var mountNowDeps = struct {
+	isMounted  func(string) bool
+	mount      func(serverAddr, mountPoint string) error
+	serverAddr func() (addr string, running bool)
+}{
+	isMounted: isMounted,
+	mount:     mountNFSWithPrompt,
+	serverAddr: func() (string, bool) {
+		globalMu.Lock()
+		srv := globalServer
+		globalMu.Unlock()
+		if srv == nil {
+			return "", false
+		}
+		return srv.Addr(), true
+	},
+}
+
+// handleMountNowHTTP re-runs the user-visible NFS mount (LB-2 "Mount
+// Now"). Loopback-only GET — the same mutation convention as
+// /spool-recover and /offline?on=…. Idempotent: when the volume is
+// already mounted it reports success without touching anything.
+//
+//	GET /mount-now                   → mount the configured mount point
+//	GET /mount-now?path=/Volumes/x   → explicit override
+//
+// Responses:
+//
+//	200 {"ok":true,"mount_point":"…","already_mounted":true|false}
+//	400 {"ok":false,"error":"no mount point configured"}
+//	500 {"ok":false,"mount_point":"…","error":"…"}  — mount attempt failed
+//	503 {"ok":false,"error":"server not running"}
+//
+// May block while macOS shows the admin-password prompt (the AppleScript
+// tier inside mountNFSWithPrompt) — callers should allow a generous
+// timeout, like the Swift force-eject caller does.
+func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	globalMu.Lock()
+	mp := r.URL.Query().Get("path")
+	if mp == "" {
+		mp = globalWantMountPoint
+	}
+	if mp == "" {
+		mp = globalMountPath
+	}
+	globalMu.Unlock()
+
+	addr, running := mountNowDeps.serverAddr()
+	if !running {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"ok":false,"error":"server not running"}`)
+		return
+	}
+	if mp == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"ok":false,"error":"no mount point configured"}`)
+		return
+	}
+	if mountNowDeps.isMounted(mp) {
+		fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_mounted":true}`, mp)
+		return
+	}
+	jmlog.Info("mount-now: mounting", "mount_point", mp)
+	if err := mountNowDeps.mount(addr, mp); err != nil {
+		// Lost a race with a concurrent mount (auto-remount, a second
+		// click): if the volume IS mounted now, that's still success.
+		if mountNowDeps.isMounted(mp) {
+			fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_mounted":true}`, mp)
+			return
+		}
+		jmlog.Warn("mount-now: mount failed", "mount_point", mp, "error", err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"ok":false,"mount_point":%q,"error":%q}`, mp, err.Error())
+		return
+	}
+	globalMu.Lock()
+	globalMountPath = mp
+	globalMu.Unlock()
+	jmlog.Info("mount-now: mounted", "mount_point", mp)
+	fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_mounted":false}`, mp)
 }
 
 // stopInProgress gates the /stop handler's teardown goroutine.

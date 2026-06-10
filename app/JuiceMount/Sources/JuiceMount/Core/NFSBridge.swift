@@ -551,6 +551,69 @@ public enum NFSBridge {
         return result
     }
 
+    // MARK: - Mount Now (LB-2)
+
+    /// Result of `/mount-now` — the control-plane action that re-runs the
+    /// user-visible NFS mount. Mirrors handleMountNowHTTP in cbridge.go.
+    public struct MountNowResult: Codable, Equatable {
+        public var ok: Bool = false
+        public var mountPoint: String = ""
+        public var alreadyMounted: Bool = false
+        public var error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case ok
+            case mountPoint = "mount_point"
+            case alreadyMounted = "already_mounted"
+            case error
+        }
+
+        /// Tolerant decode — same JSON-null discipline as SpoolStatus et al.
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.ok = try c.decodeIfPresent(Bool.self, forKey: .ok) ?? false
+            self.mountPoint = try c.decodeIfPresent(String.self, forKey: .mountPoint) ?? ""
+            self.alreadyMounted = try c.decodeIfPresent(Bool.self, forKey: .alreadyMounted) ?? false
+            self.error = try c.decodeIfPresent(String.self, forKey: .error)
+        }
+    }
+
+    /// Trigger the LB-2 "Mount Now" action. Blocking — call from a
+    /// background queue, NEVER the serial workQueue: the Go side may sit
+    /// inside the macOS admin-password prompt for as long as the user
+    /// stares at it, and parking workQueue would freeze stats polling.
+    ///
+    /// Idempotent server-side (already-mounted → ok). Returns nil when the
+    /// metrics server is unreachable or the body is unparseable (logged).
+    public static func mountNow(metricsAddr: String = "127.0.0.1:11050") -> MountNowResult? {
+        guard let url = URL(string: "http://\(metricsAddr)/mount-now") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        // Generous: the AppleScript admin prompt waits on the human.
+        req.timeoutInterval = 180
+        // Deliberately NOT loopbackSession(): its 5 s resource timeout
+        // would kill the request while the password prompt is up.
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 180
+        cfg.timeoutIntervalForResource = 180
+        cfg.waitsForConnectivity = false
+        let session = URLSession(configuration: cfg)
+        let sem = DispatchSemaphore(value: 0)
+        var result: MountNowResult?
+        session.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            do {
+                result = try JSONDecoder().decode(MountNowResult.self, from: data)
+            } catch {
+                appLog("mountNow decode failed — returning nil: \(error)")
+            }
+        }.resume()
+        sem.wait()
+        session.finishTasksAndInvalidate()
+        return result
+    }
+
     // MARK: - Self-test (A2)
     //
     // Phase A production-hardening: a 10 MB read measured against the live

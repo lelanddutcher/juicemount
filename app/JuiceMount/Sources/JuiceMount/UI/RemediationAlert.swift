@@ -32,6 +32,9 @@ public enum RemediationCategory {
     case syncNowFailed
     case startFailed
     case stopFailed
+    /// LB-2 "Mount Now" (POST-start re-mount of the user-visible NFS
+    /// volume) failed.
+    case mountFailed
     /// Generic fallback when the call site doesn't have a specific
     /// remediation script. Better than nothing; consider adding a
     /// dedicated case if a specific category becomes common.
@@ -48,6 +51,7 @@ public enum RemediationCategory {
         case .syncNowFailed: return "Sync Now failed"
         case .startFailed: return "Start failed"
         case .stopFailed: return "Stop failed"
+        case .mountFailed: return "Mount failed"
         case .generic(let action): return "\(action) failed"
         }
     }
@@ -118,6 +122,10 @@ public enum RemediationCategory {
             return "The teardown sequence hit an error. The mount " +
                    "may be in an inconsistent state — check " +
                    "Activity Monitor for stray juicefs processes."
+        case .mountFailed:
+            return "macOS couldn't mount the NFS volume. Common " +
+                   "causes: the admin-password prompt was cancelled, " +
+                   "or something else is occupying the mount point."
         case .generic:
             return "An unexpected error occurred."
         }
@@ -166,6 +174,11 @@ public enum RemediationCategory {
                    "wait 5s, then reopen the app. Check Activity " +
                    "Monitor for stray 'juicefs' processes and kill " +
                    "any you find."
+        case .mountFailed:
+            return "Click Mount Now again and approve the password " +
+                   "prompt. If it still fails, use Force Eject Mount " +
+                   "to clear a stuck entry, then retry — or restart " +
+                   "via Stop everything → Start."
         case .generic:
             return "Try Stop everything → Start. If the error " +
                    "repeats, file an issue with the diagnostic " +
