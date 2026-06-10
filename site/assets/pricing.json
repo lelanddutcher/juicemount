@@ -1,0 +1,24 @@
+{
+  "fetched": "2026-06-10",
+  "checked": "2026-06",
+  "sources": {
+    "lucidlink": "https://www.lucidlink.com/pricing",
+    "suite": "https://www.suitestudios.io/pricing",
+    "shade": "https://shade.inc/pricing",
+    "b2": "https://www.backblaze.com/cloud-storage/pricing"
+  },
+  "lucidlink_business": { "seat": 27, "included_gb_per_seat": 400, "extra_per_100gb": 8, "soft_cap_tb": 10 },
+  "suite_managed":      { "per_tb": 75, "included_seats": 5, "extra_seat": 10 },
+  "suite_byo":          { "per_tb": 40, "included_seats": 5, "extra_seat": 10 },
+  "shade_growth":       { "seat": 29.75, "active_gb_per_seat": 500, "max_seats": 15 },
+  "object_storage":     { "b2_per_tb": 6, "wasabi_per_tb": 6.99, "r2_per_tb": 15 },
+  "defaults": {
+    "drive_per_usable_tb": 25,
+    "diy_server": 1200,
+    "new_nas": 2500,
+    "tengig_addon": 300,
+    "watts": 120,
+    "kwh": 0.15,
+    "backup_per_tb": 6
+  }
+}

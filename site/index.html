@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JuiceMount — stream the blocks you scrub, from hardware you own</title>
+  <meta name="description" content="JuiceMount mounts your own server as a Finder volume for video editing: block-streaming reads, offline pinning, a write spool, and NVMe caching. Open source, macOS, no storage bill.">
+  <link rel="canonical" href="https://juicemount.com/">
+  <link rel="stylesheet" href="assets/tokens.css">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <nav class="site-nav" aria-label="Main">
+    <div class="container">
+      <a class="brand" href="index.html">
+        <img src="assets/logo-color.svg" alt="" width="30" height="30">
+        JuiceMount
+      </a>
+      <ul>
+        <li><a href="index.html" aria-current="page">Home</a></li>
+        <li><a href="#how">How it works</a></li>
+        <li><a href="compare.html">Compare</a></li>
+        <li><a href="performance.html">Performance</a></li>
+        <li><a href="calculator.html">Calculator</a></li>
+        <li><a href="https://github.com/lelanddutcher/juicemount">GitHub ↗</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <main id="main">
+
+    <!-- Hero — SITE_PLAN.md Option C, the scrub moment -->
+    <header class="band-ink hero">
+      <div class="container">
+        <p class="label">Self-hosted storage for video editors</p>
+        <h1>Scrub three seconds of a 100&nbsp;GB file. Stream only those three seconds.</h1>
+        <p class="lead">JuiceMount is a Finder volume backed by your own server. It streams the blocks your NLE touches instead of syncing whole files, caches them on NVMe so the second play is instant, keeps pinned projects working offline, and acks renders at local-SSD speed while uploading in the background. Open source. Your hardware. No storage bill.</p>
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="https://github.com/lelanddutcher/juicemount#quick-start">Get started</a>
+          <a class="btn btn-outline" href="calculator.html">See the math</a>
+        </div>
+        <p class="hero-qualifier">Open source · macOS 14+ · runs against your own server (TrueNAS, Synology, any Docker box)</p>
+      </div>
+    </header>
+
+    <!-- The hybrid thesis: speed, resilience, economics -->
+    <section class="section" aria-labelledby="pillars-h">
+      <div class="container">
+        <div class="section-head">
+          <h2 id="pillars-h">Speed, resilience, and ownership — without picking two</h2>
+          <p class="muted">Storage SaaS streams blocks but bills forever. Self-hosted sync owns the bytes but moves whole files. Plain NFS is fast and dumb. JuiceMount is the missing combination.</p>
+        </div>
+        <div class="pillars">
+          <div class="card">
+            <span class="stat">7 Gbit/s</span>
+            <h3>Fast because it's your LAN</h3>
+            <p>Roughly 7&nbsp;Gbit/s in both directions on a 10&nbsp;GbE LAN, author-measured — the same wire where sync-class tools capped near <span class="num">1&nbsp;Gbit/s</span> in the same tests. Cached reads come off local NVMe at <span class="num">226–571&nbsp;MB/s</span>; a 100&nbsp;K-file library opens folders in <span class="num">15–120&nbsp;ms</span>.</p>
+          </div>
+          <div class="card">
+            <span class="stat">4–67 ms</span>
+            <h3>Built for the day the network is gone</h3>
+            <p>Pin a project and keep cutting on a plane. In offline mode, un-pinned reads refuse in <span class="num">4–67&nbsp;ms</span> instead of a 30-second hang. The opt-in write spool acks renders on local SSD and trickle-uploads in the background, SHA-256-verified at every hop. kill&nbsp;−9 mid-write, relaunch, and the metadata store reopens clean — that's a test we run, not a promise.</p>
+          </div>
+          <div class="card">
+            <span class="stat">$0</span>
+            <h3>Software is free; the hardware is yours</h3>
+            <p>JuiceMount is open source, Apache-2.0. Suite charges <span class="num">$75/TB/mo</span> managed — or <span class="num">$40/TB/mo</span> to mount a bucket you already own (checked June&nbsp;2026). A one-time box beats a forever bill sooner than you'd think.</p>
+            <p><a href="calculator.html">See when the hardware pays for itself</a></p>
+          </div>
+        </div>
+        <p class="small muted" style="margin-top: var(--space-5)">Performance figures are the author's measurements on his own Apple-Silicon Mac ↔ TrueNAS rig, not independent benchmarks — <a href="https://github.com/lelanddutcher/juicemount/blob/main/docs/PERFORMANCE_METHODOLOGY.md">methodology, workload scripts, and the regression harness are public</a>.</p>
+      </div>
+    </section>
+
+    <!-- How it works -->
+    <section class="section" id="how" aria-labelledby="how-h">
+      <div class="container">
+        <div class="section-head">
+          <h2 id="how-h">How it works</h2>
+          <p class="muted">Your NLE talks to a normal Finder volume. Behind it, the hot path stays local: a Finder-tuned NFS server on localhost, an SQLite metadata cache, an NVMe block cache with pinning and a write spool, and a JuiceFS client that keeps file data as plain S3 objects in MinIO on your box — metadata in Redis.</p>
+        </div>
+
+        <!-- Placeholder figure: replaced by the full brand architecture diagram (sprint item D) -->
+        <figure class="figure" id="arch-diagram">
+          <svg class="diagram" viewBox="0 0 760 320" role="img" aria-labelledby="arch-t arch-d" xmlns="http://www.w3.org/2000/svg">
+            <title id="arch-t">JuiceMount architecture, simplified</title>
+            <desc id="arch-d">Premiere, Resolve, FCPX, or Finder talk over local NFS to the JuiceMount app, which serves SQLite metadata and NVMe cache hits on the Mac and reaches through the JuiceFS client to Redis and MinIO running on your server.</desc>
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-stroke)"></path>
+              </marker>
+            </defs>
+
+            <!-- groups -->
+            <rect class="d-group" x="16" y="40" width="472" height="232" rx="10"></rect>
+            <text class="d-grouplabel" x="28" y="62">Your Mac</text>
+            <rect class="d-group" x="536" y="40" width="208" height="232" rx="10"></rect>
+            <text class="d-grouplabel" x="548" y="62">Your server</text>
+
+            <!-- NLE -->
+            <rect class="d-box d-box-slate" x="36" y="99" width="108" height="120" rx="8"></rect>
+            <text x="90" y="130" text-anchor="middle">Premiere</text>
+            <text x="90" y="150" text-anchor="middle">Resolve</text>
+            <text x="90" y="170" text-anchor="middle">FCPX</text>
+            <text x="90" y="190" text-anchor="middle">Finder</text>
+
+            <!-- JuiceMount.app -->
+            <rect class="d-box d-box-green" x="196" y="84" width="164" height="150" rx="8"></rect>
+            <text class="d-title" x="278" y="110" text-anchor="middle">JuiceMount.app</text>
+            <text x="278" y="136" text-anchor="middle">NFS server (local)</text>
+            <text x="278" y="156" text-anchor="middle">SQLite metadata</text>
+            <text x="278" y="176" text-anchor="middle">NVMe block cache</text>
+            <text x="278" y="196" text-anchor="middle">write spool</text>
+
+            <!-- JuiceFS client -->
+            <rect class="d-box d-box-blue" x="396" y="120" width="80" height="78" rx="8"></rect>
+            <text x="436" y="146" text-anchor="middle">JuiceFS</text>
+            <text x="436" y="163" text-anchor="middle">client</text>
+            <text x="436" y="180" text-anchor="middle">(FUSE)</text>
+
+            <!-- server boxes -->
+            <rect class="d-box d-box-slate" x="556" y="96" width="168" height="56" rx="8"></rect>
+            <text class="d-title" x="640" y="117" text-anchor="middle">Redis</text>
+            <text x="640" y="136" text-anchor="middle">file metadata</text>
+            <rect class="d-box d-box-slate" x="556" y="176" width="168" height="72" rx="8"></rect>
+            <text class="d-title" x="640" y="198" text-anchor="middle">MinIO</text>
+            <text x="640" y="216" text-anchor="middle">file data as</text>
+            <text x="640" y="233" text-anchor="middle">plain S3 objects</text>
+            <text class="d-note" x="640" y="262" text-anchor="middle">docker compose up -d</text>
+
+            <!-- arrows -->
+            <line class="d-arrow" x1="149" y1="159" x2="191" y2="159" marker-start="url(#arrow)" marker-end="url(#arrow)"></line>
+            <text class="d-label" x="170" y="148" text-anchor="middle">NFS v3</text>
+            <line class="d-arrow" x1="365" y1="159" x2="391" y2="159" marker-start="url(#arrow)" marker-end="url(#arrow)"></line>
+            <text class="d-label" x="378" y="148" text-anchor="middle">FUSE</text>
+            <line class="d-arrow" x1="480" y1="150" x2="551" y2="128" marker-start="url(#arrow)" marker-end="url(#arrow)"></line>
+            <line class="d-arrow" x1="480" y1="168" x2="551" y2="206" marker-start="url(#arrow)" marker-end="url(#arrow)"></line>
+            <text class="d-label" x="516" y="166" text-anchor="middle">LAN / WAN</text>
+
+            <!-- flow note -->
+            <text class="d-note" x="380" y="306" text-anchor="middle">reads: NVMe cache first, stream the missing blocks · writes: spool, then background upload · pins: kept local</text>
+          </svg>
+          <figcaption>The read path in one line: metadata answers from local SQLite, cache hits stream from NVMe, and only the missing blocks cross the wire to your server. (Simplified view — the full architecture diagram is on its way.)</figcaption>
+        </figure>
+
+        <dl class="fact-grid">
+          <div>
+            <dt>Block-level partial reads</dt>
+            <dd>Files are chunked objects (JuiceFS). Scrubbing three seconds of a 100&nbsp;GB clip streams only those blocks — no full-file download, ever.</dd>
+          </div>
+          <div>
+            <dt>Finder-proof metadata</dt>
+            <dd>Directory listings come from local SQLite, so a 100&nbsp;K-entry volume opens in <span class="num">15–120&nbsp;ms</span> — the same operation takes 3–10&nbsp;s through raw FUSE.</dd>
+          </div>
+          <div>
+            <dt>A write spool that acks locally</dt>
+            <dd>Opt-in: writes are durable on local SSD the moment they ack, then upload in the background at whatever the network allows — SHA-256-verified at every hop.</dd>
+          </div>
+          <div>
+            <dt>Offline that fails fast</dt>
+            <dd>Flip one toggle: pinned files keep working at SSD speed, and everything else refuses in milliseconds instead of beachballing Finder.</dd>
+          </div>
+        </dl>
+
+        <p class="small" style="margin-top: var(--space-5)"><a href="https://github.com/lelanddutcher/juicemount/blob/main/ARCHITECTURE_juicemount.md">Architecture notes, including the security model, live in the repo</a></p>
+      </div>
+    </section>
+
+    <!-- Closing — SITE_PLAN.md Option A as the mic-drop -->
+    <section class="band-ink section" aria-labelledby="own-h">
+      <div class="container">
+        <div class="section-head">
+          <h2 id="own-h">Your bytes are your bytes.</h2>
+          <p class="lead">JuiceMount mounts your own server as a Finder volume that behaves like LucidLink and costs like a NAS: scrub 100&nbsp;GB files over the network touching only the blocks you play, pin projects for offline, write at local-SSD speed while uploads trickle in the background. No per-seat fee. No per-TB fee. No storage contract. Your hardware.</p>
+          <p class="small muted">S3 and cloud collaboration have their place — this changes the cost equation for small teams so speed doesn't force inferior infrastructure.</p>
+        </div>
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="https://github.com/lelanddutcher/juicemount#quick-start">Get started</a>
+          <a class="btn btn-outline" href="https://github.com/lelanddutcher/juicemount#how-it-compares">How it compares</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <span class="foot-brand">JuiceMount · juicemount.com</span>
+      <a href="https://github.com/lelanddutcher/juicemount">GitHub</a>
+      <a href="https://github.com/lelanddutcher/juicemount/blob/main/ROADMAP.md">Roadmap</a>
+      <a href="https://github.com/lelanddutcher/juicemount/blob/main/LICENSE">Apache-2.0</a>
+      <span>Built on <a href="https://github.com/juicedata/juicefs">JuiceFS</a> — credit where due</span>
+      <span>This site is static files — no analytics, no telemetry</span>
+    </div>
+  </footer>
+</body>
+</html>
