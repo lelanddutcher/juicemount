@@ -2,9 +2,11 @@ package nfs
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math"
 	"os"
+	"syscall"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -55,6 +57,13 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	// now the actual op.
 	file, err := fs.OpenFile(fullPath, os.O_RDWR, 0644)
 	if err != nil {
+		// A WRITE RPC can be the moment the spool's capacity cap trips
+		// (handler OpenFile → spool.OpenWrite → ErrSpoolFull, which
+		// wraps syscall.ENOSPC). That must surface as NFS3ERR_NOSPC,
+		// not EACCES. Everything else keeps the legacy Access mapping.
+		if errors.Is(err, syscall.ENOSPC) {
+			return &NFSStatusError{NFSStatusNoSPC, err}
+		}
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 	end := req.Count
@@ -102,7 +111,11 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		Log.Errorf("Error writing: %v", err)
 		_ = file.Close() // Phase-1 BUG 2: see Seek-error comment above
-		return &NFSStatusError{NFSStatusIO, err}
+		// nfsStatusErrorFrom instead of a hard NFSStatusIO so a full
+		// write spool (nfs.ErrSpoolFull wraps syscall.ENOSPC) reaches
+		// the client as NFS3ERR_NOSPC — "disk full", actionable —
+		// rather than a generic I/O error. Unmatched errors still IO.
+		return nfsStatusErrorFrom(err)
 	}
 	if err := file.Close(); err != nil {
 		Log.Errorf("error closing: %v", err)

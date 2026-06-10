@@ -487,10 +487,28 @@ func (d *Drainer) scheduleDelayedWake(delay time.Duration) {
 	}()
 }
 
-// failPermanent: terminal failure path. Marks the row failed; no retry.
+// failPermanent: terminal failure path. Marks the row failed (no retry)
+// and releases its capacity reservation. Terminal rows are not part of
+// the `used` budget — QuarantineDrain and the boot scrubber already
+// follow that invariant (RecoverOnBoot rebuilds `used` from
+// ready/draining rows only), and RetryFailed re-reserves on requeue.
+// Before this release, failed rows pinned their bytes in the budget
+// until restart. releaseCapacity floors at zero, so the
+// file-already-missing case (reservation never held) cannot drive the
+// counter negative.
 func (d *Drainer) failPermanent(row *metadata.SpoolRow, reason string) {
-	if err := d.spool.Meta().MarkFailed(row.ID, reason); err != nil {
+	transitioned, err := d.spool.Meta().MarkFailed(row.ID, reason)
+	if err != nil {
 		log.Printf("drainer: mark failed %d: %v", row.ID, err)
+	}
+	// Release ONLY when this call actually moved the row to failed
+	// (adversarial-review BUG 1). If the row is gone — deleted by
+	// CancelForDelete mid-drain, or replaced by a rename-requeue's
+	// DELETE+INSERT — its reservation was already released (or transferred
+	// to the requeued row) by that path; releasing here again would
+	// double-release and let the spool over-admit past its cap.
+	if transitioned {
+		d.spool.releaseCapacity(row.Size)
 	}
 	d.metrics.DrainsFailed.Add(1)
 }

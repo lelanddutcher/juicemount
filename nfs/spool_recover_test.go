@@ -206,7 +206,7 @@ func TestRecoverOnBootTerminalRowStaleFileCleaned(t *testing.T) {
 	// Insert a failed-state row with its file still on disk.
 	f := dropFile(t, root, "stale-failed", []byte("stranded by failed remove"))
 	id, _ := s.Meta().Insert("/stranded.bin", f)
-	_ = s.Meta().MarkFailed(id, "test setup")
+	_, _ = s.Meta().MarkFailed(id, "test setup")
 
 	if _, err := s.RecoverOnBoot(context.Background()); err != nil {
 		t.Fatalf("recover: %v", err)
@@ -232,7 +232,7 @@ func TestRecoverOnBootDoneAndFailedIgnored(t *testing.T) {
 	_, _ = s.Meta().MarkDone(idDone)
 
 	idFailed, _ := s.Meta().Insert("/failed.bin", filepath.Join(s.Root(), SpoolFilesSubdir, "f1"))
-	_ = s.Meta().MarkFailed(idFailed, "pre-existing failure")
+	_, _ = s.Meta().MarkFailed(idFailed, "pre-existing failure")
 
 	report, err := s.RecoverOnBoot(context.Background())
 	if err != nil {

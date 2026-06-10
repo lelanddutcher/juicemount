@@ -32,6 +32,8 @@ struct MenuPopoverView: View {
     @State private var prevCachedAt: Date = .distantPast
     @State private var pinRateMBps: Double = 0
     @State private var showStopEverythingConfirm = false
+    /// True while a /spool-recover action (LB-5) is round-tripping.
+    @State private var spoolRecoverInFlight = false
     // Self-test dashboard (B.2). Health is fetched from /health on the
     // same 2s tick as cache-status. Each component is "ok" or a reason
     // string ("ping failed: …"); render as colored dots, full reason
@@ -633,16 +635,19 @@ struct MenuPopoverView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    if !s.hasActivity {
+                    if !s.hasActivity && !s.needsAttention {
                         Text("idle")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
                 }
 
-                if s.hasActivity {
+                // LB-5: failed entries are not "pending", so this section must
+                // also render when there's nothing uploading but something
+                // needs the user (stalled/failed rows + the recover actions).
+                if s.hasActivity || s.needsAttention {
                     HStack {
-                        Text("\(s.pendingFiles) waiting · \(formatBytes(s.pendingBytes))")
+                        Text("\(s.pendingFiles) waiting · \(formatBytes(s.pendingBytes))\(s.oldestPendingAgeSec >= 120 ? " · oldest \(formatAge(s.oldestPendingAgeSec))" : "")")
                             .font(.caption)
                         Spacer()
                         if s.inProgress > 0 {
@@ -655,26 +660,88 @@ struct MenuPopoverView: View {
                         }
                     }
 
-                    // First few in-flight files (server returns newest-first).
-                    ForEach(s.entries.prefix(4)) { e in
-                        HStack(spacing: 6) {
-                            Image(systemName: drainStateIcon(e.drainState))
-                                .foregroundStyle(drainStateColor(e.drainState))
-                                .font(.caption2)
-                            Text(URL(fileURLWithPath: e.path).lastPathComponent)
-                                .font(.caption2)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer()
-                            Text(formatBytes(e.size))
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                    // Stuck-spool signals (LB-5): surfaced ABOVE the entry
+                    // list so "43 waiting · 0 KB" can never again be the
+                    // whole story.
+                    if s.needsAttention {
+                        HStack(spacing: 10) {
+                            if s.stalledFiles > 0 {
+                                Label("\(s.stalledFiles) stalled", systemImage: "exclamationmark.circle.fill")
+                                    .foregroundStyle(.orange)
+                            }
+                            if s.failedFiles > 0 {
+                                Label("\(s.failedFiles) failed", systemImage: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.red)
+                            }
                         }
+                        .font(.caption2)
+                    }
+
+                    // First few entries (server returns active rows newest-
+                    // first, then a short recently-done tail).
+                    ForEach(s.entries.prefix(4)) { e in
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Image(systemName: entryIcon(e))
+                                    .foregroundStyle(entryColor(e))
+                                    .font(.caption2)
+                                Text(URL(fileURLWithPath: e.path).lastPathComponent)
+                                    .font(.caption2)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer()
+                                Text(formatBytes(e.size))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            // Status detail line for problem entries only:
+                            // "writing · 2h — stalled" / "failed · 5m".
+                            if e.stalled || e.drainState == "failed" {
+                                Text(entryStatusLine(e))
+                                    .font(.caption2)
+                                    .foregroundStyle(e.drainState == "failed" ? .red : .orange)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                    .padding(.leading, 18)
+                            }
+                        }
+                        .help(entryTooltip(e))
                     }
                     if s.entries.count > 4 {
                         Text("+ \(s.entries.count - 4) more")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
+                    }
+
+                    // Last error, truncated; hover for the full text. The
+                    // decoded last_error was previously never rendered (LB-5).
+                    if let err = firstSpoolError(s) {
+                        Text(err)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(err)
+                    }
+
+                    // Recovery actions → /spool-recover (LB-5).
+                    if s.needsAttention {
+                        HStack(spacing: 8) {
+                            if s.failedFiles > 0 {
+                                Button("Retry failed") { runSpoolRecover("retry-failed") }
+                                    .help("Re-queue failed uploads whose data is still on this Mac's spool.")
+                            }
+                            if s.stalledFiles > 0 {
+                                Button("Recover stalled") { runSpoolRecover("clear-stalled") }
+                                    .help("Finalize stuck entries and hand their bytes to the uploader. No data is deleted.")
+                            }
+                            if spoolRecoverInFlight {
+                                ProgressView().controlSize(.small)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(spoolRecoverInFlight)
                     }
                 } else {
                     Text("All uploads drained — writes are caught up with your storage.")
@@ -719,6 +786,7 @@ struct MenuPopoverView: View {
         case "ready":    return "clock"
         case "draining": return "arrow.up.circle.fill"
         case "failed":   return "exclamationmark.triangle.fill"
+        case "done":     return "checkmark.circle"
         default:         return "circle"
         }
     }
@@ -727,7 +795,75 @@ struct MenuPopoverView: View {
         switch state {
         case "draining": return .blue
         case "failed":   return .red
+        case "done":     return .green
         default:         return .gray
+        }
+    }
+
+    // MARK: - Spool entry presentation (LB-5)
+
+    /// Entry-aware icon: stalled overrides the per-state icon so a stuck
+    /// `writing` row stops masquerading as routine activity.
+    private func entryIcon(_ e: NFSBridge.SpoolEntryView) -> String {
+        e.stalled ? "exclamationmark.circle.fill" : drainStateIcon(e.drainState)
+    }
+
+    private func entryColor(_ e: NFSBridge.SpoolEntryView) -> Color {
+        e.stalled ? .orange : drainStateColor(e.drainState)
+    }
+
+    /// "writing · 2h — stalled" / "failed · 5m" status detail.
+    private func entryStatusLine(_ e: NFSBridge.SpoolEntryView) -> String {
+        var line = "\(e.drainState) · \(formatAge(e.ageSec))"
+        if e.stalled { line += " — stalled" }
+        if e.drainState == "failed", let err = e.lastError, !err.isEmpty {
+            line += " — \(err)"
+        }
+        return line
+    }
+
+    /// Full detail for the hover tooltip (the row truncates).
+    private func entryTooltip(_ e: NFSBridge.SpoolEntryView) -> String {
+        var parts = ["\(e.path)", "state: \(e.drainState)\(e.stalled ? " (stalled)" : "")", "age: \(formatAge(e.ageSec))"]
+        if e.drainAttempts > 0 { parts.append("attempts: \(e.drainAttempts)") }
+        if let err = e.lastError, !err.isEmpty { parts.append("last error: \(err)") }
+        return parts.joined(separator: "\n")
+    }
+
+    /// First error worth surfacing under the entry list: a problem entry's
+    /// last_error, else the endpoint-level error string.
+    private func firstSpoolError(_ s: NFSBridge.SpoolStatus) -> String? {
+        if let e = s.entries.first(where: { ($0.stalled || $0.drainState == "failed") && !($0.lastError ?? "").isEmpty }) {
+            return e.lastError
+        }
+        if let err = s.error, !err.isEmpty { return err }
+        return nil
+    }
+
+    /// Compact age: 45s / 12m / 2h / 3d.
+    private func formatAge(_ sec: Int64) -> String {
+        switch sec {
+        case ..<60: return "\(max(sec, 0))s"
+        case ..<3600: return "\(sec / 60)m"
+        case ..<86400: return "\(sec / 3600)h"
+        default: return "\(sec / 86400)d"
+        }
+    }
+
+    /// Fire a /spool-recover action off the main thread, then refresh the
+    /// spool status so the section reflects the result promptly.
+    private func runSpoolRecover(_ action: String) {
+        spoolRecoverInFlight = true
+        Task {
+            let addr = server.preferences.metricsAddr
+            let result = await Task.detached { NFSBridge.spoolRecover(action: action, metricsAddr: addr) }.value
+            await MainActor.run {
+                spoolRecoverInFlight = false
+                if let result, !result.ok, let err = result.error {
+                    NFSBridge.appLog("spool-recover \(action) failed: \(err)")
+                }
+                server.refreshCacheStatus()
+            }
         }
     }
 
@@ -1382,7 +1518,7 @@ struct MenuPopoverView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Tears down FUSE and any partial state so the next Start can begin from a clean slate.")
+                Text("Tears down FUSE and any partial state so the next Start can begin from a clean slate." + stopEverythingSpoolWarning)
             }
         case .starting:
             ActionButton(
@@ -1422,9 +1558,19 @@ struct MenuPopoverView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Unmounts the volume and kills the JuiceFS daemon. Next Start may prompt for your password to re-mount. Use \"Stop mount and finish sync\" if you'll restart soon.")
+                Text("Unmounts the volume and kills the JuiceFS daemon. Next Start may prompt for your password to re-mount. Use \"Stop mount and finish sync\" if you'll restart soon." + stopEverythingSpoolWarning)
             }
         }
+    }
+
+    /// LB-3 consistency: the quit guard and the spool-disable guard both
+    /// surface pending-upload numbers, so "Stop everything" shows the SAME
+    /// numbers in its confirmation. (Stopping does not strand entries —
+    /// the spool stays enabled and boot recovery requeues them on the next
+    /// Start — but the user should know uploads are pausing.)
+    private var stopEverythingSpoolWarning: String {
+        guard let s = server.spoolStatus, s.enabled, s.hasActivity else { return "" }
+        return "\n\n\(s.pendingFiles) file\(s.pendingFiles == 1 ? "" : "s") (\(formatBytes(s.pendingBytes))) are still uploading to the NAS — they stay queued on this Mac and resume on the next Start (keep the write spool enabled)."
     }
 
     private var isRunningLike: Bool {

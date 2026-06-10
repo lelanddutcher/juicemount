@@ -350,6 +350,13 @@ public enum NFSBridge {
         public var drainAttempts: Int = 0
         public var lastError: String?
         public var updatedAtUnix: Int64 = 0
+        /// Seconds since the row last made progress (now - updated_at).
+        public var ageSec: Int64 = 0
+        /// True when the entry is making no progress and won't without
+        /// intervention (LB-5): a leaked-handle `writing` row quiescent
+        /// beyond the escalation window, or a row whose drain retries are
+        /// exhausted. The popover offers "Recover stalled" for these.
+        public var stalled: Bool = false
 
         // Identity for ForEach: path + last-update so a re-queued path
         // (same name, new generation) gets a fresh row rather than animating
@@ -362,6 +369,27 @@ public enum NFSBridge {
             case drainAttempts = "drain_attempts"
             case lastError = "last_error"
             case updatedAtUnix = "updated_at_unix"
+            case ageSec = "age_sec"
+            case stalled
+        }
+
+        public init() {}
+
+        /// Null/absence-tolerant decode — same discipline as SpoolStatus
+        /// and CacheStatus below. Synthesized Codable would `decode` the
+        /// non-optionals and abort the WHOLE /spool decode on a missing
+        /// key (e.g. polling an older Go core that doesn't emit age_sec/
+        /// stalled yet), silently blanking the spool UI.
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
+            self.size = try c.decodeIfPresent(Int64.self, forKey: .size) ?? 0
+            self.drainState = try c.decodeIfPresent(String.self, forKey: .drainState) ?? ""
+            self.drainAttempts = try c.decodeIfPresent(Int.self, forKey: .drainAttempts) ?? 0
+            self.lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+            self.updatedAtUnix = try c.decodeIfPresent(Int64.self, forKey: .updatedAtUnix) ?? 0
+            self.ageSec = try c.decodeIfPresent(Int64.self, forKey: .ageSec) ?? 0
+            self.stalled = try c.decodeIfPresent(Bool.self, forKey: .stalled) ?? false
         }
     }
 
@@ -376,10 +404,19 @@ public enum NFSBridge {
         public var quarantined: Int64 = 0
         public var capacityUsed: Int64 = 0
         public var capacityTotal: Int64 = 0
+        /// LB-5 stuck-spool signals (Phase 2): counts of listed stalled /
+        /// failed entries and the age of the oldest pending row.
+        public var stalledFiles: Int = 0
+        public var failedFiles: Int = 0
+        public var oldestPendingAgeSec: Int64 = 0
         public var entries: [SpoolEntryView] = []
 
         /// True when there is active or queued upload work to surface.
         public var hasActivity: Bool { pendingFiles > 0 || inProgress > 0 }
+
+        /// True when something needs the user's attention (stalled or
+        /// failed entries) even if nothing is actively uploading.
+        public var needsAttention: Bool { stalledFiles > 0 || failedFiles > 0 }
 
         enum CodingKeys: String, CodingKey {
             case enabled, error
@@ -389,6 +426,9 @@ public enum NFSBridge {
             case succeeded, failed, quarantined
             case capacityUsed = "capacity_used"
             case capacityTotal = "capacity_total"
+            case stalledFiles = "stalled_files"
+            case failedFiles = "failed_files"
+            case oldestPendingAgeSec = "oldest_pending_age_sec"
             case entries
         }
 
@@ -415,6 +455,9 @@ public enum NFSBridge {
             self.quarantined = try c.decodeIfPresent(Int64.self, forKey: .quarantined) ?? 0
             self.capacityUsed = try c.decodeIfPresent(Int64.self, forKey: .capacityUsed) ?? 0
             self.capacityTotal = try c.decodeIfPresent(Int64.self, forKey: .capacityTotal) ?? 0
+            self.stalledFiles = try c.decodeIfPresent(Int.self, forKey: .stalledFiles) ?? 0
+            self.failedFiles = try c.decodeIfPresent(Int.self, forKey: .failedFiles) ?? 0
+            self.oldestPendingAgeSec = try c.decodeIfPresent(Int64.self, forKey: .oldestPendingAgeSec) ?? 0
             self.entries = try c.decodeIfPresent([SpoolEntryView].self, forKey: .entries) ?? []
         }
     }
@@ -441,6 +484,66 @@ public enum NFSBridge {
                 result = try JSONDecoder().decode(SpoolStatus.self, from: data)
             } catch {
                 appLog("spoolStatus decode failed — returning nil: \(error)")
+            }
+        }.resume()
+        sem.wait()
+        session.finishTasksAndInvalidate()
+        return result
+    }
+
+    /// Result of a `/spool-recover` action (LB-5).
+    public struct SpoolRecoverResult: Codable, Equatable {
+        public var ok: Bool = false
+        public var action: String = ""
+        public var recovered: Int = 0
+        public var error: String?
+
+        /// Tolerant decode — same discipline as SpoolStatus above.
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.ok = try c.decodeIfPresent(Bool.self, forKey: .ok) ?? false
+            self.action = try c.decodeIfPresent(String.self, forKey: .action) ?? ""
+            self.recovered = try c.decodeIfPresent(Int.self, forKey: .recovered) ?? 0
+            self.error = try c.decodeIfPresent(String.self, forKey: .error)
+        }
+    }
+
+    /// Trigger a spool recovery action on the Go side (LB-5). Blocking —
+    /// call from a background queue. Endpoint: `/spool-recover` (GET with
+    /// query params, the same loopback mutation convention as
+    /// `/offline?on=…`).
+    ///
+    ///   - `retry-failed`:  requeue failed rows whose spool file survives
+    ///                      (fresh attempt budget) and wake the drainer.
+    ///   - `clear-stalled`: force-finalize leaked-handle writing entries
+    ///                      so their bytes drain (never deletes data).
+    ///
+    /// Returns nil when the metrics server is unreachable or the body is
+    /// unparseable (logged, not swallowed).
+    public static func spoolRecover(action: String, metricsAddr: String = "127.0.0.1:11050") -> SpoolRecoverResult? {
+        var comps = URLComponents()
+        comps.scheme = "http"
+        // host:port split — metricsAddr is "127.0.0.1:11050".
+        let parts = metricsAddr.split(separator: ":", maxSplits: 1)
+        comps.host = parts.first.map(String.init) ?? "127.0.0.1"
+        comps.port = parts.count > 1 ? Int(parts[1]) : nil
+        comps.path = "/spool-recover"
+        comps.queryItems = [URLQueryItem(name: "action", value: action)]
+        guard let url = comps.url else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        // clear-stalled fsyncs + finalizes entries; allow headroom.
+        req.timeoutInterval = 15
+        let sem = DispatchSemaphore(value: 0)
+        var result: SpoolRecoverResult?
+        let session = loopbackSession()
+        session.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            do {
+                result = try JSONDecoder().decode(SpoolRecoverResult.self, from: data)
+            } catch {
+                appLog("spoolRecover(\(action)) decode failed — returning nil: \(error)")
             }
         }.resume()
         sem.wait()
