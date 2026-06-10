@@ -42,8 +42,35 @@ entries below that referenced them read correctly:
 
 ## New open follow-ups (logged from the launch-hardening ledger)
 
-- **Burst-create ETIMEDOUT ~1/1000 under load** (QA-29 stall class, newly
-  visible now that 02-finder runs past rsync). Phase-1 gate finding.
+- **P1-INVESTIGATE — /stop with a large read in flight wedges the read
+  indefinitely** (found by wedge-tests/nfs-loopback-mid-shutdown.sh,
+  2026-06-10, Phase-5 final validation). `/stop` is the soft stop — it
+  deliberately leaves the kernel NFS mount in place for a fast prompt-free
+  restart — but an in-flight `cat` of a 1.8 GB file did NOT error within
+  the tier-1.2 budget after the server stopped: it sat in uninterruptible
+  kernel wait for 3+ hours until a manual `umount -f -t nfs` released it
+  instantly. Expected: the soft-mount client surrenders (~60 s worst case
+  at timeo=200/retrans=2); observed: no surrender — likely the orphaned
+  mount-table entry class documented in cbridge's shutdown ordering notes,
+  reachable through the /stop path. In-app /force-eject is the existing
+  remedy; candidate fixes: refuse /stop while reads are in flight, or
+  unmount-first semantics for /stop, or root-cause why the kernel client
+  never surrendered against the dead listener. The wedge test's own poll
+  loop also wedged (it stats the mount), so its force-eject phase never
+  ran — harness needs mount-touching probes to be timeout-bounded.
+- **Burst-create failures under parallel load, quantified** (QA-29 stall
+  class): ~2% of files at 20-way parallel bursts (03-media bulk import +
+  controlled 100-copy repro, 2026-06-10), ~0.1% at 1000-file sequential
+  bursts. Failed files are MISSING with a cp error — 100-copy repro
+  produced ZERO md5 mismatches (no silent corruption, ever). The 03-media
+  test labels these "corrupted" — misleading; fix the test wording.
+- **QA-suite harness bugs found in Phase 5:** (a) crash-recover-test.sh
+  line 80 evals its wait-condition as a literal command name (test never
+  measures; the app-relaunch step never runs); (b) 12-perf-regression
+  treats pin-coverage-verify's legitimate zero-pins no-op (no
+  summary.json) as a threshold breach; (c) nls wedge test died on
+  pipefail when a 405 reply has no Content-Type (FIXED 2026-06-10);
+  (d) the 02-finder set -e fragility below.
 - **`cp -R` exits 1 copying directory xattrs** (NFSv3 has no xattr support;
   file data lands fine). Needs an AppleDouble/xattr story for directories.
 - **QA-suite fragility:** a phase script dying mid-run (`set -e`) writes no

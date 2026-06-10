@@ -128,7 +128,7 @@ log "  ✓ mount is active"
 # window between two requests.
 stop_probe=$(curl -s -D - -o /dev/null -X GET "$METRICS/stop" --max-time 2 2>/dev/null || echo "")
 stop_probe_status=$(printf '%s\n' "$stop_probe" | head -1 | awk '{print $2}')
-stop_probe_ctype=$(printf '%s\n' "$stop_probe" | grep -i '^content-type:' | head -1 | tr -d '\r' | awk '{print tolower($2)}')
+stop_probe_ctype=$(printf '%s\n' "$stop_probe" | { grep -i '^content-type:' || true; } | head -1 | tr -d '\r' | awk '{print tolower($2)}')
 if [[ "$stop_probe_status" != "405" ]]; then
     fail "POST /stop not supported on the running binary (GET returned ${stop_probe_status:-no-response}, ctype=$stop_probe_ctype)"
     fail "  expected 405 from a fresh binary that has handleStopHTTP (iter 12)."
