@@ -1,4 +1,14 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/banner-dark.svg">
+  <img src="assets/readme/banner-light.svg" alt="JuiceMount — the mounted-drive workflow editors get from LucidLink-class SaaS, at 10GbE-direct-attached speed, with Dropbox-style offline resilience, on hardware you already own" width="100%">
+</picture>
+
 # JuiceMount
+
+[![License: Apache-2.0](assets/readme/badges/license-apache-2.0.svg)](LICENSE)
+![Platform: macOS 14+](assets/readme/badges/platform-macos-14plus.svg)
+[![Built on JuiceFS](assets/readme/badges/built-on-juicefs.svg)](https://github.com/juicedata/juicefs)
+![Status: beta](assets/readme/badges/status-beta.svg)
 
 **A LucidLink-style mounted volume for video editors — running entirely on hardware you own.**
 
@@ -44,29 +54,34 @@ All of the below is shipped and exercised in the current codebase (see [`ROADMAP
 
 ## How it fits together
 
-```
- YOUR MAC                                          YOUR SERVER (any Docker host)
-┌────────────────────────────────────────┐        ┌──────────────────────────────┐
-│ Premiere / Resolve / FCPX / Finder     │        │  docker compose up -d        │
-│            │                           │        │                              │
-│            ▼  NFS v3 (localhost only)  │        │  ┌─────────┐  ┌───────────┐  │
-│ ┌──────────────────────────────┐       │        │  │  Redis  │  │   MinIO   │  │
-│ │ JuiceMount.app               │       │  LAN / │  │ (file   │  │ (file     │  │
-│ │  • NFS server, Finder-tuned  │◄──────┼──WAN──►│  │  meta-  │  │  data as  │  │
-│ │  • SQLite metadata + search  │       │        │  │  data)  │  │  plain S3 │  │
-│ │  • SSD block cache + pins    │       │        │  └─────────┘  │  objects) │  │
-│ │  • write spool (opt-in)      │       │        │               └───────────┘  │
-│ │  • JuiceFS client (FUSE)     │       │        │  ┌────────────────────────┐  │
-│ └──────────────────────────────┘       │        │  │ JuiceMount Manager     │  │
-│            │                           │        │  │ web UI :30190          │  │
-│            ▼                           │        │  │ (migrate / maintain)   │  │
-│   /Volumes/<name>  ← editors work here │        │  └────────────────────────┘  │
-└────────────────────────────────────────┘        └──────────────────────────────┘
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/arch-diagram-dark.svg">
+  <img src="assets/readme/arch-diagram-light.svg" alt="Architecture: Finder, Resolve, and Premiere open files on /Volumes/(name) through the macOS NFS client, served by the JuiceMount app's localhost-only NFS server. An SQLite mirror, an SSD cache with pins, and an opt-in write spool keep the hot path local. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your server, where MinIO or any S3-compatible store holds file data in JuiceFS's open, documented chunk format and Redis holds file metadata" width="100%">
+</picture>
+
+The server side is one `docker compose up -d`: Redis, MinIO, and **JuiceMount Manager** (a web UI on `:30190` for migrating data in and maintaining the stack).
 
 Reads are served in priority order: memory buffer (small files) → direct SSD-cache reads that bypass FUSE entirely → JuiceFS → your object store. Metadata (the thing Finder hammers hardest) never leaves local SQLite on the hot path — directory opens that take 3–10 s through raw FUSE complete in 15–120 ms. Full detail in [`ARCHITECTURE_juicemount.md`](ARCHITECTURE_juicemount.md).
 
 The object store can also be a cloud bucket (Backblaze B2, Cloudflare R2, Wasabi — anything S3-compatible that JuiceFS supports); Redis still runs on your box. Be honest with yourself about what's been proven, though: the self-hosted MinIO/TrueNAS path is the one this project's QA exercises; cloud buckets ride on JuiceFS's S3 support and haven't been part of JuiceMount's own test matrix.
+
+<!-- SCREENSHOTS: uncomment when docs/screenshots/*.png land (capture steps per shot: docs/screenshots/CAPTURE.md)
+
+## A look at it
+
+<p>
+  <img src="docs/screenshots/menubar-states.png" alt="JuiceMount menu-bar icon states: green healthy, amber degraded, blue offline-files, red fault" width="70%">
+</p>
+<p>
+  <img src="docs/screenshots/popover-glance.png" alt="Menu-bar popover: at-a-glance health, backend rows, cache and pinned folders, pending uploads" width="49%">
+  <img src="docs/screenshots/onboarding.png" alt="Setup Assistant preflight checks: juicefs, macFUSE, backend reachability" width="49%">
+</p>
+<p>
+  <img src="docs/screenshots/preferences-connection.png" alt="Preferences, Connection tab: volume name, Redis URL, S3 endpoint override" width="49%">
+  <img src="docs/screenshots/calculator-web.png" alt="The rent-vs-own calculator from the JuiceMount site" width="49%">
+</p>
+
+-->
 
 ---
 
@@ -197,6 +212,103 @@ Stating this up front saves everyone time:
 - **Not multi-OS.** macOS only today. The server side runs anywhere Docker does.
 - **Not a backup.** It's primary storage with a cache. Run real backups of the MinIO bucket and Redis — the Manager has backup-scheduling tooling, but the 3-2-1 discipline is yours.
 - **Not zero-ops.** A failed disk on your NAS is your failed disk. That's the deal that makes it free.
+
+---
+
+## FAQ
+
+Straight answers, sourced from the docs and code in this repo. Where something hasn't been verified, it says so.
+
+**Why does JuiceMount ask for an admin password?**
+
+macOS restricts `mount_nfs` and `umount` to root, so the app escalates through the standard macOS authorization dialog the first time it mounts — once per session; macOS caches the authorization. If you restart the app often (or just dislike the prompt), [`docs/dev-setup.md`](docs/dev-setup.md) sets up a scoped passwordless-sudo rule — exactly `/sbin/mount_nfs`, `/sbin/umount`, `/bin/mkdir`, no shell, no wildcards — and the app probes for it and uses it automatically, falling back to the prompt on machines without it.
+
+**What happens when the NAS is off, or I'm on a plane?**
+
+Pin what you need first (popover → *Pin Folder for Offline…*, or Finder right-click → Services → *JuiceMount: Pin for Offline*): a prefetcher pulls every byte to local SSD and shows per-folder progress. Then flip on offline-files mode (popover toggle): pinned files keep reading at SSD speed, and un-pinned reads refuse in 4–67 ms instead of hanging Finder on a ~30 s NFS retry. Back online, *Sync Now* runs verify-and-repair on the pin set, re-fetching anything the cache evicted.
+
+**What happens to my writes if the network drops or the server dies mid-copy?**
+
+With the write spool enabled (Preferences → Cache & Storage), a write is acknowledged the moment it's durable on local SSD; a background drainer uploads it once the server is reachable, SHA-256-verified at every hop. The popover shows pending / in-flight / stalled / failed uploads with per-entry age and last error, offers *Retry failed* and *Recover stalled*, and the app guards quit and spool-disable while uploads are pending so spooled data isn't stranded. With the spool off (the default), writes go through to the server synchronously — if the backend is unreachable, the write fails the way it would on any network drive. Note that offline-files mode gates *reads*; it doesn't make un-spooled writes safe. <!-- sources: docs/dev-setup.md (write path), MENU_BAR_APP.md (spool UI), docs/OPEN_BUGS.md launch-hardening closures (quit/disable drain guards); the offline open gate in nfs/handler.go applies to reads only -->
+
+**Can two Macs mount the same volume?**
+
+Yes — every machine mounts the same `/Volumes/<name>`, metadata syncs through the shared Redis instance, and project files reference media at identical paths, so a teammate's `.prproj`/`.drp`/`.fcpx` opens without relinking. That's the designed multi-machine workflow. The caveat from above bears repeating: heavy *simultaneous* multi-editor use hasn't been soak-tested yet — most QA to date is single-editor.
+
+**Is my data locked in?**
+
+No. Your bytes are on your hardware — copy them from the mounted volume, or `juicefs sync` them out; the bucket stays under your control. In the bucket, file data lives in JuiceFS's open, documented chunk format, and the volume is a standard JuiceFS volume (the server stack formats it with stock `juicefs format`), so the stock `juicefs` client can mount it with no JuiceMount involved. <!-- exit story verbatim from the comparison table above; standard-volume claim: server/INSTALL-TrueNAS.md runs stock juicefs format -->
+
+**How much disk does the cache use?**
+
+You set the cache size in Preferences → Cache & Storage; JuiceMount grows the cache only as far as needed to keep your pinned content fully cached, and clamps it so the boot disk always keeps at least 10 GiB free (the JuiceFS free-space ratio is raised dynamically to enforce the floor). It also reclaims APFS purgeable space — mostly Time Machine local snapshots — at mount time and on demand via the popover's *Reclaim* button. When you leave, `scripts/uninstall.sh` shows the size of everything it would delete before touching anything; the JuiceFS chunk cache is usually the big one (it can be hundreds of GB).
+
+<details>
+<summary><strong>Why an NFS loopback server instead of using FUSE directly, or a File Provider extension?</strong></summary>
+
+Finder performance, mostly. Metadata is the thing Finder hammers hardest, and JuiceMount answers it from a local SQLite mirror behind a Finder-tuned NFS server — directory opens that take 3–10 s through the raw FUSE mount complete in 15–120 ms. The FUSE mount still exists underneath (JuiceFS needs it), but it's hidden and apps never touch it. As for File Provider: never. An orphaned File Provider registration once pinned two system daemons above 100% CPU and collapsed this very NFS path to 13 MB/s — and the registration outlived the app, the source project, and a reboot. [`docs/no-fileprovider.md`](docs/no-fileprovider.md) is the postmortem; the build script fails if a plugin ever sneaks into the bundle.
+
+</details>
+
+<details>
+<summary><strong>What exactly is the relationship to JuiceFS?</strong></summary>
+
+JuiceMount is built on JuiceFS and says so loudly (see the credit section below and [`NOTICE`](NOTICE)). JuiceFS solved the distributed-filesystem problems — chunked object layout, the Redis metadata engine, cache management — and JuiceMount adds the macOS experience layer: the Finder-tuned NFS re-export, the SQLite metadata cache, pinning and offline gates, the write spool, the menu-bar app, and the server packaging. The app drives the separately installed `juicefs` binary (`brew install juicefs`); it isn't bundled. If your problem isn't video-on-macOS, use JuiceFS directly — it's excellent.
+
+</details>
+
+<details>
+<summary><strong>Does it phone home?</strong></summary>
+
+No. The app's network connections are the Redis and S3 endpoints you configure, plus a loopback control plane on `127.0.0.1`. JuiceFS's own anonymous usage reporting is explicitly disabled — the app passes `--no-usage-report` when mounting. There's no crash reporting, no update check, no analytics; "no telemetry without opt-in" is a stated non-negotiable (see [Contributing](#contributing)). Diagnostics exist only as a local zip you create yourself with Export Diagnostics and choose to share. <!-- verified: health/fuse.go passes the no-usage-report flag to juicefs mount; the app's only URLSession targets are loopback control-plane routes; non-negotiables in Contributing + docs/VISION.md -->
+
+</details>
+
+<details>
+<summary><strong>Why is the write spool off by default?</strong></summary>
+
+It's the newest piece of the write path, and a change to where your data's durability boundary sits should earn default-on status. The spool's integrity story is strong — per-hop SHA-256, boot-time crash recovery, drain guards on quit and disable, exercised through the launch-hardening QA gates — but a planned 24-hour live soak is still on the books ([`docs/OPEN_BUGS.md`](docs/OPEN_BUGS.md)). With the spool off, writes use the unchanged direct path. Flip it on in Preferences → Cache & Storage when background-upload writes are worth it to you; over a WAN they're transformative.
+
+</details>
+
+<details>
+<summary><strong>Why does it need macFUSE?</strong></summary>
+
+The JuiceFS client mounts its filesystem through FUSE, and FUSE on macOS means macFUSE. That mount is internal — hidden where Finder and your NLE never browse it; everything user-facing goes through the kernel's native NFS client at `/Volumes/<name>`. The Setup Assistant's preflight checks for macFUSE and walks you through installing it if it's missing.
+
+</details>
+
+<details>
+<summary><strong>Does it run on Intel Macs?</strong></summary>
+
+Untested, honestly. Development and testing are on Apple Silicon; the build scripts produce host-architecture binaries, so building from source on an Intel Mac *should* work, but no one has verified it. macOS 14 (Sonoma) or later applies either way. If you try it, a report — success or failure — is a genuinely useful contribution.
+
+</details>
+
+<details>
+<summary><strong>Can the object store be a cloud bucket instead of MinIO?</strong></summary>
+
+Yes — anything S3-compatible that JuiceFS supports (Backblaze B2, Cloudflare R2, Wasabi, …), with Redis still running on your box. Honesty check, same as above: the self-hosted MinIO/TrueNAS path is what this project's QA exercises; cloud buckets ride on JuiceFS's S3 support and haven't been part of JuiceMount's own test matrix.
+
+</details>
+
+---
+
+## Troubleshooting
+
+The popover's health rows (Redis / MinIO / FUSE / NFS mount) are the first thing to check — most fixes start there. Deeper app-side detail lives in [`MENU_BAR_APP.md`](MENU_BAR_APP.md).
+
+**The volume doesn't appear in Finder.** Open the popover: if the NFS row says "Volume not mounted", click **Mount Now** — a privileged re-mount that may show the admin prompt once. (Scriptable as `/mount-now` on the control plane; it's single-flighted and returns 409 while a mount is already in progress.) If the prompt itself is the obstacle — headless Mac, automated restarts — set up the [scoped sudoers rule](docs/dev-setup.md). Also check that something else doesn't already own the path: `mount | grep <volume-name>`.
+
+**Finder says "not responding", or the icon turns amber.** Amber means degraded: running, but a backend (Redis / MinIO / FUSE / NFS) is unhealthy or recovering — the popover names which one and why. Give it a moment: the health monitor force-remounts a wedged FUSE daemon once the backend is reachable again (in the controlled long-outage repro this took about 15 s after the network returned), and an independent watchdog keeps the menu-bar state converging on reality instead of sticking. If the kernel mount itself is wedged — server died, every Finder access hangs — **Force Eject** in the popover is the last resort: a privileged kernel-level unmount behind a confirmation dialog, after which in-flight operations on the volume fail with I/O errors rather than hanging. <!-- self-heal story: QA-36 and QA-38 closure notes in docs/OPEN_BUGS.md; Force Eject: MenuPopoverView.swift -->
+
+**Uploads look stuck.** With the spool enabled, the popover's *Pending uploads* section shows pending / in-flight / stalled / failed counts with per-entry age and last error; **Retry failed** and **Recover stalled** act on them directly (scriptable as `/spool` and `/spool-recover` on the control plane). A full spool surfaces to Finder as "disk full" rather than a mystery error.
+
+**You want to re-run first-time setup.** Menu-bar icon → **Setup Assistant…** reopens onboarding any time: it preflight-checks `juicefs`, macFUSE, and backend reachability, and re-points the app at your server (same fields as Preferences → Connection).
+
+**Where logs live.** Structured JSON at `~/Library/Logs/JuiceMount/juicemount.log` (16 MB × 5 rotation); the JuiceFS daemon's own log is auto-tailed into it with warnings promoted. `tail -f ~/Library/Logs/JuiceMount/juicemount.log | jq .` for live debugging. For a bug report, use **Export Diagnostics…** (in the popover and in Preferences → Maintenance): it bundles logs, the mount table, and backend health into a local zip — nothing is sent anywhere.
+
+**Uninstalling.** `./scripts/uninstall.sh` stops the app, unmounts, shows exactly what it will remove with sizes, and asks once. One warning worth repeating from the script itself: if the write spool still holds files, those are uploads that never reached the server — deleting them loses data, so that step requires its own explicit confirmation (`--delete-pending-uploads` for unattended runs). It deliberately leaves the app bundle, the `juicefs` binary, macFUSE, and everything on your server alone; `--dry-run` previews the whole plan.
 
 ---
 
