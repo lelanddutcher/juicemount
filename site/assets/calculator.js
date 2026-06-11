@@ -350,6 +350,14 @@
 
     function setVal(id, v) { $(id).value = String(v); }
 
+    /* aria-valuetext keeps screen-reader slider announcements in units
+       (display attribute only; values come straight from the inputs). */
+    function syncSliderText() {
+      var tbRange = $("tb-range"), gRange = $("g-range");
+      tbRange.setAttribute("aria-valuetext", tbRange.value + " TB");
+      gRange.setAttribute("aria-valuetext", gRange.value + " TB per month");
+    }
+
     function writeForm(inp) {
       setVal("vendor", inp.vendor);
       setVal("seats", inp.seats);
@@ -364,6 +372,7 @@
       setVal("bill", inp.bill); setVal("billtb", inp.billPerTb); setVal("s3", inp.s3PerTb);
       syncHwPreset(inp.hardware);
       syncVendorFields(inp.vendor);
+      syncSliderText();
     }
 
     function syncHwPreset(hwValue) {
@@ -534,8 +543,8 @@
       var T0 = inp.tb, S = inp.seats;
       var t36 = libraryAt(inp, CHART_MONTHS);
       function row(label, value, note) {
-        return "<tr><td>" + label + (note ? '<span class="note">' + note + "</span>" : "") +
-          '</td><td class="num">' + value + "</td></tr>";
+        return '<tr role="row"><td role="cell">' + label + (note ? '<span class="note">' + note + "</span>" : "") +
+          '</td><td role="cell" class="num">' + value + "</td></tr>";
       }
       switch (inp.vendor) {
         case "suite_managed": {
@@ -571,7 +580,8 @@
           break;
         }
         case "shade": {
-          rows.push(row("Seats — <span class=\"num\">$" + P.shade_growth.seat + "</span> × " + S,
+          rows.push(row("Seats — <span class=\"num\">$" + P.shade_growth.seat + "</span> × " + S +
+            " (annual billing" + (P.shade_growth.seat_monthly ? "; $" + P.shade_growth.seat_monthly + " monthly" : "") + ")",
             esc(fmtUSDmo(P.shade_growth.seat * S)),
             "includes " + esc(fmtTB(sim.flags.shadeCapTb)) + " active storage"));
           break;
@@ -603,8 +613,8 @@
 
       var selfRows = [];
       function srow(label, value, note, cls) {
-        selfRows.push('<tr class="' + (cls || "") + '"><td>' + label +
-          (note ? '<span class="note">' + note + "</span>" : "") + '</td><td class="num">' + value + "</td></tr>");
+        selfRows.push('<tr role="row" class="' + (cls || "") + '"><td role="cell">' + label +
+          (note ? '<span class="note">' + note + "</span>" : "") + '</td><td role="cell" class="num">' + value + "</td></tr>");
       }
       srow("Server hardware — one-time", esc(fmtUSD(capex.hardware)));
       srow("Drives — <span class=\"num\">" + capex.provTb + " TB</span> usable × $" + inp.drivePerTb + "/TB, one-time",
@@ -625,14 +635,16 @@
 
       var saasRows = describeSaasRows(sim, inp, P);
       if (sim.status !== "not_comparable") {
-        saasRows.push('<tr class="total"><td>' + (n < CHART_MONTHS ? n + "-month total (to the tier cap)" : "36-month total") +
-          '</td><td class="num">' + esc(fmtUSD(sim.cumSaas[n])) + "</td></tr>");
+        saasRows.push('<tr role="row" class="total"><td role="cell">' + (n < CHART_MONTHS ? n + "-month total (to the tier cap)" : "36-month total") +
+          '</td><td role="cell" class="num">' + esc(fmtUSD(sim.cumSaas[n])) + "</td></tr>");
       }
 
+      /* role attributes restore the table semantics that the receipt CSS's
+         display:block strips in Chrome/Safari accessibility trees. */
       el.innerHTML =
-        '<table><caption>Self-host receipt</caption><tbody>' + selfRows.join("") + "</tbody></table>" +
-        '<table><caption>' + esc(VENDOR_LABELS[inp.vendor].charAt(0).toUpperCase() + VENDOR_LABELS[inp.vendor].slice(1)) +
-        " receipt</caption><tbody>" + (saasRows.join("") || '<tr><td class="muted">no published math at this size</td><td></td></tr>') + "</tbody></table>";
+        '<table role="table"><caption role="caption">Self-host receipt</caption><tbody role="rowgroup">' + selfRows.join("") + "</tbody></table>" +
+        '<table role="table"><caption role="caption">' + esc(VENDOR_LABELS[inp.vendor].charAt(0).toUpperCase() + VENDOR_LABELS[inp.vendor].slice(1)) +
+        ' receipt</caption><tbody role="rowgroup">' + (saasRows.join("") || '<tr role="row"><td role="cell" class="muted">no published math at this size</td><td role="cell"></td></tr>') + "</tbody></table>";
     }
 
     function renderChart(sim) {
@@ -671,6 +683,7 @@
         if (id === "g") setVal("g-range", Math.min(10, parseFloat(ev.target.value) || 0));
         if (id === "hw") syncHwPreset(ev.target.value);
         if (id === "vendor") syncVendorFields(ev.target.value);
+        syncSliderText();
         update();
       });
 
@@ -716,7 +729,10 @@
     }
 
     if (window.fetch && window.location.protocol !== "file:") {
-      window.fetch("assets/pricing.json")
+      /* no-cache = always revalidate: stale cached pricing once served a
+         row "$undefined monthly" after a data update added a key the old
+         cached JSON lacked. 304s keep it cheap; data files must be fresh. */
+      window.fetch("assets/pricing.json", { cache: "no-cache" })
         .then(function (r) { if (!r.ok) throw new Error("http " + r.status); return r.json(); })
         .then(boot)
         .catch(function () { boot(FALLBACK_PRICING); });

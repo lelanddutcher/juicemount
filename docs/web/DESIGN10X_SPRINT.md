@@ -319,7 +319,7 @@ a server is a black box of magic to them").
       client; macOS permissions; first mount; pin/offline basics;
       troubleshooting. References across hardware vendors. Source of
       truth: README + repo docs only — no invented behavior.
-- [ ] S7. Cohesion: NAS-term sweep on all canonical pages, motion
+- [x] S7. Cohesion: NAS-term sweep on all canonical pages, motion
       language, value-gate re-run, OG copy, link battery; promote
       winners; journal verdicts.
 
@@ -392,3 +392,58 @@ a server is a black box of magic to them").
   annotated — the README/site compare tables agree again. Adversarial
   verification workflow (3 lenses + refuters) running; its confirmed
   findings land as a follow-up fix commit.
+- [2026-06-11 ~14:30] S7 + adversarial audit round — CLOSED. The
+  ultracode verification workflow (3 lenses x 4 pages, every finding
+  attacked by a refuter; 29 agents) confirmed 25 of 26 raw findings
+  (6 P2, 19 P3). ALL 25 fixed and live-verified:
+  - index: #states moved to demo 01 (menu bar genuinely starts the
+    how-it-works course now: menu bar -> mount -> search -> blocks ->
+    scrub, renumbered), nav "How it works" retargeted to #states on
+    all pages, 8 leftover "server" uses -> NAS (the one survivor is
+    the README-verbatim "server stack"), visuals mandate closed on the
+    bottom third (pillar traffic/pin/meter glyphs — the economics
+    meter counts to the documented $750/mo and parks at "forever";
+    what's-coming roadmap rail lights 4 dots in order; closing band
+    exit-echo chips), search demo timings collapsed to the one frozen
+    ~29 ms figure, replay buttons now work under reduced motion (snap
+    to end state), .is-veiled gains visibility:hidden (no tabbing into
+    invisible Finder rows), svh-strip stray aria-hidden=false removed,
+    mb panes tabindex=0.
+  - calculator (agent): receipt register date 2026-06-11 + sync
+    comment, Shade option/receipt labeled annual ($35 monthly from
+    pricing data), aria-valuetext on both range sliders, aria-live on
+    #warnings/#notices, full ARIA table roles restored on the receipts
+    (display:block had stripped semantics), reduceQ change listener.
+    Formula freeze re-proven: the five math functions byte-identical
+    to HEAD, default-scenario output identical.
+  - performance (agent): ISG claim re-hedged to "appears included";
+    #6FB1EB and #f2f2f4 literals correctly KEPT with documented token
+    verdicts (the .pv panel is forced-dark on both themes; tokens
+    would shift computed colors); #method pipeline glyph, #noclaim
+    measured-vs-modeled legend, closing platter echo (byte-identical
+    SVG reuse); dead race-link selector left per the in-file
+    byte-identity note.
+  - docs (agent): uninstall pin-list overclaim corrected against
+    scripts/uninstall.sh, success-log quotes made true for BOTH
+    composes (they print different precheck-5 strings — receipts in
+    the agent report), aria-current="step" on the rail (markup, JS,
+    and the 3 CSS selectors), step-4 preflight mock now animates its
+    checks with a replay (the page's second interactive).
+  - og-card.svg/png re-rendered with the identity one-liner ("the
+    open-source alternative... storage that scales, but feels local")
+    replacing the pre-identity 10GbE line; both README banners updated
+    the same way; og:image:alt on all five pages + README banner alt
+    match; README "why this exists" drops Aspect + "magic".
+  - NEW BUG found during verification, fixed in calculator.js:
+    pricing.json was fetched with default cache policy, so a browser
+    that cached the old JSON rendered "$undefined monthly" after the
+    data update added seat_monthly — fetch now uses cache:"no-cache"
+    (revalidation; 304s keep it cheap) and the label guards against
+    missing keys. This is a deploy-relevant fix, not just a dev nit.
+  - One preview-tool incident for the record: the shared preview
+    renderer wedged (blank composites, dead IntersectionObservers)
+    and mimicked a page bug; a server restart cleared it. The page
+    was never broken — diagnosis receipts in the session log.
+  Final gates: 19 files / 560 refs / 0 broken; every inline script
+  parses; formula freeze byte-identical; consoles clean on all six
+  canonical pages.

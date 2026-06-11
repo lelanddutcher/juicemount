@@ -1,6 +1,6 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/banner-dark.svg">
-  <img src="assets/readme/banner-light.svg" alt="JuiceMount — the mounted-drive workflow editors get from LucidLink-class SaaS, at 10GbE-direct-attached speed, with Dropbox-style offline resilience, on hardware you already own" width="100%">
+  <img src="assets/readme/banner-light.svg" alt="JuiceMount — the open-source alternative to Suite, Shade, and LucidLink: storage that scales, but feels local — $0 per seat, on the NAS you already own" width="100%">
 </picture>
 
 # JuiceMount
@@ -24,7 +24,7 @@ Built on [JuiceFS](https://github.com/juicedata/juicefs) (metadata in Redis, fil
 
 Storage for small video teams currently forces a three-way trade:
 
-1. **Block-streaming SaaS** (LucidLink, Suite, Shade, Aspect) gets you the magic mounted-drive workflow — and a per-seat, per-TB bill that scales with exactly the thing video generates most of. Your library lives inside their filesystem.
+1. **Block-streaming SaaS** (LucidLink, Suite, Shade) gets you the mounted-drive workflow — and a per-seat, per-TB bill that scales with exactly the thing video generates most of. Your library lives inside their filesystem.
 2. **Self-hosted sync** (Nextcloud, Seafile, Mountain Duck) gets you ownership — but syncs whole files. Opening a 100 GB clip to check one shot means moving 100 GB. And in the author's testing these tools plateau around 0.8–1 Gbit/s even on a 10 GbE LAN.
 3. **Plain NFS/SMB to a NAS** gets you speed and ownership — and nothing else. No offline files, no cache, no WAN story, and Finder grinds on a 100 K-file library.
 

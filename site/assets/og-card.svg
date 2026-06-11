@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-labelledby="ogt ogd">
   <title id="ogt">JuiceMount</title>
-  <desc id="ogd">JuiceMount social card: the citrus mark beside the wordmark and one-liner — the mounted-drive workflow editors get from LucidLink-class SaaS, at 10GbE-direct-attached speed, with Dropbox-style offline resilience, on hardware you already own.</desc>
+  <desc id="ogd">JuiceMount social card: the citrus mark beside the wordmark and one-liner — the open-source alternative to Suite, Shade, and LucidLink; storage that scales, but feels local; $0 per seat on the NAS you already own.</desc>
   <defs>
     <style>
       .og-1 { fill: #aacd58; }
@@ -47,10 +47,10 @@
   <!-- wordmark + one-liner; the banner's type treatment adapted to the ink band: Cream text -->
   <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
     <text x="460" y="250" font-size="88" font-weight="600" letter-spacing="-1.5" fill="#FAFDE8">JuiceMount</text>
-    <text x="460" y="312" font-size="26" font-weight="400" fill="#FAFDE8">The mounted-drive workflow editors get from</text>
-    <text x="460" y="350" font-size="26" font-weight="400" fill="#FAFDE8">LucidLink-class SaaS — at 10GbE-direct-attached speed,</text>
-    <text x="460" y="388" font-size="26" font-weight="400" fill="#FAFDE8">with Dropbox-style offline resilience —</text>
-    <text x="460" y="426" font-size="26" font-weight="400" fill="#FAFDE8">on hardware you already own.</text>
+    <text x="460" y="312" font-size="26" font-weight="400" fill="#FAFDE8">The open-source alternative to</text>
+    <text x="460" y="350" font-size="26" font-weight="400" fill="#FAFDE8">Suite, Shade, and LucidLink.</text>
+    <text x="460" y="388" font-size="26" font-weight="400" fill="#FAFDE8">Storage that scales, but feels local —</text>
+    <text x="460" y="426" font-size="26" font-weight="400" fill="#FAFDE8">$0 per seat, on the NAS you already own.</text>
     <!-- domain, cream-muted (the band's muted-text token: cream at 0.72 over ink) -->
     <text x="1130" y="580" font-size="22" font-weight="400" text-anchor="end" fill="#FAFDE8" fill-opacity="0.72" font-family="'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace">juicemount.com</text>
   </g>

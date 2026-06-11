@@ -11,7 +11,7 @@
   <meta property="og:title" content="Set up JuiceMount — from your NAS to first mount">
   <meta property="og:description" content="Confirm your NAS can run the stack, bring it up with one compose file, verify it from your Mac, build the menu-bar app, and mount your library in Finder. Every step, every command, honest about what is tested.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
-  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the mounted-drive workflow editors get from LucidLink-class SaaS — at 10GbE-direct-attached speed, with Dropbox-style offline resilience — on hardware you already own.">
+  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.">
   <meta name="twitter:card" content="summary_large_image">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
@@ -29,11 +29,14 @@
        does not document (Synology/QNAP/Unraid menu paths) are labeled
        vendor-generic in the UI — nothing JuiceMount-specific is invented.
        Interactive elements: the progress rail (IntersectionObserver +
-       aria-current), copy buttons on every code block, expanding vendor
-       cards (native details), and a stylized compose-boot animation that
-       settles the five services green. All motion gates on
-       prefers-reduced-motion; the boot panel ships painted at its end
-       state so no-JS and reduced-motion read correctly.
+       aria-current="step"), copy buttons on every code block, expanding
+       vendor cards (native details), a stylized compose-boot animation
+       that settles the five services green, and a stylized step-4
+       Setup-Assistant preflight whose three checks settle green. All
+       motion gates on prefers-reduced-motion; both animated panels ship
+       painted at their end state so no-JS and reduced-motion read
+       correctly, and each has a replay button that snaps to the end
+       state under reduced motion.
        Shared tokens/site css come from ../assets; no frameworks, no CDNs,
        no fetches — works double-clicked from a folder (file://).
        ====================================================================== -->
@@ -95,7 +98,7 @@
       transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
     }
     .rail a:hover { color: var(--text); }
-    .rail a[aria-current="true"] { color: var(--text); border-bottom-color: var(--juice-green); }
+    .rail a[aria-current="step"] { color: var(--text); border-bottom-color: var(--juice-green); }
     .rail-num {
       font-size: var(--fs-label);
       font-weight: var(--fw-head);
@@ -109,7 +112,7 @@
       flex: none;
       transition: background-color var(--dur) var(--ease), border-color var(--dur) var(--ease);
     }
-    .rail a[aria-current="true"] .rail-num {
+    .rail a[aria-current="step"] .rail-num {
       background: var(--juice-green);
       border-color: var(--juice-green);
       color: var(--pulp-ink);
@@ -138,7 +141,7 @@
         border-left: 3px solid transparent;
         padding: 0.3rem 0 0.3rem var(--space-3);
       }
-      .rail a[aria-current="true"] { border-left-color: var(--juice-green); border-bottom-color: transparent; }
+      .rail a[aria-current="step"] { border-left-color: var(--juice-green); border-bottom-color: transparent; }
       .rail-aux { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1.5px solid var(--hairline-soft); }
     }
 
@@ -419,8 +422,15 @@
       padding: 0.45rem 0;
     }
     .pf-row + .pf-row { border-top: 1px solid var(--hairline-soft); }
-    .pf-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--juice-green); flex: none; }
-    .pf-row .muted { margin-left: auto; text-align: right; }
+    .pf-dot {
+      width: 9px; height: 9px; border-radius: 50%;
+      background: var(--hairline);            /* pending — same slate as the boot panel's dots */
+      flex: none;
+      transition: background-color var(--dur) var(--ease);
+    }
+    .pf-row.is-ok .pf-dot { background: var(--juice-green); }
+    .pf-row .muted { margin-left: auto; text-align: right; opacity: 0.45; transition: opacity var(--dur) var(--ease); }
+    .pf-row.is-ok .muted { opacity: 1; }
     @media (max-width: 480px) {
       .pf-row { flex-wrap: wrap; }
       .pf-row .muted { margin-left: calc(9px + var(--space-3)); width: 100%; text-align: left; }
@@ -511,7 +521,7 @@
       </a>
       <ul>
         <li><a href="index.html">Home</a></li>
-        <li><a href="index.html#how">How it works</a></li>
+        <li><a href="index.html#states">How it works</a></li>
         <li><a href="compare.html">Compare</a></li>
         <li><a href="performance.html">Performance</a></li>
         <li><a href="calculator.html">Calculator</a></li>
@@ -537,7 +547,7 @@
       <nav class="rail" aria-label="Setup steps">
         <p class="label rail-title">The setup journey</p>
         <ol class="rail-list">
-          <li><a href="#step-1" aria-current="true"><span class="rail-num" aria-hidden="true">1</span>Check your NAS</a></li>
+          <li><a href="#step-1" aria-current="step"><span class="rail-num" aria-hidden="true">1</span>Check your NAS</a></li>
           <li><a href="#step-2"><span class="rail-num" aria-hidden="true">2</span>Install the stack</a></li>
           <li><a href="#step-3"><span class="rail-num" aria-hidden="true">3</span>Verify it&rsquo;s reachable</a></li>
           <li><a href="#step-4"><span class="rail-num" aria-hidden="true">4</span>Install the Mac app</a></li>
@@ -927,7 +937,7 @@ docker compose logs juicefs-init    # confirms first-time volume format</code></
           </div>
 
           <h3>What success looks like</h3>
-          <p><code>docker compose ps</code> shows every long-running service healthy, and <code>docker compose logs juicefs-init</code> ends with <code>[format] complete</code> on first boot — or <code>[precheck-5] already formatted</code> on any boot after that. On TrueNAS, the same lines appear under <strong>Apps → Logs</strong>; every pre-flight line is prefixed <code>[precheck-N]</code> for easy grepping.</p>
+          <p><code>docker compose ps</code> shows every long-running service healthy, and the <code>juicefs-init</code> log (<code>docker compose logs juicefs-init</code>) ends with a successful format line on first boot — or reports the volume is already formatted on any boot after that — with no <code>FAIL</code> in it. The exact wording differs between the TrueNAS YAML above and the repo&rsquo;s <code>docker-compose.yml</code>, but in both, format lines are prefixed <code>[format]</code> and every pre-flight line is prefixed <code>[precheck-N]</code> for easy grepping. On TrueNAS the same log appears under <strong>Apps → Logs</strong>.</p>
         </section>
 
         <!-- ============================================================ -->
@@ -1028,12 +1038,15 @@ open /Applications/JuiceMount.app</code></pre>
 
           <h3>First launch — the Setup Assistant</h3>
           <p>On first launch the Setup Assistant opens automatically and pre-flights the three things a mount depends on. You can reopen it any time from the menu-bar icon → <strong>Setup Assistant…</strong></p>
-          <div class="preflight band-ink" role="img" aria-label="Stylized Setup Assistant preflight: juicefs binary found, macFUSE installed, backend reachable — all three passing">
-            <div class="pf-row"><span class="pf-dot"></span><span>juicefs binary</span><span class="muted">found in /opt/homebrew/bin</span></div>
-            <div class="pf-row"><span class="pf-dot"></span><span>macFUSE</span><span class="muted">installed</span></div>
-            <div class="pf-row"><span class="pf-dot"></span><span>backend reachability</span><span class="muted">Redis + MinIO answering</span></div>
+          <div class="widget-ctl">
+            <span class="label">stylized — the real window walks you through fixing whichever row fails</span>
+            <button type="button" class="replay-btn" id="pf-replay">Replay checks</button>
           </div>
-          <p class="small muted">Stylized — the real window walks you through fixing whichever row fails.</p>
+          <div class="preflight band-ink" id="preflight-demo" role="img" aria-label="Stylized Setup Assistant preflight: juicefs binary found, macFUSE installed, backend reachable — all three passing">
+            <div class="pf-row is-ok"><span class="pf-dot" aria-hidden="true"></span><span>juicefs binary</span><span class="muted">found in /opt/homebrew/bin</span></div>
+            <div class="pf-row is-ok"><span class="pf-dot" aria-hidden="true"></span><span>macFUSE</span><span class="muted">installed</span></div>
+            <div class="pf-row is-ok"><span class="pf-dot" aria-hidden="true"></span><span>backend reachability</span><span class="muted">Redis + MinIO answering</span></div>
+          </div>
 
           <h3>Point the app at your NAS</h3>
           <p>The Setup Assistant (and later <strong>Preferences → Connection</strong>) wants two fields:</p>
@@ -1249,7 +1262,7 @@ docker compose up -d      # restart with no data loss</code></pre>
               <ul>
                 <li>The LaunchAgent (<code>~/Library/LaunchAgents/com.juicemount.agent.plist</code>)</li>
                 <li>The sudoers rule (<code>/etc/sudoers.d/juicemount-mount</code> — the one step that asks for sudo)</li>
-                <li>App state at <code>~/.juicemount</code> — the local metadata cache and pin list, rebuilt from Redis on a future reinstall</li>
+                <li>App state at <code>~/.juicemount</code> — the local metadata cache (rebuilt from Redis on a future reinstall) and the pin list, which lives here too and is not recovered</li>
                 <li>App support at <code>~/Library/Application Support/JuiceMount</code>, including the spool</li>
                 <li>Logs at <code>~/Library/Logs/JuiceMount</code></li>
                 <li>The JuiceFS chunk cache at <code>~/.juicefs/cache</code> — usually the big one; it can be hundreds of GB, and the size is shown before you confirm</li>
@@ -1304,7 +1317,7 @@ docker compose up -d      # restart with no data loss</code></pre>
       var link = railById[id];
       if (!link) { return; }
       railLinks.forEach(function (a) { a.removeAttribute("aria-current"); });
-      link.setAttribute("aria-current", "true");
+      link.setAttribute("aria-current", "step");
       // keep the active chip visible when the rail scrolls horizontally
       // (mobile). Scrolls only the rail's own overflow box, never the page.
       if (railEl && railEl.scrollWidth > railEl.clientWidth && railEl.scrollTo) {
@@ -1448,6 +1461,53 @@ docker compose up -d      # restart with no data loss</code></pre>
         skReplay.addEventListener("click", function () {
           skPlayed = true;
           skPlay();
+        });
+      }
+    }
+
+    /* =================================================================
+       Setup-Assistant preflight — same contract as the boot panel: the
+       HTML ships with every row checked (is-ok) so no-JS and reduced
+       motion read the end state. On first scroll-into-view the script
+       clears the checks and re-runs them in sequence. The replay button
+       is wired unconditionally; under reduced motion its handler snaps
+       straight to the checked end state instead of animating.
+       ================================================================= */
+    var pfPanel = document.getElementById("preflight-demo");
+    var pfRows = pfPanel ? Array.prototype.slice.call(pfPanel.querySelectorAll(".pf-row")) : [];
+    var pfTimers = [];
+    function pfLater(fn, ms) { pfTimers.push(window.setTimeout(fn, ms)); }
+    function pfClear() { while (pfTimers.length) { window.clearTimeout(pfTimers.pop()); } }
+    function pfFinal() {
+      pfRows.forEach(function (row) { row.classList.add("is-ok"); });
+    }
+    function pfPlay() {
+      pfClear();
+      if (reduced()) { pfFinal(); return; }
+      pfRows.forEach(function (row) { row.classList.remove("is-ok"); });
+      pfRows.forEach(function (row, i) {
+        pfLater(function () { row.classList.add("is-ok"); }, 500 + i * 650);
+      });
+    }
+    if (pfPanel && pfRows.length) {
+      var pfPlayed = false;
+      if (!reduced() && "IntersectionObserver" in window) {
+        var pfIO = new IntersectionObserver(function (entries) {
+          entries.forEach(function (en) {
+            if (en.isIntersecting && !pfPlayed) {
+              pfPlayed = true;
+              pfPlay();
+              pfIO.disconnect();
+            }
+          });
+        }, { threshold: 0.4 });
+        pfIO.observe(pfPanel);
+      }
+      var pfReplay = document.getElementById("pf-replay");
+      if (pfReplay) {
+        pfReplay.addEventListener("click", function () {
+          pfPlayed = true;
+          pfPlay();
         });
       }
     }

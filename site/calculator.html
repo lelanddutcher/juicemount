@@ -11,7 +11,7 @@
   <meta property="og:title" content="Rent vs. own — the JuiceMount payback calculator">
   <meta property="og:description" content="Your team pays for storage SaaS by the seat and the terabyte. Find the month a one-time box pays for itself — with honest output when SaaS is actually cheaper for you.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
-  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the mounted-drive workflow editors get from LucidLink-class SaaS — at 10GbE-direct-attached speed, with Dropbox-style offline resilience — on hardware you already own.">
+  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.">
   <meta name="twitter:card" content="summary_large_image">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
@@ -209,7 +209,8 @@
       margin-bottom: 0.45rem;
     }
     .receipt caption::after {
-      content: "prices checked June 2026 · fetched 2026-06-10";
+      /* keep in sync with assets/pricing.json "fetched" */
+      content: "prices checked June 2026 · fetched 2026-06-11";
       display: block;
       font-size: 0.6875rem;
       font-weight: var(--fw-text);
@@ -246,7 +247,7 @@
       </a>
       <ul>
         <li><a href="index.html">Home</a></li>
-        <li><a href="index.html#how">How it works</a></li>
+        <li><a href="index.html#states">How it works</a></li>
         <li><a href="compare.html">Compare</a></li>
         <li><a href="performance.html">Performance</a></li>
         <li><a href="calculator.html" aria-current="page">Calculator</a></li>
@@ -286,7 +287,7 @@
               <option value="suite_managed" selected>Suite — managed ($75/TB/mo)</option>
               <option value="suite_byo">Suite — BYO storage ($40/TB/mo + your bucket)</option>
               <option value="lucidlink">LucidLink Business ($27/seat + overage)</option>
-              <option value="shade">Shade Growth ($29.75/seat)</option>
+              <option value="shade">Shade Growth ($29.75/seat, annual)</option>
               <option value="s3">Generic S3 bucket (per-TB)</option>
               <option value="mybill">My bill / my quote</option>
             </select>
@@ -391,8 +392,8 @@
       <!-- ============ results ============ -->
       <div class="results">
         <div id="headline" aria-live="polite"></div>
-        <div id="warnings"></div>
-        <div id="notices"></div>
+        <div id="warnings" aria-live="polite"></div>
+        <div id="notices" aria-live="polite"></div>
 
         <div class="chart-wrap" id="chart-wrap">
           <h2 style="font-size: var(--fs-lead); margin-bottom: var(--space-2)">Cumulative cost, 36 months</h2>
@@ -606,6 +607,16 @@
       }, { threshold: 0.45 });
       io.observe(wrap);
     }
+
+    /* If the user flips reduced-motion on mid-session, settle the chart
+       instantly (same pattern as index.html's onReduceChange). */
+    function onReduceChange() {
+      if (!reduced()) return;
+      finishDraw();                 /* settles is-pre/is-draw instantly */
+      played = true;
+    }
+    if (reduceQ.addEventListener) { reduceQ.addEventListener("change", onReduceChange); }
+    else if (reduceQ.addListener) { reduceQ.addListener(onReduceChange); }
 
     /* ---- (4) display-only notices: plan floors and promo labels the
             simulation can't know about. Data: pricing.json via the event's

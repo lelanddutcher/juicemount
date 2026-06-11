@@ -11,7 +11,7 @@
   <meta property="og:title" content="JuiceMount — the open-source alternative to Suite, Shade, and LucidLink">
   <meta property="og:description" content="For indie filmmakers and small post teams: a real mounted drive at LAN speed, Dropbox-style offline resilience, on hardware you already own. $0 per seat.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
-  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the mounted-drive workflow editors get from LucidLink-class SaaS — at 10GbE-direct-attached speed, with Dropbox-style offline resilience — on hardware you already own.">
+  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.">
   <meta name="twitter:card" content="summary_large_image">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
@@ -616,7 +616,7 @@
     .fm-vol, .fm-list li, .fm-cap {
       transition: opacity 0.35s var(--ease), transform 0.35s var(--ease);
     }
-    .is-veiled { opacity: 0; transform: translateY(5px); pointer-events: none; }
+    .is-veiled { opacity: 0; transform: translateY(5px); pointer-events: none; visibility: hidden; transition: opacity 0.35s var(--ease), transform 0.35s var(--ease), visibility 0s 0.35s; }
 
     .fm-caps {
       max-width: 760px;
@@ -995,6 +995,36 @@
     .ckg-chip:nth-child(2) { animation-delay: 0.22s; }
     .ckg-chip:nth-child(3) { animation-delay: 0.44s; }
     @keyframes ckg-pingpong { to { left: calc(100% - 8px); } }
+    /* pillar/closing variants of the wire glyph */
+    .pillar-card .ckg { margin: var(--space-2) 0 var(--space-3); }
+    .ckg-wire-down::before { border-top-style: solid; opacity: 0.35; }
+    .ckg-pin { width: 9%; left: 12%; background: var(--juice-green); border: 1px solid var(--juice-green); animation: ckg-pinhold 2.4s steps(1) infinite; }
+    @keyframes ckg-pinhold { 0%, 100% { opacity: 1; } }    /* the pin never moves; the wire is what fades */
+    .ckg-wire-down { animation: ckg-wiredrop 2.4s var(--ease) infinite; }
+    @keyframes ckg-wiredrop { 0%, 35% { opacity: 1; } 55%, 80% { opacity: 0.15; } 100% { opacity: 1; } }
+    .ckg-meter { white-space: nowrap; }
+    .ckg-exit { max-width: 460px; margin: var(--space-4) 0; }
+    .rmap { display: flex; gap: 0; margin: var(--space-2) 0 var(--space-3); }
+    .rmap-dot {
+      position: relative; flex: 1;
+      font-family: var(--font-mono); font-size: 0.6875rem; color: var(--text-muted);
+      padding-top: 14px;
+    }
+    .rmap-dot::before {
+      content: ""; position: absolute; top: 3px; left: 0; width: 8px; height: 8px;
+      border-radius: 50%; background: var(--tint-slate); border: 1.5px solid var(--hairline);
+    }
+    .rmap-dot::after {
+      content: ""; position: absolute; top: 6.5px; left: 14px; right: 6px;
+      border-top: 1.5px dashed var(--hairline-soft);
+    }
+    .rmap-dot:last-child::after { display: none; }
+    .rmap.is-on .rmap-dot::before { animation: rmap-light 0.4s var(--ease) calc(var(--d) * 0.35s) forwards; }
+    @keyframes rmap-light { to { background: var(--juice-green); border-color: var(--juice-green); } }
+    @media (prefers-reduced-motion: reduce) {
+      .rmap .rmap-dot::before { background: var(--juice-green); border-color: var(--juice-green); animation: none; }
+      .ckg-wire-down { animation: none; opacity: 0.5; }
+    }
     @keyframes ckg-cross-slab { 0% { left: -46%; } 60%, 100% { left: 100%; } }
     @keyframes ckg-cross-chip { 0% { left: -9%; } 55%, 100% { left: 100%; } }
     @media (prefers-reduced-motion: reduce) { .ckg-wire i { animation: none; left: 30%; } }
@@ -1147,7 +1177,7 @@
       </a>
       <ul>
         <li><a href="index.html" aria-current="page">Home</a></li>
-        <li><a href="#how">How it works</a></li>
+        <li><a href="#states">How it works</a></li>
         <li><a href="compare.html">Compare</a></li>
         <li><a href="performance.html">Performance</a></li>
         <li><a href="calculator.html">Calculator</a></li>
@@ -1214,15 +1244,169 @@
     </header>
 
     <!-- ================================================================
+         Animation B — "The menu bar tells the truth": the four shipped
+         state marks, cycling, with the popover's glance rows underneath.
+         ================================================================ -->
+    <section class="band-ink section" id="states" aria-labelledby="states-h">
+      <div class="container">
+        <div class="section-head">
+          <p class="label sec-kicker">demo 01 · the menu bar</p>
+          <h2 id="states-h">It starts in the menu bar.</h2>
+          <p class="muted">JuiceMount is a menu-bar app: it's where you create the mount, watch uploads land on the NAS, pin projects for offline, and flip modes. The mark is the status system — one glance says what your storage is doing, and it tells the truth, including when something's wrong. These are the marks the app actually ships.</p>
+        </div>
+
+        <div class="mb" id="mb-widget">
+          <div class="mb-strip">
+            <div class="mb-menus" aria-hidden="true">
+              <span class="mb-app">Finder</span><span>File</span><span>Edit</span><span>View</span><span>Go</span><span>Window</span><span>Help</span>
+            </div>
+            <div class="mb-cluster">
+              <span class="mb-mark">
+                <img id="mb-mark-img" src="assets/state-healthy.svg" width="18" height="18" alt="JuiceMount menu-bar mark — green, healthy">
+                <span class="mb-badge" id="mb-badge" hidden aria-hidden="true"><svg><use href="#i-up"/></svg></span>
+              </span>
+              <svg class="mb-glyph" aria-hidden="true"><use href="#i-wifi"/></svg>
+              <svg class="mb-glyph" aria-hidden="true"><use href="#i-batt"/></svg>
+              <span class="mb-clock num" aria-hidden="true">Thu 10:42 AM</span>
+            </div>
+          </div>
+
+          <div class="mb-pop" id="mb-pop">
+            <div class="mb-pane is-healthy" id="mb-pane-healthy" role="tabpanel" tabindex="0" aria-labelledby="mb-tab-healthy">
+              <div class="mb-row">
+                <span class="mb-dot" aria-hidden="true"></span>
+                <div class="mb-cell">
+                  <span class="mb-word">Healthy</span>
+                  <span class="mb-sub">Redis · MinIO · FUSE · NFS — all reachable</span>
+                </div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">cache</span>
+                <div class="mb-cell">
+                  <span class="mb-track"><span class="mb-fill" style="width:82%"></span></span>
+                  <span class="mb-sub"><span class="num">412 GB</span> cached · <span class="num">88 GB</span> free</span>
+                </div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">uploads</span>
+                <div class="mb-cell"><span class="mb-sub">none pending</span></div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">volume</span>
+                <div class="mb-cell"><span class="mb-sub num">zpool · /Volumes/zpool</span></div>
+              </div>
+            </div>
+
+            <div class="mb-pane is-uploads" id="mb-pane-uploads" role="tabpanel" tabindex="0" aria-labelledby="mb-tab-uploads" hidden>
+              <div class="mb-row">
+                <span class="mb-dot" aria-hidden="true"></span>
+                <div class="mb-cell">
+                  <span class="mb-word">Healthy — uploading</span>
+                  <span class="mb-sub">write spool (opt-in) draining in the background</span>
+                </div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">uploads</span>
+                <div class="mb-cell">
+                  <span class="mb-track"><span class="mb-fill" style="width:38%"></span></span>
+                  <span class="mb-sub"><span class="num">3</span> uploading · <span class="num">1.2 GB</span> queued</span>
+                </div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">cache</span>
+                <div class="mb-cell"><span class="mb-sub"><span class="num">412 GB</span> cached · <span class="num">88 GB</span> free</span></div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">volume</span>
+                <div class="mb-cell"><span class="mb-sub num">zpool · /Volumes/zpool</span></div>
+              </div>
+            </div>
+
+            <div class="mb-pane is-offline" id="mb-pane-offline" role="tabpanel" tabindex="0" aria-labelledby="mb-tab-offline" hidden>
+              <div class="mb-row">
+                <span class="mb-dot" aria-hidden="true"></span>
+                <div class="mb-cell">
+                  <span class="mb-word">Offline files</span>
+                  <span class="mb-sub">Offline — <span class="num">214</span> pinned files available</span>
+                </div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">pinned</span>
+                <div class="mb-cell">
+                  <span class="mb-track"><span class="mb-fill" style="width:100%"></span></span>
+                  <span class="mb-sub">pin set fully cached — reads at SSD speed</span>
+                </div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">reads</span>
+                <div class="mb-cell"><span class="mb-sub">un-pinned reads refuse in <span class="num">4–67 ms</span> — no hang</span></div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">volume</span>
+                <div class="mb-cell"><span class="mb-sub num">zpool · /Volumes/zpool</span></div>
+              </div>
+            </div>
+
+            <div class="mb-pane is-degraded" id="mb-pane-degraded" role="tabpanel" tabindex="0" aria-labelledby="mb-tab-degraded" hidden>
+              <div class="mb-row">
+                <span class="mb-dot" aria-hidden="true"></span>
+                <div class="mb-cell">
+                  <span class="mb-word">Degraded</span>
+                  <span class="mb-sub">reconnecting — reads keep flowing from cache</span>
+                </div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">health</span>
+                <div class="mb-cell"><span class="mb-sub">MinIO unreachable — retrying; Redis · FUSE · NFS fine</span></div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">cache</span>
+                <div class="mb-cell">
+                  <span class="mb-track"><span class="mb-fill" style="width:82%"></span></span>
+                  <span class="mb-sub">cached blocks keep serving from local SSD</span>
+                </div>
+              </div>
+              <div class="mb-row">
+                <span class="mb-lab">volume</span>
+                <div class="mb-cell"><span class="mb-sub num">zpool · /Volumes/zpool</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="mb-tabs" role="tablist" aria-label="Menu-bar state" id="mb-tabs">
+            <button type="button" class="mb-tab is-healthy" id="mb-tab-healthy" role="tab" aria-selected="true" aria-controls="mb-pane-healthy"><span class="mb-dot" aria-hidden="true"></span>Healthy</button>
+            <button type="button" class="mb-tab is-uploads" id="mb-tab-uploads" role="tab" aria-selected="false" aria-controls="mb-pane-uploads" tabindex="-1"><span class="mb-dot" aria-hidden="true"></span>Uploads pending</button>
+            <button type="button" class="mb-tab is-offline" id="mb-tab-offline" role="tab" aria-selected="false" aria-controls="mb-pane-offline" tabindex="-1"><span class="mb-dot" aria-hidden="true"></span>Offline files</button>
+            <button type="button" class="mb-tab is-degraded" id="mb-tab-degraded" role="tab" aria-selected="false" aria-controls="mb-pane-degraded" tabindex="-1"><span class="mb-dot" aria-hidden="true"></span>Degraded</button>
+          </div>
+          <div class="widget-ctl" style="margin-bottom:0">
+            <span class="small muted" id="mb-auto-note">Click a state to switch the mark and the popover.</span>
+            <noscript><span class="small muted">(Switching needs JavaScript — shown: the healthy state.)</span></noscript>
+            <button type="button" class="replay-btn" id="mb-cycle">Restart cycle</button>
+          </div>
+        </div>
+
+        <p class="mb-legend" style="margin-top: var(--space-6)">
+          <img src="assets/state-healthy.svg" alt="" aria-hidden="true"> green healthy ·
+          <img src="assets/state-degraded.svg" alt="" aria-hidden="true"> amber degraded ·
+          <img src="assets/state-offline-files.svg" alt="" aria-hidden="true"> blue offline files ·
+          <img src="assets/state-fault.svg" alt="" aria-hidden="true"> red fault —
+          four colors are the whole status system. You always know what your storage is doing, without opening a dashboard or reading a log.
+        </p>
+        <p class="small muted mb-legend">Numbers in this popover are illustrative — the real one shows yours. Fault red is the state you should rarely see: it means the volume needs you.</p>
+      </div>
+    </section>
+
+    <!-- ================================================================
          Animation A — "It's a real mount": a pseudo-Finder window mounts
          the volume, files populate, captions land the no-relink point.
          ================================================================ -->
     <section class="section" id="mount" aria-labelledby="mount-h">
       <div class="container">
         <div class="section-head">
-          <p class="label sec-kicker">demo 01 · a real mount</p>
+          <p class="label sec-kicker">demo 02 · a real mount</p>
           <h2 id="mount-h">It's a real mount.</h2>
-          <p class="muted">Your server shows up in Finder the way a drive does — because to macOS, it is one. Watch it mount.</p>
+          <p class="muted">Your NAS shows up in Finder the way a drive does — because to macOS, it is one. Watch it mount.</p>
         </div>
 
         <div class="widget-ctl">
@@ -1356,7 +1540,7 @@
     <section class="section" id="search" aria-labelledby="search-h">
       <div class="container">
         <div class="section-head">
-          <p class="label sec-kicker">demo 02 · instant search</p>
+          <p class="label sec-kicker">demo 03 · instant search</p>
           <h2 id="search-h">Find any file in about 29 ms.</h2>
           <p class="muted">Press <span class="num">⌘⇧F</span> from any app. The search window answers from an index that lives on your Mac — it never has to ask the NAS. Spacebar gives you Quick Look, Enter reveals in Finder, and you can drag a result straight into a Premiere, Resolve, or Final Cut timeline.</p>
         </div>
@@ -1395,159 +1579,7 @@
       </div>
     </section>
 
-    <!-- ================================================================
-         Animation B — "The menu bar tells the truth": the four shipped
-         state marks, cycling, with the popover's glance rows underneath.
-         ================================================================ -->
-    <section class="band-ink section" id="states" aria-labelledby="states-h">
-      <div class="container">
-        <div class="section-head">
-          <p class="label sec-kicker">demo 03 · the menu bar</p>
-          <h2 id="states-h">It starts in the menu bar.</h2>
-          <p class="muted">JuiceMount is a menu-bar app: it's where you create the mount, watch uploads land on the NAS, pin projects for offline, and flip modes. The mark is the status system — one glance says what your storage is doing, and it tells the truth, including when something's wrong. These are the marks the app actually ships.</p>
-        </div>
 
-        <div class="mb" id="mb-widget">
-          <div class="mb-strip">
-            <div class="mb-menus" aria-hidden="true">
-              <span class="mb-app">Finder</span><span>File</span><span>Edit</span><span>View</span><span>Go</span><span>Window</span><span>Help</span>
-            </div>
-            <div class="mb-cluster">
-              <span class="mb-mark">
-                <img id="mb-mark-img" src="assets/state-healthy.svg" width="18" height="18" alt="JuiceMount menu-bar mark — green, healthy">
-                <span class="mb-badge" id="mb-badge" hidden aria-hidden="true"><svg><use href="#i-up"/></svg></span>
-              </span>
-              <svg class="mb-glyph" aria-hidden="true"><use href="#i-wifi"/></svg>
-              <svg class="mb-glyph" aria-hidden="true"><use href="#i-batt"/></svg>
-              <span class="mb-clock num" aria-hidden="true">Thu 10:42 AM</span>
-            </div>
-          </div>
-
-          <div class="mb-pop" id="mb-pop">
-            <div class="mb-pane is-healthy" id="mb-pane-healthy" role="tabpanel" aria-labelledby="mb-tab-healthy">
-              <div class="mb-row">
-                <span class="mb-dot" aria-hidden="true"></span>
-                <div class="mb-cell">
-                  <span class="mb-word">Healthy</span>
-                  <span class="mb-sub">Redis · MinIO · FUSE · NFS — all reachable</span>
-                </div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">cache</span>
-                <div class="mb-cell">
-                  <span class="mb-track"><span class="mb-fill" style="width:82%"></span></span>
-                  <span class="mb-sub"><span class="num">412 GB</span> cached · <span class="num">88 GB</span> free</span>
-                </div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">uploads</span>
-                <div class="mb-cell"><span class="mb-sub">none pending</span></div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">volume</span>
-                <div class="mb-cell"><span class="mb-sub num">zpool · /Volumes/zpool</span></div>
-              </div>
-            </div>
-
-            <div class="mb-pane is-uploads" id="mb-pane-uploads" role="tabpanel" aria-labelledby="mb-tab-uploads" hidden>
-              <div class="mb-row">
-                <span class="mb-dot" aria-hidden="true"></span>
-                <div class="mb-cell">
-                  <span class="mb-word">Healthy — uploading</span>
-                  <span class="mb-sub">write spool (opt-in) draining in the background</span>
-                </div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">uploads</span>
-                <div class="mb-cell">
-                  <span class="mb-track"><span class="mb-fill" style="width:38%"></span></span>
-                  <span class="mb-sub"><span class="num">3</span> uploading · <span class="num">1.2 GB</span> queued</span>
-                </div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">cache</span>
-                <div class="mb-cell"><span class="mb-sub"><span class="num">412 GB</span> cached · <span class="num">88 GB</span> free</span></div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">volume</span>
-                <div class="mb-cell"><span class="mb-sub num">zpool · /Volumes/zpool</span></div>
-              </div>
-            </div>
-
-            <div class="mb-pane is-offline" id="mb-pane-offline" role="tabpanel" aria-labelledby="mb-tab-offline" hidden>
-              <div class="mb-row">
-                <span class="mb-dot" aria-hidden="true"></span>
-                <div class="mb-cell">
-                  <span class="mb-word">Offline files</span>
-                  <span class="mb-sub">Offline — <span class="num">214</span> pinned files available</span>
-                </div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">pinned</span>
-                <div class="mb-cell">
-                  <span class="mb-track"><span class="mb-fill" style="width:100%"></span></span>
-                  <span class="mb-sub">pin set fully cached — reads at SSD speed</span>
-                </div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">reads</span>
-                <div class="mb-cell"><span class="mb-sub">un-pinned reads refuse in <span class="num">4–67 ms</span> — no hang</span></div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">volume</span>
-                <div class="mb-cell"><span class="mb-sub num">zpool · /Volumes/zpool</span></div>
-              </div>
-            </div>
-
-            <div class="mb-pane is-degraded" id="mb-pane-degraded" role="tabpanel" aria-labelledby="mb-tab-degraded" hidden>
-              <div class="mb-row">
-                <span class="mb-dot" aria-hidden="true"></span>
-                <div class="mb-cell">
-                  <span class="mb-word">Degraded</span>
-                  <span class="mb-sub">reconnecting — reads keep flowing from cache</span>
-                </div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">health</span>
-                <div class="mb-cell"><span class="mb-sub">MinIO unreachable — retrying; Redis · FUSE · NFS fine</span></div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">cache</span>
-                <div class="mb-cell">
-                  <span class="mb-track"><span class="mb-fill" style="width:82%"></span></span>
-                  <span class="mb-sub">cached blocks keep serving from local SSD</span>
-                </div>
-              </div>
-              <div class="mb-row">
-                <span class="mb-lab">volume</span>
-                <div class="mb-cell"><span class="mb-sub num">zpool · /Volumes/zpool</span></div>
-              </div>
-            </div>
-          </div>
-
-          <div class="mb-tabs" role="tablist" aria-label="Menu-bar state" id="mb-tabs">
-            <button type="button" class="mb-tab is-healthy" id="mb-tab-healthy" role="tab" aria-selected="true" aria-controls="mb-pane-healthy"><span class="mb-dot" aria-hidden="true"></span>Healthy</button>
-            <button type="button" class="mb-tab is-uploads" id="mb-tab-uploads" role="tab" aria-selected="false" aria-controls="mb-pane-uploads" tabindex="-1"><span class="mb-dot" aria-hidden="true"></span>Uploads pending</button>
-            <button type="button" class="mb-tab is-offline" id="mb-tab-offline" role="tab" aria-selected="false" aria-controls="mb-pane-offline" tabindex="-1"><span class="mb-dot" aria-hidden="true"></span>Offline files</button>
-            <button type="button" class="mb-tab is-degraded" id="mb-tab-degraded" role="tab" aria-selected="false" aria-controls="mb-pane-degraded" tabindex="-1"><span class="mb-dot" aria-hidden="true"></span>Degraded</button>
-          </div>
-          <div class="widget-ctl" style="margin-bottom:0">
-            <span class="small muted" id="mb-auto-note">Click a state to switch the mark and the popover.</span>
-            <noscript><span class="small muted">(Switching needs JavaScript — shown: the healthy state.)</span></noscript>
-            <button type="button" class="replay-btn" id="mb-cycle">Restart cycle</button>
-          </div>
-        </div>
-
-        <p class="mb-legend" style="margin-top: var(--space-6)">
-          <img src="assets/state-healthy.svg" alt="" aria-hidden="true"> green healthy ·
-          <img src="assets/state-degraded.svg" alt="" aria-hidden="true"> amber degraded ·
-          <img src="assets/state-offline-files.svg" alt="" aria-hidden="true"> blue offline files ·
-          <img src="assets/state-fault.svg" alt="" aria-hidden="true"> red fault —
-          four colors are the whole status system. You always know what your storage is doing, without opening a dashboard or reading a log.
-        </p>
-        <p class="small muted mb-legend">Numbers in this popover are illustrative — the real one shows yours. Fault red is the state you should rarely see: it means the volume needs you.</p>
-      </div>
-    </section>
 
     <!-- ================================================================
          Animation C — the chunk story: a camera original splits into
@@ -1601,7 +1633,7 @@
           <button type="button" class="replay-btn" id="ck-replay">Replay story</button>
         </div>
 
-        <div class="ck" id="ck-widget" role="group" aria-label="Chunk diagram: an 8 GB file on your Mac splits into 4 MB chunks that upload once to your NAS; reading three seconds back streams three chunks home while the rest stay on the server">
+        <div class="ck" id="ck-widget" role="group" aria-label="Chunk diagram: an 8 GB file on your Mac splits into 4 MB chunks that upload once to your NAS; reading three seconds back streams three chunks home while the rest stay on the NAS">
           <div class="ck-stage" id="ck-stage">
             <div class="ck-node">
               <div class="ck-file">
@@ -1657,7 +1689,7 @@
             </div>
           </div>
           <p class="ck-status small" id="ck-status" aria-live="polite">Three chunks, 12 MB. The other 1,997 never moved. That's block storage.</p>
-          <noscript><p class="ck-status small">The animation needs JavaScript; the diagram shows the end of the story: the whole file went to the server once, and a three-second read brought back three chunks — 12 MB, not 8 GB.</p></noscript>
+          <noscript><p class="ck-status small">The animation needs JavaScript; the diagram shows the end of the story: the whole file went to the NAS once, and a three-second read brought back three chunks — 12 MB, not 8 GB.</p></noscript>
         </div>
 
         <div class="ck-compare">
@@ -1702,7 +1734,7 @@
             <span class="svh-tc num" id="svh-tc">00:00:00:00</span>
             <span class="svh-tc-sub" id="svh-frame">frame 0 · drag the strip below</span>
           </div>
-          <div class="svh-strip" id="svh-strip" aria-hidden="false">
+          <div class="svh-strip" id="svh-strip">
             <div class="svh-head" id="svh-head" role="slider" tabindex="0" aria-label="Playhead position in the clip"
                  aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
                  aria-valuetext="start of the clip — nothing paged in yet"></div>
@@ -1730,18 +1762,21 @@
           <div class="card pillar-card">
             <span class="label">speed</span>
             <span class="stat">7 Gbit/s</span>
+            <div class="ckg" aria-hidden="true"><span>Mac</span><span class="ckg-wire"><i class="ckg-chip"></i><i class="ckg-chip"></i><i class="ckg-chip"></i></span><span>NAS</span></div>
             <h3>Fast because it's your LAN</h3>
             <p>Roughly 7&nbsp;Gbit/s in both directions on a 10&nbsp;GbE LAN, author-measured — the same wire where sync-class tools capped near <span class="num">1&nbsp;Gbit/s</span> in the same tests. Cached reads come off local SSD at <span class="num">226–571&nbsp;MB/s</span>; a 100&nbsp;K-file library opens folders in <span class="num">15–120&nbsp;ms</span>.</p>
           </div>
           <div class="card pillar-card">
             <span class="label">resilience</span>
             <span class="stat">4–67 ms</span>
+            <div class="ckg" aria-hidden="true"><span>pin</span><span class="ckg-wire ckg-wire-down"><i class="ckg-pin"></i></span><span>NAS</span></div>
             <h3>Built for the day the network is gone</h3>
             <p>Pin a project and keep cutting on a plane. In offline mode, un-pinned reads refuse in <span class="num">4–67&nbsp;ms</span> instead of hanging Finder on a <span class="num">30&nbsp;s</span> NFS retry. The opt-in write spool acks renders on local SSD and trickle-uploads in the background, SHA-256-verified at every hop.</p>
           </div>
           <div class="card pillar-card">
             <span class="label">economics</span>
             <span class="stat">$0</span>
+            <div class="ckg" aria-hidden="true"><span class="ckg-meter num" id="pillar-meter">their meter: $0</span><span class="ckg-wire"></span><span>yours: $0</span></div>
             <h3>Software is free; the hardware is yours</h3>
             <p>JuiceMount is open source, Apache-2.0. Suite charges <span class="num">$75/TB/mo</span> managed — or <span class="num">$40/TB/mo</span> to mount a bucket you already own (checked June&nbsp;2026). A one-time box beats a forever bill sooner than you'd think.</p>
             <p><a href="calculator.html">See when the hardware pays for itself</a></p>
@@ -1765,14 +1800,14 @@
             <span class="arch-chips" aria-hidden="true">
               <span class="arch-chip is-local"><i></i>metadata: local SQLite</span>
               <span class="arch-chip is-local"><i></i>cache hit: local SSD</span>
-              <span class="arch-chip is-wire"><i></i>miss: your server</span>
+              <span class="arch-chip is-wire"><i></i>miss: your NAS</span>
             </span>
           </div>
           <picture>
             <source media="(prefers-color-scheme: dark)" srcset="assets/arch-diagram-dark.svg">
-            <img class="diagram" src="assets/arch-diagram.svg" width="1200" height="640" alt="Architecture: Finder, Resolve, or Premiere open files on /Volumes/(name), mounted by the macOS NFS client from the JuiceMount NFS server running in the app on localhost. Three satellites keep the hot path local: an SQLite mirror answers Finder listings, an SSD cache with pins serves cached reads at SSD speed, and a write spool acks writes locally then trickles them up. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your server, where MinIO or any S3 holds file data as plain objects and Redis holds file metadata. Reads stream only the blocks you touch; writes drain in the background at line speed. Both sides are hardware you own.">
+            <img class="diagram" src="assets/arch-diagram.svg" width="1200" height="640" alt="Architecture: Finder, Resolve, or Premiere open files on /Volumes/(name), mounted by the macOS NFS client from the JuiceMount NFS server running in the app on localhost. Three satellites keep the hot path local: an SQLite mirror answers Finder listings, an SSD cache with pins serves cached reads at SSD speed, and a write spool acks writes locally then trickles them up. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your NAS, where MinIO or any S3 holds file data as plain objects and Redis holds file metadata. Reads stream only the blocks you touch; writes drain in the background at line speed. Both sides are hardware you own.">
           </picture>
-          <figcaption>The read path in one line: metadata answers from local SQLite, cache hits stream from local SSD, and only the missing blocks cross the wire to your server.</figcaption>
+          <figcaption>The read path in one line: metadata answers from local SQLite, cache hits stream from local SSD, and only the missing blocks cross the wire to your NAS.</figcaption>
         </figure>
         <p class="small"><a href="https://github.com/lelanddutcher/juicemount/blob/main/ARCHITECTURE_juicemount.md">Architecture notes, including the security model, live in the repo</a></p>
       </div>
@@ -1796,6 +1831,9 @@
         </div>
         <div class="card not-card" style="margin-top: var(--space-4)">
           <span class="label">what's coming</span>
+          <div class="rmap" id="rmap" aria-hidden="true">
+            <span class="rmap-dot" style="--d:0">quick look</span><span class="rmap-dot" style="--d:1">backup lights</span><span class="rmap-dot" style="--d:2">auto-offline</span><span class="rmap-dot" style="--d:3">snapshots</span>
+          </div>
           <p>The near roadmap, in the order it's scored: codec-aware Quick Look (spacebar previews for R3D, ARRI, BRAW, ProRes RAW), traffic-light backup verification on every project, bandwidth-aware auto-switching to offline mode on cellular, and project snapshots — <a href="https://github.com/lelanddutcher/juicemount/blob/main/ROADMAP.md">the full roadmap is public</a>. On the drawing board beyond it: a larger, Finder-adjacent app for browsing the library with richer metadata.</p>
         </div>
         <p class="small muted" style="margin-top: var(--space-4)"><a href="https://github.com/lelanddutcher/juicemount#what-juicemount-is-not">The full what-it's-not list lives in the README</a></p>
@@ -1809,6 +1847,7 @@
           <h2 id="own-h">Your bytes are your bytes.</h2>
           <p class="lead">JuiceMount mounts your own NAS as a Finder volume that behaves like LucidLink and costs like the hardware: scrub 100&nbsp;GB files over the network touching only the blocks you play, pin projects for offline, write at local-SSD speed while uploads trickle in the background. No per-seat fee. No per-TB fee. No storage contract.</p>
           <p class="muted">And leaving stays free in both directions: the built-in migration tool moves an existing library in, and your bytes sit in JuiceFS's open, documented format the whole time — the stock <code>juicefs</code> client reads the volume with no JuiceMount involved. <a href="compare.html#exit">The exit story, animated.</a></p>
+          <div class="ckg ckg-exit" aria-hidden="true"><span>your NAS</span><span class="ckg-wire"><i class="ckg-chip"></i><i class="ckg-chip"></i><i class="ckg-chip"></i></span><span>anywhere you go next</span></div>
           <p class="small muted">S3 and cloud collaboration have their place — this changes the cost equation for small teams so speed doesn't force inferior infrastructure.</p>
           <p class="small" style="margin-top: var(--space-3)">What you'll need: a Mac on macOS&nbsp;14+ and any box that runs Docker — a TrueNAS, a Synology, an old tower. The server stack is one <code>docker compose up</code>; the README's quick-start walks the rest.</p>
         </div>
@@ -1845,13 +1884,14 @@
       var desk = document.getElementById("hero-desk");
       var replay = document.getElementById("hero-desk-replay");
       if (!desk || !replay) return;
-      if (reduced()) { desk.classList.add("is-mounted"); return; }
       function mount() {
+        if (reduced()) { desk.classList.add("is-mounted"); return; }  /* snap to end state */
         desk.classList.remove("is-mounted");
         void desk.offsetWidth;             /* restart the CSS animations */
         desk.classList.add("is-mounted");
       }
       replay.addEventListener("click", mount);
+      if (reduced()) { desk.classList.add("is-mounted"); return; }
       if ("IntersectionObserver" in window) {
         var io = new IntersectionObserver(function (entries) {
           entries.forEach(function (en) {
@@ -1897,7 +1937,7 @@
           ["interview_A_cam.braw", "/02_FOOTAGE/CamA"]
         ]
       };
-      var TIMES = { "A0042": "28.7 ms", "interview": "29.3 ms", "braw": "31.1 ms" };
+      var TIMES = { "A0042": "~29 ms", "interview": "~29 ms", "braw": "~29 ms" };  /* one frozen author-measured figure (README) — no invented per-query decimals */
 
       var swTimers = [];
       function swClear() {
@@ -1974,14 +2014,15 @@
       var bp = document.getElementById("bp");
       var replay = document.getElementById("bp-replay");
       if (!bp || !replay) return;
-      if (reduced()) { bp.classList.add("is-done"); return; }
       function playPrimer() {
+        if (reduced()) { bp.classList.add("is-done"); return; }  /* snap to end state */
         bp.classList.remove("is-play");
         bp.classList.remove("is-done");
         void bp.offsetWidth;
         bp.classList.add("is-play");
       }
       replay.addEventListener("click", playPrimer);
+      if (reduced()) { bp.classList.add("is-done"); return; }
       if ("IntersectionObserver" in window) {
         var played = false;
         var io = new IntersectionObserver(function (entries) {
@@ -1992,6 +2033,49 @@
         io.observe(bp);
       } else {
         bp.classList.add("is-done");
+      }
+    }());
+
+    /* =================================================================
+       Lower-band glyphs: the economics meter counts to the documented
+       default scenario ($750/mo — Suite managed, 5 seats / 10 TB, the
+       same worked example as the noscript); the roadmap rail lights
+       its dots in order. Both once, on scroll-into-view.
+       ================================================================= */
+    (function initLowerGlyphs() {
+      var meter = document.getElementById("pillar-meter");
+      if (meter) {
+        var settle = function () { meter.textContent = "their meter: $750/mo, forever"; };
+        if (reduced() || !("IntersectionObserver" in window)) { settle(); }
+        else {
+          var mio = new IntersectionObserver(function (entries) {
+            entries.forEach(function (en) {
+              if (!en.isIntersecting) return;
+              mio.disconnect();
+              var t0 = null, DUR = 1200;
+              function tick(ts) {
+                if (!t0) t0 = ts;
+                var p = Math.min(1, (ts - t0) / DUR);
+                meter.textContent = "their meter: $" + Math.round(750 * (1 - Math.pow(1 - p, 3))) + "/mo";
+                if (p < 1) window.requestAnimationFrame(tick); else settle();
+              }
+              window.requestAnimationFrame(tick);
+            });
+          }, { threshold: 0.4 });
+          mio.observe(meter);
+        }
+      }
+      var rmap = document.getElementById("rmap");
+      if (rmap) {
+        if (reduced() || !("IntersectionObserver" in window)) { rmap.classList.add("is-on"); }
+        else {
+          var rio = new IntersectionObserver(function (entries) {
+            entries.forEach(function (en) {
+              if (en.isIntersecting) { rmap.classList.add("is-on"); rio.disconnect(); }
+            });
+          }, { threshold: 0.5 });
+          rio.observe(rmap);
+        }
       }
     }());
 
@@ -2394,12 +2478,12 @@
         ckUpNum.textContent = "0 GB";
         ckRdNum.textContent = "—";
         ckRdNote.textContent = "nothing read yet";
-        ckSay("An 8 GB camera original, about to land on your server.");
+        ckSay("An 8 GB camera original, about to land on your NAS.");
       } else if (phase === "uploaded") {
         ckUpNum.textContent = "8 GB — once";
         ckRdNum.textContent = "—";
         ckRdNote.textContent = "nothing read yet";
-        ckSay("Done: 8 GB on the server, uploaded exactly once.");
+        ckSay("Done: 8 GB on the NAS, uploaded exactly once.");
       } else {
         ckUpNum.textContent = "8 GB — once";
         ckRdNum.textContent = "12 MB, not 8 GB";
