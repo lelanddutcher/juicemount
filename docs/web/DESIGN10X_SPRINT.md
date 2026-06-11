@@ -245,7 +245,7 @@ a server is a black box of magic to them").
       Output: dated facts pack → docs/web/RESEARCH_ROUND2.md; pricing
       deltas → site/assets/pricing.json (formulas stay frozen until
       founder sees the diff).
-- [ ] S2. home-v5: hero gets a macOS-style network-drive icon popping in
+- [x] S2. home-v5: hero gets a macOS-style network-drive icon popping in
       ("like what would show up… with the name JuiceMount"); lead
       de-buried ("it's a real mount — your NAS shows up in Finder");
       consolidate the second line; instant-search demo (real search
@@ -301,7 +301,7 @@ a server is a black box of magic to them").
       built-in migration tool (JuiceMount Manager), "cost to enter and
       cost to exit is free", show generic S3 ingest/egress economics
       instead of the SaaS toggle; NAS wording sweep.
-- [ ] S5. calculator-v4: seat minimums audit (Shade 1-seat × 5 TB must
+- [x] S5. calculator-v4: seat minimums audit (Shade 1-seat × 5 TB must
       price if their public tiers allow it — model their storage
       add-on instead of not_comparable, pending S1); jargon →
       footnotes (founder: "get a little less jargon out of there or
@@ -311,7 +311,7 @@ a server is a black box of magic to them").
       (pending S1 pricing); exit-cost panel: migration tool callout +
       S3 egress example. Formula changes go to the founder as a diff
       before canonical promotion.
-- [ ] S6. docs page v1 (site/docs.html or site/docs/): line-by-line
+- [x] S6. docs page v1 (site/docs.html or site/docs/): line-by-line
       get-started: confirm your NAS can run it (Docker check, vendor
       notes: TrueNAS SCALE, Synology DSM 7+, QNAP, Unraid, plain
       Linux); install the stack (compose YAML walkthrough); verify
@@ -327,3 +327,35 @@ a server is a black box of magic to them").
 - [2026-06-11 ~09:00] S0 — both founder-reported bugs reproduced, fixed,
   verified live (chart draws when rendered in-view; race actually races,
   warm beats cold visibly, sync crawls at its own labeled scale) — d414cda.
+- [2026-06-11 ~11:30] S2+S5+S6 — home-v5, calculator-v4, docs-v1 built,
+  verified, promoted. home-v5 (my build): hero desk vignette (drive pops
+  onto a Mac-desktop corner, menu-bar mark tints healthy, ping ring),
+  lead de-buried per founder ("It's a real mount… Storage that scales,
+  but feels local"), NEW instant-search demo (type-along ⌘⇧F window,
+  3 query chips, ~29 ms/131K badge — README-sourced; SMB walk-the-tree
+  contrast card), states section reframed "It starts in the menu bar",
+  block primer (one-object-crawls vs three-blocks-hop, CSS choreography)
+  ahead of the retitled chunk demo, SMB round-trip card added to a now
+  3-way compare row (traffic-pattern glyphs: ping-pong dot / slab /
+  chips), compact scrub demo with data-video rich-media hook (founder's
+  clip will scrub via the playhead; live timecode until then), NAS
+  vendor line + docs link, "The technology stack" retitle, what's-coming
+  roadmap card (ROADMAP-sourced; Finder-adjacent app labeled
+  drawing-board), deeper your-bytes close (migration tool + exit link).
+  Fixed in verification: setPointerCapture ordering on the scrub strip
+  (synthetic/stale pointers killed the drag before fromEvent ran).
+  calculator-v4 (my build): "The exit, priced" panel (20 TB out: AWS
+  ≈$1,741 vs B2/R2/Wasabi $0, bars fill on scroll; migration-tool
+  callout), display-only #notices (Suite BYO 20 TB floor + CSP-fees,
+  LucidLink $27-is-promo, Shade unpublished overage) fed by jm:sim —
+  formulas untouched, NAS terms, jargon hints rewritten, preload links
+  self-referencing. docs-v1 (agent build, gates all green incl. its own
+  browser pass): 7-step guide + uninstall, sticky progress rail, vendor
+  cards (TrueNAS production-tested badge vs vendor-generic), verbatim
+  compose YAML diff-verified, copy buttons w/ clipboard fallback —
+  promoted to site/docs.html (nav self-ref fixed at promotion; srcset
+  rewrite gap in my promotion script caught by the battery and fixed).
+  Full battery after promotion: 17 files, 510 refs, 0 broken. S1
+  research committed earlier (8163dfa) — URGENT corrections applied to
+  pricing.json + FALLBACK mirror. compare-v4 agent died on a 529 at
+  startup — relaunched. performance-v4 agent still running.
