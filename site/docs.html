@@ -20,23 +20,31 @@
   <link rel="stylesheet" href="assets/site.css">
 
   <!-- ======================================================================
-       Docs v1 — the setup journey, iteration file (docs sprint, first cut).
+       Docs v1 — the setup journey, iteration file (docs sprint, first cut;
+       round 3 added the working-remotely step, sprint item T4).
        One numbered path: check the NAS → install the stack → verify reach →
-       install the Mac app → first mount → basics → troubleshooting →
-       uninstall. Every command/claim is lifted from README.md,
-       server/INSTALL-TrueNAS.md, server/docker-compose.yml, server/README.md,
-       MENU_BAR_APP.md, and scripts/uninstall.sh. Vendor paths that the repo
-       does not document (Synology/QNAP/Unraid menu paths) are labeled
-       vendor-generic in the UI — nothing JuiceMount-specific is invented.
+       install the Mac app → first mount → basics → working remotely →
+       troubleshooting → uninstall. Every command/claim is lifted from
+       README.md, server/INSTALL-TrueNAS.md, server/docker-compose.yml,
+       server/README.md, MENU_BAR_APP.md, and scripts/uninstall.sh. Vendor
+       paths that the repo does not document (Synology/QNAP/Unraid menu
+       paths) are labeled vendor-generic in the UI — nothing JuiceMount-
+       specific is invented. Tailscale (step 7) is described at common-
+       knowledge level only; the README network paragraph is the source
+       ("the author runs Tailscale; any VPN that gives the Mac a route to
+       the Redis + MinIO ports works") — no JuiceMount-specific Tailscale
+       behavior, port mapping, or tested configuration is claimed.
        Interactive elements: the progress rail (IntersectionObserver +
        aria-current="step"), copy buttons on every code block, expanding
        vendor cards (native details), a stylized compose-boot animation
-       that settles the five services green, and a stylized step-4
-       Setup-Assistant preflight whose three checks settle green. All
+       that settles the five services green, a stylized step-4
+       Setup-Assistant preflight whose three checks settle green, and a
+       CSS-only dash-flow tunnel wire in step 7. All
        motion gates on prefers-reduced-motion; both animated panels ship
        painted at their end state so no-JS and reduced-motion read
        correctly, and each has a replay button that snaps to the end
-       state under reduced motion.
+       state under reduced motion. The tunnel wire needs no JS and reads
+       as a static dashed wire when motion is reduced.
        Shared tokens/site css come from ../assets; no frameworks, no CDNs,
        no fetches — works double-clicked from a folder (file://).
        ====================================================================== -->
@@ -463,7 +471,47 @@
       .basics { grid-template-columns: 1fr 1fr; gap: var(--space-5); }
     }
 
-    /* ---- troubleshooting accordions (step 7) ------------------------------------------------ */
+    /* ---- working remotely (step 7) ------------------------------------------------------------ */
+    .remote-wire .rw-row {
+      display: flex;
+      align-items: center;
+      gap: var(--space-3);
+      margin-bottom: var(--space-3);
+    }
+    .rw-svg { flex: 1 1 0; min-width: 1.25rem; height: 16px; display: block; }
+    .rw-base, .rw-flow { fill: none; stroke-width: 1.5; }
+    .rw-base { stroke: var(--hairline-soft); stroke-dasharray: 4 6; }
+    .rw-flow { stroke: var(--juice-green); stroke-dasharray: 4 26; }
+    @media (prefers-reduced-motion: no-preference) {
+      .rw-flow { animation: rw-drift 1.4s linear infinite; }
+    }
+    @keyframes rw-drift { to { stroke-dashoffset: -30; } }
+    .rw-tunnel {
+      font-family: var(--font-mono);
+      font-size: var(--fs-label);
+      font-weight: var(--fw-head);
+      letter-spacing: var(--track-label);
+      text-transform: uppercase;
+      color: var(--text);
+      background: var(--tint-green);
+      border: 1.5px solid var(--tint-green-border);
+      border-radius: 999px;
+      padding: 0.3rem 0.7rem;
+      flex: none;
+      white-space: nowrap;
+    }
+    .remote-steps { margin: 0 0 var(--space-4); padding-left: 1.3em; }
+    .remote-steps li { margin-bottom: var(--space-3); }
+    .feel-list { list-style: none; margin: 0 0 var(--space-4); padding: 0; }
+    .feel-list li {
+      padding: var(--space-3) 0;
+      border-top: 1px solid var(--hairline-soft);
+      font-size: var(--fs-small);
+    }
+    .feel-list li:first-child { border-top: 0; }
+    .feel-list strong { display: block; }
+
+    /* ---- troubleshooting accordions (step 8) ------------------------------------------------ */
     .fix {
       background: var(--surface);
       border: 1.5px solid var(--hairline-soft);
@@ -553,7 +601,8 @@
           <li><a href="#step-4"><span class="rail-num" aria-hidden="true">4</span>Install the Mac app</a></li>
           <li><a href="#step-5"><span class="rail-num" aria-hidden="true">5</span>First mount</a></li>
           <li><a href="#step-6"><span class="rail-num" aria-hidden="true">6</span>Make it yours</a></li>
-          <li><a href="#step-7"><span class="rail-num" aria-hidden="true">7</span>If something breaks</a></li>
+          <li><a href="#remote"><span class="rail-num" aria-hidden="true">7</span>Working remotely</a></li>
+          <li><a href="#step-8"><span class="rail-num" aria-hidden="true">8</span>If something breaks</a></li>
         </ol>
         <ul class="rail-aux">
           <li><a href="#uninstall"><span class="rail-num" aria-hidden="true">×</span>Uninstalling</a></li>
@@ -564,7 +613,7 @@
 
         <!-- ============================================================ -->
         <section class="step" id="step-1" data-rail-step aria-labelledby="h-step-1">
-          <p class="label step-kicker">step 1 of 7</p>
+          <p class="label step-kicker">step 1 of 8</p>
           <h2 id="h-step-1">Check your NAS</h2>
           <p class="lead">JuiceMount has two halves: a server stack that runs on your NAS in Docker, and a menu-bar app on the Mac. Before installing anything, confirm both sides qualify.</p>
 
@@ -642,7 +691,7 @@
 
         <!-- ============================================================ -->
         <section class="step" id="step-2" data-rail-step aria-labelledby="h-step-2">
-          <p class="label step-kicker">step 2 of 7</p>
+          <p class="label step-kicker">step 2 of 8</p>
           <h2 id="h-step-2">Install the stack</h2>
           <p class="lead">One compose file boots the whole backend: Redis for metadata, MinIO for file data, a one-shot init that formats the JuiceFS volume, a live JuiceFS mount with WebDAV, and the JuiceMount Manager web UI.</p>
 
@@ -916,7 +965,7 @@ openssl rand -hex 32      # for JM_ADMIN_KEY (used to gate /manager UI)</code></
       # available for canceled jobs after a redeploy).
       - CHANGEME_STATE_PATH:/var/lib/manager</code></pre>
           </div>
-          <p class="small muted">The shipped YAML names the volume <code>zpool</code> — that name becomes your mount point on the Mac, <code>/Volumes/zpool</code>. If you have no existing data to migrate, you can omit the <code>juicemount-manager</code> service entirely.</p>
+          <p class="small muted">The shipped YAML names the volume <code>zpool</code> — that name becomes your mount point on the Mac, <code>/Volumes/zpool</code>. Want Finder to say something nicer? Set <code>JM_VOL_NAME: "JuiceMount"</code> before the first <code>docker compose up</code> and the volume mounts at <code>/Volumes/JuiceMount</code> — the name is yours, but pick it once: it's baked in at format time. If you have no existing data to migrate, you can omit the <code>juicemount-manager</code> service entirely.</p>
 
           <h3>Any Docker host — clone and compose</h3>
           <p>On Ubuntu, Synology, QNAP, Unraid, or a laptop, use the repo&rsquo;s compose file directly. Its default bind-mount paths are TrueNAS-flavored (<code>/mnt/zSSD/...</code>) — change them to wherever your data should live.</p>
@@ -942,7 +991,7 @@ docker compose logs juicefs-init    # confirms first-time volume format</code></
 
         <!-- ============================================================ -->
         <section class="step" id="step-3" data-rail-step aria-labelledby="h-step-3">
-          <p class="label step-kicker">step 3 of 7</p>
+          <p class="label step-kicker">step 3 of 8</p>
           <h2 id="h-step-3">Verify it&rsquo;s reachable</h2>
           <p class="lead">Before touching the Mac app, prove two things: the stack is actually up, and your Mac can reach the NAS on the published ports.</p>
 
@@ -1013,7 +1062,7 @@ docker compose logs juicefs-init    # confirms first-time volume format</code></
 
         <!-- ============================================================ -->
         <section class="step" id="step-4" data-rail-step aria-labelledby="h-step-4">
-          <p class="label step-kicker">step 4 of 7</p>
+          <p class="label step-kicker">step 4 of 8</p>
           <h2 id="h-step-4">Install the Mac app</h2>
           <p class="lead">Two Homebrew installs, a clone, and a build script. Building from source is currently the only way to get the app.</p>
 
@@ -1063,7 +1112,7 @@ S3 Endpoint Override: http://&lt;nas-ip&gt;:30151/zpool</code></pre>
 
         <!-- ============================================================ -->
         <section class="step" id="step-5" data-rail-step aria-labelledby="h-step-5">
-          <p class="label step-kicker">step 5 of 7</p>
+          <p class="label step-kicker">step 5 of 8</p>
           <h2 id="h-step-5">First mount</h2>
           <p class="lead">Hit <strong>Start</strong> in the popover. Enter your admin password at the mount prompt. <code>/Volumes/zpool</code> appears in Finder.</p>
 
@@ -1107,7 +1156,7 @@ S3 Endpoint Override: http://&lt;nas-ip&gt;:30151/zpool</code></pre>
 
         <!-- ============================================================ -->
         <section class="step" id="step-6" data-rail-step aria-labelledby="h-step-6">
-          <p class="label step-kicker">step 6 of 7</p>
+          <p class="label step-kicker">step 6 of 8</p>
           <h2 id="h-step-6">Make it yours</h2>
           <p class="lead">Mounted is the baseline. These are the habits that make it an editing drive: pin what you&rsquo;re cutting, flip offline mode when you leave, and decide whether writes should spool.</p>
 
@@ -1160,9 +1209,59 @@ docker compose up -d      # restart with no data loss</code></pre>
         </section>
 
         <!-- ============================================================ -->
-        <section class="step" id="step-7" data-rail-step aria-labelledby="h-step-7">
-          <p class="label step-kicker">step 7 of 7</p>
-          <h2 id="h-step-7">If something breaks</h2>
+        <section class="step" id="remote" data-rail-step aria-labelledby="h-remote">
+          <p class="label step-kicker">step 7 of 8</p>
+          <h2 id="h-remote">Working remotely</h2>
+          <p class="lead">The steps above did the storage side: the volume, the cache, pins, the spool. What JuiceMount deliberately doesn&rsquo;t do is routing — when you leave the LAN, your Mac needs a route back to the NAS, and that&rsquo;s a VPN&rsquo;s job. The author runs Tailscale; any VPN that gives your Mac a route to the NAS&rsquo;s Redis and MinIO ports works the same way — WireGuard, OpenVPN, your router&rsquo;s VPN.</p>
+
+          <figure class="portmap remote-wire">
+            <div class="rw-row" aria-hidden="true">
+              <span class="pm-node">Your Mac</span>
+              <svg class="rw-svg" height="16" focusable="false">
+                <line class="rw-base" x1="0" y1="8" x2="100%" y2="8"></line>
+                <line class="rw-flow" x1="0" y1="8" x2="100%" y2="8"></line>
+              </svg>
+              <span class="rw-tunnel">VPN tunnel</span>
+              <svg class="rw-svg" height="16" focusable="false">
+                <line class="rw-base" x1="0" y1="8" x2="100%" y2="8"></line>
+                <line class="rw-flow" x1="0" y1="8" x2="100%" y2="8"></line>
+              </svg>
+              <span class="pm-node">Your NAS</span>
+            </div>
+            <figcaption>Your Mac and your NAS, each running the VPN, reach each other from any network. The tunnel carries the two required ports from step 3 — <span class="num">30179</span> (Redis) and <span class="num">30151</span> (MinIO). JuiceMount does the storage and configuration; the tunnel does the routing.</figcaption>
+          </figure>
+
+          <h3>Three steps with Tailscale</h3>
+          <p class="small">Tailscale is a third-party mesh VPN — free for personal use, not affiliated with this project. It&rsquo;s what the author runs because it removes the routing work: install it on both machines and they can reach each other from anywhere.</p>
+          <ol class="remote-steps">
+            <li><strong>Install Tailscale on both ends</strong> — on the NAS (or whatever box runs the Docker stack) and on the Mac. Signed in to the same account, the two machines can reach each other from any network.</li>
+            <li><strong>Note the NAS&rsquo;s Tailscale address.</strong> Tailscale gives each machine an address that stays stable wherever your Mac roams; copy the NAS&rsquo;s from the Tailscale app or admin console.</li>
+            <li><strong>Point the app at that address.</strong> In <strong>Preferences → Connection</strong> (or the Setup Assistant), connect using the NAS&rsquo;s Tailscale address instead of its LAN IP — the same two fields from step 4:</li>
+          </ol>
+          <div class="codeblock band-ink">
+            <div class="code-head">
+              <span class="label">preferences → connection — over the tunnel</span>
+              <button type="button" class="copy-btn" data-copy="code-remote" aria-live="polite">Copy</button>
+            </div>
+            <pre><code id="code-remote">Redis URL:            redis://&lt;tailscale-address&gt;:30179/1
+S3 Endpoint Override: http://&lt;tailscale-address&gt;:30151/zpool</code></pre>
+          </div>
+          <p class="small">Whatever VPN you pick, the test is the same as step 3: if the Mac can reach <span class="num">30179</span> and <span class="num">30151</span> on the NAS, the mount works. The diagnostic ports (<span class="num">30152</span>, <span class="num">30180</span>, <span class="num">30190</span>) come along too, if your VPN routes them.</p>
+
+          <h3>What remote actually feels like</h3>
+          <ul class="feel-list">
+            <li><strong>Pinned files play at SSD speed</strong><span class="muted">Pin the project before you leave (step 6): every byte is already on local SSD, so playback doesn&rsquo;t touch the link at all.</span></li>
+            <li><strong>First-touch reads stream at link speed</strong><span class="muted">Un-pinned files come over the tunnel as you touch them — scrub a 100&nbsp;GB file and only the blocks you touch cross the wire, at whatever the connection gives, hotel Wi-Fi included.</span></li>
+            <li><strong>Writes land locally and upload behind you</strong><span class="muted">With the write spool on (opt-in, step 6), a write acks the moment it&rsquo;s durable on local SSD, then trickle-uploads at whatever the network allows; the popover shows pending uploads until they drain.</span></li>
+            <li><strong>Offline mode refuses fast</strong><span class="muted">If the link is gone entirely, flip offline-files mode: pinned files keep reading, and un-pinned reads fail in <span class="num">4–67&nbsp;ms</span> instead of hanging Finder on a ~30&nbsp;s NFS retry.</span></li>
+          </ul>
+          <p class="small muted">Success for this step: the volume mounts with the NAS&rsquo;s Tailscale address in Preferences → Connection, from a network that isn&rsquo;t your LAN.</p>
+        </section>
+
+        <!-- ============================================================ -->
+        <section class="step" id="step-8" data-rail-step aria-labelledby="h-step-8">
+          <p class="label step-kicker">step 8 of 8</p>
+          <h2 id="h-step-8">If something breaks</h2>
           <p class="lead">Open the popover first. The health rows — Redis, MinIO, FUSE, NFS mount — are the first thing to check; most fixes start there.</p>
 
           <h3>Symptoms and fixes</h3>
