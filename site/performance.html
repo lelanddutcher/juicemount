@@ -11,7 +11,7 @@
   <meta property="og:title" content="JuiceMount performance — storage that scales, but feels local">
   <meta property="og:description" content="Latency-first, author-measured: 15–120 ms folder opens, ~29 ms library search, 226–571 MB/s cached reads — and ~7 Gbit/s on a 10 GbE LAN when data does move. Every number, the methodology, and two demos you can drive.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
-  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the mounted-drive workflow editors get from LucidLink-class SaaS — at 10GbE-direct-attached speed, with Dropbox-style offline resilience — on hardware you already own.">
+  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.">
   <meta name="twitter:card" content="summary_large_image">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
@@ -670,6 +670,73 @@
     details.cite summary { cursor: pointer; color: var(--text-muted); }
     details.cite ul { margin: var(--space-3) 0 0; padding-left: 1.2em; color: var(--text-muted); }
     details.cite li { margin-bottom: var(--space-2); overflow-wrap: anywhere; }
+
+    /* ---- methodology pipeline glyph (decorative): workload →
+       /metrics snapshot → p95 gate, lit in sequence on scroll-into-view;
+       reduced motion gets the settled, fully-lit state ------------------- */
+    .method-pipe {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      max-width: 46rem;
+      margin: 0 0 var(--space-5);
+    }
+    .mp-chip {
+      display: inline-flex;
+      align-items: center;
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      color: var(--text-muted);
+      border: 1px solid var(--hairline-soft);
+      border-radius: 999px;
+      padding: 0.12rem 0.6rem;
+      white-space: nowrap;
+    }
+    .mp-chip.is-lit { color: var(--text); border-color: var(--tint-green-border); background: var(--tint-green); }
+    .mp-wire {
+      flex: 1 1 1.5rem;
+      min-width: 1rem;
+      height: 0;
+      border-top: 2px dashed var(--hairline-soft);
+    }
+    .mp-wire.is-lit { border-top-color: var(--tint-green-border); }
+    @media (prefers-reduced-motion: no-preference) {
+      .mp-chip, .mp-wire {
+        transition: background-color var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease);
+      }
+    }
+
+    /* ---- measured-vs-modeled legend (static by design — the section is
+       a boundary statement; the pairing echoes the charts' chip chrome) -- */
+    .claim-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+      margin: var(--space-3) 0 var(--space-4);
+    }
+    .claim-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45em;
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      color: var(--text);
+      border: 1px solid var(--hairline-soft);
+      border-radius: 999px;
+      padding: 0.12rem 0.6rem;
+      white-space: nowrap;
+    }
+    .claim-chip i { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+    .claim-chip.is-measured { background: var(--tint-green); border-color: var(--tint-green-border); }
+    .claim-chip.is-measured i { background: var(--chart-self); }
+    .claim-chip.is-modeled { background: var(--tint-slate); border-color: var(--tint-slate-border); }
+    .claim-chip.is-modeled i { background: var(--text-muted); }
+
+    /* ---- closing-band platter echo: the hero homage again at sign-off
+       size; same .pl-disc/.pl-arm classes, so the existing reduced-motion
+       gate on the spin/seek animations covers this instance too ---------- */
+    .close-platter { margin: 0 0 var(--space-5); }
+    .close-platter svg { width: 72px; height: auto; display: block; }
   </style>
 </head>
 <body>
@@ -693,7 +760,7 @@
       </a>
       <ul>
         <li><a href="index.html">Home</a></li>
-        <li><a href="index.html#how">How it works</a></li>
+        <li><a href="index.html#states">How it works</a></li>
         <li><a href="compare.html">Compare</a></li>
         <li><a href="performance.html" aria-current="page">Performance</a></li>
         <li><a href="calculator.html">Calculator</a></li>
@@ -1115,7 +1182,7 @@
           <div class="vendor-card">
             <span class="label">iconik · storage gateway</span>
             <h3>Runs on your Mac, a Linux box — even your TrueNAS</h3>
-            <p>Bridges your on-prem storage to their cloud, and ships packaged as a TrueNAS app. Standard ISG comes with iconik plans; the higher-throughput ISG Pro is a quote-only add-on.</p>
+            <p>Bridges your on-prem storage to their cloud, and ships packaged as a TrueNAS app. Standard ISG appears included with iconik plans; ISG Pro is a quote-only add-on.</p>
           </div>
           <div class="vendor-card">
             <span class="label">lucidlink · teamcache + connect</span>
@@ -1200,6 +1267,13 @@
           <h2 id="method-h">How the numbers were produced</h2>
           <p class="muted">The rig: the author's Apple-Silicon Mac ↔ TrueNAS SCALE over 10&nbsp;GbE. The instrument: the repo's own performance harness — the same battery that gates releases.</p>
         </div>
+        <div class="method-pipe" id="method-pipe" aria-hidden="true">
+          <span class="mp-chip">workload</span>
+          <span class="mp-wire"></span>
+          <span class="mp-chip">/metrics snapshot</span>
+          <span class="mp-wire"></span>
+          <span class="mp-chip">p95 gate</span>
+        </div>
         <ul style="max-width: 46rem">
           <li><strong>Workloads model real NLE and Finder behavior</strong>, not synthetic IO: <code>resolve-scrub</code> sustains the ~60–240 random READs/sec a DaVinci scrub generates; <code>finder-copy-deep</code> runs Finder copy cascades with AppleDouble sidecars; <code>bin-browse</code> walks directory trees the way a bin browser does; <code>cold-playback</code> reads fully-uncached files sequentially; <code>pin-coverage-verify</code> re-prefetches an entire pin root.</li>
           <li><strong>Each run snapshots the control plane's <code>/metrics</code> before and after</strong> a fixed wall-clock window (typically 30–60&nbsp;s) and emits per-RPC latency percentiles — p50, p95, p99, max — plus throughput deltas. That's where figures like READ p95 481&nbsp;µs come from.</li>
@@ -1214,6 +1288,10 @@
       <div class="container">
         <p class="label sec-kicker">scope</p>
         <h2 id="noclaim-h" style="font-size: var(--fs-h3)">What we don't claim</h2>
+        <p class="claim-legend" aria-hidden="true">
+          <span class="claim-chip is-measured"><i></i>measured — author's rig</span>
+          <span class="claim-chip is-modeled"><i></i>modeled — labeled inline</span>
+        </p>
         <div class="callout callout-warn" style="max-width: 46rem">
           <p><strong>This is not a benchmark of named competitors' current builds.</strong> The sync-tool figure in the ledger is what Mountain Duck/Seafile-class tools measured in the author's testing, on his rig, at the time — and the SMB lane in demo&nbsp;02 is an illustrative category model, not a measurement of anyone's NAS. Category behavior as of June 2026; check current client docs, these tools evolve.</p>
           <p><strong>These are point-in-time author measurements</strong> on one Mac and one NAS, not independent benchmarks. No vendor lab, no tuned showcase — and no claim beyond what the harness reproduces. The two demos on this page are illustrative models built on these measurements plus link line-rate and round-trip arithmetic, and they say so where they say anything.</p>
@@ -1224,6 +1302,36 @@
     <!-- Closing -->
     <section class="band-ink section" aria-labelledby="close-h">
       <div class="container">
+        <div class="close-platter" aria-hidden="true">
+          <!-- the hero's platter homage, echoed at sign-off size — same
+               brand-palette drawing, same classes; the spin/seek animations
+               and their reduced-motion gate come from the hero's CSS -->
+          <svg class="platter" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg" focusable="false">
+            <g class="pl-disc">
+              <circle cx="118" cy="118" r="84" fill="#FAFDE8" stroke="#1B102A" stroke-width="5"/>
+              <g fill="#AACD58" stroke="#1B102A" stroke-width="2.5" stroke-linejoin="round">
+                <path d="M142.9 110.4 L184.9 97.5 A70 70 0 0 1 184.9 138.5 L142.9 125.6 A26 26 0 0 0 142.9 110.4 Z"/>
+                <path d="M141.0 130.2 L179.8 150.9 A70 70 0 0 1 150.9 179.8 L130.2 141.0 A26 26 0 0 0 141.0 130.2 Z"/>
+                <path d="M125.6 142.9 L138.5 184.9 A70 70 0 0 1 97.5 184.9 L110.4 142.9 A26 26 0 0 0 125.6 142.9 Z"/>
+                <path d="M105.8 141.0 L85.1 179.8 A70 70 0 0 1 56.2 150.9 L95.0 130.2 A26 26 0 0 0 105.8 141.0 Z"/>
+                <path d="M93.1 125.6 L51.1 138.5 A70 70 0 0 1 51.1 97.5 L93.1 110.4 A26 26 0 0 0 93.1 125.6 Z"/>
+                <path d="M95.0 105.8 L56.2 85.1 A70 70 0 0 1 85.1 56.2 L105.8 95.0 A26 26 0 0 0 95.0 105.8 Z"/>
+                <path d="M110.4 93.1 L97.5 51.1 A70 70 0 0 1 138.5 51.1 L125.6 93.1 A26 26 0 0 0 110.4 93.1 Z"/>
+                <path d="M130.2 95.0 L150.9 56.2 A70 70 0 0 1 179.8 85.1 L141.0 105.8 A26 26 0 0 0 130.2 95.0 Z"/>
+              </g>
+              <circle cx="118" cy="118" r="46" fill="none" stroke="#1B102A" stroke-opacity="0.22" stroke-width="1.5" stroke-dasharray="3 5"/>
+              <circle cx="118" cy="118" r="60" fill="none" stroke="#1B102A" stroke-opacity="0.22" stroke-width="1.5" stroke-dasharray="3 5"/>
+              <circle cx="118" cy="118" r="14" fill="#393839" stroke="#1B102A" stroke-width="3"/>
+              <circle cx="118" cy="118" r="3.5" fill="#FAFDE8"/>
+            </g>
+            <g class="pl-arm">
+              <path d="M215.8 189.1 L160.0 148.9 L155.4 154.3 L204.2 202.9 Z" fill="#393839" stroke="#FAFDE8" stroke-width="2"/>
+              <circle cx="210" cy="196" r="14" fill="none" stroke="#FAFDE8" stroke-width="4"/>
+              <circle cx="157.7" cy="151.6" r="7" fill="#393839" stroke="#FAFDE8" stroke-width="2"/>
+              <circle cx="157.7" cy="151.6" r="2.5" fill="#AACD58"/>
+            </g>
+          </svg>
+        </div>
         <div class="section-head">
           <h2 id="close-h">Your rig will differ — run it yourself.</h2>
           <p class="lead">The harness compares any two builds on your hardware, and a report from a different NAS, switch, or NLE is a genuinely useful contribution, whether it beats these numbers or not.</p>
@@ -1987,6 +2095,55 @@
           }, { threshold: 0.35 });
           io.observe(root);
         }
+      }
+    }());
+
+    /* ==================================================================
+       Methodology pipeline glyph — workload → /metrics snapshot →
+       p95 gate, lit in sequence once on scroll-into-view. Decorative
+       (aria-hidden); the text bullets carry the content. Reduced motion
+       gets the settled, fully-lit state, no sequencing.
+       ================================================================== */
+    (function initMethodPipe() {
+      var pipe = document.getElementById("method-pipe");
+      if (!pipe) return;
+      var steps = Array.prototype.slice.call(pipe.querySelectorAll(".mp-chip, .mp-wire"));
+      var lit = false;
+      function lightAll() {
+        for (var i = 0; i < steps.length; i++) steps[i].classList.add("is-lit");
+      }
+      function play() {
+        if (lit) return;
+        lit = true;
+        for (var i = 0; i < steps.length; i++) {
+          (function (el, idx) {
+            window.setTimeout(function () {
+              el.classList.add("is-lit");
+            }, reduced() ? 0 : 260 * idx);   /* settle instantly if motion turns off mid-flight */
+          }(steps[i], i));
+        }
+      }
+      function onReduce() {                  /* flip mid-sequence: jump to the settled state */
+        if (reduced() && lit) lightAll();
+      }
+      if (reduceQ.addEventListener) reduceQ.addEventListener("change", onReduce);
+      else if (reduceQ.addListener) reduceQ.addListener(onReduce);
+      if (reduced()) {
+        lit = true;
+        lightAll();
+      } else if ("IntersectionObserver" in window) {
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (en) {
+            if (en.isIntersecting) {
+              play();
+              io.disconnect();
+            }
+          });
+        }, { threshold: 0.4 });
+        io.observe(pipe);
+      } else {
+        lit = true;
+        lightAll();
       }
     }());
   }());

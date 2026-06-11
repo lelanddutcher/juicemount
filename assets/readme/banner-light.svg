@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-labelledby="bt bd">
   <title id="bt">JuiceMount</title>
-  <desc id="bd">JuiceMount wordmark beside the citrus mark. Tagline: the mounted-drive workflow editors get from LucidLink-class SaaS — at 10GbE-direct-attached speed, with Dropbox-style offline resilience — on hardware you already own.</desc>
+  <desc id="bd">JuiceMount wordmark beside the citrus mark. Tagline: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.</desc>
   <defs>
     <style>
       .cls-1 { fill: #aacd58; }
@@ -44,8 +44,8 @@
   <!-- wordmark + tagline; ink text on transparent for light backgrounds -->
   <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
     <text x="330" y="120" font-size="64" font-weight="600" letter-spacing="-1" fill="#1B102A">JuiceMount</text>
-    <text x="330" y="172" font-size="21" font-weight="400" fill="#393839">The mounted-drive workflow editors get from LucidLink-class SaaS —</text>
-    <text x="330" y="204" font-size="21" font-weight="400" fill="#393839">at 10GbE-direct-attached speed, with Dropbox-style offline resilience —</text>
-    <text x="330" y="236" font-size="21" font-weight="400" fill="#393839">on hardware you already own.</text>
+    <text x="330" y="172" font-size="21" font-weight="400" fill="#393839">The open-source alternative to Suite, Shade, and LucidLink —</text>
+    <text x="330" y="204" font-size="21" font-weight="400" fill="#393839">storage that scales, but feels local —</text>
+    <text x="330" y="236" font-size="21" font-weight="400" fill="#393839">$0 per seat, on the NAS you already own.</text>
   </g>
 </svg>
