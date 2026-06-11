@@ -581,3 +581,103 @@ meanwhile); (3) the scrub video file (data-video hook ready on home);
 stands: rAF/IO QA requires the preview tab visible
 (visibilityState=hidden throttles rAF to zero and reads as broken
 widgets — burned twice, documented).
+
+## ROUND 4 — founder review of 2026-06-11 (afternoon #2)
+Founder Q&A locked four calls before batching: scrub heading verb =
+"caches" (both pages); home demo-04 replacement = agent-invented
+metaphor (highway explicitly skipped); performance #race duel STAYS
+(home-only replacement); compare copy-off = honest split (Manager's
+real targets + the Finder-drag story for Drive/Dropbox — code truth:
+internal/manager/destinations.go kinds = file/s3/b2/sftp/webdav/jfs;
+sync.go directions In/Out/Between, ProgressEvent live progress).
+
+### Backlog (U)
+- [x] U1 home-v7 (agent A): hero icon = demo-01's #i-drive glyph
+      verbatim, enlarged (kill the fancier drive); #bp → film-strip-
+      of-a-video-file treatment, auto-loop, replay button gone;
+      DELETE the ck upload/teammate widget + all three ck-compare
+      bentos (safety sentence relocates to prose); #scrub-home
+      replaced with performance's scrub ported faithfully; heading
+      "Drag the playhead. Watch what caches."; pillars heading em
+      dash → comma + bento copy halved; #states visualizer height
+      locked (no reflow on tab switch); #race NOT touched (wave 2).
+- [x] U2 performance-v6 (agent B): head-dot (r 7.8 @ 502.62,505.01)
+      moves INTO .pl-arm so it seeks with the head (hero + close);
+      #scrub heading → "…Watch what caches."; #cache rebuilt
+      TrueNAS-style — cache hit/miss meter on a stated illustrative
+      assumption (≤100 GB working set, ~90% hits) with the measured
+      numbers kept alongside; #race untouched.
+- [x] U3 race-metaphor-v1 (agent C, creative): standalone band-ink
+      section replacing home #race's story — agent proposes the
+      strongest visual metaphor for round-tripping (SMB 1,390 trips
+      vs JM 20, measured, VPN profile); ≤2 captions; loops; reduced-
+      motion static; runner-up concepts reported.
+- [x] U4 compare-v5 (agent D): Manager copy-pane mock replicated
+      from internal/manager/static/index.html — source browser, job
+      queue, live progress, junk filter; job IN (old SMB share →
+      volume) + job OUT (volume → S3); destination kinds = the real
+      six; Drive/Dropbox = Finder-drag card (real mount, no sync
+      target needed); KEEPERS (cost meter, #exit) intact.
+- [x] U5 wave 2 (orchestrator): integrate U3 winner into home-v7,
+      validation loop (gates + visible-tab browser QA), promote
+      home-v7/performance-v6/compare-v5, battery, commit.
+
+### Round 4 journal
+- Wave 1, four agents in parallel, all clean on static gates:
+  home-v7 (hero glyph = demo-01 #i-drive verbatim in Stream Blue;
+  film-strip #bp with CSS sprockets + IO-gated infinite loop, replay
+  button gone; ck story + all three bentos deleted, safety sentence
+  relocated to prose; performance scrub ported whole as a scoped
+  closure, heading "Watch what caches."; pillars comma + halved
+  bentos; mb-pop grid-stacks all four panes so height is constant;
+  agent also fixed v6's latent MARK_SRC 404 forward). performance-v6
+  (both r-7.8 head-dots moved INSIDE .pl-arm, paint order preserved,
+  attributes verbatim; scrub h2 only; #cache rebuilt as ten-segment
+  hit/miss ring + four lanes, "9 of 10" model labeled illustrative
+  assumption, measured 200 MiB/4.6 MB plate kept byte-identical;
+  sacred scrub widget byte-proven 8,032+9,365+17,635+4,223 bytes).
+  compare-v5 (Manager copy-pane mock replicated from
+  internal/manager/static — direction tiles, source browser,
+  destination kinds file/s3/b2/sftp/webdav/jfs, options at real
+  defaults, two-job queue IN /sources/Editorial_SMB → /jfs/Editorial
+  and OUT /jfs/03_Delivery → s3://wasabi-archive; every label traced
+  to file:line in the agent's claims table; Dropbox/Drive = the
+  honest Finder-drag card; KEEPERS untouched). race-metaphor-v1: six
+  directions brainstormed (seismograph, phone bill, sonar, chatter
+  wall, VU meters, pneumatic capsules); winner = the chatter wall —
+  every round trip sediments as one canvas dot, 1,390 drawn 1:1 vs
+  20, six-move replay over ~10.7 s with the library-walk avalanche,
+  loop 14.4 s, reduced-motion/no-JS ship the settled walls.
+- Wave 2 (orchestrator): transplant into home #race — caught and
+  fixed the block's getElementById("rm-race") still pointing at the
+  old id after the section rename (would have silently never
+  animated); attribution honesty fix per the agent's own flag
+  ("Measured June 2026" → "Modeled from measurements taken June
+  2026"); orphan .statline CSS removed; TOC comment updated.
+- Validation loop: zero console errors on all three pages; hero
+  glyph verified in pixels (geometry rect#rx1.6+circle#r1, color
+  rgb(55,138,221), glow renders); mb-pop measured 259 px constant
+  across all four states with bodyShift 0 (the founder's reflow bug
+  is dead); perf dots .closest(".pl-arm") true ×2; cache gauge 10
+  segments + "illustrative assumption" present; compare mock DOM
+  verified (both jobs, real kinds, no Dropbox target). Tool finding
+  reconfirmed and sharpened: a hidden preview tab composites NO new
+  frames after scroll — screenshots work only at the initial
+  scroll-0 composite; eval/layout/clicks all still work. Chrome
+  extension disconnected, so motion FEEL (bp loop pacing, chatter
+  avalanche, hit-meter rhythm, hero pop) is code-verified only —
+  founder should eyeball in a visible browser.
+- Promotion: home-v7 → index.html, performance-v6 →
+  performance.html, compare-v5 → compare.html (path rewrite incl.
+  srcset, JS MARK_SRC strings, apple-touch-icon). Battery: 25 files
+  / 801 refs / 0 broken local (external github anchors excluded).
+
+## ROUND 4 CLOSING (2026-06-11 night)
+U1–U5 complete. Founder Q&A before batching locked: "caches" verb,
+agent-invented metaphor (not highway), perf duel stays, honest split
+on copy targets. Parked founder decisions (unchanged): H1 A/B
+variant; shipped JM_VOL_NAME default; scrub video file (data-video
++ pv:frac hooks ready on BOTH pages now); Suite's seat in the table.
+New for his review pass: the chatter wall's feel (avalanche pacing,
+hold length), bp film-strip loop cadence, hit-meter rhythm — all
+motion was code-verified because no visible tab existed this round.
