@@ -24,7 +24,7 @@
     </linearGradient>
   </defs>
   <!-- OG cards own their background: a full-bleed Pulp Ink band (site .band-ink). -->
-  <rect width="1200" height="630" fill="#1B102A"/>
+  <rect width="1200" height="630" fill="#17181B"/>
   <!-- the citrus mark at 300 px on the left third, inlined from logos/color.svg;
        clearspace ≥ 36 px (12% of mark width) on all sides: 70 left, 165 top/bottom, 90 to the text -->
   <g transform="translate(70,165) scale(0.3)">

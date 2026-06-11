@@ -54,6 +54,7 @@
   --stream-blue: #378ADD; /* informational accent, links on light */
   --fault-red:   #E24B4A; /* errors only, never decorative */
   --slate:       #393839; /* secondary dark: muted text on light, borders on dark */
+  --cinema-dark: #17181B; /* site dark SURFACE (founder 2026-06-11: the flat ink bands read purple; surfaces go neutral cinema-dark; --pulp-ink remains for text-on-light + the mark) */
 
   /* ---- derived tints (BRAND.md: mix base with page background —
           8–12% for fills, 25–35% for borders). Implemented as alpha over
@@ -131,7 +132,7 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --bg: var(--pulp-ink);
+    --bg: var(--cinema-dark);
     --surface: rgba(250, 253, 232, 0.06);
     --surface-2: rgba(250, 253, 232, 0.04);
     --text: var(--rind-cream);
@@ -145,7 +146,7 @@
 }
 [data-theme="dark"] {
   color-scheme: dark;
-  --bg: var(--pulp-ink);
+  --bg: var(--cinema-dark);
   --surface: rgba(250, 253, 232, 0.06);
   --surface-2: rgba(250, 253, 232, 0.04);
   --text: var(--rind-cream);

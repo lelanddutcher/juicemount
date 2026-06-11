@@ -141,3 +141,20 @@ Calibration examples:
   state-system explainer and the menu-bar screenshots.
 - Charts: bars/lines in Juice Green on neutral grids; comparisons may
   use Stream Blue vs Slate (never green-vs-red competitor framing).
+
+## Addendum — 2026-06-11 (founder direction)
+
+- **Site dark surfaces**: the flat `#1B102A` page bands read as purple
+  on screen. Site/OG dark SURFACES now use **Cinema Dark `#17181B`**
+  (neutral). `--pulp-ink` remains the token for body text on light and
+  the mark's outline — the logo itself is unchanged.
+- **Messaging**: identity-first. The sanctioned frame is "the
+  open-source alternative to Suite / Shade / Iconik / LucidLink, for
+  indie filmmakers and small post teams" — category anchor up front,
+  the cost story with it; proofs (scrub-streaming, numbers) support
+  rather than lead. Equally sanctioned: saying plainly what it is NOT
+  (a multi-department collaboration platform — yet).
+- **Show, don't tell**: every site page carries at least two animated,
+  interactive, explanatory visuals (mount-no-relink, menu-bar states,
+  chunking/read-back, cost meters, scrub paging). Motion has a job or
+  it doesn't ship. See docs/web/DESIGN10X_SPRINT.md.
