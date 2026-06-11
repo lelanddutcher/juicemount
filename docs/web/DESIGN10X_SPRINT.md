@@ -488,7 +488,7 @@ simulate() formulas — formula changes remain founder-gated.
       that's latency), economics in plain words (no "where the bucket
       lives decides the bill") → menu-bar/how-you-drive-it → tech
       stack → what's-not → closing.
-- [ ] T3. performance-v5: platter animation must use the REAL mark —
+- [x] T3. performance-v5: platter animation must use the REAL mark —
       dissect logos/color.svg, separate the founder-designed read head
       and platter groups, animate those (not an homage drawing). WAN
       graphic redesigned: the cloud path must visibly choke through
@@ -503,7 +503,7 @@ simulate() formulas — formula changes remain founder-gated.
       "the author runs Tailscale; any VPN that gives the Mac a route
       to the Redis + MinIO ports works"). Simple, line-by-line. Plus a
       pointer from performance/home where remote work comes up.
-- [ ] T5. Verify (gates + fresh browser pass), promote, cohesion,
+- [x] T5. Verify (gates + fresh browser pass), promote, cohesion,
       journal, closing report.
 
 ## Journal — round 3
@@ -548,3 +548,36 @@ simulate() formulas — formula changes remain founder-gated.
   masqueraded as broken widgets twice today. rAF-driven motion is
   verified by code-equivalence to the visible-tab runs on
   performance; final visual QA wants a visible tab.
+- [2026-06-11 ~17:15] T3+T5 — performance-v5 (agent) verified +
+  promoted; round 3 closed. The platter is now the REAL mark: the
+  agent dissected logos/color.svg paint-order — slice paths (rind,
+  flesh, 8 segment wedges, verbatim fills) spin about the drawn
+  spindle dot (502.62, 505.01); the gray-gradient juicer arm + hub
+  ring + chevron seek ±4°/−3° about the hub the founder drew at
+  (185.6, 821.72); logo file untouched, gradient ids instance-unique,
+  both ornaments (hero + closing echo) updated; render verified in a
+  live frame. WAN graphic recomposed: Mac inside a dashed
+  "same building — your gear" boundary, fat green LAN pipe to the
+  NAS, the WAN route necking through a funnel choke labeled "your
+  ISP" before the thin dashed run to "their cloud · the far side" —
+  no invented Mbps. #wherever dropped (tombstone comment; zero
+  inbound links). #theirs visual: one SSD box, two price tags drop
+  (your hardware + their subscription vs your hardware + $0
+  software). Tailscale pointer resolves to docs#remote. Gates: JS
+  parses, scrub byte-identical (8,727 bytes), final battery 21 files
+  / 634 refs / 0 broken.
+
+## ROUND 3 CLOSING (2026-06-11 evening)
+T0–T5 complete (commits bc7040e, 6b6cae3, + this one). Six pages at
+the round-3 standard; iteration trail: home-v6, performance-v5 (+ the
+docs Working-remotely addition on canonical). Founder decisions
+parked: (1) H1 A/B test — "The open-source alternative to Suite,
+Shade, and LucidLink." vs a simpler "self-hosted block storage for
+media" class headline (build the variant when he wants the test);
+(2) renaming the SHIPPED compose default JM_VOL_NAME zpool→JuiceMount
+is a server-side product call (site docs carry the rename pointer
+meanwhile); (3) the scrub video file (data-video hook ready on home);
+(4) Suite stays in the compare table pending his call. Tool note
+stands: rAF/IO QA requires the preview tab visible
+(visibilityState=hidden throttles rAF to zero and reads as broken
+widgets — burned twice, documented).
