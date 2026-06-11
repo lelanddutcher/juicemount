@@ -268,7 +268,7 @@ a server is a black box of magic to them").
       NLE names as text (Resolve, Premiere, FCP — "to your Mac it's
       just a drive"); a laptop/desktop mockup frame (our own drawing,
       no third-party logo art); NAS wording sweep.
-- [ ] S3. performance-v4: tagline pivots from "7 Gbit/s to hardware you
+- [x] S3. performance-v4: tagline pivots from "7 Gbit/s to hardware you
       own" to latency-first — "storage that scales but feels local"
       (echo on homepage); perf numbers into a smaller table (less
       billboard); race widget re-ideated: not warm-vs-cold, but
@@ -281,7 +281,7 @@ a server is a black box of magic to them").
       logo animation (platter spins, read head seeks — the mark IS a
       read head over a citrus platter) as a section visual; "mount it
       wherever you want" titling idea; NAS wording sweep.
-- [ ] S4. compare-v4: "a three-way trade / why two lanes exist" REDESIGNED
+- [x] S4. compare-v4: "a three-way trade / why two lanes exist" REDESIGNED
       as a visual (pay-a-lot SaaS vs struggle-with-SMB, us in the
       middle — barely any words); table: ADD Dropbox, Google Drive,
       Nextcloud (familiar anchors), Strada (pending S1), DROP Aspect
@@ -359,3 +359,36 @@ a server is a black box of magic to them").
   research committed earlier (8163dfa) — URGENT corrections applied to
   pricing.json + FALLBACK mirror. compare-v4 agent died on a 529 at
   startup — relaunched. performance-v4 agent still running.
+- [2026-06-11 ~13:00] S3+S4 — performance-v4 + compare-v4 (agent builds),
+  browser-verified by orchestrator, both promoted. performance-v4: hero
+  is the founder's tagline verbatim ("Storage that scales, but feels
+  local."), latency-first statline w/ 7 Gbit/s demoted-but-kept, platter
+  homage ornament (spin + head-seek, reduced-motion static, mark files
+  untouched), race re-ideated as "One minute of editing, two ways" —
+  SMB lane 1,390 wire trips / 38 s vs JuiceMount 20 trips / 7.3 s at
+  the VPN default (illustrative beats labeled; totals node-verified;
+  live-verified to settle exactly), LAN verdict concedes SMB is fine on
+  a quiet LAN; #tp chart → WAN-vs-LAN pipe diagram in plain words;
+  charts condensed (cache-vs-wire plate stays, #table = canonical
+  numbers home); NEW "Their answer to latency is your hardware"
+  (research §3, all four vendors, dated); #scrub diff-verified sacred;
+  #race/#scrub anchors stable. compare-v4: three-way trade redesigned
+  as the rent-meter / ping-pong / quiet-middle visual (1 sentence per
+  pole; 360px+dark verified); Aspect dropped, Suite kept (research:
+  alive, funded, ≠ Iconik — founder flag raised); iconik corrected to
+  $9/$65/$120 + credits/egress; Shade annual/monthly labels + pinning
+  ✅ documented; Dropbox/Workspace familiar-anchors compact table
+  ("automatically download" receipts); Strada other-approaches card;
+  open-source row explicit "No"; leave-with-bytes → cost-to-migrate;
+  pricing cruft → one details element; concessions consolidated into
+  "Compromises you'll make with JuiceMount" (zero honesty deleted);
+  exit section leads with the migration tool + the 20 TB worked
+  example (AWS ≈$1,741 vs $0×3). S7 progress: nav aligned across all
+  six canonical pages (docs.html order fixed at promotion), full
+  battery 19 files / 559 refs / 0 broken, voice clean, ink literals
+  all sanctioned (receipt paper ×2, platter outline ×5), docs
+  exclamations all inside pre/code. README: stale Shade-pinning cell
+  corrected (research receipt), Aspect column dropped, price labels
+  annotated — the README/site compare tables agree again. Adversarial
+  verification workflow (3 lenses + refuters) running; its confirmed
+  findings land as a follow-up fix commit.
