@@ -13,11 +13,11 @@
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
   <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the mounted-drive workflow editors get from LucidLink-class SaaS — at 10GbE-direct-attached speed, with Dropbox-style offline resilience — on hardware you already own.">
   <meta name="twitter:card" content="summary_large_image">
-  <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
-  <link rel="apple-touch-icon" href="apple-touch-icon.png">
-  <link rel="stylesheet" href="assets/tokens.css">
-  <link rel="stylesheet" href="assets/site.css">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="alternate icon" sizes="32x32" href="../favicon-32.png">
+  <link rel="apple-touch-icon" href="../apple-touch-icon.png">
+  <link rel="stylesheet" href="../assets/tokens.css">
+  <link rel="stylesheet" href="../assets/site.css">
 
   <!-- ======================================================================
        Canonical home — promoted from site/iterations/home-v3.html
@@ -776,16 +776,16 @@
 
   <nav class="site-nav" aria-label="Main">
     <div class="container">
-      <a class="brand" href="index.html">
-        <img src="assets/logo-color.svg" alt="" width="30" height="30">
+      <a class="brand" href="../index.html">
+        <img src="../assets/logo-color.svg" alt="" width="30" height="30">
         JuiceMount
       </a>
       <ul>
-        <li><a href="index.html" aria-current="page">Home</a></li>
+        <li><a href="../index.html" aria-current="page">Home</a></li>
         <li><a href="#how">How it works</a></li>
-        <li><a href="compare.html">Compare</a></li>
-        <li><a href="performance.html">Performance</a></li>
-        <li><a href="calculator.html">Calculator</a></li>
+        <li><a href="../compare.html">Compare</a></li>
+        <li><a href="../performance.html">Performance</a></li>
+        <li><a href="../calculator.html">Calculator</a></li>
         <li><a href="https://github.com/lelanddutcher/juicemount">GitHub ↗</a></li>
       </ul>
     </div>
@@ -801,7 +801,7 @@
         <p class="lead">The mounted-drive workflow those subscriptions sell, without the subscription: a real volume in Finder at LAN speed, Dropbox-style resilience when the network drops, on hardware you already own. <span class="num">$0</span> per seat, no storage contract.</p>
         <div class="hero-ctas">
           <a class="btn btn-primary" href="https://github.com/lelanddutcher/juicemount#quick-start">Install from GitHub</a>
-          <a class="btn btn-outline" href="calculator.html">See the math</a>
+          <a class="btn btn-outline" href="../calculator.html">See the math</a>
         </div>
         <p class="hero-qualifier">Open source · macOS 14+ · runs against your own server (TrueNAS, Synology, any Docker box)</p>
         <ul class="statline">
@@ -976,7 +976,7 @@
             </div>
             <div class="mb-cluster">
               <span class="mb-mark">
-                <img id="mb-mark-img" src="assets/state-healthy.svg" width="18" height="18" alt="JuiceMount menu-bar mark — green, healthy">
+                <img id="mb-mark-img" src="../assets/state-healthy.svg" width="18" height="18" alt="JuiceMount menu-bar mark — green, healthy">
                 <span class="mb-badge" id="mb-badge" hidden aria-hidden="true"><svg><use href="#i-up"/></svg></span>
               </span>
               <svg class="mb-glyph" aria-hidden="true"><use href="#i-wifi"/></svg>
@@ -1101,10 +1101,10 @@
         </div>
 
         <p class="mb-legend" style="margin-top: var(--space-6)">
-          <img src="assets/state-healthy.svg" alt="" aria-hidden="true"> green healthy ·
-          <img src="assets/state-degraded.svg" alt="" aria-hidden="true"> amber degraded ·
-          <img src="assets/state-offline-files.svg" alt="" aria-hidden="true"> blue offline files ·
-          <img src="assets/state-fault.svg" alt="" aria-hidden="true"> red fault —
+          <img src="../assets/state-healthy.svg" alt="" aria-hidden="true"> green healthy ·
+          <img src="../assets/state-degraded.svg" alt="" aria-hidden="true"> amber degraded ·
+          <img src="../assets/state-offline-files.svg" alt="" aria-hidden="true"> blue offline files ·
+          <img src="../assets/state-fault.svg" alt="" aria-hidden="true"> red fault —
           four colors are the whole status system. You always know what your storage is doing, without opening a dashboard or reading a log.
         </p>
         <p class="small muted mb-legend">Numbers in this popover are illustrative — the real one shows yours. Fault red is the state you should rarely see: it means the volume needs you.</p>
@@ -1235,7 +1235,7 @@
             <span class="stat">$0</span>
             <h3>Software is free; the hardware is yours</h3>
             <p>JuiceMount is open source, Apache-2.0. Suite charges <span class="num">$75/TB/mo</span> managed — or <span class="num">$40/TB/mo</span> to mount a bucket you already own (checked June&nbsp;2026). A one-time box beats a forever bill sooner than you'd think.</p>
-            <p><a href="calculator.html">See when the hardware pays for itself</a></p>
+            <p><a href="../calculator.html">See when the hardware pays for itself</a></p>
           </div>
         </div>
         <p class="small muted" style="margin-top: var(--space-5)">Performance figures are the author's measurements on his own Apple-Silicon Mac ↔ TrueNAS rig, not independent benchmarks — <a href="https://github.com/lelanddutcher/juicemount/blob/main/docs/PERFORMANCE_METHODOLOGY.md">methodology, workload scripts, and the regression harness are public</a>.</p>
@@ -1259,8 +1259,8 @@
             </span>
           </div>
           <picture>
-            <source media="(prefers-color-scheme: dark)" srcset="assets/arch-diagram-dark.svg">
-            <img class="diagram" src="assets/arch-diagram.svg" width="1200" height="640" alt="Architecture: Finder, Resolve, or Premiere open files on /Volumes/(name), mounted by the macOS NFS client from the JuiceMount NFS server running in the app on localhost. Three satellites keep the hot path local: an SQLite mirror answers Finder listings, an SSD cache with pins serves cached reads at SSD speed, and a write spool acks writes locally then trickles them up. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your server, where MinIO or any S3 holds file data as plain objects and Redis holds file metadata. Reads stream only the blocks you touch; writes drain in the background at line speed. Both sides are hardware you own.">
+            <source media="(prefers-color-scheme: dark)" srcset="../assets/arch-diagram-dark.svg">
+            <img class="diagram" src="../assets/arch-diagram.svg" width="1200" height="640" alt="Architecture: Finder, Resolve, or Premiere open files on /Volumes/(name), mounted by the macOS NFS client from the JuiceMount NFS server running in the app on localhost. Three satellites keep the hot path local: an SQLite mirror answers Finder listings, an SSD cache with pins serves cached reads at SSD speed, and a write spool acks writes locally then trickles them up. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your server, where MinIO or any S3 holds file data as plain objects and Redis holds file metadata. Reads stream only the blocks you touch; writes drain in the background at line speed. Both sides are hardware you own.">
           </picture>
           <figcaption>The read path in one line: metadata answers from local SQLite, cache hits stream from local SSD, and only the missing blocks cross the wire to your server.</figcaption>
         </figure>
@@ -1299,7 +1299,7 @@
         </div>
         <div class="hero-ctas">
           <a class="btn btn-primary" href="https://github.com/lelanddutcher/juicemount#quick-start">Install from GitHub</a>
-          <a class="btn btn-outline" href="compare.html">How it compares</a>
+          <a class="btn btn-outline" href="../compare.html">How it compares</a>
         </div>
       </div>
     </section>

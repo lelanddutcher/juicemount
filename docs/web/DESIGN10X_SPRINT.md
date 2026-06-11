@@ -121,7 +121,7 @@ IDENTIFIES WITH in five seconds and finds visually convincing.
 - [x] R6. Cross-page cohesion pass: shared motion language, nav, OG
       descriptions match new messaging; update og:title/descriptions;
       re-run all v1 gates (links/anchors/voice/structure) on canonical.
-- [ ] R7+. Further iteration rounds as quality demands (vN+1 per page,
+- [x] R7+. Further iteration rounds as quality demands (vN+1 per page,
       Journal-driven): keep iterating until the value gate scores
       strong on every page or the founder wakes up. Aim: every page has
       had ≥2 iterations reviewed against the gate.
@@ -138,3 +138,74 @@ IDENTIFIES WITH in five seconds and finds visually convincing.
 - [2026-06-11 (R5)] R5 — site/iterations/calculator-v2.html: the calculator restyled around the founder's two notes, MATH UNTOUCHED. RECEIPTS: printed-register look — calculator.js renders the identical two <table><caption><tbody> receipts (renderReceipt unchanged); the v2 CSS makes each table a paper card that stays paper-WHITE in both themes (a receipt is paper; ink is literal #1B102A in its BRAND.md text-on-light role), JetBrains Mono throughout, CSS-only perforated tear teeth top+bottom (::before/::after dash strips, no images), register header printed by caption::before ("JUICEMOUNT — RENT VS OWN") and caption::after ("prices checked June 2026 · fetched 2026-06-10"), dashed item rules, right-aligned amounts, 3px-double rules over totals (36-month framing prominent, h2 retitled "The receipts — 36-month totals"), the literal "$0 JuiceMount software / this row is the point" line untouched, faint barcode rule block painted by a bottom background gradient (decorative-honest). CHART: draw-in once on scroll-into-view — page script measures each polyline with getTotalLength (pathLength on polylines is flaky cross-engine) and animates stroke-dashoffset len→0 over 700 ms, SaaS area fades up at 500 ms, payback dot pops at 800 ms, label/guide fade last; re-renders after the first draw paint instantly; mid-draw re-render settles to final; reduced-motion and no-IO browsers never arm. CLARITY: calculator.js update() gains a jm:sim CustomEvent rendering hook (no math out there); the page listens and keeps a one-line explainer between chart and receipts — "Receipts show 36-month totals. Payback is a different number: the month the green self-host line crosses below the blue SaaS line — month N for this setup", with honest variants for payback_beyond / saas_cheaper ("the lines don't cross: SaaS stays cheaper") / Shade's tier-cap states; the crossing dot gains a dashed drop-guide to the month axis (only when it sits clear of it) and a hover <title> ("cumulative self-host drops below cumulative SaaS"). NO formula/default change: git-diff proof libraryAt/saasRate/selfRate/capexOf/simulate + FALLBACK_PRICING/DEFAULTS byte-identical to HEAD; form + noscript blocks byte-identical to v1 through promotion. Gates: parser battery PASS both files, 19/19 refs from both roots, 0 external resource loads, node --check PASS (page inline + calculator.js), voice PASS, #1B102A only as receipt ink (text-on-light role), pricing strings byte-match pricing.json + receipt date line, 360px zero overflow, live browser light+dark+1280+360 (explainer live at month 3/8, all four status variants exercised, guide on late paybacks, paper stays white on dark, console clean), file://-safe by construction (parse-time inline script, fetch fallback). Value gate vs old canonical: five-second TIE, teaching motion WIN (draw-in + explicit crossing vs static chart), designed-not-styled WIN (printed receipts vs plain tables), honesty PASS= (dates printed on the receipts), tech PASS=. Verdict: PROMOTE — copied over site/calculator.html with path rewrites, canonical/og:url restored, stale "Pulp Ink card" og:image:alt moved to the cinema-dark wording (now consistent on all four pages), aria-current restored, badge + dead badge CSS dropped. index/performance + all prior iterations untouched. Files left uncommitted for review.
 - [2026-06-11 05:20] R4+R5 — compare-v2 (1320 ln) + calculator-v2 (584 ln), BOTH PROMOTED: year-one cost meter (seats stepper + TB presets, capex-vs-recurring split bar, honest Shade-quote/LucidLink-cap states, deep-links carry state), exit-story toggle (bucket-never-changes vs export-gate, README-verbatim quotes); printed receipts (paper-white in dark, perforations, register header, barcode rule), chart draw-in + labeled payback crossing + explainer line w/ jm:sim event. calculator.js: 3 hooks only — formula freeze verified by git diff (orchestrator note: two of MY freeze checks false-alarmed — hash() randomization, then a regex that swallowed the file tail; diff is ground truth). All gates green; prior pages/iterations untouched.
 - [2026-06-11 05:40] R6 — cohesion battery: 275 refs/anchors 0 broken across 4 canonical + 5 iterations + README; og titles/alt identity-aligned on all pages; voice clean; ink only in the 2 sanctioned receipt-text literals; deploy guide carries no stale refs. PASS.
+- [2026-06-11 07:25] R7 — fresh-eyes design crit + fix round, all four pages re-promoted.
+  A no-context reviewer agent rendered all four canonical pages (served, 1280+360,
+  light+dark emulated, every widget driven, consoles clean) against the value gate
+  and the founder directives. Scorecard: zero WEAK cells anywhere; index strong
+  across G1–G4, the others strong with adequate cells traced to one P1 and layout
+  nits. Punch list: 12 items. Dispositions:
+  P1 fonts-404 (tokens.css url()'d woff2s that don't exist; Inter never rendered,
+    3 requests/page) — FIXED: @font-face now local()-only with commented url()
+    siblings + exact drop-in paths; site/README.md documents the self-host upgrade
+    (OFL sources). Verified: zero font requests, zero failed resources.
+  P2 CTA cold-jump — FIXED: both index CTAs relabeled "Install from GitHub" + a
+    what-you'll-need line (macOS 14+, any Docker box, one docker compose up — all
+    README-sourced, no invented time claim) ahead of the closing CTA.
+  P2 "/yr 1" unit glitch — FIXED: unit spans removed (header already carries
+    ANNUAL COST · YEAR ONE).
+  P2 mid-tween wrong numbers — FIXED: paint() takes textVals; printed figures snap
+    to settled values, only bars animate. Browser-verified: $9,600 shown while bar
+    still mid-flight.
+  P2 dead right gutter (3 measured plates) — FIXED: at ≥980px each figure becomes
+    a 2-col grid, figcaption fills the former gutter as a bordered side note
+    (40rem chart cap kept for SVG type). Verified cap col x=773 w=374; collapses
+    to block <980.
+  P3 LucidLink bar drops as seats rise — FIXED: lucidYr1(s) vs s−1 comparison
+    appends "an added seat lowers the bill… their math, not ours" to the basis
+    line. Node-checked against real pricing: the drop is real at EVERY seat step
+    2–10 for 5/10/25 TB (seat $324/yr < $384/yr overage relief), so the note
+    shows whenever seats ≥ 2 — correct, since the bar move reads as a bug every
+    time.
+  P3 "10 GbE speed" hero overclaim — FIXED: "LAN speed" in hero + both meta
+    descriptions (measured 7 Gbit/s stands in the stat strip).
+  P3 table scroll affordance at 360 — FIXED: mono micro-hint (≤760px) + both
+    .table-wrap now tabindex=0 role=region (keyboard-scrollable). Hint verified
+    display:none at desktop.
+  P3 "magic" in competitor lane copy — FIXED (cut).
+  P3 replay beats too quick — FIXED where real: the read-back leg (the punchline)
+    was ~1.5s; now ~2.2s with three separated arrivals (sampled live: chips in
+    flight at 1.3s, done ~2.4s). Mount full-play was already ~4s of staged beats
+    (crit impression didn't match the timer math); only its fast toggle path was
+    eased 0.9→1.9s.
+  P3 aria-valuetext missing on scrub slider — FALSE POSITIVE, no change: markup
+    ships it at init and renderPlayhead writes it on every update (verified live:
+    "0 GB into the clip — 0 of 80 blocks paged…"). Noted for honesty.
+  P3 drives receipt note wrong at g=0 — FIXED in shared calculator.js (display
+    copy only; git diff confirms formulas untouched beyond the 3 sanctioned
+    hooks + this string). Deep-link ?g=0 verified showing "today's X TB × 1.25
+    headroom, growth set to 0".
+  Iterations home-v4 / performance-v3 / compare-v3 / calculator-v3 created per
+  protocol (never overwrote v2/v3), all promoted to canonical after: node --check
+  on every inline script, JMCalc node simulation, live browser verification of
+  the riskiest changes (one stale-cache false alarm on the canonical re-check —
+  cache-busted, grid confirmed), and the full battery re-run: 388 refs across 13
+  files, 0 broken; voice clean (Blackmagic RAW is a file-kind label, not a voice
+  hit); ink literals only the calculator's 2 sanctioned paper-text uses.
+
+## CLOSING REPORT (design-10x sprint — backlog complete)
+Every page now leads with identity (the open-source alternative to Suite, Shade,
+and LucidLink, for indie filmmakers and small post teams), carries ≥2 teaching
+interactives on cinema-dark surfaces, and survived a fresh-eyes crit with zero
+weak gate cells. Iteration ledger: home v2→v3→v4 (3 reviewed), performance
+v2→v3, compare v2→v3, calculator v2→v3 (2 each) — the ≥2-reviewed-iterations
+aim is met on every page, all nine iteration files preserved in
+site/iterations/ for founder review. Shared-asset deltas this sprint: tokens.css
+(cinema-dark + fonts fix), site.css (band-ink retoken, dead scrub CSS removed),
+calculator.js (3 sanctioned hooks + 1 display-copy string; formulas byte-frozen),
+og-card re-rendered, state-mark SVGs vendored into site/assets. FOR THE FOUNDER:
+(1) the morning review — iterations are numbered if you want to compare rounds;
+(2) optional: drop the four woff2s into site/assets/fonts/ per site/README.md to
+self-host Inter/JetBrains Mono; (3) the standing pre-publish list (screenshots
+via docs/screenshots/CAPTURE.md, real video assets for the performance scrub,
+public repo + deploy per site/README.md) is unchanged. Loop closed — no further
+wakes scheduled.
