@@ -5,25 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>JuiceMount performance — author-measured numbers and methodology</title>
   <meta name="description" content="JuiceMount performance, author-measured: ~7 Gbit/s on a 10 GbE LAN, 226–571 MB/s cached reads, 15–120 ms folder opens, ~29 ms search, 4–67 ms offline fail-fast — every number, the methodology, what we don't claim, and two interactive demos that show the blocks move.">
-  <link rel="canonical" href="https://juicemount.com/performance.html">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://juicemount.com/performance.html">
   <meta property="og:title" content="JuiceMount performance — author-measured numbers and methodology">
   <meta property="og:description" content="Author-measured: ~7 Gbit/s on a 10 GbE LAN, 226–571 MB/s cached reads, 15–120 ms folder opens — every number, the methodology, what we don't claim, and two interactive demos that show the blocks move.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
-  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the mounted-drive workflow editors get from LucidLink-class SaaS — at 10GbE-direct-attached speed, with Dropbox-style offline resilience — on hardware you already own.">
   <meta name="twitter:card" content="summary_large_image">
-  <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
-  <link rel="apple-touch-icon" href="apple-touch-icon.png">
-  <link rel="stylesheet" href="assets/tokens.css">
-  <link rel="stylesheet" href="assets/site.css">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="alternate icon" sizes="32x32" href="../favicon-32.png">
+  <link rel="apple-touch-icon" href="../apple-touch-icon.png">
+  <link rel="stylesheet" href="../assets/tokens.css">
+  <link rel="stylesheet" href="../assets/site.css">
 
   <!-- ======================================================================
-       Canonical performance page — promoted from
-       site/iterations/performance-v2.html (design-10x sprint R3; the vN
-       file stays for review, per protocol).
-       The scrub widget moves here from the old homepage and is
+       performance-v2 — design-10x sprint R3 (iteration file; promotion
+       candidate). The scrub widget moves here from the old homepage and is
        REORGANIZED per the founder's direction: the stage splits into a
        LOCAL side (your Mac: frame strip + playhead + SSD cache row) and a
        SERVER side (your NAS: the block field). Scrub the strip and the
@@ -37,9 +32,9 @@
        on an ink band, methodology, what-we-don't-claim, and a closing band.
        All real figures are the README's frozen, author-measured numbers;
        everything derived is line-rate math and labeled as such in the UI.
-       Page-scoped CSS/JS are inline; shared tokens/site css come from
-       assets/. No frameworks, no CDNs, no fetches — works double-clicked
-       from a folder (file://).
+       Page-scoped CSS/JS are inline so the iteration stands alone; shared
+       tokens/site css come from ../assets. No frameworks, no CDNs, no
+       fetches — works double-clicked from a folder (file://).
        VIDEO-READY: the strip is a row of .pv-frame cells with data-frame
        attributes and a commented <video>/<canvas> monitor slot — see the
        comment inside #scrub for how real footage drops in.
@@ -518,6 +513,21 @@
     table.meas { width: 100%; border-collapse: collapse; font-size: var(--fs-small); }
     .meas th, .meas td { text-align: left; vertical-align: top; padding: 0.55rem 0.75rem 0.55rem 0; border-top: 1px solid var(--hairline-soft); }
     .meas thead th { border-top: 0; border-bottom: 1.5px solid var(--hairline); color: var(--text-muted); }
+
+    /* ---- iteration badge -------------------------------------------------- */
+    .iter-badge {
+      font-family: var(--font-mono);
+      font-size: var(--fs-label);
+      font-weight: var(--fw-head);
+      letter-spacing: var(--track-label);
+      text-transform: uppercase;
+      color: var(--text);
+      background: var(--tint-amber);
+      border: 1.5px solid var(--tint-amber-border);
+      border-radius: 999px;
+      padding: 0.15rem 0.7rem;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -535,16 +545,16 @@
 
   <nav class="site-nav" aria-label="Main">
     <div class="container">
-      <a class="brand" href="index.html">
-        <img src="assets/logo-color.svg" alt="" width="30" height="30">
+      <a class="brand" href="../index.html">
+        <img src="../assets/logo-color.svg" alt="" width="30" height="30">
         JuiceMount
       </a>
       <ul>
-        <li><a href="index.html">Home</a></li>
-        <li><a href="index.html#how">How it works</a></li>
-        <li><a href="compare.html">Compare</a></li>
-        <li><a href="performance.html" aria-current="page">Performance</a></li>
-        <li><a href="calculator.html">Calculator</a></li>
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../index.html#how">How it works</a></li>
+        <li><a href="../compare.html">Compare</a></li>
+        <li><a href="../performance.html">Performance</a></li>
+        <li><a href="../calculator.html">Calculator</a></li>
         <li><a href="https://github.com/lelanddutcher/juicemount">GitHub ↗</a></li>
       </ul>
     </div>
@@ -631,7 +641,7 @@
                      founder supplies assets — no structural change needed.
                      1) Thumbnails: each .pv-frame below is one frame cell,
                         addressed by data-frame="0".."15". Drop a real still
-                        into a cell as <img src="assets/frames/clip-07.jpg"
+                        into a cell as <img src="../assets/frames/clip-07.jpg"
                         alt=""> (or a background-image) keyed by data-frame;
                         the .is-live / .is-ready classes keep working on top.
                      2) Live scrub: the script dispatches a "pv:frac"
@@ -640,10 +650,10 @@
                         monitor below, then on that event set
                         video.currentTime = e.detail.frac * video.duration
                         (and draw to the canvas if you want frame-exact
-                        paint). Keep the file on assets/clips/ so the
+                        paint). Keep the file on ../assets/clips/ so the
                         page stays static and file://-safe.
                 <div class="pv-monitor">
-                  <video muted playsinline preload="metadata" src="assets/clips/scrub-demo.mp4"></video>
+                  <video muted playsinline preload="metadata" src="../assets/clips/scrub-demo.mp4"></video>
                   <canvas width="640" height="360"></canvas>
                 </div>
                 ========================================================== -->
@@ -1003,7 +1013,7 @@
         </div>
         <div class="hero-ctas">
           <a class="btn btn-primary" href="https://github.com/lelanddutcher/juicemount#quick-start">Get started</a>
-          <a class="btn btn-outline" href="compare.html">How it compares</a>
+          <a class="btn btn-outline" href="../compare.html">How it compares</a>
         </div>
       </div>
     </section>
@@ -1017,6 +1027,7 @@
       <a href="https://github.com/lelanddutcher/juicemount/blob/main/LICENSE">Apache-2.0</a>
       <span>Built on <a href="https://github.com/juicedata/juicefs">JuiceFS</a> — credit where due</span>
       <span>This site is static files — no analytics, no telemetry</span>
+      <span class="iter-badge">iteration v2 · review copy</span>
     </div>
   </footer>
 
