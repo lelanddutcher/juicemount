@@ -84,9 +84,9 @@ autonomous loop ("churn for several hours"), 2026-06-10.
 - [x] H. Scrub-streaming explainer widget → site/ (interactive: a film-
       strip timeline; drag the playhead — "only these blocks stream";
       first-read vs cached-read toggle showing network vs NVMe speeds)
-- [ ] I. OG/social card (1200×630) + favicon set from the mark via
+- [x] I. OG/social card (1200×630) + favicon set from the mark via
       scripts/svg2png.swift → site/assets/, wired into page heads
-- [ ] J. Deploy story → site/README.md (GitHub Pages + Cloudflare Pages
+- [x] J. Deploy story → site/README.md (GitHub Pages + Cloudflare Pages
       steps, custom-domain DNS for juicemount.com, cache headers)
 - [ ] K. Final pass: link check across site+README, lighthouse-style
       sanity (no console errors, images sized), brand consistency sweep,
@@ -103,3 +103,4 @@ autonomous loop ("churn for several hours"), 2026-06-10.
 - [2026-06-10 17:15] E — README v2: banner light/dark (visually approved), 4 local badges, arch <picture> embed (ASCII sketch retired, 19 lines, zero frozen-claim deletions), 13-Q FAQ + 6-entry troubleshooting (all claims source-cited, 0 VERIFY tags), commented screenshots block + docs/screenshots/CAPTURE.md; folded in the site/ arch <desc> A2-wording fix the agent flagged
 - [2026-06-10 22:25] F+G — compare.html (335 ln: both lanes, 14 dated price cells, Iconik labeled MAM-adjacent, mandatory concessions incl. Frame.io/SOC2/AI-search; pick-the-other-thing close) + performance.html (288 ln: sanctioned H1, 3 token-driven SVG charts Stream-Blue-vs-Slate, ranges-as-ranges, what-we-dont-claim box). ~100 claims byte-matched vs README/pricing/SITE_PLAN; orchestrator re-verified structure/voice/externals + ceiling-claim verbatim (entity-wrapped). Nav 404s from B+C now resolve.
 - [2026-06-10 23:05] H — scrub explainer (#scrub band-ink section, 446-ln scrub.js): ARIA-slider playhead, JM-vs-sync modes w/ persistent cache cells, link-speed radios, honest illustrative-labeled math (14/14 node asserts; 320MB full-strip punchline computed), reduced-motion path, browser-verified light/dark/360px/keyboard; hero secondary CTA → See it stream (calculator keeps nav + pillar links)
+- [2026-06-10 23:45] I+J — og-card 1200x630 (visually approved: ink band, mark left-third, cream type), favicon set (color svg + mono 16/32 per tiny-size rule + touch-icon 180 on cream), per-page OG/Twitter meta x4, svg2png height extension (3-arg regression proven); site/README.md deploy guide (CF Pages recommended w/ DNS + _headers cache rules; GH Pages workflow inline as fallback)

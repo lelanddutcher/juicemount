@@ -1,0 +1,52 @@
+# juicemount.com response headers. Cloudflare Pages reads this file from the
+# deploy output; every other host (and file://) ignores it. See site/README.md.
+#
+# The shape: HTML answers no-cache so a deploy shows up on the next request;
+# everything under /assets/ plus the root icons get a browser-cache window
+# with stale-while-revalidate, because nothing here is content-hashed.
+# Cloudflare purges its own edge cache on every Pages deploy — these headers
+# govern browsers. Rules are written per-path (no overlapping Cache-Control
+# globs), so behavior doesn't depend on rule-precedence details. When a page
+# is added, add both its /name and /name.html lines (Pages serves both).
+
+/*
+  X-Content-Type-Options: nosniff
+
+/assets/*
+  Cache-Control: public, max-age=86400, stale-while-revalidate=604800
+
+/favicon.svg
+  Cache-Control: public, max-age=604800, stale-while-revalidate=2592000
+
+/favicon-32.png
+  Cache-Control: public, max-age=604800, stale-while-revalidate=2592000
+
+/favicon-16.png
+  Cache-Control: public, max-age=604800, stale-while-revalidate=2592000
+
+/apple-touch-icon.png
+  Cache-Control: public, max-age=604800, stale-while-revalidate=2592000
+
+/
+  Cache-Control: no-cache
+
+/index.html
+  Cache-Control: no-cache
+
+/calculator
+  Cache-Control: no-cache
+
+/calculator.html
+  Cache-Control: no-cache
+
+/compare
+  Cache-Control: no-cache
+
+/compare.html
+  Cache-Control: no-cache
+
+/performance
+  Cache-Control: no-cache
+
+/performance.html
+  Cache-Control: no-cache
