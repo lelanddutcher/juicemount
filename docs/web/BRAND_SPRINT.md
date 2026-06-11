@@ -88,7 +88,7 @@ autonomous loop ("churn for several hours"), 2026-06-10.
       scripts/svg2png.swift → site/assets/, wired into page heads
 - [x] J. Deploy story → site/README.md (GitHub Pages + Cloudflare Pages
       steps, custom-domain DNS for juicemount.com, cache headers)
-- [ ] K. Final pass: link check across site+README, lighthouse-style
+- [x] K. Final pass: link check across site+README, lighthouse-style
       sanity (no console errors, images sized), brand consistency sweep,
       final sprint report in Journal
 - [ ] L. (user-assisted, schedule last) Screenshots: founder runs
@@ -104,3 +104,30 @@ autonomous loop ("churn for several hours"), 2026-06-10.
 - [2026-06-10 22:25] F+G — compare.html (335 ln: both lanes, 14 dated price cells, Iconik labeled MAM-adjacent, mandatory concessions incl. Frame.io/SOC2/AI-search; pick-the-other-thing close) + performance.html (288 ln: sanctioned H1, 3 token-driven SVG charts Stream-Blue-vs-Slate, ranges-as-ranges, what-we-dont-claim box). ~100 claims byte-matched vs README/pricing/SITE_PLAN; orchestrator re-verified structure/voice/externals + ceiling-claim verbatim (entity-wrapped). Nav 404s from B+C now resolve.
 - [2026-06-10 23:05] H — scrub explainer (#scrub band-ink section, 446-ln scrub.js): ARIA-slider playhead, JM-vs-sync modes w/ persistent cache cells, link-speed radios, honest illustrative-labeled math (14/14 node asserts; 320MB full-strip punchline computed), reduced-motion path, browser-verified light/dark/360px/keyboard; hero secondary CTA → See it stream (calculator keeps nav + pillar links)
 - [2026-06-10 23:45] I+J — og-card 1200x630 (visually approved: ink band, mark left-third, cream type), favicon set (color svg + mono 16/32 per tiny-size rule + touch-icon 180 on cream), per-page OG/Twitter meta x4, svg2png height extension (3-arg regression proven); site/README.md deploy guide (CF Pages recommended w/ DNS + _headers cache rules; GH Pages workflow inline as fallback)
+- [2026-06-11 00:10] K — final sweep: 101 local refs checked (5 expected
+  placeholders in the commented README screenshots block), anchors ok,
+  zero off-palette hexes, voice clean, nav identical x4 pages.
+
+## FINAL SPRINT REPORT (loop closing — item L awaits the founder)
+Eleven commits, ~5 hours, every backlog item delivered except the
+user-assisted screenshots:
+- Brand: BRAND.md v1 (state-language-as-palette, voice w/ calibration).
+- README: banner light/dark, 4 local badges, arch diagram embed, 13-Q
+  FAQ + troubleshooting, all claims source-cited, frozen Phase-4 claims
+  untouched.
+- Site (fully static, zero CDNs, file://-safe, light+dark, 360px-clean):
+  index w/ hero Option C + scrub-streaming interactive (ARIA slider,
+  honest illustrative math), rent-vs-own calculator (36-mo simulation,
+  3.25-mo documented default, honest SaaS-cheaper branch, URL state),
+  compare (dated pricing, mandatory concessions), performance (token-
+  driven SVG charts, what-we-dont-claim box), OG card + favicons +
+  per-page meta, deploy guide (CF Pages recommended + _headers).
+- Orchestrator gate catches during the sprint: stale "plain objects"
+  wording in diagram (Phase-4 A2 class) fixed pre-commit x2; ceiling
+  claim verified verbatim through entity wrapping.
+REMAINING FOR THE FOUNDER:
+1. Screenshots: run docs/screenshots/CAPTURE.md (~2 min), then ask the
+   loop to wire them in (item L: uncomment README block + add real PNGs).
+2. Deploy when ready: site/README.md has the juicemount.com steps.
+3. Repo placeholders: github.com/lelanddutcher/juicemount URLs go live
+   when the public repo exists.
