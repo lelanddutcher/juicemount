@@ -75,10 +75,10 @@ autonomous loop ("churn for several hours"), 2026-06-10.
       embed, expanded FAQ + troubleshooting section, screenshots section
       with docs/screenshots/CAPTURE.md script+instructions (founder runs
       capture; placeholders committed with exact filenames)
-- [ ] F. Comparison page → site/compare.html (SaaS suites vs sync tools
+- [x] F. Comparison page → site/compare.html (SaaS suites vs sync tools
       vs JuiceMount; the honest table from README, expanded; "what they
       do better" sections)
-- [ ] G. Performance page → site/performance.html with SVG charts
+- [x] G. Performance page → site/performance.html with SVG charts
       (author-measured numbers + methodology link; chart the cached-read
       MB/s, dir-open ms, search ms, offline fail-fast ms)
 - [ ] H. Scrub-streaming explainer widget → site/ (interactive: a film-
@@ -101,3 +101,4 @@ autonomous loop ("churn for several hours"), 2026-06-10.
 - [2026-06-10 16:05] B+C — site/ scaffold (tokens/site css, index hero Option C, zero-JS baseline) + calculator (725-line js, spec math verified 3.25mo, honest-branch live, URL state, pricing.json dated) — 1936 lines, all gates green. Deviations logged in agent report (payback=crossing-month not avg36; defaults=worked example). Nav links to compare/performance 404 until F/G.
 - [2026-06-10 16:40] D — arch-diagram light+dark SVGs (site/assets + assets/readme), index figure swapped to <picture>; orchestrator caught + fixed stale "plain objects" wording (Phase-4 A2 class) in all 4 variants before commit; svg2png render-verified + visually approved
 - [2026-06-10 17:15] E — README v2: banner light/dark (visually approved), 4 local badges, arch <picture> embed (ASCII sketch retired, 19 lines, zero frozen-claim deletions), 13-Q FAQ + 6-entry troubleshooting (all claims source-cited, 0 VERIFY tags), commented screenshots block + docs/screenshots/CAPTURE.md; folded in the site/ arch <desc> A2-wording fix the agent flagged
+- [2026-06-10 22:25] F+G — compare.html (335 ln: both lanes, 14 dated price cells, Iconik labeled MAM-adjacent, mandatory concessions incl. Frame.io/SOC2/AI-search; pick-the-other-thing close) + performance.html (288 ln: sanctioned H1, 3 token-driven SVG charts Stream-Blue-vs-Slate, ranges-as-ranges, what-we-dont-claim box). ~100 claims byte-matched vs README/pricing/SITE_PLAN; orchestrator re-verified structure/voice/externals + ceiling-claim verbatim (entity-wrapped). Nav 404s from B+C now resolve.
