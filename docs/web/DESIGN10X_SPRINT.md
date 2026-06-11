@@ -458,3 +458,52 @@ independent + funded, not Iconik; (2) the scrub video file slots in via
 data-video on #svh-stage when he supplies it; (3) Dropbox/Drive
 calculator tiers are data-ready (pricing.json) but not built into the
 simulate() formulas — formula changes remain founder-gated.
+
+# ROUND 3 — founder review of 2026-06-11 (afternoon)
+
+## Backlog — round 3
+- [ ] T0. GLOBAL: the demo volume is named JuiceMount, not zpool —
+      "/Volumes/JuiceMount" everywhere on the site ("much cooler").
+- [ ] T1. Comprehension gut-check (founder-mandated): a no-context
+      sub-agent with a creative-not-technical persona reads the home
+      page cold and reports, section by section, what they think the
+      product is/does. Findings inform the T2 flow rework.
+- [ ] T2. home-v6: hero mock dies — no window chrome, no menu-bar strip,
+      no caption: just a macOS-style external-drive icon popping on
+      with a green glow, labeled JuiceMount, ONE-TIME (no replay
+      button). Kill the statline (7 Gbit/100 GB/$0 callouts). H1 stays
+      but record the A/B plan (simpler variant: "Self-hosted block
+      storage for media" class). Menu-bar section demoted far down
+      (it's "how you interact with it", not the opener — the app is
+      nothing without the NAS-side stack). Section order per founder:
+      real mount → instant search → blocks ("Your files become blocks.
+      That's the magic." — founder's phrase) with the scrub timeline
+      copied in as its second segment + the read-back story FIXED
+      (reading back your own upload makes no sense — it's a teammate's
+      Mac / any other Mac that reads 3 seconds) + the SMB
+      back-and-forth duel visual ported from performance ("I quite
+      like that one") → three-ways cards cut to graphical (current
+      copy "insane"ly wordy) → pillars reworked: speed "tested up to
+      10 GbE", resilience is offline/pinning (NOT milliseconds —
+      that's latency), economics in plain words (no "where the bucket
+      lives decides the bill") → menu-bar/how-you-drive-it → tech
+      stack → what's-not → closing.
+- [ ] T3. performance-v5: platter animation must use the REAL mark —
+      dissect logos/color.svg, separate the founder-designed read head
+      and platter groups, animate those (not an homage drawing). WAN
+      graphic redesigned: the cloud path must visibly choke through
+      the ISP (current layout puts NAS and cloud on the same side —
+      "doesn't work"). DROP "Mount it wherever you want" (conveys
+      rename-ability, not the intended hardware-agnosticism). "Their
+      answer to latency is your hardware" visual reworked by a
+      sub-agent for moderately-technical creatives (pain points: long
+      waits for massive files; paying cloud rent while owning a NAS).
+- [ ] T4. docs-v2 + remote access: a "Working remotely" section —
+      JuiceMount does storage, Tailscale does routing (README-sourced:
+      "the author runs Tailscale; any VPN that gives the Mac a route
+      to the Redis + MinIO ports works"). Simple, line-by-line. Plus a
+      pointer from performance/home where remote work comes up.
+- [ ] T5. Verify (gates + fresh browser pass), promote, cohesion,
+      journal, closing report.
+
+## Journal — round 3
