@@ -20,41 +20,58 @@
   <link rel="stylesheet" href="assets/site.css">
 
   <!-- ======================================================================
-       performance-v4 — design-10x ROUND 2, backlog item S3 (founder review
-       2026-06-11). Iteration file: lives in site/iterations/, refs ../.
+       performance-v5 — design-10x ROUND 3, backlog item T3 (founder review
+       2026-06-11, DESIGN10X_SPRINT.md). Iteration file: lives in
+       site/iterations/, local refs rewritten to ../.
        Changes vs canonical performance.html:
-         A. hero reframed latency-first — "Storage that scales, but feels
-            local."; the ~7 Gbit/s figure demoted to a supporting stat
-            (still attributed); new hero ornament: the platter (F).
-         B. measured charts condensed — one hero-grade chart stays (the
-            cache-vs-wire read, #cache); the throughput and latency plates
-            fold into the canonical numbers table (#table, "the ledger").
-         C. demo 02 re-ideated (#race): no longer a warm-cache race — now
-            one minute of editing replayed on a plain SMB share vs the
-            JuiceMount cache. The share pays a wire round trip for every
-            touch, every time; the cache pays once per new block, then
-            answers from SSD. Counters: total wait + total wire trips.
-            The SMB lane is an illustrative category model and says so.
-         D. throughput reframed (#tp): plain-words physics — a cloud mount
-            can't beat your ISP; a NAS on your LAN carries the measured
-            ~7 Gbit/s; away, the cache rides the same internet as everyone.
-         E. new section (#theirs): every SaaS vendor's WAN-latency fix runs
-            on hardware the customer supplies (RESEARCH_ROUND2.md §3,
-            checked 2026-06-11) — sources in a <details> element.
-         F. the platter: an inline-SVG homage to the mark (citrus-slice
-            platter + read-head arm; NOT the logo file — BRAND.md forbids
-            modifying the mark) — platter spins, head seeks; reduced
-            motion gets the static pose.
-         G. NAS wording; "Mount it wherever you want" section (#wherever),
-            README-backed. H. nav gains Docs (../docs.html — resolves at
-            promotion).
-       demo 01 — the playhead (#scrub, .pv-*) is UNCHANGED from canonical
-       (founder-loved; byte-compatible except the two commented asset paths
-       rewritten to ../ per iteration protocol). All real figures remain
-       the README's frozen, author-measured numbers; everything derived is
-       labeled line-rate / round-trip arithmetic. Page-scoped CSS/JS are
-       inline; shared tokens/site css come from ../assets/. No frameworks,
-       no CDNs, no fetches — works double-clicked from a folder (file://).
+         A. the platter is now the REAL mark (founder: "it's not the logo
+            ... separate the read head that I designed and the actual
+            platter that I designed, and use that instead"). Both
+            instances (hero + closing band) embed the artwork dissected
+            from logos/color.svg: the citrus slice (his platter) in a
+            .pl-disc group that spins about the drawn spindle dot
+            (502.62, 505.01); the juicer arm (his read head: the gray
+            swoosh, its hub ring, and the chevron) in .pl-arm groups that
+            seek a few degrees about the hub-ring center (185.6, 821.72).
+            Path data and every fill/stroke value are copied verbatim from
+            the logo file; only the gradient ids are made instance-unique.
+            The logo FILE is untouched; rotating these groups is the
+            founder's explicit request, sanctioned over BRAND.md's default
+            "don't rotate".
+         B. WAN graphic redesigned (#tp): the old drawing put your NAS and
+            their cloud on the same side, which hid the bottleneck. Now:
+            your Mac center-left inside a dashed "same building" boundary;
+            route one is a short fat green pipe to your NAS (the measured
+            ~7 Gbit/s lives on it, attributed); route two leaves the
+            building, visibly narrows through a funnel-and-pinch labeled
+            "your ISP", then continues thin, dashed, and long to their
+            cloud on the far side. Flow dashes animate on both routes,
+            motion-gated. No invented WAN numbers — the thin pipe is
+            "whatever your ISP sells you".
+         C. "Mount it wherever you want" (#wherever) DROPPED — founder: it
+            accidentally read as Finder rename-ability, not
+            hardware-agnosticism (which lives on the home pillars + docs).
+            Its CSS (.placeviz) removed with it; no JS referenced it; no
+            other page links to #wherever (checked site/*.html).
+         D. #theirs visual reworked (copy, vendor cards, and sources kept —
+            founder liked the commentary; the twin-cache drawing did not
+            survive review). New figure: the cache everyone agrees you
+            need, drawn ONCE, with two price tags hanging off it — theirs
+            ("your hardware + their subscription, $/TB-month, add-ons
+            quote-only") vs JuiceMount ("your hardware + $0 software,
+            Apache-2.0"). Tags drop in once on scroll-into-view
+            (motion-gated; reduced motion and no-JS get the settled pose);
+            the SVG is aria-hidden with the figcaption as text equivalent.
+         E. remote-work pointer: one line under demo 02's footnotes —
+            remote routing is one Tailscale away — linking
+            ../docs.html#remote (the docs "Working remotely" section;
+            the anchor exists in canonical docs.html as of this edit).
+       demo 01 — the playhead (#scrub, .pv-*) is SACRED and byte-identical
+       to canonical, including its in-comment asset paths. All real figures
+       remain the README's frozen, author-measured numbers; everything
+       derived is labeled line-rate / round-trip arithmetic. Page-scoped
+       CSS/JS are inline; shared tokens/site css come from ../assets/. No
+       frameworks, no CDNs, no fetches — works double-clicked (file://).
        ====================================================================== -->
   <style>
     /* ---- hero statline (same chrome as the canonical homepage) ---------- */
@@ -78,11 +95,17 @@
       .perf-hero { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
       .hero-platter { padding-left: var(--space-6); }
     }
-    /* the platter is an HOMAGE to the mark (citrus platter + read head),
-       drawn fresh in brand palette — not the logo file, never recolored.
-       Spin + seek run only when motion is welcome. */
-    .pl-disc { transform-box: view-box; transform-origin: 118px 118px; }
-    .pl-arm  { transform-box: view-box; transform-origin: 210px 196px; }
+    /* the platter is the REAL mark (founder, round 3): slice and juicer
+       arm lifted verbatim from logos/color.svg — same path data, same
+       fills — split into two groups. The disc spins about the spindle dot
+       the mark draws at its center (502.62, 505.01); the arm seeks a few
+       degrees about its drawn hub ring (185.6, 821.72) — the bearing the
+       founder put at the arm's rounded end. Rotating these groups is his
+       explicit request; nothing is recolored, skewed, or restyled. The
+       seek stays within ±4° so the arm never visually detaches. Spin +
+       seek run only when motion is welcome. */
+    .pl-disc { transform-box: view-box; transform-origin: 502.62px 505.01px; }
+    .pl-arm  { transform-box: view-box; transform-origin: 185.6px 821.72px; }
     @media (prefers-reduced-motion: no-preference) {
       .pl-disc { animation: pl-spin 26s linear infinite; }
       .pl-arm  { animation: pl-seek 9s ease-in-out infinite; }
@@ -90,9 +113,9 @@
     @keyframes pl-spin { to { transform: rotate(360deg); } }
     @keyframes pl-seek {
       0%, 12%  { transform: rotate(0deg); }
-      24%, 38% { transform: rotate(8deg); }
-      50%, 62% { transform: rotate(-6deg); }
-      74%, 86% { transform: rotate(5deg); }
+      24%, 38% { transform: rotate(4deg); }
+      50%, 62% { transform: rotate(-3deg); }
+      74%, 86% { transform: rotate(2.5deg); }
       100%     { transform: rotate(0deg); }
     }
 
@@ -635,20 +658,49 @@
     .meas th, .meas td { text-align: left; vertical-align: top; padding: 0.55rem 0.75rem 0.55rem 0; border-top: 1px solid var(--hairline-soft); }
     .meas thead th { border-top: 0; border-bottom: 1.5px solid var(--hairline); color: var(--text-muted); }
 
-    /* ---- the physics / wherever / theirs diagrams ------------------------ */
-    .pathviz, .placeviz, .twin-cache { width: 100%; height: auto; display: block; }
+    /* ---- the physics diagram (#tp): two routes, one choke ----------------
+       LAN: short fat green pipe, building-internal. WAN: a wide stub that
+       leaves the building, necks down through the ISP funnel, and carries
+       on thin + dashed to their cloud. Flow dashes on both, motion-gated;
+       dash periods divide the keyframe offsets so the loops are seamless. */
+    .pathviz, .price-once { width: 100%; height: auto; display: block; }
     .pipe-lan { stroke: var(--chart-self); stroke-width: 16; fill: none; stroke-linecap: round; opacity: 0.85; }
-    .pipe-wan { stroke: var(--chart-saas); stroke-width: 4; fill: none; stroke-linecap: round; stroke-dasharray: 1 9; }
     .pipe-flow { stroke: var(--bg); stroke-width: 6; fill: none; stroke-linecap: round; stroke-dasharray: 2 22; }
-    .meter-needle { transform-box: view-box; transform-origin: 300px 98px; }
+    .pipe-wan-wide { stroke: var(--chart-saas); stroke-width: 14; fill: none; stroke-linecap: round; opacity: 0.45; }
+    .pipe-wan-funnel { fill: var(--chart-saas); opacity: 0.45; }
+    .pipe-wan-thin { stroke: var(--chart-saas); stroke-width: 3.5; fill: none; stroke-linecap: round; stroke-dasharray: 5 7; }
+    .pipe-flow-wan { stroke: var(--bg); stroke-width: 5; fill: none; stroke-linecap: round; stroke-dasharray: 2 22; }
+    .choke-wall { stroke: var(--diagram-stroke); stroke-width: 2.5; fill: none; stroke-linecap: round; }
     @media (prefers-reduced-motion: no-preference) {
       .pipe-flow { animation: pipe-flow 1.6s linear infinite; }
-      .meter-needle { animation: meter-tick 7s ease-in-out infinite; }
+      .pipe-flow-wan { animation: pipe-flow 2.8s linear infinite; }
+      .pipe-wan-thin { animation: wan-crawl 2.2s linear infinite; }
     }
     @keyframes pipe-flow { to { stroke-dashoffset: -24; } }
-    @keyframes meter-tick {
-      0%, 100% { transform: rotate(-32deg); }
-      45%, 55% { transform: rotate(30deg); }
+    @keyframes wan-crawl { to { stroke-dashoffset: -24; } }
+
+    /* ---- #theirs: one cache, two price tags -------------------------------
+       The SSD box is drawn once; the bills hang off it. Tags rest tilted
+       on their strings; with motion welcome and the figure scrolled into
+       view (JS adds .is-live) they drop in once and settle on the same
+       resting tilt — reduced motion and no-JS get the settled pose. */
+    .ptag { transform-box: view-box; }
+    .ptag-theirs { transform-origin: 210px 152px; transform: rotate(-3deg); }
+    .ptag-jm { transform-origin: 510px 152px; transform: rotate(2.5deg); }
+    .tag-string { stroke: var(--text-muted); stroke-width: 2; fill: none; }
+    @media (prefers-reduced-motion: no-preference) {
+      .price-once.is-live .ptag-theirs { animation: tag-drop-l 0.9s cubic-bezier(0.2, 0.7, 0.3, 1) both; }
+      .price-once.is-live .ptag-jm { animation: tag-drop-r 0.9s cubic-bezier(0.2, 0.7, 0.3, 1) 0.25s both; }
+    }
+    @keyframes tag-drop-l {
+      0%   { opacity: 0; transform: translateY(-30px) rotate(-9deg); }
+      65%  { opacity: 1; transform: translateY(5px) rotate(0deg); }
+      100% { opacity: 1; transform: rotate(-3deg); }
+    }
+    @keyframes tag-drop-r {
+      0%   { opacity: 0; transform: translateY(-30px) rotate(8deg); }
+      65%  { opacity: 1; transform: translateY(5px) rotate(0deg); }
+      100% { opacity: 1; transform: rotate(2.5deg); }
     }
     .vendor-grid {
       display: grid;
@@ -732,9 +784,9 @@
     .claim-chip.is-modeled { background: var(--tint-slate); border-color: var(--tint-slate-border); }
     .claim-chip.is-modeled i { background: var(--text-muted); }
 
-    /* ---- closing-band platter echo: the hero homage again at sign-off
-       size; same .pl-disc/.pl-arm classes, so the existing reduced-motion
-       gate on the spin/seek animations covers this instance too ---------- */
+    /* ---- closing-band platter echo: the hero's real-mark platter again
+       at sign-off size; same .pl-disc/.pl-arm classes, so the existing
+       reduced-motion gate on the spin/seek animations covers it too ------ */
     .close-platter { margin: 0 0 var(--space-5); }
     .close-platter svg { width: 72px; height: auto; display: block; }
   </style>
@@ -804,35 +856,45 @@
           <p class="small muted" style="margin-top: var(--space-5)">Every number on this page was measured by the author on his own setup — Apple-Silicon Mac ↔ TrueNAS SCALE over 10&nbsp;GbE. Honest measurements, not marketing benchmarks; your hardware will differ. <a href="https://github.com/lelanddutcher/juicemount/blob/main/docs/PERFORMANCE_METHODOLOGY.md">Methodology, workload scripts, and the regression harness are public</a>.</p>
         </div>
         <div class="hero-platter" aria-hidden="true">
-          <!-- The platter: an HOMAGE to the mark — the founder's read of the
-               logo is a hard-drive head over a citrus slice that looks like a
-               disk platter. This is a fresh drawing in brand palette (the logo
-               file itself is never rotated or recolored, per BRAND.md). The
-               platter spins and the head seeks between tracks; reduced motion
-               gets the static pose. -->
-          <svg class="platter" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg" focusable="false">
+          <!-- The platter IS the mark (founder, round 3): the citrus slice
+               (his platter) and the juicer arm (his read head), dissected
+               from logos/color.svg. Path data, paint order, and every fill
+               and stroke value are copied verbatim from the logo file —
+               only the gradient id is instance-unique so the closing-band
+               echo can't collide. The slice spins about the mark's own
+               spindle dot (502.62, 505.01); the arm — swoosh, hub ring,
+               and chevron — seeks about its hub-ring center (185.6,
+               821.72). The spindle dot sits between the arm's layers in
+               the original, so it stays a standalone element here: it is
+               the axle, and it is rotation-invariant at the disc's center
+               anyway. Reduced motion gets the mark at rest. -->
+          <svg class="platter" viewBox="0 0 1000 1000" xmlns="http://www.w3.org/2000/svg" focusable="false">
+            <defs>
+              <linearGradient id="pl-grad-hero" x1="47.8" y1="711.87" x2="605.26" y2="711.87" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#ccc"/>
+                <stop offset="1" stop-color="gray"/>
+              </linearGradient>
+            </defs>
             <g class="pl-disc">
-              <circle cx="118" cy="118" r="84" fill="#FAFDE8" stroke="#1B102A" stroke-width="5"/>
-              <g fill="#AACD58" stroke="#1B102A" stroke-width="2.5" stroke-linejoin="round">
-                <path d="M142.9 110.4 L184.9 97.5 A70 70 0 0 1 184.9 138.5 L142.9 125.6 A26 26 0 0 0 142.9 110.4 Z"/>
-                <path d="M141.0 130.2 L179.8 150.9 A70 70 0 0 1 150.9 179.8 L130.2 141.0 A26 26 0 0 0 141.0 130.2 Z"/>
-                <path d="M125.6 142.9 L138.5 184.9 A70 70 0 0 1 97.5 184.9 L110.4 142.9 A26 26 0 0 0 125.6 142.9 Z"/>
-                <path d="M105.8 141.0 L85.1 179.8 A70 70 0 0 1 56.2 150.9 L95.0 130.2 A26 26 0 0 0 105.8 141.0 Z"/>
-                <path d="M93.1 125.6 L51.1 138.5 A70 70 0 0 1 51.1 97.5 L93.1 110.4 A26 26 0 0 0 93.1 125.6 Z"/>
-                <path d="M95.0 105.8 L56.2 85.1 A70 70 0 0 1 85.1 56.2 L105.8 95.0 A26 26 0 0 0 95.0 105.8 Z"/>
-                <path d="M110.4 93.1 L97.5 51.1 A70 70 0 0 1 138.5 51.1 L125.6 93.1 A26 26 0 0 0 110.4 93.1 Z"/>
-                <path d="M130.2 95.0 L150.9 56.2 A70 70 0 0 1 179.8 85.1 L141.0 105.8 A26 26 0 0 0 130.2 95.0 Z"/>
-              </g>
-              <circle cx="118" cy="118" r="46" fill="none" stroke="#1B102A" stroke-opacity="0.22" stroke-width="1.5" stroke-dasharray="3 5"/>
-              <circle cx="118" cy="118" r="60" fill="none" stroke="#1B102A" stroke-opacity="0.22" stroke-width="1.5" stroke-dasharray="3 5"/>
-              <circle cx="118" cy="118" r="14" fill="#393839" stroke="#1B102A" stroke-width="3"/>
-              <circle cx="118" cy="118" r="3.5" fill="#FAFDE8"/>
+              <circle fill="#393839" cx="495.56" cy="506.15" r="238.15"/>
+              <path fill="#a9cd58" stroke="#1b102a" stroke-miterlimit="10" stroke-width="22.71" d="M765.88,905.66c-117.74,78.1-262.97,99.6-397.95,60.35-104.84-30.48-196.23-96.14-260.02-184.98C24.1,664.29-1.98,517.61,34.31,378.58c15.9-60.91,43.49-116.72,81.77-167.14,62.95-82.9,150.15-143.26,249.45-172.95C494.61-.11,634.16,18,749.57,87.76c68.45,41.37,126.32,99.27,167.67,167.76,22.28,36.91,38.57,75.62,50.15,117.16,22.11,79.32,23.23,160.68,4.55,240.98-27.93,120.06-102.37,223.22-206.06,292Z"/>
+              <path fill="#fafde8" d="M580.62,935.71c-56.96,10.61-114.6,9.85-169.63-2.2-127.58-27.93-237.01-111.96-298.86-226.6-62.25-115.38-68.7-252.46-17.53-373.16,43.11-101.71,122.84-184.91,223.36-232,101.2-47.4,217.96-53.75,324.4-17.31,129.85,44.44,233.25,148.02,277.42,277.99,36.86,108.49,29.51,226.27-20.23,328.48-22.15,45.52-51.69,85.72-87.33,121.41-63.23,63.32-142.2,106.74-231.59,123.39Z"/>
+              <path fill="#aace59" d="M443.23,465.82l-179.78-74.29-68.51-28.3c-13.18-5.44-25.47-12.27-33.21-24-9.25-14.02-9.77-29.61-.33-43.98,34.64-52.78,79.42-97.68,131.71-132.23,14.72-9.73,33.51-7.94,47.5,2.76,8.57,6.56,14.52,14.72,18.61,24.53l63.55,152.22,43.22,103.07c2.9,6.92,3.07,13.97-3.39,18.43-5.47,3.77-12.03,4.82-19.35,1.8Z"/>
+              <path fill="#aace59" d="M592.51,889.41c-62.07,12.13-123.51,12.39-184.14-.14-17.66-3.65-30.38-18.37-31.16-36.53-.38-8.98.23-18.25,3.99-27.4l106.08-258.61c2.49-6.08,8.7-8.67,12.56-9.55,5.63-1.29,13.16.71,15.86,7.21l87.55,210.55,20.6,51.78c8.91,22.39,2.04,56.16-31.34,62.68Z"/>
+              <path fill="#aacd58" d="M816.7,357.98l-102.26,43.53-154.12,64.35c-5.82,2.43-12.61,3.91-16.81.44-3.42-2.83-10.08-9.97-7.36-16.62l105.95-258.36c3.89-9.48,9.95-17.09,16.31-23.64,13.69-14.11,34.53-16.38,51.13-5.52,34.59,22.62,65.08,48.9,92.07,79.88,13.79,15.83,25.54,32.29,37.71,49.43,7.42,10.46,10.11,22.61,5.97,35.33-4.43,13.62-14.31,25.1-28.59,31.18Z"/>
+              <path fill="#a9cd58" d="M488.9,441.63l-108.94-263.24c-9.14-22.08-1.99-57,28.78-63.3,61.94-12.67,125.18-13.75,186.7.06,20.06,4.5,32.57,22.3,30.82,42.62-.95,11.07-3.44,20.63-7.91,31.43l-103.53,250.13c-2.26,5.46-8.14,6.64-11.46,7.54-3.64.99-12.07.53-14.46-5.25Z"/>
+              <path fill="#a9cd58" d="M341.35,839.92c-14.42,11.53-32.15,11.93-47.4,1.97-51.72-33.78-93.62-77.14-128.52-127.65-8.27-11.97-12.04-24.23-6.57-38.62,4.99-13.13,14.75-24.4,28.45-30.14l257.02-107.7c5.64-2.36,12.5-3.06,17.12,1.37,3.19,3.07,8.14,9.59,5.38,16.32l-75.68,184.72-32.17,76.25c-3.9,9.25-10.42,17.71-17.63,23.49Z"/>
+              <path fill="#aace5a" d="M815,619.02l-248.35-102.21c-5.97-2.46-8.28-7.91-9.59-12.12-1.27-4.09-.91-12.94,4.26-15.06l112.66-46.29,144.76-60.54c10.7-4.48,21.53-7.24,32.52-5.94,22.3,2.64,35.38,17.69,39.05,38.96,10.34,59.99,11.4,120.14-1.77,179.62-4.14,18.69-17.63,30.92-36.74,31.69-12.78.52-23.8-2.77-36.8-8.12Z"/>
+              <path fill="#abce5a" d="M712.34,839.55c-16.85,11.61-38.06,9.88-53.02-4.16-6.78-6.36-11.72-13.92-15.39-22.65l-32.7-77.54-72.76-175c-2.45-5.89-4.4-12-.43-17.05,2.71-3.45,9.2-9.63,15.99-6.83l255.45,105c12.09,4.97,22.04,11.25,29.78,20.36,12.21,14.37,12.18,32.45,2.36,47.89-32.75,51.54-79.09,95.38-129.28,129.96Z"/>
+              <path fill="#a9cd58" d="M177.38,623.52c-11.26,4.64-22.83,4.87-33.83,1.75-18.3-5.19-27.26-19.19-30.33-37.18-10.15-59.56-11.34-119.26,1.15-178.15,4.14-19.52,18.33-32.95,38.78-32.86,11.58.05,22.07,2.62,33.34,7.27l250.32,103.31c7.4,3.05,10.51,10.33,10.18,15.98-.51,8.86-6.48,11.53-13.64,14.48l-120.8,49.72-135.18,55.69Z"/>
             </g>
             <g class="pl-arm">
-              <path d="M215.8 189.1 L160.0 148.9 L155.4 154.3 L204.2 202.9 Z" fill="#393839" stroke="#FAFDE8" stroke-width="2"/>
-              <circle cx="210" cy="196" r="14" fill="none" stroke="#FAFDE8" stroke-width="4"/>
-              <circle cx="157.7" cy="151.6" r="7" fill="#393839" stroke="#FAFDE8" stroke-width="2"/>
-              <circle cx="157.7" cy="151.6" r="2.5" fill="#AACD58"/>
+              <path fill="url(#pl-grad-hero)" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" d="M282.55,922.69c53.7-53.7,313.89-400.95,260.18-454.66-53.7-53.7-400.95,206.48-454.66,260.18-53.7,53.7-53.7,140.77,0,194.47,53.7,53.7,140.77,53.7,194.47,0Z"/>
+              <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="20.05" cx="185.6" cy="821.72" r="77.08"/>
+            </g>
+            <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" cx="502.62" cy="505.01" r="7.8"/>
+            <g class="pl-arm">
+              <path fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="15.94" d="M255.39,692.26l156.69-95.68-94.96,156.29s-14.11-26.25-23.85-35.94c-11.43-11.38-37.89-24.67-37.89-24.67Z"/>
             </g>
           </svg>
         </div>
@@ -1039,6 +1101,7 @@
         </div>
 
         <p class="duel-truth small muted">Illustrative model, labeled: the SMB lane is a category sketch — one round trip per <span class="num">100</span> directory entries, no persistent client cache, no library index — not a benchmark of any vendor's NAS or client. Round-trip times and link speeds (<span class="num">0.5&nbsp;ms</span>/<span class="num">125&nbsp;MB/s</span> LAN, <span class="num">20&nbsp;ms</span>/<span class="num">12.5&nbsp;MB/s</span> VPN, <span class="num">60&nbsp;ms</span>/<span class="num">6.25&nbsp;MB/s</span> road) are assumptions you pick, not measurements. The JuiceMount waits are the author's measured figures at their slow ends — directory opens <span class="num">15–120&nbsp;ms</span>, library search <span class="num">~29&nbsp;ms</span>, cached reads <span class="num">226–571&nbsp;MB/s</span> — and its first-touch scrubs pay the same wire as anything else, once. Category behavior as of June&nbsp;2026.</p>
+        <p class="duel-truth small muted">Editing from home or the road for real: remote routing is one Tailscale away — <a href="docs.html#remote">see the setup guide</a>.</p>
         <p class="mock-note small muted">UI mock — the bins, clips, and touch counts are invented; the round-trip accounting is the point.</p>
       </div>
     </section>
@@ -1052,55 +1115,47 @@
           <p class="muted">A cloud mount can never be faster than your internet connection — at the studio or anywhere else, every byte arrives through the line your ISP sells you. A NAS in your building talks over your LAN, and that's where the measured ~7&nbsp;Gbit/s lives. Away from the studio, JuiceMount rides the same internet as everything else — behind a cache that already holds the blocks you've been working with, so most of what you do never touches the wire at all.</p>
         </div>
         <figure class="figure" style="max-width: 880px; margin-inline: auto">
-          <svg class="diagram pathviz" viewBox="0 0 720 264" role="img" aria-label="Two paths from your Mac. A thick pipe labeled your LAN, 10 gigabit Ethernet, where the author measured roughly 7 gigabits per second, runs to your NAS in the same building. A thin pipe labeled the internet, whatever your ISP sells, runs to their cloud. Any cloud-hosted tool is bounded by the thin pipe wherever you sit; the NAS is bounded only by the LAN you own.">
-            <path class="pipe-lan" d="M172 116 C 330 116, 390 64, 548 64"/>
-            <path class="pipe-flow" d="M172 116 C 330 116, 390 64, 548 64"/>
-            <path class="pipe-wan" d="M172 148 C 330 148, 390 200, 548 200"/>
-            <rect class="d-box d-box-green" x="28" y="100" width="144" height="64" rx="8"/>
-            <text class="d-title" x="100" y="128" text-anchor="middle">your Mac</text>
-            <text class="d-label" x="100" y="146" text-anchor="middle">the edit bay</text>
-            <rect class="d-box d-box-green" x="548" y="32" width="144" height="64" rx="8"/>
-            <text class="d-title" x="620" y="60" text-anchor="middle">your NAS</text>
-            <text class="d-label" x="620" y="78" text-anchor="middle">same building</text>
-            <rect class="d-box d-box-blue" x="548" y="168" width="144" height="64" rx="8"/>
-            <text class="d-title" x="620" y="196" text-anchor="middle">their cloud</text>
-            <text class="d-label" x="620" y="214" text-anchor="middle">behind your ISP</text>
-            <text class="d-label" x="360" y="44" text-anchor="middle">your LAN · 10 GbE — ~7 Gbit/s measured here</text>
-            <text class="d-label" x="360" y="246" text-anchor="middle">the internet · whatever your ISP sells</text>
+          <!-- redesigned (round 3): the founder's note was that NAS and
+               cloud sat on the same side, so the ISP never read as the
+               bottleneck. Now the two routes separate at the Mac: the LAN
+               pipe never leaves the dashed building boundary; the WAN
+               route exits it and necks down through the ISP pinch before
+               the long thin dashed run to their cloud. -->
+          <svg class="diagram pathviz" viewBox="0 0 720 330" role="img" aria-label="Two routes out of your Mac. Route one: a short, fat green pipe across the same building to your NAS — the author measured roughly 7 gigabits per second on it. Route two: a pipe that leaves the building and narrows to a pinch labeled your ISP, then continues thin, dashed, and long to their cloud on the far side. Every byte from any cloud tool squeezes through the pinch; the fat pipe never leaves your building.">
+            <rect class="d-group" x="20" y="36" width="400" height="176" rx="10"/>
+            <text class="d-label" x="36" y="58">same building — your gear</text>
+            <path class="pipe-lan" d="M168 148 H276"/>
+            <path class="pipe-flow" d="M168 148 H276"/>
+            <path class="pipe-wan-wide" d="M168 168 C 280 198, 340 262, 426 262"/>
+            <path class="pipe-flow-wan" d="M168 168 C 280 198, 340 262, 426 262"/>
+            <path class="pipe-wan-funnel" d="M426 255 L458 260.25 L458 263.75 L426 269 Z"/>
+            <path class="choke-wall" d="M438 242 L462 258"/>
+            <path class="choke-wall" d="M438 282 L462 266"/>
+            <path class="pipe-wan-thin" d="M462 262 C 506 262, 520 256, 576 256"/>
+            <rect class="d-box d-box-green" x="40" y="116" width="128" height="64" rx="8"/>
+            <text class="d-title" x="104" y="142" text-anchor="middle">your Mac</text>
+            <text class="d-label" x="104" y="160" text-anchor="middle">the edit bay</text>
+            <rect class="d-box d-box-green" x="276" y="116" width="128" height="64" rx="8"/>
+            <text class="d-title" x="340" y="142" text-anchor="middle">your NAS</text>
+            <text class="d-label" x="340" y="160" text-anchor="middle">down the hall</text>
+            <rect class="d-box d-box-blue" x="576" y="224" width="128" height="64" rx="8"/>
+            <text class="d-title" x="640" y="250" text-anchor="middle">their cloud</text>
+            <text class="d-label" x="640" y="268" text-anchor="middle">the far side</text>
+            <text class="d-label" x="222" y="96" text-anchor="middle">your LAN · 10 GbE — ~7 Gbit/s measured here</text>
+            <text class="d-label" x="450" y="300" text-anchor="middle">your ISP</text>
+            <text class="d-label" x="520" y="322" text-anchor="middle">the internet · whatever your ISP sells you</text>
           </svg>
-          <figcaption>The fat pipe is in your building. No cloud tool can hand you more than the thin pipe carries — that ceiling is physics, not engineering — and the thin pipe is the only pipe they have. The ~7&nbsp;Gbit/s figure is the author's measurement on his own 10&nbsp;GbE LAN; your hardware will differ.</figcaption>
+          <figcaption>The two routes never share a pipe. Your NAS sits on the fat one, which never leaves your building; their cloud sits on the far side of the pinch, and the pinch is your ISP — every cloud byte squeezes through whatever they sell you. That ceiling is physics, not engineering. The ~7&nbsp;Gbit/s figure is the author's measurement on his own 10&nbsp;GbE LAN; your hardware will differ.</figcaption>
         </figure>
         <p class="small muted" style="max-width: 46rem">Off site, nobody beats the physics — which is why the cache does the heavy lifting there, and why every vendor in this category now runs one on hardware you supply (below, with sources).</p>
       </div>
     </section>
 
-    <!-- Mount it wherever you want — flexibility, README-backed -->
-    <section class="section" id="wherever" aria-labelledby="wherever-h" style="padding-top: 0">
-      <div class="container">
-        <div class="section-head">
-          <p class="label sec-kicker">flexibility · your call</p>
-          <h2 id="wherever-h">Mount it wherever you want</h2>
-          <p class="muted">The backend is any box that runs Docker — a TrueNAS (the production-tested path), a Synology, a plain Linux machine — or even a cloud bucket, since the store is anything S3-compatible. On your Mac the volume shows up in Finder at <code>/Volumes/&lt;name&gt;</code>, and the name is yours to pick. Every editor mounts the same absolute path, so a teammate's Premiere or Resolve project opens without relinking.</p>
-        </div>
-        <figure class="figure" style="max-width: 880px; margin-inline: auto">
-          <svg class="diagram placeviz" viewBox="0 0 720 212" role="img" aria-label="Three backends — a TrueNAS SCALE, a Synology, any Docker box — all serve the same volume, which appears on every Mac at the same absolute path, slash Volumes slash the name you chose.">
-            <rect class="d-box d-box-slate" x="28" y="16" width="168" height="48" rx="8"/>
-            <text class="d-title" x="112" y="44" text-anchor="middle">TrueNAS SCALE</text>
-            <rect class="d-box d-box-slate" x="28" y="82" width="168" height="48" rx="8"/>
-            <text class="d-title" x="112" y="110" text-anchor="middle">Synology</text>
-            <rect class="d-box d-box-slate" x="28" y="148" width="168" height="48" rx="8"/>
-            <text class="d-title" x="112" y="176" text-anchor="middle">any Docker box</text>
-            <path class="d-arrow" d="M196 40 C 330 40, 350 106, 452 106"/>
-            <path class="d-arrow" d="M196 106 L 452 106"/>
-            <path class="d-arrow" d="M196 172 C 330 172, 350 106, 452 106"/>
-            <rect class="d-box d-box-green" x="458" y="74" width="234" height="64" rx="8"/>
-            <text class="d-title" x="575" y="100" text-anchor="middle">/Volumes/&lt;name&gt;</text>
-            <text class="d-label" x="575" y="120" text-anchor="middle">same path on every Mac</text>
-          </svg>
-          <figcaption>One caveat, stated plainly: the self-hosted MinIO/TrueNAS path is the one this project's QA exercises; cloud buckets ride on JuiceFS's S3 support and haven't been part of JuiceMount's own test matrix.</figcaption>
-        </figure>
-      </div>
-    </section>
+    <!-- ("Mount it wherever you want" lived here through v4 — dropped in
+         round 3: the founder read it as accidentally conveying that the
+         Finder name changes, not hardware-agnosticism, which the home
+         pillars and the docs page already carry. Its .placeviz CSS left
+         with it; nothing else on the site links to #wherever.) -->
 
     <!-- Measured 03 — cache vs. the wire -->
     <section class="section" id="cache" aria-labelledby="cache-h" style="padding-top: 0">
@@ -1154,23 +1209,36 @@
           <p class="muted">Every storage SaaS in this category has shipped the same fix for WAN latency: a cache running on hardware the customer supplies. We agree with all of them — a local cache on hardware you own is the answer. We differ on charging rent on top of it.</p>
         </div>
         <figure class="figure" style="max-width: 880px; margin-inline: auto">
-          <svg class="diagram twin-cache" viewBox="0 0 720 220" role="img" aria-label="The same cache box drawn twice. Left: their on-prem cache — an SSD box you buy, wired to a subscription meter. Right: the JuiceMount cache — the same SSD box, no meter; the software is Apache-2.0.">
-            <rect class="d-box d-box-slate" x="40" y="56" width="190" height="84" rx="10"/>
-            <text class="d-title" x="135" y="92" text-anchor="middle">your SSD cache</text>
-            <text class="d-label" x="135" y="110" text-anchor="middle">hardware you buy</text>
-            <path class="d-arrow" d="M230 98 H 266"/>
-            <circle class="d-box" cx="300" cy="98" r="32" fill="var(--tint-amber)"/>
-            <line class="meter-needle" x1="300" y1="98" x2="300" y2="74" stroke="var(--text)" stroke-width="2.5"/>
-            <circle cx="300" cy="98" r="3" fill="var(--text)"/>
-            <text class="d-label" x="300" y="148" text-anchor="middle">the subscription it rides on</text>
-            <text class="d-label" x="186" y="190" text-anchor="middle">theirs — cache included or quoted; meter always</text>
-            <path class="d-group" d="M368 28 V 196"/>
-            <rect class="d-box d-box-green" x="438" y="56" width="190" height="84" rx="10"/>
-            <text class="d-title" x="533" y="92" text-anchor="middle">your SSD cache</text>
-            <text class="d-label" x="533" y="110" text-anchor="middle">hardware you buy</text>
-            <text class="d-label" x="533" y="190" text-anchor="middle">JuiceMount — same cache, no meter · Apache-2.0</text>
+          <!-- reworked (round 3): one cache, two bills. The SSD box is
+               drawn ONCE — every vendor above agrees you need it and
+               expects you to buy it — with two price tags hanging off it.
+               Decorative (aria-hidden); the figcaption is the text
+               equivalent. Tags drop in once on scroll-into-view via
+               .is-live (JS at the bottom of the page), motion-gated. -->
+          <svg class="diagram price-once" id="price-once" viewBox="0 0 720 242" aria-hidden="true" focusable="false">
+            <rect class="d-box d-box-slate" x="250" y="28" width="220" height="72" rx="10"/>
+            <text class="d-title" x="360" y="58" text-anchor="middle">your SSD cache</text>
+            <text class="d-label" x="360" y="78" text-anchor="middle">the hardware is yours either way</text>
+            <path class="tag-string" d="M322 100 L210 150"/>
+            <path class="tag-string" d="M398 100 L510 150"/>
+            <g class="ptag ptag-theirs">
+              <rect class="d-box" x="110" y="140" width="200" height="88" rx="8" fill="var(--tint-amber)"/>
+              <circle cx="210" cy="152" r="4" fill="var(--bg)" stroke="var(--diagram-stroke)" stroke-width="1.5"/>
+              <text class="d-label" x="210" y="172" text-anchor="middle">theirs</text>
+              <text class="d-title" x="210" y="192" text-anchor="middle">your hardware</text>
+              <text class="d-title" x="210" y="208" text-anchor="middle">+ their subscription</text>
+              <text class="d-label" x="210" y="222" text-anchor="middle">$/TB-month · add-ons quote-only</text>
+            </g>
+            <g class="ptag ptag-jm">
+              <rect class="d-box" x="410" y="140" width="200" height="88" rx="8" fill="var(--tint-green)"/>
+              <circle cx="510" cy="152" r="4" fill="var(--bg)" stroke="var(--diagram-stroke)" stroke-width="1.5"/>
+              <text class="d-label" x="510" y="172" text-anchor="middle">JuiceMount</text>
+              <text class="d-title" x="510" y="192" text-anchor="middle">your hardware</text>
+              <text class="d-title" x="510" y="208" text-anchor="middle">+ $0 software</text>
+              <text class="d-label" x="510" y="222" text-anchor="middle">Apache-2.0 · no meter</text>
+            </g>
           </svg>
-          <figcaption>Same box on both sides — the SSD is yours either way. The difference is the meter attached to it.</figcaption>
+          <figcaption>One cache, two bills: the SSD on your desk is the same box either way. Their tag adds a subscription on top — per-TB monthly plans, add-ons priced by quote. The JuiceMount tag adds $0 — the software is Apache-2.0, and there is no meter to attach.</figcaption>
         </figure>
 
         <div class="vendor-grid">
@@ -1303,32 +1371,38 @@
     <section class="band-ink section" aria-labelledby="close-h">
       <div class="container">
         <div class="close-platter" aria-hidden="true">
-          <!-- the hero's platter homage, echoed at sign-off size — same
-               brand-palette drawing, same classes; the spin/seek animations
-               and their reduced-motion gate come from the hero's CSS -->
-          <svg class="platter" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg" focusable="false">
+          <!-- the hero's real-mark platter, echoed at sign-off size — same
+               dissected logos/color.svg artwork, same classes (so the
+               spin/seek animations and their reduced-motion gate come from
+               the hero's CSS); only the gradient id differs so the two
+               inline instances can't collide -->
+          <svg class="platter" viewBox="0 0 1000 1000" xmlns="http://www.w3.org/2000/svg" focusable="false">
+            <defs>
+              <linearGradient id="pl-grad-close" x1="47.8" y1="711.87" x2="605.26" y2="711.87" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#ccc"/>
+                <stop offset="1" stop-color="gray"/>
+              </linearGradient>
+            </defs>
             <g class="pl-disc">
-              <circle cx="118" cy="118" r="84" fill="#FAFDE8" stroke="#1B102A" stroke-width="5"/>
-              <g fill="#AACD58" stroke="#1B102A" stroke-width="2.5" stroke-linejoin="round">
-                <path d="M142.9 110.4 L184.9 97.5 A70 70 0 0 1 184.9 138.5 L142.9 125.6 A26 26 0 0 0 142.9 110.4 Z"/>
-                <path d="M141.0 130.2 L179.8 150.9 A70 70 0 0 1 150.9 179.8 L130.2 141.0 A26 26 0 0 0 141.0 130.2 Z"/>
-                <path d="M125.6 142.9 L138.5 184.9 A70 70 0 0 1 97.5 184.9 L110.4 142.9 A26 26 0 0 0 125.6 142.9 Z"/>
-                <path d="M105.8 141.0 L85.1 179.8 A70 70 0 0 1 56.2 150.9 L95.0 130.2 A26 26 0 0 0 105.8 141.0 Z"/>
-                <path d="M93.1 125.6 L51.1 138.5 A70 70 0 0 1 51.1 97.5 L93.1 110.4 A26 26 0 0 0 93.1 125.6 Z"/>
-                <path d="M95.0 105.8 L56.2 85.1 A70 70 0 0 1 85.1 56.2 L105.8 95.0 A26 26 0 0 0 95.0 105.8 Z"/>
-                <path d="M110.4 93.1 L97.5 51.1 A70 70 0 0 1 138.5 51.1 L125.6 93.1 A26 26 0 0 0 110.4 93.1 Z"/>
-                <path d="M130.2 95.0 L150.9 56.2 A70 70 0 0 1 179.8 85.1 L141.0 105.8 A26 26 0 0 0 130.2 95.0 Z"/>
-              </g>
-              <circle cx="118" cy="118" r="46" fill="none" stroke="#1B102A" stroke-opacity="0.22" stroke-width="1.5" stroke-dasharray="3 5"/>
-              <circle cx="118" cy="118" r="60" fill="none" stroke="#1B102A" stroke-opacity="0.22" stroke-width="1.5" stroke-dasharray="3 5"/>
-              <circle cx="118" cy="118" r="14" fill="#393839" stroke="#1B102A" stroke-width="3"/>
-              <circle cx="118" cy="118" r="3.5" fill="#FAFDE8"/>
+              <circle fill="#393839" cx="495.56" cy="506.15" r="238.15"/>
+              <path fill="#a9cd58" stroke="#1b102a" stroke-miterlimit="10" stroke-width="22.71" d="M765.88,905.66c-117.74,78.1-262.97,99.6-397.95,60.35-104.84-30.48-196.23-96.14-260.02-184.98C24.1,664.29-1.98,517.61,34.31,378.58c15.9-60.91,43.49-116.72,81.77-167.14,62.95-82.9,150.15-143.26,249.45-172.95C494.61-.11,634.16,18,749.57,87.76c68.45,41.37,126.32,99.27,167.67,167.76,22.28,36.91,38.57,75.62,50.15,117.16,22.11,79.32,23.23,160.68,4.55,240.98-27.93,120.06-102.37,223.22-206.06,292Z"/>
+              <path fill="#fafde8" d="M580.62,935.71c-56.96,10.61-114.6,9.85-169.63-2.2-127.58-27.93-237.01-111.96-298.86-226.6-62.25-115.38-68.7-252.46-17.53-373.16,43.11-101.71,122.84-184.91,223.36-232,101.2-47.4,217.96-53.75,324.4-17.31,129.85,44.44,233.25,148.02,277.42,277.99,36.86,108.49,29.51,226.27-20.23,328.48-22.15,45.52-51.69,85.72-87.33,121.41-63.23,63.32-142.2,106.74-231.59,123.39Z"/>
+              <path fill="#aace59" d="M443.23,465.82l-179.78-74.29-68.51-28.3c-13.18-5.44-25.47-12.27-33.21-24-9.25-14.02-9.77-29.61-.33-43.98,34.64-52.78,79.42-97.68,131.71-132.23,14.72-9.73,33.51-7.94,47.5,2.76,8.57,6.56,14.52,14.72,18.61,24.53l63.55,152.22,43.22,103.07c2.9,6.92,3.07,13.97-3.39,18.43-5.47,3.77-12.03,4.82-19.35,1.8Z"/>
+              <path fill="#aace59" d="M592.51,889.41c-62.07,12.13-123.51,12.39-184.14-.14-17.66-3.65-30.38-18.37-31.16-36.53-.38-8.98.23-18.25,3.99-27.4l106.08-258.61c2.49-6.08,8.7-8.67,12.56-9.55,5.63-1.29,13.16.71,15.86,7.21l87.55,210.55,20.6,51.78c8.91,22.39,2.04,56.16-31.34,62.68Z"/>
+              <path fill="#aacd58" d="M816.7,357.98l-102.26,43.53-154.12,64.35c-5.82,2.43-12.61,3.91-16.81.44-3.42-2.83-10.08-9.97-7.36-16.62l105.95-258.36c3.89-9.48,9.95-17.09,16.31-23.64,13.69-14.11,34.53-16.38,51.13-5.52,34.59,22.62,65.08,48.9,92.07,79.88,13.79,15.83,25.54,32.29,37.71,49.43,7.42,10.46,10.11,22.61,5.97,35.33-4.43,13.62-14.31,25.1-28.59,31.18Z"/>
+              <path fill="#a9cd58" d="M488.9,441.63l-108.94-263.24c-9.14-22.08-1.99-57,28.78-63.3,61.94-12.67,125.18-13.75,186.7.06,20.06,4.5,32.57,22.3,30.82,42.62-.95,11.07-3.44,20.63-7.91,31.43l-103.53,250.13c-2.26,5.46-8.14,6.64-11.46,7.54-3.64.99-12.07.53-14.46-5.25Z"/>
+              <path fill="#a9cd58" d="M341.35,839.92c-14.42,11.53-32.15,11.93-47.4,1.97-51.72-33.78-93.62-77.14-128.52-127.65-8.27-11.97-12.04-24.23-6.57-38.62,4.99-13.13,14.75-24.4,28.45-30.14l257.02-107.7c5.64-2.36,12.5-3.06,17.12,1.37,3.19,3.07,8.14,9.59,5.38,16.32l-75.68,184.72-32.17,76.25c-3.9,9.25-10.42,17.71-17.63,23.49Z"/>
+              <path fill="#aace5a" d="M815,619.02l-248.35-102.21c-5.97-2.46-8.28-7.91-9.59-12.12-1.27-4.09-.91-12.94,4.26-15.06l112.66-46.29,144.76-60.54c10.7-4.48,21.53-7.24,32.52-5.94,22.3,2.64,35.38,17.69,39.05,38.96,10.34,59.99,11.4,120.14-1.77,179.62-4.14,18.69-17.63,30.92-36.74,31.69-12.78.52-23.8-2.77-36.8-8.12Z"/>
+              <path fill="#abce5a" d="M712.34,839.55c-16.85,11.61-38.06,9.88-53.02-4.16-6.78-6.36-11.72-13.92-15.39-22.65l-32.7-77.54-72.76-175c-2.45-5.89-4.4-12-.43-17.05,2.71-3.45,9.2-9.63,15.99-6.83l255.45,105c12.09,4.97,22.04,11.25,29.78,20.36,12.21,14.37,12.18,32.45,2.36,47.89-32.75,51.54-79.09,95.38-129.28,129.96Z"/>
+              <path fill="#a9cd58" d="M177.38,623.52c-11.26,4.64-22.83,4.87-33.83,1.75-18.3-5.19-27.26-19.19-30.33-37.18-10.15-59.56-11.34-119.26,1.15-178.15,4.14-19.52,18.33-32.95,38.78-32.86,11.58.05,22.07,2.62,33.34,7.27l250.32,103.31c7.4,3.05,10.51,10.33,10.18,15.98-.51,8.86-6.48,11.53-13.64,14.48l-120.8,49.72-135.18,55.69Z"/>
             </g>
             <g class="pl-arm">
-              <path d="M215.8 189.1 L160.0 148.9 L155.4 154.3 L204.2 202.9 Z" fill="#393839" stroke="#FAFDE8" stroke-width="2"/>
-              <circle cx="210" cy="196" r="14" fill="none" stroke="#FAFDE8" stroke-width="4"/>
-              <circle cx="157.7" cy="151.6" r="7" fill="#393839" stroke="#FAFDE8" stroke-width="2"/>
-              <circle cx="157.7" cy="151.6" r="2.5" fill="#AACD58"/>
+              <path fill="url(#pl-grad-close)" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" d="M282.55,922.69c53.7-53.7,313.89-400.95,260.18-454.66-53.7-53.7-400.95,206.48-454.66,260.18-53.7,53.7-53.7,140.77,0,194.47,53.7,53.7,140.77,53.7,194.47,0Z"/>
+              <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="20.05" cx="185.6" cy="821.72" r="77.08"/>
+            </g>
+            <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" cx="502.62" cy="505.01" r="7.8"/>
+            <g class="pl-arm">
+              <path fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="15.94" d="M255.39,692.26l156.69-95.68-94.96,156.29s-14.11-26.25-23.85-35.94c-11.43-11.38-37.89-24.67-37.89-24.67Z"/>
             </g>
           </svg>
         </div>
@@ -2145,6 +2219,33 @@
         lit = true;
         lightAll();
       }
+    }());
+
+    /* ==================================================================
+       #theirs price tags — the two bills drop onto the one cache box
+       when the figure scrolls into view. Decorative (the SVG is
+       aria-hidden; the figcaption carries the content). All motion
+       lives in CSS behind prefers-reduced-motion: no-preference — this
+       only adds the .is-live trigger class, so reduced motion and
+       no-IntersectionObserver browsers settle on the static pose.
+       ================================================================== */
+    (function initPriceTags() {
+      var fig = document.getElementById("price-once");
+      if (!fig) return;
+      function live() { fig.classList.add("is-live"); }
+      if (reduced() || !("IntersectionObserver" in window)) {
+        live();                          /* CSS gate keeps this static under reduced motion */
+        return;
+      }
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) {
+          if (en.isIntersecting) {
+            live();
+            io.disconnect();
+          }
+        });
+      }, { threshold: 0.4 });
+      io.observe(fig);
     }());
   }());
   </script>
