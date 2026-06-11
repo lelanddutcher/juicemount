@@ -209,3 +209,121 @@ self-host Inter/JetBrains Mono; (3) the standing pre-publish list (screenshots
 via docs/screenshots/CAPTURE.md, real video assets for the performance scrub,
 public repo + deploy per site/README.md) is unchanged. Loop closed — no further
 wakes scheduled.
+
+# ROUND 2 — founder review of 2026-06-11 (morning)
+
+Standing direction: "checking for quality along the way… feel free to have
+a little creativity and a little wow factor." Everything below is from the
+founder's review. NEW MANDATE: every section on every page carries a
+visual/animated element ("that's gonna be mandatory"). Leave placeholders
+for rich media (founder will supply a video file that syncs with the scrub
+playhead; later, real screenshots). Terminology: prefer NAS over "server"
+everywhere it fits ("a ubiquitous term creative people understand…
+a server is a black box of magic to them").
+
+## Backlog — round 2
+- [x] S0. BUGS (canonical hotfix, committed d414cda): calculator chart
+      invisible after restored-scroll loads (IO initial report beat the
+      async pricing render; visibleNow() check added); race lanes
+      finished inside one frame at uniform ≈114× (now per-lane scale,
+      cold ≈1.5 s sweep / real-time at 1 GbE, two-scale note).
+- [ ] S1. Research pack (WebSearch agent): Strada (S-T-R-A-D-A, Michael
+      Cioni) value prop + pricing + lane fit; Suite Studios current
+      status ("isn't that the same product as Iconik?" — verify
+      relationship/acquisitions; founder calls Suite "sort of
+      irrelevant" now); Iconik Storage Gateway / Suite on-prem cache
+      add-ons (founder: both sell a local cache you install on your own
+      hardware — confirm + price); Shade minimum seats (founder: "I
+      should be able to get shade with a one-seat quota and five
+      terabytes" — verify their storage model beyond active-per-seat +
+      offline pinning docs); Dropbox / Google Drive / Nextcloud pricing
+      + streaming semantics (for table + future calculator tiers); S3
+      egress costs for the exit story (AWS, B2, R2, Wasabi; 20 TB
+      worked example) + any documented SaaS export/egress fees; design
+      reference notes from shade.inc / Suite / Iconik / LucidLink /
+      Strada sites (hero patterns, laptop mockups, NLE logo usage).
+      Output: dated facts pack → docs/web/RESEARCH_ROUND2.md; pricing
+      deltas → site/assets/pricing.json (formulas stay frozen until
+      founder sees the diff).
+- [ ] S2. home-v5: hero gets a macOS-style network-drive icon popping in
+      ("like what would show up… with the name JuiceMount"); lead
+      de-buried ("it's a real mount — your NAS shows up in Finder");
+      consolidate the second line; instant-search demo (real search
+      figures: ~29 ms across ~131 K names, vs SMB search pain) with
+      example results; "menu bar tells the truth" reframed as the START
+      of how-it-works (menu bar app is where you create the mount);
+      block-level vs byte-level primer BEFORE the chunk demo (the
+      upload-once message isn't landing without it); SMB contrast
+      explainer (no real cache → remote = slow, local = round-trip
+      inefficient; JuiceMount fixes both); scrub/playhead widget
+      promoted from performance in compact form + data-video
+      placeholder hooks (founder supplies the clip later; sync video to
+      playhead); "without picking two" → any commercial NAS with
+      Docker: QNAP, Synology, TrueNAS, Unraid…; "How it works" →
+      "The technology stack" (NLE → normal Finder volume via NFS;
+      SQLite metadata cache, SSD block cache, write spool; JuiceFS
+      chunks to S3 objects on your NAS — less wordy, keep GitHub link);
+      what-it's-not gains roadmap teaser (Finder-adjacent full-size
+      app w/ richer metadata views); your-bytes closing goes deeper;
+      NLE names as text (Resolve, Premiere, FCP — "to your Mac it's
+      just a drive"); a laptop/desktop mockup frame (our own drawing,
+      no third-party logo art); NAS wording sweep.
+- [ ] S3. performance-v4: tagline pivots from "7 Gbit/s to hardware you
+      own" to latency-first — "storage that scales but feels local"
+      (echo on homepage); perf numbers into a smaller table (less
+      billboard); race widget re-ideated: not warm-vs-cold, but
+      JuiceMount cache vs typical SMB round-tripping (every open/seek
+      pays the wire; cache keeps your working set local and current);
+      throughput reframed: cloud SaaS is WAN-bottlenecked — on-prem =
+      local speed on site + cached speed off site, best of both
+      (plainer words); add the SaaS on-prem-cache-add-on comparison
+      (Suite/Iconik paid local cache — from S1 research); disk-platter
+      logo animation (platter spins, read head seeks — the mark IS a
+      read head over a citrus platter) as a section visual; "mount it
+      wherever you want" titling idea; NAS wording sweep.
+- [ ] S4. compare-v4: "a three-way trade / why two lanes exist" REDESIGNED
+      as a visual (pay-a-lot SaaS vs struggle-with-SMB, us in the
+      middle — barely any words); table: ADD Dropbox, Google Drive,
+      Nextcloud (familiar anchors), Strada (pending S1), DROP Aspect
+      (unknown) and Suite (founder: irrelevant; pending S1 verdict),
+      KEEP LucidLink, Shade (their offline pinning is documented —
+      fix cell), Iconik; Open-source row: explicit "No" not a dash;
+      "leave with your bytes" → cost-to-migrate framing (time + fees;
+      S3 egress worked example, 20 TB); drop the "pricing in detail
+      checked June 2026" cruft under the table; "what they do better" →
+      "compromises you'll make with JuiceMount" (no managed support,
+      you administer your own NAS — we make it easy, no
+      collaboration/review layer yet — roadmap), consolidated with
+      pick-the-other-thing-if; self-hosted sync table: simplify the
+      ~1 Gbit point (we ride your connection up to 10 GbE; they won't
+      move hundreds of GB in an editor's afternoon), DROP the wordy
+      offline-semantics row; "leave whenever" panel: call out the
+      built-in migration tool (JuiceMount Manager), "cost to enter and
+      cost to exit is free", show generic S3 ingest/egress economics
+      instead of the SaaS toggle; NAS wording sweep.
+- [ ] S5. calculator-v4: seat minimums audit (Shade 1-seat × 5 TB must
+      price if their public tiers allow it — model their storage
+      add-on instead of not_comparable, pending S1); jargon →
+      footnotes (founder: "get a little less jargon out of there or
+      minimize into much smaller footnotes"); keep/extend the
+      vendor-color denotations (Suite blue / JuiceMount green —
+      founder likes); groundwork for Dropbox/Google Drive tiers
+      (pending S1 pricing); exit-cost panel: migration tool callout +
+      S3 egress example. Formula changes go to the founder as a diff
+      before canonical promotion.
+- [ ] S6. docs page v1 (site/docs.html or site/docs/): line-by-line
+      get-started: confirm your NAS can run it (Docker check, vendor
+      notes: TrueNAS SCALE, Synology DSM 7+, QNAP, Unraid, plain
+      Linux); install the stack (compose YAML walkthrough); verify
+      it's reachable on your network; install + open the JuiceMount
+      client; macOS permissions; first mount; pin/offline basics;
+      troubleshooting. References across hardware vendors. Source of
+      truth: README + repo docs only — no invented behavior.
+- [ ] S7. Cohesion: NAS-term sweep on all canonical pages, motion
+      language, value-gate re-run, OG copy, link battery; promote
+      winners; journal verdicts.
+
+## Journal — round 2
+- [2026-06-11 ~09:00] S0 — both founder-reported bugs reproduced, fixed,
+  verified live (chart draws when rendered in-view; race actually races,
+  warm beats cold visibly, sync crawls at its own labeled scale) — d414cda.
