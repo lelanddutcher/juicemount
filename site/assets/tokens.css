@@ -7,10 +7,13 @@
    ========================================================================== */
 
 /* --------------------------------------------------------------------------
-   Fonts. Self-hosted files are OPTIONAL: drop the woff2 binaries into
-   site/assets/fonts/ with these exact names and they get picked up.
-   local() sources mean an installed Inter/JetBrains Mono is used without
-   any file request; absent both, the stack degrades to system fonts.
+   Fonts. local() only — an installed Inter/JetBrains Mono is used with no
+   network request; absent both, the stack degrades to the system fonts in
+   --font-sans/--font-mono. The url() sources below stay commented until the
+   woff2 binaries actually exist (a src that 404s fires a request for every
+   visitor without the local font). To self-host: drop the four files into
+   site/assets/fonts/ with these exact names, then swap each src line for
+   its commented sibling.
      site/assets/fonts/Inter-Regular.woff2
      site/assets/fonts/Inter-SemiBold.woff2
      site/assets/fonts/JetBrainsMono-Regular.woff2
@@ -18,28 +21,32 @@
    -------------------------------------------------------------------------- */
 @font-face {
   font-family: "Inter";
-  src: local("Inter"), url("fonts/Inter-Regular.woff2") format("woff2");
+  src: local("Inter");
+  /* src: local("Inter"), url("fonts/Inter-Regular.woff2") format("woff2"); */
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: "Inter";
-  src: local("Inter SemiBold"), local("Inter"), url("fonts/Inter-SemiBold.woff2") format("woff2");
+  src: local("Inter SemiBold"), local("Inter");
+  /* src: local("Inter SemiBold"), local("Inter"), url("fonts/Inter-SemiBold.woff2") format("woff2"); */
   font-weight: 600;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: "JetBrains Mono";
-  src: local("JetBrains Mono"), url("fonts/JetBrainsMono-Regular.woff2") format("woff2");
+  src: local("JetBrains Mono");
+  /* src: local("JetBrains Mono"), url("fonts/JetBrainsMono-Regular.woff2") format("woff2"); */
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: "JetBrains Mono";
-  src: local("JetBrains Mono SemiBold"), local("JetBrains Mono"), url("fonts/JetBrainsMono-SemiBold.woff2") format("woff2");
+  src: local("JetBrains Mono SemiBold"), local("JetBrains Mono");
+  /* src: local("JetBrains Mono SemiBold"), local("JetBrains Mono"), url("fonts/JetBrainsMono-SemiBold.woff2") format("woff2"); */
   font-weight: 600;
   font-style: normal;
   font-display: swap;

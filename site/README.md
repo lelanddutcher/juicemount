@@ -1,9 +1,18 @@
 # juicemount.com — the static site
 
 This directory is the whole site: plain HTML, CSS, and JS with no build
-step. No bundler, no framework, no external CDNs — fonts fall back to the
-system stack unless woff2 files are dropped into `assets/fonts/`. Any
-static host can serve it as-is.
+step. No bundler, no framework, no external CDNs — type uses locally
+installed Inter/JetBrains Mono when present and otherwise the system
+stack. Any static host can serve it as-is.
+
+To self-host the brand fonts (optional, ~80 KB total): download the
+woff2s from the official releases (Inter: github.com/rsms/inter,
+JetBrains Mono: github.com/JetBrains/JetBrainsMono — both SIL OFL), drop
+them into `assets/fonts/` under the four exact names listed at the top
+of `assets/tokens.css`, and swap each `src:` line in that file for its
+commented sibling. Until the files exist the `url()` sources stay
+commented — a `src` that 404s fires a network request for every visitor
+without the font installed.
 
 The pages: `index.html` (hero + how it works + scrub explainer),
 `calculator.html` (rent vs. own payback), `compare.html` (the honest

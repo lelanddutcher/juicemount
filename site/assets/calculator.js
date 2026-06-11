@@ -595,7 +595,9 @@
       srow("Server hardware — one-time", esc(fmtUSD(capex.hardware)));
       srow("Drives — <span class=\"num\">" + capex.provTb + " TB</span> usable × $" + inp.drivePerTb + "/TB, one-time",
         esc(fmtUSD(capex.drives)),
-        capex.provAuto ? "(today’s " + esc(fmtTB(inp.tb)) + " + a year of growth) × 1.25 headroom — override under advanced" : "provisioned size set by hand");
+        capex.provAuto ? (inp.growth > 0
+          ? "(today’s " + esc(fmtTB(inp.tb)) + " + a year of growth) × 1.25 headroom — override under advanced"
+          : "today’s " + esc(fmtTB(inp.tb)) + " × 1.25 headroom, growth set to 0 — override under advanced") : "provisioned size set by hand");
       if (inp.gbe) srow("10 GbE NIC + switch port — one-time", esc(fmtUSD(capex.gbe)));
       srow("JuiceMount software", esc(fmtUSD(0)), "open source, Apache-2.0 — this row is the point");
       srow("One-time total", esc(fmtUSD(capex.total)), "", "total");
