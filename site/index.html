@@ -39,7 +39,7 @@
         <p class="lead">JuiceMount is a Finder volume backed by your own server. It streams the blocks your NLE touches instead of syncing whole files, caches them on NVMe so the second play is instant, keeps pinned projects working offline, and acks renders at local-SSD speed while uploading in the background. Open source. Your hardware. No storage bill.</p>
         <div class="hero-ctas">
           <a class="btn btn-primary" href="https://github.com/lelanddutcher/juicemount#quick-start">Get started</a>
-          <a class="btn btn-outline" href="calculator.html">See the math</a>
+          <a class="btn btn-outline" href="#scrub">See it stream</a>
         </div>
         <p class="hero-qualifier">Open source · macOS 14+ · runs against your own server (TrueNAS, Synology, any Docker box)</p>
       </div>
@@ -71,6 +71,63 @@
           </div>
         </div>
         <p class="small muted" style="margin-top: var(--space-5)">Performance figures are the author's measurements on his own Apple-Silicon Mac ↔ TrueNAS rig, not independent benchmarks — <a href="https://github.com/lelanddutcher/juicemount/blob/main/docs/PERFORMANCE_METHODOLOGY.md">methodology, workload scripts, and the regression harness are public</a>.</p>
+      </div>
+    </section>
+
+    <!-- Scrub-streaming explainer — the hero claim, made draggable (scrub.js).
+         Ink band on purpose: it restores the hero(ink) → pillars → scrub(ink)
+         → how → closing(ink) alternation, and Stream Blue cells read best on ink. -->
+    <section class="band-ink section" id="scrub" aria-labelledby="scrub-h">
+      <div class="container">
+        <div class="section-head">
+          <h2 id="scrub-h">Drag the playhead. Watch what moves.</h2>
+          <p class="muted">One hypothetical <span class="num">100&nbsp;GB</span> clip, drawn as a strip of blocks. Scrub it the way JuiceMount streams it — then switch models and scrub it the way a whole-file sync tool moves it.</p>
+        </div>
+
+        <div class="scrub-widget" id="scrub-widget">
+          <div class="scrub-controls">
+            <div class="scrub-modes" role="group" aria-label="Transfer model">
+              <button type="button" class="scrub-mode-btn" id="scrub-mode-jm" aria-pressed="true">JuiceMount</button>
+              <button type="button" class="scrub-mode-btn" id="scrub-mode-sync" aria-pressed="false">Whole-file sync tool</button>
+            </div>
+            <div class="scrub-links" role="radiogroup" aria-label="Assumed link speed">
+              <span class="label">link</span>
+              <label class="scrub-link"><input type="radio" name="scrub-link" value="cellular"><span><span class="num">100&nbsp;Mbit</span> cellular</span></label>
+              <label class="scrub-link"><input type="radio" name="scrub-link" value="gbe1" checked><span class="num">1&nbsp;GbE</span></label>
+              <label class="scrub-link"><input type="radio" name="scrub-link" value="gbe10"><span class="num">10&nbsp;GbE</span></label>
+            </div>
+            <button type="button" class="scrub-reset" id="scrub-reset">Start over</button>
+          </div>
+
+          <div class="scrub-strip" id="scrub-strip">
+            <div class="scrub-cells" id="scrub-cells" aria-hidden="true"></div>
+            <div class="scrub-playhead" id="scrub-playhead" role="slider" tabindex="0"
+                 aria-label="Playhead position in the clip"
+                 aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+                 aria-valuetext="0 GB into the clip — nothing streamed yet"
+                 aria-describedby="scrub-help"></div>
+          </div>
+          <p class="scrub-help small muted" id="scrub-help">Drag anywhere on the strip — or Tab to the playhead and use the arrow keys; Home/End jump, PageUp/PageDown step by ten.</p>
+
+          <div class="scrub-readouts">
+            <div class="scrub-readout">
+              <span class="label">data moved</span>
+              <span class="stat num" id="scrub-moved">0 MB</span>
+              <span class="small muted" id="scrub-moved-note">of 100 GB</span>
+            </div>
+            <div class="scrub-readout">
+              <span class="label">wait before this frame plays</span>
+              <span class="stat num" id="scrub-wait">—</span>
+              <span class="small muted" id="scrub-wait-note">illustrative line-rate math</span>
+            </div>
+          </div>
+          <p class="scrub-status small" id="scrub-status">Move the playhead — only the blocks under it stream.</p>
+          <noscript>
+            <p class="small muted">The demo is plain local JavaScript — nothing leaves this page — and it needs JS to run. The claim it dramatizes, worked by hand: scrubbing a dozen spots in a <span class="num">100&nbsp;GB</span> clip streams a dozen <span class="num">~4&nbsp;MB</span> blocks, about <span class="num">48&nbsp;MB</span>; a whole-file sync tool moves all <span class="num">100&nbsp;GB</span> before the far end is seekable — <span class="num">13&nbsp;m&nbsp;20&nbsp;s</span> at 1&nbsp;GbE line rate.</p>
+          </noscript>
+        </div>
+
+        <p class="small muted scrub-truth">Illustrative model of block-level streaming — <span class="num">80</span> cells stand in for a real clip's <span class="num">~25,000</span> blocks of <span class="num">~4&nbsp;MB</span>, and the wait math uses link line rate (first reads are bounded by your link). Real numbers: <span class="num">226–571&nbsp;MB/s</span> cached reads, author-measured — <a href="performance.html">see performance</a> and <a href="https://github.com/lelanddutcher/juicemount/blob/main/docs/PERFORMANCE_METHODOLOGY.md">the methodology</a>.</p>
       </div>
     </section>
 
@@ -139,5 +196,7 @@
       <span>This site is static files — no analytics, no telemetry</span>
     </div>
   </footer>
+
+  <script src="assets/scrub.js" defer></script>
 </body>
 </html>
