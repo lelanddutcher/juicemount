@@ -462,13 +462,13 @@ simulate() formulas — formula changes remain founder-gated.
 # ROUND 3 — founder review of 2026-06-11 (afternoon)
 
 ## Backlog — round 3
-- [ ] T0. GLOBAL: the demo volume is named JuiceMount, not zpool —
+- [x] T0. GLOBAL: the demo volume is named JuiceMount, not zpool —
       "/Volumes/JuiceMount" everywhere on the site ("much cooler").
-- [ ] T1. Comprehension gut-check (founder-mandated): a no-context
+- [x] T1. Comprehension gut-check (founder-mandated): a no-context
       sub-agent with a creative-not-technical persona reads the home
       page cold and reports, section by section, what they think the
       product is/does. Findings inform the T2 flow rework.
-- [ ] T2. home-v6: hero mock dies — no window chrome, no menu-bar strip,
+- [x] T2. home-v6: hero mock dies — no window chrome, no menu-bar strip,
       no caption: just a macOS-style external-drive icon popping on
       with a green glow, labeled JuiceMount, ONE-TIME (no replay
       button). Kill the statline (7 Gbit/100 GB/$0 callouts). H1 stays
@@ -498,7 +498,7 @@ simulate() formulas — formula changes remain founder-gated.
       answer to latency is your hardware" visual reworked by a
       sub-agent for moderately-technical creatives (pain points: long
       waits for massive files; paying cloud rent while owning a NAS).
-- [ ] T4. docs-v2 + remote access: a "Working remotely" section —
+- [x] T4. docs-v2 + remote access: a "Working remotely" section —
       JuiceMount does storage, Tailscale does routing (README-sourced:
       "the author runs Tailscale; any VPN that gives the Mac a route
       to the Redis + MinIO ports works"). Simple, line-by-line. Plus a
@@ -507,3 +507,44 @@ simulate() formulas — formula changes remain founder-gated.
       journal, closing report.
 
 ## Journal — round 3
+- [2026-06-11 ~16:30] T0+T1+T2+T4 — zpool is dead (long live
+  /Volumes/JuiceMount): full sweep on the marketing demos; docs keeps
+  the shipped YAML's literal zpool (it's verbatim-verified) and gains a
+  "want Finder to say something nicer? set JM_VOL_NAME before first
+  format" pointer — changing the SHIPPED default is flagged as a
+  founder/server-side decision. T1 comprehension gut-check (no-context
+  freelance-editor persona): comprehension B-, the demos teach better
+  than the copy; "demo 02 + the scrub do the heavy lifting";
+  persuasion peaks at $0-vs-$750/mo; CONVERSION DIES at
+  docker/YAML/GitHub CTAs; "will it eat my footage" raised by the
+  blocks lecture and never answered; zpool flagged cold (validating
+  T0). Full report drove T2. T2 home-v6 built+promoted: hero mock
+  replaced by the founder's ask — bare macOS-style drive icon, green
+  glow pop, one-time, no replay, no window chrome; statline killed;
+  H1 A/B note recorded (simpler "self-hosted block storage" variant
+  to test); section order mount→search→blocks(+scrub as "the magic,
+  part two")→the ported SMB round-trip duel (founder: "copy that
+  visual over — I quite like that one")→three-ways cards cut to
+  one-liners→pillars reworked (10 GbE tested-up-to; resilience as
+  offline/pinning not milliseconds; economics in plain $0 words)→
+  menu bar demoted to "the cockpit · how you drive it" with a
+  jargon-translating caption (Redis/MinIO/FUSE/NFS = the four links
+  in the chain)→stack→not-yet→closing (persona rewrite: "LucidLink
+  speed, on the NAS you already own — free, forever"). Conversion
+  fix: primary CTAs now "Set it up on your NAS — the guide" → docs;
+  GitHub demoted to secondary. Chunk story reframed (a TEAMMATE
+  scrubs three seconds — reading back your own upload made no sense,
+  founder right); safety answer in persona words ("if JuiceMount
+  vanished tomorrow, a free standard tool still opens everything").
+  Port bugs found+fixed in verification: my substring extraction
+  grabbed a NESTED wireLocRadios as standalone (closure refs →
+  silent load-kill) and missed CACHED_MBPS_LO/HI; both repaired,
+  whole-script no-throw proven by in-page execution probe. T4
+  docs "Working remotely" (agent): step 7 of 8, Tailscale 3-step
+  (README-sourced, third-party-labeled), tunnel visual, rail wired;
+  home duel links to docs#remote. TOOL NOTE for the record: the
+  preview tab reports visibilityState=hidden when the Launch panel
+  isn't showing it — Chrome throttles rAF to ZERO there; this
+  masqueraded as broken widgets twice today. rAF-driven motion is
+  verified by code-equivalence to the visible-tab runs on
+  performance; final visual QA wants a visible tab.
