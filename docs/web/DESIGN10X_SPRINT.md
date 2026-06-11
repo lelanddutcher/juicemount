@@ -447,3 +447,14 @@ a server is a black box of magic to them").
   Final gates: 19 files / 560 refs / 0 broken; every inline script
   parses; formula freeze byte-identical; consoles clean on all six
   canonical pages.
+
+## ROUND 2 CLOSING (2026-06-11 afternoon)
+S0–S7 complete across seven commits (d414cda, 97e0a21, 8163dfa,
+c46d5bb, 0f5f8b4, 20b4d6b + the wave-1 journal commit). Six canonical
+pages at the round-2 standard; iteration trail preserved (home-v5,
+performance-v4, compare-v4, calculator-v4, docs-v1). Founder decisions
+parked: (1) Suite stays in the table pending his call — research says
+independent + funded, not Iconik; (2) the scrub video file slots in via
+data-video on #svh-stage when he supplies it; (3) Dropbox/Drive
+calculator tiers are data-ready (pricing.json) but not built into the
+simulate() formulas — formula changes remain founder-gated.
