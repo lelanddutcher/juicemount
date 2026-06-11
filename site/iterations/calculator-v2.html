@@ -5,24 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Rent vs. own — the JuiceMount payback calculator</title>
   <meta name="description" content="Your team pays for storage SaaS by the seat and the terabyte. Find the month a one-time box pays for itself — with honest output when SaaS is actually cheaper for you.">
-  <link rel="canonical" href="https://juicemount.com/calculator.html">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://juicemount.com/calculator.html">
   <meta property="og:title" content="Rent vs. own — the JuiceMount payback calculator">
   <meta property="og:description" content="Your team pays for storage SaaS by the seat and the terabyte. Find the month a one-time box pays for itself — with honest output when SaaS is actually cheaper for you.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
-  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the mounted-drive workflow editors get from LucidLink-class SaaS — at 10GbE-direct-attached speed, with Dropbox-style offline resilience — on hardware you already own.">
   <meta name="twitter:card" content="summary_large_image">
-  <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
-  <link rel="apple-touch-icon" href="apple-touch-icon.png">
-  <link rel="stylesheet" href="assets/tokens.css">
-  <link rel="stylesheet" href="assets/site.css">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="alternate icon" sizes="32x32" href="../favicon-32.png">
+  <link rel="apple-touch-icon" href="../apple-touch-icon.png">
+  <link rel="stylesheet" href="../assets/tokens.css">
+  <link rel="stylesheet" href="../assets/site.css">
 
   <!-- ======================================================================
-       Canonical calculator page — promoted from
-       site/iterations/calculator-v2.html (design-10x sprint R5; the vN
-       file stays for review, per protocol). The founder's redirect: the receipts get a PRINTED
+       calculator-v2 — design-10x sprint R5 (iteration file; promotion
+       candidate). The founder's redirect: the receipts get a PRINTED
        RECEIPT look ("that could be way cooler") and the payback story gets
        a clarity pass — the MATH IS CORRECT (founder verified) and is not
        touched: assets/calculator.js computes and renders exactly as
@@ -46,8 +42,8 @@
            the crossing marker gains a dashed drop-guide to the month axis
            and a hover title. NO formulas or defaults changed — proven by
            git diff (math functions byte-identical).
-       Page-scoped CSS/JS are inline; shared tokens/site css come from
-       assets/. No frameworks, no CDNs; pricing
+       Page-scoped CSS/JS inline so the iteration stands alone; shared
+       tokens/site css from ../assets. No frameworks, no CDNs; pricing
        fetch falls back to calculator.js's pinned mirror of
        assets/pricing.json on file:// — works double-clicked.
        ====================================================================== -->
@@ -213,6 +209,21 @@
     @media (max-width: 420px) {
       .receipt table { font-size: 0.75rem; padding-inline: 0.85rem; }
     }
+
+    /* ---- iteration badge -------------------------------------------------- */
+    .iter-badge {
+      font-family: var(--font-mono);
+      font-size: var(--fs-label);
+      font-weight: var(--fw-head);
+      letter-spacing: var(--track-label);
+      text-transform: uppercase;
+      color: var(--text);
+      background: var(--tint-amber);
+      border: 1.5px solid var(--tint-amber-border);
+      border-radius: 999px;
+      padding: 0.15rem 0.7rem;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -220,16 +231,16 @@
 
   <nav class="site-nav" aria-label="Main">
     <div class="container">
-      <a class="brand" href="index.html">
-        <img src="assets/logo-color.svg" alt="" width="30" height="30">
+      <a class="brand" href="../index.html">
+        <img src="../assets/logo-color.svg" alt="" width="30" height="30">
         JuiceMount
       </a>
       <ul>
-        <li><a href="index.html">Home</a></li>
-        <li><a href="index.html#how">How it works</a></li>
-        <li><a href="compare.html">Compare</a></li>
-        <li><a href="performance.html">Performance</a></li>
-        <li><a href="calculator.html" aria-current="page">Calculator</a></li>
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../index.html#how">How it works</a></li>
+        <li><a href="../compare.html">Compare</a></li>
+        <li><a href="../performance.html">Performance</a></li>
+        <li><a href="../calculator.html">Calculator</a></li>
         <li><a href="https://github.com/lelanddutcher/juicemount">GitHub ↗</a></li>
       </ul>
     </div>
@@ -243,11 +254,11 @@
           <h1 style="font-size: var(--fs-h2)">Rent vs. own</h1>
           <p class="lead">Storage SaaS bills by the seat and the terabyte, forever. The same mounted-drive workflow runs on a box you buy once. Set your numbers; the simulation finds the month the box pays for itself — and says so plainly when it doesn't.</p>
           <p class="preload-row">Preload a comparison:
-            <a href="calculator.html?vs=suite_managed">Suite managed</a> ·
-            <a href="calculator.html?vs=suite_byo">Suite BYO</a> ·
-            <a href="calculator.html?vs=lucidlink">LucidLink Business</a> ·
-            <a href="calculator.html?vs=shade&amp;tb=2">Shade Growth</a> ·
-            <a href="calculator.html?vs=s3">generic S3 bucket</a>
+            <a href="calculator-v2.html?vs=suite_managed">Suite managed</a> ·
+            <a href="calculator-v2.html?vs=suite_byo">Suite BYO</a> ·
+            <a href="calculator-v2.html?vs=lucidlink">LucidLink Business</a> ·
+            <a href="calculator-v2.html?vs=shade&amp;tb=2">Shade Growth</a> ·
+            <a href="calculator-v2.html?vs=s3">generic S3 bucket</a>
           </p>
         </div>
       </div>
@@ -399,7 +410,7 @@
           <a href="https://shade.inc/pricing">Shade pricing</a> ·
           <a href="https://www.backblaze.com/cloud-storage/pricing">Backblaze B2 pricing</a>
         </p>
-        <p class="small muted">Hardware estimates are editable defaults, not quotes. JuiceMount is free software; you supply and operate the server. What this doesn't price: your time, a failed disk being your failed disk, and the vendors' real strengths — managed convenience, support contracts, AI search. The <a href="compare.html">comparison pages</a> name those plainly.</p>
+        <p class="small muted">Hardware estimates are editable defaults, not quotes. JuiceMount is free software; you supply and operate the server. What this doesn't price: your time, a failed disk being your failed disk, and the vendors' real strengths — managed convenience, support contracts, AI search. The <a href="../compare.html">comparison pages</a> name those plainly.</p>
 
         <noscript>
           <div class="callout callout-warn">
@@ -418,10 +429,11 @@
       <a href="https://github.com/lelanddutcher/juicemount/blob/main/LICENSE">Apache-2.0</a>
       <span>Built on <a href="https://github.com/juicedata/juicefs">JuiceFS</a> — credit where due</span>
       <span>This site is static files — no analytics, no telemetry</span>
+      <span class="iter-badge">iteration v2 · review copy</span>
     </div>
   </footer>
 
-  <script src="assets/calculator.js" defer></script>
+  <script src="../assets/calculator.js" defer></script>
   <script>
   /* ====================================================================
      Page script — presentation only. calculator.js owns every number on

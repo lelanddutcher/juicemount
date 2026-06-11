@@ -301,6 +301,9 @@
     var PRICING = FALLBACK_PRICING;
     var $ = function (id) { return document.getElementById(id); };
     var form = $("calc-form");
+    /* Pages without the calculator form (compare's cost meter loads this
+       file for the math exports below) skip all DOM wiring. */
+    if (!form) return;
 
     /* ---- form <-> inputs ------------------------------------------------ */
     function numVal(id, min, max, fallback) {
@@ -635,6 +638,11 @@
       renderChart(sim);
       renderReceipt(sim, inp, PRICING);
       writeUrl(inp);
+      /* rendering hook for page scripts (the payback explainer line and
+         chart decorations listen for this); no math happens out there. */
+      try {
+        document.dispatchEvent(new CustomEvent("jm:sim", { detail: { sim: sim, inp: inp } }));
+      } catch (e) { /* no CustomEvent constructor: the static copy stands */ }
     }
 
     /* ---- wiring ------------------------------------------------------------ */
@@ -715,6 +723,22 @@
     module.exports = {
       DEFAULTS: DEFAULTS,
       FALLBACK_PRICING: FALLBACK_PRICING,
+      libraryAt: libraryAt,
+      saasRate: saasRate,
+      selfRate: selfRate,
+      capexOf: capexOf,
+      simulate: simulate
+    };
+  }
+
+  /* Same pure functions for other pages (compare's annual-cost meter loads
+     this file and derives every figure from these — one set of formulas,
+     no forks). DOM wiring above no-ops on pages without #calc-form. */
+  if (typeof window !== "undefined") {
+    window.JMCalc = {
+      DEFAULTS: DEFAULTS,
+      FALLBACK_PRICING: FALLBACK_PRICING,
+      VENDOR_LABELS: VENDOR_LABELS,
       libraryAt: libraryAt,
       saasRate: saasRate,
       selfRate: selfRate,

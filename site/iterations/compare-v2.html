@@ -5,26 +5,21 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>How it compares — JuiceMount vs. storage SaaS and self-hosted sync</title>
   <meta name="description" content="Pricing front and center: a year-one cost meter at your team size (vendor prices checked June 2026), the exit story animated, and the honest lane tables — JuiceMount vs. LucidLink, Suite, Shade, Aspect, Iconik, and self-hosted sync.">
-  <link rel="canonical" href="https://juicemount.com/compare.html">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://juicemount.com/compare.html">
   <meta property="og:title" content="How it compares — JuiceMount vs. storage SaaS and self-hosted sync">
   <meta property="og:description" content="Pricing front and center: a year-one cost meter at your team size (vendor prices checked June 2026), the exit story animated, and the honest lane tables — JuiceMount vs. LucidLink, Suite, Shade, Aspect, Iconik, and self-hosted sync.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
-  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the mounted-drive workflow editors get from LucidLink-class SaaS — at 10GbE-direct-attached speed, with Dropbox-style offline resilience — on hardware you already own.">
   <meta name="twitter:card" content="summary_large_image">
-  <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
-  <link rel="apple-touch-icon" href="apple-touch-icon.png">
-  <link rel="stylesheet" href="assets/tokens.css">
-  <link rel="stylesheet" href="assets/site.css">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="alternate icon" sizes="32x32" href="../favicon-32.png">
+  <link rel="apple-touch-icon" href="../apple-touch-icon.png">
+  <link rel="stylesheet" href="../assets/tokens.css">
+  <link rel="stylesheet" href="../assets/site.css">
 
   <!-- ======================================================================
-       Canonical compare page — promoted from
-       site/iterations/compare-v2.html (design-10x sprint R4; the vN file
-       stays for review, per protocol). The founder's redirect for this
-       page: be MORE EXPLICIT with the costs — pricing front and center,
-       deliberate.
+       compare-v2 — design-10x sprint R4 (iteration file; promotion
+       candidate). The founder's redirect for this page: be MORE EXPLICIT
+       with the costs — pricing front and center, deliberate.
          demo 01 — the year-one meter (#meter, .m-*): a team-size stepper
            (1–10 seats) and library presets (5/10/25 TB); per-vendor bars
            grow to year-one totals with mono counters. EVERY figure is
@@ -49,8 +44,8 @@
        honesty) lifted into plate frames, the pricing detail list, both
        "what they do better" concessions, and the pick-the-other-thing
        closing band. Strict ink/light band rhythm; kickers tie the page to
-       the home/performance course. Page-scoped CSS/JS are inline; shared
-       tokens/site css come from assets/.
+       the home/performance course. Page-scoped CSS/JS inline so the
+       iteration stands alone; shared tokens/site css from ../assets.
        No frameworks, no CDNs, no fetches — works double-clicked (file://).
        ====================================================================== -->
   <style>
@@ -448,6 +443,21 @@
     .pick-list { margin: 0; padding-left: 1.15em; }
     .pick-list li { margin-bottom: var(--space-4); }
     .preload-row { font-size: var(--fs-small); color: var(--text-muted); }
+
+    /* ---- iteration badge -------------------------------------------------- */
+    .iter-badge {
+      font-family: var(--font-mono);
+      font-size: var(--fs-label);
+      font-weight: var(--fw-head);
+      letter-spacing: var(--track-label);
+      text-transform: uppercase;
+      color: var(--text);
+      background: var(--tint-amber);
+      border: 1.5px solid var(--tint-amber-border);
+      border-radius: 999px;
+      padding: 0.15rem 0.7rem;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -455,16 +465,16 @@
 
   <nav class="site-nav" aria-label="Main">
     <div class="container">
-      <a class="brand" href="index.html">
-        <img src="assets/logo-color.svg" alt="" width="30" height="30">
+      <a class="brand" href="../index.html">
+        <img src="../assets/logo-color.svg" alt="" width="30" height="30">
         JuiceMount
       </a>
       <ul>
-        <li><a href="index.html">Home</a></li>
-        <li><a href="index.html#how">How it works</a></li>
-        <li><a href="compare.html" aria-current="page">Compare</a></li>
-        <li><a href="performance.html">Performance</a></li>
-        <li><a href="calculator.html">Calculator</a></li>
+        <li><a href="../index.html">Home</a></li>
+        <li><a href="../index.html#how">How it works</a></li>
+        <li><a href="../compare.html">Compare</a></li>
+        <li><a href="../performance.html">Performance</a></li>
+        <li><a href="../calculator.html">Calculator</a></li>
         <li><a href="https://github.com/lelanddutcher/juicemount">GitHub ↗</a></li>
       </ul>
     </div>
@@ -528,7 +538,7 @@
 
               <div class="m-row" id="m-suite_managed" role="group" aria-label="Suite managed: $9,000 in year one at 5 seats and 10 TB — checked June 2026">
                 <span class="m-name">Suite — managed
-                  <a class="m-link" id="mlink-suite_managed" href="calculator.html?vs=suite_managed&amp;s=5&amp;tb=10&amp;g=0">open in calculator →</a>
+                  <a class="m-link" id="mlink-suite_managed" href="../calculator.html?vs=suite_managed&amp;s=5&amp;tb=10&amp;g=0">open in calculator →</a>
                 </span>
                 <span class="m-clock" aria-hidden="true"><span id="mval-suite_managed">$9,000</span><span class="m-unit"> /yr 1</span></span>
                 <span class="m-track" aria-hidden="true"><span class="m-fill" id="mbar-suite_managed" style="width:96.8%"></span></span>
@@ -537,7 +547,7 @@
 
               <div class="m-row" id="m-suite_byo" role="group" aria-label="Suite BYO storage: $5,520 in year one at 5 seats and 10 TB — checked June 2026">
                 <span class="m-name">Suite — BYO storage
-                  <a class="m-link" id="mlink-suite_byo" href="calculator.html?vs=suite_byo&amp;s=5&amp;tb=10&amp;g=0">open in calculator →</a>
+                  <a class="m-link" id="mlink-suite_byo" href="../calculator.html?vs=suite_byo&amp;s=5&amp;tb=10&amp;g=0">open in calculator →</a>
                 </span>
                 <span class="m-clock" aria-hidden="true"><span id="mval-suite_byo">$5,520</span><span class="m-unit"> /yr 1</span></span>
                 <span class="m-track" aria-hidden="true"><span class="m-fill" id="mbar-suite_byo" style="width:59.4%"></span></span>
@@ -546,7 +556,7 @@
 
               <div class="m-row" id="m-lucidlink" role="group" aria-label="LucidLink Business: $9,300 in year one at 5 seats and 10 TB — checked June 2026">
                 <span class="m-name">LucidLink Business
-                  <a class="m-link" id="mlink-lucidlink" href="calculator.html?vs=lucidlink&amp;s=5&amp;tb=10&amp;g=0">open in calculator →</a>
+                  <a class="m-link" id="mlink-lucidlink" href="../calculator.html?vs=lucidlink&amp;s=5&amp;tb=10&amp;g=0">open in calculator →</a>
                 </span>
                 <span class="m-clock" aria-hidden="true"><span id="mval-lucidlink">$9,300</span><span class="m-unit"> /yr 1</span></span>
                 <span class="m-track" aria-hidden="true"><span class="m-fill" id="mbar-lucidlink" style="width:100%"></span></span>
@@ -555,7 +565,7 @@
 
               <div class="m-row" id="m-shade" role="group" aria-label="Shade Growth: past the published Growth-tier active-storage cap at 5 seats and 10 TB — Enterprise quote, checked June 2026">
                 <span class="m-name">Shade Growth
-                  <a class="m-link" id="mlink-shade" href="calculator.html?vs=shade&amp;s=5&amp;tb=10&amp;g=0">open in calculator →</a>
+                  <a class="m-link" id="mlink-shade" href="../calculator.html?vs=shade&amp;s=5&amp;tb=10&amp;g=0">open in calculator →</a>
                 </span>
                 <span class="m-clock" aria-hidden="true"><span id="mval-shade" style="font-size:0.78em">Enterprise quote</span><span class="m-unit" id="munit-shade" hidden> /yr 1</span></span>
                 <span class="m-track is-na" aria-hidden="true" id="mtrack-shade"><span class="m-fill" id="mbar-shade" style="width:0%"></span></span>
@@ -577,7 +587,7 @@
         </figure>
 
         <div class="hero-ctas">
-          <a class="btn btn-primary" id="m-cta" href="calculator.html?s=5&amp;tb=10&amp;g=0">Run your own numbers</a>
+          <a class="btn btn-primary" id="m-cta" href="../calculator.html?s=5&amp;tb=10&amp;g=0">Run your own numbers</a>
         </div>
         <p class="small muted" style="max-width: 46rem">The calculator adds growth, payback month, and your real hardware quote — and says so plainly when SaaS is cheaper for your shape.</p>
       </div>
@@ -695,7 +705,7 @@
           </div>
         </div>
         <p class="lead" style="margin-top: var(--space-6); max-width: 46rem">JuiceMount is the missing combination: partial-file streaming and Dropbox-style cache/offline semantics, at near-line-speed on your own LAN, against storage you own. There is no penalty for choosing the hybrid. That's the whole product.</p>
-        <p class="small muted">Every claim below carries its date or its measurement. Performance figures are the author's own — <a href="performance.html">the numbers and methodology have their own page</a>.</p>
+        <p class="small muted">Every claim below carries its date or its measurement. Performance figures are the author's own — <a href="../performance.html">the numbers and methodology have their own page</a>.</p>
       </div>
     </section>
 
@@ -829,14 +839,14 @@
         </div>
 
         <div class="hero-ctas">
-          <a class="btn btn-primary" href="calculator.html">Run the rent-vs-own math</a>
+          <a class="btn btn-primary" href="../calculator.html">Run the rent-vs-own math</a>
         </div>
         <p class="preload-row">Preload the calculator with a vendor's June-2026 pricing:
-          <a href="calculator.html?vs=suite_managed">Suite managed</a> ·
-          <a href="calculator.html?vs=suite_byo">Suite BYO</a> ·
-          <a href="calculator.html?vs=lucidlink">LucidLink Business</a> ·
-          <a href="calculator.html?vs=shade&amp;tb=2">Shade Growth</a> ·
-          <a href="calculator.html?vs=s3">generic S3 bucket</a>
+          <a href="../calculator.html?vs=suite_managed">Suite managed</a> ·
+          <a href="../calculator.html?vs=suite_byo">Suite BYO</a> ·
+          <a href="../calculator.html?vs=lucidlink">LucidLink Business</a> ·
+          <a href="../calculator.html?vs=shade&amp;tb=2">Shade Growth</a> ·
+          <a href="../calculator.html?vs=s3">generic S3 bucket</a>
         </p>
       </div>
     </section>
@@ -850,7 +860,7 @@
           <p class="muted">Nextcloud, Seafile, Mountain Duck. Right instinct — own your storage. Wrong primitive for video: these tools sync files; editors need to stream blocks.</p>
         </div>
 
-        <p style="max-width: 46rem">Open a <span class="num">100&nbsp;GB</span> clip to check one shot and a sync tool moves <span class="num">100&nbsp;GB</span>; JuiceMount streams only the blocks your NLE touches. The gap shows up on the wire too: in the author's testing these tools plateau around <span class="num">0.8–1&nbsp;Gbit/s</span> even on a <span class="num">10&nbsp;GbE</span> LAN — the same hardware where JuiceMount sustains roughly <span class="num">7&nbsp;Gbit/s</span> in both directions. They're bound by single-stream sync engines, not the network. (Author-measured, <a href="performance.html">methodology on the performance page</a>.)</p>
+        <p style="max-width: 46rem">Open a <span class="num">100&nbsp;GB</span> clip to check one shot and a sync tool moves <span class="num">100&nbsp;GB</span>; JuiceMount streams only the blocks your NLE touches. The gap shows up on the wire too: in the author's testing these tools plateau around <span class="num">0.8–1&nbsp;Gbit/s</span> even on a <span class="num">10&nbsp;GbE</span> LAN — the same hardware where JuiceMount sustains roughly <span class="num">7&nbsp;Gbit/s</span> in both directions. They're bound by single-stream sync engines, not the network. (Author-measured, <a href="../performance.html">methodology on the performance page</a>.)</p>
 
         <figure class="figure plate" style="max-width: none">
           <div class="plate-head">
@@ -948,7 +958,7 @@
         </ul>
         <div class="hero-ctas">
           <a class="btn btn-primary" href="https://github.com/lelanddutcher/juicemount#quick-start">Get started</a>
-          <a class="btn btn-outline" href="calculator.html">Run your numbers</a>
+          <a class="btn btn-outline" href="../calculator.html">Run your numbers</a>
         </div>
       </div>
     </section>
@@ -962,12 +972,13 @@
       <a href="https://github.com/lelanddutcher/juicemount/blob/main/LICENSE">Apache-2.0</a>
       <span>Built on <a href="https://github.com/juicedata/juicefs">JuiceFS</a> — credit where due</span>
       <span>This site is static files — no analytics, no telemetry</span>
+      <span class="iter-badge">iteration v2 · review copy</span>
     </div>
   </footer>
 
   <!-- The calculator's own math, loaded whole — window.JMCalc exports the
        pure functions; the form wiring no-ops here (no #calc-form). -->
-  <script src="assets/calculator.js" defer></script>
+  <script src="../assets/calculator.js" defer></script>
   <script defer>
   (function () {
     "use strict";
@@ -1057,9 +1068,9 @@
 
         /* deep links — the calculator's own URL params (vs/s/tb/g) */
         SAAS.forEach(function (v) {
-          $("mlink-" + v).href = "calculator.html?vs=" + v + "&s=" + s + "&tb=" + tb + "&g=0";
+          $("mlink-" + v).href = "../calculator.html?vs=" + v + "&s=" + s + "&tb=" + tb + "&g=0";
         });
-        $("m-cta").href = "calculator.html?s=" + s + "&tb=" + tb + "&g=0";
+        $("m-cta").href = "../calculator.html?s=" + s + "&tb=" + tb + "&g=0";
 
         /* accessible row labels carry the final figures immediately */
         var at = " at " + s + (s === 1 ? " seat" : " seats") + " and " + fmtTBnum(tb) + " TB";
