@@ -91,9 +91,9 @@ code, kbd {
 /* A band that stays Pulp Ink in both themes (hero, closing). Children read
    the re-scoped tokens, so cards/buttons/diagrams adapt automatically. */
 .band-ink {
-  background: var(--pulp-ink);
+  background: var(--cinema-dark);
   color: var(--rind-cream);
-  --bg: var(--pulp-ink);
+  --bg: var(--cinema-dark);
   --surface: rgba(250, 253, 232, 0.06);
   --surface-2: rgba(250, 253, 232, 0.04);
   --text: var(--rind-cream);
