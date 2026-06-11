@@ -102,7 +102,7 @@ IDENTIFIES WITH in five seconds and finds visually convincing.
 - [x] R0. tokens.css dark-surface retoken (kill the purple read) +
       BRAND.md addendum + verify all four canonical pages still pass
       contrast/structure gates with the new surface.
-- [ ] R1. home-v2: new identity-first hero (open-source alternative to
+- [x] R1. home-v2: new identity-first hero (open-source alternative to
       Suite/Shade/Iconik; for indie filmmakers + small post teams;
       cost story up front) + pseudo-Finder mount animation (HOME a) +
       menu-bar state mock (HOME b). Keep page structure coherent;
@@ -129,3 +129,4 @@ IDENTIFIES WITH in five seconds and finds visually convincing.
 ## Journal
 <!-- [date time] item — what changed — verdict vs value gate — commit -->
 - [2026-06-11 02:05] R0 — cinema-dark #17181B replaces ink on all dark surfaces (tokens, band-ink, og-card re-rendered); BRAND.md addendum (surface override + identity-first messaging + show-dont-tell mandate) — committed
+- [2026-06-11 02:40] R1 — site/iterations/home-v2.html (1210 ln, self-contained): identity hero ("The open-source alternative to Suite, Shade, and LucidLink." / indie-film kicker / $0-seat lead), Finder mount narrative (scroll/replay, You-vs-teammate toggle, path-holds-still lesson), menu-bar state tablist w/ real state marks + auto-cycle + popover mocks, what-its-not block, scrub removed. Agent gates all PASS incl. live browser light/dark/360; orchestrator re-verified structure/paths/voice/cinema-dark. Verdict: KEEP-FOR-REVIEW, PROMOTE-candidate pending R2 comparison (chunk animation still to add).
