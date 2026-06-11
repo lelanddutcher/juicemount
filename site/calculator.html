@@ -519,6 +519,26 @@
       if (drawTimer) { window.clearTimeout(drawTimer); drawTimer = 0; }
     }
 
+    function play() {
+      armed = false;
+      chart.classList.remove("is-pre");
+      chart.classList.add("is-draw");
+      drawTimer = window.setTimeout(finishDraw, 1450);
+      if (io) { io.disconnect(); io = null; }
+    }
+
+    /* mirror of the observer's 0.45 threshold, for the case where the
+       chart renders while ALREADY in view (pricing fetch resolves after
+       the observer's one initial report — e.g. a refresh with restored
+       scroll) and no further intersection change is ever coming */
+    function visibleNow() {
+      var r = wrap.getBoundingClientRect();
+      if (r.height <= 0) return false;
+      var vh = window.innerHeight || document.documentElement.clientHeight;
+      var part = Math.min(r.bottom, vh) - Math.max(r.top, 0);
+      return part / r.height >= 0.45;
+    }
+
     function onRender() {
       decorate();
       if (played) return;
@@ -526,6 +546,7 @@
       prep();
       chart.classList.add("is-pre");
       armed = true;
+      if (visibleNow()) play();
     }
 
     var mo = new MutationObserver(function (muts) {
@@ -541,15 +562,11 @@
     });
     mo.observe(chart, { childList: true });
 
+    var io = null;
     if (!played) {
-      var io = new IntersectionObserver(function (entries) {
+      io = new IntersectionObserver(function (entries) {
         for (var i = 0; i < entries.length; i++) {
-          if (entries[i].isIntersecting && armed) {
-            chart.classList.remove("is-pre");
-            chart.classList.add("is-draw");
-            drawTimer = window.setTimeout(finishDraw, 1450);
-            io.disconnect();
-          }
+          if (entries[i].isIntersecting && armed) { play(); return; }
         }
       }, { threshold: 0.45 });
       io.observe(wrap);

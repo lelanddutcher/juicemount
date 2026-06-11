@@ -1588,6 +1588,18 @@
         };
       }
       function compress() { return totals().sync / RACE_SCREEN_S; }
+      /* one global compression makes the JuiceMount lanes finish inside a
+         single frame (cold is ~1.7 s wire at ≈114× = 15 ms on screen) — the
+         "race" visibly never raced. The two fast lanes get their own scale:
+         cold sweeps over ~1.5 s of screen time, warm keeps its true ratio
+         to cold, and the note tells the truth about both scales. */
+      var FAST_SCREEN_S = 1.5;
+      function fastCompress() { return totals().cold / FAST_SCREEN_S; }
+      function scaleWord(x) {
+        if (x >= 0.85 && x <= 1.15) return "in real time";
+        if (x < 0.85) return "slowed to ≈" + (Math.round(x * 10) / 10) + "× — at full speed they'd be over in a blink";
+        return "at ≈" + Math.round(x).toLocaleString("en-US") + "× (1× = real time)";
+      }
 
       var raf = null;
       var startTs = 0;
@@ -1618,8 +1630,9 @@
         els.subs.cold.textContent = "first touch: 200 MiB over " + linkLabel() + " at line rate";
         els.subs.warm.textContent = "second pass: the measured fully-cached 200 MiB read, 431 MB/s off local SSD";
         els.subs.sync.textContent = "the 100 GB clip must finish syncing before the far end can read any of it";
-        els.note.textContent = "Watching at ≈" + Math.round(compress()).toLocaleString("en-US") +
-          "× — one second on screen ≈ " + fmtTime(compress()) + " of wire time. The clocks count wire time.";
+        els.note.textContent = "The sync lane is fast-forwarded ≈" + Math.round(compress()).toLocaleString("en-US") +
+          "× to fit on screen. The two JuiceMount lanes play " + scaleWord(fastCompress()) +
+          ". All clocks count wire time.";
         return t;
       }
       function verdictText(t) {
@@ -1667,11 +1680,15 @@
         var cmp = compress();
         startTs = 0;
         els.verdict.textContent = "Racing — three clocks, one wire.";
+        var cmpFast = fastCompress();
         function step(ts) {
           raf = null;
           if (!startTs) startTs = ts;
-          var wireS = ((ts - startTs) / 1000) * cmp;
-          for (var i = 0; i < LANES.length; i++) paintLane(LANES[i], wireS, t);
+          var el = (ts - startTs) / 1000;
+          var wireS = el * cmp;
+          paintLane("cold", el * cmpFast, t);
+          paintLane("warm", el * cmpFast, t);
+          paintLane("sync", wireS, t);
           paintSyncSub(wireS, t);
           if (wireS >= t.sync) {
             finish();
