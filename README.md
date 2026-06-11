@@ -178,15 +178,15 @@ Two different categories claim to solve this; JuiceMount sits deliberately betwe
 
 **vs. storage SaaS for editors:**
 
-| | **JuiceMount** | LucidLink | Suite | Shade | Aspect |
-|---|---|---|---|---|---|
-| Your files live | your hardware / your bucket | their cloud (AWS) | their cloud ($75/TB/mo) or BYO ($40/TB/mo) | their cloud | their cloud |
-| Partial-file streaming | ✅ block-level | ✅ | ✅ | ✅ (ShadeFS) | ✅ |
-| Offline pinned files | ✅ | ✅ | not clearly documented | not clearly documented | not clearly documented |
-| Pricing model | **$0 — bring your own hardware** | $7–27+/user/mo + $8/100 GB extra | $75/TB/mo, +$10/user after 5 | $29.75/seat/mo (500 GB active/seat) | free tier + custom enterprise |
-| Exhaustive metadata/AI search | roadmap (filename search today) | — | — | ✅ | ✅ |
-| Open source | ✅ | — | — | — | — |
-| Leave with your bytes intact | your hardware — copy from the mounted volume or `juicefs sync`; the bucket stays under your control | export required | export required | export required | export required |
+| | **JuiceMount** | LucidLink | Suite | Shade |
+|---|---|---|---|---|
+| Your files live | your hardware / your bucket | their cloud (AWS) | their cloud ($75/TB/mo) or BYO ($40/TB/mo) | their cloud |
+| Partial-file streaming | ✅ block-level | ✅ | ✅ | ✅ (ShadeFS) |
+| Offline pinned files | ✅ | ✅ | not clearly documented | ✅ (documented) |
+| Pricing model | **$0 — bring your own hardware** | $7–27+/user/mo + $8/100 GB extra ($27 is promo off $32 list) | $75/TB/mo, +$10/user after 5 | $29.75/seat/mo annual ($35 monthly), 500 GB active/seat |
+| Exhaustive metadata/AI search | roadmap (filename search today) | no | no | ✅ |
+| Open source | ✅ | no | no | no |
+| Leave with your bytes intact | your hardware — copy from the mounted volume or `juicefs sync`; the bucket stays under your control | export required | export required | export required |
 
 These products are good at things JuiceMount doesn't do: managed convenience, review/approval tools, AI semantic search, Windows clients, someone to call. If you want those and the bill works for you, use them.
 
