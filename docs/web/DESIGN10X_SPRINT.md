@@ -681,3 +681,61 @@ variant; shipped JM_VOL_NAME default; scrub video file (data-video
 New for his review pass: the chatter wall's feel (avalanche pacing,
 hold length), bp film-strip loop cadence, hit-meter rhythm — all
 motion was code-verified because no visible tab existed this round.
+
+## ROUND 5 — founder review of 2026-06-11 (post-round-4)
+Two orders: (1) a stronger hero visual — 3+ ideation agents, ~10
+concepts, ALL built into one openable iterations page; (2) the
+performance platter animation promoted to the nav, top-left beside
+the wordmark, persistent and animating sitewide. Founder Q&A locked:
+everything on the table (round-3 bans lifted for exploration); nav
+mark verbatim miniature but with the read-head seek EXAGGERATED
+(spin speed kept); gallery = compact grid.
+
+### Backlog (V)
+- [x] V-nav: animated nav mark on all 5 canonical pages (agent) —
+      30 px inline SVG per page, geometry verbatim from the perf
+      ornament, seek 3x exaggerated (+12/-9/+7.5 deg, period 9 s,
+      spin 26 s), per-page-unique gradient ids, reduced-motion off,
+      byte-identical cross-page (sha256-proven), aria-hidden beside
+      the wordmark. Scroll-0 screenshot confirms composition.
+- [x] V-ideate: 3 agents x 5 pitches (macOS moments / brand mark in
+      motion / editor's world) = 15 concepts.
+- [x] V-curate: 10 built of 15. Dropped: locations-arrival
+      (duplicates demo 01's Finder language), get-info-receipt
+      (niche), relink-never (same pain as media-offline-never at 3x
+      cost), cache-pour (weakest claim).
+- [x] V-build: 3 builder agents -> hero-cards-a.html (desktop-mount,
+      path-holds-still, media-offline-never, instant-bin),
+      hero-cards-b.html (the-squeeze, block-conform, exploded-view),
+      hero-cards-c.html (jog-wheel interactive, one-light-on,
+      pinned-at-takeoff). Strict transplant contract: per-card
+      prefixes on every selector/keyframe/gradient id, one IIFE per
+      card, IO-gated, reduced-motion stills, file://-safe, no
+      external assets.
+- [x] V-assemble: hero-gallery-v1.html — V0 incumbent card (built by
+      orchestrator) + the 10 in curated order, V-number + angle
+      chips via data attributes, shared shell CSS. Orchestrator
+      patch: V0 base state was opacity-0 pre-IO (blank under no-JS
+      and in static frames) -> settled base + explicit from-state
+      keyframes so replay still pops.
+- [x] V-qa: assembled-page gates — 11 scripts node-clean, 42 ids no
+      dups, 51 keyframes no dups (cross-agent collision check),
+      refs resolve, tag balance. Live: zero console errors on load
+      AND after clicking all 7 replays; jog-wheel ArrowRight moved
+      aria-valuenow 9->10 matching the agent's code-trace; every
+      stage 300 px. Load-composite screenshots verified header +
+      V0/V1/V2/V3 row (the-squeeze mark + cache strip render).
+      Battery: 29 files / 780 refs / 0 broken.
+
+### Round 5 notes
+- Hidden-tab compositing rule sharpened again: focus() scrolls the
+  page and kills all further composites — screenshots only ever show
+  the load-time scroll-0 frame; use history.scrollRestoration=manual
+  + reload to re-anchor.
+- Motion FEEL on all 11 cards + the nav seek legibility at 30 px
+  still needs founder eyes in a visible browser (Chrome extension
+  was disconnected again this round).
+- Parked (unchanged): H1 A/B variant; shipped JM_VOL_NAME default;
+  scrub video file; Suite's seat in the table. New: founder picks
+  the winning hero from the gallery (then it gets built at hero
+  scale in context as home-v8).
