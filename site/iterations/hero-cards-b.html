@@ -1,0 +1,1157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hero-cards-b · brand-mark family · JuiceMount iteration</title>
+  <meta name="robots" content="noindex">
+  <link rel="icon" href="../favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../assets/tokens.css">
+  <link rel="stylesheet" href="../assets/site.css">
+
+  <!-- ======================================================================
+       Iteration: hero-cards-b - the brand-mark family (3 hero concepts)
+       Three candidate hero treatments built from the dissected mark on
+       performance.html: every path, fill, and stroke is verbatim from
+       logos/color.svg; the slice spins about the spindle (502.62, 505.01)
+       and the arm seeks about its hub ring (185.6, 821.72). Gradient,
+       clipPath, and keyframe ids are per-card unique (hvsq- / hvbc- /
+       hvex-) so cards can be transplanted into the shared gallery without
+       collisions. Each card carries its own scoped style block and one
+       script IIFE; motion is gated by IntersectionObserver and honors
+       prefers-reduced-motion with a strong static state.
+       ====================================================================== -->
+
+  <!-- shared gallery shell (verbatim; no card-specific styles in here) -->
+  <style>
+.hv-grid { display: grid; gap: var(--space-5); grid-template-columns: 1fr; max-width: 1400px; margin: 0 auto; }
+@media (min-width: 900px) { .hv-grid { grid-template-columns: 1fr 1fr; } }
+@media (min-width: 1360px) { .hv-grid { grid-template-columns: 1fr 1fr 1fr; } }
+.hv-card { border: 1px solid rgba(250,253,232,0.14); border-radius: 12px; padding: var(--space-4); background: rgba(250,253,232,0.03); }
+.hv-name { margin: 0 0 var(--space-1); font-size: var(--fs-h4, 1.1rem); }
+.hv-why { margin: 0 0 var(--space-3); font-size: var(--fs-small); color: var(--text-muted); }
+.hv-stage { position: relative; height: 300px; overflow: hidden; border-radius: 8px; }
+.hv-replay { margin-top: var(--space-3); font: inherit; font-size: var(--fs-small); padding: 4px 12px; border-radius: 999px; border: 1px solid rgba(250,253,232,0.25); background: transparent; color: inherit; cursor: pointer; }
+  </style>
+
+  <!-- preview chrome only - NOT part of any transplant block -->
+  <style>
+    .iter-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-3);
+      align-items: center;
+      justify-content: space-between;
+      padding-block: var(--space-3);
+      border-bottom: 1.5px solid var(--hairline-soft);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- preview chrome (not transplanted) -->
+  <div class="container iter-bar">
+    <span class="label">iteration · hero-cards-b · brand-mark family · 3 hero concepts</span>
+  </div>
+
+  <main class="band-ink section">
+    <div class="container">
+      <div class="hv-grid">
+
+        <!-- ===== BEGIN hero-card: the-squeeze ===== -->
+        <article class="hv-card hvsq-scope" id="hv-the-squeeze" data-angle="brand">
+          <style>
+            /* hvsq- · the squeeze. All selectors scoped under .hvsq-scope. */
+            .hvsq-scope .hvsq-stage { background: rgba(0, 0, 0, 0.18); }
+            .hvsq-scope .hvsq-svg {
+              position: absolute;
+              inset: 0;
+              width: 100%;
+              height: 100%;
+              display: block;
+            }
+            /* mark groups: same transform discipline as performance.html,
+               origins in the inner svg's own 1000-space viewBox */
+            .hvsq-scope .hvsq-disc {
+              transform-box: view-box;
+              transform-origin: 502.62px 505.01px;
+            }
+            .hvsq-scope .hvsq-arm {
+              transform-box: view-box;
+              transform-origin: 185.6px 821.72px;
+              transition: transform 600ms cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            @media (prefers-reduced-motion: no-preference) {
+              .hvsq-scope .hvsq-disc {
+                animation: hvsq-spin 26s linear infinite;
+                animation-play-state: paused;
+              }
+              .hvsq-scope .hvsq-run .hvsq-disc { animation-play-state: running; }
+            }
+            @keyframes hvsq-spin { to { transform: rotate(360deg); } }
+
+            /* the cache strip: empty slot, green-lit frame, evicted frame */
+            .hvsq-scope .hvsq-slot {
+              fill: transparent;
+              stroke: rgba(250, 253, 232, 0.2);
+              stroke-width: 1.25;
+              transition: fill 0.4s ease, stroke 0.4s ease;
+            }
+            .hvsq-scope .hvsq-slot.hvsq-on {
+              fill: #AACD58;
+              stroke: rgba(250, 253, 232, 0);
+            }
+            .hvsq-scope .hvsq-slot.hvsq-old {
+              fill: transparent;
+              stroke: rgba(250, 253, 232, 0.45);
+            }
+            @media (prefers-reduced-motion: no-preference) {
+              .hvsq-scope .hvsq-slot.hvsq-on {
+                animation: hvsq-tick 180ms ease-out;
+                transform-box: fill-box;
+                transform-origin: center;
+              }
+            }
+            @keyframes hvsq-tick {
+              from { transform: scale(1.22); }
+              to { transform: scale(1); }
+            }
+
+            .hvsq-scope .hvsq-wire {
+              fill: none;
+              stroke: #378ADD;
+              stroke-width: 1.5;
+              opacity: 0.55;
+            }
+            .hvsq-scope .hvsq-block { fill: #378ADD; }
+            .hvsq-scope .hvsq-glint { fill: #FAFDE8; opacity: 0; }
+            .hvsq-scope .hvsq-cap {
+              font-family: var(--font-mono);
+              font-size: 14px;
+              fill: var(--text-muted);
+            }
+
+            /* strong static state: arm frozen at contact, blocks mid-flight,
+               strip two-thirds green, caption visible */
+            .hvsq-scope .hvsq-staticbits { display: none; }
+            .hvsq-scope .hvsq-static .hvsq-staticbits { display: block; }
+            .hvsq-scope .hvsq-static .hvsq-live { display: none; }
+            .hvsq-scope .hvsq-static .hvsq-arm {
+              transform: rotate(5.5deg);
+              transition: none;
+            }
+            .hvsq-scope .hvsq-static .hvsq-disc { animation: none; }
+          </style>
+
+          <h3 class="hv-name">The Squeeze</h3>
+          <p class="hv-why">The mark runs its familiar spin and seek at hero scale, and the press has output: each contact squeezes 4 MB blocks out of the fruit and into a rolling local cache strip.</p>
+
+          <div class="hv-stage hvsq-stage" id="hvsq-stage">
+            <svg class="hvsq-svg" viewBox="0 0 560 400" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" focusable="false" aria-hidden="true">
+              <defs>
+                <linearGradient id="hvsq-grad" x1="47.8" y1="711.87" x2="605.26" y2="711.87" gradientUnits="userSpaceOnUse">
+                  <stop offset="0" stop-color="#ccc"/>
+                  <stop offset="1" stop-color="gray"/>
+                </linearGradient>
+              </defs>
+
+              <!-- the mark, verbatim geometry in its own 1000-space viewport -->
+              <svg x="96" y="6" width="330" height="330" viewBox="0 0 1000 1000" overflow="visible">
+                <g class="hvsq-disc">
+                  <circle fill="#393839" cx="495.56" cy="506.15" r="238.15"/>
+                  <path fill="#a9cd58" stroke="#1b102a" stroke-miterlimit="10" stroke-width="22.71" d="M765.88,905.66c-117.74,78.1-262.97,99.6-397.95,60.35-104.84-30.48-196.23-96.14-260.02-184.98C24.1,664.29-1.98,517.61,34.31,378.58c15.9-60.91,43.49-116.72,81.77-167.14,62.95-82.9,150.15-143.26,249.45-172.95C494.61-.11,634.16,18,749.57,87.76c68.45,41.37,126.32,99.27,167.67,167.76,22.28,36.91,38.57,75.62,50.15,117.16,22.11,79.32,23.23,160.68,4.55,240.98-27.93,120.06-102.37,223.22-206.06,292Z"/>
+                  <path fill="#fafde8" d="M580.62,935.71c-56.96,10.61-114.6,9.85-169.63-2.2-127.58-27.93-237.01-111.96-298.86-226.6-62.25-115.38-68.7-252.46-17.53-373.16,43.11-101.71,122.84-184.91,223.36-232,101.2-47.4,217.96-53.75,324.4-17.31,129.85,44.44,233.25,148.02,277.42,277.99,36.86,108.49,29.51,226.27-20.23,328.48-22.15,45.52-51.69,85.72-87.33,121.41-63.23,63.32-142.2,106.74-231.59,123.39Z"/>
+                  <path fill="#aace59" d="M443.23,465.82l-179.78-74.29-68.51-28.3c-13.18-5.44-25.47-12.27-33.21-24-9.25-14.02-9.77-29.61-.33-43.98,34.64-52.78,79.42-97.68,131.71-132.23,14.72-9.73,33.51-7.94,47.5,2.76,8.57,6.56,14.52,14.72,18.61,24.53l63.55,152.22,43.22,103.07c2.9,6.92,3.07,13.97-3.39,18.43-5.47,3.77-12.03,4.82-19.35,1.8Z"/>
+                  <path fill="#aace59" d="M592.51,889.41c-62.07,12.13-123.51,12.39-184.14-.14-17.66-3.65-30.38-18.37-31.16-36.53-.38-8.98.23-18.25,3.99-27.4l106.08-258.61c2.49-6.08,8.7-8.67,12.56-9.55,5.63-1.29,13.16.71,15.86,7.21l87.55,210.55,20.6,51.78c8.91,22.39,2.04,56.16-31.34,62.68Z"/>
+                  <path fill="#aacd58" d="M816.7,357.98l-102.26,43.53-154.12,64.35c-5.82,2.43-12.61,3.91-16.81.44-3.42-2.83-10.08-9.97-7.36-16.62l105.95-258.36c3.89-9.48,9.95-17.09,16.31-23.64,13.69-14.11,34.53-16.38,51.13-5.52,34.59,22.62,65.08,48.9,92.07,79.88,13.79,15.83,25.54,32.29,37.71,49.43,7.42,10.46,10.11,22.61,5.97,35.33-4.43,13.62-14.31,25.1-28.59,31.18Z"/>
+                  <path fill="#a9cd58" d="M488.9,441.63l-108.94-263.24c-9.14-22.08-1.99-57,28.78-63.3,61.94-12.67,125.18-13.75,186.7.06,20.06,4.5,32.57,22.3,30.82,42.62-.95,11.07-3.44,20.63-7.91,31.43l-103.53,250.13c-2.26,5.46-8.14,6.64-11.46,7.54-3.64.99-12.07.53-14.46-5.25Z"/>
+                  <path fill="#a9cd58" d="M341.35,839.92c-14.42,11.53-32.15,11.93-47.4,1.97-51.72-33.78-93.62-77.14-128.52-127.65-8.27-11.97-12.04-24.23-6.57-38.62,4.99-13.13,14.75-24.4,28.45-30.14l257.02-107.7c5.64-2.36,12.5-3.06,17.12,1.37,3.19,3.07,8.14,9.59,5.38,16.32l-75.68,184.72-32.17,76.25c-3.9,9.25-10.42,17.71-17.63,23.49Z"/>
+                  <path fill="#aace5a" d="M815,619.02l-248.35-102.21c-5.97-2.46-8.28-7.91-9.59-12.12-1.27-4.09-.91-12.94,4.26-15.06l112.66-46.29,144.76-60.54c10.7-4.48,21.53-7.24,32.52-5.94,22.3,2.64,35.38,17.69,39.05,38.96,10.34,59.99,11.4,120.14-1.77,179.62-4.14,18.69-17.63,30.92-36.74,31.69-12.78.52-23.8-2.77-36.8-8.12Z"/>
+                  <path fill="#abce5a" d="M712.34,839.55c-16.85,11.61-38.06,9.88-53.02-4.16-6.78-6.36-11.72-13.92-15.39-22.65l-32.7-77.54-72.76-175c-2.45-5.89-4.4-12-.43-17.05,2.71-3.45,9.2-9.63,15.99-6.83l255.45,105c12.09,4.97,22.04,11.25,29.78,20.36,12.21,14.37,12.18,32.45,2.36,47.89-32.75,51.54-79.09,95.38-129.28,129.96Z"/>
+                  <path fill="#a9cd58" d="M177.38,623.52c-11.26,4.64-22.83,4.87-33.83,1.75-18.3-5.19-27.26-19.19-30.33-37.18-10.15-59.56-11.34-119.26,1.15-178.15,4.14-19.52,18.33-32.95,38.78-32.86,11.58.05,22.07,2.62,33.34,7.27l250.32,103.31c7.4,3.05,10.51,10.33,10.18,15.98-.51,8.86-6.48,11.53-13.64,14.48l-120.8,49.72-135.18,55.69Z"/>
+                </g>
+                <g class="hvsq-arm">
+                  <path fill="url(#hvsq-grad)" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" d="M282.55,922.69c53.7-53.7,313.89-400.95,260.18-454.66-53.7-53.7-400.95,206.48-454.66,260.18-53.7,53.7-53.7,140.77,0,194.47,53.7,53.7,140.77,53.7,194.47,0Z"/>
+                  <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="20.05" cx="185.6" cy="821.72" r="77.08"/>
+                  <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" cx="502.62" cy="505.01" r="7.8"/>
+                </g>
+                <g class="hvsq-arm">
+                  <path fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="15.94" d="M255.39,692.26l156.69-95.68-94.96,156.29s-14.11-26.25-23.85-35.94c-11.43-11.38-37.89-24.67-37.89-24.67Z"/>
+                </g>
+              </svg>
+
+              <!-- the wire: contact point down to the cache strip -->
+              <path id="hvsq-wire" class="hvsq-wire" d="M264,176 C360,232 432,286 452,346"/>
+
+              <!-- film-strip cache bar (slots are built by the script) -->
+              <g id="hvsq-strip">
+                <line x1="36" y1="350" x2="520" y2="350" stroke="rgba(250,253,232,0.18)" stroke-width="1"/>
+                <line x1="36" y1="384" x2="520" y2="384" stroke="rgba(250,253,232,0.18)" stroke-width="1"/>
+              </g>
+
+              <!-- live layer: glint + blocks in flight -->
+              <g class="hvsq-live">
+                <circle id="hvsq-glint" class="hvsq-glint" cx="262" cy="173" r="3"/>
+                <g id="hvsq-blocks"></g>
+              </g>
+
+              <!-- reduced-motion static bits: three blocks mid-flight + caption -->
+              <g class="hvsq-staticbits">
+                <rect class="hvsq-block" x="338.5" y="221.5" width="9" height="9" rx="1.5"/>
+                <rect class="hvsq-block" x="391.5" y="263.5" width="9" height="9" rx="1.5"/>
+                <rect class="hvsq-block" x="427.5" y="302.5" width="9" height="9" rx="1.5"/>
+                <text class="hvsq-cap" x="40" y="341">4 MB blocks &#8594; local SSD</text>
+              </g>
+            </svg>
+          </div>
+
+          <script>
+            (function () {
+              "use strict";
+              var card = document.getElementById("hv-the-squeeze");
+              if (!card) { return; }
+              var stage = card.querySelector(".hvsq-stage");
+              var arms = card.querySelectorAll(".hvsq-arm");
+              var wire = card.querySelector("#hvsq-wire");
+              var glint = card.querySelector("#hvsq-glint");
+              var blocksG = card.querySelector("#hvsq-blocks");
+              var stripG = card.querySelector("#hvsq-strip");
+              var SVGNS = "http://www.w3.org/2000/svg";
+
+              /* outer-space anchors: spindle and hub of the 330px mark at (96,6) */
+              var HUB = { x: 157.25, y: 277.17 };
+              var SPIN = { x: 261.92, y: 172.66 };
+              var SLOTS = 12, WINDOW = 9;
+              var seekAngles = [5.5, -4.5, 3.5];
+
+              var mq = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+              function reduced() { return !!(mq && mq.matches); }
+
+              /* build the 12 cache slots */
+              var slots = [];
+              (function () {
+                var i, r;
+                for (i = 0; i < SLOTS; i++) {
+                  r = document.createElementNS(SVGNS, "rect");
+                  r.setAttribute("class", "hvsq-slot");
+                  r.setAttribute("x", 40 + i * 40);
+                  r.setAttribute("y", 354);
+                  r.setAttribute("width", 34);
+                  r.setAttribute("height", 26);
+                  r.setAttribute("rx", 3);
+                  stripG.appendChild(r);
+                  slots.push(r);
+                }
+              }());
+
+              var wireLen = 0;
+              try { wireLen = wire.getTotalLength(); } catch (e) { wireLen = 0; }
+
+              var visible = false, running = false, raf = 0;
+              var timers = [];
+              var flights = [];
+              var glintT = -1;
+              var seekIx = 0, aimSlot = 0;
+              var filled = [];
+
+              function later(fn, ms) { timers.push(window.setTimeout(fn, ms)); }
+              function clearTimers() {
+                var i;
+                for (i = 0; i < timers.length; i++) { window.clearTimeout(timers[i]); }
+                timers = [];
+              }
+
+              function setArm(deg) {
+                var i;
+                for (i = 0; i < arms.length; i++) {
+                  arms[i].style.transform = deg === null ? "" : "rotate(" + deg + "deg)";
+                }
+              }
+
+              function contactPoint(deg) {
+                var rad = deg * Math.PI / 180;
+                var dx = SPIN.x - HUB.x, dy = SPIN.y - HUB.y;
+                return {
+                  x: HUB.x + dx * Math.cos(rad) - dy * Math.sin(rad),
+                  y: HUB.y + dx * Math.sin(rad) + dy * Math.cos(rad)
+                };
+              }
+
+              function resetStrip() {
+                var i;
+                for (i = 0; i < SLOTS; i++) {
+                  slots[i].setAttribute("class", "hvsq-slot");
+                }
+                filled = [];
+                aimSlot = 0;
+              }
+
+              function land(ix) {
+                if (filled.length >= WINDOW) {
+                  var old = filled.shift();
+                  slots[old].setAttribute("class", "hvsq-slot hvsq-old");
+                }
+                /* retrigger the tick by swapping class off and on */
+                slots[ix].setAttribute("class", "hvsq-slot");
+                void slots[ix].getBBox();
+                slots[ix].setAttribute("class", "hvsq-slot hvsq-on");
+                filled.push(ix);
+              }
+
+              function spawnBlock(from, rideDur) {
+                var el = document.createElementNS(SVGNS, "rect");
+                el.setAttribute("class", "hvsq-block");
+                el.setAttribute("width", 9);
+                el.setAttribute("height", 9);
+                el.setAttribute("rx", 1.5);
+                blocksG.appendChild(el);
+                var slotIx = aimSlot; /* claim the target slot at spawn time */
+                aimSlot = (aimSlot + 1) % SLOTS;
+                flights.push({
+                  el: el, t0: performance.now(), from: from,
+                  ride: rideDur, slotPeek: slotIx
+                });
+              }
+
+              function placeBlock(el, x, y) {
+                el.setAttribute("x", x - 4.5);
+                el.setAttribute("y", y - 4.5);
+              }
+
+              function step(now) {
+                raf = running ? window.requestAnimationFrame(step) : 0;
+                /* glint pulse: 300ms */
+                if (glintT >= 0) {
+                  var gt = (now - glintT) / 300;
+                  if (gt >= 1) {
+                    glint.style.opacity = "0";
+                    glintT = -1;
+                  } else {
+                    glint.style.opacity = String(0.9 * (1 - gt));
+                    glint.setAttribute("r", String(3 + 14 * gt));
+                  }
+                }
+                /* block flights: 90ms lerp to wire, eased ride, 140ms hop, land */
+                var i, f, t, p, k, e2;
+                for (i = flights.length - 1; i >= 0; i--) {
+                  f = flights[i];
+                  t = now - f.t0;
+                  if (t < 90) {
+                    p = wireLen ? wire.getPointAtLength(0) : { x: 264, y: 176 };
+                    k = t / 90;
+                    placeBlock(f.el, f.from.x + (p.x - f.from.x) * k, f.from.y + (p.y - f.from.y) * k);
+                  } else if (t < 90 + f.ride) {
+                    k = (t - 90) / f.ride;
+                    k = Math.pow(k, 1.6);
+                    p = wireLen ? wire.getPointAtLength(k * wireLen) : { x: 264 + 188 * k, y: 176 + 170 * k };
+                    placeBlock(f.el, p.x, p.y);
+                  } else if (t < 90 + f.ride + 140) {
+                    k = (t - 90 - f.ride) / 140;
+                    k = 1 - (1 - k) * (1 - k);
+                    p = wireLen ? wire.getPointAtLength(wireLen) : { x: 452, y: 346 };
+                    e2 = { x: 40 + f.slotPeek * 40 + 17, y: 367 };
+                    placeBlock(f.el, p.x + (e2.x - p.x) * k, p.y + (e2.y - p.y) * k);
+                  } else {
+                    if (f.el.parentNode) { f.el.parentNode.removeChild(f.el); }
+                    flights.splice(i, 1);
+                    land(f.slotPeek);
+                  }
+                }
+              }
+
+              function press() {
+                if (!running) { return; }
+                var angle = seekAngles[seekIx % seekAngles.length];
+                seekIx++;
+                setArm(angle);
+                later(function () {
+                  if (!running) { return; }
+                  var cp = contactPoint(angle);
+                  glint.setAttribute("cx", cp.x);
+                  glint.setAttribute("cy", cp.y);
+                  glintT = performance.now();
+                  var n = 5 + Math.floor(Math.random() * 3); /* 5..7 */
+                  var i;
+                  for (i = 0; i < n; i++) {
+                    (function (ix) {
+                      later(function () {
+                        if (!running) { return; }
+                        spawnBlock(cp, Math.max(400, 1060 - 110 * ix));
+                      }, ix * 190);
+                    }(i));
+                  }
+                  later(function () { if (running) { setArm(0); } }, 1500);
+                }, 600);
+                later(press, 5000);
+              }
+
+              function clearFlights() {
+                var i;
+                for (i = 0; i < flights.length; i++) {
+                  if (flights[i].el.parentNode) { flights[i].el.parentNode.removeChild(flights[i].el); }
+                }
+                flights = [];
+                glint.style.opacity = "0";
+                glintT = -1;
+              }
+
+              function start() {
+                if (running || reduced() || !visible) { return; }
+                running = true;
+                stage.classList.add("hvsq-run");
+                later(press, 900);
+                raf = window.requestAnimationFrame(step);
+              }
+
+              function stop() {
+                running = false;
+                stage.classList.remove("hvsq-run");
+                clearTimers();
+                if (raf) { window.cancelAnimationFrame(raf); raf = 0; }
+                clearFlights();
+                setArm(0);
+              }
+
+              function applyMotionPref() {
+                if (reduced()) {
+                  stop();
+                  setArm(null); /* clear inline so the static CSS rule wins */
+                  stage.classList.add("hvsq-static");
+                  resetStrip();
+                  var i;
+                  for (i = 0; i < 8; i++) { slots[i].setAttribute("class", "hvsq-slot hvsq-on"); }
+                } else {
+                  stage.classList.remove("hvsq-static");
+                  resetStrip();
+                  if (visible) { start(); }
+                }
+              }
+
+              if ("IntersectionObserver" in window) {
+                var io = new IntersectionObserver(function (entries) {
+                  var i;
+                  for (i = 0; i < entries.length; i++) { visible = entries[i].isIntersecting; }
+                  if (visible) { start(); } else { stop(); }
+                }, { threshold: 0.2 });
+                io.observe(stage);
+              } else {
+                visible = true;
+              }
+
+              if (mq) {
+                if (mq.addEventListener) { mq.addEventListener("change", applyMotionPref); }
+                else if (mq.addListener) { mq.addListener(applyMotionPref); }
+              }
+              applyMotionPref();
+            }());
+          </script>
+        </article>
+        <!-- ===== END hero-card: the-squeeze ===== -->
+
+        <!-- ===== BEGIN hero-card: block-conform ===== -->
+        <article class="hv-card hvbc-scope" id="hv-block-conform" data-angle="brand">
+          <style>
+            /* hvbc- · block conform. All selectors scoped under .hvbc-scope. */
+            .hvbc-scope .hvbc-stage { background: rgba(0, 0, 0, 0.18); }
+            .hvbc-scope .hvbc-svg {
+              position: absolute;
+              inset: 0;
+              width: 100%;
+              height: 100%;
+              display: block;
+            }
+            .hvbc-scope .hvbc-ghosttile {
+              fill: none;
+              stroke: rgba(250, 253, 232, 0.14);
+              stroke-width: 3.5;
+            }
+            .hvbc-scope .hvbc-ghost {
+              opacity: 0;
+              transition: opacity 0.5s ease;
+            }
+            .hvbc-scope .hvbc-gridon .hvbc-ghost { opacity: 1; }
+            .hvbc-scope .hvbc-tile {
+              fill: #AACD58;
+              opacity: 0;
+              transition: opacity 0.18s ease-out;
+            }
+            .hvbc-scope .hvbc-tile.hvbc-on { opacity: 0.92; }
+            @media (prefers-reduced-motion: no-preference) {
+              .hvbc-scope .hvbc-tile.hvbc-pulse { animation: hvbc-pulse 600ms ease-out; }
+            }
+            @keyframes hvbc-pulse {
+              0% { opacity: 0.92; }
+              30% { opacity: 1; }
+              100% { opacity: 0.92; }
+            }
+            .hvbc-scope .hvbc-mark {
+              opacity: 0;
+              transition: opacity 0.8s ease;
+            }
+            .hvbc-scope .hvbc-conform .hvbc-mark { opacity: 1; }
+            .hvbc-scope .hvbc-fillg { transition: opacity 0.8s ease; }
+            .hvbc-scope .hvbc-conform .hvbc-fillg { opacity: 0.55; }
+            .hvbc-scope .hvbc-led { fill: #AACD58; opacity: 0.2; }
+            @media (prefers-reduced-motion: no-preference) {
+              .hvbc-scope .hvbc-idle .hvbc-led { animation: hvbc-blink 3.4s linear infinite; }
+            }
+            @keyframes hvbc-blink {
+              0%, 8%, 16%, 100% { opacity: 0.2; }
+              4%, 12% { opacity: 1; }
+            }
+            .hvbc-scope .hvbc-ping {
+              fill: none;
+              stroke: #AACD58;
+              stroke-width: 8;
+              opacity: 0;
+              transform-box: fill-box;
+              transform-origin: center;
+            }
+            @media (prefers-reduced-motion: no-preference) {
+              .hvbc-scope .hvbc-pinged .hvbc-ping { animation: hvbc-ping 700ms ease-out; }
+            }
+            @keyframes hvbc-ping {
+              0% { opacity: 0.9; transform: scale(0.3); }
+              100% { opacity: 0; transform: scale(4); }
+            }
+            .hvbc-scope .hvbc-wire {
+              stroke: #378ADD;
+              stroke-width: 1.5;
+              opacity: 0.55;
+            }
+            .hvbc-scope .hvbc-wblock { fill: #378ADD; }
+
+            /* strong static state: the finished composite */
+            .hvbc-scope .hvbc-staticbits { display: none; }
+            .hvbc-scope .hvbc-static .hvbc-staticbits { display: block; }
+            .hvbc-scope .hvbc-static .hvbc-ghost { opacity: 1; transition: none; }
+            .hvbc-scope .hvbc-static .hvbc-mark { opacity: 1; transition: none; }
+            .hvbc-scope .hvbc-static .hvbc-fillg { opacity: 0.55; transition: none; }
+            .hvbc-scope .hvbc-static .hvbc-tile { transition: none; }
+            .hvbc-scope .hvbc-static .hvbc-led { opacity: 0.9; }
+          </style>
+
+          <h3 class="hv-name">Block Conform</h3>
+          <p class="hv-why">The mark opens as an offline proxy, a ghost grid of tiles, then conforms to full res as 4 MB blocks stream in and light only the tiles the mark owns.</p>
+
+          <div class="hv-stage hvbc-stage" id="hvbc-stage">
+            <svg class="hvbc-svg" viewBox="0 0 560 400" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" focusable="false" aria-hidden="true">
+              <defs>
+                <linearGradient id="hvbc-grad" x1="47.8" y1="711.87" x2="605.26" y2="711.87" gradientUnits="userSpaceOnUse">
+                  <stop offset="0" stop-color="#ccc"/>
+                  <stop offset="1" stop-color="gray"/>
+                </linearGradient>
+                <clipPath id="hvbc-clip">
+                  <path d="M765.88,905.66c-117.74,78.1-262.97,99.6-397.95,60.35-104.84-30.48-196.23-96.14-260.02-184.98C24.1,664.29-1.98,517.61,34.31,378.58c15.9-60.91,43.49-116.72,81.77-167.14,62.95-82.9,150.15-143.26,249.45-172.95C494.61-.11,634.16,18,749.57,87.76c68.45,41.37,126.32,99.27,167.67,167.76,22.28,36.91,38.57,75.62,50.15,117.16,22.11,79.32,23.23,160.68,4.55,240.98-27.93,120.06-102.37,223.22-206.06,292Z"/>
+                  <path d="M282.55,922.69c53.7-53.7,313.89-400.95,260.18-454.66-53.7-53.7-400.95,206.48-454.66,260.18-53.7,53.7-53.7,140.77,0,194.47,53.7,53.7,140.77,53.7,194.47,0Z"/>
+                  <circle cx="185.6" cy="821.72" r="88"/>
+                </clipPath>
+              </defs>
+
+              <!-- proxy mosaic + vector mark in the logo's own 1000-space -->
+              <svg x="120" y="40" width="320" height="320" viewBox="0 0 1000 1000" overflow="visible">
+                <g class="hvbc-ghost" id="hvbc-ghostg"></g>
+                <g class="hvbc-fillg" id="hvbc-fillg" clip-path="url(#hvbc-clip)"></g>
+                <g class="hvbc-mark" id="hvbc-mark">
+                  <g>
+                    <circle fill="#393839" cx="495.56" cy="506.15" r="238.15"/>
+                    <path fill="#a9cd58" stroke="#1b102a" stroke-miterlimit="10" stroke-width="22.71" d="M765.88,905.66c-117.74,78.1-262.97,99.6-397.95,60.35-104.84-30.48-196.23-96.14-260.02-184.98C24.1,664.29-1.98,517.61,34.31,378.58c15.9-60.91,43.49-116.72,81.77-167.14,62.95-82.9,150.15-143.26,249.45-172.95C494.61-.11,634.16,18,749.57,87.76c68.45,41.37,126.32,99.27,167.67,167.76,22.28,36.91,38.57,75.62,50.15,117.16,22.11,79.32,23.23,160.68,4.55,240.98-27.93,120.06-102.37,223.22-206.06,292Z"/>
+                    <path fill="#fafde8" d="M580.62,935.71c-56.96,10.61-114.6,9.85-169.63-2.2-127.58-27.93-237.01-111.96-298.86-226.6-62.25-115.38-68.7-252.46-17.53-373.16,43.11-101.71,122.84-184.91,223.36-232,101.2-47.4,217.96-53.75,324.4-17.31,129.85,44.44,233.25,148.02,277.42,277.99,36.86,108.49,29.51,226.27-20.23,328.48-22.15,45.52-51.69,85.72-87.33,121.41-63.23,63.32-142.2,106.74-231.59,123.39Z"/>
+                    <path fill="#aace59" d="M443.23,465.82l-179.78-74.29-68.51-28.3c-13.18-5.44-25.47-12.27-33.21-24-9.25-14.02-9.77-29.61-.33-43.98,34.64-52.78,79.42-97.68,131.71-132.23,14.72-9.73,33.51-7.94,47.5,2.76,8.57,6.56,14.52,14.72,18.61,24.53l63.55,152.22,43.22,103.07c2.9,6.92,3.07,13.97-3.39,18.43-5.47,3.77-12.03,4.82-19.35,1.8Z"/>
+                    <path fill="#aace59" d="M592.51,889.41c-62.07,12.13-123.51,12.39-184.14-.14-17.66-3.65-30.38-18.37-31.16-36.53-.38-8.98.23-18.25,3.99-27.4l106.08-258.61c2.49-6.08,8.7-8.67,12.56-9.55,5.63-1.29,13.16.71,15.86,7.21l87.55,210.55,20.6,51.78c8.91,22.39,2.04,56.16-31.34,62.68Z"/>
+                    <path fill="#aacd58" d="M816.7,357.98l-102.26,43.53-154.12,64.35c-5.82,2.43-12.61,3.91-16.81.44-3.42-2.83-10.08-9.97-7.36-16.62l105.95-258.36c3.89-9.48,9.95-17.09,16.31-23.64,13.69-14.11,34.53-16.38,51.13-5.52,34.59,22.62,65.08,48.9,92.07,79.88,13.79,15.83,25.54,32.29,37.71,49.43,7.42,10.46,10.11,22.61,5.97,35.33-4.43,13.62-14.31,25.1-28.59,31.18Z"/>
+                    <path fill="#a9cd58" d="M488.9,441.63l-108.94-263.24c-9.14-22.08-1.99-57,28.78-63.3,61.94-12.67,125.18-13.75,186.7.06,20.06,4.5,32.57,22.3,30.82,42.62-.95,11.07-3.44,20.63-7.91,31.43l-103.53,250.13c-2.26,5.46-8.14,6.64-11.46,7.54-3.64.99-12.07.53-14.46-5.25Z"/>
+                    <path fill="#a9cd58" d="M341.35,839.92c-14.42,11.53-32.15,11.93-47.4,1.97-51.72-33.78-93.62-77.14-128.52-127.65-8.27-11.97-12.04-24.23-6.57-38.62,4.99-13.13,14.75-24.4,28.45-30.14l257.02-107.7c5.64-2.36,12.5-3.06,17.12,1.37,3.19,3.07,8.14,9.59,5.38,16.32l-75.68,184.72-32.17,76.25c-3.9,9.25-10.42,17.71-17.63,23.49Z"/>
+                    <path fill="#aace5a" d="M815,619.02l-248.35-102.21c-5.97-2.46-8.28-7.91-9.59-12.12-1.27-4.09-.91-12.94,4.26-15.06l112.66-46.29,144.76-60.54c10.7-4.48,21.53-7.24,32.52-5.94,22.3,2.64,35.38,17.69,39.05,38.96,10.34,59.99,11.4,120.14-1.77,179.62-4.14,18.69-17.63,30.92-36.74,31.69-12.78.52-23.8-2.77-36.8-8.12Z"/>
+                    <path fill="#abce5a" d="M712.34,839.55c-16.85,11.61-38.06,9.88-53.02-4.16-6.78-6.36-11.72-13.92-15.39-22.65l-32.7-77.54-72.76-175c-2.45-5.89-4.4-12-.43-17.05,2.71-3.45,9.2-9.63,15.99-6.83l255.45,105c12.09,4.97,22.04,11.25,29.78,20.36,12.21,14.37,12.18,32.45,2.36,47.89-32.75,51.54-79.09,95.38-129.28,129.96Z"/>
+                    <path fill="#a9cd58" d="M177.38,623.52c-11.26,4.64-22.83,4.87-33.83,1.75-18.3-5.19-27.26-19.19-30.33-37.18-10.15-59.56-11.34-119.26,1.15-178.15,4.14-19.52,18.33-32.95,38.78-32.86,11.58.05,22.07,2.62,33.34,7.27l250.32,103.31c7.4,3.05,10.51,10.33,10.18,15.98-.51,8.86-6.48,11.53-13.64,14.48l-120.8,49.72-135.18,55.69Z"/>
+                  </g>
+                  <g>
+                    <path fill="url(#hvbc-grad)" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" d="M282.55,922.69c53.7-53.7,313.89-400.95,260.18-454.66-53.7-53.7-400.95,206.48-454.66,260.18-53.7,53.7-53.7,140.77,0,194.47,53.7,53.7,140.77,53.7,194.47,0Z"/>
+                    <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="20.05" cx="185.6" cy="821.72" r="77.08"/>
+                    <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" cx="502.62" cy="505.01" r="7.8"/>
+                  </g>
+                  <g>
+                    <path fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="15.94" d="M255.39,692.26l156.69-95.68-94.96,156.29s-14.11-26.25-23.85-35.94c-11.43-11.38-37.89-24.67-37.89-24.67Z"/>
+                  </g>
+                </g>
+                <circle class="hvbc-led" cx="502.62" cy="505.01" r="14"/>
+                <circle class="hvbc-ping" id="hvbc-pingel" cx="502.62" cy="505.01" r="30"/>
+              </svg>
+
+              <!-- the wire in from the right edge -->
+              <line class="hvbc-wire" x1="450" y1="200" x2="556" y2="200"/>
+              <g id="hvbc-flights"></g>
+
+              <!-- reduced-motion static bits: two blocks frozen on the wire -->
+              <g class="hvbc-staticbits">
+                <rect class="hvbc-wblock" x="495.5" y="195.5" width="9" height="9" rx="1.5"/>
+                <rect class="hvbc-wblock" x="527.5" y="195.5" width="9" height="9" rx="1.5"/>
+              </g>
+            </svg>
+          </div>
+
+          <button type="button" class="hv-replay" id="hvbc-replay">replay</button>
+
+          <script>
+            (function () {
+              "use strict";
+              var card = document.getElementById("hv-block-conform");
+              if (!card) { return; }
+              var stage = card.querySelector(".hvbc-stage");
+              var ghostG = card.querySelector("#hvbc-ghostg");
+              var fillG = card.querySelector("#hvbc-fillg");
+              var flightsG = card.querySelector("#hvbc-flights");
+              var ping = card.querySelector("#hvbc-pingel");
+              var replayBtn = card.querySelector("#hvbc-replay");
+              var SVGNS = "http://www.w3.org/2000/svg";
+              var GRID = 12, CELL = 1000 / GRID;
+
+              var mq = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+              function reduced() { return !!(mq && mq.matches); }
+
+              /* silhouette test in 1000-space: badge circle + arm capsule */
+              function inSilhouette(px, py) {
+                var dx = px - 502.62, dy = py - 505.01;
+                if (dx * dx + dy * dy <= 488 * 488) { return true; }
+                var ax = 185.6, ay = 821.72, bx = 535, by = 475;
+                var abx = bx - ax, aby = by - ay;
+                var t = ((px - ax) * abx + (py - ay) * aby) / (abx * abx + aby * aby);
+                if (t < 0) { t = 0; } if (t > 1) { t = 1; }
+                var cx = ax + abx * t, cy = ay + aby * t;
+                var r = 150 - 110 * t;
+                dx = px - cx; dy = py - cy;
+                return dx * dx + dy * dy <= r * r;
+              }
+
+              /* build the ghost grid + the clipped fill tiles; collect targets */
+              var targets = [];
+              (function () {
+                var r, c, x, y, g, f, cx, cy, hit, pts, i;
+                for (r = 0; r < GRID; r++) {
+                  for (c = 0; c < GRID; c++) {
+                    x = c * CELL + 6; y = r * CELL + 6;
+                    g = document.createElementNS(SVGNS, "rect");
+                    g.setAttribute("class", "hvbc-ghosttile");
+                    g.setAttribute("x", x); g.setAttribute("y", y);
+                    g.setAttribute("width", CELL - 12); g.setAttribute("height", CELL - 12);
+                    g.setAttribute("rx", 8);
+                    ghostG.appendChild(g);
+                    cx = c * CELL + CELL / 2; cy = r * CELL + CELL / 2;
+                    pts = [
+                      [cx, cy], [x + 8, y + 8], [x + CELL - 20, y + 8],
+                      [x + 8, y + CELL - 20], [x + CELL - 20, y + CELL - 20]
+                    ];
+                    hit = false;
+                    for (i = 0; i < pts.length; i++) {
+                      if (inSilhouette(pts[i][0], pts[i][1])) { hit = true; break; }
+                    }
+                    if (!hit) { continue; }
+                    f = document.createElementNS(SVGNS, "rect");
+                    f.setAttribute("class", "hvbc-tile");
+                    f.setAttribute("x", x); f.setAttribute("y", y);
+                    f.setAttribute("width", CELL - 12); f.setAttribute("height", CELL - 12);
+                    f.setAttribute("rx", 8);
+                    fillG.appendChild(f);
+                    targets.push({ el: f, cx: 120 + cx * 0.32, cy: 40 + cy * 0.32 });
+                  }
+                }
+              }());
+
+              var visible = false, played = false;
+              var timers = [], idleTimer = 0;
+
+              function later(fn, ms) { timers.push(window.setTimeout(fn, ms)); }
+              function clearTimers() {
+                var i;
+                for (i = 0; i < timers.length; i++) { window.clearTimeout(timers[i]); }
+                timers = [];
+                if (idleTimer) { window.clearInterval(idleTimer); idleTimer = 0; }
+              }
+
+              function shuffled(list) {
+                var a = list.slice(), i, j, t;
+                for (i = a.length - 1; i > 0; i--) {
+                  j = Math.floor(Math.random() * (i + 1));
+                  t = a[i]; a[i] = a[j]; a[j] = t;
+                }
+                return a;
+              }
+
+              /* one block in from the right edge, then a burst of tiles lights */
+              function launchBlock(toTile, burst, pulse) {
+                var el = document.createElementNS(SVGNS, "rect");
+                el.setAttribute("class", "hvbc-wblock");
+                el.setAttribute("x", 551.5); el.setAttribute("y", 195.5);
+                el.setAttribute("width", 9); el.setAttribute("height", 9);
+                el.setAttribute("rx", 1.5);
+                flightsG.appendChild(el);
+                void el.getBBox();
+                el.style.transition = "transform 200ms linear";
+                el.style.transform = "translate(-86px, 0px)";
+                later(function () {
+                  el.style.transition = "transform 150ms ease-out, opacity 150ms ease-out";
+                  el.style.transform = "translate(" + (toTile.cx - 556) + "px, " + (toTile.cy - 200) + "px)";
+                  el.style.opacity = "0.25";
+                }, 200);
+                later(function () {
+                  if (el.parentNode) { el.parentNode.removeChild(el); }
+                  var i;
+                  for (i = 0; i < burst.length; i++) {
+                    (function (tile, d) {
+                      later(function () { tile.el.classList.add("hvbc-on"); }, d);
+                    }(burst[i], i * 30));
+                  }
+                  if (pulse) {
+                    toTile.el.classList.add("hvbc-pulse");
+                    later(function () { toTile.el.classList.remove("hvbc-pulse"); }, 650);
+                  }
+                }, 350);
+              }
+
+              function fillAll() {
+                var i;
+                for (i = 0; i < targets.length; i++) { targets[i].el.classList.add("hvbc-on"); }
+              }
+
+              function beat() {
+                clearTimers();
+                stage.classList.add("hvbc-gridon");
+                var order = shuffled(targets);
+                var n = Math.min(20, order.length);
+                var i, k, t, pos = 0;
+                for (i = 0; i < n && pos < order.length; i++) {
+                  k = 1 + Math.floor(Math.pow(i / (n - 1 || 1), 1.7) * 10);
+                  k = Math.min(k, order.length - pos);
+                  t = 500 + 2100 * (1 - Math.pow(1 - i / (n - 1 || 1), 1.9));
+                  (function (toTile, burst, when) {
+                    later(function () { launchBlock(toTile, burst, false); }, when);
+                  }(order[pos], order.slice(pos, pos + k), t));
+                  pos += k;
+                }
+                later(function () {
+                  fillAll();
+                  stage.classList.add("hvbc-conform");
+                }, 3000);
+                later(function () {
+                  stage.classList.add("hvbc-pinged");
+                  later(function () { stage.classList.remove("hvbc-pinged"); }, 750);
+                }, 3800);
+                later(function () {
+                  stage.classList.add("hvbc-idle");
+                  idleTimer = window.setInterval(function () {
+                    var tile = targets[Math.floor(Math.random() * targets.length)];
+                    if (tile) { launchBlock(tile, [], true); }
+                  }, 4200);
+                }, 4500);
+              }
+
+              function teardown() {
+                clearTimers();
+                stage.classList.remove("hvbc-gridon");
+                stage.classList.remove("hvbc-conform");
+                stage.classList.remove("hvbc-pinged");
+                stage.classList.remove("hvbc-idle");
+                while (flightsG.firstChild) { flightsG.removeChild(flightsG.firstChild); }
+                var i;
+                for (i = 0; i < targets.length; i++) {
+                  targets[i].el.classList.remove("hvbc-on");
+                  targets[i].el.classList.remove("hvbc-pulse");
+                }
+                played = false;
+              }
+
+              function applyMotionPref() {
+                if (reduced()) {
+                  teardown();
+                  stage.classList.add("hvbc-static");
+                  fillAll();
+                } else {
+                  stage.classList.remove("hvbc-static");
+                  teardown();
+                  if (visible) { played = true; beat(); }
+                }
+              }
+
+              replayBtn.addEventListener("click", function () {
+                if (reduced()) { return; }
+                teardown();
+                if (visible) { played = true; beat(); }
+              });
+
+              if ("IntersectionObserver" in window) {
+                var io = new IntersectionObserver(function (entries) {
+                  var i;
+                  for (i = 0; i < entries.length; i++) { visible = entries[i].isIntersecting; }
+                  if (reduced()) { return; }
+                  if (visible && !played) { played = true; beat(); }
+                  if (!visible && played) { teardown(); }
+                }, { threshold: 0.2 });
+                io.observe(stage);
+              } else {
+                visible = true;
+                if (!reduced()) { played = true; beat(); }
+              }
+
+              if (mq) {
+                if (mq.addEventListener) { mq.addEventListener("change", applyMotionPref); }
+                else if (mq.addListener) { mq.addListener(applyMotionPref); }
+              }
+              if (reduced()) { applyMotionPref(); }
+            }());
+          </script>
+        </article>
+        <!-- ===== END hero-card: block-conform ===== -->
+
+        <!-- ===== BEGIN hero-card: exploded-view ===== -->
+        <article class="hv-card hvex-scope" id="hv-exploded-view" data-angle="brand">
+          <style>
+            /* hvex- · exploded view. All selectors scoped under .hvex-scope. */
+            .hvex-scope .hvex-stage { background: rgba(0, 0, 0, 0.18); }
+            .hvex-scope .hvex-svg {
+              position: absolute;
+              inset: 0;
+              width: 100%;
+              height: 100%;
+              display: block;
+            }
+            /* per-part exploded offsets and nudge vectors (1000-space units) */
+            .hvex-scope .hvex-p1 { --hvex-tx: -113.3px; --hvex-ty: 120px;    --hvex-nx: -13.7px; --hvex-ny: 14.5px; }
+            .hvex-scope .hvex-p2 { --hvex-tx: 146.7px;  --hvex-ty: -153.3px; --hvex-nx: 13.8px;  --hvex-ny: -14.4px; }
+            .hvex-scope .hvex-p3 { --hvex-tx: -146.7px; --hvex-ty: 153.3px;  --hvex-nx: -13.8px; --hvex-ny: 14.4px; }
+            .hvex-scope .hvex-p4 { --hvex-tx: -346.7px; --hvex-ty: 253.3px;  --hvex-nx: -16.1px; --hvex-ny: 11.8px; }
+            .hvex-scope .hvex-p5 { --hvex-tx: 566.7px;  --hvex-ty: -506.7px; --hvex-nx: 14.9px;  --hvex-ny: -13.3px; }
+            .hvex-scope .hvex-p6 { --hvex-tx: -40px;    --hvex-ty: 40px;     --hvex-nx: -14.1px; --hvex-ny: 14.1px; }
+
+            /* home state + assembly click with soft overshoot */
+            .hvex-scope .hvex-part {
+              transform: translate(0, 0);
+              transition: transform 0.9s cubic-bezier(0.34, 1.56, 0.64, 1);
+            }
+            /* exploding out is gentler */
+            .hvex-scope .hvex-exploded .hvex-part {
+              transform: translate(var(--hvex-tx), var(--hvex-ty));
+              transition: transform 1s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            .hvex-scope .hvex-idle:hover .hvex-part {
+              transform: translate(var(--hvex-tx), var(--hvex-ty));
+              transition: transform 0.6s cubic-bezier(0.22, 0.61, 0.36, 1);
+            }
+            .hvex-scope .hvex-static .hvex-part {
+              transform: translate(var(--hvex-tx), var(--hvex-ty));
+              transition: none;
+            }
+
+            /* gentle float while hovering apart */
+            @media (prefers-reduced-motion: no-preference) {
+              .hvex-scope .hvex-exploded .hvex-fl,
+              .hvex-scope .hvex-idle:hover .hvex-fl {
+                animation: hvex-float 5.2s ease-in-out infinite alternate;
+              }
+              .hvex-scope .hvex-part.hvex-nudging { animation: hvex-nudge 0.9s ease-in-out; }
+              .hvex-scope .hvex-blink .hvex-dotled { animation: hvex-led 0.8s linear; }
+            }
+            .hvex-scope .hvex-p2 .hvex-fl { animation-delay: -1.1s; }
+            .hvex-scope .hvex-p3 .hvex-fl { animation-delay: -2.3s; }
+            .hvex-scope .hvex-p4 .hvex-fl { animation-delay: -3.4s; }
+            .hvex-scope .hvex-p5 .hvex-fl { animation-delay: -4.2s; }
+            .hvex-scope .hvex-p6 .hvex-fl { animation-delay: -0.6s; }
+            @keyframes hvex-float {
+              from { transform: translate(0, 0); }
+              to { transform: translate(8px, -10px); }
+            }
+            @keyframes hvex-nudge {
+              0%, 100% { transform: translate(0, 0); }
+              50% { transform: translate(var(--hvex-nx), var(--hvex-ny)); }
+            }
+            @keyframes hvex-led {
+              0%, 32%, 64%, 100% { opacity: 0; }
+              14%, 48% { opacity: 1; }
+            }
+            .hvex-scope .hvex-dotled { fill: #AACD58; opacity: 0; }
+
+            /* leader lines + captions */
+            .hvex-scope .hvex-lead {
+              fill: none;
+              stroke: rgba(250, 253, 232, 0.5);
+              stroke-width: 1;
+              transition: stroke-dashoffset 0.3s ease;
+            }
+            .hvex-scope .hvex-cap {
+              font-family: var(--font-mono);
+              font-size: 15px;
+              fill: var(--text-muted);
+            }
+            .hvex-scope .hvex-anno { transition: opacity 0.25s ease; }
+            .hvex-scope .hvex-assembling .hvex-anno { opacity: 0; }
+            .hvex-scope .hvex-idle .hvex-anno { opacity: 0; }
+            .hvex-scope .hvex-idle:hover .hvex-anno {
+              opacity: 1;
+              transition: opacity 0.5s ease;
+            }
+
+            /* the small assembled mark, shown only in the static state */
+            .hvex-scope .hvex-mini { display: none; }
+            .hvex-scope .hvex-static .hvex-mini { display: inline; }
+            .hvex-scope .hvex-static .hvex-anno { opacity: 1; }
+          </style>
+
+          <h3 class="hv-name">Exploded View</h3>
+          <p class="hv-why">The mark as a technical drawing: platter, head, hub, and chevron hover apart, each labeled with the thing it stands for, then glide home and click.</p>
+
+          <div class="hv-stage hvex-stage" id="hvex-stage">
+            <svg class="hvex-svg" viewBox="0 0 560 400" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" focusable="false" aria-hidden="true">
+              <defs>
+                <linearGradient id="hvex-grad" x1="47.8" y1="711.87" x2="605.26" y2="711.87" gradientUnits="userSpaceOnUse">
+                  <stop offset="0" stop-color="#ccc"/>
+                  <stop offset="1" stop-color="gray"/>
+                </linearGradient>
+              </defs>
+
+              <!-- the dissected mark in its own 1000-space viewport -->
+              <svg x="120" y="42" width="300" height="300" viewBox="0 0 1000 1000" overflow="visible">
+                <g class="hvex-part hvex-p1"><g class="hvex-fl">
+                  <circle fill="#393839" cx="495.56" cy="506.15" r="238.15"/>
+                </g></g>
+                <g class="hvex-part hvex-p2"><g class="hvex-fl">
+                  <path fill="#a9cd58" stroke="#1b102a" stroke-miterlimit="10" stroke-width="22.71" d="M765.88,905.66c-117.74,78.1-262.97,99.6-397.95,60.35-104.84-30.48-196.23-96.14-260.02-184.98C24.1,664.29-1.98,517.61,34.31,378.58c15.9-60.91,43.49-116.72,81.77-167.14,62.95-82.9,150.15-143.26,249.45-172.95C494.61-.11,634.16,18,749.57,87.76c68.45,41.37,126.32,99.27,167.67,167.76,22.28,36.91,38.57,75.62,50.15,117.16,22.11,79.32,23.23,160.68,4.55,240.98-27.93,120.06-102.37,223.22-206.06,292Z"/>
+                  <path fill="#fafde8" d="M580.62,935.71c-56.96,10.61-114.6,9.85-169.63-2.2-127.58-27.93-237.01-111.96-298.86-226.6-62.25-115.38-68.7-252.46-17.53-373.16,43.11-101.71,122.84-184.91,223.36-232,101.2-47.4,217.96-53.75,324.4-17.31,129.85,44.44,233.25,148.02,277.42,277.99,36.86,108.49,29.51,226.27-20.23,328.48-22.15,45.52-51.69,85.72-87.33,121.41-63.23,63.32-142.2,106.74-231.59,123.39Z"/>
+                  <path fill="#aace59" d="M443.23,465.82l-179.78-74.29-68.51-28.3c-13.18-5.44-25.47-12.27-33.21-24-9.25-14.02-9.77-29.61-.33-43.98,34.64-52.78,79.42-97.68,131.71-132.23,14.72-9.73,33.51-7.94,47.5,2.76,8.57,6.56,14.52,14.72,18.61,24.53l63.55,152.22,43.22,103.07c2.9,6.92,3.07,13.97-3.39,18.43-5.47,3.77-12.03,4.82-19.35,1.8Z"/>
+                  <path fill="#aace59" d="M592.51,889.41c-62.07,12.13-123.51,12.39-184.14-.14-17.66-3.65-30.38-18.37-31.16-36.53-.38-8.98.23-18.25,3.99-27.4l106.08-258.61c2.49-6.08,8.7-8.67,12.56-9.55,5.63-1.29,13.16.71,15.86,7.21l87.55,210.55,20.6,51.78c8.91,22.39,2.04,56.16-31.34,62.68Z"/>
+                  <path fill="#aacd58" d="M816.7,357.98l-102.26,43.53-154.12,64.35c-5.82,2.43-12.61,3.91-16.81.44-3.42-2.83-10.08-9.97-7.36-16.62l105.95-258.36c3.89-9.48,9.95-17.09,16.31-23.64,13.69-14.11,34.53-16.38,51.13-5.52,34.59,22.62,65.08,48.9,92.07,79.88,13.79,15.83,25.54,32.29,37.71,49.43,7.42,10.46,10.11,22.61,5.97,35.33-4.43,13.62-14.31,25.1-28.59,31.18Z"/>
+                  <path fill="#a9cd58" d="M488.9,441.63l-108.94-263.24c-9.14-22.08-1.99-57,28.78-63.3,61.94-12.67,125.18-13.75,186.7.06,20.06,4.5,32.57,22.3,30.82,42.62-.95,11.07-3.44,20.63-7.91,31.43l-103.53,250.13c-2.26,5.46-8.14,6.64-11.46,7.54-3.64.99-12.07.53-14.46-5.25Z"/>
+                  <path fill="#a9cd58" d="M341.35,839.92c-14.42,11.53-32.15,11.93-47.4,1.97-51.72-33.78-93.62-77.14-128.52-127.65-8.27-11.97-12.04-24.23-6.57-38.62,4.99-13.13,14.75-24.4,28.45-30.14l257.02-107.7c5.64-2.36,12.5-3.06,17.12,1.37,3.19,3.07,8.14,9.59,5.38,16.32l-75.68,184.72-32.17,76.25c-3.9,9.25-10.42,17.71-17.63,23.49Z"/>
+                  <path fill="#aace5a" d="M815,619.02l-248.35-102.21c-5.97-2.46-8.28-7.91-9.59-12.12-1.27-4.09-.91-12.94,4.26-15.06l112.66-46.29,144.76-60.54c10.7-4.48,21.53-7.24,32.52-5.94,22.3,2.64,35.38,17.69,39.05,38.96,10.34,59.99,11.4,120.14-1.77,179.62-4.14,18.69-17.63,30.92-36.74,31.69-12.78.52-23.8-2.77-36.8-8.12Z"/>
+                  <path fill="#abce5a" d="M712.34,839.55c-16.85,11.61-38.06,9.88-53.02-4.16-6.78-6.36-11.72-13.92-15.39-22.65l-32.7-77.54-72.76-175c-2.45-5.89-4.4-12-.43-17.05,2.71-3.45,9.2-9.63,15.99-6.83l255.45,105c12.09,4.97,22.04,11.25,29.78,20.36,12.21,14.37,12.18,32.45,2.36,47.89-32.75,51.54-79.09,95.38-129.28,129.96Z"/>
+                  <path fill="#a9cd58" d="M177.38,623.52c-11.26,4.64-22.83,4.87-33.83,1.75-18.3-5.19-27.26-19.19-30.33-37.18-10.15-59.56-11.34-119.26,1.15-178.15,4.14-19.52,18.33-32.95,38.78-32.86,11.58.05,22.07,2.62,33.34,7.27l250.32,103.31c7.4,3.05,10.51,10.33,10.18,15.98-.51,8.86-6.48,11.53-13.64,14.48l-120.8,49.72-135.18,55.69Z"/>
+                </g></g>
+                <g class="hvex-part hvex-p3"><g class="hvex-fl">
+                  <path fill="url(#hvex-grad)" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" d="M282.55,922.69c53.7-53.7,313.89-400.95,260.18-454.66-53.7-53.7-400.95,206.48-454.66,260.18-53.7,53.7-53.7,140.77,0,194.47,53.7,53.7,140.77,53.7,194.47,0Z"/>
+                </g></g>
+                <g class="hvex-part hvex-p4"><g class="hvex-fl">
+                  <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="20.05" cx="185.6" cy="821.72" r="77.08"/>
+                </g></g>
+                <g class="hvex-part hvex-p5"><g class="hvex-fl">
+                  <circle class="hvex-dotled" cx="502.62" cy="505.01" r="12"/>
+                  <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" cx="502.62" cy="505.01" r="7.8"/>
+                </g></g>
+                <g class="hvex-part hvex-p6"><g class="hvex-fl">
+                  <path fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="15.94" d="M255.39,692.26l156.69-95.68-94.96,156.29s-14.11-26.25-23.85-35.94c-11.43-11.38-37.89-24.67-37.89-24.67Z"/>
+                </g></g>
+              </svg>
+
+              <!-- leader lines + captions (outer space, drawn over the parts) -->
+              <g class="hvex-anno" id="hvex-anno">
+                <path class="hvex-lead" d="M190,276 L180,284 L174,286"/>
+                <path class="hvex-lead" d="M130,323 L140,320 L146,318"/>
+                <path class="hvex-lead" d="M122,372 L128,380 L132,384"/>
+                <path class="hvex-lead" d="M214,260 L230,330 L234,341"/>
+                <path class="hvex-lead" d="M426,84 L433,66 L436,60"/>
+                <text class="hvex-cap" x="14" y="288" data-t="platter, your NAS"></text>
+                <text class="hvex-cap" x="14" y="318" data-t="head, the wire"></text>
+                <text class="hvex-cap" x="136" y="388" data-t="hub, local SSD cache"></text>
+                <text class="hvex-cap" x="238" y="346" data-t="chevron, play"></text>
+                <text class="hvex-cap" x="438" y="58" data-t="format, open"></text>
+              </g>
+
+              <!-- assembled mark, small, corner: shown in the static state -->
+              <svg class="hvex-mini" x="474" y="308" width="72" height="72" viewBox="0 0 1000 1000">
+                <g>
+                  <circle fill="#393839" cx="495.56" cy="506.15" r="238.15"/>
+                  <path fill="#a9cd58" stroke="#1b102a" stroke-miterlimit="10" stroke-width="22.71" d="M765.88,905.66c-117.74,78.1-262.97,99.6-397.95,60.35-104.84-30.48-196.23-96.14-260.02-184.98C24.1,664.29-1.98,517.61,34.31,378.58c15.9-60.91,43.49-116.72,81.77-167.14,62.95-82.9,150.15-143.26,249.45-172.95C494.61-.11,634.16,18,749.57,87.76c68.45,41.37,126.32,99.27,167.67,167.76,22.28,36.91,38.57,75.62,50.15,117.16,22.11,79.32,23.23,160.68,4.55,240.98-27.93,120.06-102.37,223.22-206.06,292Z"/>
+                  <path fill="#fafde8" d="M580.62,935.71c-56.96,10.61-114.6,9.85-169.63-2.2-127.58-27.93-237.01-111.96-298.86-226.6-62.25-115.38-68.7-252.46-17.53-373.16,43.11-101.71,122.84-184.91,223.36-232,101.2-47.4,217.96-53.75,324.4-17.31,129.85,44.44,233.25,148.02,277.42,277.99,36.86,108.49,29.51,226.27-20.23,328.48-22.15,45.52-51.69,85.72-87.33,121.41-63.23,63.32-142.2,106.74-231.59,123.39Z"/>
+                  <path fill="#aace59" d="M443.23,465.82l-179.78-74.29-68.51-28.3c-13.18-5.44-25.47-12.27-33.21-24-9.25-14.02-9.77-29.61-.33-43.98,34.64-52.78,79.42-97.68,131.71-132.23,14.72-9.73,33.51-7.94,47.5,2.76,8.57,6.56,14.52,14.72,18.61,24.53l63.55,152.22,43.22,103.07c2.9,6.92,3.07,13.97-3.39,18.43-5.47,3.77-12.03,4.82-19.35,1.8Z"/>
+                  <path fill="#aace59" d="M592.51,889.41c-62.07,12.13-123.51,12.39-184.14-.14-17.66-3.65-30.38-18.37-31.16-36.53-.38-8.98.23-18.25,3.99-27.4l106.08-258.61c2.49-6.08,8.7-8.67,12.56-9.55,5.63-1.29,13.16.71,15.86,7.21l87.55,210.55,20.6,51.78c8.91,22.39,2.04,56.16-31.34,62.68Z"/>
+                  <path fill="#aacd58" d="M816.7,357.98l-102.26,43.53-154.12,64.35c-5.82,2.43-12.61,3.91-16.81.44-3.42-2.83-10.08-9.97-7.36-16.62l105.95-258.36c3.89-9.48,9.95-17.09,16.31-23.64,13.69-14.11,34.53-16.38,51.13-5.52,34.59,22.62,65.08,48.9,92.07,79.88,13.79,15.83,25.54,32.29,37.71,49.43,7.42,10.46,10.11,22.61,5.97,35.33-4.43,13.62-14.31,25.1-28.59,31.18Z"/>
+                  <path fill="#a9cd58" d="M488.9,441.63l-108.94-263.24c-9.14-22.08-1.99-57,28.78-63.3,61.94-12.67,125.18-13.75,186.7.06,20.06,4.5,32.57,22.3,30.82,42.62-.95,11.07-3.44,20.63-7.91,31.43l-103.53,250.13c-2.26,5.46-8.14,6.64-11.46,7.54-3.64.99-12.07.53-14.46-5.25Z"/>
+                  <path fill="#a9cd58" d="M341.35,839.92c-14.42,11.53-32.15,11.93-47.4,1.97-51.72-33.78-93.62-77.14-128.52-127.65-8.27-11.97-12.04-24.23-6.57-38.62,4.99-13.13,14.75-24.4,28.45-30.14l257.02-107.7c5.64-2.36,12.5-3.06,17.12,1.37,3.19,3.07,8.14,9.59,5.38,16.32l-75.68,184.72-32.17,76.25c-3.9,9.25-10.42,17.71-17.63,23.49Z"/>
+                  <path fill="#aace5a" d="M815,619.02l-248.35-102.21c-5.97-2.46-8.28-7.91-9.59-12.12-1.27-4.09-.91-12.94,4.26-15.06l112.66-46.29,144.76-60.54c10.7-4.48,21.53-7.24,32.52-5.94,22.3,2.64,35.38,17.69,39.05,38.96,10.34,59.99,11.4,120.14-1.77,179.62-4.14,18.69-17.63,30.92-36.74,31.69-12.78.52-23.8-2.77-36.8-8.12Z"/>
+                  <path fill="#abce5a" d="M712.34,839.55c-16.85,11.61-38.06,9.88-53.02-4.16-6.78-6.36-11.72-13.92-15.39-22.65l-32.7-77.54-72.76-175c-2.45-5.89-4.4-12-.43-17.05,2.71-3.45,9.2-9.63,15.99-6.83l255.45,105c12.09,4.97,22.04,11.25,29.78,20.36,12.21,14.37,12.18,32.45,2.36,47.89-32.75,51.54-79.09,95.38-129.28,129.96Z"/>
+                  <path fill="#a9cd58" d="M177.38,623.52c-11.26,4.64-22.83,4.87-33.83,1.75-18.3-5.19-27.26-19.19-30.33-37.18-10.15-59.56-11.34-119.26,1.15-178.15,4.14-19.52,18.33-32.95,38.78-32.86,11.58.05,22.07,2.62,33.34,7.27l250.32,103.31c7.4,3.05,10.51,10.33,10.18,15.98-.51,8.86-6.48,11.53-13.64,14.48l-120.8,49.72-135.18,55.69Z"/>
+                </g>
+                <g>
+                  <path fill="url(#hvex-grad)" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" d="M282.55,922.69c53.7-53.7,313.89-400.95,260.18-454.66-53.7-53.7-400.95,206.48-454.66,260.18-53.7,53.7-53.7,140.77,0,194.47,53.7,53.7,140.77,53.7,194.47,0Z"/>
+                  <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="20.05" cx="185.6" cy="821.72" r="77.08"/>
+                  <circle fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="18.27" cx="502.62" cy="505.01" r="7.8"/>
+                </g>
+                <g>
+                  <path fill="none" stroke="#1b102a" stroke-miterlimit="10" stroke-width="15.94" d="M255.39,692.26l156.69-95.68-94.96,156.29s-14.11-26.25-23.85-35.94c-11.43-11.38-37.89-24.67-37.89-24.67Z"/>
+                </g>
+              </svg>
+            </svg>
+          </div>
+
+          <button type="button" class="hv-replay" id="hvex-replay">replay</button>
+
+          <script>
+            (function () {
+              "use strict";
+              var card = document.getElementById("hv-exploded-view");
+              if (!card) { return; }
+              var stage = card.querySelector(".hvex-stage");
+              var parts = card.querySelectorAll(".hvex-part");
+              var leads = card.querySelectorAll(".hvex-lead");
+              var caps = card.querySelectorAll(".hvex-cap");
+              var replayBtn = card.querySelector("#hvex-replay");
+
+              var mq = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+              function reduced() { return !!(mq && mq.matches); }
+
+              /* prime the leader lines for the dash-offset draw */
+              var leadLens = [];
+              (function () {
+                var i, l;
+                for (i = 0; i < leads.length; i++) {
+                  l = 0;
+                  try { l = leads[i].getTotalLength(); } catch (e) { l = 60; }
+                  leadLens.push(l);
+                  leads[i].style.strokeDasharray = String(l);
+                  leads[i].style.strokeDashoffset = String(l);
+                }
+              }());
+
+              var visible = false, played = false, hovered = false;
+              var timers = [], idleTimer = 0, nudgeIx = 0;
+
+              function later(fn, ms) { timers.push(window.setTimeout(fn, ms)); }
+              function clearTimers() {
+                var i;
+                for (i = 0; i < timers.length; i++) { window.clearTimeout(timers[i]); }
+                timers = [];
+                if (idleTimer) { window.clearInterval(idleTimer); idleTimer = 0; }
+              }
+
+              function resetLines(instant) {
+                var i;
+                for (i = 0; i < leads.length; i++) {
+                  if (instant) { leads[i].style.transition = "none"; }
+                  leads[i].style.strokeDashoffset = String(leadLens[i]);
+                  if (instant) {
+                    void leads[i].getBoundingClientRect();
+                    leads[i].style.transition = "";
+                  }
+                }
+              }
+
+              function drawLines() {
+                var i;
+                for (i = 0; i < leads.length; i++) {
+                  (function (el, d) {
+                    later(function () { el.style.strokeDashoffset = "0"; }, d);
+                  }(leads[i], i * 80));
+                }
+              }
+
+              function setCaps(full) {
+                var i;
+                for (i = 0; i < caps.length; i++) {
+                  caps[i].textContent = full ? caps[i].getAttribute("data-t") : "";
+                }
+              }
+
+              function typeCaps() {
+                var i, j, t;
+                for (i = 0; i < caps.length; i++) {
+                  t = caps[i].getAttribute("data-t");
+                  for (j = 1; j <= t.length; j++) {
+                    (function (el, s, d) {
+                      later(function () { el.textContent = s; }, d);
+                    }(caps[i], t.slice(0, j), i * 90 + j * 26));
+                  }
+                }
+              }
+
+              function beat() {
+                clearTimers();
+                stage.classList.add("hvex-exploded");
+                later(drawLines, 1000);
+                later(typeCaps, 1500);
+                later(function () {
+                  stage.classList.remove("hvex-exploded");
+                  stage.classList.add("hvex-assembling");
+                }, 2900);
+                later(function () {
+                  stage.classList.add("hvex-blink");
+                  later(function () { stage.classList.remove("hvex-blink"); }, 850);
+                }, 3800);
+                later(function () {
+                  stage.classList.remove("hvex-assembling");
+                  stage.classList.add("hvex-idle");
+                  idleTimer = window.setInterval(function () {
+                    if (hovered) { return; }
+                    var p = parts[nudgeIx % parts.length];
+                    nudgeIx++;
+                    p.classList.add("hvex-nudging");
+                    window.setTimeout(function () { p.classList.remove("hvex-nudging"); }, 950);
+                  }, 8000);
+                }, 3850);
+              }
+
+              function teardown() {
+                clearTimers();
+                stage.classList.remove("hvex-exploded");
+                stage.classList.remove("hvex-assembling");
+                stage.classList.remove("hvex-idle");
+                stage.classList.remove("hvex-blink");
+                var i;
+                for (i = 0; i < parts.length; i++) { parts[i].classList.remove("hvex-nudging"); }
+                resetLines(true);
+                setCaps(false);
+                played = false;
+              }
+
+              function applyMotionPref() {
+                if (reduced()) {
+                  teardown();
+                  stage.classList.add("hvex-static");
+                  var i;
+                  for (i = 0; i < leads.length; i++) {
+                    leads[i].style.transition = "none";
+                    leads[i].style.strokeDashoffset = "0";
+                  }
+                  setCaps(true);
+                } else {
+                  stage.classList.remove("hvex-static");
+                  teardown();
+                  if (visible) { played = true; beat(); }
+                }
+              }
+
+              stage.addEventListener("mouseenter", function () { hovered = true; });
+              stage.addEventListener("mouseleave", function () { hovered = false; });
+
+              replayBtn.addEventListener("click", function () {
+                if (reduced()) { return; }
+                teardown();
+                if (visible) { played = true; beat(); }
+              });
+
+              if ("IntersectionObserver" in window) {
+                var io = new IntersectionObserver(function (entries) {
+                  var i;
+                  for (i = 0; i < entries.length; i++) { visible = entries[i].isIntersecting; }
+                  if (reduced()) { return; }
+                  if (visible && !played) { played = true; beat(); }
+                  if (!visible && played) { teardown(); }
+                }, { threshold: 0.2 });
+                io.observe(stage);
+              } else {
+                visible = true;
+                if (!reduced()) { played = true; beat(); }
+              }
+
+              if (mq) {
+                if (mq.addEventListener) { mq.addEventListener("change", applyMotionPref); }
+                else if (mq.addListener) { mq.addListener(applyMotionPref); }
+              }
+              if (reduced()) { applyMotionPref(); }
+            }());
+          </script>
+        </article>
+        <!-- ===== END hero-card: exploded-view ===== -->
+
+      </div>
+    </div>
+  </main>
+</body>
+</html>
