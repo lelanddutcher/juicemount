@@ -1,0 +1,17 @@
+# juicemount.com robots: everything is crawlable, for search engines and
+# AI agents alike. /iterations/ is deliberately not disallowed here; its
+# pages are de-indexed by the X-Robots-Tag noindex header in _headers,
+# and a Disallow would stop crawlers from ever seeing that header.
+
+User-agent: *
+Allow: /
+
+# Named explicitly so the welcome to AI crawlers is unambiguous.
+User-agent: GPTBot
+User-agent: ClaudeBot
+User-agent: Claude-Web
+User-agent: PerplexityBot
+User-agent: Google-Extended
+Allow: /
+
+Sitemap: https://juicemount.com/sitemap.xml

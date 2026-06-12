@@ -11,6 +11,9 @@
 
 /*
   X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
 
 /assets/*
   Cache-Control: public, max-age=86400, stale-while-revalidate=604800
@@ -45,8 +48,26 @@
 /compare.html
   Cache-Control: no-cache
 
+/docs
+  Cache-Control: no-cache
+
+/docs.html
+  Cache-Control: no-cache
+
 /performance
   Cache-Control: no-cache
 
 /performance.html
+  Cache-Control: no-cache
+
+# Design drafts: keep /iterations/ out of search indexes even if a deploy
+# ships it. robots.txt deliberately does NOT disallow the path, because
+# crawlers must be able to fetch these pages to see this header.
+/iterations/*
+  X-Robots-Tag: noindex
+
+# Blog HTML revalidates like every other page, so a deploy shows up on the
+# next request. (Pages serves /blog/slug for /blog/slug.html too; one glob
+# covers both, and nothing else under /blog/ wants a cache window.)
+/blog/*
   Cache-Control: no-cache

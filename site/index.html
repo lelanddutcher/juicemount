@@ -7,12 +7,44 @@
   <meta name="description" content="JuiceMount is the open-source alternative to Suite, Shade, and LucidLink for indie filmmakers and small post teams: a real mounted drive at LAN speed, Dropbox-style offline resilience, on hardware you already own. $0 per seat.">
   <link rel="canonical" href="https://juicemount.com/">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="JuiceMount">
+  <meta property="og:locale" content="en_US">
   <meta property="og:url" content="https://juicemount.com/">
   <meta property="og:title" content="JuiceMount — the open-source alternative to Suite, Shade, and LucidLink">
   <meta property="og:description" content="For indie filmmakers and small post teams: a real mounted drive at LAN speed, Dropbox-style offline resilience, on hardware you already own. $0 per seat.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="JuiceMount — the open-source alternative to Suite, Shade, and LucidLink">
+  <meta name="twitter:description" content="For indie filmmakers and small post teams: a real mounted drive at LAN speed, Dropbox-style offline resilience, on hardware you already own. $0 per seat.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#FAFDE8">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17181B">
+  <!-- Structured data. Deliberately omitted: aggregateRating and reviews
+       (no review corpus exists and we will not invent one), FAQPage (no
+       FAQ on these pages), BreadcrumbList (a five-page flat site has no
+       crumb trail). Add them only when the real thing exists. -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "JuiceMount",
+    "operatingSystem": "macOS 14+",
+    "applicationCategory": "MultimediaApplication",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "license": "https://www.apache.org/licenses/LICENSE-2.0",
+    "description": "Open-source storage for film and video teams: a real mounted volume in Finder at LAN speed, block-level streaming, an SSD cache, and offline files. $0 per seat because it runs on your own NAS hardware.",
+    "url": "https://juicemount.com/",
+    "downloadUrl": "https://github.com/lelanddutcher/juicemount",
+    "sameAs": "https://github.com/lelanddutcher/juicemount"
+  }
+  </script>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -1327,6 +1359,7 @@
         <li><a href="performance.html">Performance</a></li>
         <li><a href="calculator.html">Calculator</a></li>
         <li><a href="docs.html">Docs</a></li>
+        <li><a href="blog/index.html">Blog</a></li>
         <li><a href="https://github.com/lelanddutcher/juicemount">GitHub ↗</a></li>
       </ul>
     </div>
@@ -2450,10 +2483,10 @@
         </div>
 
         <p class="mb-legend" style="margin-top: var(--space-6)">
-          <img src="assets/state-healthy.svg" alt="" aria-hidden="true"> green healthy ·
-          <img src="assets/state-degraded.svg" alt="" aria-hidden="true"> amber degraded ·
-          <img src="assets/state-offline-files.svg" alt="" aria-hidden="true"> blue offline files ·
-          <img src="assets/state-fault.svg" alt="" aria-hidden="true"> red fault —
+          <img src="assets/state-healthy.svg" alt="" aria-hidden="true" width="16" height="16" loading="lazy" decoding="async"> green healthy ·
+          <img src="assets/state-degraded.svg" alt="" aria-hidden="true" width="16" height="16" loading="lazy" decoding="async"> amber degraded ·
+          <img src="assets/state-offline-files.svg" alt="" aria-hidden="true" width="16" height="16" loading="lazy" decoding="async"> blue offline files ·
+          <img src="assets/state-fault.svg" alt="" aria-hidden="true" width="16" height="16" loading="lazy" decoding="async"> red fault —
           four colors are the whole status system. You always know what your storage is doing, without opening a dashboard or reading a log.
         </p>
         <p class="small muted mb-legend">Numbers in this popover are illustrative — the real one shows yours. Fault red is the state you should rarely see: it means the volume needs you.</p>
@@ -2479,7 +2512,7 @@
           </div>
           <picture>
             <source media="(prefers-color-scheme: dark)" srcset="assets/arch-diagram-dark.svg">
-            <img class="diagram" src="assets/arch-diagram.svg" width="1200" height="640" alt="Architecture: Finder, Resolve, or Premiere open files on /Volumes/(name), mounted by the macOS NFS client from the JuiceMount NFS server running in the app on localhost. Three satellites keep the hot path local: an SQLite mirror answers Finder listings, an SSD cache with pins serves cached reads at SSD speed, and a write spool acks writes locally then trickles them up. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your NAS, where MinIO or any S3 holds file data as plain objects and Redis holds file metadata. Reads stream only the blocks you touch; writes drain in the background at line speed. Both sides are hardware you own.">
+            <img class="diagram" src="assets/arch-diagram.svg" width="1200" height="640" loading="lazy" decoding="async" alt="Architecture: Finder, Resolve, or Premiere open files on /Volumes/(name), mounted by the macOS NFS client from the JuiceMount NFS server running in the app on localhost. Three satellites keep the hot path local: an SQLite mirror answers Finder listings, an SSD cache with pins serves cached reads at SSD speed, and a write spool acks writes locally then trickles them up. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your NAS, where MinIO or any S3 holds file data as plain objects and Redis holds file metadata. Reads stream only the blocks you touch; writes drain in the background at line speed. Both sides are hardware you own.">
           </picture>
           <figcaption>The read path in one line: metadata answers from local SQLite, cache hits stream from local SSD, and only the missing blocks cross the wire to your NAS.</figcaption>
         </figure>
@@ -2542,6 +2575,14 @@
       <span>Built on <a href="https://github.com/juicedata/juicefs">JuiceFS</a> — credit where due</span>
       <span>This site is static files — no analytics, no telemetry</span>
     </div>
+    <nav class="container foot-map" aria-label="Site map">
+      <a href="compare.html">How it compares to LucidLink, Suite, and Shade</a>
+      <a href="performance.html">Performance: the measured numbers</a>
+      <a href="calculator.html">Rent vs own: the calculator</a>
+      <a href="docs.html">Set it up on your NAS</a>
+      <a href="index.html">Home</a>
+      <a href="blog/index.html">Blog</a>
+    </nav>
   </footer>
 
   <script>

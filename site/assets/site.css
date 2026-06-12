@@ -466,6 +466,11 @@ details.advanced[open] summary { margin-bottom: var(--space-3); }
 }
 .site-footer a { color: inherit; }
 .site-footer .foot-brand { color: var(--text); font-weight: var(--fw-head); }
+.site-footer .foot-map {
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1.5px solid var(--hairline-soft);
+}
 
 /* ---- breakpoints ------------------------------------------------------------------ */
 @media (min-width: 768px) {
@@ -493,4 +498,14 @@ details.advanced[open] summary { margin-bottom: var(--space-3); }
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* ---- anchor targets + smooth scroll ------------------------------------------------ */
+/* Sitewide versions of what docs.html carried locally. :where() keeps the
+   selector at bare-[id] specificity, so page rules with a tighter offset
+   (the docs rail's .step pair) still win their own cascade. */
+:where(main, section, article, h1, h2, h3, h4)[id] { scroll-margin-top: var(--space-5); }
+
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
 }

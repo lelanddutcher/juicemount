@@ -814,3 +814,96 @@ separately whether to run the H1 A/B (reviewer independently argued
 for dropping the two lesser-known names). The scrub-in-hero idea
 survives in v8b if he still wants it after reading the review's
 case against it.
+
+## ROUND 7 — growth + experience loop (founder-delegated decisions, 2026-06-12)
+Founder (while reviewing v8): "anything else to improve quality of
+web experience and ability to get traffic, perhaps blog — kick off
+sub-agents to ideate, make the executive decisions on what is high
+value, begin implementing." Three ideation agents ran (experience
+audit / SEO+discoverability / blog strategy).
+
+### Executive decisions (X)
+DO NOW — X1 launch-hygiene batch (one agent, canonical pages + new
+root files): robots.txt (allow + AI crawlers + sitemap line, no
+iterations Disallow), sitemap.xml (5 pages + 4 blog URLs, lastmod
+2026-06-12), 404.html ("That file isn't on this volume."), _headers
+(docs no-cache pair, security headers, /iterations/* X-Robots-Tag
+noindex, /blog/* no-cache), theme-color+color-scheme metas, og:site_
+name/locale/image dims + twitter tags, compare description <=160,
+JSON-LD (SoftwareApplication on index incl. BYO-hardware honesty,
+TechArticle on docs, WebPage+dateModified elsewhere; NO ratings, NO
+FAQPage stars chase, NO breadcrumbs), llms.txt with dated-claims
+note, sitewide scroll-margin + gated smooth-scroll, img dims +
+lazy/decoding, .DS_Store purge + gitignore, footer sitemap links
+with query-bearing anchors, nav "Blog" link, two in-body cross-link
+lines (compare->T1 post, performance->T2 post), site/README deploy
+note re excluding iterations/.
+DO NOW — X2 blog (one agent): site/blog/ scaffold (index, template
+conventions in comments, feed.xml Atom, Article JSON-LD, byline
+"Leland Dutcher, JuiceMount's author" + Person sameAs GitHub,
+strand labels, dated-facts house rule, one CTA per post) + the
+three launch posts from the approved outlines: lucidlink-
+alternatives, smb-slow-over-vpn, your-bytes-are-your-bytes. Facts
+ONLY from RESEARCH_ROUND2/site pages/README with dates; "pick them
+if" fairness blocks mandatory.
+DEFERRED with reasons: /vs-lucidlink|suite|shade pages (L, price-
+drift risk — founder greenlight wanted on a per-competitor page
+strategy); per-page OG cards (M, art direction + svg2png run);
+calculator shareable permalinks (M, touches frozen-formula file's
+display layer — wants its own careful round); /press.html (cheap,
+next round); animation idling (M, must not break no-JS contracts);
+tap-target + print passes (need visual review); Synology/QNAP post
+(BLOCKED on real-hardware validation per testing discipline);
+GitHub repo About/topics/social-preview + README->site deep links
+(launch checklist — repo not public, domain not live).
+- [x] X1 launch-hygiene batch
+- [x] X2 blog scaffold + 3 launch posts
+- [x] X3 QA loop: gates, battery, preview, commit
+
+### Round 7 journal
+- Ideation: experience-audit agent surfaced 12 items, SEO agent 13,
+  blog strategist a full content system + 10-post pipeline. Both
+  infra agents independently flagged the launch landmine: site/
+  iterations/ (27 draft pages, founder comments) ships with the
+  documented deploy, 9 files with no canonical — handled via
+  _headers X-Robots-Tag noindex (robots.txt deliberately does NOT
+  Disallow so crawlers can see the noindex) + site/README deploy
+  note to exclude it from the artifact.
+- X1 shipped: robots.txt (AI crawlers explicitly allowed), 9-URL
+  sitemap.xml (canonical-byte-matched), branded 404 ("That file
+  isn't on this volume."), _headers (docs no-cache pair, security
+  headers, iterations noindex, blog no-cache), theme-color/color-
+  scheme metas, og:site_name/locale/image dims + twitter tags,
+  compare description rewritten to 159 chars, JSON-LD (Software-
+  Application/TechArticle/WebPage; ratings/FAQ/breadcrumbs
+  deliberately omitted with comment), llms.txt with the dated-
+  claims note, sitewide scroll-margin + gated smooth scroll (docs'
+  rail offsets preserved), img dims + lazy/async, footer sitemap
+  group with query-bearing anchors, nav Blog item, two in-body
+  cross-links into the blog, .DS_Store purged.
+- X2 shipped: site/blog/ with index (publishing ritual documented
+  in-file), Atom feed, and three launch posts (1,793/1,443/1,419
+  words): lucidlink-alternatives (disclosure-first roundup),
+  smb-slow-over-vpn (round-trips explainer on the site's own
+  modeled minute), your-bytes-are-your-bytes (exit-cost essay).
+  Eight outline points softened/dropped for source-support honesty,
+  all itemized in the agent report — notably the Shade before/after
+  price pair reduced to "moved, and not down" per RESEARCH_ROUND2's
+  own uncertainty flag, and the migration-tool-as-exit-tool claim
+  corrected to copy-off/juicefs-sync with the Manager as rehearsal.
+- X3: blog-index canonical reconciled to https://juicemount.com/
+  blog/ (sitemap form); battery 37 files / 1,105 refs / 0 broken;
+  honesty spot-checks traced ($1,741 / $27 / $32 / 20 TB / $29.75
+  all present in RESEARCH_ROUND2); sitemap+feed XML-parse; preview:
+  blog index, smb post, 404 all render clean, zero console errors;
+  home DOM probe: nav Blog true, foot-map 6 links, JSON-LD 1,
+  theme-color 2, og:site_name true.
+
+## ROUND 7 CLOSING (2026-06-12)
+Shipped: launch hygiene + blog with three posts. Deferred (founder
+greenlights wanted): /vs-competitor pages, per-page OG cards,
+calculator share-permalinks, /press.html, animation idling, tap-
+target/print passes, Synology post (blocked on real-hardware test),
+GitHub repo About/topics + README->site links (launch checklist).
+Still parked: hero v8 pick (a/b/c), H1 A/B, shipped JM_VOL_NAME,
+scrub video, Suite's table seat.
