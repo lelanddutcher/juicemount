@@ -4,15 +4,33 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>How it compares — JuiceMount vs. storage SaaS and self-hosted sync</title>
-  <meta name="description" content="Pricing front and center: a year-one cost meter at your team size (vendor prices checked June 2026), the exit priced — pulling 20 TB off B2, R2, or Wasabi costs $0 — and the honest lane tables: JuiceMount vs. LucidLink, Suite, Shade, Iconik, Dropbox, Google Drive, and self-hosted sync.">
+  <meta name="description" content="Year-one cost vs LucidLink, Suite, and Shade at your team size, prices checked June 2026. The exit is priced too: pulling 20 TB off B2, R2, or Wasabi costs $0.">
   <link rel="canonical" href="https://juicemount.com/compare.html">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="JuiceMount">
+  <meta property="og:locale" content="en_US">
   <meta property="og:url" content="https://juicemount.com/compare.html">
   <meta property="og:title" content="How it compares — JuiceMount vs. storage SaaS and self-hosted sync">
-  <meta property="og:description" content="Pricing front and center: a year-one cost meter at your team size (vendor prices checked June 2026), the exit priced — pulling 20 TB off B2, R2, or Wasabi costs $0 — and the honest lane tables: JuiceMount vs. LucidLink, Suite, Shade, Iconik, Dropbox, Google Drive, and self-hosted sync.">
+  <meta property="og:description" content="Year-one cost vs LucidLink, Suite, and Shade at your team size, prices checked June 2026. The exit is priced too: pulling 20 TB off B2, R2, or Wasabi costs $0.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="How it compares — JuiceMount vs. storage SaaS and self-hosted sync">
+  <meta name="twitter:description" content="Year-one cost vs LucidLink, Suite, and Shade at your team size, prices checked June 2026. The exit is priced too: pulling 20 TB off B2, R2, or Wasabi costs $0.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#FAFDE8">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17181B">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebPage",
+    "name": "How it compares — JuiceMount vs. storage SaaS and self-hosted sync",
+    "description": "Year-one cost vs LucidLink, Suite, and Shade at your team size, prices checked June 2026. The exit is priced too: pulling 20 TB off B2, R2, or Wasabi costs $0.",
+    "dateModified": "2026-06-12"
+  }
+  </script>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -1167,6 +1185,7 @@
         <li><a href="performance.html">Performance</a></li>
         <li><a href="calculator.html">Calculator</a></li>
         <li><a href="docs.html">Docs</a></li>
+        <li><a href="blog/index.html">Blog</a></li>
         <li><a href="https://github.com/lelanddutcher/juicemount">GitHub ↗</a></li>
       </ul>
     </div>
@@ -1850,6 +1869,8 @@
         <p style="max-width: 46rem">The third corner of the trade: speed and ownership, and nothing else. No offline files, no cache, no WAN story, and Finder grinds on a <span class="num">100&nbsp;K</span>-file library. JuiceMount keeps the LAN speed and adds the missing parts — directory listings answer from local SQLite in <span class="num">15–120&nbsp;ms</span> on a <span class="num">100&nbsp;K+</span>-entry volume, pinned projects survive the network, and the same volume mounts over a WAN (hotel Wi-Fi with pinned files and the write spool is a supported shape).</p>
 
         <p class="small muted" style="max-width: 46rem; margin-top: var(--space-5)">Mountain Duck is a fine generalist — <span class="num">$49</span> one-time to mount almost any bucket for everyday files; it isn't built for scrubbing OCF over the wire and doesn't claim to be. What the rest of this lane does better — maturity, clients everywhere, share links — is named plainly in the compromises section below.</p>
+
+        <p class="small muted" style="max-width: 46rem; margin-top: var(--space-3)">Longer read: <a href="blog/lucidlink-alternatives.html">LucidLink alternatives in 2026, including the one we built</a>.</p>
       </div>
     </section>
 
@@ -1891,6 +1912,14 @@
       <span>Built on <a href="https://github.com/juicedata/juicefs">JuiceFS</a> — credit where due</span>
       <span>This site is static files — no analytics, no telemetry</span>
     </div>
+    <nav class="container foot-map" aria-label="Site map">
+      <a href="compare.html">How it compares to LucidLink, Suite, and Shade</a>
+      <a href="performance.html">Performance: the measured numbers</a>
+      <a href="calculator.html">Rent vs own: the calculator</a>
+      <a href="docs.html">Set it up on your NAS</a>
+      <a href="index.html">Home</a>
+      <a href="blog/index.html">Blog</a>
+    </nav>
   </footer>
 
   <!-- The calculator's own math, loaded whole — window.JMCalc exports the

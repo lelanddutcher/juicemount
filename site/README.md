@@ -118,6 +118,14 @@ and the `_headers` file in this directory only does anything on Cloudflare.
    launch; every page's canonical tag already points at `juicemount.com`,
    which keeps search engines on the domain.
 
+Whichever route deploys, the artifact should exclude `site/iterations/`
+and `.DS_Store` litter. The iterations directory is design drafts, not
+pages; the `/iterations/*` noindex rule in `_headers` is the backstop if a
+copy ships anyway, but the clean move is to not upload drafts at all. Both
+routes run from the repo root, so the same commands work in the Cloudflare
+build command field or as an Actions step before `upload-pages-artifact`:
+`rm -rf site/iterations && find site -name .DS_Store -delete`.
+
 ## Cache headers
 
 `site/_headers` ships the rules (Cloudflare Pages format; inert on any

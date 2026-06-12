@@ -7,12 +7,30 @@
   <meta name="description" content="Step-by-step JuiceMount setup: confirm your NAS can run the server stack (TrueNAS SCALE, Synology, QNAP, Unraid, or any Docker box), bring up Redis + MinIO + JuiceFS with one compose file, verify it from your Mac, build the menu-bar app, and mount your library in Finder.">
   <link rel="canonical" href="https://juicemount.com/docs.html">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="JuiceMount">
+  <meta property="og:locale" content="en_US">
   <meta property="og:url" content="https://juicemount.com/docs.html">
   <meta property="og:title" content="Set up JuiceMount — from your NAS to first mount">
   <meta property="og:description" content="Confirm your NAS can run the stack, bring it up with one compose file, verify it from your Mac, build the menu-bar app, and mount your library in Finder. Every step, every command, honest about what is tested.">
   <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Set up JuiceMount — from your NAS to first mount">
+  <meta name="twitter:description" content="Confirm your NAS can run the stack, bring it up with one compose file, verify it from your Mac, build the menu-bar app, and mount your library in Finder. Every step, every command, honest about what is tested.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#FAFDE8">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#17181B">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "TechArticle",
+    "headline": "Set up JuiceMount — from your NAS to first mount",
+    "description": "Step-by-step JuiceMount setup: confirm your NAS can run the server stack (TrueNAS SCALE, Synology, QNAP, Unraid, or any Docker box), bring up Redis + MinIO + JuiceFS with one compose file, verify it from your Mac, build the menu-bar app, and mount your library in Finder.",
+    "dateModified": "2026-06-12"
+  }
+  </script>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" sizes="32x32" href="favicon-32.png">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -49,9 +67,7 @@
        no fetches — works double-clicked from a folder (file://).
        ====================================================================== -->
   <style>
-    @media (prefers-reduced-motion: no-preference) {
-      html { scroll-behavior: smooth; }
-    }
+    /* smooth scroll moved to assets/site.css (sitewide, same motion gate) */
 
     /* ---- hero ----------------------------------------------------------- */
     .docs-hero { padding-block: var(--space-8) var(--space-7); }
@@ -646,6 +662,7 @@
         <li><a href="performance.html">Performance</a></li>
         <li><a href="calculator.html">Calculator</a></li>
         <li><a href="docs.html" aria-current="page">Docs</a></li>
+        <li><a href="blog/index.html">Blog</a></li>
         <li><a href="https://github.com/lelanddutcher/juicemount">GitHub ↗</a></li>
       </ul>
     </div>
@@ -1198,19 +1215,19 @@ S3 Endpoint Override: http://&lt;nas-ip&gt;:30151/zpool</code></pre>
           <p>The menu-bar icon is the status system — the tint is the signal. These are the marks the app ships:</p>
           <ul class="statelist">
             <li>
-              <img src="assets/state-healthy.svg" alt="" width="22" height="22">
+              <img src="assets/state-healthy.svg" alt="" width="22" height="22" loading="lazy" decoding="async">
               <div><strong>Green — healthy</strong><span class="muted">All systems healthy: Redis, MinIO, FUSE, and the NFS mount all reachable. At 50% opacity it means idle — the server isn&rsquo;t started.</span></div>
             </li>
             <li>
-              <img src="assets/state-degraded.svg" alt="" width="22" height="22">
+              <img src="assets/state-degraded.svg" alt="" width="22" height="22" loading="lazy" decoding="async">
               <div><strong>Amber — degraded</strong><span class="muted">Running, but a backend (Redis / MinIO / FUSE / NFS) is unhealthy or recovering. The popover names which one and why.</span></div>
             </li>
             <li>
-              <img src="assets/state-offline-files.svg" alt="" width="22" height="22">
+              <img src="assets/state-offline-files.svg" alt="" width="22" height="22" loading="lazy" decoding="async">
               <div><strong>Blue — offline-files mode</strong><span class="muted">Pinned files served locally at SSD speed; un-pinned reads fail fast instead of hanging.</span></div>
             </li>
             <li>
-              <img src="assets/state-fault.svg" alt="" width="22" height="22">
+              <img src="assets/state-fault.svg" alt="" width="22" height="22" loading="lazy" decoding="async">
               <div><strong>Red — fault</strong><span class="muted">Unreachable, start failed, or disconnected. The failure message surfaces in the popover.</span></div>
             </li>
           </ul>
@@ -1467,6 +1484,14 @@ S3 Endpoint Override: http://&lt;tailscale-address&gt;:30151/zpool</code></pre>
       <span>Built on <a href="https://github.com/juicedata/juicefs">JuiceFS</a> — credit where due</span>
       <span>This site is static files — no analytics, no telemetry</span>
     </div>
+    <nav class="container foot-map" aria-label="Site map">
+      <a href="compare.html">How it compares to LucidLink, Suite, and Shade</a>
+      <a href="performance.html">Performance: the measured numbers</a>
+      <a href="calculator.html">Rent vs own: the calculator</a>
+      <a href="docs.html">Set it up on your NAS</a>
+      <a href="index.html">Home</a>
+      <a href="blog/index.html">Blog</a>
+    </nav>
   </footer>
 
   <script>
