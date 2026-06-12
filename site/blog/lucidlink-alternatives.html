@@ -10,8 +10,10 @@
   <meta property="og:url" content="https://juicemount.com/blog/lucidlink-alternatives.html">
   <meta property="og:title" content="LucidLink alternatives in 2026, including the one we built">
   <meta property="og:description" content="A comparison written by the people who build one of the options. Every price checked June 2026 and sourced, with JuiceMount's caveats stated harder than anyone else's.">
-  <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
-  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.">
+  <meta property="og:image" content="https://juicemount.com/assets/og-blog-lucidlink.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="The JuiceMount citrus mark on a cinema-dark blog card: LucidLink alternatives in 2026, including the one we built · year one at 5 seats / 10 TB: $9,300 vs $2,703 · prices checked June 2026.">
   <meta name="twitter:card" content="summary_large_image">
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" sizes="32x32" href="../favicon-32.png">
@@ -144,6 +146,237 @@
       color: var(--text-muted);
     }
     details.src li { margin-top: var(--space-2); }
+
+    /* ---- fg: enrichment layer (this post only) --------------------------
+       Figures drawn in code, all token-driven so light/dark stay linked.
+       Static-first: the one animation (year-one bars growing to their
+       published widths) sits behind prefers-reduced-motion: no-preference,
+       and the markup ships the final widths inline, so with animation off
+       the chart is already complete. ------------------------------------ */
+
+    /* heading anchors: one spec across the blog posts. Resting color is
+       var(--text-muted); revealed on heading hover or the anchor's own
+       focus; underlined on hover and focus. */
+    .fg-anchor {
+      font-family: var(--font-mono);
+      font-weight: var(--fw-text);
+      font-size: 0.65em;
+      margin-left: 0.4ch;
+      color: var(--text-muted);
+      text-decoration: none;
+      opacity: 0;
+      transition: opacity var(--dur) var(--ease);
+    }
+    .post-body h2:hover .fg-anchor,
+    .fg-anchor:focus { opacity: 1; }
+    .fg-anchor:hover,
+    .fg-anchor:focus { text-decoration: underline; }
+    .fg-anchor:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+    /* shared figure internals */
+    .fg-fig { margin-block: var(--space-5); }
+    .fg-fig > .label { display: block; margin: 0 0 var(--space-4); }
+
+    /* the five questions, as tiles */
+    .fg-quiz {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: var(--space-3);
+    }
+    .fg-q {
+      border: 1.5px solid var(--hairline-soft);
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+      padding: var(--space-4);
+    }
+    .fg-glyph { width: 26px; height: 26px; margin-bottom: var(--space-2); color: var(--text-muted); }
+    .fg-glyph .fg-ga  { stroke: var(--chart-self); }
+    .fg-glyph .fg-gaf { fill: var(--chart-self); stroke: none; }
+    .fg-glyph .fg-gb  { stroke: var(--chart-saas); }
+    .fg-q-k { margin: 0 0 var(--space-1); }
+    .fg-q-k .label { display: block; margin-bottom: 2px; }
+    .fg-q-t { margin: 0; font-size: var(--fs-small); color: var(--text-muted); }
+
+    /* pull stats at section boundaries */
+    .fg-stat {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: var(--space-2) var(--space-5);
+      border: 1.5px solid var(--tint-blue-border);
+      background: var(--tint-blue);
+      border-radius: var(--radius);
+      padding: var(--space-4) var(--space-5);
+      margin: var(--space-5) 0;
+    }
+    .fg-stat-num {
+      font-family: var(--font-mono);
+      font-weight: var(--fw-head);
+      font-size: var(--fs-h3);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .fg-stat-line { margin: 0; flex: 1 1 16rem; font-size: var(--fs-small); color: var(--text-muted); }
+
+    /* the architecture map: four shapes of tool */
+    .fg-map {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: var(--space-3);
+    }
+    .fg-mcol {
+      border: 1.5px solid var(--hairline-soft);
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+      padding: var(--space-4);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+    }
+    .fg-mcol > .label { margin: 0; }
+    .fg-tools { margin: 0; display: flex; flex-wrap: wrap; gap: var(--space-1); }
+    .fg-chip {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      border: 1px solid var(--hairline);
+      border-radius: 999px;
+      padding: 0.1em 0.6em;
+      white-space: nowrap;
+    }
+    .fg-chip-jm { border-color: var(--tint-green-border); background: var(--tint-green); }
+    .fg-mcost {
+      margin: 0;
+      margin-top: auto;
+      padding-top: var(--space-2);
+      border-top: 1px dashed var(--hairline-soft);
+      font-size: var(--fs-small);
+      color: var(--text-muted);
+    }
+
+    /* the year-one bars (same visual language as compare.html's meter:
+       Stream Blue for SaaS, solid green one-time hardware, hatched green
+       for the year of power + mirror, slate hatch for no-published-price) */
+    .fg-bill { display: grid; gap: var(--space-4); }
+    .fg-brow {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 4px var(--space-4);
+      align-items: end;
+    }
+    .fg-bname { font-weight: var(--fw-head); font-size: var(--fs-small); }
+    .fg-bval {
+      font-family: var(--font-mono);
+      font-weight: var(--fw-head);
+      font-variant-numeric: tabular-nums;
+      font-size: 1.1rem;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .fg-bval.fg-quote { font-size: 0.82rem; }
+    .fg-btrack {
+      grid-column: 1 / -1;
+      display: flex;
+      height: 13px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      border: 1px solid var(--hairline-soft);
+      overflow: hidden;
+    }
+    .fg-bfill { display: block; height: 100%; background: var(--chart-saas); }
+    .fg-bfill.fg-capex { background: var(--chart-self); }
+    .fg-bfill.fg-opex {
+      background: repeating-linear-gradient(135deg, var(--chart-self) 0 3px, var(--tint-green) 3px 7px);
+    }
+    .fg-btrack.fg-na {
+      background: repeating-linear-gradient(135deg, var(--tint-slate) 0 4px, transparent 4px 9px);
+    }
+    .fg-bsplit {
+      grid-column: 1 / -1;
+      margin: 0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35em 1.1em;
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+    .fg-bsplit i { font-style: normal; display: inline-flex; align-items: center; gap: 0.45em; }
+    .fg-bsplit i::before { content: ""; width: 9px; height: 9px; border-radius: 2px; flex: none; }
+    .fg-bsplit .fg-capex::before { background: var(--chart-self); }
+    .fg-bsplit .fg-opex::before {
+      background: repeating-linear-gradient(135deg, var(--chart-self) 0 2px, var(--tint-green) 2px 4px);
+    }
+    .fg-bbasis { grid-column: 1 / -1; margin: 0; font-size: var(--fs-small); color: var(--text-muted); }
+    .fg-bbasis .num { font-size: 0.95em; }
+    .fg-attr { margin: var(--space-4) 0 0; font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); }
+    @media (max-width: 560px) {
+      .fg-brow { grid-template-columns: 1fr; align-items: start; }
+      .fg-bval { text-align: left; }
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .fg-bfill { animation: fg-grow 900ms var(--ease) both; }
+      .fg-brow:nth-child(2) .fg-bfill { animation-delay: 90ms; }
+      .fg-brow:nth-child(3) .fg-bfill { animation-delay: 180ms; }
+      .fg-brow:nth-child(4) .fg-bfill { animation-delay: 270ms; }
+      .fg-brow:nth-child(5) .fg-bfill { animation-delay: 360ms; }
+    }
+    @keyframes fg-grow { from { width: 0; } }
+
+    /* decision cards: vendor, pick-if, dated price chip */
+    .fg-picks {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: var(--space-3);
+    }
+    .fg-pick {
+      border: 1.5px solid var(--hairline-soft);
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+      padding: var(--space-4);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+    }
+    .fg-pick-name { margin: 0; font-weight: var(--fw-head); }
+    .fg-pick-if { margin: 0; font-size: var(--fs-small); color: var(--text-muted); flex: 1 1 auto; }
+    .fg-price {
+      margin: 0;
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 0.75rem;
+      border: 1px solid var(--hairline-soft);
+      border-radius: 999px;
+      padding: 0.15em 0.7em;
+      align-self: flex-start;
+      background: var(--surface);
+    }
+    .fg-pick-jm { border-color: var(--tint-green-border); background: var(--tint-green); }
+
+    /* the caveats, made to look like what they are: the page's loudest card */
+    .fg-caveat {
+      border: 2px solid var(--tint-amber-border);
+      background: var(--tint-amber);
+      border-radius: var(--radius);
+      padding: var(--space-5);
+      margin: 0 0 var(--space-5);
+    }
+    .fg-caveat-label { display: block; margin-bottom: var(--space-3); }
+    .fg-caveat-label::before {
+      content: "";
+      display: inline-block;
+      width: 0.7em;
+      height: 0.7em;
+      background: var(--amber);
+      border-radius: 2px;
+      margin-right: 0.5em;
+    }
+    .fg-caveat ul { margin: 0; padding-left: 1.2em; display: grid; gap: var(--space-2); }
+    .fg-caveat li { margin: 0; }
   </style>
 </head>
 <body>
@@ -215,7 +448,7 @@
         <p class="post-meta">
           <span>Leland Dutcher · JuiceMount's author</span>
           <span>published <time class="num" datetime="2026-06-12">2026-06-12</time></span>
-          <span class="num">8 min read</span>
+          <span class="num">10 min read</span>
         </p>
         <p class="post-facts">Competitor facts checked June 2026; verify before relying on them.</p>
       </div>
@@ -227,96 +460,212 @@
 
           <p>Disclosure before anything else: we build one of the alternatives on this page. JuiceMount is open source, written by the author of this post, and it appears below with its caveats stated harder than anyone else's. Every price here was checked June 2026 against the vendor's public pages, is dated inline, and is worth re-verifying before you sign anything; the sources sit in the open at the end.</p>
 
-          <h2>What LucidLink gets right, and what it costs</h2>
+          <h2 id="what-lucidlink-gets-right">What LucidLink gets right, and what it costs <a class="fg-anchor" href="#what-lucidlink-gets-right" aria-label="link to this section">#</a></h2>
           <p>Start with respect. LucidLink proved the workflow this whole category sells: a volume that mounts like a local drive and streams the blocks you touch instead of syncing whole files, for teams that stopped sharing a building. JuiceMount's own README introduces the product as a LucidLink-style mounted volume, which is about as direct as credit gets.</p>
           <p>What it costs, checked June 2026 at their pricing page: Business is <span class="num">$27</span>/user/mo on annual billing, currently a promo off the <span class="num">$32</span> list price. Each seat brings <span class="num">400&nbsp;GB</span> of pooled storage; past the pool it is <span class="num">$8</span> per <span class="num">100&nbsp;GB</span> per month. Business caps at <span class="num">25</span> members; the page calls it best for up to <span class="num">10&nbsp;TB</span>, in their words. Starter is <span class="num">$7</span>/user/mo with <span class="num">100&nbsp;GB</span> per seat, a <span class="num">10</span>-seat cap, and a <span class="num">1&nbsp;TB</span> ceiling.</p>
           <p>Two more pieces exist that you cannot price from the outside, both checked June 2026. TeamCache puts a shared cache on what their page calls a commodity on-prem server with SSD storage, supplied by you; it is an early-release Enterprise add-on, enabled by talking to them. Connect, announced March 2026, mounts S3 buckets you already own into their filesystem; Enterprise plans only, no published price. Their Custom tier can also point at S3-compatible stores, on-prem included. The direction is worth noting: LucidLink is moving toward storage you own, priced by quote.</p>
 
-          <h2>The five questions that decide it</h2>
-          <p>Vendor names age fast; these questions don't. Run every candidate, ours included, through all five.</p>
-          <ol>
-            <li><strong>Where do the bytes live?</strong> Their cloud, a bucket you control, or nowhere central at all; this one predicts most of the others.</li>
-            <li><strong>Streaming or sync?</strong> Block-level streaming opens a <span class="num">100&nbsp;GB</span> clip by moving only the blocks you play. Whole-file sync moves all <span class="num">100&nbsp;GB</span> before the first frame.</li>
-            <li><strong>What is the offline story?</strong> Documented pinning you can test, or an FAQ shrug.</li>
-            <li><strong>What does leaving cost?</strong> Egress fees, credit meters, or a plain re-download project.</li>
-            <li><strong>Who do you call when it breaks?</strong> A vendor with a support queue, or yourself with a runbook. Neither answer is wrong; pretending you picked the other one is.</li>
-          </ol>
+          <aside class="fg-stat" role="note">
+            <span class="fg-stat-num num">$8 / 100&nbsp;GB / mo</span>
+            <p class="fg-stat-line">At library scale that is the <span class="num">$80</span>-per-TB-per-month class, and it is most of LucidLink's line in the worked bill below · checked June 2026</p>
+          </aside>
 
-          <h2>The SaaS alternatives, each with a fair pick-this-if</h2>
+          <h2 id="the-five-questions">The five questions that decide it <a class="fg-anchor" href="#the-five-questions" aria-label="link to this section">#</a></h2>
+          <p>Vendor names age fast; these questions don't. Run every candidate, ours included, through all five.</p>
+          <figure class="figure fg-fig">
+            <p class="label">the five questions · every candidate, ours included</p>
+            <ol class="fg-quiz" role="list">
+              <li class="fg-q">
+                <svg class="fg-glyph" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <ellipse cx="16" cy="8.5" rx="9.5" ry="4"/>
+                  <path d="M6.5 8.5v15c0 2.2 4.3 4 9.5 4s9.5-1.8 9.5-4v-15"/>
+                  <path d="M6.5 16c0 2.2 4.3 4 9.5 4s9.5-1.8 9.5-4"/>
+                  <circle class="fg-gaf" cx="16" cy="23.5" r="1.8"/>
+                </svg>
+                <p class="fg-q-k"><span class="label">q1</span> <strong>Where do the bytes live?</strong></p>
+                <p class="fg-q-t">Their cloud, a bucket you control, or nowhere central at all; this one predicts most of the others.</p>
+              </li>
+              <li class="fg-q">
+                <svg class="fg-glyph" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <path class="fg-gaf" d="M17 5l4.5 2.8L17 10.6z" stroke="none"/>
+                  <rect x="4" y="14" width="24" height="8" rx="2"/>
+                  <path d="M9.8 14v8M15.6 14v8M21.4 14v8"/>
+                  <rect class="fg-gaf" x="15.6" y="14" width="5.8" height="8" stroke="none"/>
+                </svg>
+                <p class="fg-q-k"><span class="label">q2</span> <strong>Streaming or sync?</strong></p>
+                <p class="fg-q-t">Block-level streaming opens a <span class="num">100&nbsp;GB</span> clip by moving only the blocks you play. Whole-file sync moves all <span class="num">100&nbsp;GB</span> before the first frame.</p>
+              </li>
+              <li class="fg-q">
+                <svg class="fg-glyph" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <path d="M16 4.5v12.5"/>
+                  <path d="M10.5 11.5 16 17l5.5-5.5"/>
+                  <path class="fg-ga" d="M6.5 21v5a1.5 1.5 0 0 0 1.5 1.5h16a1.5 1.5 0 0 0 1.5-1.5v-5"/>
+                </svg>
+                <p class="fg-q-k"><span class="label">q3</span> <strong>What is the offline story?</strong></p>
+                <p class="fg-q-t">Documented pinning you can test, or an FAQ shrug.</p>
+              </li>
+              <li class="fg-q">
+                <svg class="fg-glyph" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <path d="M19 5.5H8a1.5 1.5 0 0 0-1.5 1.5v18A1.5 1.5 0 0 0 8 26.5h11"/>
+                  <path class="fg-gb" d="M13.5 16h12"/>
+                  <path class="fg-gb" d="M21.5 11.5 26 16l-4.5 4.5"/>
+                </svg>
+                <p class="fg-q-k"><span class="label">q4</span> <strong>What does leaving cost?</strong></p>
+                <p class="fg-q-t">Egress fees, credit meters, or a plain re-download project.</p>
+              </li>
+              <li class="fg-q">
+                <svg class="fg-glyph" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <path d="M8.7 5.6 12 9.5c.5.6.5 1.5 0 2.1l-1.6 1.9a17 17 0 0 0 8.1 8.1l1.9-1.6c.6-.5 1.5-.5 2.1 0l3.9 3.3c.7.6.8 1.7.1 2.4-1.2 1.3-2.9 2.1-4.6 1.8C13.7 26 6 18.3 4.5 10.1c-.3-1.7.5-3.4 1.8-4.6.7-.7 1.8-.6 2.4.1z"/>
+                </svg>
+                <p class="fg-q-k"><span class="label">q5</span> <strong>Who do you call when it breaks?</strong></p>
+                <p class="fg-q-t">A vendor with a support queue, or yourself with a runbook. Neither answer is wrong; pretending you picked the other one is.</p>
+              </li>
+            </ol>
+            <figcaption>The five questions that outlive vendor names. Question <span class="num">4</span> gets a full post of its own: <a href="your-bytes-are-your-bytes.html">your bytes are your bytes, on what leaving actually costs</a>.</figcaption>
+          </figure>
+          <p>Run questions one and two across the field and the tools sort into four shapes. Knowing which shape you are buying matters more than any single price on this page.</p>
+          <figure class="figure fg-fig">
+            <p class="label">the architecture map · four shapes of tool</p>
+            <div class="fg-map">
+              <div class="fg-mcol">
+                <p class="label">mounted streaming drive</p>
+                <p class="fg-tools"><span class="fg-chip">LucidLink</span> <span class="fg-chip">Suite</span> <span class="fg-chip">Shade</span> <span class="fg-chip fg-chip-jm">JuiceMount</span></p>
+                <p class="fg-mcost">A volume that streams blocks on demand. The shape's cost: rent on the mount, per seat or per TB; self-hosting trades the rent for ops you own.</p>
+              </div>
+              <div class="fg-mcol">
+                <p class="label">whole-file sync</p>
+                <p class="fg-tools"><span class="fg-chip">Dropbox class</span> <span class="fg-chip">Nextcloud</span> <span class="fg-chip">Seafile</span></p>
+                <p class="fg-mcost">Files copy in full before they open. The shape's cost: a <span class="num">100&nbsp;GB</span> clip is <span class="num">100&nbsp;GB</span> of waiting before the first frame.</p>
+              </div>
+              <div class="fg-mcol">
+                <p class="label">media asset manager</p>
+                <p class="fg-tools"><span class="fg-chip">iconik</span></p>
+                <p class="fg-mcost">Indexes media wherever it lives. The shape's cost: a second bill, because something else still has to hold the bytes.</p>
+              </div>
+              <div class="fg-mcol">
+                <p class="label">p2p transfer</p>
+                <p class="fg-tools"><span class="fg-chip">Strada</span></p>
+                <p class="fg-mcost">Collaborators reach your drives directly. The shape's cost: no central copy, so the volume is only as on as the source machine.</p>
+              </div>
+            </div>
+            <figcaption>Each tool placed by its own positioning, checked June 2026. Plain SMB over a VPN is a fifth shape, a real mount with no streaming layer; <a href="smb-slow-over-vpn.html">its failure arithmetic gets its own post</a>. JuiceMount sits in the first column on purpose: same shape as LucidLink, except you host it.</figcaption>
+          </figure>
+
+          <h2 id="the-saas-alternatives">The SaaS alternatives, each with a fair pick-this-if <a class="fg-anchor" href="#the-saas-alternatives" aria-label="link to this section">#</a></h2>
+          <p>Vendor by vendor, the judgment call on each. The spec-by-spec rows for every lane, with a source beside each number, live in <a href="../compare.html">the compare page's lane tables</a>.</p>
           <p><strong>Suite Studios.</strong> The closest analog to LucidLink: a streaming storage volume for editors, managed at <span class="num">$75/TB/mo</span> with <span class="num">5</span> seats included and <span class="num">$10</span>/user/mo after, checked June 2026. Bring-your-own-storage drops Suite's fee to <span class="num">$40/TB/mo</span> with two catches their own docs state: a <span class="num">20&nbsp;TB</span> minimum, and your cloud provider bills storage and egress separately on top. Their on-prem cache tech is real: Onsite Caching is a listed plan feature, a whole studio can share one cache box, and Suite requires SSD for it, on hardware you buy. The company is funded: a <span class="num">$12.5M</span> Series A closed April 2025 (checked June 2026). Pick Suite if you want a managed mount with the strongest shared-cache story in the SaaS lane and the per-TB meter fits your library.</p>
-          <p><strong>Shade.</strong> <span class="num">$29.75</span>/seat/mo on annual billing, <span class="num">$35</span> monthly, with <span class="num">500&nbsp;GB</span> of active storage per seat and a <span class="num">15</span>-seat cap on the Growth tier, checked June 2026. Above the included active storage there is no published rate: allocations are listed, overage is not, so a bigger library is a sales conversation. The AI search is genuinely good and genuinely the point: natural-language search down to the moment inside a clip, and a <span class="num">$14M</span> round closed March 2026 largely on that bet (checked June 2026). Offline pinning is documented in their academy. Pick Shade if your team is small, the active working set fits in <span class="num">500&nbsp;GB</span> per seat, and searching inside footage is worth more to you than per-TB economics.</p>
+          <p><strong>Shade.</strong> <span class="num">$29.75</span>/seat/mo on annual billing, <span class="num">$35</span> monthly, with <span class="num">500&nbsp;GB</span> of active storage per seat and a <span class="num">15</span>-seat cap on the Growth tier, checked June 2026. Above the included active storage there is no published rate: allocations are listed, overage is not, so a bigger library is a sales conversation. The AI search is genuinely good and genuinely the point: natural-language search down to the moment inside a clip, and a <span class="num">$14M</span> round announced in spring 2026 largely on that bet (TechCrunch, 2026-04-22). Offline pinning is documented in their academy. Pick Shade if your team is small, the active working set fits in <span class="num">500&nbsp;GB</span> per seat, and searching inside footage is worth more to you than per-TB economics.</p>
           <p><strong>iconik.</strong> A media asset manager, not a mount: it indexes media where it lives and adds search, metadata, proxies, and review on top. Seats, checked June 2026: Collaborator <span class="num">$0</span>, Browse <span class="num">$9</span>, Standard <span class="num">$65</span>, Power <span class="num">$120</span> per user/mo; storage is metered through prepaid credits, quote-only, and egress is billed through those credits too. Its Storage Gateway runs on your hardware, packaged even as a TrueNAS app. Pick iconik if the problem is finding and managing media across storage you already have, and pair it with whatever actually holds the bytes.</p>
 
-          <h2>Adjacent categories that solve a different problem</h2>
+          <h2 id="adjacent-categories">Adjacent categories that solve a different problem <a class="fg-anchor" href="#adjacent-categories" aria-label="link to this section">#</a></h2>
           <p><strong>Strada.</strong> Peer-to-peer access to drives you already own: <span class="num">$8</span>/user/mo with <span class="num">250&nbsp;GB</span> of transfer per month, <span class="num">$24</span> for unlimited transfer, checked June 2026. It stores nothing: files stay on your drives and collaborators reach them directly, which also means there is no volume when the source machine is off. Pick Strada when one person's drives need to be reachable by remote collaborators and nobody wants to run an always-on server.</p>
           <p><strong>Self-hosted sync.</strong> Nextcloud, Seafile, and the Mountain Duck class give you ownership, and they sync whole files by architecture: opening a <span class="num">100&nbsp;GB</span> clip to check one shot means moving <span class="num">100&nbsp;GB</span>. Nextcloud's server is free to self-host, and paid Enterprise support starts at <span class="num">100</span> users at roughly <span class="num">€68</span>/user/yr, checked June 2026, so the cost argument is real; large-file pain on the macOS client is documented on their own issue tracker. Pick this class for documents and deliverables, not for scrubbing camera originals.</p>
           <p><strong>Plain SMB over a VPN.</strong> <span class="num">$0</span>, fully yours, and the failure mode is specific and measurable: round-trip latency multiplied by a chatty protocol, which no bandwidth upgrade fixes. We wrote that arithmetic up separately in <a href="smb-slow-over-vpn.html">why your NAS feels slow over a VPN</a>.</p>
 
-          <h2>JuiceMount, with the caveats stated first</h2>
-          <p>The entry we are biased about, caveats first. JuiceMount is macOS-only (14 or later), and Intel Macs are untested. It is pre-1.0, and building from source is currently the only way to get the app. There is no managed service and no support contract: you run a Docker stack on a box you own, and a failed disk on your NAS is your failed disk. Every performance number we publish is the author's own measurement on his own rig, not an independent benchmark. Multi-machine mounting is the designed workflow, but heavy simultaneous multi-editor use has not been soak-tested yet; most QA to date is single-editor. That last sentence is the README's own language, not a critic's.</p>
-          <p>What you get for tolerating all of that: the mounted-volume workflow at <span class="num">$0</span> per seat under Apache-2.0. Block-level partial reads, documented offline pinning, an opt-in write spool, instant filename search, on storage you control, with file data in JuiceFS's open, documented chunk format so the exit never needs our permission.</p>
+          <h2 id="juicemount-caveats-first">JuiceMount, with the caveats stated first <a class="fg-anchor" href="#juicemount-caveats-first" aria-label="link to this section">#</a></h2>
+          <p>The entry we are biased about, caveats first.</p>
+          <aside class="fg-caveat" role="note" aria-label="JuiceMount's caveats, stated before its pitch">
+            <span class="label fg-caveat-label">read before the pitch · this is our own product</span>
+            <ul>
+              <li><strong>macOS-only.</strong> 14 or later, and Intel Macs are untested.</li>
+              <li><strong>Pre-1.0.</strong> Building from source is currently the only way to get the app.</li>
+              <li><strong>No managed service, no support contract.</strong> You run a Docker stack on a box you own; <a href="../docs.html">the setup guide</a> shows exactly what you would be signing up to operate. A failed disk on your NAS is your failed disk.</li>
+              <li><strong>Single-author measurements.</strong> Every number on <a href="../performance.html">our performance page</a> is the author's own measurement on his own rig, not an independent benchmark.</li>
+              <li><strong>Multi-editor is not soak-tested.</strong> Multi-machine mounting is the designed workflow, but heavy simultaneous multi-editor use has not been soak-tested yet; most QA to date is single-editor. That sentence is the README's own language, not a critic's.</li>
+            </ul>
+          </aside>
+          <p>What you get for tolerating all of that: the mounted-volume workflow at <span class="num">$0</span> per seat under Apache-2.0. Block-level partial reads, documented offline pinning, an opt-in write spool, instant filename search, on storage you control, with file data in JuiceFS's open, documented chunk format so the exit never needs our permission. The compare page <a href="../compare.html#exit">prices that exit at 20&nbsp;TB</a> against AWS, B2, R2, and Wasabi.</p>
 
-          <h2>The bill, worked once</h2>
-          <p>Five seats, a <span class="num">10&nbsp;TB</span> library held steady, year one. These are the <a href="../compare.html#meter">compare page's published bars</a>, computed by the same code the public calculator runs, vendor prices checked June 2026:</p>
-          <table class="post-table">
-            <caption>Year one at 5 seats and 10 TB, library held steady</caption>
-            <thead>
-              <tr>
-                <th scope="col">Option</th>
-                <th scope="col">Year-one total</th>
-                <th scope="col">Basis</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <th scope="row">LucidLink Business</th>
-                <td class="num">$9,300</td>
-                <td><span class="num">$27</span>/seat/mo annual (promo off <span class="num">$32</span> list) plus <span class="num">$8</span>/<span class="num">100&nbsp;GB</span> beyond the <span class="num">2&nbsp;TB</span> the five seats pool</td>
-              </tr>
-              <tr>
-                <th scope="row">Suite, managed</th>
-                <td class="num">$9,000</td>
-                <td><span class="num">$75/TB/mo</span> × <span class="num">10&nbsp;TB</span>, 5 seats included</td>
-              </tr>
-              <tr>
-                <th scope="row">Suite, BYO storage</th>
-                <td class="num">$5,520</td>
-                <td><span class="num">$40/TB/mo</span> mount fee plus a B2-class bucket at <span class="num">$6/TB/mo</span><span class="note">their published BYO minimum is <span class="num">20&nbsp;TB</span>, above this library's size</span></td>
-              </tr>
-              <tr>
-                <th scope="row">Shade Growth</th>
-                <td>Enterprise quote</td>
-                <td>5 seats include <span class="num">2.5&nbsp;TB</span> active storage; a <span class="num">10&nbsp;TB</span> library is past the published tier</td>
-              </tr>
-              <tr>
-                <th scope="row">JuiceMount on your hardware</th>
-                <td class="num">$2,703</td>
-                <td><span class="num">$1,825</span> one-time hardware at calculator defaults plus <span class="num">$878</span> of year-one power and offsite mirror; about <span class="num">$878</span>/yr after that<span class="note">seats do not change this row; already own the box and year one shrinks to the running costs</span></td>
-              </tr>
-            </tbody>
-          </table>
-          <p>The hardware line keeps the 3-2-1 honesty: a <span class="num">$6/TB/mo</span> offsite mirror, a <span class="num">$1,200</span> DIY build, drives at <span class="num">$25</span> per usable TB, <span class="num">120&nbsp;W</span> at <span class="num">$0.15/kWh</span>. Real libraries grow; the deep link below pins growth to zero so the calculator reproduces these exact bars.</p>
+          <h2 id="the-bill-worked-once">The bill, worked once <a class="fg-anchor" href="#the-bill-worked-once" aria-label="link to this section">#</a></h2>
+          <p>Five seats, a <span class="num">10&nbsp;TB</span> library held steady, year one. These are the compare page's published bars, computed by the same code the public calculator runs, vendor prices checked June 2026:</p>
+          <figure class="figure fg-fig">
+            <p class="label">year one · 5 seats · 10 TB · library held steady</p>
+            <div class="fg-bill">
+              <div class="fg-brow" role="group" aria-label="LucidLink Business: $9,300 in year one at 5 seats and 10 TB, checked June 2026">
+                <span class="fg-bname">LucidLink Business</span>
+                <span class="fg-bval num">$9,300</span>
+                <span class="fg-btrack" aria-hidden="true"><i class="fg-bfill" style="width:100%"></i></span>
+                <p class="fg-bbasis"><span class="num">$27</span>/seat/mo annual (promo off <span class="num">$32</span> list) plus <span class="num">$8</span>/<span class="num">100&nbsp;GB</span> beyond the <span class="num">2&nbsp;TB</span> the five seats pool</p>
+              </div>
+              <div class="fg-brow" role="group" aria-label="Suite managed: $9,000 in year one at 5 seats and 10 TB, checked June 2026">
+                <span class="fg-bname">Suite, managed</span>
+                <span class="fg-bval num">$9,000</span>
+                <span class="fg-btrack" aria-hidden="true"><i class="fg-bfill" style="width:96.8%"></i></span>
+                <p class="fg-bbasis"><span class="num">$75/TB/mo</span> × <span class="num">10&nbsp;TB</span>, 5 seats included</p>
+              </div>
+              <div class="fg-brow" role="group" aria-label="Suite BYO storage: $5,520 in year one at 5 seats and 10 TB, checked June 2026">
+                <span class="fg-bname">Suite, BYO storage</span>
+                <span class="fg-bval num">$5,520</span>
+                <span class="fg-btrack" aria-hidden="true"><i class="fg-bfill" style="width:59.4%"></i></span>
+                <p class="fg-bbasis"><span class="num">$40/TB/mo</span> mount fee plus a B2-class bucket at <span class="num">$6/TB/mo</span>; their published BYO minimum is <span class="num">20&nbsp;TB</span>, above this library's size</p>
+              </div>
+              <div class="fg-brow" role="group" aria-label="Shade Growth: past the published Growth-tier active-storage cap at 5 seats and 10 TB; Enterprise quote, checked June 2026">
+                <span class="fg-bname">Shade Growth</span>
+                <span class="fg-bval num fg-quote">Enterprise quote</span>
+                <span class="fg-btrack fg-na" aria-hidden="true"><i class="fg-bfill" style="width:0%"></i></span>
+                <p class="fg-bbasis">5 seats include <span class="num">2.5&nbsp;TB</span> active storage; a <span class="num">10&nbsp;TB</span> library is past the published tier</p>
+              </div>
+              <div class="fg-brow" role="group" aria-label="JuiceMount: $2,703 in year one at 10 TB; $1,825 one-time hardware plus $878 of power and offsite mirror, calculator defaults">
+                <span class="fg-bname">JuiceMount on your hardware</span>
+                <span class="fg-bval num">$2,703</span>
+                <span class="fg-btrack" aria-hidden="true"><i class="fg-bfill fg-capex" style="width:19.6%"></i><i class="fg-bfill fg-opex" style="width:9.4%"></i></span>
+                <p class="fg-bsplit" aria-hidden="true"><i class="fg-capex">$1,825 one-time</i><i class="fg-opex">$878 power + mirror, year 1</i></p>
+                <p class="fg-bbasis"><span class="num">$1,825</span> one-time hardware at calculator defaults plus <span class="num">$878</span> of year-one power and offsite mirror; about <span class="num">$878</span>/yr after that. Seats do not change this row; if you already own the box, year one shrinks to the hatched running costs</p>
+              </div>
+            </div>
+            <p class="fg-attr">computed by the calculator's own code · prices checked June 2026</p>
+            <figcaption>The same five bars the <a href="../compare.html#meter">compare page's year-one meter</a> publishes at its default scenario. <a href="../calculator.html?s=5&amp;tb=10&amp;g=0">Open the calculator preloaded with this scenario</a>; the deep link pins growth to <span class="num">0</span> so it reproduces these exact totals.</figcaption>
+          </figure>
+          <p>The hardware bar keeps the 3-2-1 honesty: a <span class="num">$6/TB/mo</span> offsite mirror, a <span class="num">$1,200</span> DIY build, drives at <span class="num">$25</span> per usable TB, <span class="num">120&nbsp;W</span> at <span class="num">$0.15/kWh</span>. Real libraries grow, and the calculator models that; growth is pinned to zero here only so the bars stay reproducible.</p>
 
-          <h2>When not to choose us</h2>
+          <aside class="fg-stat" role="note">
+            <span class="fg-stat-num num">$6,597</span>
+            <p class="fg-stat-line">the year-one gap between LucidLink Business (<span class="num">$9,300</span>) and the self-hosted bill (<span class="num">$2,703</span>) at this scenario. The gap can run the other way for small libraries; the calculator says so plainly when it does · computed from the bars above, prices checked June 2026</p>
+          </aside>
+
+          <h2 id="when-not-to-choose-us">When not to choose us <a class="fg-anchor" href="#when-not-to-choose-us" aria-label="link to this section">#</a></h2>
           <p>Choose something else if any of these are true. You have Windows or Linux editors: we are macOS-only, and LucidLink, Suite, and Shade all ship Windows clients. You need a support contract and a phone number: we are a GitHub repo, and that is not the same thing. Nobody on the team wants to own a NAS: self-hosted means the ops, the backups, and the failed disk are yours. You need content-aware AI search today: Shade and iconik do it well; our search is filenames.</p>
-          <table class="post-table">
-            <caption>The short version</caption>
-            <thead>
-              <tr>
-                <th scope="col">If this describes you</th>
-                <th scope="col">Look at</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><td>Managed mount, per-TB bill acceptable, strongest shared-cache story</td><td>Suite</td></tr>
-              <tr><td>Few seats, AI search inside the footage matters most</td><td>Shade</td></tr>
-              <tr><td>Search and metadata across storage you already have</td><td>iconik</td></tr>
-              <tr><td>Remote collaborators reaching one person's drives, no server</td><td>Strada</td></tr>
-              <tr><td>The one that proved the workflow, managed, caps fit your library</td><td>LucidLink</td></tr>
-              <tr><td>Documents and deliverables, not camera originals</td><td>Nextcloud-class sync</td></tr>
-              <tr><td>Small macOS team, a NAS, and someone willing to own it</td><td>JuiceMount</td></tr>
-            </tbody>
-          </table>
+          <figure class="figure fg-fig">
+            <p class="label">the short version · pick this if</p>
+            <div class="fg-picks">
+              <div class="fg-pick">
+                <p class="fg-pick-name">Suite</p>
+                <p class="fg-pick-if">Managed mount, per-TB bill acceptable, strongest shared-cache story in the SaaS lane.</p>
+                <p class="fg-price">$75/TB/mo managed · checked June 2026</p>
+              </div>
+              <div class="fg-pick">
+                <p class="fg-pick-name">Shade</p>
+                <p class="fg-pick-if">Few seats, AI search inside the footage matters most.</p>
+                <p class="fg-price">$29.75/seat/mo annual · checked June 2026</p>
+              </div>
+              <div class="fg-pick">
+                <p class="fg-pick-name">iconik</p>
+                <p class="fg-pick-if">Search and metadata across storage you already have.</p>
+                <p class="fg-price">$0 to $120/seat/mo · checked June 2026</p>
+              </div>
+              <div class="fg-pick">
+                <p class="fg-pick-name">Strada</p>
+                <p class="fg-pick-if">Remote collaborators reaching one person's drives, no server to run.</p>
+                <p class="fg-price">$8 or $24/user/mo · checked June 2026</p>
+              </div>
+              <div class="fg-pick">
+                <p class="fg-pick-name">LucidLink</p>
+                <p class="fg-pick-if">The one that proved the workflow, managed, caps fit your library.</p>
+                <p class="fg-price">$27/seat/mo annual promo · checked June 2026</p>
+              </div>
+              <div class="fg-pick">
+                <p class="fg-pick-name">Nextcloud-class sync</p>
+                <p class="fg-pick-if">Documents and deliverables, not camera originals.</p>
+                <p class="fg-price">$0 self-hosted · checked June 2026</p>
+              </div>
+              <div class="fg-pick fg-pick-jm">
+                <p class="fg-pick-name">JuiceMount</p>
+                <p class="fg-pick-if">Small macOS team, a NAS, and someone willing to own the ops.</p>
+                <p class="fg-price">$0/seat · your hardware · Apache-2.0</p>
+              </div>
+            </div>
+            <figcaption>One line each, prices as published June 2026 and sourced at the end of this post. The vendor sections above carry the longer pick-this-if reasoning, caveats included.</figcaption>
+          </figure>
 
           <div class="next-step">
             <span class="label">next step</span>

@@ -10,8 +10,10 @@
   <meta property="og:url" content="https://juicemount.com/blog/your-bytes-are-your-bytes.html">
   <meta property="og:title" content="Your bytes are your bytes: what leaving actually costs">
   <meta property="og:description" content="Every storage product runs two meters: the monthly one and the exit one. Pulling 20 TB out, priced, and why an open on-disk format can't be repriced.">
-  <meta property="og:image" content="https://juicemount.com/assets/og-card.png">
-  <meta property="og:image:alt" content="The JuiceMount citrus mark and one-liner on a cinema-dark card: the open-source alternative to Suite, Shade, and LucidLink — storage that scales, but feels local — $0 per seat, on the NAS you already own.">
+  <meta property="og:image" content="https://juicemount.com/assets/og-blog-bytes.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="The JuiceMount citrus mark on a cinema-dark blog card: Your bytes are your bytes: what leaving actually costs · pulling 20 TB out: AWS S3 about $1,741 · B2, R2, Wasabi $0 · checked June 2026.">
   <meta name="twitter:card" content="summary_large_image">
   <link rel="icon" href="../favicon.svg" type="image/svg+xml">
   <link rel="alternate icon" sizes="32x32" href="../favicon-32.png">
@@ -144,6 +146,216 @@
       color: var(--text-muted);
     }
     details.src li { margin-top: var(--space-2); }
+
+    /* ---- round 6 enrichment (fg-*): figures, stat cards, pull quotes,
+            heading anchors. Static-first: every animated element draws its
+            finished state with animations off; motion is gated behind
+            prefers-reduced-motion: no-preference. Exit and wire numbers
+            byte-match compare.html (#exit) and docs/web/RESEARCH_ROUND2.md
+            section 6. ------------------------------------------------------ */
+
+    /* heading anchors: one spec across the blog posts. Resting color is
+       var(--text-muted); revealed on heading hover or the anchor's own
+       focus; underlined on hover and focus. */
+    .fg-anchor {
+      font-family: var(--font-mono);
+      font-weight: var(--fw-text);
+      font-size: 0.65em;
+      margin-left: 0.4ch;
+      color: var(--text-muted);
+      text-decoration: none;
+      opacity: 0;
+      transition: opacity var(--dur) var(--ease);
+    }
+    .post-body h2:hover .fg-anchor,
+    .fg-anchor:focus { opacity: 1; }
+    .fg-anchor:hover,
+    .fg-anchor:focus { text-decoration: underline; }
+    .fg-anchor:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+    /* shared figure furniture */
+    .fg-fig-kicker { margin: 0 0 var(--space-4); }
+    .fg-att { display: block; margin: var(--space-4) 0 0; }
+
+    /* pull quotes: the site's quiet emphasis, no quote marks */
+    .fg-pull {
+      margin: var(--space-6) 0;
+      padding: var(--space-2) 0 var(--space-2) var(--space-5);
+      border-left: 3px solid var(--juice-green);
+      max-width: 36ch;
+      font-size: var(--fs-lead);
+      font-weight: var(--fw-head);
+      line-height: 1.45;
+      letter-spacing: var(--track-display);
+    }
+
+    /* stat cards */
+    .fg-stats {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: var(--space-3);
+      margin: var(--space-6) 0;
+    }
+    @media (max-width: 640px) { .fg-stats { grid-template-columns: 1fr; } }
+    .fg-stat {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+      padding: var(--space-4);
+      border: 1.5px solid var(--hairline-soft);
+      border-radius: var(--radius-sm);
+      background: var(--surface);
+    }
+    .fg-stat-n { font-size: 1.55rem; font-weight: var(--fw-head); line-height: 1.1; }
+    .fg-stat-t { font-size: var(--fs-small); color: var(--text-muted); flex: 1; }
+
+    /* fig 01 · the two meters */
+    .fg-meters-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+    .fg-meter {
+      padding: var(--space-4);
+      border: 1.5px solid var(--hairline-soft);
+      border-radius: var(--radius-sm);
+      background: var(--surface-2);
+    }
+    .fg-meter svg { display: block; width: 100%; height: auto; margin-top: var(--space-3); }
+    .fg-meter-read { margin: var(--space-2) 0 0; font-size: var(--fs-body); font-weight: var(--fw-head); }
+    .fg-meter-note { margin: var(--space-1) 0 0; font-size: var(--fs-small); color: var(--text-muted); }
+    .fg-dial-face { fill: var(--surface); stroke: var(--hairline-soft); stroke-width: 1.5; }
+    .fg-dial-tick line { stroke: var(--hairline); stroke-width: 2; }
+    .fg-dial-zone { fill: none; stroke-width: 6; stroke-linecap: round; }
+    .fg-dial-zone-ok { stroke: var(--juice-green); }
+    .fg-dial-zone-hot { stroke: var(--fault-red); }
+    .fg-needle-line { stroke: var(--text); stroke-width: 3; stroke-linecap: round; }
+    .fg-needle-hub { fill: var(--text); }
+    .fg-meter.is-exit { background: var(--pulp-ink); border-color: rgba(250, 253, 232, 0.18); }
+    .fg-meter.is-exit .label, .fg-meter.is-exit .fg-meter-note { color: rgba(250, 253, 232, 0.66); }
+    .fg-meter.is-exit .fg-meter-read { color: var(--rind-cream); }
+    .fg-meter.is-exit .fg-dial-face { fill: rgba(250, 253, 232, 0.05); stroke: rgba(250, 253, 232, 0.2); }
+    .fg-meter.is-exit .fg-dial-tick line { stroke: rgba(250, 253, 232, 0.38); }
+    .fg-meter.is-exit .fg-needle-line { stroke: var(--fault-red); }
+    .fg-meter.is-exit .fg-needle-hub { fill: var(--fault-red); }
+    /* the monthly needle ticks slowly upward and settles back; the exit
+       needle never moves, which is the joke */
+    .fg-needle { transform-box: view-box; transform-origin: 110px 112px; }
+    @media (prefers-reduced-motion: no-preference) {
+      .fg-needle.is-ticking { animation: fg-meter-tick 16s ease-in-out infinite; }
+    }
+    @keyframes fg-meter-tick {
+      0%, 14%  { transform: rotate(0deg); }
+      20%, 44% { transform: rotate(3deg); }
+      50%, 74% { transform: rotate(6deg); }
+      80%, 96% { transform: rotate(3deg); }
+      100%     { transform: rotate(0deg); }
+    }
+
+    /* fig 02 · the exit receipt */
+    .fg-rcpt-rows { display: flex; flex-direction: column; gap: var(--space-4); margin-top: var(--space-2); }
+    .fg-rcpt-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      column-gap: var(--space-4);
+      row-gap: var(--space-2);
+      align-items: end;
+      border-top: 1px solid var(--hairline-soft);
+      padding-top: var(--space-3);
+    }
+    .fg-rcpt-row:first-child { border-top: 0; padding-top: 0; }
+    .fg-rcpt-name { font-size: var(--fs-small); font-weight: var(--fw-head); }
+    .fg-rcpt-note { display: block; margin-top: 2px; font-weight: var(--fw-text); font-size: 0.875em; color: var(--text-muted); }
+    .fg-rcpt-val { font-size: 1.3rem; font-weight: var(--fw-head); white-space: nowrap; justify-self: end; }
+    .fg-fn { font-size: 0.62em; }
+    .fg-fn-k { font-weight: var(--fw-head); }
+    .fg-rcpt-zero {
+      display: inline-block;
+      margin-left: var(--space-2);
+      padding: 1px 10px 2px;
+      border: 1px solid var(--tint-green-border);
+      border-radius: 999px;
+      background: var(--tint-green);
+      font-family: var(--font-mono);
+      font-size: var(--fs-label);
+      font-weight: var(--fw-head);
+      letter-spacing: var(--track-label);
+      text-transform: uppercase;
+      color: var(--text);
+      vertical-align: middle;
+    }
+    .fg-rcpt-track {
+      grid-column: 1 / -1;
+      height: 10px;
+      border: 1px solid var(--hairline-soft);
+      border-radius: 999px;
+      background: var(--surface-2);
+      overflow: hidden;
+    }
+    .fg-rcpt-fill { display: block; height: 100%; border-radius: inherit; background: var(--chart-saas); }
+
+    /* fig 03 · two days of wire */
+    .fg-wire-head { margin: 0; }
+    .fg-wire-sub { font-size: var(--fs-small); color: var(--text-muted); }
+    .fg-wire-viz { margin-top: var(--space-4); }
+    .fg-wire-strip {
+      position: relative;
+      height: 18px;
+      border: 1px solid var(--hairline-soft);
+      border-radius: 999px;
+      background: var(--surface-2);
+      overflow: hidden;
+    }
+    .fg-wire-fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 92.5%;
+      border-radius: inherit;
+      background: var(--stream-blue);
+      overflow: hidden;
+    }
+    .fg-wire-tick { position: absolute; top: 0; bottom: 0; width: 1.5px; background: rgba(250, 253, 232, 0.55); }
+    .fg-wire-tick.is-day { width: 2.5px; background: rgba(250, 253, 232, 0.8); }
+    .fg-wire-tick.is-end { right: 0; background: var(--text-muted); }
+    .fg-wire-ticklabels { position: relative; height: 1.5em; margin-top: var(--space-2); font-size: var(--fs-small); color: var(--text-muted); }
+    .fg-wire-ticklabels span:nth-child(1) { position: absolute; left: 0; }
+    .fg-wire-ticklabels span:nth-child(2) { position: absolute; left: 50%; transform: translateX(-50%); }
+    .fg-wire-ticklabels span:nth-child(3) { position: absolute; right: 0; }
+    @media (prefers-reduced-motion: no-preference) {
+      .fg-wire-fill::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(105deg, rgba(250, 253, 232, 0) 42%, rgba(250, 253, 232, 0.3) 50%, rgba(250, 253, 232, 0) 58%);
+        background-size: 230% 100%;
+        animation: fg-wire-sheen 5s linear infinite;
+      }
+    }
+    @keyframes fg-wire-sheen {
+      from { background-position: 230% 0; }
+      to   { background-position: -130% 0; }
+    }
+
+    /* fig 04 · mountable without us */
+    .fg-mount svg { display: block; width: 100%; max-width: 470px; height: auto; margin: 0 auto; }
+    .fg-mount text { font-family: var(--font-mono); fill: var(--text); }
+    .fg-mnt-name { font-size: 13px; font-weight: 600; }
+    .fg-mnt-sub { font-size: 10px; fill: var(--text-muted); }
+    .fg-mnt-box { fill: var(--surface-2); stroke: var(--hairline); stroke-width: 1.5; }
+    .fg-mnt-vol { fill: var(--tint-green); stroke: var(--tint-green-border); stroke-width: 1.5; }
+    .fg-mnt-ghost { opacity: 0.45; }
+    .fg-mnt-strike { stroke: var(--text-muted); stroke-width: 2; }
+    .fg-mnt-arrow { stroke: var(--juice-green); stroke-width: 3; }
+    .fg-mnt-arrow-ghost { stroke: var(--text-muted); stroke-width: 2.5; stroke-dasharray: 6 5; }
+    .fg-mnt-head { fill: var(--juice-green); }
+    .fg-mnt-head-ghost { fill: var(--text-muted); }
+    .fg-mnt-cut { stroke: var(--text-muted); stroke-width: 2; stroke-linecap: round; }
+    .fg-mnt-chunk { fill: var(--juice-green); }
+    .fg-mnt-dot { fill: var(--juice-green); }
+
+    /* 360px: the meters stay side by side (the composition is the thesis);
+       tighten padding so the dials keep room */
+    @media (max-width: 430px) {
+      .fg-meters-grid { gap: var(--space-2); }
+      .fg-meter { padding: var(--space-3); }
+      .fg-rcpt-val { font-size: 1.15rem; }
+    }
   </style>
 </head>
 <body>
@@ -215,7 +427,7 @@
         <p class="post-meta">
           <span>Leland Dutcher · JuiceMount's author</span>
           <span>published <time class="num" datetime="2026-06-12">2026-06-12</time></span>
-          <span class="num">6 min read</span>
+          <span class="num">7 min read</span>
         </p>
         <p class="post-facts">Competitor facts checked June 2026; verify before relying on them.</p>
       </div>
@@ -227,65 +439,222 @@
 
           <p>Two meters run on every storage product you will ever use. The first is the monthly one, printed on the pricing page in a large friendly font, and everyone reads it. The second is the exit meter: what it costs, in dollars and days, to take the whole library somewhere else. Nobody reads that one until the day they need it, which is the day they discover whether they own the library or rent access to it. This post reads the second meter in public, with sources, and is honest about where our own project's interest lies: we build JuiceMount, and the exit story is one of its arguments.</p>
 
-          <h2>Pulling 20 TB out, priced</h2>
-          <p>Take a <span class="num">20&nbsp;TB</span> library, a normal size for a small post team, and price the one-time pull at published rates, checked June 2026 (<span class="num">1&nbsp;TB</span> = <span class="num">1,000&nbsp;GB</span> here):</p>
-          <table class="post-table">
-            <caption>One-time exit, 20 TB, published rates checked June 2026</caption>
-            <thead>
-              <tr>
-                <th scope="col">From</th>
-                <th scope="col">Cost</th>
-                <th scope="col">The math</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <th scope="row">AWS S3</th>
-                <td class="num">≈ $1,741</td>
-                <td><span class="num">100&nbsp;GB</span> free, then <span class="num">9,900&nbsp;GB</span> × <span class="num">$0.09</span> + <span class="num">10,000&nbsp;GB</span> × <span class="num">$0.085</span></td>
-              </tr>
-              <tr>
-                <th scope="row">Backblaze B2</th>
-                <td class="num">$0</td>
-                <td>egress free up to <span class="num">3×</span> stored volume per month, so a <span class="num">20&nbsp;TB</span> library has <span class="num">60&nbsp;TB</span> of monthly headroom; <span class="num">$0.01/GB</span> beyond that</td>
-              </tr>
-              <tr>
-                <th scope="row">Cloudflare R2</th>
-                <td class="num">$0</td>
-                <td>zero egress at any volume, by policy</td>
-              </tr>
-              <tr>
-                <th scope="row">Wasabi</th>
-                <td class="num">$0</td>
-                <td>free under their reasonable-use policy; a one-time migration qualifies<span class="note">deleting young data can trigger their 90-day minimum-storage charge, a separate line worth knowing about</span></td>
-              </tr>
-            </tbody>
-          </table>
-          <p>Same bytes, same wire, a <span class="num">$1,741</span> spread, decided entirely by which logo is on the bucket. If your library lives in MinIO on your own NAS, the table does not apply at all: copying out crosses your own LAN and no egress bill exists.</p>
+          <!-- fig 01 · the two meters: the essay's thesis as its signature
+               visual. Both dials are decorative SVG (aria-hidden); the
+               meaning lives in the visible readouts and the figcaption.
+               No prices drawn on purpose, so no attribution line needed.
+               Motion: the monthly needle ticks slowly behind the
+               reduced-motion gate; the exit needle never moves. -->
+          <figure class="figure fg-meters" id="fig-two-meters">
+            <p class="label fg-fig-kicker">the thesis, drawn · two meters per product</p>
+            <div class="fg-meters-grid">
+              <div class="fg-meter">
+                <p class="label">meter 01 · monthly</p>
+                <svg viewBox="0 0 220 126" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+                  <path class="fg-dial-face" d="M 24 112 A 86 86 0 0 1 196 112 Z"/>
+                  <path class="fg-dial-zone fg-dial-zone-ok" d="M 27 112 A 83 83 0 0 1 42.8 63.2"/>
+                  <g class="fg-dial-tick">
+                    <line x1="40" y1="112" x2="31" y2="112"/>
+                    <line x1="49.4" y1="77" x2="41.6" y2="72.5"/>
+                    <line x1="75" y1="51.4" x2="70.5" y2="43.6"/>
+                    <line x1="110" y1="42" x2="110" y2="33"/>
+                    <line x1="145" y1="51.4" x2="149.5" y2="43.6"/>
+                    <line x1="170.6" y1="77" x2="178.4" y2="72.5"/>
+                    <line x1="180" y1="112" x2="189" y2="112"/>
+                  </g>
+                  <g class="fg-needle is-ticking">
+                    <line class="fg-needle-line" x1="110" y1="112" x2="60" y2="73"/>
+                    <circle class="fg-needle-hub" cx="110" cy="112" r="5.5"/>
+                  </g>
+                </svg>
+                <p class="fg-meter-read">reads <span class="num">$/mo</span>, budgeted</p>
+                <p class="fg-meter-note">printed on the pricing page in a large friendly font, read every month</p>
+              </div>
+              <div class="fg-meter is-exit">
+                <p class="label">meter 02 · exit</p>
+                <svg viewBox="0 0 220 126" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+                  <path class="fg-dial-face" d="M 24 112 A 86 86 0 0 1 196 112 Z"/>
+                  <path class="fg-dial-zone fg-dial-zone-hot" d="M 177.2 63.2 A 83 83 0 0 1 193 112"/>
+                  <g class="fg-dial-tick">
+                    <line x1="40" y1="112" x2="31" y2="112"/>
+                    <line x1="49.4" y1="77" x2="41.6" y2="72.5"/>
+                    <line x1="75" y1="51.4" x2="70.5" y2="43.6"/>
+                    <line x1="110" y1="42" x2="110" y2="33"/>
+                    <line x1="145" y1="51.4" x2="149.5" y2="43.6"/>
+                    <line x1="170.6" y1="77" x2="178.4" y2="72.5"/>
+                    <line x1="180" y1="112" x2="189" y2="112"/>
+                  </g>
+                  <g class="fg-needle">
+                    <line class="fg-needle-line" x1="110" y1="112" x2="170" y2="90"/>
+                    <circle class="fg-needle-hub" cx="110" cy="112" r="5.5"/>
+                  </g>
+                </svg>
+                <p class="fg-meter-read">reads <span class="num">$ + days</span>, once</p>
+                <p class="fg-meter-note">unread until the day you leave; it tells you who owns the library</p>
+              </div>
+            </div>
+            <figcaption>Two meters, one product. The monthly meter is familiar, budgeted, and read every month; the exit meter sits dark until the day you leave, and that day it is the only number that matters. No prices drawn on purpose: the rest of this post reads the second meter with sources.</figcaption>
+          </figure>
 
-          <h2>The vendors, named fairly</h2>
-          <p>The storage SaaS tools for editors sit a layer above those rates, and they deserve precise language rather than a scary one, all checked June 2026.</p>
+          <!-- pull stats: the two numbers the post runs on -->
+          <aside class="fg-stats" aria-label="The numbers this post runs on">
+            <div class="fg-stat">
+              <span class="fg-stat-n num">≈ $1,741</span>
+              <span class="fg-stat-t">what AWS S3's published rates charge to hand back a 20 TB library</span>
+              <span class="label">checked june 2026</span>
+            </div>
+            <div class="fg-stat">
+              <span class="fg-stat-n num">90 days</span>
+              <span class="fg-stat-t">Wasabi's minimum-storage window: the $0 exit is real, and deleting young data can still cost</span>
+              <span class="label">checked june 2026</span>
+            </div>
+          </aside>
+
+          <h2 id="pulling-20-tb-out-priced">Pulling 20 TB out, priced <a class="fg-anchor" href="#pulling-20-tb-out-priced" aria-label="link to this section">#</a></h2>
+          <p>Take a <span class="num">20&nbsp;TB</span> library, a normal size for a small post team, and price the one-time pull at published rates, checked June 2026 (<span class="num">1&nbsp;TB</span> = <span class="num">1,000&nbsp;GB</span> here):</p>
+          <!-- fig 02 · the exit receipt. Four rows, one red bar. Values are
+               real text (accessible as-is); only the bar tracks are
+               decorative. Each $0 keeps its caveat attached as a footnote
+               marker, resolved in the figcaption. Figures byte-match
+               compare.html #exit and RESEARCH_ROUND2.md section 6. -->
+          <figure class="figure fg-rcpt" id="fig-exit-receipt">
+            <p class="label fg-fig-kicker">the exit bill · pulling 20 tb out</p>
+            <div class="fg-rcpt-rows">
+              <div class="fg-rcpt-row">
+                <span class="fg-rcpt-name">AWS S3<span class="fg-rcpt-note"><span class="num">100&nbsp;GB</span> free, then <span class="num">9,900&nbsp;GB</span> × <span class="num">$0.09</span> + <span class="num">10,000&nbsp;GB</span> × <span class="num">$0.085</span></span></span>
+                <span class="fg-rcpt-val num">≈ $1,741</span>
+                <span class="fg-rcpt-track" aria-hidden="true"><span class="fg-rcpt-fill" style="width:100%"></span></span>
+              </div>
+              <div class="fg-rcpt-row">
+                <span class="fg-rcpt-name">Backblaze B2 <span class="fg-rcpt-zero">leaving is free</span></span>
+                <span class="fg-rcpt-val num">$0<sup class="fg-fn num">1</sup></span>
+                <span class="fg-rcpt-track" aria-hidden="true"><span class="fg-rcpt-fill" style="width:0"></span></span>
+              </div>
+              <div class="fg-rcpt-row">
+                <span class="fg-rcpt-name">Cloudflare R2 <span class="fg-rcpt-zero">leaving is free</span></span>
+                <span class="fg-rcpt-val num">$0<sup class="fg-fn num">2</sup></span>
+                <span class="fg-rcpt-track" aria-hidden="true"><span class="fg-rcpt-fill" style="width:0"></span></span>
+              </div>
+              <div class="fg-rcpt-row">
+                <span class="fg-rcpt-name">Wasabi <span class="fg-rcpt-zero">leaving is free</span></span>
+                <span class="fg-rcpt-val num">$0<sup class="fg-fn num">3</sup></span>
+                <span class="fg-rcpt-track" aria-hidden="true"><span class="fg-rcpt-fill" style="width:0"></span></span>
+              </div>
+            </div>
+            <p class="label fg-att">checked june 2026 · sources below</p>
+            <figcaption>One-time pull at published rates, <span class="num">1&nbsp;TB</span> = <span class="num">1,000&nbsp;GB</span>. <span class="fg-fn-k num">1</span>&nbsp;egress free up to <span class="num">3×</span> stored volume per month, so a <span class="num">20&nbsp;TB</span> library has <span class="num">60&nbsp;TB</span> of monthly headroom; <span class="num">$0.01/GB</span> beyond that. <span class="fg-fn-k num">2</span>&nbsp;zero egress at any volume, by policy. <span class="fg-fn-k num">3</span>&nbsp;free under their reasonable-use policy, and a one-time migration qualifies; deleting young data can trigger their 90-day minimum-storage charge, a separate line worth knowing about.</figcaption>
+          </figure>
+          <p>Same bytes, same wire, a <span class="num">$1,741</span> spread, decided entirely by which logo is on the bucket. The same four rows run live in <a href="../compare.html#exit">the priced exit on the compare page</a>. And if your library lives in MinIO on your own NAS, this bill does not apply at all: copying out crosses your own LAN and no egress bill exists.</p>
+
+          <h2 id="the-vendors-named-fairly">The vendors, named fairly <a class="fg-anchor" href="#the-vendors-named-fairly" aria-label="link to this section">#</a></h2>
+          <p>The storage SaaS tools for editors sit a layer above those rates, and they deserve precise language rather than scary language, all checked June 2026. Their full published prices sit side by side in <a href="../compare.html#lane-saas-h">the compare page's lane tables</a>, and they are weighed as working tools in <a href="lucidlink-alternatives.html">the LucidLink alternatives rundown</a>; here the only question is the exit.</p>
           <p><strong>iconik</strong> is the explicit one: egress is billed through its prepaid credits, per its own cost documentation. Getting media out of iconik-managed storage costs real money, quantified only through sales.</p>
           <p><strong>LucidLink</strong> documents no separate egress or exit fee; their own writing says storage and streaming are included in one monthly price with no separate egress line items. The precise phrase is none documented, not free: there is also no documented bulk-export tool, so leaving is a re-download project you run yourself through the client, at your line's speed, while the subscription stays alive long enough to finish it.</p>
           <p><strong>Shade</strong> likewise documents no egress, export, or exit fee anywhere public; their billing docs speak only of seats and storage. Same phrase, same reason: none documented, and the same re-download project on the way out.</p>
-          <p><strong>Suite</strong> on the managed plan documents no egress fee either. On their bring-your-own-storage plan the answer is structural: the bucket is yours at a cloud provider, Suite's own terms say the provider bills you separately, so the exit costs whatever your provider's egress rate says. BYO on R2 exits at <span class="num">$0</span>; BYO on S3 exits at the table above.</p>
 
-          <h2>True even at $0: the wire</h2>
-          <p>Suppose the meter reads zero. The bytes still have to move, and <span class="num">20&nbsp;TB</span> at a sustained <span class="num">1&nbsp;Gbit/s</span> is about <span class="num">2</span> days of wire time, whoever you are leaving. That number is plain arithmetic, but it changes what the exit meter means: the question is not only what leaving costs, it is whether a monthly bill keeps running while the wire does its two days of work, and whether anything in the contract is in a hurry on your behalf. An exit you can run calmly, off your own hardware, on your own schedule, is a different project from one running against a renewal date.</p>
+          <p><strong>Suite</strong> on the managed plan documents no egress fee either. On their bring-your-own-storage plan the answer is structural: the bucket is yours at a cloud provider, Suite's own terms say the provider bills you separately, so the exit costs whatever your provider's egress rate says. BYO on R2 exits at <span class="num">$0</span>; BYO on S3 exits at the bill above.</p>
 
-          <h2>Policy versus architecture</h2>
+          <h2 id="true-even-at-0-the-wire">True even at $0: the wire <a class="fg-anchor" href="#true-even-at-0-the-wire" aria-label="link to this section">#</a></h2>
+          <p>Suppose the meter reads zero. The bytes still have to move, and <span class="num">20&nbsp;TB</span> at a sustained <span class="num">1&nbsp;Gbit/s</span> is about <span class="num">2</span> days of wire time, whoever you are leaving. That number is plain arithmetic, but it changes what the exit meter means: the question is not only what leaving costs, it is whether a monthly bill keeps running while the wire does its two days of work, and whether anything in the contract is in a hurry on your behalf. An exit you can run calmly, off your own hardware, on your own schedule, is a different project from one running against a renewal date. Wire physics has its own post: <a href="smb-slow-over-vpn.html">why your NAS feels slow over a VPN</a> counts what latency, rather than bandwidth, does to a working day.</p>
+
+          <!-- fig 03 · two days of wire. The number lives in the visible
+               header; the strip itself is decorative. Static fill ends just
+               short of the day-2 tick (about 2 days, not exactly 2); the
+               sheen that moves along the fill is gated behind the
+               reduced-motion query. -->
+          <figure class="figure fg-wire" id="fig-two-days">
+            <p class="label fg-fig-kicker">the wire, drawn · 20 tb at 1 gbit/s</p>
+            <p class="fg-wire-head"><span class="fg-stat-n num">≈ 2 days</span> <span class="fg-wire-sub">of sustained transfer, whoever you are leaving</span></p>
+            <div class="fg-wire-viz" aria-hidden="true">
+              <div class="fg-wire-strip">
+                <span class="fg-wire-fill"></span>
+                <span class="fg-wire-tick" style="left: 25%"></span>
+                <span class="fg-wire-tick is-day" style="left: 50%"></span>
+                <span class="fg-wire-tick" style="left: 75%"></span>
+                <span class="fg-wire-tick is-day is-end"></span>
+              </div>
+              <div class="fg-wire-ticklabels">
+                <span class="num">start</span>
+                <span class="num">day 1</span>
+                <span class="num">day 2</span>
+              </div>
+            </div>
+            <p class="label fg-att">20 tb at a sustained 1 gbit/s · plain arithmetic</p>
+            <figcaption>The strip is two days wide and the fill stops just short of the second tick. It fills at the same speed whoever you are leaving; the meter question is whether a bill or a deadline runs while it does.</figcaption>
+          </figure>
+
+          <h2 id="policy-versus-architecture">Policy versus architecture <a class="fg-anchor" href="#policy-versus-architecture" aria-label="link to this section">#</a></h2>
           <p>Everything above is policy: published prices and terms, true the day we checked them and changeable by their owners any day after. This is not a hypothetical. Shade's published Growth price in June 2026 is <span class="num">$35</span> monthly, <span class="num">$29.75</span> annual; TechCrunch's coverage of their funding round, published 2026-04-22, described a <span class="num">$20</span> per seat per month plan with the same <span class="num">500&nbsp;GB</span> of active storage. We cannot prove a before-and-after from the outside, so here is the supportable weaker claim: within one quarter, the price on the public record moved, and it did not move down. LucidLink's published <span class="num">$27</span> is itself labeled a promotion off a <span class="num">$32</span> list price, checked June 2026: the price you sign at and the price on the list are already two different numbers. None of this is scandal. It is what published prices do, and a policy that says leaving is free today is the same kind of object.</p>
+
           <p>Architecture is a different kind of object. An on-disk format that is open and documented cannot be repriced, because there is no one to send the new bill. The promise is not in a terms document; it is a property of the bytes.</p>
 
-          <h2>Ownership at the architecture level</h2>
-          <p>This is the level JuiceMount aims at, and the claim is checkable rather than promised. File data sits in a bucket you control, on your NAS or at a provider you chose, in JuiceFS's open, documented chunk format. The volume is a standard JuiceFS volume, formatted by the stock tooling, and the README states the consequence plainly: the stock <code>juicefs</code> client can mount it with no JuiceMount involved. If this project disappeared tomorrow, your volume would not notice.</p>
-          <p>Leaving is correspondingly boring, which is the point. Copy files off the mounted volume, or <code>juicefs sync</code> the tree out: the same migration-grade tooling that moves a library around is the exit tool, and the Manager web UI that migrated your existing library in at the start was the rehearsal. There is no exporter to request, no credits to buy, and the bucket never stops being yours during any of it.</p>
+          <h2 id="ownership-at-the-architecture-level">Ownership at the architecture level <a class="fg-anchor" href="#ownership-at-the-architecture-level" aria-label="link to this section">#</a></h2>
+          <p>This is the level JuiceMount aims at, and the claim is checkable rather than promised. File data sits in a bucket you control, on your NAS or at a provider you chose, in JuiceFS's open, documented chunk format. The volume is a standard JuiceFS volume, formatted by the stock tooling, and <a href="https://github.com/lelanddutcher/juicemount">the README</a> states the consequence plainly: the stock <code>juicefs</code> client can mount it with no JuiceMount involved. If this project disappeared tomorrow, your volume would not notice.</p>
 
-          <h2>The honest counterweight</h2>
+          <!-- fig 04 · mountable without us. Decorative SVG (aria-hidden):
+               two readers pointed at one volume, JuiceMount ghosted and
+               struck through, the stock client still mounting. The claim
+               itself is quoted verbatim in the figcaption. -->
+          <figure class="figure fg-mount" id="fig-mountable-without-us">
+            <p class="label fg-fig-kicker">the open format · mountable without us</p>
+            <svg viewBox="0 0 420 230" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+              <!-- reader 01: this project, ghosted and struck -->
+              <g class="fg-mnt-ghost">
+                <rect class="fg-mnt-box" x="16" y="34" width="140" height="64" rx="10"/>
+                <text class="fg-mnt-name" x="86" y="62" text-anchor="middle">JuiceMount</text>
+                <text class="fg-mnt-sub" x="86" y="80" text-anchor="middle">this project</text>
+                <line class="fg-mnt-arrow-ghost" x1="158" y1="66" x2="240" y2="66"/>
+                <polygon class="fg-mnt-head-ghost" points="252,66 241,60.5 241,71.5"/>
+              </g>
+              <line class="fg-mnt-strike" x1="42" y1="58" x2="130" y2="58"/>
+              <line class="fg-mnt-cut" x1="194" y1="60" x2="206" y2="72"/>
+              <line class="fg-mnt-cut" x1="206" y1="60" x2="194" y2="72"/>
+              <!-- reader 02: the stock client, still mounting -->
+              <rect class="fg-mnt-box" x="16" y="150" width="140" height="64" rx="10"/>
+              <text class="fg-mnt-name" x="86" y="178" text-anchor="middle">juicefs</text>
+              <text class="fg-mnt-sub" x="86" y="196" text-anchor="middle">the stock client</text>
+              <line class="fg-mnt-arrow" x1="158" y1="182" x2="240" y2="182"/>
+              <polygon class="fg-mnt-head" points="252,182 241,176.5 241,187.5"/>
+              <text class="fg-mnt-sub" x="200" y="204" text-anchor="middle">mounts</text>
+              <!-- the volume: one open format, two doors -->
+              <rect class="fg-mnt-vol" x="252" y="44" width="152" height="160" rx="10"/>
+              <text class="fg-mnt-name" x="328" y="70" text-anchor="middle">the volume</text>
+              <text class="fg-mnt-sub" x="328" y="88" text-anchor="middle">JuiceFS chunk format</text>
+              <text class="fg-mnt-sub" x="328" y="102" text-anchor="middle">bucket on your NAS</text>
+              <g class="fg-mnt-chunk">
+                <rect x="271" y="118" width="18" height="13" rx="2" opacity="0.9"/>
+                <rect x="295" y="118" width="18" height="13" rx="2" opacity="0.5"/>
+                <rect x="319" y="118" width="18" height="13" rx="2" opacity="0.7"/>
+                <rect x="343" y="118" width="18" height="13" rx="2" opacity="0.4"/>
+                <rect x="367" y="118" width="18" height="13" rx="2" opacity="0.8"/>
+                <rect x="271" y="137" width="18" height="13" rx="2" opacity="0.5"/>
+                <rect x="295" y="137" width="18" height="13" rx="2" opacity="0.85"/>
+                <rect x="319" y="137" width="18" height="13" rx="2" opacity="0.45"/>
+                <rect x="343" y="137" width="18" height="13" rx="2" opacity="0.75"/>
+                <rect x="367" y="137" width="18" height="13" rx="2" opacity="0.55"/>
+                <rect x="271" y="156" width="18" height="13" rx="2" opacity="0.7"/>
+                <rect x="295" y="156" width="18" height="13" rx="2" opacity="0.4"/>
+                <rect x="319" y="156" width="18" height="13" rx="2" opacity="0.9"/>
+                <rect x="343" y="156" width="18" height="13" rx="2" opacity="0.5"/>
+                <rect x="367" y="156" width="18" height="13" rx="2" opacity="0.8"/>
+              </g>
+              <circle class="fg-mnt-dot" cx="300" cy="187" r="4"/>
+              <text class="fg-mnt-sub" x="310" y="191">still opens</text>
+            </svg>
+            <figcaption>The exit that cannot be repriced, drawn. Per the project README, the volume is "a standard JuiceFS volume", formatted with stock tooling, "so the stock <code>juicefs</code> client can mount it with no JuiceMount involved": cross this project out and the volume still opens.</figcaption>
+          </figure>
+
+          <p>Leaving is correspondingly boring, which is the point. Copy files off the mounted volume, or <code>juicefs sync</code> the tree out: the same migration-grade tooling that moves a library around is the exit tool, and <a href="../compare.html#mgr">the Manager web UI</a> that migrated your existing library in at the start was the rehearsal. There is no exporter to request, no credits to buy, and the bucket never stops being yours during any of it.</p>
+
+          <h2 id="the-honest-counterweight">The honest counterweight <a class="fg-anchor" href="#the-honest-counterweight" aria-label="link to this section">#</a></h2>
           <p>Here is what the exit meter does not measure, and where the SaaS bill buys real things. A managed service brings managed durability, a support queue, and someone whose pager goes off at 2 AM who is not you. Self-hosting brings the opposite deal, and our README says it without flinching: a failed disk on your NAS is your failed disk, the 3-2-1 backup discipline is yours, and that is the deal that makes it free. If nobody on the team wants that deal, the monthly meter is not waste; it is the correct price of not carrying the pager. The argument of this post is narrower: whatever you pick, pick it knowing what both meters read.</p>
 
-          <h2>The test to run before the first upload</h2>
-          <p>So here is the test, applicable to any vendor including us. Before the first byte goes in, ask what leaving costs in dollars and in days. If the answer is a published egress rate, you can price it. If the answer is an open on-disk format on your own hardware, you can verify it. If the answer is a credit system, a quote, or a shrug, you have learned what you needed to know, cheaply, and earlier than most teams learn it.</p>
+          <!-- pull quote · the thesis line, verbatim from the dek, re-landed
+               before the close; aria-hidden because it repeats page copy -->
+          <aside class="fg-pull" aria-hidden="true">Every storage product runs two meters: the monthly one on the pricing page, and the exit meter you only read the day you leave.</aside>
+
+          <h2 id="the-test-to-run-before-the-first-upload">The test to run before the first upload <a class="fg-anchor" href="#the-test-to-run-before-the-first-upload" aria-label="link to this section">#</a></h2>
+          <p>So here is the test, applicable to any vendor including us. Before the first byte goes in, ask what leaving costs in dollars and in days. If the answer is a published egress rate, you can price it; <a href="../calculator.html#exit-panel">the calculator's exit line</a> does that arithmetic at your own library size. If the answer is an open on-disk format on your own hardware, you can verify it. If the answer is a credit system, a quote, or a shrug, you have learned what you needed to know, cheaply, and earlier than most teams learn it.</p>
 
           <div class="next-step">
             <span class="label">next step</span>

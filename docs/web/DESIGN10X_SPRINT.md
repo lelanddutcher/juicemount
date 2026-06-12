@@ -907,3 +907,73 @@ target/print passes, Synology post (blocked on real-hardware test),
 GitHub repo About/topics + README->site links (launch checklist).
 Still parked: hero v8 pick (a/b/c), H1 A/B, shipped JM_VOL_NAME,
 scrub video, Suite's table seat.
+
+## ROUND 8 — blog enrichment loop (founder, 2026-06-12)
+"Blog sounds great. How rich can we make the pages with link backs
+and other images? Work on that in a loop and make this blog high
+quality and detail rich."
+
+### Backlog (Y)
+- [x] Y1-Y3 one agent per post: 3-5 drawn-in-code figures each
+      (site visual language, static-first, CSS-only motion gated,
+      zero JS kept), stat callouts/pull quotes, linkable h2 anchors
+      with visible section links, inline citation links at numbers,
+      dense internal link-backs (product anchors, sibling posts,
+      prefilled calculator deep links), figures carry attribution
+      (author-measured / checked June 2026) in the artwork.
+- [x] Y4 cold quality review (discerning-reader persona) on all
+      three enriched posts; fix findings.
+- [x] Y5 per-post OG cards: 3 SVGs + PNG via scripts/svg2png.swift,
+      attribution baked into artwork, heads rewired; feed updated
+      bumped; index richness check; gates+battery+preview; commit.
+
+### Round 8 journal
+- Y1-Y3: three agents enriched the posts in parallel. smb post: the
+  40:1 two-lane latency diagram (drawn to honest scale), the worked-
+  minute bars (widths proportional to seconds), the latency-times-
+  chattiness equation card, the 100 GB strip whose "not to scale"
+  marker quantifies its own distortion ("drawn ~28x too wide so it
+  shows up at all"), fix menu as cards; +664 words, 7->10 min.
+  lucidlink post: five-questions glyph strip, the year-one bar
+  chart byte-matched to compare.html ($9,300/$9,000/$5,520/$2,703,
+  Shade as a refused hatched "Enterprise quote" track), the four-
+  shapes architecture map, pick-this-if decision cards with dated
+  price chips, the caveats block restyled as the loudest element on
+  the page; +556 words, 8->10 min. bytes post: the two-meters
+  signature figure (monthly needle ticks, exit needle frozen "which
+  is the joke"), the exit receipt, the two-days wire strip, the
+  mountable-without-us diagram (JuiceMount ghosted, stock juicefs
+  client still opens the volume); +470 words, 6->7 min. All posts:
+  linkable h2 anchors, stat callouts, dense inline link-backs,
+  zero-JS preserved (JSON-LD only), figures static-complete with
+  animations gated.
+- Y4 cold review (skeptical editor + craft reviewer): recomputed
+  every figure (model arithmetic airtight; bar widths match values
+  to the decimal; "an unusually verifiable blog"). Grades A-/A-/B+.
+  Real catches: fault-red used in the exit receipt against
+  tokens.css's own never-green-vs-red rule; a caption describing a
+  tick that wasn't drawn; "Your bandwidth never enters it"
+  overclaim disproved by the post's own arithmetic; echo disease
+  (pull devices adjacent to their source sentences); a grammar
+  fragment inside the centerpiece figure; "$14M closed March 2026"
+  precision unsupported by its 04-22 source. All 21 accepted fixes
+  applied by a fix agent and gate-verified; methodology attribution
+  confirmed surviving the stat-row deletion (GitHub doc + ledger
+  links remain).
+- Y5: three per-post OG cards in the brand template's exact
+  composition (attribution baked into the artwork: "prices checked
+  June 2026" / "modeled June 2026"), rendered via scripts/
+  svg2png.swift to verified 1200x630 PNGs, safe-area pixel-scanned,
+  heads rewired with og:image dims + faithful alts. Blog index read
+  times corrected (10/10/7 min).
+- Final battery: 37 files / 1,154 refs / 0 broken; posts render
+  clean, zero console errors.
+
+## ROUND 8 CLOSING (2026-06-12)
+The blog is now figure-rich, dated, cross-linked, and socially
+unfurlable, with a cold review on record calling the honesty
+apparatus "the best I've seen in vendor content." Residual polish
+noted for a future pass: unify the three figure-attribution class
+skins, a public first-party source for R2's zero-egress line,
+real-device look at small SVG label sizes at 360px. Still parked:
+hero v8 pick, H1 A/B, JM_VOL_NAME default, scrub video, Suite seat.
