@@ -739,3 +739,78 @@ mark verbatim miniature but with the read-head seek EXAGGERATED
   scrub video file; Suite's seat in the table. New: founder picks
   the winning hero from the gallery (then it gets built at hero
   scale in context as home-v8).
+
+## ROUND 6 — founder gallery verdict (2026-06-12)
+Verdict on the 11: only V3 one-light-on really lands ("kind of
+cutesy — maybe as a background/header image to the heading callout").
+His favorite interaction remains the scrub ("Drag the playhead.
+Watch what caches.") — candidate for THE first interactive element,
+with the synced timecode brought back (placeholder until the video
+file). Orders: build both hero options, send both to a no-context
+sub-agent to review comprehension/intentionality ("cohesive story"),
+iterate another version if neither lands.
+
+### Backlog (W)
+- [x] W1 home-v8a: one-light-on as ambient hero backdrop/header
+      image (hero-pop glyph retired); rest of page untouched.
+- [x] W2 home-v8b: the pv scrub relocated INTO the hero as the first
+      interactive element, compacted, with a synced timecode readout
+      driven by the existing pv:frac event (video placeholder);
+      down-page #scrub-home section removed, references healed.
+- [x] W3 cold comprehension review of both (no-context editor
+      persona), comparative, with improvement notes.
+- [x] W4 synthesize: if neither conveys the story, iterate v8c;
+      gates, journal, commit.
+
+### Round 6 journal
+- W1 home-v8a: one-light-on scene as ambient hero backdrop — scene
+  scaled to 580px right-anchored with a three-layer melt (in-SVG
+  radial pool, CSS mask ellipse, left scrim), loop slowed 1.2x,
+  hero-pop fully retired, stacked below CTAs under 1080px.
+- W2 home-v8b: the pv scrub relocated whole into the hero (markup
+  moved, initPv untouched — all 36 id lookups document-wide), big
+  synced timecode plate driven by the existing pv:frac event (600 s
+  illustrative clip at 25 fps), link picker collapsed to the 1 GbE
+  default (disclosed), #scrub-home section removed and the #chunks
+  intro now points up at the hero. Live-verified: six ArrowRights
+  moved the playhead to 8.1% and the timecode tracked 00:00:00:00 →
+  00:00:48:18 with honest aria-valuetext.
+- W3 cold review (no-context freelance-editor persona, comparative):
+  A wins decisively. A: comprehension A-, intentionality A,
+  conversion B+ ("the midnight scene is a point of view; the
+  numbered demo course feels authored"). B: C+/B-/B- — "final exam
+  first, lesson one second"; the instrument cluster cold is
+  "homework"; the illustrative-timecode caption is "a production
+  TODO shipped on the marquee"; demo 03 "has to point backwards up
+  the page instead of forward into a payoff". Key structural
+  insight: A teaches then plays; B spends the payoff before the
+  lesson. Reviewer's prescription: the hybrid — A's frame, one live
+  receipt from B, zero interaction required.
+- W4: both did NOT fail (A passed), so no forced re-roll; instead
+  built the reviewer's prescribed hybrid as home-v8c: v8a + a
+  receipt line tucked under the NAS corner ("data moved · NN MB of a
+  100 GB clip · only blocks the playhead touched") ticking in 4 MB
+  steps off the gesture loop's own activity gate, high-water-marked
+  so the return swipe over cached territory holds flat (the cache,
+  demonstrated); resets with each loop replay; reduced-motion ships
+  36 MB settled. Plus the two accepted copy fixes: "$0 per seat, no
+  storage contract." promoted to its own line above the CTAs, and a
+  soft second path "or watch it work ↓" → #mount. H1 wording
+  untouched (parked A/B decision); orchestrator post-fixes: scene
+  column 480→460, wrap 500→480, and a non-breaking hyphen in
+  "open-source" so the H1 never breaks mid-word (it was rendering
+  "The open- / source" at 1280). Reviewer's "cut Suite, Shade from
+  the H1" suggestion NOT applied — recorded here for the founder's
+  A/B call.
+- Gates: all three v8 files node-clean, zero dup ids; v8b timecode
+  sync live-verified; v8a/v8c hero screenshots verified at 1280
+  (load-composite); zero console errors on all three.
+
+## ROUND 6 CLOSING (2026-06-12)
+Three options on the table for the founder: v8a (mood), v8b
+(instrument-first), v8c (the reviewer's hybrid — recommended).
+Founder decides: pick one to promote as home-v9 → canonical, and
+separately whether to run the H1 A/B (reviewer independently argued
+for dropping the two lesser-known names). The scrub-in-hero idea
+survives in v8b if he still wants it after reading the review's
+case against it.
