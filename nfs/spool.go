@@ -291,12 +291,34 @@ func (s *SpoolStore) StartSweeper(idle, tick time.Duration) (stop func()) {
 	go func() {
 		t := time.NewTicker(tick)
 		defer t.Stop()
+		// QA-38: garbage-collect finished `done` spool rows. DeleteDone was
+		// defined but never scheduled, so the table grew unbounded (44k+
+		// rows). The /spool status poll then scanned and allocated every row
+		// on each poll, burning multiple cores + GC and starving the NFS
+		// handlers until the mount wedged and writes hit the soft-mount
+		// timeout (Finder "error 100060"). Keep done rows only long enough
+		// for the status tail window plus margin, then delete; clear any
+		// accumulated backlog once on start.
+		const gcInterval = 60 * time.Second
+		const doneRetention = 10 * time.Minute
+		runGC := func() {
+			if n, err := s.meta.DeleteDone(time.Now().Add(-doneRetention)); err != nil {
+				jmlog.Warn("spool done-GC failed", "err", err)
+			} else if n > 0 {
+				jmlog.Info("spool done-GC", "deleted", n)
+			}
+		}
+		runGC()
+		gcTick := time.NewTicker(gcInterval)
+		defer gcTick.Stop()
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
 				s.sweepOnce(idle)
+			case <-gcTick.C:
+				runGC()
 			}
 		}
 	}()

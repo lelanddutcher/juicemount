@@ -120,8 +120,18 @@ type HealthMonitor struct {
 // Tunables for NFS auto-remount. Exposed as vars so tests can override.
 var (
 	// NFSStaleThreshold is the number of consecutive failed NFS health
-	// checks (10s apart) before triggering a remount.
+	// checks (10s apart) before triggering a remount WHEN THE JUICEFS PROCESS
+	// TREE IS GONE. While juicefs is alive, the remount is deferred to the
+	// FUSE watchdog (see handleNFSAutoRemount / health/fuse.go).
 	NFSStaleThreshold = 3
+
+	// NFSStaleHardRemountThreshold is the last-resort streak (10s/tick) after
+	// which the NFS path remounts EVEN IF juicefs is still alive — a backstop
+	// for a genuinely-stuck NFS layer that the FUSE watchdog's own escalation
+	// (FUSEStaleEscalateTicks ≈ 90s) didn't clear. Set well beyond that window
+	// so a transient backend blip (which recovers in seconds) never reaches
+	// it. 18 ticks ≈ 180s.
+	NFSStaleHardRemountThreshold = 18
 
 	// NFSRemountCooldown is the minimum time between auto-remount
 	// attempts. Prevents flapping if the underlying issue is persistent.
@@ -346,6 +356,29 @@ func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
 		m.mu.Unlock()
 		return
 	}
+	m.mu.Unlock()
+
+	// QA-39 (2026-06-13): do NOT tear the mount down while juicefs is alive.
+	// NFS staleness during a backend-link blip is a temporarily-wedged FUSE
+	// mount, not a dead one — and force-unmount + SIGKILL of the juicefs tree
+	// (the unmount kills processes matching "juicefs mount.*<mountpoint>",
+	// which also takes out juicefs's own -d supervisor) is exactly the macFUSE
+	// remount-thrash that the fuse.go monitorLoop was rewritten to avoid on
+	// 2026-05-29 — yet this NFS path kept the old "remount after N stale
+	// checks" policy and fired it on a flap, vanishing the volume mid-copy
+	// ("device disappeared"). While juicefs is alive, defer to the FUSE
+	// watchdog (health/fuse.go), which owns the last-resort escalation after a
+	// sustained window + backend-reachable check. Remount from here only when
+	// the juicefs process tree is gone, or — as a far-out backstop — if the
+	// NFS layer stays wedged well past the FUSE watchdog's own window.
+	alive := isJuiceFSProcessAlive()
+	if alive && streak < NFSStaleHardRemountThreshold {
+		jmlog.Warn("nfs mount stale but juicefs alive — deferring to the fuse watchdog, not remounting",
+			"mount_point", mountPoint, "consecutive_failures", streak)
+		return
+	}
+
+	m.mu.Lock()
 	if !m.lastRemountAt.IsZero() && time.Since(m.lastRemountAt) < NFSRemountCooldown {
 		jmlog.Debug("nfs auto-remount suppressed by cooldown",
 			"streak", streak,
@@ -362,6 +395,7 @@ func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
 	jmlog.Warn("nfs mount stale, attempting auto-remount",
 		"mount_point", mountPoint,
 		"consecutive_failures", streak,
+		"juicefs_alive", alive,
 	)
 	if err := forceUnmountFn(mountPoint); err != nil {
 		jmlog.Warn("nfs force-unmount failed (continuing to remount anyway)",

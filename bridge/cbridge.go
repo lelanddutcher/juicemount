@@ -1416,9 +1416,20 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 //
 // Write size stays at 1 MiB — writes are sequential and the
 // failure mode there is different.
+// QA-36 (2026-06-13): bumped timeo=200 -> timeo=400 (~120 s budget). During a
+// heavy OpenLoupe + native-Finder ingest, a CREATE/first-WRITE RPC stalled past
+// the ~60 s budget and Finder aborted with "operation can't be completed
+// (error 100060)" = ETIMEDOUT. Root cause traced to metadata.db SQLite
+// contention: the spool's synchronous Insert on the OpenWrite hot path
+// (spool.go, held under openMu) competes at the SQLite writer with the reconcile
+// loop's BulkInsert, amplified by a bloated WAL. This is a STOPGAP to stop the
+// aborts; the real fix removes that spool-insert vs reconcile contention so the
+// write path never stalls this long. Tradeoff: a genuinely dead backend now
+// surfaces EIO after ~120 s instead of ~60 s, which lengthens the worst-case
+// Finder /Volumes-enumeration hang in the dead-server case (see QA-29 below).
 func nfsMountOpts(port string) string {
 	return fmt.Sprintf(
-		"port=%s,mountport=%s,soft,intr,timeo=200,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
+		"port=%s,mountport=%s,soft,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
 		port, port)
 }
 

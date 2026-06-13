@@ -481,6 +481,42 @@ func (s *SpoolStore) ListAll() ([]*SpoolRow, error) {
 	return out, rows.Err()
 }
 
+// ListForStatus returns only the rows the /spool status view needs: every
+// non-done row (writing/ready/draining/failed) plus done rows updated at or
+// after doneSince. BuildSpoolStatus discards older done rows anyway, so this
+// is output-identical to ListAll for the status view while scanning a handful
+// of rows instead of the whole table.
+//
+// QA-38 (2026-06-13): the table had grown to 44k+ rows because DeleteDone was
+// defined but never scheduled. ListAll on every /spool status poll then
+// fetched + allocated all 44k rows; the Swift menu-bar UI polls continuously,
+// so the bridge burned multiple cores (database/sql row iteration + GC) and
+// held SQLite locks, starving the NFS request handlers until the FUSE mount
+// went readdir-unresponsive and writes blew the soft-mount budget — surfacing
+// to Finder as "operation can't be completed (error 100060)" mid-copy.
+func (s *SpoolStore) ListForStatus(doneSince time.Time) ([]*SpoolRow, error) {
+	rows, err := s.db.Query(
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		 FROM spool_entries
+		 WHERE drain_state != ? OR updated_at >= ?
+		 ORDER BY id`,
+		DrainDone, doneSince.Unix(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("spool list for status: %w", err)
+	}
+	defer rows.Close()
+	var out []*SpoolRow
+	for rows.Next() {
+		r, err := scanSpoolRow(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // PendingStats returns counts of writing+ready+draining rows and their
 // total size. Used by the manager UI overview tile.
 func (s *SpoolStore) PendingStats() (pendingFiles int, pendingBytes int64, err error) {
