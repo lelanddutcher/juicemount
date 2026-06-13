@@ -115,7 +115,12 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 	resp.CapacityUsed = used
 	resp.CapacityTotal = total
 
-	rows, listErr := spool.Meta().ListAll()
+	// QA-38: only fetch the rows the view actually renders (active + the
+	// recent-done tail). The old ListAll() scanned the entire spool table —
+	// which had grown to 44k+ rows — on every poll, burning CPU + GC and
+	// wedging the mount. The loop below already discards done rows older than
+	// SpoolStatusDoneTailWindow, so this is output-identical.
+	rows, listErr := spool.Meta().ListForStatus(time.Now().Add(-SpoolStatusDoneTailWindow))
 	if listErr != nil {
 		resp.Error = "list entries: " + listErr.Error()
 		// Continue — counters above are still useful for the UI.

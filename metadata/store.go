@@ -409,20 +409,25 @@ func (s *Store) DB() *sql.DB { return s.db }
 // Insert adds or replaces an entry in the store.
 func (s *Store) Insert(e *Entry) error {
 	s.writeMu.Lock()
-	// Cast inode to int64 for SQLite compatibility (modernc.org/sqlite
-	// rejects uint64 values with the high bit set).
-	_, err := s.db.Exec(
-		`INSERT OR REPLACE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.Path, e.Name, e.ParentPath,
-		boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
-		int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
-	)
-	s.writeMu.Unlock()
-
+	// entries + external-content FTS updated atomically so search stays in sync
+	// without a periodic full rebuild (QA-40). The inode int64 cast for
+	// modernc.org/sqlite (rejects uint64 with the high bit set) is inside
+	// ftsExternalUpsert.
+	tx, err := s.db.Begin()
 	if err != nil {
+		s.writeMu.Unlock()
+		return fmt.Errorf("insert begin %q: %w", e.Path, err)
+	}
+	if err := ftsExternalUpsert(tx, e); err != nil {
+		tx.Rollback()
+		s.writeMu.Unlock()
 		return fmt.Errorf("insert %q: %w", e.Path, err)
 	}
+	if err := tx.Commit(); err != nil {
+		s.writeMu.Unlock()
+		return fmt.Errorf("insert commit %q: %w", e.Path, err)
+	}
+	s.writeMu.Unlock()
 
 	s.mu.Lock()
 	// Remove old entry from children index if path existed with different parent
@@ -454,12 +459,45 @@ func (s *Store) Delete(entryPath string) error {
 	s.mu.RUnlock()
 
 	s.writeMu.Lock()
-	_, err := s.db.Exec(`DELETE FROM entries WHERE path = ?`, entryPath)
-	s.writeMu.Unlock()
-
+	tx, err := s.db.Begin()
 	if err != nil {
+		s.writeMu.Unlock()
+		return fmt.Errorf("delete begin %q: %w", entryPath, err)
+	}
+	// Read rowid+name+path first so we can remove the external-content FTS
+	// tokens after the row is gone (QA-40).
+	var oldRowid int64
+	var oldName, oldPath string
+	hadOld := false
+	switch scanErr := tx.QueryRow(`SELECT rowid, name, path FROM entries WHERE path = ?`, entryPath).Scan(&oldRowid, &oldName, &oldPath); scanErr {
+	case nil:
+		hadOld = true
+	case sql.ErrNoRows:
+		// nothing indexed for this path
+	default:
+		tx.Rollback()
+		s.writeMu.Unlock()
+		return fmt.Errorf("delete read %q: %w", entryPath, scanErr)
+	}
+	if _, err := tx.Exec(`DELETE FROM entries WHERE path = ?`, entryPath); err != nil {
+		tx.Rollback()
+		s.writeMu.Unlock()
 		return fmt.Errorf("delete %q: %w", entryPath, err)
 	}
+	if hadOld {
+		if _, err := tx.Exec(
+			`INSERT INTO entries_fts(entries_fts, rowid, name, path) VALUES('delete', ?, ?, ?)`,
+			oldRowid, oldName, oldPath); err != nil {
+			tx.Rollback()
+			s.writeMu.Unlock()
+			return fmt.Errorf("delete fts %q: %w", entryPath, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		s.writeMu.Unlock()
+		return fmt.Errorf("delete commit %q: %w", entryPath, err)
+	}
+	s.writeMu.Unlock()
 
 	s.mu.Lock()
 	if e != nil {
@@ -624,6 +662,11 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 		batchSize = 500
 	}
 
+	// A large load (startup/initial sync) skips per-row FTS and does one bulk
+	// RebuildFTS below; smaller reconcile deltas maintain FTS incrementally so
+	// they never hold writeMu through a full reindex (QA-40).
+	incremental := len(entries) > 0 && len(entries) < FTSFullRebuildThreshold
+
 	for i := 0; i < len(entries); i += batchSize {
 		end := i + batchSize
 		if end > len(entries) {
@@ -631,7 +674,7 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 		}
 		batch := entries[i:end]
 
-		if err := s.bulkInsertBatch(batch); err != nil {
+		if err := s.bulkInsertBatch(batch, incremental); err != nil {
 			return err
 		}
 	}
@@ -658,28 +701,114 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 	s.evictOldest()
 	s.mu.Unlock()
 
-	// Rebuild FTS index after bulk operation. This is much faster than
-	// per-row trigger updates (~1s for 131K entries vs minutes with triggers).
-	if err := s.RebuildFTS(); err != nil {
-		// Stale FTS is recoverable, lost data isn't — the caller's rows
-		// are already committed by the batch loop above. Log loudly so
-		// the user (or a future debugger) can see the search index drifted
-		// from the row store.
-		log.Printf("[metadata] BulkInsert: RebuildFTS failed: %v", err)
+	// Startup/large load only: one bulk RebuildFTS. Steady-state reconcile
+	// deltas already maintained the external-content FTS incrementally in
+	// bulkInsertBatch, so rebuilding here would needlessly hold writeMu through
+	// a full reindex — the QA-40 stall that timed out NFS creates.
+	if !incremental {
+		if err := s.RebuildFTS(); err != nil {
+			// Stale FTS is recoverable, lost data isn't — the caller's rows
+			// are already committed by the batch loop above. Log loudly so
+			// the user (or a future debugger) can see the search index drifted
+			// from the row store.
+			log.Printf("[metadata] BulkInsert: RebuildFTS failed: %v", err)
+		}
 	}
 
 	return nil
 }
 
+// FTSFullRebuildThreshold: a BulkInsert with at least this many entries is
+// treated as a startup/initial load — it skips per-row FTS maintenance and
+// does one bulk RebuildFTS at the end (far faster for a huge load). Smaller
+// batches (the periodic reconcile delta) maintain the external-content FTS
+// incrementally per row.
+//
+// QA-40 (2026-06-13): before this split, BulkInsert ALWAYS called RebuildFTS,
+// which wipes (FTS5 'delete-all') and reindexes the entire entries_fts under
+// writeMu. The reconcile runs BulkInsert every ~30s, so under concurrent copy
+// load the full reindex's disk I/O held writeMu for >100s while NFS onCreate
+// handlers blocked on the same lock — surfacing to the client as ETIMEDOUT
+// ("error 100060") mid-copy. Proven via a goroutine dump: the holder was in
+// _sqlite3Fts5StorageDeleteAll while four writers (one a live onCreate) waited
+// on writeMu. Var so tests can lower it.
+var FTSFullRebuildThreshold = 5000
+
+// ftsExternalUpsert maintains the external-content entries_fts index for an
+// INSERT OR REPLACE of e, inside the given tx (caller holds writeMu). Because
+// the entries PK is the TEXT path (not the rowid), INSERT OR REPLACE on a
+// path conflict deletes the old row and inserts a new one with a NEW rowid —
+// so we must read the OLD row's rowid+name+path BEFORE the replace to issue
+// the FTS5 'delete' for its stale tokens, then index the new rowid. Keeps the
+// external-content index consistent without a full rebuild.
+func ftsExternalUpsert(tx *sql.Tx, e *Entry) error {
+	var oldRowid int64
+	var oldName, oldPath string
+	hadOld := false
+	switch err := tx.QueryRow(`SELECT rowid, name, path FROM entries WHERE path = ?`, e.Path).Scan(&oldRowid, &oldName, &oldPath); err {
+	case nil:
+		hadOld = true
+	case sql.ErrNoRows:
+		// new path
+	default:
+		return fmt.Errorf("fts upsert read old %q: %w", e.Path, err)
+	}
+	res, err := tx.Exec(
+		`INSERT OR REPLACE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.Path, e.Name, e.ParentPath,
+		boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
+		int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
+	)
+	if err != nil {
+		return fmt.Errorf("fts upsert %q: %w", e.Path, err)
+	}
+	newRowid, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("fts upsert lastid %q: %w", e.Path, err)
+	}
+	if hadOld {
+		if _, err := tx.Exec(
+			`INSERT INTO entries_fts(entries_fts, rowid, name, path) VALUES('delete', ?, ?, ?)`,
+			oldRowid, oldName, oldPath); err != nil {
+			return fmt.Errorf("fts upsert delete-old %q: %w", e.Path, err)
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO entries_fts(rowid, name, path) VALUES(?, ?, ?)`,
+		newRowid, e.Name, e.Path); err != nil {
+		return fmt.Errorf("fts upsert insert-new %q: %w", e.Path, err)
+	}
+	return nil
+}
+
 // bulkInsertBatch runs one transaction holding writeMu only for its own
 // duration. Extracted so the outer loop can release between batches.
-func (s *Store) bulkInsertBatch(batch []*Entry) error {
+// incremental=true maintains the external-content FTS per row (steady-state
+// reconcile deltas); incremental=false skips FTS here and the caller does a
+// single bulk RebuildFTS (startup/initial load).
+func (s *Store) bulkInsertBatch(batch []*Entry, incremental bool) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
+	}
+
+	// Steady-state reconcile delta: maintain the external-content FTS per row
+	// so we never wipe+reindex the whole table under writeMu (QA-40).
+	if incremental {
+		for _, e := range batch {
+			if err := ftsExternalUpsert(tx, e); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit: %w", err)
+		}
+		return nil
 	}
 
 	stmt, err := tx.Prepare(
