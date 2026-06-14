@@ -6,8 +6,10 @@ package health
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/url"
@@ -91,6 +93,19 @@ func (fm *FUSEManager) EffectiveCacheSize() string {
 	return fm.cfg.CacheSize
 }
 
+// lastNonEmptyLine returns the last non-blank line of s, trimmed. juicefs
+// prints progress/info lines before the fatal one, so the final non-empty
+// line is the actionable reason. Returns "" if s has no non-blank content.
+func lastNonEmptyLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
 // NewFUSEManager creates a FUSE mount manager.
 func NewFUSEManager(cfg FUSEConfig) *FUSEManager {
 	if cfg.JuiceFSBin == "" {
@@ -123,8 +138,15 @@ func (fm *FUSEManager) Mount() error {
 		return nil
 	}
 
-	// Unmount any stale mount first
-	fm.unmountLocked()
+	// Unmount any stale mount first — and VERIFY the kernel actually released
+	// the mountpoint before relaunching juicefs onto it. A `juicefs mount`
+	// against a still-occupied mountpoint fails with a bare "exit status 1"
+	// (mountpoint/device busy). The pre-2026-06-14 code unmounted once without
+	// checking, so a watchdog remount after a wedge (kill juicefs → mount
+	// entry survives a moment) would fail right here and leave the share down.
+	if err := fm.ensureUnmountedLocked(3); err != nil {
+		return err
+	}
 
 	// Pre-mount: if free space is tight on the cache volume but APFS is
 	// holding lots of purgeable (Time Machine local snapshots, mostly),
@@ -351,11 +373,19 @@ func (fm *FUSEManager) Mount() error {
 	defer launchCancel()
 	cmd := exec.CommandContext(launchCtx, fm.cfg.JuiceFSBin, args...)
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// Tee stderr: still stream to os.Stderr (the log tail) but also capture it
+	// so a failed launch's RETURNED error carries juicefs's actual reason
+	// (e.g. "mountpoint is not empty", "address already in use") instead of a
+	// bare "exit status 1" that tells the user nothing (2026-06-14).
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
 
 	if err := cmd.Run(); err != nil {
 		if launchCtx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("juicefs mount: timed out after 30s (backend unreachable?)")
+		}
+		if reason := lastNonEmptyLine(stderrBuf.String()); reason != "" {
+			return fmt.Errorf("juicefs mount: %w: %s", err, reason)
 		}
 		return fmt.Errorf("juicefs mount: %w", err)
 	}
@@ -755,6 +785,43 @@ func (fm *FUSEManager) unmountLocked() {
 		// own ctx deadline), don't pin fm.mu forever.
 		jmlog.Warn("unmountLocked: unmount goroutine did not return in 65s, proceeding anyway")
 	}
+}
+
+// ensureUnmountedLocked runs unmountLocked and verifies the mountpoint left the
+// kernel mount table, retrying up to `attempts` times with a short backoff.
+// Returns an error only if the entry survives every attempt — in which case
+// relaunching juicefs onto the busy mountpoint would fail with a bare
+// "exit status 1", so the caller should surface this descriptive error instead
+// of churning on a doomed launch. Must be called with fm.mu held.
+//
+// Always runs unmountLocked at least once (it also SIGKILLs any lingering
+// juicefs processes for this mountpoint, which we want even when the kernel
+// table is already clear).
+func (fm *FUSEManager) ensureUnmountedLocked(attempts int) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	for i := 0; i < attempts; i++ {
+		fm.unmountLocked()
+		if !fm.stillInMountTable() {
+			if i > 0 {
+				jmlog.Info("ensureUnmounted: mountpoint cleared",
+					"attempt", i+1, "mountpoint", fm.cfg.MountPoint)
+			}
+			return nil
+		}
+		jmlog.Warn("ensureUnmounted: mountpoint still in mount table after unmount",
+			"attempt", i+1, "of", attempts, "mountpoint", fm.cfg.MountPoint)
+		// Linear backoff: give the kernel a moment to drain in-flight FUSE
+		// teardown before the next forced attempt.
+		time.Sleep(time.Duration(i+1) * time.Second)
+	}
+	if fm.stillInMountTable() {
+		return fmt.Errorf("mountpoint %s still in kernel mount table after %d unmount attempts; "+
+			"refusing to relaunch juicefs onto a busy mountpoint (would fail 'exit status 1')",
+			fm.cfg.MountPoint, attempts)
+	}
+	return nil
 }
 
 // stillInMountTable reports whether fm.cfg.MountPoint appears in the kernel
