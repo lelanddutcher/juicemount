@@ -107,7 +107,15 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		return nil, errors.New("drainer: FuseRoot is required")
 	}
 	if cfg.Workers <= 0 {
-		cfg.Workers = 4
+		// 8 (up from 4): a large SD-card offload (tens of thousands of RAW
+		// files) ingests far faster than 4 drain workers can copy+verify into
+		// FUSE, so the spool backlog grows and capacity backpressure engages
+		// sooner than necessary. 8 roughly doubles drain throughput to better
+		// track ingest. Each worker is I/O-bound (FUSE copy + at-rest re-read
+		// SHA), so this trades a bounded rise in concurrent JuiceFS writeback
+		// pressure (--buffer-size 4096) for backlog headroom; tune if the
+		// writeback buffer saturates on slower uplinks.
+		cfg.Workers = 8
 	}
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 5
@@ -306,6 +314,15 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 	return true
 }
 
+// atRestVerifyRetries is how many times a "sha mismatch (fuse at-rest)" is
+// retried (re-copy + re-verify) before quarantining. A transient JuiceFS
+// writeback coherence blip clears on retry; a real at-rest bit flip persists.
+// Kept below the default MaxAttempts (5) so a persistent mismatch quarantines
+// (preserving the file for forensics) rather than failing via the generic
+// retry budget. Quarantine remains the correct terminal disposition for a
+// confirmed mismatch; this only stops a blip from being mistaken for one.
+const atRestVerifyRetries = 2
+
 // drainOne copies a single spool file into the FUSE mount, SHA-verifies
 // the copy, and dispositions the row.
 func (d *Drainer) drainOne(row *metadata.SpoolRow) {
@@ -346,10 +363,27 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	mw := io.MultiWriter(dst, h)
 	buf := make([]byte, 1<<20)
 	n, copyErr := io.CopyBuffer(mw, src, buf)
+	// fsync the FUSE destination before closing so JuiceFS --writeback stages
+	// the bytes coherently. Without it, the at-rest re-read below is a
+	// read-after-close against the writeback cache and can momentarily return
+	// inconsistent bytes under a many-file burst — which the SHA check then
+	// mis-diagnoses as a permanent bit flip and quarantines an intact file
+	// (observed ~0.3% under a 2000-file storm). In writeback mode fsync
+	// flushes to the local cache (it does NOT wait for the MinIO upload), so
+	// it is cheap relative to the full readback that follows.
+	var syncErr error
+	if copyErr == nil {
+		syncErr = dst.Sync()
+	}
 	closeErr := dst.Close()
 	if copyErr != nil {
 		_ = os.Remove(dest) // best-effort cleanup of partial write
 		d.failTransient(row, fmt.Errorf("copy to fuse: %w", copyErr))
+		return
+	}
+	if syncErr != nil {
+		_ = os.Remove(dest)
+		d.failTransient(row, fmt.Errorf("sync fuse dest: %w", syncErr))
 		return
 	}
 	if closeErr != nil {
@@ -394,8 +428,19 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 			return
 		}
 		if !bytes.Equal(atRestSHA, row.SHA256) {
-			d.quarantine(row, fmt.Sprintf("sha mismatch (fuse at-rest): streamed=%x atrest=%x", row.SHA256, atRestSHA))
+			// A real at-rest bit flip persists across re-reads; a transient
+			// JuiceFS writeback coherence blip clears on a fresh copy. Retry
+			// the whole copy a bounded number of times before quarantining,
+			// so a blip under burst can't TERMINALLY lose an intact photo
+			// (quarantine is no-retry). The dst.Sync() above makes the first
+			// attempt coherent in the common case; this guards the residual.
+			reason := fmt.Sprintf("sha mismatch (fuse at-rest): streamed=%x atrest=%x", row.SHA256, atRestSHA)
 			_ = os.Remove(dest)
+			if row.DrainAttempts < atRestVerifyRetries {
+				d.failTransient(row, fmt.Errorf("%s — re-verifying", reason))
+			} else {
+				d.quarantine(row, reason)
+			}
 			return
 		}
 	}

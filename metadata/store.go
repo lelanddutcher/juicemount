@@ -1120,22 +1120,41 @@ func (s *Store) DeletePaths(paths []string) error {
 		return err
 	}
 
-	stmt, err := tx.Prepare(`DELETE FROM entries WHERE path = ?`)
-	if err != nil {
-		tx.Rollback()
-		s.writeMu.Unlock()
-		return err
-	}
-
 	for _, p := range paths {
-		if _, err := stmt.Exec(p); err != nil {
-			stmt.Close()
+		// Read rowid+name+path BEFORE deleting so we can remove the matching
+		// external-content FTS tokens. entries_fts has NO triggers (QA-40), so
+		// a bare DELETE orphans its FTS rows; once SQLite reuses the rowid for
+		// a new INSERT OR REPLACE, a stale token resolves to an unrelated file
+		// (wrong search hit) and violates the FTS5 integrity invariant. Mirror
+		// Delete()'s proven per-row 'delete' op.
+		var oldRowid int64
+		var oldName, oldPath string
+		hadOld := false
+		switch scanErr := tx.QueryRow(`SELECT rowid, name, path FROM entries WHERE path = ?`, p).Scan(&oldRowid, &oldName, &oldPath); scanErr {
+		case nil:
+			hadOld = true
+		case sql.ErrNoRows:
+			// nothing indexed for this path
+		default:
+			tx.Rollback()
+			s.writeMu.Unlock()
+			return scanErr
+		}
+		if _, err := tx.Exec(`DELETE FROM entries WHERE path = ?`, p); err != nil {
 			tx.Rollback()
 			s.writeMu.Unlock()
 			return err
 		}
+		if hadOld {
+			if _, err := tx.Exec(
+				`INSERT INTO entries_fts(entries_fts, rowid, name, path) VALUES('delete', ?, ?, ?)`,
+				oldRowid, oldName, oldPath); err != nil {
+				tx.Rollback()
+				s.writeMu.Unlock()
+				return err
+			}
+		}
 	}
-	stmt.Close()
 
 	if err := tx.Commit(); err != nil {
 		s.writeMu.Unlock()

@@ -37,8 +37,9 @@ CREATE TABLE IF NOT EXISTS spool_entries (
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_spool_drain_state ON spool_entries(drain_state);
+CREATE INDEX IF NOT EXISTS idx_spool_ready_fifo ON spool_entries(drain_state, created_at);
 CREATE INDEX IF NOT EXISTS idx_spool_path ON spool_entries(nfs_path);
+DROP INDEX IF EXISTS idx_spool_drain_state;
 `
 
 // InitSpoolSchema applies the spool_entries schema to db. Safe to call
