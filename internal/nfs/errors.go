@@ -166,6 +166,19 @@ func basicErrorFormatter(err error) RPCError {
 	return &ResponseCodeSystemError{}
 }
 
+// ErrFUSETimeout is returned by the handler's filesystem layer (nfs package)
+// when a JuiceFS FUSE syscall (Stat/Lstat/ReadDir/OpenFile) does not complete
+// within its deadline because the mount is wedged. The RPC dispatch
+// (conn.handle) maps any error that wraps this to NFS3ERR_JUKEBOX so the
+// client retries ("server busy") instead of aborting on a permanent error.
+// Critically, the handler returns immediately and frees its rpcSem slot rather
+// than parking it on the wedged mount — without that, a JuiceFS wedge consumes
+// all 128 in-flight slots, the server stops reading requests, and the whole
+// NFS mount goes stale (Finder "error 100060"). Lives in this lower package so
+// both the handlers (internal/nfs) and the filesystem layer (nfs, imported as
+// nfslib) reference the same value.
+var ErrFUSETimeout = errors.New("nfs: fuse operation timed out (mount wedged)")
+
 // NFSStatusError represents an error at the NFS level.
 type NFSStatusError struct {
 	NFSStatus
