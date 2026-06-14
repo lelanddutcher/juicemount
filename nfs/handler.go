@@ -823,6 +823,14 @@ func (h *JuiceMountHandler) ToHandle(f billy.Filesystem, path []string) []byte {
 	// Look up inode from metadata store
 	e := h.store.LookupByPath(fullPath)
 	if e != nil {
+		// Record the synthetic→path mapping for handles handed out via THIS
+		// branch too. The create/readdir path assigns COUNTER-based synthetic
+		// inodes (nextSyntheticInode = counter|high-bit) that land in the cache,
+		// so ToHandle returns them here — not only via the fnv64a fallback
+		// below. Both kinds can lose their inodeCache entry when the reconcile
+		// swaps in JuiceFS's real inode, stranding the client's handle → ESTALE.
+		// RecordSyntheticHandle no-ops for real inodes.
+		h.store.RecordSyntheticHandle(e.Inode, fullPath)
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, e.Inode)
 		return buf
