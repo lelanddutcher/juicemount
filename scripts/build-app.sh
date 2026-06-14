@@ -198,15 +198,31 @@ ENT_FILE="$PROJECT_ROOT/entitlements.plist"
 [ -f "$ENT_FILE" ] || ENT_FILE=""
 
 # Pick a signing identity. Order of preference:
-#   1. JM_SIGN_IDENTITY env var (cert hash or full name in quotes)
-#   2. Any "Developer ID Application" cert in the user's keychain
-#   3. Fall back to ad-hoc with a warning (daily-dev path).
+#   1. JM_ADHOC=1 env var — force ad-hoc (fast, hang-free local dev path)
+#   2. JM_SIGN_IDENTITY env var (cert hash or full name in quotes)
+#   3. Any "Developer ID Application" cert in the user's keychain
+#   4. Fall back to ad-hoc with a warning (daily-dev path).
+#
+# Why JM_ADHOC exists: an unnotarized "Developer ID Application" signature
+# combined with the hardened runtime (--options runtime) makes macOS stall the
+# FIRST launch of a freshly-built bundle for 30-60 s while syspolicyd performs
+# an online notarization check that times out. During that window the process
+# is parked in-kernel before main() runs (no logs, 0% CPU) — the "startup hang"
+# that plagued the rebuild→launch dev loop. An ad-hoc signature skips that path
+# entirely and launches instantly. Unnotarized Developer ID gives NO
+# distribution benefit anyway (Gatekeeper rejects it on other Macs), so for
+# local iteration ad-hoc is strictly better. Set JM_ADHOC=1 for dev builds;
+# leave it unset (and provide a notary profile) for real release builds.
 YELLOW=$'\033[33m'
 RESET=$'\033[0m'
 
 SIGN_IDENTITY=""
 SIGN_IDENTITY_LABEL=""
-if [ -n "${JM_SIGN_IDENTITY:-}" ]; then
+if [ -n "${JM_ADHOC:-}" ]; then
+    SIGN_IDENTITY="-"
+    SIGN_IDENTITY_LABEL="ad-hoc (JM_ADHOC=1)"
+    echo "    Signing ad-hoc (JM_ADHOC=1) — fast local-dev path, no Gatekeeper first-launch stall"
+elif [ -n "${JM_SIGN_IDENTITY:-}" ]; then
     SIGN_IDENTITY="$JM_SIGN_IDENTITY"
     SIGN_IDENTITY_LABEL="$JM_SIGN_IDENTITY"
     echo "    Signing with JM_SIGN_IDENTITY: $SIGN_IDENTITY_LABEL"
@@ -236,11 +252,14 @@ else
     echo "    ${YELLOW}WARNING: 'security' command not found; signing ad-hoc (not distributable)${RESET}"
 fi
 
-# Build the codesign argv. `--timestamp` is required for notarization but only
-# works with a real identity (ad-hoc rejects it).
-CS_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime)
+# Build the codesign argv. The hardened runtime (--options runtime) and
+# --timestamp are for DISTRIBUTABLE (notarizable) builds and only work with a
+# real identity. Ad-hoc dev builds skip both: hardened runtime gives no local
+# benefit, --timestamp is rejected for ad-hoc, and (critically) hardened
+# runtime is part of what makes an unnotarized bundle stall on first launch.
+CS_ARGS=(--force --deep --sign "$SIGN_IDENTITY")
 if [ "$SIGN_IDENTITY" != "-" ]; then
-    CS_ARGS+=(--timestamp)
+    CS_ARGS+=(--options runtime --timestamp)
 fi
 if [ -n "$ENT_FILE" ]; then
     CS_ARGS+=(--entitlements "$ENT_FILE")
@@ -284,6 +303,17 @@ else
         echo "          To set up: xcrun notarytool store-credentials JuiceMount \\"
         echo "                       --apple-id <email> --team-id <team> --password <app-specific-password>"
     fi
+fi
+
+# Warn about the hang-prone combo: Developer ID signature + hardened runtime
+# but NOT notarized. macOS stalls the first launch of such a bundle for
+# 30-60 s (syspolicyd online notarization check that times out), which reads
+# as a "startup hang" in the rebuild→launch dev loop. For local iteration,
+# JM_ADHOC=1 sidesteps it entirely.
+if [ "$SIGN_IDENTITY" != "-" ] && [ "$NOTARIZED" != "yes" ]; then
+    echo "    ${YELLOW}WARNING: signed Developer ID but NOT notarized — this bundle may stall 30-60s on its"
+    echo "             FIRST launch while Gatekeeper does an online check. For local dev rebuilds, set"
+    echo "             JM_ADHOC=1 to sign ad-hoc and launch instantly.${RESET}"
 fi
 
 # Guard: refuse to ship a build that contains a FileProvider extension.
