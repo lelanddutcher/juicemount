@@ -233,8 +233,10 @@ func main() {
 					ss.Stop()
 				} else {
 					// Slice F: boot-time scrubber. MUST run BEFORE
-					// drainer.Start so it doesn't race with workers.
-					recCtx, recCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					// drainer.Start so it doesn't race with workers. Generous
+					// deadline (5 min): recovery integrity outranks boot speed,
+					// and 30s stranded `draining` rows at 50k+ (see cbridge.go).
+					recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 					recReport, recErr := ss.RecoverOnBoot(recCtx)
 					recCancel()
 					if recErr != nil {
