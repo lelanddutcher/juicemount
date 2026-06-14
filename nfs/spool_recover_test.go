@@ -227,14 +227,16 @@ func TestRecoverOnBootReadyAccountsCapacity(t *testing.T) {
 }
 
 // TestRecoverOnBootTerminalRowStaleFileCleaned covers reviewer HIGH:
-// a terminal-state (done/failed) row whose spool file unexpectedly
-// remains on disk (e.g. from a prior os.Remove failure during a
-// writing→failed transition) must have that file removed on the next
-// boot. Without this, the file leaks forever because it's referenced
-// in expectedFiles and the orphan scan won't touch it.
+// a `failed` row that NEVER FINALIZED (row.Size==0 — a writing-state
+// crash whose best-effort partial remove failed) leaves a stale partial
+// on disk. RecoverOnBoot reclaims it (the user already re-copied). The
+// size-0 gate is what distinguishes this reclaimable partial from an
+// intact finalized copy (see TestRecoverOnBootFailedIntactFileRecovered),
+// which must NEVER be deleted.
 func TestRecoverOnBootTerminalRowStaleFileCleaned(t *testing.T) {
 	s, root, _ := newSpoolStoreForRecovery(t)
-	// Insert a failed-state row with its file still on disk.
+	// Insert a failed-state row with its file still on disk. Insert leaves
+	// size=0 (never finalized), so this is the reclaimable-partial case.
 	f := dropFile(t, root, "stale-failed", []byte("stranded by failed remove"))
 	id, _ := s.Meta().Insert("/stranded.bin", f)
 	_, _ = s.Meta().MarkFailed(id, "test setup")
@@ -243,12 +245,94 @@ func TestRecoverOnBootTerminalRowStaleFileCleaned(t *testing.T) {
 		t.Fatalf("recover: %v", err)
 	}
 	if _, err := os.Stat(f); !os.IsNotExist(err) {
-		t.Errorf("stale file under failed row should be removed: stat err=%v", err)
+		t.Errorf("stale size-0 partial under failed row should be removed: stat err=%v", err)
 	}
 	// Row state preserved.
 	row, _ := s.Meta().Get(id)
 	if row.DrainState != metadata.DrainFailed {
 		t.Errorf("row state changed unexpectedly: %q", row.DrainState)
+	}
+}
+
+// TestRecoverOnBootFailedIntactFileRecovered is the "we can't lose photos"
+// regression guard. A `failed` row whose spool file is an INTACT,
+// size-matching copy (the failPermanent case after a transient FUSE
+// "device not configured" unmount) must NOT be deleted on the next boot —
+// it is the last durable copy of the user's photo/video. RecoverOnBoot must
+// preserve the file AND reset the row to `ready` with a fresh attempt budget
+// so the restart re-drives it. Before the fix, this file was silently
+// deleted (lumped with `done`), losing the photo permanently.
+func TestRecoverOnBootFailedIntactFileRecovered(t *testing.T) {
+	s, root, _ := newSpoolStoreForRecovery(t)
+
+	content := []byte("a fully-copied 60MB CR3 stand-in, every byte intact")
+	f := dropFile(t, root, "intact-failed-cr3", content)
+	id, _ := s.Meta().Insert("/DCIM/100CANON/IMG_0001.CR3", f)
+	// Finalize to a real size+sha (as a successful spool write would), then
+	// fail it as failPermanent does after exhausting transient retries.
+	if err := s.Meta().MarkReady(id, int64(len(content)), []byte("sha-of-intact")); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if _, err := s.Meta().MarkFailed(id, "mkdir parent: device not configured"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	report, err := s.RecoverOnBoot(context.Background())
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if report.FailedResumed != 1 {
+		t.Errorf("FailedResumed=%d, want 1 (intact failed copy must auto-recover): %+v", report.FailedResumed, report)
+	}
+	// The file MUST survive — it is the only copy.
+	if _, err := os.Stat(f); err != nil {
+		t.Fatalf("intact failed-row spool file was deleted (DATA LOSS): %v", err)
+	}
+	// Row reset to ready with a fresh attempt budget so the drainer re-drives.
+	row, _ := s.Meta().Get(id)
+	if row.DrainState != metadata.DrainReady {
+		t.Errorf("row state=%q, want ready (auto-recover)", row.DrainState)
+	}
+	if row.DrainAttempts != 0 {
+		t.Errorf("DrainAttempts=%d, want 0 (fresh budget after reset)", row.DrainAttempts)
+	}
+	// Bytes are re-accounted against capacity (the drainer will free them on
+	// a successful re-drive).
+	if used, _ := s.Capacity(); used != int64(len(content)) {
+		t.Errorf("used=%d after recovery, want %d", used, len(content))
+	}
+}
+
+// TestRecoverOnBootFailedSizeMismatchPreserved: a `failed` row with a
+// finalized size (>0) but an on-disk file whose size DOESN'T match is
+// ambiguous (a rare truncation/double-fault). We must not delete >0 bytes
+// of finalized data — preserve the file and leave the row failed for the
+// operator. Better to keep recoverable bytes than to guess and delete.
+func TestRecoverOnBootFailedSizeMismatchPreserved(t *testing.T) {
+	s, root, _ := newSpoolStoreForRecovery(t)
+
+	f := dropFile(t, root, "mismatch-failed", []byte("only 13 bytes")) // 13 on disk
+	id, _ := s.Meta().Insert("/DCIM/100CANON/IMG_0002.CR3", f)
+	if err := s.Meta().MarkReady(id, 9999, []byte("sha")); err != nil { // row says 9999
+		t.Fatalf("mark ready: %v", err)
+	}
+	if _, err := s.Meta().MarkFailed(id, "size mismatch test"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	report, err := s.RecoverOnBoot(context.Background())
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if report.FailedResumed != 0 {
+		t.Errorf("FailedResumed=%d, want 0 (size mismatch must not auto-recover)", report.FailedResumed)
+	}
+	if _, err := os.Stat(f); err != nil {
+		t.Errorf("size-mismatched file must be preserved, not deleted: %v", err)
+	}
+	row, _ := s.Meta().Get(id)
+	if row.DrainState != metadata.DrainFailed {
+		t.Errorf("row state=%q, want failed (preserved for operator)", row.DrainState)
 	}
 }
 
