@@ -3,6 +3,7 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 
 	"github.com/go-git/go-billy/v5"
@@ -48,8 +49,16 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 			return &NFSStatusError{NFSStatusExist, nil}
 		}
 	} else {
+		// A FUSE-stat TIMEOUT verifying the parent must NOT fail the mkdir:
+		// it would wrap ErrFUSETimeout → NFS3ERR_JUKEBOX → the client retries
+		// MKDIR, storming toward the ~40s soft-mount timeout ("error 100060")
+		// during a large copy (parent LRU-evicted + drain-contended FUSE). The
+		// parent exists by construction (Finder created it first); on an
+		// ambiguous timeout proceed and let MkdirAll arbitrate. See onCreate.
 		if s, err := fs.Stat(fs.Join(path...)); err != nil {
-			return &NFSStatusError{NFSStatusAccess, err}
+			if !errors.Is(err, ErrFUSETimeout) {
+				return &NFSStatusError{NFSStatusAccess, err}
+			}
 		} else if !s.IsDir() {
 			return &NFSStatusError{NFSStatusNotDir, nil}
 		}

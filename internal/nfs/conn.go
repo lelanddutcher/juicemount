@@ -205,6 +205,14 @@ func (c *conn) serve(ctx context.Context) {
 			}()
 
 			start := time.Now()
+			// Track this RPC from dispatch to completion. The completed-op
+			// latency metrics can't see a HUNG RPC (it never completes); the
+			// in-flight watchdog dumps goroutines when one crosses ~22s, well
+			// before the ~40s soft-mount timeout aborts the client's copy with
+			// "error 100060". defer (not an inline call after c.handle) so the
+			// entry is always cleared, even if the handler panics.
+			ifid := inflightRegister(inflightOpName(w.req))
+			defer inflightDone(ifid)
 			err := c.handle(connCtx, w)
 			elapsed := time.Since(start)
 			respErr := w.finish(connCtx)
