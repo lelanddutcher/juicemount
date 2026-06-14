@@ -521,12 +521,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// who set 0 to disable buffering would expect. Now we warn
 		// explicitly and keep the default so the user knows the env
 		// var was ignored.
-		spoolCapacity := int64(50) << 30
+		// Default auto-sizes to free disk (minus a floor) so a large SD-card
+		// offload — e.g. an 87 GB RAW shoot — fits in the spool instead of
+		// overflowing the old fixed 50 GiB and aborting the copy with NOSPC.
+		// An explicit JM_SPOOL_SIZE_GB still wins (and is clamped to free disk
+		// inside NewSpoolStore).
+		spoolCapacity := jmnfs.AutoSpoolCapacity(spoolDir)
 		if cfg.SpoolSizeGB >= 1 {
 			spoolCapacity = int64(cfg.SpoolSizeGB) << 30
 		} else if s := os.Getenv("JM_SPOOL_SIZE_GB"); s != "" {
 			if v, err := strconv.ParseInt(s, 10, 64); err != nil || v < 1 {
-				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using 50 GiB default",
+				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using auto-sized default",
 					"raw", s)
 			} else {
 				spoolCapacity = v << 30

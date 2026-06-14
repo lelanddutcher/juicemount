@@ -1544,7 +1544,19 @@ func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 		inode := jfs.handler.nextSyntheticInode()
 		e := metadata.MakeEntry(filename, false, 0, now, inode)
 		e.LocalOnly = true
-		jfs.handler.store.Insert(e)
+		// Persist the entries row ASYNC (matching MkdirAll at :679 and prefetch
+		// at :1745): InsertToCache gives the NFS handle + directory listing
+		// immediate visibility, while the SQLite write — a writeMu-serialized
+		// FTS-upsert transaction — moves OFF the CREATE RPC hot path. A
+		// synchronous Insert here was the dominant per-file serialization in a
+		// many-file offload: every CREATE blocked behind every other entries
+		// write (reconcile BulkInsert, the echoed event flood), pushing CREATE
+		// latency toward the soft-mount timeout at tens of thousands of files.
+		// Crash-safe: the entry is LocalOnly + size 0; if the async Insert is
+		// lost to a crash, the spool file + spool_entries row survive and the
+		// boot scrubber + onSpoolDrained re-materialize the entry.
+		jfs.handler.store.InsertToCache(e)
+		go jfs.handler.store.Insert(e)
 
 		sentry, err := jfs.handler.spool.OpenWrite(filename)
 		if err != nil {
@@ -1562,10 +1574,12 @@ func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 		return nil, err
 	}
 
-	// Insert into SQLite immediately with local_only flag
+	// Cache immediately for NFS visibility; persist to SQLite async (same
+	// off-hot-path pattern as the spool branch above and MkdirAll at :679).
 	e := metadata.MakeEntry(filename, false, 0, now, jfs.handler.nextSyntheticInode())
 	e.LocalOnly = true
-	jfs.handler.store.Insert(e)
+	jfs.handler.store.InsertToCache(e)
+	go jfs.handler.store.Insert(e)
 
 	// QA-19: Create returns a writeFile whose Close calls decActiveWriter.
 	// Match it with an inc here so the phantom-purge gate sees the writer.

@@ -131,13 +131,57 @@ func (s *SpoolStore) unlockAllShards() {
 	}
 }
 
+// SpoolFreeFloorBytes is the disk space the spool leaves free when
+// auto-sizing or clamping its capacity, so the OS and the JuiceFS cache that
+// shares the same SSD always have headroom. Mirrors the 10 GiB cache floor in
+// health/fuse.go but is larger because the spool can hold an entire un-drained
+// SD-card burst.
+const SpoolFreeFloorBytes = int64(20) << 30 // 20 GiB
+
+// spoolDiskAvail returns the bytes available to this user on the filesystem
+// backing dir. dir may not exist yet (NewSpoolStore creates it after the
+// config layer computes the default), so it walks up to the nearest existing
+// ancestor — any path on the same volume reports the same free space.
+func spoolDiskAvail(dir string) (int64, error) {
+	for d := dir; ; {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(d, &st); err == nil {
+			return int64(st.Bavail) * int64(st.Bsize), nil
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return 0, fmt.Errorf("spool: statfs: no accessible ancestor of %s", dir)
+		}
+		d = parent
+	}
+}
+
+// AutoSpoolCapacity is the default spool capacity when JM_SPOOL_SIZE_GB is
+// unset: free disk minus the floor, so the spool sizes to the machine instead
+// of a fixed 50 GiB that a large SD-card offload (e.g. an 87 GB RAW shoot)
+// would overflow mid-copy. Falls back to 50 GiB if Statfs fails, and never
+// returns below 8 GiB. Callers pass the result as NewSpoolStore's capacity.
+func AutoSpoolCapacity(dir string) int64 {
+	avail, err := spoolDiskAvail(dir)
+	if err != nil || avail <= 0 {
+		return int64(50) << 30
+	}
+	c := avail - SpoolFreeFloorBytes
+	if c < int64(8)<<30 {
+		c = int64(8) << 30
+	}
+	return c
+}
+
 // NewSpoolStore creates the spool root if it doesn't exist and returns an
 // empty store. It does NOT recover prior on-disk state — call Recover for
 // that (Slice F adds the recovery scrubber; for Slice A this is a no-op).
 //
-// capacity is in bytes; 0 means unlimited. meta is the SQLite-backed index
-// (callers should have called metadata.InitSpoolSchema on the underlying
-// db before this).
+// capacity is in bytes; 0 means unlimited. A positive capacity is clamped to
+// the actual free disk (minus SpoolFreeFloorBytes) so a logical budget larger
+// than the spool SSD cannot cause a kernel ENOSPC mid-copy — the budget is
+// otherwise blind to physical space. meta is the SQLite-backed index (callers
+// should have called metadata.InitSpoolSchema on the underlying db first).
 func NewSpoolStore(root string, capacity int64, meta *metadata.SpoolStore) (*SpoolStore, error) {
 	if root == "" {
 		return nil, fmt.Errorf("spool: root path is required")
@@ -148,6 +192,16 @@ func NewSpoolStore(root string, capacity int64, meta *metadata.SpoolStore) (*Spo
 	filesDir := filepath.Join(root, SpoolFilesSubdir)
 	if err := os.MkdirAll(filesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("spool: mkdir %s: %w", filesDir, err)
+	}
+	if capacity > 0 {
+		if avail, err := spoolDiskAvail(root); err == nil && avail > 0 {
+			if maxCap := avail - SpoolFreeFloorBytes; maxCap > 0 && capacity > maxCap {
+				jmlog.Warn("spool: capacity clamped to free disk",
+					"requested_gb", capacity>>30, "clamped_gb", maxCap>>30,
+					"free_gb", avail>>30)
+				capacity = maxCap
+			}
+		}
 	}
 	s := &SpoolStore{
 		root:          root,
@@ -209,6 +263,13 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	const reopenMaxWait = 30 * time.Second
 	var waited time.Duration
 
+	// capWaits bounds how many times a full-spool create applies backpressure
+	// (each waitForHeadroom is itself bounded by capacityWaitDeadline) so a
+	// persistently-full spool fails the create cleanly within the NFS timeout
+	// budget instead of looping.
+	const maxCapWaits = 2
+	capWaits := 0
+
 	// Same path always maps to the same shard, so the check-then-create
 	// dedup below is serialized exactly as the old global openMu did; opens
 	// of OTHER paths now run on other shards concurrently.
@@ -248,8 +309,17 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 
 		// No entry for this path — create a fresh one under the path shard.
 		if s.capacity > 0 && s.used.Load() >= s.capacity {
+			// Spool full. Release the shard and apply backpressure (wait for
+			// the drainer to free headroom) before failing the create, so an
+			// offload doesn't abort the instant the spool fills. On headroom,
+			// re-check existence + capacity with a fresh shard lock; only fail
+			// after the wait deadline truly elapses.
 			shard.Unlock()
-			return nil, ErrSpoolFull
+			if capWaits >= maxCapWaits || !s.waitForHeadroom() {
+				return nil, ErrSpoolFull
+			}
+			capWaits++
+			continue
 		}
 
 		// Spool file basename: SHA-256(nfs_path) hex prefix + a microsecond
@@ -890,6 +960,62 @@ func (s *SpoolStore) tryReserveCapacity(delta int64) bool {
 	}
 }
 
+// capacityWaitPoll / capacityWaitDeadline bound the backpressure stall when the
+// spool is full. A WriteAt/OpenWrite that can't get capacity waits up to the
+// deadline (polling for the drainer to free space) before giving up with
+// ErrSpoolFull — converting a hard NOSPC abort of the whole Finder copy into a
+// brief stall the NFS client tolerates as slow I/O, pacing ingest to drain
+// throughput. The deadline stays well under the NFS soft-mount timeout so the
+// stall itself never trips ETIMEDOUT. Vars (not consts) so tests can shorten
+// them. This is the flow-control valve the spool previously lacked: before, the
+// instant ingest outran drain past the cap, every write hard-failed and the
+// copy aborted — fatal for a large SD-card offload.
+var (
+	capacityWaitPoll     = 25 * time.Millisecond
+	capacityWaitDeadline = 5 * time.Second
+)
+
+// reserveCapacityOrWait reserves delta bytes, blocking up to capacityWaitDeadline
+// for the drainer to free space if the cap is currently exhausted. Returns true
+// with delta reserved, false on timeout/close. Callers MUST NOT hold a per-entry
+// e.mu or path shard across this call — it can block for the full deadline, and
+// holding those would stall the sweeper and other opens.
+func (s *SpoolStore) reserveCapacityOrWait(delta int64) bool {
+	if s.tryReserveCapacity(delta) {
+		return true
+	}
+	deadline := time.Now().Add(capacityWaitDeadline)
+	for {
+		if s.closed.Load() || time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(capacityWaitPoll)
+		if s.tryReserveCapacity(delta) {
+			return true
+		}
+	}
+}
+
+// waitForHeadroom blocks up to capacityWaitDeadline for the spool to drop below
+// its cap (the drainer freeing space), so a new-file OpenWrite during a full
+// spool stalls instead of hard-failing the copy. Returns true once there is
+// headroom, false on timeout/close. Must not be called with a shard held.
+func (s *SpoolStore) waitForHeadroom() bool {
+	if s.capacity <= 0 || s.used.Load() < s.capacity {
+		return true
+	}
+	deadline := time.Now().Add(capacityWaitDeadline)
+	for {
+		if s.closed.Load() || time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(capacityWaitPoll)
+		if s.used.Load() < s.capacity {
+			return true
+		}
+	}
+}
+
 // releaseCapacity returns reserved bytes to the budget. Used when a
 // reserved write partially failed and the actual delta committed to
 // disk was less than reserved.
@@ -1190,8 +1316,25 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 	if newEnd > e.writtenEnd {
 		reserved = newEnd - e.writtenEnd
 		if !e.store.tryReserveCapacity(reserved) {
+			// Spool full. Release e.mu and apply backpressure instead of
+			// hard-failing the WRITE RPC (which aborts the whole Finder copy
+			// with NOSPC). Wait briefly for the drainer to free capacity, then
+			// re-acquire and re-validate. writtenEnd may have advanced while
+			// unlocked (a concurrent write to this file); the refund logic
+			// below reconciles `reserved` (computed against the pre-wait
+			// writtenEnd) against the then-current writtenEnd — since writtenEnd
+			// only moves forward, the actual extension is <= reserved and the
+			// excess is refunded, so the accounting stays correct.
 			e.mu.Unlock()
-			return 0, ErrSpoolFull
+			if !e.store.reserveCapacityOrWait(reserved) {
+				return 0, ErrSpoolFull
+			}
+			e.mu.Lock()
+			if e.closed || e.file == nil {
+				e.store.releaseCapacity(reserved)
+				e.mu.Unlock()
+				return 0, fmt.Errorf("spool: write to closed entry")
+			}
 		}
 	}
 	outOfOrder := off < e.writtenEnd

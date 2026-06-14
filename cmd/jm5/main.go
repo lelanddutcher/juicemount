@@ -208,10 +208,12 @@ func main() {
 				spoolDir = filepath.Join(home, "Library", "Application Support", "JuiceMount", "spool")
 			}
 		}
-		spoolCapacity := int64(50) << 30
+		// Auto-size to free disk by default so a large SD-card offload fits;
+		// explicit JM_SPOOL_SIZE_GB still wins (clamped to disk in NewSpoolStore).
+		spoolCapacity := jmnfs.AutoSpoolCapacity(spoolDir)
 		if s := os.Getenv("JM_SPOOL_SIZE_GB"); s != "" {
 			if v, err := strconv.ParseInt(s, 10, 64); err != nil || v < 1 {
-				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using 50 GiB default",
+				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using auto-sized default",
 					"raw", s)
 			} else {
 				spoolCapacity = v << 30
