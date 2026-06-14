@@ -263,12 +263,10 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	const reopenMaxWait = 30 * time.Second
 	var waited time.Duration
 
-	// capWaits bounds how many times a full-spool create applies backpressure
-	// (each waitForHeadroom is itself bounded by capacityWaitDeadline) so a
-	// persistently-full spool fails the create cleanly within the NFS timeout
-	// budget instead of looping.
-	const maxCapWaits = 2
-	capWaits := 0
+	// capStart marks when this open first hit a full spool. The backpressure
+	// loop below throttles (polls for the drainer to free headroom) until
+	// capacityWaitDeadline elapses, then fails the create with ErrSpoolFull.
+	var capStart time.Time
 
 	// Same path always maps to the same shard, so the check-then-create
 	// dedup below is serialized exactly as the old global openMu did; opens
@@ -309,16 +307,24 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 
 		// No entry for this path — create a fresh one under the path shard.
 		if s.capacity > 0 && s.used.Load() >= s.capacity {
-			// Spool full. Release the shard and apply backpressure (wait for
-			// the drainer to free headroom) before failing the create, so an
-			// offload doesn't abort the instant the spool fills. On headroom,
-			// re-check existence + capacity with a fresh shard lock; only fail
-			// after the wait deadline truly elapses.
+			// Spool full. Release the shard and THROTTLE — poll for the drainer
+			// to free headroom rather than hard-fail the create, so a large copy
+			// paces itself to drain throughput (the copy slows) instead of
+			// aborting the whole Finder copy with NOSPC ("disk full"). Polling
+			// and re-checking each tick (vs one fixed wait) is fair under many
+			// concurrent full-spool opens — none starves on a lost race, since
+			// every waiter keeps re-checking as the drainer frees slots. Bounded
+			// by capacityWaitDeadline (well under the soft-mount timeout) so the
+			// stall never trips ETIMEDOUT (error 100060); only a genuinely
+			// stalled drain reaches the deadline and fails with ErrSpoolFull.
 			shard.Unlock()
-			if capWaits >= maxCapWaits || !s.waitForHeadroom() {
+			if capStart.IsZero() {
+				capStart = time.Now()
+			}
+			if s.closed.Load() || time.Since(capStart) >= capacityWaitDeadline {
 				return nil, ErrSpoolFull
 			}
-			capWaits++
+			time.Sleep(capacityWaitPoll)
 			continue
 		}
 
@@ -1060,8 +1066,18 @@ func (s *SpoolStore) tryReserveCapacity(delta int64) bool {
 // instant ingest outran drain past the cap, every write hard-failed and the
 // copy aborted — fatal for a large SD-card offload.
 var (
-	capacityWaitPoll     = 25 * time.Millisecond
-	capacityWaitDeadline = 5 * time.Second
+	capacityWaitPoll = 25 * time.Millisecond
+	// capacityWaitDeadline: how long a full-spool WriteAt/OpenWrite throttles,
+	// waiting for the drainer to free space, before giving up with ErrSpoolFull.
+	// 30s (was 5s) — kept safely under the NFS soft-mount timeout (~40s) so the
+	// stall never trips ETIMEDOUT, but long enough that ingest THROTTLES to
+	// drain throughput across a sustained large copy instead of hard-failing the
+	// whole Finder copy with NOSPC ("disk full") the moment the spool fills
+	// (2026-06-14: a 500 GB copy aborted "disk is full" at the cap; the old 10s
+	// total OpenWrite budget couldn't outlast a slow drain under concurrency).
+	// The drain freeing ~1 file every few hundred ms means each waiter gets its
+	// slot well within this window; only a genuinely stalled drain reaches it.
+	capacityWaitDeadline = 30 * time.Second
 )
 
 // reserveCapacityOrWait reserves delta bytes, blocking up to capacityWaitDeadline
