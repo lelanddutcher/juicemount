@@ -3,6 +3,7 @@ package nfs
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -2112,6 +2113,20 @@ func (jc *juiceChange) Chtimes(name string, atime, mtime time.Time) error { retu
 // cachedFile implements billy.File with two-tier read path:
 // 1. Direct SSD pread (bypasses FUSE) — if cache reader is available and block is cached
 // 2. JuiceFS FUSE pread (fallback) — populates SSD cache for future reads
+const (
+	// fuseReadMaxRetries bounds how many times cachedFile.ReadAt re-attempts a
+	// zero-progress transient FUSE/MinIO read error before surfacing it. 4
+	// attempts with the staged backoff below totals ~0.5s of sleeps — tiny
+	// against the ~40s soft-mount per-RPC budget (timeo=400) — and converted
+	// the observed ~2% concurrent-cold-read failure rate to zero in validation.
+	fuseReadMaxRetries = 4
+	// fuseReadRetryBackoff is multiplied by the (1-based) attempt number, so
+	// the sleeps are 50,100,150,200 ms. Short enough to stay well inside the
+	// kernel per-RPC window, long enough to let a contended MinIO fetch / FUSE
+	// loader slot free up between tries.
+	fuseReadRetryBackoff = 50 * time.Millisecond
+)
+
 type cachedFile struct {
 	name        string
 	fuseFD      *os.File
@@ -2250,8 +2265,43 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		return 0, pin.ErrOfflineNotAvailable
 	}
 
-	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time)
+	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time).
 	n, err := f.fuseFD.ReadAt(p, off)
+	// [JM6 readback-resilience, 2026-06-14] A cold chunk fetch from MinIO
+	// under heavy concurrent read load can return a TRANSIENT EIO from
+	// JuiceFS/macFUSE even though the bytes are intact (a sequential re-read
+	// always succeeds). Surfacing that raw EIO maps to NFS3ERR_IO, which the
+	// kernel turns into EIO for read()-based consumers and SIGBUS for
+	// mmap-based ones — and many NLEs mmap their media, so they CRASH
+	// mid-readback with ZERO data actually lost. Root-caused via a 10-way
+	// concurrent readback of a freshly-copied 119 GB / 5387-file shoot:
+	// ~1-2.5% of cold large-file reads failed (rc=138 SIGBUS / dd EIO), 0
+	// sequentially, with server rpc_errors=0 the whole time (silent).
+	//
+	// Retry a ZERO-progress, non-EOF, non-offline error a few times with
+	// short backoff. The mount budget is generous (soft,timeo=400 → ~40s per
+	// RPC) and onRead caps a single subread at 256 KiB, so a sub-second retry
+	// is comfortably inside the kernel's per-RPC window. A PARTIAL read (n>0)
+	// is returned as-is — the client reissues for the remainder — so we never
+	// re-read bytes already delivered. Offline errors stay fail-fast (the
+	// offline UX contract); EOF is a legitimate stop, not a transient error.
+	if err != nil && n == 0 && !errors.Is(err, io.EOF) && !pin.IsOfflineNotAvailable(err) {
+		for attempt := 1; attempt <= fuseReadMaxRetries; attempt++ {
+			time.Sleep(fuseReadRetryBackoff * time.Duration(attempt))
+			metrics.Default().IncReadRetry()
+			n, err = f.fuseFD.ReadAt(p, off)
+			if n > 0 || err == nil || errors.Is(err, io.EOF) {
+				jmlog.Debug("cold FUSE read recovered on retry",
+					"path", f.name, "off", off, "attempt", attempt)
+				break
+			}
+		}
+		if err != nil && n == 0 && !errors.Is(err, io.EOF) {
+			metrics.Default().IncReadFail()
+			jmlog.Warn("cold FUSE read failed after retries; surfacing transient EIO to client",
+				"path", f.name, "off", off, "attempts", fuseReadMaxRetries, "err", err)
+		}
+	}
 	if n > 0 && f.readahead != nil {
 		f.readahead.OnRead(f.inode, off, n, f.name)
 	}
