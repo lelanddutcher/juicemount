@@ -1179,7 +1179,16 @@ type SpoolEntry struct {
 	mu         sync.RWMutex
 	file       *os.File // nil after Close
 	writtenEnd int64
-	hasher     hash.Hash
+	// contiguousEnd is the end of the contiguously-written prefix from offset
+	// 0 — i.e. the largest N such that bytes [0,N) all actually contain written
+	// data. Distinct from writtenEnd, which is the high-water/allocated size:
+	// an ftruncate-preallocate (cp/copyfile/fio) or an out-of-order WRITE jumps
+	// writtenEnd past data that hasn't landed yet, leaving a HOLE. Reads must
+	// never serve those holes (pread returns them as ZEROS with no error — an
+	// NLE reading a still-copying clip would get black frames / corrupt RAW),
+	// so the read shadow clamps to contiguousEnd. Monotonic; guarded by mu.
+	contiguousEnd int64
+	hasher        hash.Hash
 	sha256     []byte // populated on Close iff streaming hash is trustworthy
 	// hashValid tracks whether the streaming hasher reflects the on-disk
 	// contents. False once we observe any out-of-order WriteAt (off <
@@ -1243,6 +1252,17 @@ func (e *SpoolEntry) SpoolFilePath() string { return e.spoolFile }
 func (e *SpoolEntry) WrittenEnd() int64 {
 	e.mu.RLock()
 	n := e.writtenEnd
+	e.mu.RUnlock()
+	return n
+}
+
+// ContiguousEnd returns the end of the contiguously-written prefix — the
+// largest N such that bytes [0,N) all contain real written data (no
+// preallocation/out-of-order holes). The read shadow uses this as the
+// readable boundary so an in-flight file never serves a hole as zeros.
+func (e *SpoolEntry) ContiguousEnd() int64 {
+	e.mu.RLock()
+	n := e.contiguousEnd
 	e.mu.RUnlock()
 	return n
 }
@@ -1354,6 +1374,16 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 			// whole reservation since we never actually grew the file.
 			e.store.releaseCapacity(reserved)
 		}
+		// Extend the contiguous-written prefix if this write starts at or
+		// before its current end (sequential write, or a backfill that closes
+		// the gap). A write that starts ABOVE contiguousEnd leaves a hole and
+		// does NOT advance it — reads must not see that hole as zeros. This is
+		// conservative for fully out-of-order writers (the prefix lags until
+		// the gap fills) but never serves unwritten data; the dominant
+		// cp/Finder pattern is sequential, so contiguousEnd == writtenEnd.
+		if off <= e.contiguousEnd && end > e.contiguousEnd {
+			e.contiguousEnd = end
+		}
 		if outOfOrder {
 			e.hashValid = false
 		}
@@ -1409,6 +1439,12 @@ func (e *SpoolEntry) Truncate(size int64) error {
 		e.store.releaseCapacity(e.writtenEnd - size)
 	}
 	e.writtenEnd = size
+	if e.contiguousEnd > size {
+		// Shrink past the contiguous prefix: those bytes are gone.
+		e.contiguousEnd = size
+	}
+	// NB: a GROW/preallocate (size > writtenEnd) leaves contiguousEnd alone —
+	// the extended region is an unwritten hole that reads must not serve.
 	e.hashValid = false
 	// Truncate is writer activity: bump quiescence so the sweeper doesn't
 	// finalize between a client's ftruncate and its first WRITE.

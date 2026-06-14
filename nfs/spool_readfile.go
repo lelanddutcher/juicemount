@@ -87,7 +87,26 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 	if err := f.ensureFDLocked(); err != nil {
 		return 0, err
 	}
-	return f.fd.ReadAt(p, off)
+	// Never serve bytes from an unwritten region of an in-flight file. A
+	// preallocated (ftruncate) or out-of-order write leaves a hole that a raw
+	// pread returns as ZEROS with err=nil — indistinguishable from real data,
+	// so an NLE reading a still-copying clip renders black frames / corrupt
+	// RAW. Clamp every read to the contiguous-written prefix; anything beyond
+	// it is not on disk yet, so report EOF at that boundary (the file appears
+	// to grow, the client re-stats and reissues) rather than fabricate zeros.
+	cend := f.entry.ContiguousEnd()
+	if off >= cend {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > cend-off {
+		p = p[:cend-off]
+	}
+	n, err := f.fd.ReadAt(p, off)
+	// A short read because we clamped at the contiguous boundary is NOT a real
+	// EOF if the file is still growing; the FileInfo.Size (also clamped to
+	// contiguousEnd) keeps the client coherent, so a true past-end read above
+	// returns io.EOF and a clamped read returns the available bytes.
+	return n, err
 }
 
 // Seek updates the logical position.
@@ -100,7 +119,9 @@ func (f *spoolReadFile) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		f.pos += offset
 	case io.SeekEnd:
-		f.pos = f.entry.WrittenEnd() + offset
+		// SeekEnd is relative to the READABLE end (contiguous-written), not the
+		// preallocated high-water, so a seek-to-end never lands in a hole.
+		f.pos = f.entry.ContiguousEnd() + offset
 	default:
 		return 0, fmt.Errorf("spoolReadFile.Seek: invalid whence %d", whence)
 	}
@@ -142,8 +163,13 @@ func (i *spoolFileInfo) Sys() any           { return nil }
 // Finder sees the right name; the full path is in the spoolReadFile.
 func spoolFileInfoForEntry(base string, e *SpoolEntry) *spoolFileInfo {
 	return &spoolFileInfo{
-		name:  base,
-		size:  e.WrittenEnd(),
+		name: base,
+		// Report the contiguous-written size, NOT the preallocated high-water:
+		// onRead clamps reads to this, so a read can never be directed into an
+		// unwritten hole (which pread would return as zeros). The file appears
+		// to grow as data lands; once drained, reads come from FUSE at full
+		// size. Keeps the read clamp and the no-zeros guarantee consistent.
+		size:  e.ContiguousEnd(),
 		mtime: e.LastWrite(),
 		inode: e.Inode(),
 	}
