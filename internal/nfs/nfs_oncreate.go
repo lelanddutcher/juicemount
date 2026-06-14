@@ -74,9 +74,25 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 	if s, err := fs.Stat(newFilePath); err == nil && s.IsDir() {
 		return &NFSStatusError{NFSStatusExist, nil}
 	}
-	// Verify parent directory exists
+	// Verify parent directory exists. A FUSE-stat TIMEOUT here must NOT fail
+	// the create: under heavy copy+drain load the parent's stat can fall
+	// through to a contended FUSE mount and exceed the 2s bound (e.g. after the
+	// parent gets LRU-evicted from the metadata cache mid-large-copy). Returning
+	// an error that wraps ErrFUSETimeout makes the RPC layer reply
+	// NFS3ERR_JUKEBOX (conn.go), so the client RETRIES the CREATE; under a
+	// sustained slow spell those retries accumulate past the ~40s soft-mount
+	// timeout and the client aborts the whole copy with "error 100060"
+	// (2026-06-14, tripped a 500 GB Finder copy at ~8 GB). We are mid-copy INTO
+	// this directory, which Finder created (MKDIR) before any file in it, so on
+	// an ambiguous timeout assume the parent exists and let fs.Create arbitrate
+	// (it returns ENOENT if the parent is genuinely gone). A DEFINITIVE error
+	// (real ENOENT, not-a-dir) still fails fast as before.
 	if s, err := fs.Stat(fs.Join(path...)); err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
+		if errors.Is(err, ErrFUSETimeout) {
+			// ambiguous (FUSE wedged/slow) — proceed optimistically
+		} else {
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
 	} else if !s.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, nil}
 	}

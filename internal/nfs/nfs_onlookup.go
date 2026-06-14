@@ -3,6 +3,7 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 
 	"github.com/go-git/go-billy/v5"
@@ -40,8 +41,23 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
+	// A FUSE-stat TIMEOUT verifying the parent dir must NOT fail the lookup.
+	// `p` is a directory by construction (the client holds its handle and is
+	// looking up a child in it); under heavy copy load this sanity Lstat can
+	// fall through to a contended FUSE mount (parent LRU-evicted mid-large-copy)
+	// and exceed the 2s bound. Returning NotDir wrapping ErrFUSETimeout makes
+	// the RPC layer reply NFS3ERR_JUKEBOX (conn.go), so the client RETRIES the
+	// LOOKUP; during a sustained slow spell those retries storm and accumulate
+	// past the ~40s soft-mount timeout → "error 100060" aborts the copy
+	// (2026-06-14: a LOOKUP storm of +22k retries was the observed stall). On an
+	// ambiguous timeout, skip the check and proceed to the child Lstat below
+	// (which resolves from cache, or returns NoEnt so a CREATE can proceed).
 	dirInfo, err := fs.Lstat(fs.Join(p...))
-	if err != nil || !dirInfo.IsDir() {
+	if err != nil {
+		if !errors.Is(err, ErrFUSETimeout) {
+			return &NFSStatusError{NFSStatusNotDir, err}
+		}
+	} else if !dirInfo.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, err}
 	}
 
