@@ -31,6 +31,14 @@ func TestBulkInsertStaysIncrementalAfterInit(t *testing.T) {
 		t.Fatal("ftsInitialized should be set after the first BulkInsert")
 	}
 
+	// Baseline the full-rebuild counter AFTER init. This is the load-bearing
+	// assertion the prior version lacked: searchability alone cannot tell an
+	// incremental maintain from a delete-all+full-reindex (both leave every row
+	// searchable), so the old test passed even on the broken pre-fix code. We
+	// instead assert the BRANCH taken — a large post-init delta must trigger
+	// ZERO RebuildFTS calls.
+	rebuildsBefore := s.ftsFullRebuilds.Load()
+
 	// A LARGE post-init delta (10 > threshold 3) must stay incremental.
 	var big []*Entry
 	for i := 0; i < 10; i++ {
@@ -40,8 +48,18 @@ func TestBulkInsertStaysIncrementalAfterInit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The post-init large delta must be searchable — proving incremental FTS
-	// maintenance ran (a skipped full rebuild would leave them unindexed).
+	// THE decisive check: the large post-init delta must NOT have run a full
+	// RebuildFTS (the writeMu-long-hold QA-40 stall). On the pre-fix code
+	// (incremental := len(entries) < FTSFullRebuildThreshold) this delta of 10
+	// exceeds the threshold of 3, takes the !incremental branch, calls
+	// RebuildFTS, and this assertion FAILS — which is exactly the regression the
+	// old searchability-only test could not catch.
+	if got := s.ftsFullRebuilds.Load() - rebuildsBefore; got != 0 {
+		t.Fatalf("post-init large delta triggered %d full RebuildFTS call(s); want 0 (must stay incremental — QA-40 stall path)", got)
+	}
+
+	// Secondary: it must also actually be searchable (incremental maintenance
+	// truly ran, not silently dropped).
 	res, err := s.Search("CARDFILE", 50, "")
 	if err != nil {
 		t.Fatal(err)
