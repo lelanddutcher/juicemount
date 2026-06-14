@@ -17,13 +17,19 @@ func TestNFSAutoRemountThreshold(t *testing.T) {
 	prevThreshold := NFSStaleThreshold
 	prevCooldown := NFSRemountCooldown
 	prevUmount := forceUnmountFn
+	prevAlive := isJuiceFSProcessAliveFn
 	NFSStaleThreshold = 3
 	NFSRemountCooldown = 100 * time.Millisecond
 	forceUnmountFn = func(string) error { return nil }
+	// Force "juicefs gone" so the remount path runs deterministically — on a
+	// host where a real juicefs is running (e.g. the dev's own app) the handler
+	// would otherwise defer to the FUSE watchdog and never remount.
+	isJuiceFSProcessAliveFn = func() bool { return false }
 	t.Cleanup(func() {
 		NFSStaleThreshold = prevThreshold
 		NFSRemountCooldown = prevCooldown
 		forceUnmountFn = prevUmount
+		isJuiceFSProcessAliveFn = prevAlive
 	})
 
 	var calls atomic.Int32
@@ -76,11 +82,14 @@ func TestNFSAutoRemountThreshold(t *testing.T) {
 func TestNFSAutoRemountResetOnHealthy(t *testing.T) {
 	prevThreshold := NFSStaleThreshold
 	prevUmount := forceUnmountFn
+	prevAlive := isJuiceFSProcessAliveFn
 	NFSStaleThreshold = 3
 	forceUnmountFn = func(string) error { return nil }
+	isJuiceFSProcessAliveFn = func() bool { return false }
 	t.Cleanup(func() {
 		NFSStaleThreshold = prevThreshold
 		forceUnmountFn = prevUmount
+		isJuiceFSProcessAliveFn = prevAlive
 	})
 
 	var calls atomic.Int32
