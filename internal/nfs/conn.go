@@ -320,6 +320,9 @@ func (c *conn) handle(ctx context.Context, w *response) error {
 	// from exhausting the slot budget and staling the whole mount.
 	if appError != nil && errors.Is(appError, ErrFUSETimeout) {
 		appError = &NFSStatusError{NFSStatusJukebox, appError}
+		// Count it: a JUKEBOX reply is a "success" to the latency metrics, so a
+		// retry storm (the "error 100060" mechanism) is otherwise invisible.
+		recordJukebox(inflightOpName(w.req))
 	}
 	if drainErr := w.drain(ctx); drainErr != nil {
 		return drainErr
