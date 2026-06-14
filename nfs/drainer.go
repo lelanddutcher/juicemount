@@ -417,9 +417,11 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// negligible on a video-editor machine vs the cost of silently
 	// drained corruption.
 	//
-	// Only performed when row.SHA256 is set (sequential writes); for
-	// out-of-order writes the comparison reference doesn't exist, so
-	// slice G's manifest log carries the integrity story instead.
+	// row.SHA256 is now ALWAYS populated: sequential writes carry the streaming
+	// hash, and finalizeLocked derives a disk reference for out-of-order writes
+	// (so this at-rest check, and the spool-SSD check above, run for EVERY
+	// file). The len>0 guard remains only as defense for a finalize-time disk
+	// hash that failed to compute.
 	if len(row.SHA256) > 0 {
 		atRestSHA, _, hashErr := hashSpoolFile(dest)
 		if hashErr != nil {

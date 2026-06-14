@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"os"
@@ -457,12 +458,22 @@ func TestSpoolOutOfOrderInvalidatesStreamingHash(t *testing.T) {
 
 	_ = e.Close()
 	if e.SHA256() != nil {
-		t.Errorf("SHA256() should be nil after out-of-order write invalidates streaming hash")
+		t.Errorf("SHA256() (streaming) should be nil after out-of-order write invalidates streaming hash")
 	}
-	// SQL row's sha column should also be nil → drainer knows to re-hash.
+	// DATA-INTEGRITY FIX: finalize now derives a reference SHA from the on-disk
+	// file when the streaming hash was invalidated, so the SQL row carries a
+	// non-nil sha and the drainer VERIFIES the out-of-order file at rest
+	// (previously it drained unverified — silent corruption risk).
 	row, _ := s.Meta().Get(e.ID())
-	if row.SHA256 != nil {
-		t.Errorf("SQL row should have nil sha after streaming hash invalidated")
+	if row.SHA256 == nil {
+		t.Fatalf("SQL row should have a disk-derived sha after out-of-order write so the drainer can verify it")
+	}
+	diskSha, _, herr := hashSpoolFile(e.SpoolFilePath())
+	if herr != nil {
+		t.Fatalf("re-hash spool file: %v", herr)
+	}
+	if !bytes.Equal(row.SHA256, diskSha) {
+		t.Errorf("row sha %x != actual on-disk sha %x", row.SHA256, diskSha)
 	}
 }
 
