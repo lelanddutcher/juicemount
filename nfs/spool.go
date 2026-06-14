@@ -784,6 +784,11 @@ func (s *SpoolStore) CancelForDelete(nfsPath string) {
 	e, indexed := s.index.Lookup(nfsPath)
 	if indexed {
 		s.index.DeleteIfMatches(nfsPath, e)
+		// Close the live entry BEFORE its spool file is unlinked below, so a
+		// concurrent WriteAt to this path (a delete racing an active write
+		// under concurrent NLE/Finder activity) errors cleanly instead of
+		// writing into an unlinked fd, which would silently discard the bytes.
+		e.cancelClose()
 	}
 	rows, err := s.meta.DeleteActiveByPath(nfsPath)
 	if err != nil {
@@ -1309,6 +1314,23 @@ func (e *SpoolEntry) Sync() error {
 		return nil
 	}
 	return e.file.Sync()
+}
+
+// cancelClose marks the entry closed and closes its fd. Used by CancelForDelete
+// BEFORE it unlinks the spool file, so a concurrent WriteAt (which checks
+// e.closed under e.mu) errors cleanly instead of writing into a soon-to-be-
+// unlinked fd — those bytes would be silently discarded yet the WRITE RPC would
+// return OK, a delete-racing-an-active-write data hazard. Idempotent.
+func (e *SpoolEntry) cancelClose() {
+	e.mu.Lock()
+	if !e.closed {
+		e.closed = true
+		if e.file != nil {
+			_ = e.file.Close()
+			e.file = nil
+		}
+	}
+	e.mu.Unlock()
 }
 
 // SetInode sets the synthetic inode for this entry. Called once by the

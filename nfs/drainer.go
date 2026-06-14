@@ -314,15 +314,6 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 	return true
 }
 
-// atRestVerifyRetries is how many times a "sha mismatch (fuse at-rest)" is
-// retried (re-copy + re-verify) before quarantining. A transient JuiceFS
-// writeback coherence blip clears on retry; a real at-rest bit flip persists.
-// Kept below the default MaxAttempts (5) so a persistent mismatch quarantines
-// (preserving the file for forensics) rather than failing via the generic
-// retry budget. Quarantine remains the correct terminal disposition for a
-// confirmed mismatch; this only stops a blip from being mistaken for one.
-const atRestVerifyRetries = 2
-
 // drainOne copies a single spool file into the FUSE mount, SHA-verifies
 // the copy, and dispositions the row.
 func (d *Drainer) drainOne(row *metadata.SpoolRow) {
@@ -430,19 +421,20 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 			return
 		}
 		if !bytes.Equal(atRestSHA, row.SHA256) {
-			// A real at-rest bit flip persists across re-reads; a transient
-			// JuiceFS writeback coherence blip clears on a fresh copy. Retry
-			// the whole copy a bounded number of times before quarantining,
-			// so a blip under burst can't TERMINALLY lose an intact photo
-			// (quarantine is no-retry). The dst.Sync() above makes the first
-			// attempt coherent in the common case; this guards the residual.
-			reason := fmt.Sprintf("sha mismatch (fuse at-rest): streamed=%x atrest=%x", row.SHA256, atRestSHA)
+			// The FUSE at-rest copy differs from the verified reference, but the
+			// spool-side check above PASSED — so the spool file holds GOOD data.
+			// This is FUSE/writeback corruption (or a transient coherence blip),
+			// NOT lost data: re-draining the preserved spool file fixes it.
+			// failTransient retries (a blip clears), and on exhaustion
+			// failPermanent KEEPS the spool file in place so RetryFailed can
+			// recover the good bytes. We deliberately do NOT quarantine here —
+			// quarantine moves the file aside and RetryFailed skips it, which
+			// for recoverable, good-on-spool data would be needless loss of a
+			// photo. (The spool-side mismatch above DOES quarantine — that one
+			// is genuine spool-SSD corruption with no good copy.)
+			reason := fmt.Sprintf("sha mismatch (fuse at-rest): fuse=%x want=%x — spool good, re-draining", atRestSHA, row.SHA256)
 			_ = os.Remove(dest)
-			if row.DrainAttempts < atRestVerifyRetries {
-				d.failTransient(row, fmt.Errorf("%s — re-verifying", reason))
-			} else {
-				d.quarantine(row, reason)
-			}
+			d.failTransient(row, fmt.Errorf("%s", reason))
 			return
 		}
 	}

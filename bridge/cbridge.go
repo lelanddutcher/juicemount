@@ -500,7 +500,22 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// reads consult the spool index before metadata/FUSE (slice D);
 	// when disabled, the handler's spool field stays nil and the
 	// pre-spool writeFile / cachedFile paths run unchanged.
-	if cfg.SpoolEnable || os.Getenv("JM_SPOOL_ENABLE") == "1" {
+	spoolConfigured := cfg.SpoolEnable || os.Getenv("JM_SPOOL_ENABLE") == "1"
+	// Even if the spool is toggled OFF, a previous spool-enabled run may have
+	// left writing/ready/draining rows whose bytes are on the local SSD but NOT
+	// yet on the NAS — while Finder already told the user "copied". Losing those
+	// is unacceptable, so force the spool wiring on to recover + drain the
+	// backlog (boot recovery runs inside the block); the user can re-disable
+	// once it clears. PendingStats errors (no spool schema) mean "no history".
+	spoolHasPending := false
+	if !spoolConfigured {
+		if pf, _, statErr := metadata.NewSpoolStore(store.DB()).PendingStats(); statErr == nil && pf > 0 {
+			spoolHasPending = true
+			jmlog.Warn("spool disabled but PENDING ENTRIES exist — enabling the spool to drain them to the NAS so the user does not lose data they already saw copied (re-disable once it clears)",
+				"pending_files", pf)
+		}
+	}
+	if spoolConfigured || spoolHasPending {
 		spoolDir := os.Getenv("JM_SPOOL_DIR")
 		if spoolDir == "" {
 			home, err := os.UserHomeDir()
@@ -594,22 +609,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				}
 			}
 		}
-	} else {
-		// LB-3 defense in depth: starting with the spool DISABLED skips
-		// ALL spool wiring including boot recovery — any
-		// writing/ready/draining rows left by a previous spool-enabled
-		// run are stranded: bytes sit on the local SSD, never drain to
-		// the NAS, yet Finder already told the user "copied". The Swift
-		// preferences flow guards the toggle, but make the condition
-		// loudly visible in diagnostics regardless of how we got here.
-		// PendingStats errors (e.g. spool schema never created on this
-		// DB) mean "no spool history" and are deliberately ignored.
-		if pf, pb, statErr := metadata.NewSpoolStore(store.DB()).PendingStats(); statErr == nil && pf > 0 {
-			jmlog.Warn("SPOOL DISABLED WITH PENDING ENTRIES — files the user already saw \"copied\" are NOT on the NAS and will not upload until the write spool is re-enabled",
-				"stranded_files", pf,
-				"stranded_bytes", pb)
-		}
 	}
+	// (The spool-disabled-with-pending-entries case is now handled above by
+	// force-enabling the spool to drain the backlog, so there is no stranded-
+	// data path left here. A clean disabled start with zero pending rows needs
+	// no action.)
 
 	// Mount NFS at the user-visible mount point (e.g. /Volumes/zpool) so
 	// Finder can browse it. This requires sudo, which we obtain via an
