@@ -106,15 +106,16 @@ func TestRecoverOnBootOrphanRowReadyMissingFile(t *testing.T) {
 	}
 }
 
-// TestRecoverOnBootWritingStateFailsRow: rows stuck in `writing` state
-// can't be safely resumed (partial file, NFS client doesn't know to
-// retry). Mark failed + remove the partial.
-func TestRecoverOnBootWritingStateFailsRow(t *testing.T) {
+// TestRecoverOnBootWritingStateResumesData: a `writing` row whose spool file
+// holds real data is PRESERVED across a crash — resumed to `ready` and drained
+// — not discarded. Discarding it was the acked-then-lost data-loss bug (a
+// client that COMMITted, then power-lost before the idle finalize, would lose
+// acknowledged bytes). The drainer verifies against the disk-derived sha.
+func TestRecoverOnBootWritingStateResumesData(t *testing.T) {
 	s, root, _ := newSpoolStoreForRecovery(t)
 
-	// Insert a row and leave it in `writing` state, plus drop the
-	// half-written file.
-	file := dropFile(t, root, "halfwritten-abc", []byte("partial bytes"))
+	content := []byte("partial bytes")
+	file := dropFile(t, root, "halfwritten-abc", content)
 	id, _ := s.Meta().Insert("/half.bin", file)
 	// State is already `writing` from Insert.
 
@@ -122,15 +123,45 @@ func TestRecoverOnBootWritingStateFailsRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recover: %v", err)
 	}
-	if report.WritingFailedRows != 1 {
-		t.Errorf("WritingFailedRows=%d, want 1", report.WritingFailedRows)
+	if report.WritingResumed != 1 || report.WritingFailedRows != 0 {
+		t.Errorf("WritingResumed=%d WritingFailedRows=%d, want 1 and 0", report.WritingResumed, report.WritingFailedRows)
+	}
+	row, _ := s.Meta().Get(id)
+	if row.DrainState != metadata.DrainReady {
+		t.Errorf("row state=%q, want ready (resumed for drain)", row.DrainState)
+	}
+	if int(row.Size) != len(content) {
+		t.Errorf("row size=%d, want %d", row.Size, len(content))
+	}
+	if row.SHA256 == nil {
+		t.Errorf("resumed row must carry a disk-derived sha so the drainer verifies it")
+	}
+	if _, err := os.Stat(file); err != nil {
+		t.Errorf("spool file must be PRESERVED for the drainer, got stat err=%v", err)
+	}
+}
+
+// TestRecoverOnBootWritingEmptyFileFails: a `writing` row whose file is empty
+// (created but never written) carries no recoverable data → failed + removed.
+func TestRecoverOnBootWritingEmptyFileFails(t *testing.T) {
+	s, root, _ := newSpoolStoreForRecovery(t)
+
+	file := dropFile(t, root, "empty-abc", []byte{})
+	id, _ := s.Meta().Insert("/empty.bin", file)
+
+	report, err := s.RecoverOnBoot(context.Background())
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if report.WritingFailedRows != 1 || report.WritingResumed != 0 {
+		t.Errorf("WritingFailedRows=%d WritingResumed=%d, want 1 and 0", report.WritingFailedRows, report.WritingResumed)
 	}
 	row, _ := s.Meta().Get(id)
 	if row.DrainState != metadata.DrainFailed {
 		t.Errorf("row state=%q, want failed", row.DrainState)
 	}
 	if _, err := os.Stat(file); !os.IsNotExist(err) {
-		t.Errorf("partial spool file should be removed: stat err=%v", err)
+		t.Errorf("empty partial file should be removed: stat err=%v", err)
 	}
 }
 
@@ -296,7 +327,7 @@ func TestRecoverOnBootMixedFixture(t *testing.T) {
 	idOrphan, _ := s.Meta().Insert("/orphan-row.bin", filepath.Join(s.Root(), SpoolFilesSubdir, "missing"))
 	_ = s.Meta().MarkReady(idOrphan, 100, nil)
 
-	// 1 writing row (file present, will be failed).
+	// 1 writing row (file present with data, will be RESUMED — preserve bytes).
 	writingFile := dropFile(t, root, "writing-1", make([]byte, 50))
 	_, _ = s.Meta().Insert("/writing.bin", writingFile)
 
@@ -322,8 +353,8 @@ func TestRecoverOnBootMixedFixture(t *testing.T) {
 	if report.OrphanRowsFailed != 1 {
 		t.Errorf("OrphanRowsFailed=%d, want 1", report.OrphanRowsFailed)
 	}
-	if report.WritingFailedRows != 1 {
-		t.Errorf("WritingFailedRows=%d, want 1", report.WritingFailedRows)
+	if report.WritingResumed != 1 || report.WritingFailedRows != 0 {
+		t.Errorf("WritingResumed=%d WritingFailedRows=%d, want 1 and 0 (non-empty writing file is preserved)", report.WritingResumed, report.WritingFailedRows)
 	}
 	if report.DrainingReset != 1 {
 		t.Errorf("DrainingReset=%d, want 1", report.DrainingReset)
@@ -332,9 +363,9 @@ func TestRecoverOnBootMixedFixture(t *testing.T) {
 		t.Errorf("ReadyResumed=%d, want 1", report.ReadyResumed)
 	}
 
-	// Capacity counter = draining 200 + ready 1000 = 1200.
-	if used, _ := s.Capacity(); used != 1200 {
-		t.Errorf("used=%d, want 1200 (draining+ready)", used)
+	// Capacity counter = resumed writing 50 + draining 200 + ready 1000 = 1250.
+	if used, _ := s.Capacity(); used != 1250 {
+		t.Errorf("used=%d, want 1250 (writing-resumed+draining+ready)", used)
 	}
 }
 

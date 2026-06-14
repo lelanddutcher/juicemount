@@ -491,11 +491,17 @@ type RecoveryReport struct {
 	// spool file is no longer on disk → MarkFailed (no data to retry).
 	OrphanRowsFailed int
 
-	// WritingFailedRows: rows in `writing` state at boot time. The
-	// partial spool file is unsafe to resume (NFS client doesn't know
-	// the in-flight WRITEs aren't durable) → MarkFailed + delete the
-	// partial file.
+	// WritingFailedRows: rows in `writing` state at boot time with NO
+	// recoverable data (missing/empty/unreadable spool file) → MarkFailed +
+	// delete the partial file.
 	WritingFailedRows int
+
+	// WritingResumed: rows in `writing` state at boot time whose spool file
+	// holds real data → finalized to `ready` (hashed from disk) and drained,
+	// PRESERVING the bytes the client wrote (and may have COMMITted) rather
+	// than discarding acknowledged data. The drainer verifies against the
+	// disk-derived sha.
+	WritingResumed int
 
 	// DrainingReset: rows in `draining` state with spool file present
 	// → ResetToReady so the drainer re-attempts the copy.
@@ -605,16 +611,39 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 		fileExists := actualFiles[r.SpoolFile]
 		switch r.DrainState {
 		case metadata.DrainWriting:
-			if _, mErr := s.meta.MarkFailed(r.ID, "writing-state row recovered after crash (partial spool file unsafe to resume)"); mErr != nil {
-				log.Printf("spool recover: mark writing→failed %d: %v", r.ID, mErr)
-				continue
-			}
+			// RESUME the written data instead of discarding it. A crash / power
+			// loss after the client COMMITted (onCommit now fsyncs the spool
+			// file) must not lose acknowledged bytes — so finalize the on-disk
+			// file to `ready` and let the drainer copy+verify it to MinIO. The
+			// stored sha is the on-disk hash, making the drain self-consistent.
+			// A genuinely partial (uncommitted) file is preserved too; the user
+			// sees it and re-copies, which overwrites it — strictly safer than
+			// silently deleting data the app reported as copied. Only a
+			// missing / empty / unreadable file is failed (no recoverable data).
+			var sha []byte
+			var sz int64
+			var hErr error
 			if fileExists {
-				if rmErr := os.Remove(r.SpoolFile); rmErr != nil {
-					log.Printf("spool recover: writing partial file remove %s: %v", r.SpoolFile, rmErr)
-				}
+				sha, sz, hErr = hashSpoolFile(r.SpoolFile)
 			}
-			report.WritingFailedRows++
+			if !fileExists || hErr != nil || sz == 0 {
+				if _, mErr := s.meta.MarkFailed(r.ID, "writing-state row recovered after crash (no recoverable data)"); mErr != nil {
+					log.Printf("spool recover: mark writing→failed %d: %v", r.ID, mErr)
+					continue
+				}
+				if fileExists {
+					if rmErr := os.Remove(r.SpoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
+						log.Printf("spool recover: writing partial file remove %s: %v", r.SpoolFile, rmErr)
+					}
+				}
+				report.WritingFailedRows++
+			} else if mErr := s.meta.MarkReady(r.ID, sz, sha); mErr != nil {
+				log.Printf("spool recover: resume writing→ready %d: %v", r.ID, mErr)
+				continue
+			} else {
+				s.used.Add(sz)
+				report.WritingResumed++
+			}
 
 		case metadata.DrainReady:
 			if !fileExists {
@@ -1265,6 +1294,21 @@ func (e *SpoolEntry) ContiguousEnd() int64 {
 	n := e.contiguousEnd
 	e.mu.RUnlock()
 	return n
+}
+
+// Sync fsyncs the spool file to stable storage WITHOUT finalizing the entry —
+// the writer may continue. This is the NFS COMMIT / FILE_SYNC durability
+// barrier: it makes the data written so far survive a power loss (a plain
+// WriteAt only reaches the OS page cache). No-op once closed. Without this,
+// onCommit was a lie — a client told its fsync succeeded could lose
+// acknowledged bytes on power loss before the idle sweeper's finalize fsync.
+func (e *SpoolEntry) Sync() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed || e.file == nil {
+		return nil
+	}
+	return e.file.Sync()
 }
 
 // SetInode sets the synthetic inode for this entry. Called once by the

@@ -198,8 +198,8 @@ func TestSpoolRecoverOnBootDispositions(t *testing.T) {
 	if rep.DrainingReset != 1 {
 		t.Errorf("DrainingReset=%d, want 1", rep.DrainingReset)
 	}
-	if rep.WritingFailedRows != 1 {
-		t.Errorf("WritingFailedRows=%d, want 1", rep.WritingFailedRows)
+	if rep.WritingResumed != 1 || rep.WritingFailedRows != 0 {
+		t.Errorf("WritingResumed=%d WritingFailedRows=%d, want 1 and 0 (non-empty writing partial is preserved)", rep.WritingResumed, rep.WritingFailedRows)
 	}
 	if rep.OrphanRowsFailed != 1 {
 		t.Errorf("OrphanRowsFailed=%d, want 1", rep.OrphanRowsFailed)
@@ -208,14 +208,15 @@ func TestSpoolRecoverOnBootDispositions(t *testing.T) {
 		t.Errorf("OrphanFilesDeleted=%d, want 1", rep.OrphanFilesDeleted)
 	}
 
-	// Capacity re-accounted from the surviving ready + reset-to-ready rows.
-	const wantUsed = 12 + 13
+	// Capacity re-accounted from the surviving ready + reset-to-ready rows,
+	// PLUS the resumed writing row (7 bytes "partial") whose data we preserve.
+	const wantUsed = 12 + 13 + 7
 	if used, _ := s2.Capacity(); used != wantUsed {
 		t.Errorf("recovered used=%d, want %d", used, wantUsed)
 	}
-	// State assertions.
-	if row, _ := meta.Get(eWriting.ID()); row == nil || row.DrainState != metadata.DrainFailed {
-		t.Errorf("writing row not failed: %+v", row)
+	// State assertions: the writing row's data is preserved → ready for drain.
+	if row, _ := meta.Get(eWriting.ID()); row == nil || row.DrainState != metadata.DrainReady {
+		t.Errorf("writing row not resumed to ready: %+v", row)
 	}
 	if row, _ := meta.Get(eMissing.ID()); row == nil || row.DrainState != metadata.DrainFailed {
 		t.Errorf("missing-file row not failed: %+v", row)
