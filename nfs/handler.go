@@ -1533,6 +1533,26 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	return infos, nil
 }
 
+// StatCacheOnly returns the FileInfo for filename if the metadata cache knows
+// it, WITHOUT any FUSE round-trip. found=false means the path is not in our
+// local view. The guarded-CREATE existence checks use this instead of fs.Stat
+// so a brand-new file (definitionally absent from the cache) doesn't pay an
+// 800ms FUSE existence-stat each — the dominant cost that made a recursive
+// deep-tree Finder copy (tens of thousands of new files → tens of thousands of
+// cache-miss stats, bottlenecked through nfsLstatGate) saturate the metadata
+// hot path and trip the kernel soft-mount timeout ("error 100060"), while a
+// flat copy of large files (few new files) sailed through (2026-06-14, root-
+// caused via a faithful Finder reproduction). It does NOT prove backend
+// non-existence; use only where an optimistic "not present locally → proceed"
+// is correct (a CREATE whose fs.Create is the real arbiter).
+func (jfs *juiceFS) StatCacheOnly(filename string) (os.FileInfo, bool) {
+	filename = strings.TrimPrefix(filename, "/")
+	if e := jfs.handler.store.LookupByPath(filename); e != nil {
+		return e.FileInfo(), true
+	}
+	return nil, false
+}
+
 // File operations — proxy to JuiceFS FUSE
 func (jfs *juiceFS) Open(filename string) (billy.File, error) {
 	return jfs.OpenFile(filename, os.O_RDONLY, 0)
