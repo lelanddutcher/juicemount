@@ -223,23 +223,34 @@ func (fm *FUSEManager) Mount() error {
 		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
 		"-d", // daemon mode
 		"--no-usage-report",
-		"--writeback", // enable writeback for write performance
-		// QA-33 (2026-05-25): bumped --buffer-size 1024 → 4096 (4 GiB).
-		// Vision: writes to /Volumes/zpool should sustain at local SSD
-		// speed; uploads to MinIO happen async in background; cache
-		// holds dirty data. The previous 1 GiB ceiling capped sustained
-		// write throughput at the network upload rate after only ~1 GB
-		// — wrong model for video-render workflows where a 20 GB export
-		// would slow to wifi speed mid-bounce.
-		// 4 GiB is a balanced point: enough buffer to absorb realistic
-		// chunky-render write bursts before back-pressure kicks in,
-		// without eating an unbounded amount of RAM. Crash window
-		// (data not yet durable in S3): ≤4 GiB; the on-disk cache holds
-		// the persistent copy until upload completes.
+		// --buffer-size 4 GiB: write buffer to absorb chunky-render bursts.
 		"--buffer-size", "4096", // 4 GiB
 		"--prefetch", "3", // prefetch 3 blocks ahead
 		"-o", "nobrowse", // hide from Finder (MNT_DONTBROWSE flag)
 	)
+	// DATA-LOSS FIX (2026-06-13): --writeback is DISABLED by default.
+	//
+	// With --writeback, a close/fsync on a FUSE file returns once the bytes are
+	// in JuiceFS's LOCAL writeback cache; the MinIO upload happens async and may
+	// lag by seconds. The drainer fsyncs the FUSE dest and then deletes the
+	// spool safety-copy + frees capacity (nfs/spool.go MarkDrainComplete),
+	// trusting that fsync = durable. It is NOT: at that instant the only durable
+	// copy is a dirty writeback-cache block. A crash / power-loss / cache
+	// eviction / juicefs SIGKILL in that window destroys an already-"drained"
+	// photo with no recovery source — the spool copy is gone. A kill-9 crash
+	// test CONFIRMED this: 5 of 50 drained Canon CR3s came back corrupt in MinIO.
+	//
+	// The write SPOOL already provides the local write buffer + burst absorption
+	// that --writeback was added for (writes land on the spool SSD at local
+	// speed; the drainer uploads in the background). WITHOUT --writeback the
+	// drainer's close waits for the real MinIO PUT, so the data is confirmed
+	// durable before the spool copy is deleted. Drain is then honestly
+	// upload-bound, which is correct — you cannot acknowledge a photo as stored
+	// faster than you can durably store it; the spool + capacity backpressure
+	// pace ingest to that rate. Re-enable only if you accept the crash window:
+	if os.Getenv("JM_FUSE_WRITEBACK") == "1" {
+		args = append(args, "--writeback")
+	}
 
 	// Slice H — WAN mode. JuiceFS default --max-uploads is 20; on a
 	// high-RTT path (Tailscale, cellular, distant MinIO) 20 concurrent
