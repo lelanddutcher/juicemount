@@ -511,6 +511,18 @@ type RecoveryReport struct {
 	// accounted against the capacity counter; drainer will pick them
 	// up on next Start. No SQL state change.
 	ReadyResumed int
+
+	// FailedResumed: rows in `failed` state whose spool file is still an
+	// INTACT copy (on-disk size == row.Size, row.Size > 0) → reset to
+	// `ready` with a fresh attempt budget and re-driven. `failed` is
+	// reached by failPermanent after a transient/infra error (FUSE
+	// unmounted → "device not configured", MinIO down, disk full); the
+	// spool file is the LAST durable copy of the user's photo/video and
+	// must never be deleted. Auto-recovering on boot means a restart
+	// re-drives it now that the destination is back — the "we can't lose
+	// photos" invariant. (A genuine corruption goes to quarantine, whose
+	// file lives outside files/ and is not seen here.)
+	FailedResumed int
 }
 
 // RecoverOnBoot reconciles on-disk spool files against the SQL index.
@@ -527,8 +539,10 @@ type RecoveryReport struct {
 //	             → file missing  : mark failed
 //	row.draining → file present  : reset to ready (drainer retries)
 //	             → file missing  : mark failed
-//	row.done, row.failed         : no action (terminal states; done rows are
-//	                               audit, failed rows are operator-actionable)
+//	row.done     → file present  : reclaim stale leftover (already in MinIO)
+//	row.failed   → intact copy (size==row.Size>0): reset to ready + re-drive
+//	             → writing-crash partial (row.Size==0): reclaim
+//	             → size mismatch / missing: preserve (never delete >0 bytes)
 //
 // Files inside spool_root/quarantine/ are forensic state preserved by
 // the drainer's SHA-mismatch path; they are NOT touched here.
@@ -674,19 +688,60 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 				report.DrainingReset++
 			}
 
-		case metadata.DrainDone, metadata.DrainFailed:
-			// Terminal — no state transition. But the spool file
-			// must not survive: `done` rows had their file removed by
-			// MarkDrainComplete; `failed` rows from a writing-state
-			// crash above MAY have left a partial file when our
-			// best-effort os.Remove failed. Without this cleanup, a
-			// stale file paired to a terminal SQL row stays in
-			// expectedFiles indefinitely and the orphan-scan above
-			// never reclaims it. Code-reviewer slice-F HIGH fix.
+		case metadata.DrainDone:
+			// `done` = data is durably in MinIO; MarkDrainComplete already
+			// removed the spool file on success. A surviving file is a stale
+			// leftover from a crash in the narrow window between the SQL
+			// commit and the post-SQL unlink — safe to reclaim. Without this
+			// it stays in expectedFiles forever and the orphan scan never
+			// touches it. Code-reviewer slice-F HIGH fix.
 			if fileExists {
 				if rmErr := os.Remove(r.SpoolFile); rmErr != nil {
-					log.Printf("spool recover: terminal-row stale file remove %s: %v", r.SpoolFile, rmErr)
+					log.Printf("spool recover: done-row stale file remove %s: %v", r.SpoolFile, rmErr)
 				}
+			}
+
+		case metadata.DrainFailed:
+			// CRITICAL — "we can't lose photos." A `failed` row's spool file
+			// is the LAST durable copy of the user's data. `failed` is
+			// reached by failPermanent after a transient/infra error (FUSE
+			// unmounted → "device not configured", MinIO down, disk full)
+			// where the spool file is a COMPLETE copy. Deleting it here (the
+			// previous behavior, lumped with `done`) silently destroyed an
+			// intact photo on the next boot — the exact loss this audit
+			// found (1–2 GB MP4s gone after a transient unmount).
+			//
+			// Discriminate by size, never deleting finalized bytes:
+			//   • intact (row.Size > 0 && on-disk size == row.Size): the
+			//     full copy survived. Reset to `ready` (fresh attempt budget)
+			//     so THIS boot re-drives it now that the destination is back.
+			//   • writing-crash leftover (row.Size == 0): never finalized,
+			//     the user already re-copied — reclaim the partial (slice-F).
+			//   • ambiguous (row.Size > 0 but size mismatch): PRESERVE, leave
+			//     failed for the operator. We do not delete >0 finalized bytes.
+			if !fileExists {
+				break // already lost upstream; nothing on disk to recover
+			}
+			fi, statErr := os.Stat(r.SpoolFile)
+			diskSize := int64(-1)
+			if statErr == nil {
+				diskSize = fi.Size()
+			}
+			switch {
+			case r.Size > 0 && diskSize == r.Size:
+				if ok, rErr := s.meta.ResetForRetry(r.ID); rErr != nil {
+					log.Printf("spool recover: failed→ready reset %d: %v", r.ID, rErr)
+				} else if ok {
+					s.used.Add(r.Size)
+					report.FailedResumed++
+				}
+			case r.Size == 0:
+				if rmErr := os.Remove(r.SpoolFile); rmErr != nil {
+					log.Printf("spool recover: failed-row partial file remove %s: %v", r.SpoolFile, rmErr)
+				}
+			default:
+				log.Printf("spool recover: failed-row file size mismatch (disk=%d row=%d), preserving %s",
+					diskSize, r.Size, r.SpoolFile)
 			}
 		}
 	}
@@ -1223,7 +1278,7 @@ type SpoolEntry struct {
 	// so the read shadow clamps to contiguousEnd. Monotonic; guarded by mu.
 	contiguousEnd int64
 	hasher        hash.Hash
-	sha256     []byte // populated on Close iff streaming hash is trustworthy
+	sha256        []byte // populated on Close iff streaming hash is trustworthy
 	// hashValid tracks whether the streaming hasher reflects the on-disk
 	// contents. False once we observe any out-of-order WriteAt (off <
 	// current writtenEnd) — sparse / out-of-order writes make the streaming

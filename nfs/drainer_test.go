@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -216,6 +218,71 @@ func TestDrainerExhaustsRetries(t *testing.T) {
 	}
 }
 
+// TestDrainerInfraUnavailableDoesNotExhaustAttempts proves a FUSE-mount
+// outage (ENXIO "device not configured", ENODEV, ENOTCONN) never spends the
+// per-file retry budget. Even at the attempt ceiling — where a normal
+// transient error would go permanent — an infra-unavailable failTransient must
+// requeue the row to `ready` and NOT mark it failed. Losing a photo to a
+// transient unmount window is exactly the loss this guards against.
+func TestDrainerInfraUnavailableDoesNotExhaustAttempts(t *testing.T) {
+	spool, d := newTestDrainer(t, DrainerConfig{MaxAttempts: 2, BackoffBase: 1 * time.Millisecond})
+	e := writeSpoolEntry(t, spool, "/DCIM/100CANON/IMG_0003.CR3", []byte("intact photo bytes"))
+
+	// Claim it (draining), as a real drain attempt would, then drive it to the
+	// attempt ceiling so a NORMAL transient failure would go permanent.
+	if _, err := spool.Meta().MarkDraining(e.ID()); err != nil {
+		t.Fatalf("mark draining: %v", err)
+	}
+	row, err := spool.Meta().Get(e.ID())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	row.DrainAttempts = d.maxAttempts // one more bump on the normal path = permanent
+
+	// Wrap an ENXIO PathError exactly as os.MkdirAll on a dead FUSE mount would,
+	// then through the same fmt.Errorf("%w") the drain uses.
+	enxio := &os.PathError{Op: "mkdir", Path: d.fuseRoot, Err: syscall.ENXIO}
+	d.failTransient(row, fmt.Errorf("mkdir parent: %w", enxio))
+
+	got, _ := spool.Meta().Get(e.ID())
+	if got.DrainState != metadata.DrainReady {
+		t.Errorf("state=%q, want ready (infra outage must requeue, not fail the photo)", got.DrainState)
+	}
+	if d.Metrics().DrainsFailed.Load() != 0 {
+		t.Errorf("DrainsFailed=%d, want 0 (no permanent failure on a FUSE outage)", d.Metrics().DrainsFailed.Load())
+	}
+	// The spool file — the only durable copy — must still be intact.
+	if _, err := os.Stat(e.SpoolFilePath()); err != nil {
+		t.Errorf("spool file must survive an infra outage: %v", err)
+	}
+}
+
+// TestIsInfraUnavailable table-checks the FUSE-outage error classifier across
+// the wrapped *os.PathError → syscall.Errno chain the drain produces.
+func TestIsInfraUnavailable(t *testing.T) {
+	wrap := func(e syscall.Errno) error {
+		return fmt.Errorf("mkdir parent: %w", &os.PathError{Op: "mkdir", Path: "/x", Err: e})
+	}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"enxio-device-not-configured", wrap(syscall.ENXIO), true},
+		{"enodev", wrap(syscall.ENODEV), true},
+		{"enotconn", wrap(syscall.ENOTCONN), true},
+		{"enospc-not-infra", wrap(syscall.ENOSPC), false},
+		{"eacces-not-infra", wrap(syscall.EACCES), false},
+		{"plain-error", fmt.Errorf("size mismatch: expected 10 got 5"), false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := isInfraUnavailable(c.err); got != c.want {
+			t.Errorf("%s: isInfraUnavailable=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestDrainerMissingSpoolFileMarksFailed(t *testing.T) {
 	spool, d := newTestDrainer(t, DrainerConfig{})
 
@@ -402,4 +469,3 @@ func TestDrainerNewDrainerValidation(t *testing.T) {
 		t.Errorf("expected missing-FuseRoot error")
 	}
 }
-

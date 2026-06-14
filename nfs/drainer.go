@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/metadata"
@@ -484,6 +485,23 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 // that fires wakeNonBlocking after the delay; the worker returns
 // immediately, freeing its sem slot.
 func (d *Drainer) failTransient(row *metadata.SpoolRow, err error) {
+	// Infrastructure-unavailable (the destination filesystem is gone, not the
+	// file): a JuiceFS FUSE mount that vanished mid-drain returns ENXIO
+	// ("device not configured"), ENODEV, or ENOTCONN for every op against it.
+	// This happens during a restart/unmount window. Spending the per-file
+	// attempt budget on an OUTAGE would permanently `failed` every in-flight
+	// drain within ~maxAttempts*backoff (≈2.5 min) — and a `failed` row is the
+	// last copy of a photo. Treat it as a pause, NOT a per-file failure:
+	// requeue to `ready` WITHOUT bumping drain_attempts, and re-drive after a
+	// fixed backoff once the mount returns. "We can't lose photos."
+	if isInfraUnavailable(err) {
+		if rErr := d.spool.Meta().ResetToReady(row.ID); rErr != nil {
+			log.Printf("drainer: infra-pause reset %d: %v", row.ID, rErr)
+		}
+		d.metrics.DrainsRetried.Add(1)
+		d.scheduleDelayedWake(infraUnavailableBackoff)
+		return
+	}
 	nextAttempts := row.DrainAttempts + 1
 	if nextAttempts >= d.maxAttempts {
 		d.failPermanent(row, err.Error())
@@ -494,6 +512,25 @@ func (d *Drainer) failTransient(row *metadata.SpoolRow, err error) {
 	}
 	d.metrics.DrainsRetried.Add(1)
 	d.scheduleDelayedWake(d.backoffDuration(nextAttempts))
+}
+
+// infraUnavailableBackoff is the fixed delay before re-driving a row that
+// failed because the destination FUSE mount was unavailable. Kept short so
+// recovery is prompt once the mount returns, but long enough that a sustained
+// outage doesn't tight-spin the dispatcher. Under the soft-mount timeout.
+const infraUnavailableBackoff = 5 * time.Second
+
+// isInfraUnavailable reports whether err indicates the destination filesystem
+// (the JuiceFS FUSE mount) is unavailable, as opposed to a problem with the
+// individual file. A dead/unmounting FUSE mount surfaces as ENXIO ("device
+// not configured" on Darwin), ENODEV, or ENOTCONN for every operation. These
+// are transient outage conditions — the row must be re-driven without
+// counting against its permanent-failure budget, never lost. errors.Is walks
+// the *os.PathError → syscall.Errno chain through our fmt.Errorf("%w") wraps.
+func isInfraUnavailable(err error) bool {
+	return errors.Is(err, syscall.ENXIO) ||
+		errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.ENOTCONN)
 }
 
 // backoffDuration returns the exponential-backoff delay for the given
