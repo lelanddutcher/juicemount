@@ -111,10 +111,131 @@ type verifierData struct {
 // timeouts exist to handle), each call leaks a goroutine until the
 // underlying Lstat returns — which under a sustained wedge is "never."
 // Bounded gate prevents thousands of leaked goroutines during a stale-
-// handle storm (QA-30 Layer B code review HIGH-1). 8 slots is enough for
-// healthy throughput; when saturated, callers bail on the gate wait
-// within their own deadline (treated as "FUSE degraded, fail conservative").
-var nfsLstatGate = make(chan struct{}, 8)
+// handle storm (QA-30 Layer B code review HIGH-1). When saturated, callers
+// bail on the gate wait within their own deadline (treated as "FUSE
+// degraded, fail conservative").
+//
+// 24 slots (up from 8): these bounded helpers are now on the per-RPC HOT
+// path (juiceFS.Stat/Lstat/ReadDir/OpenFile fall-throughs), not just the
+// rare phantom-purge path. Under a JuiceFS wedge the NFS server's 128
+// concurrent-RPC budget (rpcSem) was being fully consumed by handlers stuck
+// in unbounded os.Lstat/os.Stat, which stopped the server reading new
+// requests and staled the whole mount (Finder "error 100060"). Bounding the
+// FUSE syscalls converts that into fast per-RPC errors that free the RPC
+// slot immediately; the gate caps how many goroutines can be parked in a
+// stuck syscall at once (≤24) while healthy cold-cache concurrency flows.
+var nfsLstatGate = make(chan struct{}, 24)
+
+// errFUSETimeout is returned by the bounded FUSE helpers when a JuiceFS
+// syscall doesn't complete within its deadline (the mount is wedged/slow).
+// It is the shared nfslib.ErrFUSETimeout sentinel so the RPC boundary
+// (internal/nfs/conn.go) can map it to NFS3ERR_JUKEBOX — the client then
+// treats it as "server busy, retry" instead of a permanent error that would
+// abort the Finder operation.
+var errFUSETimeout = nfslib.ErrFUSETimeout
+
+// fuseStatTimeout bounds a single hot-path FUSE Stat/Lstat/ReadDir/OpenFile.
+// Long enough that a healthy cold-cache fetch (Redis + a MinIO range get on a
+// slow link) completes, short enough that a wedge fails the RPC well within
+// the client's mount timeout. Tunable via JM_FUSE_OP_TIMEOUT_MS.
+var fuseStatTimeout = func() time.Duration {
+	if v := os.Getenv("JM_FUSE_OP_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return 2 * time.Second
+}()
+
+// statWithTimeout is the os.Stat sibling of lstatWithTimeout. ok=false means
+// the underlying Stat didn't complete within the timeout (FUSE wedged).
+func statWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, err error, ok bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case nfsLstatGate <- struct{}{}:
+	case <-timer.C:
+		return nil, nil, false
+	}
+	type result struct {
+		fi  os.FileInfo
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		fi, err := os.Stat(p)
+		ch <- result{fi: fi, err: err}
+		<-nfsLstatGate // release only after Stat actually returns
+	}()
+	select {
+	case r := <-ch:
+		return r.fi, r.err, true
+	case <-timer.C:
+		return nil, nil, false
+	}
+}
+
+// readDirWithTimeout is the os.ReadDir sibling. ok=false → FUSE wedged.
+func readDirWithTimeout(p string, timeout time.Duration) (ents []os.DirEntry, err error, ok bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case nfsLstatGate <- struct{}{}:
+	case <-timer.C:
+		return nil, nil, false
+	}
+	type result struct {
+		ents []os.DirEntry
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		ents, err := os.ReadDir(p)
+		ch <- result{ents: ents, err: err}
+		<-nfsLstatGate
+	}()
+	select {
+	case r := <-ch:
+		return r.ents, r.err, true
+	case <-timer.C:
+		return nil, nil, false
+	}
+}
+
+// openFileWithTimeout is the os.OpenFile sibling. ok=false → FUSE wedged.
+// On timeout the leaked goroutine's *os.File (if the open eventually
+// succeeds) is closed so we don't leak an fd.
+func openFileWithTimeout(p string, flag int, perm os.FileMode, timeout time.Duration) (f *os.File, err error, ok bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case nfsLstatGate <- struct{}{}:
+	case <-timer.C:
+		return nil, nil, false
+	}
+	type result struct {
+		f   *os.File
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		f, err := os.OpenFile(p, flag, perm)
+		ch <- result{f: f, err: err}
+		<-nfsLstatGate
+	}()
+	select {
+	case r := <-ch:
+		return r.f, r.err, true
+	case <-timer.C:
+		// Close the fd if the open completes after we've bailed.
+		go func() {
+			if r := <-ch; r.f != nil {
+				_ = r.f.Close()
+			}
+		}()
+		return nil, nil, false
+	}
+}
 
 func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok bool) {
 	timer := time.NewTimer(timeout)
@@ -1143,9 +1264,16 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 		}
 	}
 
-	// Fallback: stat the file on FUSE directly and cache it
+	// Fallback: stat the file on FUSE directly and cache it. BOUNDED: a
+	// wedged JuiceFS makes os.Stat hang forever; on the per-RPC hot path
+	// that exhausts the NFS server's concurrency budget and stales the whole
+	// mount. statWithTimeout returns ok=false on a wedge so we fail this RPC
+	// fast (errFUSETimeout → JUKEBOX) and free the slot instead of blocking.
 	fusePath := jfs.fullPath(filename)
-	info, err := os.Stat(fusePath)
+	info, err, ok := statWithTimeout(fusePath, fuseStatTimeout)
+	if !ok {
+		return nil, errFUSETimeout
+	}
 	if err != nil {
 		return nil, os.ErrNotExist
 	}
@@ -1291,9 +1419,14 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 		return []os.FileInfo{}, nil
 	}
 
-	// Fallback: read directly from FUSE and cache into SQLite
+	// Fallback: read directly from FUSE and cache into SQLite. BOUNDED so a
+	// wedged JuiceFS can't hang the READDIR RPC and exhaust the server's
+	// concurrency budget (see statWithTimeout rationale).
 	fusePath := jfs.fullPath(dirname)
-	dirEntries, err := os.ReadDir(fusePath)
+	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout)
+	if !ok {
+		return nil, errFUSETimeout
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1571,7 +1704,11 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 		}, nil
 	}
 
-	f, err := os.OpenFile(fullPath, flag, perm)
+	// BOUNDED open: a wedged JuiceFS can't hang this OPEN/READ RPC path.
+	f, err, ok := openFileWithTimeout(fullPath, flag, perm, fuseStatTimeout)
+	if !ok {
+		return nil, errFUSETimeout
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2028,8 +2165,8 @@ func (f *cachedFile) Write(p []byte) (int, error) { return f.fuseFD.Write(p) }
 func (f *cachedFile) Seek(offset int64, whence int) (int64, error) {
 	return f.fuseFD.Seek(offset, whence)
 }
-func (f *cachedFile) Lock() error               { return nil }
-func (f *cachedFile) Unlock() error             { return nil }
+func (f *cachedFile) Lock() error   { return nil }
+func (f *cachedFile) Unlock() error { return nil }
 func (f *cachedFile) Truncate(size int64) error {
 	// Clamp the sticky write-size high-water DOWN to the truncation point.
 	// Without this, a SHRINKING overwrite (truncate to a smaller size, then
@@ -2188,9 +2325,9 @@ type billyFile struct {
 	handler *JuiceMountHandler // for clampWriteSize on Truncate
 }
 
-func (f *billyFile) Name() string              { return f.name }
-func (f *billyFile) Lock() error               { return nil }
-func (f *billyFile) Unlock() error             { return nil }
+func (f *billyFile) Name() string  { return f.name }
+func (f *billyFile) Lock() error   { return nil }
+func (f *billyFile) Unlock() error { return nil }
 func (f *billyFile) Truncate(size int64) error {
 	// Clamp the write-size high-water down to the truncation point — see
 	// cachedFile.Truncate; a shrink-overwrite would otherwise over-report size.

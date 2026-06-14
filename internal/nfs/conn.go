@@ -305,6 +305,14 @@ func (c *conn) handle(ctx context.Context, w *response) error {
 		return c.err(ctx, w, &ResponseCodeProcUnavailableError{})
 	}
 	appError := handler(ctx, w, c.Server.Handler)
+	// A wedged JuiceFS surfaces as ErrFUSETimeout from the filesystem layer.
+	// Map it (however the handler wrapped it) to NFS3ERR_JUKEBOX so the client
+	// retries instead of aborting on a permanent error. The handler has already
+	// returned — freeing its rpcSem slot — which is what keeps a backend wedge
+	// from exhausting the slot budget and staling the whole mount.
+	if appError != nil && errors.Is(appError, ErrFUSETimeout) {
+		appError = &NFSStatusError{NFSStatusJukebox, appError}
+	}
 	if drainErr := w.drain(ctx); drainErr != nil {
 		return drainErr
 	}
