@@ -137,14 +137,32 @@ var errFUSETimeout = nfslib.ErrFUSETimeout
 // fuseStatTimeout bounds a single hot-path FUSE Stat/Lstat/ReadDir/OpenFile.
 // Long enough that a healthy cold-cache fetch (Redis + a MinIO range get on a
 // slow link) completes, short enough that a wedge fails the RPC well within
-// the client's mount timeout. Tunable via JM_FUSE_OP_TIMEOUT_MS.
+// the client's mount timeout.
+//
+// Default is WAN-aware: 800ms on LAN, 2s when JM_WAN_MODE=1. On a LAN the
+// hot-path stats are existence checks served from the SQLite mirror first
+// (FUSE is fallback-only), and a genuine cold fetch is Redis (~1ms) + a
+// MinIO range GET (tens of ms) — 800ms is ample headroom while still
+// failing a wedge fast. 800ms was validated against a real recursive
+// CFexpress-card Finder copy (2026-06-14): with the cache-only CREATE/LOOKUP
+// path it kept CREATE/LOOKUP tail latency ~10x under the soft-mount timeout
+// and the deep-tree copy cleared the metadata danger zone that used to trip
+// "error 100060". Baking it in as the LAN default makes that durable (the
+// prior launchctl setenv was reboot-only). On WAN (high-RTT MinIO over
+// Tailscale/cellular) a cold range GET legitimately takes longer, so the
+// default stays 2s there to avoid spurious JUKEBOX retries.
+//
+// An explicit JM_FUSE_OP_TIMEOUT_MS always wins over the WAN-aware default.
 var fuseStatTimeout = func() time.Duration {
 	if v := os.Getenv("JM_FUSE_OP_TIMEOUT_MS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return time.Duration(n) * time.Millisecond
 		}
 	}
-	return 2 * time.Second
+	if os.Getenv("JM_WAN_MODE") == "1" {
+		return 2 * time.Second
+	}
+	return 800 * time.Millisecond
 }()
 
 // statWithTimeout is the os.Stat sibling of lstatWithTimeout. ok=false means
