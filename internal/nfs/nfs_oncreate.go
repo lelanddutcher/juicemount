@@ -17,6 +17,15 @@ const (
 	createModeExclusive = 2
 )
 
+// cacheStater is implemented by the filesystem (nfs.juiceFS) to expose a
+// cache-only stat that never touches FUSE. The guarded-CREATE existence/parent
+// checks use it so a deep-tree copy of tens of thousands of new files doesn't
+// pay an 800ms FUSE existence-stat per file — the cost that tripped the
+// soft-mount timeout ("error 100060") on recursive copies (2026-06-14).
+type cacheStater interface {
+	StatCacheOnly(path string) (os.FileInfo, bool)
+}
+
 func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = wccDataErrorFormatter
 	obj := DirOpArg{}
@@ -66,31 +75,35 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 	newFile := append(path, string(obj.Filename))
 	newFilePath := fs.Join(newFile...)
 
-	// [JM5] Existence check: only reject if the entry is a directory.
-	// For guarded creates of regular files, proceed with Create() and let
-	// the backing FUSE filesystem be the arbiter. The metadata cache may
-	// contain stale entries from previous failed copies or Redis sync that
-	// would incorrectly block Finder from creating new files.
-	if s, err := fs.Stat(newFilePath); err == nil && s.IsDir() {
+	// [JM5] Existence check: only reject if the entry is a DIRECTORY. Use the
+	// CACHE-ONLY stat (no FUSE round-trip): a brand-new file is absent from the
+	// cache, so the common copy case proceeds without an 800ms FUSE existence-
+	// stat — the dominant cost that made a recursive deep-tree Finder copy (tens
+	// of thousands of new files → that many cache-miss stats through the
+	// nfsLstatGate) saturate the metadata path and trip the soft-mount timeout
+	// ("error 100060"), while a flat large-file copy sailed through (2026-06-14,
+	// root-caused via a faithful Finder reproduction). fs.Create is the real
+	// arbiter for any conflict. Filesystems without the cache-only stat fall
+	// back to the original FUSE Stat.
+	if cs, ok := fs.(cacheStater); ok {
+		if s, found := cs.StatCacheOnly(newFilePath); found && s.IsDir() {
+			return &NFSStatusError{NFSStatusExist, nil}
+		}
+	} else if s, err := fs.Stat(newFilePath); err == nil && s.IsDir() {
 		return &NFSStatusError{NFSStatusExist, nil}
 	}
-	// Verify parent directory exists. A FUSE-stat TIMEOUT here must NOT fail
-	// the create: under heavy copy+drain load the parent's stat can fall
-	// through to a contended FUSE mount and exceed the 2s bound (e.g. after the
-	// parent gets LRU-evicted from the metadata cache mid-large-copy). Returning
-	// an error that wraps ErrFUSETimeout makes the RPC layer reply
-	// NFS3ERR_JUKEBOX (conn.go), so the client RETRIES the CREATE; under a
-	// sustained slow spell those retries accumulate past the ~40s soft-mount
-	// timeout and the client aborts the whole copy with "error 100060"
-	// (2026-06-14, tripped a 500 GB Finder copy at ~8 GB). We are mid-copy INTO
-	// this directory, which Finder created (MKDIR) before any file in it, so on
-	// an ambiguous timeout assume the parent exists and let fs.Create arbitrate
-	// (it returns ENOENT if the parent is genuinely gone). A DEFINITIVE error
-	// (real ENOENT, not-a-dir) still fails fast as before.
-	if s, err := fs.Stat(fs.Join(path...)); err != nil {
-		if errors.Is(err, ErrFUSETimeout) {
-			// ambiguous (FUSE wedged/slow) — proceed optimistically
-		} else {
+	// Verify the parent directory — also cache-only. Finder MKDIRs the parent
+	// before any file in it, so it is in the cache; if the cache says it's not a
+	// dir, reject. A cache MISS is treated as "assume it exists" (proceed) — the
+	// parent was just created locally; fs.Create returns ENOENT if it's truly
+	// gone. The old FUSE-Stat fallback (with the ErrFUSETimeout proceed guard)
+	// is kept for filesystems without the cache-only stat.
+	if cs, ok := fs.(cacheStater); ok {
+		if s, found := cs.StatCacheOnly(fs.Join(path...)); found && !s.IsDir() {
+			return &NFSStatusError{NFSStatusNotDir, nil}
+		}
+	} else if s, err := fs.Stat(fs.Join(path...)); err != nil {
+		if !errors.Is(err, ErrFUSETimeout) {
 			return &NFSStatusError{NFSStatusAccess, err}
 		}
 	} else if !s.IsDir() {
