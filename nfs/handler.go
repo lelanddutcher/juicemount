@@ -597,7 +597,15 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 	}
 
 	readStart := time.Now()
-	dirEntries, err := os.ReadDir(fusePath)
+	// Bounded: this background scan must never park its goroutine (and its OS
+	// thread) on a wedged/slow FUSE mount. readDirWithTimeout returns ok=false
+	// past the deadline; we abandon the best-effort prefetch rather than leak
+	// a blocked thread (crash 2026-06-14). The nfsLstatGate (cap 24) shared
+	// with the hot path also caps how many of these can be in flight at once.
+	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout)
+	if !ok {
+		return
+	}
 	if err != nil {
 		return
 	}
@@ -1400,9 +1408,34 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 		sort.Slice(infos, func(i, j int) bool {
 			return infos[i].Name() < infos[j].Name()
 		})
-		// Proactively prefetch subdirectories' children in background
-		// so Finder's subsequent navigation is instant
-		go jfs.handler.prefetchChildren(dirname)
+		// Proactively prefetch subdirectories' children in background so
+		// Finder's subsequent navigation is instant. Two guards make this
+		// safe under a bulk recursive walk (crash 2026-06-14, threads→5200+
+		// toward the 8192 cap):
+		//
+		//   1. Skip when offline. prefetchChildren's os.ReadDir hits
+		//      JuiceFS→Redis, which is unreachable offline; the read blocks
+		//      until JuiceFS gives up. The synchronous offline path below
+		//      (line ~1416) returns empty precisely to avoid that hang —
+		//      spawning it here in the background would reintroduce it, one
+		//      unbounded goroutine per directory.
+		//   2. Bound the fan-out. A bare `go prefetchChildren` per READDIR
+		//      turned a deep walk into thousands of concurrent ungated FUSE
+		//      reads, each pinning an OS thread. Acquire a prefetchSem slot
+		//      non-blocking and skip if the pool is busy — prefetch is a
+		//      best-effort nav-latency optimization, not correctness, so
+		//      shedding it under load is the right trade.
+		if !pin.IsOffline() {
+			select {
+			case jfs.handler.prefetchSem <- struct{}{}:
+				go func() {
+					defer func() { <-jfs.handler.prefetchSem }()
+					jfs.handler.prefetchChildren(dirname)
+				}()
+			default:
+				// prefetch pool busy — shed this one
+			}
+		}
 		return infos, nil
 	}
 

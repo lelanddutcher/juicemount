@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -26,6 +27,20 @@ const (
 	// wedged FUSE would otherwise park every reader of the same file
 	// forever on the entry.ready channel.
 	memBufLoadTimeout = 5 * time.Second
+
+	// Default cap on concurrently-running loadFile goroutines. Each loadFile
+	// does an os.Open on the FUSE mount; when the mount is wedged/slow that
+	// open blocks in the kernel, pinning one OS thread for the duration.
+	// Without a cap, a burst of distinct small-file reads (e.g. Spotlight or
+	// QuickLook indexing a freshly-listed tree) spawns one blocked open per
+	// file. The budget check is no real bound here — 2 GiB of ~1 KiB sidecar
+	// files is ~2 million entries — so the process marches straight to the
+	// macOS hard per-task thread limit (kern.num_taskthreads = 8192) and the
+	// Go runtime aborts when pthread_create fails inside runtime.newm1
+	// (crash 2026-06-14, 8178 threads parked in open()). This cap converts
+	// that fan-out into a fixed worst-case thread cost. Tunable via
+	// JM_MEMBUF_LOADERS.
+	defaultMemBufLoaders = 16
 )
 
 // MemoryBuffer caches small files entirely in Go heap for zero-syscall reads.
@@ -41,11 +56,21 @@ type MemoryBuffer struct {
 
 	stopCh chan struct{}
 
+	// loadSem bounds the number of loadFile goroutines that can be blocked in
+	// an os.Open on the FUSE mount at once. Buffered to defaultMemBufLoaders
+	// (or JM_MEMBUF_LOADERS). Acquired non-blocking in Get before spawning a
+	// loader; when saturated, Get declines to buffer and the caller falls
+	// through to the per-RPC fd-pool read (already bounded by the NFS
+	// server's rpcSem). This is the structural bound that keeps a FUSE wedge
+	// from exhausting OS threads and aborting the process.
+	loadSem chan struct{}
+
 	// Stats
-	statsMu sync.Mutex
-	hits    int64
-	misses  int64
-	evicts  int64
+	statsMu     sync.Mutex
+	hits        int64
+	misses      int64
+	evicts      int64
+	loadSkipped int64 // loads declined because loadSem was saturated
 }
 
 type memBufEntry struct {
@@ -63,11 +88,18 @@ func NewMemoryBuffer(threshold, budget int64) *MemoryBuffer {
 	if budget <= 0 {
 		budget = DefaultMemBufBudget
 	}
+	loaders := defaultMemBufLoaders
+	if v := os.Getenv("JM_MEMBUF_LOADERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			loaders = n
+		}
+	}
 	mb := &MemoryBuffer{
 		entries:   make(map[string]*memBufEntry),
 		threshold: threshold,
 		budget:    budget,
 		stopCh:    make(chan struct{}),
+		loadSem:   make(chan struct{}, loaders),
 	}
 	go mb.evictLoop()
 	return mb
@@ -132,6 +164,26 @@ func (mb *MemoryBuffer) Get(path string, fileSize int64, fusePath string) []byte
 		return nil
 	}
 
+	// Bound concurrent background loads. Each loadFile blocks in os.Open on
+	// the FUSE mount; under a wedge that pins an OS thread. Acquire a loader
+	// slot non-blocking BEFORE inserting the entry — if the pool is
+	// saturated we neither buffer nor spawn, and the caller falls through to
+	// the per-RPC fd-pool read (bounded by rpcSem). Crucially we must not
+	// insert a `loading` entry we can't load: that would park every
+	// concurrent reader of this path on entry.ready until the 5s timeout for
+	// no benefit. (Thread-exhaustion crash 2026-06-14.)
+	select {
+	case mb.loadSem <- struct{}{}:
+		// acquired — proceed to insert + spawn below
+	default:
+		mb.mu.Unlock()
+		mb.statsMu.Lock()
+		mb.misses++
+		mb.loadSkipped++
+		mb.statsMu.Unlock()
+		return nil
+	}
+
 	// Start async loading
 	entry = &memBufEntry{
 		size:       fileSize,
@@ -147,7 +199,7 @@ func (mb *MemoryBuffer) Get(path string, fileSize int64, fusePath string) []byte
 	mb.misses++
 	mb.statsMu.Unlock()
 
-	// Load in background
+	// Load in background (loadFile releases the loadSem slot on exit).
 	go mb.loadFile(path, fusePath, fileSize, entry)
 
 	return nil // caller uses FUSE for this first read
@@ -170,6 +222,9 @@ func (mb *MemoryBuffer) ReadAt(path string, p []byte, off int64, fileSize int64,
 }
 
 func (mb *MemoryBuffer) loadFile(path, fusePath string, fileSize int64, entry *memBufEntry) {
+	// Release the loader slot last (LIFO: close(entry.ready) runs first to
+	// wake any waiters, then we free the slot for the next load).
+	defer func() { <-mb.loadSem }()
 	defer close(entry.ready)
 
 	fd, err := os.Open(fusePath)
@@ -277,5 +332,5 @@ func (mb *MemoryBuffer) Stop() {
 	mb.mu.Lock()
 	mb.entries = nil
 	mb.mu.Unlock()
-	log.Printf("membuf: stopped (hits=%d, misses=%d, evicts=%d)", mb.hits, mb.misses, mb.evicts)
+	log.Printf("membuf: stopped (hits=%d, misses=%d, evicts=%d, loadSkipped=%d)", mb.hits, mb.misses, mb.evicts, mb.loadSkipped)
 }
