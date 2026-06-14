@@ -63,7 +63,19 @@ type SpoolStore struct {
 	meta     *metadata.SpoolStore
 	index    *SpoolIndex
 	closed   atomic.Bool
-	openMu   sync.Mutex // serializes OpenWrite for the same path; tiny contention area
+	// openShards serializes OpenWrite per-path. Sharded by path hash so a
+	// slow create (the new-file path holds its shard across s.meta.Insert +
+	// os.OpenFile) blocks only concurrent opens of the SAME file, never
+	// writes to other files. Before sharding this was a single global mutex
+	// taken on EVERY write RPC (NFS does OpenFile→WriteAt→Close per WRITE);
+	// when a new-file Insert stalled behind a reconcile's SQLite work it
+	// froze every in-flight copy and tripped the soft-mount timeout
+	// (Finder "error 100060" under parallel copy — caught mid-stall via
+	// pprof: 12 onWrite handlers blocked on OpenWrite's lock). Same path
+	// always maps to the same shard, so the check-then-create dedup is
+	// preserved exactly. MigrateForRename locks ALL shards (rare full
+	// barrier) since a directory rename re-keys many paths at once.
+	openShards [spoolOpenShards]sync.Mutex
 
 	// wakeDrainer is guarded by wakeMu so concurrent SetDrainerWake and
 	// signalReady can't race on the func pointer.
@@ -81,6 +93,42 @@ type SpoolStore struct {
 	// tests shorten it via SetStuckEscalationWindow before concurrency
 	// starts. <=0 disables escalation.
 	escalateAfter time.Duration
+}
+
+// spoolOpenShards is the number of per-path OpenWrite locks. 64 keeps
+// cross-file collision probability negligible for realistic parallel-copy
+// fan-out (Finder/ditto rarely exceed a handful of concurrent files) while
+// costing only 64 mutexes per store. Must stay a power-of-two-friendly small
+// constant; the FNV-1a hash below maps a path to its shard.
+const spoolOpenShards = 64
+
+// pathShard returns the per-path OpenWrite mutex. Allocation-free (inline
+// FNV-1a over the path bytes) so it stays cheap on the per-RPC write hot
+// path — the QA-35 perf-discipline gate forbids per-RPC allocation here.
+func (s *SpoolStore) pathShard(path string) *sync.Mutex {
+	var h uint32 = 2166136261
+	for i := 0; i < len(path); i++ {
+		h ^= uint32(path[i])
+		h *= 16777619
+	}
+	return &s.openShards[h%spoolOpenShards]
+}
+
+// lockAllShards / unlockAllShards take every OpenWrite shard in index order,
+// making the caller mutually exclusive with all concurrent OpenWrites — the
+// pre-sharding global-mutex behavior, used only by the rare rename barrier.
+// Ascending order is deadlock-free vs OpenWrite (which holds at most one
+// shard) and vs another all-shards caller (same acquisition order).
+func (s *SpoolStore) lockAllShards() {
+	for i := range s.openShards {
+		s.openShards[i].Lock()
+	}
+}
+
+func (s *SpoolStore) unlockAllShards() {
+	for i := range s.openShards {
+		s.openShards[i].Unlock()
+	}
 }
 
 // NewSpoolStore creates the spool root if it doesn't exist and returns an
@@ -144,7 +192,7 @@ func (s *SpoolStore) Index() *SpoolIndex { return s.index }
 // OpenWrite creates a new spool entry for nfsPath in `writing` state.
 // Returns ErrSpoolFull if the capacity budget is already exhausted.
 //
-// Concurrent OpenWrite for the same nfsPath is serialized by openMu; if
+// Concurrent OpenWrite for the same nfsPath is serialized by its path shard; if
 // the index already has an entry for this path, that entry is returned
 // directly (same-path-reopen). This matches the FDPool same-path-dedupe
 // semantics so a single Finder copy's multi-RPC write lifecycle reuses
@@ -161,11 +209,16 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	const reopenMaxWait = 30 * time.Second
 	var waited time.Duration
 
+	// Same path always maps to the same shard, so the check-then-create
+	// dedup below is serialized exactly as the old global openMu did; opens
+	// of OTHER paths now run on other shards concurrently.
+	shard := s.pathShard(nfsPath)
+
 	for {
 		if s.closed.Load() {
 			return nil, fmt.Errorf("spool: store is closed")
 		}
-		s.openMu.Lock()
+		shard.Lock()
 
 		if existing, ok := s.index.Lookup(nfsPath); ok {
 			existing.mu.Lock()
@@ -177,14 +230,14 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 				existing.refcount++
 				existing.lastWrite.Store(time.Now().UnixNano())
 				existing.mu.Unlock()
-				s.openMu.Unlock()
+				shard.Unlock()
 				return existing, nil
 			}
 			// Finalized-but-not-yet-drained entry holds this path. Don't
 			// reuse (writes would fail) and don't create a competing entry
 			// (dup drain). Wait for the drainer to evict it.
 			existing.mu.Unlock()
-			s.openMu.Unlock()
+			shard.Unlock()
 			if waited >= reopenMaxWait {
 				return nil, ErrSpoolBusy
 			}
@@ -193,9 +246,9 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 			continue
 		}
 
-		// No entry for this path — create a fresh one under openMu.
+		// No entry for this path — create a fresh one under the path shard.
 		if s.capacity > 0 && s.used.Load() >= s.capacity {
-			s.openMu.Unlock()
+			shard.Unlock()
 			return nil, ErrSpoolFull
 		}
 
@@ -209,7 +262,7 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 
 		id, err := s.meta.Insert(nfsPath, spoolFile)
 		if err != nil {
-			s.openMu.Unlock()
+			shard.Unlock()
 			return nil, err
 		}
 
@@ -221,7 +274,7 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 			// grow spool_entries unboundedly because LookupByPath ignores
 			// failed rows and every retry would Insert a new one.
 			_ = s.meta.Delete(id)
-			s.openMu.Unlock()
+			shard.Unlock()
 			return nil, fmt.Errorf("spool: open file: %w", err)
 		}
 
@@ -237,7 +290,7 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 		}
 		entry.lastWrite.Store(time.Now().UnixNano())
 		s.index.Insert(nfsPath, entry)
-		s.openMu.Unlock()
+		shard.Unlock()
 		return entry, nil
 	}
 }
@@ -671,13 +724,15 @@ func (s *SpoolStore) CancelForDelete(nfsPath string) {
 //     `ready` row is inserted at the new path sharing the same spool file.
 //     The entry adopts the new row id so drain-complete eviction matches.
 //
-// openMu serializes against OpenWrite so a concurrent write RPC can't
-// create a second entry for either path mid-migration. Lock order:
-// openMu → meta.writeMu (released) → e.mu → index.mu — same direction as
-// OpenWrite, no cycles.
+// Locking all OpenWrite shards serializes against every concurrent OpenWrite
+// so a write RPC can't create a second entry for any migrated path
+// mid-migration (a directory rename re-keys many paths, so a single path
+// shard is insufficient). Lock order: openShards → meta.writeMu (released) →
+// e.mu → index.mu — same direction as OpenWrite, no cycles. Renames are rare
+// relative to the per-RPC write path, so the full-barrier cost is acceptable.
 func (s *SpoolStore) MigrateForRename(oldPath, newPath string) (int, error) {
-	s.openMu.Lock()
-	defer s.openMu.Unlock()
+	s.lockAllShards()
+	defer s.unlockAllShards()
 
 	migs, err := s.meta.MigrateActivePaths(oldPath, newPath)
 	if err != nil {
@@ -1044,8 +1099,9 @@ func (e *SpoolEntry) NFSPath() string {
 
 // adoptRename re-binds the entry to a new NFS path and (for requeued
 // draining rows) a new SQL row id. Called only by MigrateForRename, which
-// owns the corresponding index re-key; the two updates happen under openMu
-// so no concurrent OpenWrite can observe a half-migrated entry.
+// owns the corresponding index re-key; the two updates happen under the
+// all-shards OpenWrite barrier (MigrateForRename) so no concurrent OpenWrite
+// can observe a half-migrated entry.
 func (e *SpoolEntry) adoptRename(newPath string, newID int64) {
 	e.mu.Lock()
 	e.nfsPath = newPath
