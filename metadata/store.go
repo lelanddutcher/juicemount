@@ -104,6 +104,15 @@ type Store struct {
 	// through a full RebuildFTS that would stall concurrent NFS CREATEs (QA-40).
 	ftsInitialized atomic.Bool
 
+	// ftsFullRebuilds counts how many times RebuildFTS actually ran the
+	// delete-all + whole-catalog reindex (the writeMu-long-hold QA-40 stall
+	// path). It exists so a test can deterministically assert that a large
+	// post-init BulkInsert delta took the INCREMENTAL path, not the full
+	// rebuild — searchability alone can't distinguish the two (a full rebuild
+	// also leaves every row searchable), which made the prior QA-40 test a
+	// false positive that passed on the broken code.
+	ftsFullRebuilds atomic.Uint64
+
 	// QA-30 Layer B (2026-05-25): recently-evicted shadow map. When an entry
 	// is removed from pathCache+inodeCache via Delete/DeleteFromCache/
 	// DeletePaths or via evictOldest's rebuild, a copy of its scalar
@@ -155,14 +164,14 @@ const ShadowTTL = 5 * time.Minute
 // presence if Layer B confirms the file is still on disk. Value-copy of
 // scalars only — never aliases the original *Entry.
 type evictedShadow struct {
-	Path      string
-	Name      string
+	Path       string
+	Name       string
 	ParentPath string
-	Mode      fs.FileMode
-	Size      int64
-	Mtime     time.Time
-	IsDir     bool
-	ExpiresAt time.Time
+	Mode       fs.FileMode
+	Size       int64
+	Mtime      time.Time
+	IsDir      bool
+	ExpiresAt  time.Time
 }
 
 // shadowEvictedLocked parks a scalar copy of an entry being removed from
@@ -1115,6 +1124,10 @@ func (s *Store) Search(query string, limit int, parentPath string) ([]SearchResu
 func (s *Store) RebuildFTS() error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+
+	// Count the full reindex so tests can assert a large post-init delta did
+	// NOT take this path (the QA-40 stall). Incremented under writeMu.
+	s.ftsFullRebuilds.Add(1)
 
 	// Delete all FTS content, then re-insert from entries table
 	if _, err := s.db.Exec(`INSERT INTO entries_fts(entries_fts) VALUES('delete-all')`); err != nil {
