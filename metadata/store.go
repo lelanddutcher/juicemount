@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -96,6 +97,12 @@ type Store struct {
 	childrenIdx  map[string]map[string]*Entry // parentPath → {path → *Entry}
 	maxCacheSize int
 	pinChecker   PinChecker // optional (QA-30); see PinChecker docstring
+
+	// ftsInitialized is set once the external-content FTS has been built (the
+	// first BulkInsert / initial sync). After that EVERY BulkInsert maintains
+	// FTS incrementally — even a large delta — so it never holds writeMu
+	// through a full RebuildFTS that would stall concurrent NFS CREATEs (QA-40).
+	ftsInitialized atomic.Bool
 
 	// QA-30 Layer B (2026-05-25): recently-evicted shadow map. When an entry
 	// is removed from pathCache+inodeCache via Delete/DeleteFromCache/
@@ -662,10 +669,16 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 		batchSize = 500
 	}
 
-	// A large load (startup/initial sync) skips per-row FTS and does one bulk
-	// RebuildFTS below; smaller reconcile deltas maintain FTS incrementally so
-	// they never hold writeMu through a full reindex (QA-40).
-	incremental := len(entries) > 0 && len(entries) < FTSFullRebuildThreshold
+	// Only the INITIAL sync (FTS not yet built, no NFS ingest in flight) takes
+	// the fast bulk-RebuildFTS path. Once the FTS exists, EVERY BulkInsert —
+	// including a big offload's >5000-path reconcile delta — maintains it
+	// incrementally (per-row, batched, writeMu released between batches), so it
+	// never long-holds the SQLite writer through a full reindex (>100s on 130k
+	// rows). That full reindex was the QA-40 stall: it blocked the synchronous
+	// spool meta.Insert on the shared DB and timed out concurrent NFS CREATEs,
+	// failing a copy mid-ingest. A large delta after init is exactly the
+	// big-offload case the threshold was wrongly catching.
+	incremental := len(entries) > 0 && (s.ftsInitialized.Load() || len(entries) < FTSFullRebuildThreshold)
 
 	for i := 0; i < len(entries); i += batchSize {
 		end := i + batchSize
@@ -713,6 +726,12 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 			// from the row store.
 			log.Printf("[metadata] BulkInsert: RebuildFTS failed: %v", err)
 		}
+	}
+
+	// The FTS is now built (either incrementally above or via the bulk rebuild);
+	// all subsequent BulkInserts stay incremental to avoid the QA-40 stall.
+	if len(entries) > 0 {
+		s.ftsInitialized.Store(true)
 	}
 
 	return nil
