@@ -931,7 +931,7 @@ func (fm *FUSEManager) monitorLoop() {
 
 			// The mount is unhealthy. Decide WHY before acting — killing a
 			// live-but-slow juicefs is what drove the macFUSE remount thrash.
-			if isJuiceFSProcessAlive() {
+			if isJuiceFSProcessAliveFn() {
 				// juicefs (and its own supervisor) is alive — the mount is
 				// stale, usually a flapping/blipping backend link. Default to
 				// deferring (no kill, no macFUSE thrash). BUT juicefs's own

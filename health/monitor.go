@@ -153,6 +153,15 @@ var (
 	// forceUnmountFn is the function used to force-unmount a stale mount.
 	// Replaceable so tests can avoid invoking `sudo`.
 	forceUnmountFn = forceUnmount
+
+	// isJuiceFSProcessAliveFn reports whether a juicefs mount process is alive.
+	// Indirected through a var (default: the real pgrep probe in fuse.go) so
+	// the remount-decision tests are deterministic regardless of what's running
+	// on the host. Without this, a developer's own running JuiceMount makes the
+	// probe return true, the handler defers ("juicefs alive — not remounting"),
+	// and TestNFSAutoRemountThreshold sees calls=0 and fails. Production never
+	// reassigns it, so behavior is identical to calling isJuiceFSProcessAlive.
+	isJuiceFSProcessAliveFn = isJuiceFSProcessAlive
 )
 
 // New creates a HealthMonitor for the given configuration.
@@ -371,7 +380,7 @@ func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
 	// sustained window + backend-reachable check. Remount from here only when
 	// the juicefs process tree is gone, or — as a far-out backstop — if the
 	// NFS layer stays wedged well past the FUSE watchdog's own window.
-	alive := isJuiceFSProcessAlive()
+	alive := isJuiceFSProcessAliveFn()
 	if alive && streak < NFSStaleHardRemountThreshold {
 		jmlog.Warn("nfs mount stale but juicefs alive — deferring to the fuse watchdog, not remounting",
 			"mount_point", mountPoint, "consecutive_failures", streak)
@@ -631,7 +640,7 @@ func (m *HealthMonitor) logWedgeDiagnostics(reason string) {
 		"reason", reason,
 		"redis_ok", redisStatus.Healthy, "redis_probe_ms", redisMs, "redis_msg", redisStatus.Message,
 		"minio_ok", minioStatus.Healthy, "minio_probe_ms", minioMs, "minio_msg", minioStatus.Message,
-		"juicefs_alive", isJuiceFSProcessAlive(),
+		"juicefs_alive", isJuiceFSProcessAliveFn(),
 	)
 }
 
