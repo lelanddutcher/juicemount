@@ -177,14 +177,27 @@ func (p *FDPool) evictLoop() {
 			return
 		case <-ticker.C:
 			now := time.Now()
+			// Collect the idle fds under the lock, but CLOSE them outside it.
+			// Closing a JuiceFS FUSE fd flushes pending data and can BLOCK for
+			// seconds under write load; holding p.mu across that Close convoys
+			// every concurrent GetWrite/Get/Release on the single pool mutex.
+			// A deep-tree Finder copy generates dozens of parallel WRITE RPCs,
+			// all calling GetWrite — 93 were observed wedged on this lock while
+			// evictLoop held it inside a stuck Close, saturating the NFS server's
+			// in-flight budget and timing out the copy with "error 100060"
+			// (2026-06-14, reproduced via ditto of a 5598-file subtree).
+			var toClose []*os.File
 			p.mu.Lock()
 			for path, entry := range p.entries {
 				if entry.refCount <= 0 && now.Sub(entry.lastUsed) > fdIdleTimeout {
-					entry.fd.Close()
+					toClose = append(toClose, entry.fd)
 					delete(p.entries, path)
 				}
 			}
 			p.mu.Unlock()
+			for _, fd := range toClose {
+				fd.Close()
+			}
 		}
 	}
 }
@@ -192,12 +205,15 @@ func (p *FDPool) evictLoop() {
 // Stop closes all pooled fds.
 func (p *FDPool) Stop() {
 	close(p.stopCh)
+	// Detach the fds under the lock, close them outside it (a FUSE fd Close can
+	// block; don't hold p.mu across it — see evictLoop).
 	p.mu.Lock()
-	for _, entry := range p.entries {
-		entry.fd.Close()
-	}
+	entries := p.entries
 	p.entries = nil
 	p.mu.Unlock()
+	for _, entry := range entries {
+		entry.fd.Close()
+	}
 	log.Printf("fdpool: stopped")
 }
 
