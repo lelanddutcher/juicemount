@@ -226,6 +226,28 @@ func (h *JuiceMountHandler) SetCacheReader(cr *cache.Reader) {
 	h.cacheReader = cr
 }
 
+// invalidateReadCaches drops any cached bytes for path from BOTH the memory
+// buffer and the direct-SSD slice cache, so a read after an overwrite / rename
+// / delete / re-drain never serves the PREVIOUS generation's content. The
+// slice cache maps inode -> JuiceFS slice IDs and was otherwise NEVER
+// invalidated in production, so an in-place overwrite (same inode, new slice
+// IDs) kept returning the old blocks (silent stale-content corruption on the
+// re-export / NLE-relink round-trip). Invalidating is cheap and idempotent —
+// a spurious invalidation just forces a correct FUSE/MinIO re-fetch — so we
+// call it broadly. The inode is resolved from the live metadata cache; if the
+// entry is already evicted (delete/rename source) there is nothing cached to
+// serve under it, so a miss is fine.
+func (h *JuiceMountHandler) invalidateReadCaches(path string) {
+	if h.memBuf != nil {
+		h.memBuf.Invalidate(path)
+	}
+	if h.cacheReader != nil {
+		if e := h.store.LookupByPath(path); e != nil {
+			h.cacheReader.InvalidateSliceCache(e.Inode)
+		}
+	}
+}
+
 // SetPinStore attaches the pin registry and the user-facing mount point that
 // the pin keys are anchored to. When offline mode is on, the read path
 // consults this store to fail-fast on un-pinned/un-cached files.
@@ -322,6 +344,17 @@ func (h *JuiceMountHandler) onSpoolDrained(nfsPath string, size int64) {
 	inode := uint64(0)
 	if e := h.store.LookupByPath(nfsPath); e != nil {
 		inode = e.Inode
+	}
+	// The drainer just (re)wrote this path's bytes into FUSE. If this drain was
+	// an OVERWRITE of a previously-read file (re-export / NLE relink over the
+	// same name, which routes through the spool), the direct-SSD slice cache
+	// still maps this inode to the OLD slice IDs and the memory buffer holds
+	// the old content; drop both so reads see the freshly-drained data.
+	if h.cacheReader != nil && inode != 0 {
+		h.cacheReader.InvalidateSliceCache(inode)
+	}
+	if h.memBuf != nil {
+		h.memBuf.Invalidate(nfsPath)
 	}
 	h.publishEvent(metadata.MetadataEvent{
 		Op: "create", Path: nfsPath, Size: size, Mtime: now.Unix(), Inode: inode,
@@ -1645,12 +1678,11 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 		}
 	}
 
-	// Invalidate memory buffer for both ends: the old path is gone, and a
-	// replaced destination must not serve the pre-rename bytes from cache.
-	if jfs.handler.memBuf != nil {
-		jfs.handler.memBuf.Invalidate(oldpath)
-		jfs.handler.memBuf.Invalidate(newpath)
-	}
+	// Invalidate both read caches for both ends: the old path is gone, and a
+	// replaced destination must not serve the pre-rename bytes from the memory
+	// buffer OR the direct-SSD slice cache.
+	jfs.handler.invalidateReadCaches(oldpath)
+	jfs.handler.invalidateReadCaches(newpath)
 
 	// Carry the in-flight write-size high-water mark across the rename so
 	// (a) Stat at the new path stays accurate for a file still being
@@ -1711,10 +1743,9 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 func (jfs *juiceFS) Remove(filename string) error {
 	filename = strings.TrimPrefix(filename, "/")
 
-	// Invalidate memory buffer
-	if jfs.handler.memBuf != nil {
-		jfs.handler.memBuf.Invalidate(filename)
-	}
+	// Invalidate both read caches BEFORE the entry is evicted below (so the
+	// inode is still resolvable for the slice-cache drop).
+	jfs.handler.invalidateReadCaches(filename)
 
 	// QA-37: cancel any in-flight spool entry FIRST, so a pending or
 	// mid-flight drain can't resurrect the file we're about to delete. A
@@ -2021,10 +2052,10 @@ func (f *writeFile) Close() error {
 		f.File.Close()
 	}
 
-	// Invalidate memory buffer so subsequent reads see fresh data
-	if f.handler.memBuf != nil {
-		f.handler.memBuf.Invalidate(f.name)
-	}
+	// Invalidate BOTH read caches so subsequent reads see the freshly-written
+	// data, not the previous generation's bytes from the slice cache (in-place
+	// overwrite keeps the same inode with new JuiceFS slice IDs).
+	f.handler.invalidateReadCaches(f.name)
 
 	// QA-16 fix (2026-05-17): use the HIGH-WATER mark from the shared
 	// writeSizes accumulator, NOT this RPC's per-instance writtenEnd.
