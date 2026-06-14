@@ -122,6 +122,22 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 
+	// Honor the requested write stability. UNSTABLE (the default, and what
+	// macOS uses for buffered copies) defers durability to a later COMMIT. But
+	// if the client asked for DATA_SYNC/FILE_SYNC it expects these bytes durable
+	// NOW, so force the spool fsync barrier before acking that stability —
+	// otherwise we'd claim a durability level we didn't provide and a power
+	// loss would lose acknowledged data.
+	stability := unstable
+	if req.How != uint32(unstable) {
+		if c, ok := fs.(Committer); ok {
+			if cErr := c.CommitFile(fullPath); cErr != nil {
+				return &NFSStatusError{NFSStatusIO, cErr}
+			}
+		}
+		stability = writeStability(req.How)
+	}
+
 	// [JM5] Use pooled response buffer instead of allocating.
 	writer := getResponseBuffer()
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
@@ -137,7 +153,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		putResponseBuffer(writer)
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := xdr.Write(writer, unstable); err != nil {
+	if err := xdr.Write(writer, stability); err != nil {
 		putResponseBuffer(writer)
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}

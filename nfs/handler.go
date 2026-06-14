@@ -1560,6 +1560,23 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	return &billyFile{File: f, name: filename, pinned: isPinned}, nil
 }
 
+// CommitFile satisfies the internal/nfs Committer interface: it fsyncs any
+// buffered spool data for path to stable storage (the NFS COMMIT / FILE_SYNC
+// durability barrier) WITHOUT finalizing the entry, so a power loss after the
+// client's fsync/commit can't lose acknowledged bytes. No-op when the path is
+// not currently spooled (already drained, or spool disabled — those bytes are
+// durable via their own path).
+func (jfs *juiceFS) CommitFile(path string) error {
+	if jfs.handler.spool == nil {
+		return nil
+	}
+	path = strings.TrimPrefix(path, "/")
+	if e, ok := jfs.handler.spool.Index().Lookup(path); ok {
+		return e.Sync()
+	}
+	return nil
+}
+
 func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 	filename = strings.TrimPrefix(filename, "/")
 	now := time.Now()
