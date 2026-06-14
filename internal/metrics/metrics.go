@@ -177,6 +177,18 @@ type Registry struct {
 	bytesRead  atomic.Uint64
 	bytesWrite atomic.Uint64
 
+	// Read-path resilience counters. A cold JuiceFS/MinIO chunk fetch under
+	// heavy concurrent read load can return a TRANSIENT EIO that the read
+	// path now retries (cachedFile.ReadAt) instead of surfacing as NFS3ERR_IO
+	// — which the kernel turns into EIO for read() consumers and SIGBUS for
+	// mmap consumers (many NLEs mmap media → crash), with no data lost.
+	// readRetries counts retried subreads; readFails counts the ones that
+	// still failed after exhausting retries (the genuinely-bad case worth an
+	// alert). Both were SILENT before (rpc_errors stayed 0), which made the
+	// concurrent-readback SIGBUS hard to diagnose (2026-06-14).
+	readRetries atomic.Uint64
+	readFails   atomic.Uint64
+
 	// Health hook — set by main.go so /health can answer accurately.
 	healthMu sync.RWMutex
 	healthFn func() HealthSnapshot
@@ -256,6 +268,13 @@ func (r *Registry) AddBytesWritten(n int64) {
 	}
 }
 
+// IncReadRetry records that a transient cold-read EIO was retried.
+func (r *Registry) IncReadRetry() { r.readRetries.Add(1) }
+
+// IncReadFail records that a cold read still failed after exhausting retries
+// (the genuinely-bad case — bytes were surfaced to the client as an error).
+func (r *Registry) IncReadFail() { r.readFails.Add(1) }
+
 // Snapshot is the JSON shape returned by /metrics.
 type Snapshot struct {
 	UptimeSec    int64                  `json:"uptime_sec"`
@@ -263,6 +282,8 @@ type Snapshot struct {
 	RPCErrors    uint64                 `json:"rpc_errors"`
 	BytesRead    uint64                 `json:"bytes_read"`
 	BytesWritten uint64                 `json:"bytes_written"`
+	ReadRetries  uint64                 `json:"read_retries"`
+	ReadFails    uint64                 `json:"read_fails"`
 	RPCs         map[string]RPCSnapshot `json:"rpcs"`
 }
 
@@ -284,6 +305,8 @@ func (r *Registry) Snapshot() Snapshot {
 		RPCErrors:    r.rpcErrors.Load(),
 		BytesRead:    r.bytesRead.Load(),
 		BytesWritten: r.bytesWrite.Load(),
+		ReadRetries:  r.readRetries.Load(),
+		ReadFails:    r.readFails.Load(),
 		RPCs:         make(map[string]RPCSnapshot, len(trackedTypes)),
 	}
 
