@@ -280,10 +280,10 @@ func TestDrainerSHAMismatchQuarantines(t *testing.T) {
 	}
 }
 
-func TestDrainerOutOfOrderWritesNoSHACompare(t *testing.T) {
+func TestDrainerOutOfOrderWritesVerifiedViaDiskSHA(t *testing.T) {
 	spool, d := newTestDrainer(t, DrainerConfig{})
 
-	// Write out of order so streaming SHA is invalidated.
+	// Write out of order so the STREAMING SHA is invalidated.
 	e, _ := spool.OpenWrite("/sparse.bin")
 	if _, err := e.WriteAt([]byte("part2"), 5); err != nil {
 		t.Fatalf("write: %v", err)
@@ -296,21 +296,25 @@ func TestDrainerOutOfOrderWritesNoSHACompare(t *testing.T) {
 	}
 
 	if e.SHA256() != nil {
-		t.Fatal("expected SHA to be nil due to out-of-order writes")
+		t.Fatal("expected STREAMING SHA to be nil due to out-of-order writes")
 	}
+	// DATA-INTEGRITY FIX: finalize derives a reference SHA from the on-disk file
+	// when the streaming hash was invalidated, so the row carries a sha and the
+	// drainer VERIFIES the out-of-order file (it previously drained unverified).
 	row, _ := spool.Meta().Get(e.ID())
-	if row.SHA256 != nil {
-		t.Fatal("SQL sha should be nil for out-of-order writes")
+	if row.SHA256 == nil {
+		t.Fatal("SQL sha should be the disk-derived reference for out-of-order writes (drainer must verify)")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 	_ = d.DrainOnceForTest(ctx)
 
-	// Without a stored SHA, drain skips comparison and treats success.
+	// With the disk-derived SHA, the drain verifies (spool-disk + FUSE at-rest
+	// both match) and succeeds — the content is intact.
 	row, _ = spool.Meta().Get(e.ID())
 	if row.DrainState != metadata.DrainDone {
-		t.Errorf("state=%q, want done (no sha to compare)", row.DrainState)
+		t.Errorf("state=%q, want done (verified out-of-order drain)", row.DrainState)
 	}
 
 	// Verify the actual destination file has the right content.

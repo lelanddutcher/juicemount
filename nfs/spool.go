@@ -1593,9 +1593,24 @@ func (e *SpoolEntry) finalizeLocked() error {
 		e.sha256 = e.hasher.Sum(nil)
 	}
 	finalSize := e.writtenEnd
-	finalSha := e.sha256 // nil if streaming hash was invalidated; drainer re-hashes
-	finalID := e.id      // capture under mu: rename migration can re-bind id
+	finalSha := e.sha256 // nil if streaming hash was invalidated (out-of-order)
+	finalSpoolFile := e.spoolFile
+	finalID := e.id // capture under mu: rename migration can re-bind id
 	e.mu.Unlock()
+
+	// If the streaming hash was invalidated (out-of-order / truncate-resized
+	// writes), derive a reference SHA from the finalized on-disk spool file —
+	// off the lock, after fsync+close so the on-disk bytes are complete. Without
+	// this, row.SHA256 stayed nil and the drainer SKIPPED both its integrity
+	// checks (spool-SSD bit-flip and FUSE at-rest), so a corrupt copy of an
+	// out-of-order-written file became the only copy with no detection. One
+	// extra full read, only for the rare out-of-order case; sequential
+	// cp/Finder writes keep the streaming hash and never reach here.
+	if finalSha == nil && finalSpoolFile != "" {
+		if sha, _, herr := hashSpoolFile(finalSpoolFile); herr == nil {
+			finalSha = sha
+		}
+	}
 
 	if err := e.store.meta.MarkReady(finalID, finalSize, finalSha); err != nil && firstErr == nil {
 		firstErr = err
