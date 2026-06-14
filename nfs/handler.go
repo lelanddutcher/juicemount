@@ -1461,6 +1461,7 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			fuseFD:      fd,
 			fusePath:    fusePath,
 			fdPool:      jfs.handler.fdPool,
+			handler:     jfs.handler,
 			cacheReader: jfs.handler.cacheReader,
 			readahead:   jfs.handler.readahead,
 			memBuf:      jfs.handler.memBuf,
@@ -1557,7 +1558,7 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	// Writes don't gate (writes are always allowed); reads through this
 	// branch (e == nil, no metadata cache) pick up the same offline policy
 	// as the cachedFile branch.
-	return &billyFile{File: f, name: filename, pinned: isPinned}, nil
+	return &billyFile{File: f, name: filename, pinned: isPinned, handler: jfs.handler}, nil
 }
 
 // CommitFile satisfies the internal/nfs Committer interface: it fsyncs any
@@ -1857,6 +1858,7 @@ type cachedFile struct {
 	fuseFD      *os.File
 	fusePath    string
 	fdPool      *FDPool
+	handler     *JuiceMountHandler // for clampWriteSize on Truncate
 	cacheReader *cache.Reader
 	readahead   *ReadaheadManager
 	memBuf      *MemoryBuffer
@@ -2007,7 +2009,17 @@ func (f *cachedFile) Seek(offset int64, whence int) (int64, error) {
 }
 func (f *cachedFile) Lock() error               { return nil }
 func (f *cachedFile) Unlock() error             { return nil }
-func (f *cachedFile) Truncate(size int64) error { return f.fuseFD.Truncate(size) }
+func (f *cachedFile) Truncate(size int64) error {
+	// Clamp the sticky write-size high-water DOWN to the truncation point.
+	// Without this, a SHRINKING overwrite (truncate to a smaller size, then
+	// write less) leaves the old larger high-water in writeSizes — trackWriteSize
+	// only RAISES it — and Stat then over-reports the old size, so reads return
+	// the truncated tail as ZEROS (corrupt content on a shrink-overwrite).
+	if f.handler != nil {
+		f.handler.clampWriteSize(f.name, size)
+	}
+	return f.fuseFD.Truncate(size)
+}
 
 func (f *cachedFile) Close() error {
 	if f.closed {
@@ -2033,6 +2045,19 @@ type writeFile struct {
 func (f *writeFile) Name() string  { return f.name }
 func (f *writeFile) Lock() error   { return nil }
 func (f *writeFile) Unlock() error { return nil }
+
+// Truncate overrides the embedded *os.File.Truncate to ALSO clamp the sticky
+// write-size high-water down to the truncation point. writeFile.Close persists
+// that high-water as the SQLite size (MAX-wise, to survive concurrent
+// out-of-order writes), so without clamping, a SHRINKING overwrite (truncate to
+// a smaller size, then write less) would leave the OLD larger size in the
+// metadata while the FUSE file is smaller — reads then return the truncated
+// tail as ZEROS (silent corrupt content on shrink-overwrite / re-export over a
+// smaller file). Subsequent writes past the new size re-raise the mark normally.
+func (f *writeFile) Truncate(size int64) error {
+	f.handler.clampWriteSize(f.name, size)
+	return f.File.Truncate(size)
+}
 
 func (f *writeFile) Write(p []byte) (int, error) {
 	n, err := f.File.Write(p)
@@ -2137,14 +2162,22 @@ func (f *writeFile) Close() error {
 // flips on would bypass the gate and stall on FUSE → backend.
 type billyFile struct {
 	*os.File
-	name   string
-	pinned bool
+	name    string
+	pinned  bool
+	handler *JuiceMountHandler // for clampWriteSize on Truncate
 }
 
 func (f *billyFile) Name() string              { return f.name }
 func (f *billyFile) Lock() error               { return nil }
 func (f *billyFile) Unlock() error             { return nil }
-func (f *billyFile) Truncate(size int64) error { return f.File.Truncate(size) }
+func (f *billyFile) Truncate(size int64) error {
+	// Clamp the write-size high-water down to the truncation point — see
+	// cachedFile.Truncate; a shrink-overwrite would otherwise over-report size.
+	if f.handler != nil {
+		f.handler.clampWriteSize(f.name, size)
+	}
+	return f.File.Truncate(size)
+}
 
 // Read overrides *os.File.Read to enforce the read-time offline gate on
 // un-pinned files. Pinned files fall through to FUSE/JuiceFS LRU as usual.
