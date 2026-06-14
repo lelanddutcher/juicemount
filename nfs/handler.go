@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -328,7 +329,27 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 	if spool != nil {
 		// NFS closes the file after every WRITE RPC, so finalize is driven
 		// by quiescence (idle sweeper), not by Close. Stopped in StopHandler.
-		h.spoolSweeperStop = spool.StartSweeper(0, 0)
+		//
+		// The idle window must be LONGER than the realistic gap between a
+		// single file's consecutive WRITE RPCs under concurrent load. With the
+		// old 3s default, a large-offload Finder copy (many files in flight)
+		// would interleave RPCs so that one file's writes were >3s apart; the
+		// sweeper then finalized it MID-COPY, and the next WRITE for that path
+		// hit OpenWrite's 30s reopen-wait (waiting for the backed-up drainer to
+		// evict the just-finalized entry) — which exceeds the 40s soft-mount
+		// timeout and aborts the whole copy with "error 100060" (ETIMEDOUT).
+		// A generous window keeps actively-copied files in `writing` so they
+		// are never finalized out from under an in-progress copy. Drain
+		// throughput is unaffected (the drainers run continuously on the
+		// backlog); only the per-file drain START is delayed by the window.
+		// Tunable via JM_SPOOL_SWEEP_IDLE_SEC for unusual workloads.
+		idle := 30 * time.Second
+		if v := os.Getenv("JM_SPOOL_SWEEP_IDLE_SEC"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				idle = time.Duration(n) * time.Second
+			}
+		}
+		h.spoolSweeperStop = spool.StartSweeper(idle, 0)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -61,6 +62,17 @@ type Drainer struct {
 	// the metadata cache. Worker goroutines read it after Start, so
 	// set-before-Start provides the happens-before (no lock needed).
 	onDrainComplete func(nfsPath string, size int64)
+
+	// atRestVerify gates the post-copy at-rest SHA re-read (re-opening the
+	// just-written file through JuiceFS and re-hashing it). Default OFF: with
+	// --writeback disabled (a86eaf6) dst.Sync() already blocks until the
+	// durable MinIO PUT, and the spool-side SHA check already proved we sent
+	// the right bytes, so the re-read is redundant — AND under a heavy offload
+	// it re-reads not-yet-fully-served bytes back through JuiceFS, which
+	// deadlocks the FUSE mount (read-after-write on a saturated writeback
+	// buffer). Opt back in with JM_DRAIN_ATREST_VERIFY=1 only on a fast/idle
+	// backend where the extra read pass is affordable.
+	atRestVerify bool
 }
 
 // DrainerConfig controls drainer behavior. Zero values fall back to
@@ -108,15 +120,22 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		return nil, errors.New("drainer: FuseRoot is required")
 	}
 	if cfg.Workers <= 0 {
-		// 8 (up from 4): a large SD-card offload (tens of thousands of RAW
-		// files) ingests far faster than 4 drain workers can copy+verify into
-		// FUSE, so the spool backlog grows and capacity backpressure engages
-		// sooner than necessary. 8 roughly doubles drain throughput to better
-		// track ingest. Each worker is I/O-bound (FUSE copy + at-rest re-read
-		// SHA), so this trades a bounded rise in concurrent JuiceFS writeback
-		// pressure (--buffer-size 4096) for backlog headroom; tune if the
-		// writeback buffer saturates on slower uplinks.
-		cfg.Workers = 8
+		// 4 concurrent drains. Each worker copies a whole file into JuiceFS and
+		// (writeback now OFF, see fix a86eaf6) dst.Sync() BLOCKS until the real
+		// MinIO PUT lands. Too many concurrent workers pile that many in-flight
+		// 66 MB writes into JuiceFS's --buffer-size buffer; on a real
+		// ~40 GB+ offload the buffer saturates, JuiceFS goes readdir-
+		// unresponsive (wedge), the health watchdog then SIGKILLs+remounts it,
+		// and the whole copy stalls (observed 2026-06-14 under a 16-way Finder
+		// copy). 4 keeps JuiceFS healthy while still overlapping uploads; the
+		// spool absorbs the burst and capacity backpressure paces ingest to
+		// drain speed. Tune via JM_DRAIN_WORKERS for faster/slower uplinks.
+		cfg.Workers = 4
+		if v := os.Getenv("JM_DRAIN_WORKERS"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				cfg.Workers = n
+			}
+		}
 	}
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 5
@@ -134,6 +153,7 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		maxAttempts:  cfg.MaxAttempts,
 		backoffBase:  cfg.BackoffBase,
 		pollFallback: cfg.PollFallback,
+		atRestVerify: os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
 		sem:          make(chan struct{}, cfg.Workers),
 		notify:       make(chan struct{}, 1),
 		stop:         make(chan struct{}),
@@ -414,7 +434,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// (so this at-rest check, and the spool-SSD check above, run for EVERY
 	// file). The len>0 guard remains only as defense for a finalize-time disk
 	// hash that failed to compute.
-	if len(row.SHA256) > 0 {
+	if d.atRestVerify && len(row.SHA256) > 0 {
 		atRestSHA, _, hashErr := hashSpoolFile(dest)
 		if hashErr != nil {
 			// Could not re-read what we just wrote. Treat as transient.
