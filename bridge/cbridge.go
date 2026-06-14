@@ -555,19 +555,29 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					// Slice F: boot-time scrubber. MUST run BEFORE
 					// drainer.Start so it doesn't race with worker
 					// claims on the `draining`-state rows it resets.
-					recCtx, recCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					//
+					// Deadline is generous (5 min, up from 30s): recovery
+					// integrity outranks a slow boot. At 50k+ rows the per-row
+					// SQL writes + writing-row hashes can exceed 30s; a timeout
+					// left `draining` rows unreset so their bytes never drained
+					// to MinIO (silent loss until the next reboot re-ran
+					// recovery). 5 min completes any realistic count while still
+					// bounding a truly-wedged disk. Recovery is idempotent, so a
+					// rare timeout still recovers on the next boot.
+					recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 					recReport, recErr := spool.RecoverOnBoot(recCtx)
 					recCancel()
 					if recErr != nil {
 						jmlog.Warn("spool boot scrubber failed (proceeding anyway)",
 							"error", recErr.Error())
 					} else if recReport.OrphanFilesDeleted > 0 || recReport.OrphanRowsFailed > 0 ||
-						recReport.WritingFailedRows > 0 || recReport.DrainingReset > 0 ||
-						recReport.ReadyResumed > 0 {
+						recReport.WritingFailedRows > 0 || recReport.WritingResumed > 0 ||
+						recReport.DrainingReset > 0 || recReport.ReadyResumed > 0 {
 						jmlog.Info("spool boot recovery",
 							"orphan_files_deleted", recReport.OrphanFilesDeleted,
 							"orphan_rows_failed", recReport.OrphanRowsFailed,
 							"writing_failed", recReport.WritingFailedRows,
+							"writing_resumed", recReport.WritingResumed,
 							"draining_reset", recReport.DrainingReset,
 							"ready_resumed", recReport.ReadyResumed)
 					}
