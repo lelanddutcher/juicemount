@@ -1693,6 +1693,20 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 		if !(migrated > 0 && os.IsNotExist(err)) {
 			return err
 		}
+		// migrated>0 && ENOENT: the SOURCE was purely spooled (not yet on FUSE),
+		// so the migration re-keyed its spool entry to newpath and the rename
+		// itself is a no-op on FUSE. But if newpath ALREADY had drained content
+		// on FUSE, that OLD content still sits there and would be served if the
+		// migrated entry's drain later FAILS (quarantine / retry-exhaust) —
+		// silent stale-content corruption (a relink/atomic-save reading the
+		// pre-rename bytes). Remove the stale FUSE dest now so a failed drain
+		// yields a clean ENOENT instead. In-flight readers keep their open fd
+		// (open-then-unlink); new reads hit the migrated spool entry's fresh
+		// content during the drain, then FUSE after it lands.
+		if rmErr := os.Remove(jfs.fullPath(newpath)); rmErr != nil && !os.IsNotExist(rmErr) {
+			jmlog.Warn("rename: remove stale FUSE dest after spooled-source migration",
+				"newpath", newpath, "error", rmErr.Error())
+		}
 	}
 
 	// Invalidate both read caches for both ends: the old path is gone, and a
