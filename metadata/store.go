@@ -134,6 +134,71 @@ type Store struct {
 	// pinnedSetErr non-nil → evictOldest skips this cycle (fail-safe).
 	pinnedSetForEviction map[string]struct{}
 	pinnedSetErr         error
+
+	// syntheticHandles maps a SYNTHETIC inode (high bit set — handed out by
+	// ToHandle's fnv64a fallback for a path not yet in the store) to its path.
+	//
+	// Why this exists (2026-06-14, "error 100070 ESTALE mid-copy", and the
+	// retry-storm path to "error 100060"): the inodeCache entry for a synthetic
+	// inode is churned away when the 30s reconcile replaces the path's synthetic
+	// inode with JuiceFS's real inode (the entry object's .Inode field changes,
+	// so the synthetic key is dropped on the next cache rebuild / orphan-evict).
+	// But the CLIENT still holds the synthetic handle for the file's lifetime,
+	// so its next op → FromHandle(synthetic) → inodeCache miss → ESTALE. Under a
+	// heavy Finder copy (every just-created file + its ._ sidecar takes the
+	// synthetic path) this fires constantly and aborts the copy. Reproduced
+	// locally: 49 FromHandle STALE over a 1500-file parallel copy with ._ sidecars.
+	//
+	// This map is written ONLY when a synthetic handle is handed out and is
+	// never touched by the inodeCache eviction/reconcile churn, so FromHandle
+	// can always recover the path for a synthetic handle the client still holds.
+	// Bounded FIFO (a synthetic handle the client refreshed via LOOKUP no longer
+	// needs recovery, so evicting the oldest is safe). Guarded by mu.
+	syntheticHandles map[uint64]string
+	syntheticOrder   []uint64
+}
+
+// maxSyntheticHandles bounds syntheticHandles. Generous — far above any real
+// in-flight working set — because a synthetic handle must stay resolvable for
+// the file's lifetime; evicting the oldest can only re-expose ESTALE for a
+// handle the client has almost certainly already refreshed via LOOKUP.
+const maxSyntheticHandles = 1 << 20 // ~1M
+
+// RecordSyntheticHandle remembers that a synthetic inode was handed out for
+// path (called from ToHandle). No-op for non-synthetic inodes. Idempotent.
+func (s *Store) RecordSyntheticHandle(inode uint64, path string) {
+	if inode&(1<<63) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.syntheticHandles[inode]; ok {
+		s.syntheticHandles[inode] = path // refresh (e.g. delete + re-create)
+		return
+	}
+	s.syntheticHandles[inode] = path
+	s.syntheticOrder = append(s.syntheticOrder, inode)
+	if len(s.syntheticOrder) > maxSyntheticHandles {
+		drop := s.syntheticOrder[:len(s.syntheticOrder)/4]
+		s.syntheticOrder = s.syntheticOrder[len(s.syntheticOrder)/4:]
+		for _, in := range drop {
+			// Only delete if still mapped to a now-dropped slot; a refresh
+			// could have re-appended it (then it's also later in the slice).
+			if _, ok := s.syntheticHandles[in]; ok {
+				delete(s.syntheticHandles, in)
+			}
+		}
+	}
+}
+
+// SyntheticHandlePath returns the path a synthetic inode was handed out for,
+// or ("", false). FromHandle uses this to recover a synthetic handle that lost
+// its inodeCache entry, instead of returning ESTALE.
+func (s *Store) SyntheticHandlePath(inode uint64) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.syntheticHandles[inode]
+	return p, ok
 }
 
 // stagePinnedForEviction is called by BulkInsert/rebuildCaches BEFORE they
@@ -387,11 +452,12 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	}
 
 	s := &Store{
-		db:           db,
-		inodeCache:   make(map[uint64]*Entry),
-		pathCache:    make(map[string]*Entry),
-		childrenIdx:  make(map[string]map[string]*Entry),
-		maxCacheSize: maxCacheSize,
+		db:               db,
+		inodeCache:       make(map[uint64]*Entry),
+		pathCache:        make(map[string]*Entry),
+		childrenIdx:      make(map[string]map[string]*Entry),
+		maxCacheSize:     maxCacheSize,
+		syntheticHandles: make(map[uint64]string),
 	}
 
 	if err := s.rebuildCaches(); err != nil {

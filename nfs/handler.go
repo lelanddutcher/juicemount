@@ -862,6 +862,14 @@ func (h *JuiceMountHandler) ToHandle(f billy.Filesystem, path []string) []byte {
 	h.store.InsertToCache(entry)
 	go h.store.Insert(entry) // persist async
 
+	// Remember this synthetic handle → path mapping PERMANENTLY (until FIFO
+	// eviction), separate from the inodeCache. The 30s reconcile replaces this
+	// path's synthetic inode with JuiceFS's real inode, dropping the synthetic
+	// key from inodeCache — but the client keeps using this synthetic handle for
+	// the file's lifetime. Without this record, its next op → FromHandle miss →
+	// ESTALE (error 100070, and the retry-storm path to 100060) mid-copy.
+	h.store.RecordSyntheticHandle(inode, fullPath)
+
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, inode)
 	return buf
@@ -892,6 +900,20 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 		if recovered := h.tryRecoverEvicted(inode); recovered != nil {
 			parts := splitPath(recovered.Path)
 			return &juiceFS{handler: h}, parts, nil
+		}
+
+		// Synthetic-handle recovery (2026-06-14). A synthetic inode (high bit)
+		// that ToHandle handed out for a not-yet-persisted path loses its
+		// inodeCache entry when the reconcile swaps in JuiceFS's real inode —
+		// but the client still holds the synthetic handle. Resolve it from the
+		// persistent synthetic-handle map so the op proceeds on the path instead
+		// of failing the client with ESTALE (error 100070 / retry-storm 100060
+		// mid-copy). tryRecoverEvicted above deliberately skips synthetic inodes
+		// (no Redis shadow); this is their recovery path.
+		if inode&(1<<63) != 0 {
+			if p, ok := h.store.SyntheticHandlePath(inode); ok {
+				return &juiceFS{handler: h}, splitPath(p), nil
+			}
 		}
 
 		// QA-25 diagnostic (2026-05-20): log every STALE so we can
