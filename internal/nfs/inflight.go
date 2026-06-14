@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -90,11 +92,63 @@ func InflightStats() (count int, oldestOp string, oldestAge time.Duration) {
 	return
 }
 
+// JUKEBOX tracking. The completed-RPC metrics count a JUKEBOX reply as a
+// SUCCESS (it's a valid NFS status, not an rpc_error), so a JUKEBOX storm — the
+// mechanism behind "error 100060" when the client retries the same logical op
+// until its ~40s soft-mount timeout — is invisible. We count JUKEBOX replies
+// per op and the watchdog logs the per-op rate periodically, so a storm names
+// its own op (e.g. "nfs.LOOKUP" retrying thousands of times) instead of forcing
+// another guess.
+var jukeboxByOp sync.Map // op string -> *atomic.Int64
+
+func recordJukebox(op string) {
+	v, _ := jukeboxByOp.LoadOrStore(op, new(atomic.Int64))
+	v.(*atomic.Int64).Add(1)
+}
+
+// snapshotJukebox returns the current per-op JUKEBOX totals.
+func snapshotJukebox() map[string]int64 {
+	out := map[string]int64{}
+	jukeboxByOp.Range(func(k, v any) bool {
+		out[k.(string)] = v.(*atomic.Int64).Load()
+		return true
+	})
+	return out
+}
+
 func inflightWatchdog() {
 	tick := time.NewTicker(3 * time.Second)
 	defer tick.Stop()
 	var lastDump time.Time
+	prevJuke := map[string]int64{}
+	var sinceJukeLog int
 	for range tick.C {
+		// Every ~15s, report any op whose JUKEBOX count grew — a storming op
+		// is the "error 100060" signature.
+		sinceJukeLog++
+		if sinceJukeLog >= 5 {
+			sinceJukeLog = 0
+			cur := snapshotJukebox()
+			type kv struct {
+				op string
+				d  int64
+			}
+			var grew []kv
+			for op, n := range cur {
+				if d := n - prevJuke[op]; d > 0 {
+					grew = append(grew, kv{op, d})
+				}
+			}
+			prevJuke = cur
+			if len(grew) > 0 {
+				sort.Slice(grew, func(i, j int) bool { return grew[i].d > grew[j].d })
+				parts := ""
+				for _, g := range grew {
+					parts += fmt.Sprintf(" %s=%d", g.op, g.d)
+				}
+				Log.Errorf("JUKEBOX-RATE (per ~15s):%s — a high per-op rate is the 'error 100060' retry-storm signature", parts)
+			}
+		}
 		count, op, age := InflightStats()
 		if age < inflightDumpAfter {
 			continue
