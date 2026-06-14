@@ -40,6 +40,42 @@ entries below that referenced them read correctly:
 - **Reset-DB flow** (S-6) — ✓ Phase 3b `b47834e`: soft-stop → delete →
   Start Now/Later, pin.db preserved.
 
+## Closed 2026-06-14 — OS-thread-exhaustion crash + watchdog remount reliability
+
+- **App SIGABRT (Abort trap: 6) on a heavy/offline recursive walk** — ✓ FIXED
+  `98ca6f4`. Crash report: ~8178 of 8192 threads parked in `open`/`readdir`
+  (`runtime.syscallN_trampoline`), faulting in `runtime.newm1`. macOS caps a
+  process at `kern.num_taskthreads`=8192 and every goroutine blocked in a FUSE
+  syscall pins one OS thread, so an unbounded fan-out of blocking FUSE syscalls
+  hits the cap and the runtime aborts. **Root cause (the crash path):**
+  `prefetchChildren` was spawned UNBOUNDED — a bare `go prefetchChildren` per
+  directory READDIR — and did a raw, ungated `os.ReadDir` on the FUSE mount; a
+  ~114k-path walk spawned thousands at once, and offline each `os.ReadDir`
+  blocks on Redis. **Measured:** an offline "Film Projects" walk drove the
+  process to 5216 threads (the original 102k-path walk hit the cap and aborted).
+  Fix: skip the prefetch spawn when offline; bound the online spawn via
+  `prefetchSem` (non-blocking, shed under load); route its `os.ReadDir` through
+  `readDirWithTimeout`. Also bounded a second latent path — `membuf.loadFile`
+  (one `os.Open`-blocking loader per distinct small-file read; `loadSem`,
+  `JM_MEMBUF_LOADERS` default 16). **Validation:** offline walk 5216→30 threads
+  (114k paths still fully enumerated); online walk + 250-way read storm peak 30
+  threads; `TestMemBufLoadCap`.
+- **Toggling offline stalls the NFS share** — ✓ FIXED `98ca6f4` (same root
+  cause: the prefetch fan-out consumed the server's rpcSem budget). Validated:
+  control-stat latency 0 ms across an offline ON/OFF toggle under continuous
+  navigation.
+- **Watchdog remount fails "exit status 1" after a wedge** — ✓ FIXED `4e2c9cc`.
+  `Mount()` relaunched juicefs without verifying the kernel released the
+  mountpoint (busy → "exit status 1"), and the real reason was discarded.
+  Fix: `ensureUnmountedLocked` verifies `stillInMountTable`==false with
+  retry+backoff before relaunch; juicefs stderr teed into the returned error.
+  **Validation:** kill -9 whole juicefs tree → watchdog "fuse remount
+  succeeded" attempt 1 in ~12s, 0 "exit status 1", share + data recovered.
+- **Zero-data-loss write+readback (mandate gate)** — ✓ VALIDATED 2026-06-14:
+  100 real CR3s (6.11 GiB) card→mount→spool→drainer→FUSE→MinIO, drain
+  succeeded=200/failed=0/quarantined=0, readback 100/100 byte-identical
+  (SHA-256), survived a watchdog remount byte-identical.
+
 ## New open follow-ups (logged from the launch-hardening ledger)
 
 - **P1-INVESTIGATE — /stop with a large read in flight wedges the read
