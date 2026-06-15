@@ -71,7 +71,7 @@ public enum NFSBridge {
             logLevel: String = "info",
             bucketOverride: String = "",
             spoolEnable: Bool = false,
-            spoolSizeGB: Int = 50,
+            spoolSizeGB: Int = 0, // 0 = Auto (Go core sizes to free disk minus floor)
             memoryBufferMB: Int = 0,
             memBufFileLimitMB: Int = 0,
             reconcileSeconds: Int = 0

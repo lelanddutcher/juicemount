@@ -74,8 +74,11 @@ public final class Preferences {
     public var spoolEnabled: Bool {
         didSet { save() }
     }
-    /// Local-SSD spool capacity in GB (`JM_SPOOL_SIZE_GB`). Writes are
-    /// refused with a clean ENOSPC once the spool fills; default 50.
+    /// Local-SSD spool capacity in GB (`JM_SPOOL_SIZE_GB`). 0 = Auto: the Go
+    /// core sizes the buffer to free disk minus a 20 GB safety floor, so a large
+    /// offline ingest can absorb far more before pausing. Once full, writes no
+    /// longer fail — they PAUSE (stall to zero speed) and resume when the drain
+    /// frees space (online) or the user reconnects (offline). Default Auto.
     public var spoolCapacityGB: Int {
         didSet { save() }
     }
@@ -105,7 +108,7 @@ public final class Preferences {
         offlineNotificationsEnabled: Bool = false,
         s3EndpointOverride: String = "",
         spoolEnabled: Bool = false,
-        spoolCapacityGB: Int = 50,
+        spoolCapacityGB: Int = 0, // 0 = Auto (size to free disk minus a safety floor)
         hasCompletedOnboarding: Bool = false
     ) {
         self.volumeName = volumeName
@@ -224,7 +227,7 @@ public final class Preferences {
             offlineNotificationsEnabled: d.bool(forKey: Key.offlineNotificationsEnabled.rawValue),
             s3EndpointOverride: d.string(forKey: Key.s3EndpointOverride.rawValue) ?? "",
             spoolEnabled:       d.bool(forKey: Key.spoolEnabled.rawValue),
-            spoolCapacityGB:    d.object(forKey: Key.spoolCapacityGB.rawValue) as? Int ?? 50,
+            spoolCapacityGB:    d.object(forKey: Key.spoolCapacityGB.rawValue) as? Int ?? 0, // 0 = Auto
             hasCompletedOnboarding: d.bool(forKey: Key.hasCompletedOnboarding.rawValue)
         )
     }

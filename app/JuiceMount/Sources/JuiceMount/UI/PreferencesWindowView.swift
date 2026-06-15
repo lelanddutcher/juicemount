@@ -261,13 +261,20 @@ struct PreferencesWindowView: View {
                             checkPendingThenDisableSpool()
                         }
                     }
-                numericRow("Spool capacity", value: $preferences.spoolCapacityGB,
-                           unit: "GB", range: 10...500, fallback: 50)
-                    .disabled(!preferences.spoolEnabled)
+                Toggle("Auto-size spool to free disk", isOn: Binding(
+                    get: { preferences.spoolCapacityGB == 0 },
+                    set: { preferences.spoolCapacityGB = $0 ? 0 : 200 }
+                ))
+                .disabled(!preferences.spoolEnabled)
+                if preferences.spoolCapacityGB != 0 {
+                    numericRow("Spool capacity", value: $preferences.spoolCapacityGB,
+                               unit: "GB", range: 10...2000, fallback: 200)
+                        .disabled(!preferences.spoolEnabled)
+                }
             } header: {
                 Text("Write spool (background uploads)")
             } footer: {
-                footnote("Writes land on the local SSD and are acknowledged immediately, then upload in the background — large copies feel local even over a slow link. Pending uploads show in the menu-bar popover. The toggle restarts the server when needed; capacity changes apply on the next start.")
+                footnote("Writes land on the local SSD and are acknowledged immediately, then upload in the background — large copies feel local even over a slow link. Auto-size lets the buffer grow to nearly all free disk (keeping a 20 GB safety floor) so a big offline ingest fits; you can set a fixed cap instead. When the buffer fills, copies PAUSE (not fail) and resume as space frees or you reconnect. Pending uploads show in the menu-bar popover. Capacity changes apply on the next start.")
             }
 
             Section {
