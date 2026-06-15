@@ -2130,7 +2130,40 @@ const (
 	// kernel per-RPC window, long enough to let a contended MinIO fetch / FUSE
 	// loader slot free up between tries.
 	fuseReadRetryBackoff = 50 * time.Millisecond
+
+	// offlineLocalReadTimeout bounds an OFFLINE un-pinned FUSE read so a
+	// locally-cached block is served while a read that would need an S3/MinIO
+	// fetch is refused fast (the offline tarpit guarantee). A JuiceFS LRU hit
+	// returns in well under this; an S3 GET on a slow link is 30s+, so this
+	// cleanly separates "served from local cache" from "needs the backend".
+	offlineLocalReadTimeout = 1500 * time.Millisecond
 )
+
+// readAtBounded runs fd.ReadAt in a goroutine and returns (n, err, true) if it
+// finishes within timeout, or (0, nil, false) on timeout. MUST be given a
+// PRIVATE buffer: on timeout the goroutine keeps running and writes to buf, so
+// buf must NOT be the caller's reusable/pooled slice (else a late write
+// corrupts a subsequent RPC). Used by the offline read path to probe whether
+// an un-pinned block is locally servable without tarpitting on a backend fetch.
+func readAtBounded(fd *os.File, buf []byte, off int64, timeout time.Duration) (int, error, bool) {
+	type res struct {
+		n   int
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		n, err := fd.ReadAt(buf, off)
+		ch <- res{n, err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.n, r.err, true
+	case <-timer.C:
+		return 0, nil, false
+	}
+}
 
 type cachedFile struct {
 	name        string
@@ -2267,7 +2300,30 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	// re-introducing the very "media offline" UX cliff the offline-pin
 	// feature exists to prevent.
 	if pin.IsOffline() && !f.pinned {
-		return 0, pin.ErrOfflineNotAvailable
+		// Offline + un-pinned: the bytes MIGHT be local — JuiceFS's own LRU has
+		// them (recently read/written/just-copied), or the user toggled offline
+		// while the network is actually up (Redis/JuiceFS reachable, just don't
+		// want S3 traffic). Don't refuse blindly (the old behavior, which made a
+		// just-copied-then-drained file unreadable offline — 2026-06-14
+		// offline-ingest sprint). Attempt the FUSE read with a SHORT bound: a
+		// local hit returns within it → serve it; a read that would need an
+		// S3/MinIO fetch blocks past it → THEN refuse with
+		// ErrOfflineNotAvailable, preserving the tarpit-avoidance the offline
+		// mode exists for. A PRIVATE buffer is used so a bound-exceeded read's
+		// still-running goroutine can never scribble into the caller's pooled p.
+		tmp := make([]byte, len(p))
+		bn, berr, done := readAtBounded(f.fuseFD, tmp, off, offlineLocalReadTimeout)
+		if !done || (berr != nil && bn == 0 && !errors.Is(berr, io.EOF)) {
+			return 0, pin.ErrOfflineNotAvailable
+		}
+		if bn > 0 {
+			copy(p, tmp[:bn])
+			if f.readahead != nil {
+				f.readahead.OnRead(f.inode, off, bn, f.name)
+			}
+			metrics.Default().AddBytesRead(int64(bn))
+		}
+		return bn, berr
 	}
 
 	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time).
