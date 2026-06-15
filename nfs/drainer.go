@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -230,12 +231,46 @@ func (d *Drainer) wakeNonBlocking() {
 // missed signals.
 func (d *Drainer) dispatchLoop() {
 	defer close(d.done)
+	wasOffline := false
 	for {
+		// When offline, poll at a tighter cadence than pollFallback so we
+		// notice reconnection (manual toggle or auto-recovery) within a few
+		// seconds and resume draining promptly. Online, the wake signal drives
+		// us and pollFallback is just a missed-signal backstop.
+		wait := d.pollFallback
+		if pin.IsOffline() {
+			wait = drainOfflineRecheck
+		}
 		select {
 		case <-d.stop:
 			return
 		case <-d.notify:
-		case <-time.After(d.pollFallback):
+		case <-time.After(wait):
+		}
+
+		// PAUSE while offline. Draining writes into the JuiceFS FUSE mount,
+		// which is backed by the (now-unreachable) object store; attempting it
+		// offline just hangs then fails — burning each row's drain_attempts
+		// budget toward a spurious permanent `failed` (a `failed` row is the
+		// last copy of a photo) and churning row state (ready→draining) that
+		// the NFS spool-shadow read path keys on. Park the dispatcher until the
+		// backend is reachable again; ingest keeps filling the spool meanwhile
+		// (offline-ingest sprint) and we drain it on reconnect.
+		if pin.IsOffline() {
+			wasOffline = true
+			continue
+		}
+		// RECONNECT edge: any rows that exhausted their retry budget before or
+		// during the offline window are stuck in `failed`. Requeue them now
+		// that the backend is reachable so no spooled photo is left undrained.
+		// RetryFailed is a no-op (returns 0) when nothing is failed.
+		if wasOffline {
+			wasOffline = false
+			if n, err := d.spool.RetryFailed(); err != nil {
+				log.Printf("drainer: reconnect RetryFailed: %v", err)
+			} else if n > 0 {
+				log.Printf("drainer: reconnect requeued %d failed spool row(s)", n)
+			}
 		}
 
 		// Drain all currently-ready rows before going back to sleep.
@@ -244,6 +279,13 @@ func (d *Drainer) dispatchLoop() {
 			case <-d.stop:
 				return
 			default:
+			}
+			// Bail out of the batch if the network dropped mid-drain; the outer
+			// loop re-evaluates and parks. In-flight workers finish or
+			// fail-transient (treated as an offline pause, not a per-file
+			// failure — see failTransient).
+			if pin.IsOffline() {
+				break
 			}
 			rows, err := d.spool.Meta().ListReady(d.workers * 2)
 			if err != nil {
@@ -254,6 +296,9 @@ func (d *Drainer) dispatchLoop() {
 				break
 			}
 			for _, row := range rows {
+				if pin.IsOffline() {
+					break
+				}
 				if !d.dispatchRow(row) {
 					return // stop signal received
 				}
@@ -514,7 +559,16 @@ func (d *Drainer) failTransient(row *metadata.SpoolRow, err error) {
 	// last copy of a photo. Treat it as a pause, NOT a per-file failure:
 	// requeue to `ready` WITHOUT bumping drain_attempts, and re-drive after a
 	// fixed backoff once the mount returns. "We can't lose photos."
-	if isInfraUnavailable(err) {
+	//
+	// OFFLINE is the same class of outage from the row's perspective: a drain
+	// that was in flight when the link dropped (or that raced the dispatcher's
+	// pause) fails against the unreachable backend with an error that is NOT
+	// necessarily ENXIO (the FUSE mount is still up; only MinIO/Redis is gone),
+	// so isInfraUnavailable wouldn't catch it. Gate on pin.IsOffline() too:
+	// don't spend this photo's per-file budget on a network outage. The
+	// dispatcher is already parked offline, so this just resets the in-flight
+	// row to `ready`; it drains on reconnect.
+	if isInfraUnavailable(err) || pin.IsOffline() {
 		if rErr := d.spool.Meta().ResetToReady(row.ID); rErr != nil {
 			log.Printf("drainer: infra-pause reset %d: %v", row.ID, rErr)
 		}
@@ -539,6 +593,13 @@ func (d *Drainer) failTransient(row *metadata.SpoolRow, err error) {
 // recovery is prompt once the mount returns, but long enough that a sustained
 // outage doesn't tight-spin the dispatcher. Under the soft-mount timeout.
 const infraUnavailableBackoff = 5 * time.Second
+
+// drainOfflineRecheck is how often the parked dispatcher re-checks pin state
+// while offline, so it resumes draining within a few seconds of reconnect
+// rather than waiting a full pollFallback. Well under the NFS soft-mount
+// window; reconnect itself is ~instant (manual toggle / auto recovery), so
+// this bounds the resume latency without tight-spinning.
+const drainOfflineRecheck = 3 * time.Second
 
 // isInfraUnavailable reports whether err indicates the destination filesystem
 // (the JuiceFS FUSE mount) is unavailable, as opposed to a problem with the
