@@ -607,15 +607,64 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 		if wasDisconnected {
 			rc.lastReconnect = time.Now()
 		}
+		lastSync := rc.lastSyncDuration
 		rc.mu.Unlock()
+
 		if *consecutiveFailures > 0 {
 			jmlog.Info("reconciliation recovered", "previous_failures", *consecutiveFailures)
 			*consecutiveFailures = 0
-			*backoff = baseInterval
+		}
+
+		// [JM6] Adaptive reconcile cadence (task #22). syncMetadata
+		// re-reads the FULL backend tree and reconciles it against the
+		// local store; on a large tree (200k+ entries) that takes 4-5s
+		// and holds Redis/SQLite contention the whole time. At the fixed
+		// 30s base interval, a long-running metadata-heavy Finder copy
+		// eats a 4-5s stall every 30s — per-file CREATE/LOOKUP/SETATTR
+		// crawl ("anemic ingest" observed on the 500GB copy 2026-06-15).
+		//
+		// Self-tune the duty cycle to the measured sync cost: keep each
+		// sync to ~1/reconcileDutyDivisor of wall-clock so the copy has
+		// uncontended metadata access the rest of the time. Cheap syncs
+		// (small/idle tree) stay at the responsive base interval; only
+		// expensive syncs stretch out, clamped to maxBackoff so we never
+		// drift the local view too far from the backend.
+		next := baseInterval
+		if lastSync > reconcileAdaptiveThreshold {
+			scaled := lastSync * reconcileDutyDivisor
+			if scaled < baseInterval {
+				scaled = baseInterval
+			}
+			if scaled > maxBackoff {
+				scaled = maxBackoff
+			}
+			next = scaled
+		}
+		if next != *backoff {
+			if next > baseInterval {
+				jmlog.Info("reconcile cadence adapted to sync cost",
+					"last_sync_ms", lastSync.Milliseconds(),
+					"next_interval_sec", int64(next.Round(time.Second).Seconds()),
+				)
+			}
+			*backoff = next
 			ticker.Reset(*backoff)
 		}
 	}
 }
+
+// [JM6] Adaptive-reconcile tuning (task #22).
+//
+//   - reconcileAdaptiveThreshold: syncs faster than this are "cheap" and
+//     stay at the base interval — no point slowing down responsiveness
+//     when the sync isn't contending for anything meaningful.
+//   - reconcileDutyDivisor: target duty cycle. next = lastSync * divisor,
+//     so a 5s sync → 150s interval (sync is ~1/30 ≈ 3% of wall-clock),
+//     a 1.5s sync → 45s, clamped into [baseInterval, maxBackoff].
+const (
+	reconcileAdaptiveThreshold = 1500 * time.Millisecond
+	reconcileDutyDivisor       = 30
+)
 
 // connErrKind classifies a connection-related error. Used to decide
 // whether a failure means "the user's machine can't reach the backend"
