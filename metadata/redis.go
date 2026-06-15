@@ -818,40 +818,40 @@ func min(a, b int) int {
 // adds new d{number} non-hash key types, this WRONGTYPE will return
 // and we'll add the TYPE check then with eyes open. Don't pre-pay
 // the cost for a hypothetical future schema change.
-const luaScript = `
+// luaScanBatch processes ONE SCAN batch (not the whole tree). The previous
+// single EVAL ran a full `repeat SCAN ... until cursor=='0'` over all ~200k
+// `d[0-9]*` keys + path reconstruction atomically, leaving single-threaded
+// Redis BUSY for ~4.6s and rejecting every concurrent command — which aborted
+// in-flight Finder copies with error -36 (2026-06-14, the T2 flat large-file
+// copy: "BUSY Redis is busy running a script" coincided exactly with the
+// abort). The Go caller (syncMetadata) now drives the SCAN cursor loop, so
+// Redis yields between batches and a concurrent copy's ops keep getting served.
+// Path reconstruction moved to Go; the binary-attr parsing (gi/u32/u64) is
+// UNCHANGED and stays here.
+//
+// ARGV[1] = SCAN cursor, ARGV[2] = COUNT. Returns a flat list whose FIRST
+// element is the next cursor, followed by one
+// "fileType:mtime:fileSize:inode:parentInode:name" string per child entry
+// (parentInode, not a path — Go reconstructs the path from the reverse map).
+const luaScanBatch = `
 local function gi(v) if #v~=9 then return nil end
 local a,b,c,d=string.byte(v,6,9) return a*16777216+b*65536+c*256+d end
 local function u32(s,o) local a,b,c,d=string.byte(s,o,o+3) return a*16777216+b*65536+c*256+d end
 local function u64(s,o) return u32(s,o)*4294967296+u32(s,o+4) end
-local cursor='0' local rev={} local all={}
-repeat local r=redis.call('SCAN',cursor,'MATCH','d[0-9]*','COUNT',1000) cursor=r[1]
+local r=redis.call('SCAN',ARGV[1],'MATCH','d[0-9]*','COUNT',ARGV[2])
+local out={r[1]}
 for _,key in ipairs(r[2]) do local pi=string.sub(key,2)
 local ent=redis.call('HGETALL',key)
 for i=1,#ent,2 do local nm=ent[i] local val=ent[i+1]
 local ci=gi(val) local ft=string.byte(val,1)
-if ci then rev[tostring(ci)]=pi..'\t'..nm
-table.insert(all,{inode=tostring(ci),parent=pi,name=nm,ft=ft}) end
-end end until cursor=='0'
-local results={}
-for _,e in ipairs(all) do
-local parts={e.name} local cur=e.parent
-for d=1,50 do if cur=='1' then break end
-local mp=rev[cur] if not mp then break end
-local sp=string.find(mp,'\t',1,true)
-cur=string.sub(mp,1,sp-1)
-table.insert(parts,1,string.sub(mp,sp+1)) end
-if cur=='1' or e.parent=='1' then
-local path=table.concat(parts,'/')
+if ci then
 local mt=0 local sz=0
-local attr=redis.call('GET','i'..e.inode)
-if attr and #attr>=59 then
-mt=u64(attr,24)
-sz=u64(attr,52)
+local attr=redis.call('GET','i'..tostring(ci))
+if attr and #attr>=59 then mt=u64(attr,24) sz=u64(attr,52) end
+table.insert(out,tostring(ft)..':'..tostring(mt)..':'..tostring(sz)..':'..tostring(ci)..':'..pi..':'..nm)
 end
-table.insert(results,tostring(e.ft)..':'..tostring(mt)..':'..tostring(sz)..':'..e.inode..':'..path)
-end
-end
-return results
+end end
+return out
 `
 
 // syncMetadata performs a full batch reconciliation: Lua tree pull → SQLite sync.
@@ -861,31 +861,79 @@ func (rc *RedisClient) syncMetadata() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	result, err := rc.rdb.Eval(ctx, luaScript, nil).StringSlice()
-	if err != nil {
-		return fmt.Errorf("redis EVAL: %w", err)
+	// Drive the SCAN cursor loop from Go so Redis only blocks for one small
+	// batch at a time (see luaScanBatch). Collect raw child entries — each
+	// carries its parent INODE, not yet a path — plus a reverse map, then
+	// reconstruct paths in Go. scanCount caps keys per SCAN; keep it modest so
+	// no single batch (incl. a big dir's HGETALL + per-child attr GETs) keeps
+	// Redis BUSY long enough to starve a concurrent copy.
+	const scanCount = "500"
+	type rawEntry struct {
+		ft          int
+		mtime, size int64
+		inode       uint64
+		parentInode string
+		name        string
+	}
+	var raws []rawEntry
+	rev := make(map[string][2]string) // childInode → {parentInode, name}
+	cursor := "0"
+	for {
+		res, err := rc.rdb.Eval(ctx, luaScanBatch, nil, cursor, scanCount).StringSlice()
+		if err != nil {
+			return fmt.Errorf("redis SCAN batch: %w", err)
+		}
+		if len(res) == 0 {
+			break
+		}
+		cursor = res[0]
+		for _, raw := range res[1:] {
+			// "fileType:mtime:fileSize:inode:parentInode:name"
+			parts := strings.SplitN(raw, ":", 6)
+			if len(parts) != 6 {
+				continue
+			}
+			ft, _ := strconv.Atoi(parts[0])
+			mt, _ := strconv.ParseInt(parts[1], 10, 64)
+			sz, _ := strconv.ParseInt(parts[2], 10, 64)
+			ino, _ := strconv.ParseUint(parts[3], 10, 64)
+			raws = append(raws, rawEntry{ft: ft, mtime: mt, size: sz, inode: ino, parentInode: parts[4], name: parts[5]})
+			rev[parts[3]] = [2]string{parts[4], parts[5]}
+		}
+		if cursor == "0" {
+			break
+		}
 	}
 
-	// Parse entries from Lua output
-	redisEntries := make([]*Entry, 0, len(result))
-	redisPaths := make(map[string]struct{}, len(result))
-
-	for _, raw := range result {
-		// Format: "fileType:mtime:fileSize:inode:relative/path"
-		parts := strings.SplitN(raw, ":", 5)
-		if len(parts) != 5 || parts[4] == "" {
+	// Reconstruct each entry's path by walking parentInode → root ("1") via the
+	// reverse map, bounded to 50 levels (ported verbatim from the old Lua).
+	// Entries that don't resolve to root (orphans / mid-scan races) are dropped,
+	// exactly as before.
+	redisEntries := make([]*Entry, 0, len(raws))
+	redisPaths := make(map[string]struct{}, len(raws))
+	for _, e := range raws {
+		parts := []string{e.name}
+		cur := e.parentInode
+		for d := 0; d < 50; d++ {
+			if cur == "1" {
+				break
+			}
+			mp, ok := rev[cur]
+			if !ok {
+				break
+			}
+			cur = mp[0]
+			parts = append([]string{mp[1]}, parts...)
+		}
+		if cur != "1" && e.parentInode != "1" {
 			continue
 		}
-		ft, _ := strconv.Atoi(parts[0])
-		mtimeEpoch, _ := strconv.ParseInt(parts[1], 10, 64)
-		fileSize, _ := strconv.ParseInt(parts[2], 10, 64)
-		inode, _ := strconv.ParseUint(parts[3], 10, 64)
-		entryPath := parts[4]
+		entryPath := strings.Join(parts, "/")
 
-		isDir := ft == 2
+		isDir := e.ft == 2
 		var mtime time.Time
-		if mtimeEpoch > 0 {
-			mtime = time.Unix(mtimeEpoch, 0)
+		if e.mtime > 0 {
+			mtime = time.Unix(e.mtime, 0)
 		}
 
 		var mode fs.FileMode = 0644
@@ -898,9 +946,9 @@ func (rc *RedisClient) syncMetadata() error {
 			Name:       path.Base(entryPath),
 			ParentPath: path.Dir(entryPath),
 			IsDir:      isDir,
-			Size:       fileSize,
+			Size:       e.size,
 			Mtime:      mtime,
-			Inode:      inode,
+			Inode:      e.inode,
 			Mode:       mode,
 		})
 		redisPaths[entryPath] = struct{}{}
