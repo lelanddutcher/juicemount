@@ -692,6 +692,35 @@ func (fm *FUSEManager) isMountedLocked() bool {
 	}
 }
 
+// fuseConfirmProbeTimeout is the GENEROUS window used to CONFIRM a mount is
+// truly wedged before the destructive last-resort remount. isMountedLocked's
+// 5s readdir flips to "stale" whenever the mount is merely SLOW — e.g. while a
+// metadata reconcile or a backend blip contends the JuiceFS→Redis path — and
+// under sustained slowness that accumulates to FUSEStaleEscalateTicks and
+// SIGKILLs a perfectly-alive juicefs, which is exactly what drove the macFUSE
+// remount thrash (2026-06-14, surfaced re-deploying mid-reconcile). Confirming
+// with a long timeout distinguishes "slow" from "dead": a slow-but-alive mount
+// answers within 25s; a genuinely wedged one never does.
+const fuseConfirmProbeTimeout = 25 * time.Second
+
+// mountResponsiveWithin returns true if an os.ReadDir of the mount point
+// completes without error inside timeout. Same probe as isMountedLocked's
+// Check 2 but with a caller-chosen budget; used to CONFIRM wedged-ness before
+// an escalation remount. Safe to call without fm.mu (touches no fm state).
+func (fm *FUSEManager) mountResponsiveWithin(timeout time.Duration) bool {
+	done := make(chan bool, 1)
+	go func() {
+		_, err := os.ReadDir(fm.cfg.MountPoint)
+		done <- (err == nil)
+	}()
+	select {
+	case ok := <-done:
+		return ok
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // runBoundedCommand fires a shell command with a hard time limit and reaps
 // the process. Logs on timeout. Used for fire-and-forget cleanup work that
 // previously called `.Start()` without ever calling `.Wait()` — leaking
@@ -948,6 +977,20 @@ func (fm *FUSEManager) monitorLoop() {
 				staleWhileAliveTicks++
 				consecutiveFailures = 0
 				if staleWhileAliveTicks >= FUSEStaleEscalateTicks {
+					// CONFIRM truly-wedged before the destructive SIGKILL+remount.
+					// The 5s isMountedLocked probe flips to "stale" under mere
+					// SLOWNESS (reconcile/backend contention); accumulating that
+					// to the threshold and killing a live juicefs is what drove
+					// the macFUSE remount thrash (2026-06-14). A slow-but-alive
+					// mount answers a generous probe — if it does, it is NOT
+					// wedged; reset and keep deferring instead of remounting.
+					if fm.mountResponsiveWithin(fuseConfirmProbeTimeout) {
+						jmlog.Warn("fuse stale at escalation threshold but a generous probe succeeded — NOT remounting (slow, not wedged)",
+							"stale_ticks", staleWhileAliveTicks,
+							"confirm_timeout_sec", int(fuseConfirmProbeTimeout.Seconds()))
+						staleWhileAliveTicks = 0
+						continue
+					}
 					if fm.backendReachable() {
 						jmlog.Warn("fuse wedged but juicefs alive for a sustained window + backend reachable — escalating to remount (last resort)",
 							"stale_ticks", staleWhileAliveTicks)
