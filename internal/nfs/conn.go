@@ -103,13 +103,27 @@ func RPCStats() (total, slow, flushes, batched int64) {
 	return rpcCount.Load(), slowRPCCount.Load(), tcpFlushCount.Load(), tcpBatchedCount.Load()
 }
 
-// DataXferActivity returns a monotonic counter that advances only when the
-// READ/WRITE handlers move file bytes. Used by the keep-awake loop to hold a
-// macOS power assertion during an active copy/read-back while still letting an
-// idle mount (metadata/liveness chatter only) release it and sleep. See the
-// dataXferCount declaration for why rpcCount is unsuitable here.
+// DataXferActivity returns a monotonic counter of keep-awake-worthy activity:
+// it advances when the READ/WRITE handlers move file bytes AND when the spool
+// drains a file to the backend (via NoteDrainProgress). Used by the keep-awake
+// loop to hold a macOS power assertion during an active copy/read-back OR a
+// post-copy drain tail, while still letting a truly idle mount (metadata/
+// liveness chatter only) release it and sleep. See the dataXferCount
+// declaration for why rpcCount is unsuitable here.
 func DataXferActivity() int64 {
 	return dataXferCount.Load()
+}
+
+// NoteDrainProgress records that the spool freed bytes (a file drained to the
+// backend), counting as keep-awake-worthy activity so the Mac stays awake to
+// FINISH a post-copy / post-reconnect drain tail before idle-sleeping — the
+// "reconnect, close the lid, walk away and it still uploads" case. The drainer
+// is paused while offline, so this only fires online; if the drain wedges
+// (stops making progress) the counter goes flat and the assertion releases on
+// the normal idle timer, bounding the battery cost. Called from the spool's
+// releaseCapacity (package nfs) across the internal/nfs boundary.
+func NoteDrainProgress() {
+	dataXferCount.Add(1)
 }
 
 // ResponseCode is a combination of accept_stat and reject_stat.
@@ -170,13 +184,21 @@ func (c *conn) serve(ctx context.Context) {
 		}
 		Log.Tracef("request: %v", w.req)
 
-		// [JM6-concurrent] Acquire the cross-connection RPC semaphore
-		// in the serve loop (before dispatching). This back-pressures
-		// the read loop: if the global slot pool is exhausted we wait
-		// here rather than spawning unbounded goroutines. The select
-		// against connCtx.Done() lets us exit cleanly if the client
-		// disconnects while we're blocked on a full pool.
-		if c.Server.rpcSem != nil {
+		// [JM6] Admission control. A WRITE RPC can park INDEFINITELY in the spool
+		// capacity stall (offline buffer full / slow drain). Two hard rules keep
+		// that stall from wedging the single per-connection reader:
+		//   1. The reader (this loop) must NOT block on a write-only gate, or one
+		//      over-cap write head-of-line-blocks every following read/LOOKUP/
+		//      GETATTR on the same TCP mount — the whole mount goes unnavigable.
+		//   2. A parked write must NOT hold an rpcSem slot that reads need.
+		// So: NON-WRITE RPCs acquire the shared rpcSem HERE (reader back-pressure,
+		// bounds read goroutines). WRITE RPCs are dispatched immediately and
+		// acquire the SEPARATE writeSem INSIDE their goroutine — the reader never
+		// parks on a write, and reads keep their full rpcSem pool even when every
+		// write is stalled. The two pools are independent.
+		isWrite := w.req.Header.Prog == nfsServiceID &&
+			w.req.Header.Proc == uint32(NFSProcedureWrite)
+		if !isWrite && c.Server.rpcSem != nil {
 			select {
 			case c.Server.rpcSem <- struct{}{}:
 			case <-connCtx.Done():
@@ -218,10 +240,23 @@ func (c *conn) serve(ctx context.Context) {
 					Log.Errorf("handler panic: %v", r)
 					c.Close()
 				}
-				if c.Server.rpcSem != nil {
+				if !isWrite && c.Server.rpcSem != nil {
 					<-c.Server.rpcSem
 				}
 			}()
+
+			// [JM6] WRITE admission happens HERE, off the reader path. A write
+			// parked on a full writeSem is a cheap goroutine holding NO rpcSem
+			// slot, so reads stay live. connCtx.Done() lets an abandoned /
+			// disconnected write unwind before it ever runs the handler.
+			if isWrite && c.Server.writeSem != nil {
+				select {
+				case c.Server.writeSem <- struct{}{}:
+				case <-connCtx.Done():
+					return
+				}
+				defer func() { <-c.Server.writeSem }()
+			}
 
 			start := time.Now()
 			// Track this RPC from dispatch to completion. The completed-op
