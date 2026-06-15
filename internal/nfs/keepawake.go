@@ -20,10 +20,13 @@ import (
 // system idle sleep). "We can't lose photos."
 //
 // We hold a `caffeinate -i` child (kIOPMAssertionTypePreventUserIdleSystemSleep)
-// whenever there has been NFS DATA-TRANSFER activity recently (an active
-// copy/read-back), and release it after a couple minutes of quiet so the Mac
-// can still sleep when the share isn't moving bytes. `-w <ourpid>` makes
-// caffeinate exit if we die (no orphan on SIGKILL).
+// whenever there has been keep-awake-worthy activity recently — NFS DATA
+// TRANSFER (an active copy/read-back) OR spool DRAIN PROGRESS (a post-copy /
+// post-reconnect upload still flushing to the backend; see NoteDrainProgress) —
+// and release it after a couple minutes of quiet so the Mac can still sleep when
+// nothing is moving. The drain-tail hold is what lets a user reconnect, close
+// the lid, and walk away while the backlog finishes uploading. `-w <ourpid>`
+// makes caffeinate exit if we die (no orphan on SIGKILL).
 //
 // NOTE: the trigger is DataXferActivity() (READ/WRITE byte movement), NOT total
 // RPC count. The macOS NFS client emits a steady low-rate trickle of liveness/

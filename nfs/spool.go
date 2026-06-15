@@ -10,12 +10,15 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -63,6 +66,24 @@ type SpoolStore struct {
 	meta     *metadata.SpoolStore
 	index    *SpoolIndex
 	closed   atomic.Bool
+
+	// lastReleaseNanos is the wall-clock (UnixNano) of the most recent
+	// capacity release — i.e. the last time the drainer (or a write
+	// rollback) freed spool bytes. The capacity-stall waiter uses it as a
+	// drain-progress heartbeat: while ONLINE, a full spool stalls writes
+	// indefinitely (the hard NFS mount makes the client wait) AS LONG AS
+	// the drain keeps freeing space; only if NOTHING drains for the wedge
+	// backstop window does the stall give up with ErrSpoolFull (a genuinely
+	// wedged drain, which the user should see rather than hang forever).
+	// While OFFLINE the waiter never gives up — it stalls until the user
+	// reconnects and the drain frees headroom. See waitForCapacity.
+	lastReleaseNanos atomic.Int64
+
+	// stallWaiters counts writes currently parked in the capacity stall
+	// (spool full). Surfaced via metrics so the app can show "offline
+	// buffer full — N copies waiting, reconnect to drain" instead of the
+	// bare "disk is full" the NFS NOSPC used to produce.
+	stallWaiters atomic.Int64
 	// openShards serializes OpenWrite per-path. Sharded by path hash so a
 	// slow create (the new-file path holds its shard across s.meta.Insert +
 	// os.OpenFile) blocks only concurrent opens of the SAME file, never
@@ -238,6 +259,13 @@ func (s *SpoolStore) Capacity() (used, total int64) {
 	return s.used.Load(), s.capacity
 }
 
+// StallWaiters returns the number of writes currently parked in the capacity
+// stall (spool full, blocking for the drainer to free headroom). Surfaced via
+// /spool so the app can show "offline buffer full — N copies waiting".
+func (s *SpoolStore) StallWaiters() int64 {
+	return s.stallWaiters.Load()
+}
+
 // Index returns the in-memory lookup table. Exposed so the NFS handler
 // (slice D) can take O(1) lookups directly without going through the
 // SpoolStore method surface on the hot path.
@@ -262,11 +290,6 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	const reopenPoll = 10 * time.Millisecond
 	const reopenMaxWait = 30 * time.Second
 	var waited time.Duration
-
-	// capStart marks when this open first hit a full spool. The backpressure
-	// loop below throttles (polls for the drainer to free headroom) until
-	// capacityWaitDeadline elapses, then fails the create with ErrSpoolFull.
-	var capStart time.Time
 
 	// Same path always maps to the same shard, so the check-then-create
 	// dedup below is serialized exactly as the old global openMu did; opens
@@ -307,24 +330,19 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 
 		// No entry for this path — create a fresh one under the path shard.
 		if s.capacity > 0 && s.used.Load() >= s.capacity {
-			// Spool full. Release the shard and THROTTLE — poll for the drainer
-			// to free headroom rather than hard-fail the create, so a large copy
-			// paces itself to drain throughput (the copy slows) instead of
-			// aborting the whole Finder copy with NOSPC ("disk full"). Polling
-			// and re-checking each tick (vs one fixed wait) is fair under many
-			// concurrent full-spool opens — none starves on a lost race, since
-			// every waiter keeps re-checking as the drainer frees slots. Bounded
-			// by capacityWaitDeadline (well under the soft-mount timeout) so the
-			// stall never trips ETIMEDOUT (error 100060); only a genuinely
-			// stalled drain reaches the deadline and fails with ErrSpoolFull.
+			// Spool full. Release the shard and STALL — block (per
+			// waitForCapacity) for the drainer to free headroom rather than
+			// hard-fail the create, so a large copy paces itself to drain
+			// throughput and an OFFLINE copy stalls to zero speed until the
+			// user reconnects, instead of aborting the whole Finder copy with
+			// NOSPC ("disk full"). waitForHeadroom returns false only on a
+			// store close or a genuinely WEDGED online drain (no bytes freed
+			// for the backstop window) — then we surface ErrSpoolFull. The
+			// hard,intr NFS mount makes the client wait through the stall.
 			shard.Unlock()
-			if capStart.IsZero() {
-				capStart = time.Now()
-			}
-			if s.closed.Load() || time.Since(capStart) >= capacityWaitDeadline {
+			if !s.waitForHeadroom() {
 				return nil, ErrSpoolFull
 			}
-			time.Sleep(capacityWaitPoll)
 			continue
 		}
 
@@ -797,6 +815,11 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 		s.index.DeleteIfMatches(nfsPath, e)
 	}
 	s.releaseCapacity(size)
+	// Drain-tail keep-awake: a file genuinely reached the backend, so the Mac
+	// should stay awake to finish the rest of a post-copy / post-reconnect drain
+	// before idle-sleeping. Only the real drain-complete path bumps this (not the
+	// shared releaseCapacity), so deletes/refunds never hold the assertion.
+	nfslib.NoteDrainProgress()
 	if rmErr := os.Remove(spoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
 		log.Printf("spool: drain complete %d: remove %s: %v", id, spoolFile, rmErr)
 	}
@@ -1067,58 +1090,114 @@ func (s *SpoolStore) tryReserveCapacity(delta int64) bool {
 // copy aborted — fatal for a large SD-card offload.
 var (
 	capacityWaitPoll = 25 * time.Millisecond
-	// capacityWaitDeadline: how long a full-spool WriteAt/OpenWrite throttles,
-	// waiting for the drainer to free space, before giving up with ErrSpoolFull.
-	// 30s (was 5s) — kept safely under the NFS soft-mount timeout (~40s) so the
-	// stall never trips ETIMEDOUT, but long enough that ingest THROTTLES to
-	// drain throughput across a sustained large copy instead of hard-failing the
-	// whole Finder copy with NOSPC ("disk full") the moment the spool fills
-	// (2026-06-14: a 500 GB copy aborted "disk is full" at the cap; the old 10s
-	// total OpenWrite budget couldn't outlast a slow drain under concurrency).
-	// The drain freeing ~1 file every few hundred ms means each waiter gets its
-	// slot well within this window; only a genuinely stalled drain reaches it.
-	capacityWaitDeadline = 30 * time.Second
+	// capacityWaitDeadline is the ONLINE "wedge backstop": how long the
+	// capacity stall tolerates the drain making ZERO progress (no spool bytes
+	// freed) before giving up with ErrSpoolFull. It is NOT a fixed total wait —
+	// any drain release resets it (see waitForCapacity), so a slow link that
+	// keeps draining files stalls/paces INDEFINITELY and never fails; only a
+	// genuinely WEDGED drain (online, nothing freed for this whole window)
+	// surfaces as NOSPC instead of hanging the client forever.
+	//
+	// While OFFLINE the stall is unconditional — it waits until the user
+	// reconnects and the drain frees headroom, never failing. (Pre-2026-06-15
+	// this was a fixed 30s deadline that DID fail: a copy that filled the spool
+	// while offline hit "disk is full" because the paused drain could never
+	// free space. The user's explicit requirement is that a full spool stall to
+	// zero speed and resume on reconnect, not abort.)
+	//
+	// 2 min (was 30s): the old value was kept under the NFS SOFT-mount timeout
+	// (~40s) to avoid ETIMEDOUT, but the mount is now HARD,intr — the client
+	// waits across an arbitrarily long stall and the user can cancel — so the
+	// backstop is sized for "is the drain actually wedged" rather than the mount
+	// timeout. Env JM_SPOOL_WEDGE_BACKSTOP_SEC overrides; 0 = never give up
+	// (infinite stall even online).
+	capacityWaitDeadline = envBackstop("JM_SPOOL_WEDGE_BACKSTOP_SEC", 2*time.Minute)
 )
 
-// reserveCapacityOrWait reserves delta bytes, blocking up to capacityWaitDeadline
-// for the drainer to free space if the cap is currently exhausted. Returns true
-// with delta reserved, false on timeout/close. Callers MUST NOT hold a per-entry
-// e.mu or path shard across this call — it can block for the full deadline, and
-// holding those would stall the sweeper and other opens.
-func (s *SpoolStore) reserveCapacityOrWait(delta int64) bool {
-	if s.tryReserveCapacity(delta) {
+// envBackstop reads a non-negative seconds value from env (0 allowed = infinite),
+// falling back to def. Bad/empty values use def.
+func envBackstop(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return def
+}
+
+// waitForCapacity is the spool's flow-control valve. It blocks until try()
+// succeeds (capacity reserved / headroom available), the store closes, or — only
+// while ONLINE and the drain has frozen for capacityWaitDeadline — gives up
+// (false → ErrSpoolFull at the call site). A full spool therefore STALLS the
+// copy to zero speed (the hard NFS mount keeps the client waiting) instead of
+// failing it: offline ⇒ stall until reconnect; online + draining ⇒ pace to drain
+// throughput. try() is re-evaluated each poll and MUST be cheap and lock-free.
+//
+// Callers MUST NOT hold a path shard or e.mu across this call — it can park for a
+// long time and holding those would stall the sweeper and every other open.
+//
+// touch (may be nil) is invoked each poll while parked. The WriteAt path passes a
+// closure that refreshes the entry's lastWrite, so a write parked here for minutes
+// (offline buffer full) is NOT mistaken by the sweeper's leaked-handle escalation
+// for a quiescent abandoned handle and force-finalized TRUNCATED — that would
+// silently lose the rest of the file. New-file OpenWrite has no entry yet and
+// passes nil.
+func (s *SpoolStore) waitForCapacity(try func() bool, touch func()) bool {
+	if try() {
 		return true
 	}
-	deadline := time.Now().Add(capacityWaitDeadline)
+	s.stallWaiters.Add(1)
+	defer s.stallWaiters.Add(-1)
+	lastSeen := s.lastReleaseNanos.Load()
+	frozenSince := time.Now()
+	wasOffline := pin.IsOffline()
 	for {
-		if s.closed.Load() || time.Now().After(deadline) {
+		if s.closed.Load() {
 			return false
 		}
+		if touch != nil {
+			touch()
+		}
 		time.Sleep(capacityWaitPoll)
-		if s.tryReserveCapacity(delta) {
+		if try() {
 			return true
+		}
+		offline := pin.IsOffline()
+		// Reset the wedge backstop when the drain freed space (alive & making
+		// progress — lets a slow link stall indefinitely), OR we are offline, OR
+		// we JUST transitioned offline→online (give the reconnected drain a fresh
+		// full window instead of failing on a stale offline-poll timestamp if the
+		// goroutine was descheduled across the edge). So the backstop only ever
+		// measures contiguous ONLINE-and-frozen time.
+		if rel := s.lastReleaseNanos.Load(); rel != lastSeen || offline || (wasOffline && !offline) {
+			lastSeen = rel
+			frozenSince = time.Now()
+		}
+		wasOffline = offline
+		// Online ⇒ give up only if the drain is genuinely wedged (no capacity
+		// freed for the whole backstop window). capacityWaitDeadline <= 0 means
+		// "infinite stall" even online.
+		if !offline && capacityWaitDeadline > 0 && time.Since(frozenSince) >= capacityWaitDeadline {
+			return false
 		}
 	}
 }
 
-// waitForHeadroom blocks up to capacityWaitDeadline for the spool to drop below
-// its cap (the drainer freeing space), so a new-file OpenWrite during a full
-// spool stalls instead of hard-failing the copy. Returns true once there is
-// headroom, false on timeout/close. Must not be called with a shard held.
+// reserveCapacityOrWait reserves delta bytes, stalling (per waitForCapacity) for
+// the drainer to free space if the cap is currently exhausted. Returns true with
+// delta reserved, false only on a wedged online drain / store close. Callers MUST
+// NOT hold a per-entry e.mu or path shard across this call. touch (may be nil) is
+// forwarded to waitForCapacity — see there.
+func (s *SpoolStore) reserveCapacityOrWait(delta int64, touch func()) bool {
+	return s.waitForCapacity(func() bool { return s.tryReserveCapacity(delta) }, touch)
+}
+
+// waitForHeadroom stalls (per waitForCapacity) until the spool drops below its
+// cap, so a new-file OpenWrite during a full spool pauses instead of hard-failing
+// the copy. Returns true once there is headroom, false only on a wedged online
+// drain / store close. Must not be called with a shard held.
 func (s *SpoolStore) waitForHeadroom() bool {
-	if s.capacity <= 0 || s.used.Load() < s.capacity {
-		return true
-	}
-	deadline := time.Now().Add(capacityWaitDeadline)
-	for {
-		if s.closed.Load() || time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(capacityWaitPoll)
-		if s.used.Load() < s.capacity {
-			return true
-		}
-	}
+	return s.waitForCapacity(func() bool { return s.capacity <= 0 || s.used.Load() < s.capacity }, nil)
 }
 
 // releaseCapacity returns reserved bytes to the budget. Used when a
@@ -1142,6 +1221,13 @@ func (s *SpoolStore) releaseCapacity(delta int64) {
 			next = 0
 		}
 		if s.used.CompareAndSwap(cur, next) {
+			// Drain-progress heartbeat for the capacity stall waiter. ANY release
+			// (drain-complete, fail, write-refund, truncate-shrink) frees spool
+			// bytes, so all of them legitimately reset the stall's wedge backstop.
+			// NOTE: the keep-awake drain-tail bump (NoteDrainProgress) is NOT here
+			// — it fires only on a GENUINE drain-to-backend (MarkDrainComplete),
+			// so deletes/refunds don't spuriously hold the Mac awake.
+			s.lastReleaseNanos.Store(time.Now().UnixNano())
 			return
 		}
 	}
@@ -1483,7 +1569,14 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 			// only moves forward, the actual extension is <= reserved and the
 			// excess is refunded, so the accounting stays correct.
 			e.mu.Unlock()
-			if !e.store.reserveCapacityOrWait(reserved) {
+			// touch refreshes lastWrite each poll so the sweeper's leaked-handle
+			// escalation never force-finalizes this entry TRUNCATED while the
+			// write is parked (offline buffer full can park for many minutes,
+			// well past the 10-min escalation window). lastWrite is atomic, safe
+			// to store with e.mu released.
+			if !e.store.reserveCapacityOrWait(reserved, func() {
+				e.lastWrite.Store(time.Now().UnixNano())
+			}) {
 				return 0, ErrSpoolFull
 			}
 			e.mu.Lock()

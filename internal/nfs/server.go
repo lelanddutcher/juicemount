@@ -13,6 +13,19 @@ import (
 const (
 	// DefaultRPCSemaphoreSize limits total in-flight RPCs across all connections.
 	DefaultRPCSemaphoreSize = 128
+
+	// WriteRPCReserve sizes the SEPARATE WRITE admission pool (writeSem) relative
+	// to rpcSem: writeSem cap = DefaultRPCSemaphoreSize - WriteRPCReserve. WRITE
+	// RPCs use writeSem ONLY (acquired inside the dispatch goroutine, off the
+	// reader path); non-WRITE RPCs use rpcSem ONLY (acquired in the serve loop).
+	// Because the two pools are independent, a write parked indefinitely in the
+	// spool capacity stall (offline buffer full / slow drain) can never consume a
+	// read's rpcSem slot nor block the single per-connection reader — so the mount
+	// stays navigable even when every write is stalled. The value bounds
+	// concurrent RUNNING writes (96) to keep spool fds/handles in check; parked
+	// (not-yet-admitted) writes are cheap goroutines bounded by the client's own
+	// outstanding-write window.
+	WriteRPCReserve = 32
 )
 
 // Server is a handle to the listening NFS server.
@@ -25,6 +38,15 @@ type Server struct {
 	// across all connections to prevent goroutine/fd explosion under heavy
 	// concurrent load (e.g., Finder + Premiere + DaVinci simultaneously).
 	rpcSem chan struct{}
+
+	// [JM6] WRITE-only admission semaphore (cap DefaultRPCSemaphoreSize -
+	// WriteRPCReserve). A WRITE acquires this INSIDE its dispatch goroutine
+	// (off the per-connection reader path) and NEVER touches rpcSem — the two
+	// pools are independent. So a write parked in the spool capacity stall
+	// (offline buffer full / slow drain) holds only a writeSem slot, the reader
+	// never blocks on it, and reads/metadata keep their full rpcSem pool: the
+	// mount stays navigable even when every write is stalled. See conn.go.
+	writeSem chan struct{}
 
 	// [JM5] Active connection tracking for health monitoring.
 	activeConns atomic.Int64
@@ -86,6 +108,14 @@ func (s *Server) Serve(l net.Listener) error {
 	// [JM5] Initialize RPC semaphore if not already set.
 	if s.rpcSem == nil {
 		s.rpcSem = make(chan struct{}, DefaultRPCSemaphoreSize)
+	}
+	// [JM6] WRITE admission semaphore — reserves slots for non-WRITE RPCs.
+	if s.writeSem == nil {
+		n := DefaultRPCSemaphoreSize - WriteRPCReserve
+		if n < 1 {
+			n = 1
+		}
+		s.writeSem = make(chan struct{}, n)
 	}
 
 	// [JM6] Hold a macOS power assertion while the NFS mount is in active use
