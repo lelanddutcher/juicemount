@@ -1161,28 +1161,19 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 		}
 	}
 
-	// Fast rejection for macOS metadata patterns that never exist on
-	// JuiceFS. Eliminates ~1/3 of LOOKUPs from Finder.
-	//
-	// QA-13 (2026-05-17): `._*` AppleDouble sidecars REMOVED from
-	// this filter. The kernel's setxattr fallback creates `._filename`
-	// then immediately stat's it to confirm. With the filter, the
-	// post-create stat returned ENOENT — the kernel concluded the
-	// create had failed and reported EPERM/ENOENT back to userspace,
-	// which crashed copyfile(3) into a 0-byte truncation. cp and
-	// Finder both broke as a result. Let `._*` files round-trip
-	// normally; ReadDir keeps suppressing them from listings so they
-	// don't clutter Finder's view of user-facing files.
-	base := path.Base(filename)
-	if base == ".DS_Store" ||
-		base == ".Spotlight-V100" ||
-		base == ".Trashes" ||
-		base == ".fseventsd" ||
-		base == ".TemporaryItems" ||
-		base == ".VolumeIcon.icns" ||
-		base == "Icon\r" {
-		return nil, os.ErrNotExist
-	}
+	// NO fast-reject of macOS metadata names here. QA-13 (2026-05-17)
+	// already removed `._*` after the name-based ErrNotExist broke
+	// copyfile(3): Finder/cp create the file then immediately stat it to
+	// confirm, and a name-based ENOENT made the kernel conclude the create
+	// failed → 0-byte truncation / error. The SAME bug bit the volume
+	// system dirs (.fseventsd/.Spotlight-V100/.Trashes/.TemporaryItems/
+	// .VolumeIcon.icns/Icon\r) when a user copied a whole volume/card ROOT:
+	// Finder created .fseventsd, stat'd it, got our ErrNotExist, and aborted
+	// the copy with -36 at the tail (2026-06-14). Anything onCreate lets
+	// through MUST round-trip through Stat/Lstat/ReadDir or copying it fails.
+	// The lost micro-optimization (skipping a LookupByPath for these probes)
+	// is now negligible — LookupByPath is a cache-only map read, and absent
+	// names still return ErrNotExist from the lookup below, identically.
 
 	// Check if there's a tracked write size (in-flight write)
 	jfs.handler.writeSizeMu.Lock()
@@ -1394,20 +1385,10 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 		}
 	}
 
-	// Mirror Stat's macOS metadata filter — see lines 770-779 there.
-	// Keeps Lstat and Stat behaviorally identical for these names so
-	// the fast-path can never reach LookupByPath for a path that Stat
-	// would reject outright.
-	base := path.Base(filename)
-	if base == ".DS_Store" ||
-		base == ".Spotlight-V100" ||
-		base == ".Trashes" ||
-		base == ".fseventsd" ||
-		base == ".TemporaryItems" ||
-		base == ".VolumeIcon.icns" ||
-		base == "Icon\r" {
-		return nil, os.ErrNotExist
-	}
+	// Lstat mirrors Stat: NO name-based fast-reject of macOS metadata names.
+	// Rejecting them by name broke copying a volume/card root (the .fseventsd
+	// -36, 2026-06-14) — see the Stat comment above. Round-trip them; an
+	// absent name still returns ErrNotExist from the cache lookup below.
 
 	// Tracked write size for in-flight writes (sticky map — see Stat).
 	jfs.handler.writeSizeMu.Lock()
