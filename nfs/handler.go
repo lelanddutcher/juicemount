@@ -2059,12 +2059,25 @@ func (jfs *juiceFS) Remove(filename string) error {
 func (jfs *juiceFS) MkdirAll(dirname string, perm os.FileMode) error {
 	dirname = strings.TrimPrefix(dirname, "/")
 
-	// Create on FUSE
-	if err := os.MkdirAll(jfs.fullPath(dirname), perm); err != nil {
-		return err
+	// Create on FUSE — but NOT when offline. A FUSE mkdir needs JuiceFS→Redis,
+	// which is unreachable offline; the call hangs or fails and an offline
+	// Finder folder copy aborts with "the device disappeared" (-36). Lazy
+	// dir-creation (2026-06-14): offline we ONLY record the dir in the metadata
+	// cache below (LocalOnly, so it's browsable immediately AND reconcile won't
+	// prune it), and the drainer materializes it on FUSE — os.MkdirAll the
+	// parent of each spooled file — when the files inside it drain after
+	// reconnect. So an offline copy spools cleanly and the tree appears for the
+	// user; the backend catches up online.
+	if !pin.IsOffline() {
+		if err := os.MkdirAll(jfs.fullPath(dirname), perm); err != nil {
+			return err
+		}
 	}
 
-	// Insert into in-memory cache FIRST (instant visibility for NFS stats)
+	// Insert into in-memory cache FIRST (instant visibility for NFS stats).
+	// LocalOnly=true both flags "not yet on the backend" (the drainer/reconcile
+	// clear it once it lands in Redis) and protects it from the reconcile prune
+	// while it's only local — essential for offline-created dirs.
 	now := time.Now()
 	e := metadata.MakeEntry(dirname, true, 0, now, jfs.handler.nextSyntheticInode())
 	e.LocalOnly = true
