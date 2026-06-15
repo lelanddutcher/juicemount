@@ -495,7 +495,13 @@ func mountNFS(addr, mountPoint string) error {
 		return fmt.Errorf("invalid addr: %s", addr)
 	}
 
-	opts := fmt.Sprintf("port=%s,mountport=%s,soft,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp", port, port)
+	// readahead=16 (was 128): readahead=128 over-drives the macOS NFS client and
+	// causes silent file TRUNCATION under high concurrent reads (server is
+	// correct). See bridge/cbridge.go nfsMountOpts + [torn-read 2026-06-15].
+	// hard (was soft): a soft mount's ETIMEDOUT (errno 60) on a timed-out mmap
+	// pagein becomes SIGBUS, crashing apps that mmap media. See bridge/cbridge.go
+	// nfsMountOpts + [mmap-SIGBUS 2026-06-15].
+	opts := fmt.Sprintf("port=%s,mountport=%s,hard,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,actimeo=3600,vers=3,tcp", port, port)
 	cmd := exec.Command("sudo", "mount_nfs", "-o", opts,
 		fmt.Sprintf("%s:/", host), mountPoint)
 
