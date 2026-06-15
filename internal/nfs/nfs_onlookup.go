@@ -52,9 +52,13 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 	// (2026-06-14: a LOOKUP storm of +22k retries was the observed stall). On an
 	// ambiguous timeout, skip the check and proceed to the child Lstat below
 	// (which resolves from cache, or returns NoEnt so a CREATE can proceed).
+	// OFFLINE the same applies: this FUSE Lstat returns ErrOfflineNotAvailable,
+	// which must NOT fail the lookup — the parent is a dir by construction and
+	// the child resolves from the cache below. Treating it as NotDir aborted an
+	// offline copy with "device disappeared" (2026-06-14, offline-ingest).
 	dirInfo, err := fs.Lstat(fs.Join(p...))
 	if err != nil {
-		if !errors.Is(err, ErrFUSETimeout) {
+		if !errors.Is(err, ErrFUSETimeout) && !pin.IsOfflineNotAvailable(err) {
 			return &NFSStatusError{NFSStatusNotDir, err}
 		}
 	} else if !dirInfo.IsDir() {
@@ -89,24 +93,28 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	reqPath := append(p, string(obj.Filename))
-	// ONLINE fast path: resolve the child from the metadata cache with NO FUSE
-	// round-trip. A cache MISS returns NoEnt rather than paying an 800ms FUSE
-	// Lstat — for a recursive copy that miss is a brand-new file the client is
-	// about to CREATE, and the cache mirrors the full backend tree for the
-	// offload workload (the same completeness the offline-navigation path
-	// relies on). After the onCreate cache-only fix, this per-new-file LOOKUP
-	// stat (LOOKUP max=801ms) was the remaining deep-tree-copy throughput
-	// bottleneck that kept tripping "error 100060" (2026-06-14, root-caused via
-	// a faithful Finder reproduction). OFFLINE keeps the FUSE-Lstat path so a
-	// cache miss still maps to NXIO (preserving the kernel handle cache per JM6
-	// tier-1.7) rather than NoEnt.
-	if cs, ok := fs.(cacheStater); ok && !pin.IsOffline() {
+	// Resolve the child from the metadata cache with NO FUSE round-trip — BOTH
+	// online AND offline. A cache MISS returns NoEnt: for a copy that's a
+	// brand-new name the client is about to CREATE, and the cache mirrors the
+	// full backend tree (the same completeness offline-navigation relies on).
+	//
+	// OFFLINE this is critical: the kernel does a LOOKUP before EVERY
+	// CREATE/MKDIR, and the old offline path took a FUSE Lstat that returns
+	// ErrOfflineNotAvailable → NXIO, which aborted an offline copy with Finder
+	// "the device disappeared" (2026-06-14, offline-ingest sprint). Returning
+	// NoEnt instead lets the create proceed (into the spool / cache). This does
+	// NOT invalidate live handles: a file the kernel holds a handle for was
+	// looked up before, so it's in the cache → a cache HIT here → resolves
+	// fine. Data-unavailability offline is enforced at the READ layer
+	// (cachedFile.ReadAt → NXIO), where it belongs — not at lookup. Online this
+	// also avoided an 800ms FUSE Lstat per new file (deep-tree "error 100060").
+	// Filesystems without the cache-only stat keep the FUSE-Lstat path (offline
+	// cache-miss → NXIO via the handle-preservation branch below).
+	if cs, ok := fs.(cacheStater); ok {
 		if _, found := cs.StatCacheOnly(fs.Join(reqPath...)); !found {
 			return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}
 		}
 	} else if _, err = fs.Lstat(fs.Join(reqPath...)); err != nil {
-		// [JM6 tier-1.7] See nfs_ongetattr.go comment — offline fail-
-		// fast must not invalidate the kernel's file handle cache.
 		if pin.IsOfflineNotAvailable(err) {
 			return &NFSStatusError{NFSStatusNXIO, err}
 		}
