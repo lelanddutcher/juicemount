@@ -51,6 +51,16 @@ var (
 	rpcCount     atomic.Int64
 	slowRPCCount atomic.Int64
 
+	// [JM6] Data-transfer activity counter — bumped only by READ/WRITE
+	// handlers that actually move file bytes, NOT by metadata/liveness
+	// RPCs (GETATTR/FSSTAT/LOOKUP/READDIR). The macOS NFS client emits a
+	// steady low-rate trickle of those liveness RPCs even on a totally
+	// idle mount, so rpcCount never goes flat — keying the keep-awake
+	// power assertion off rpcCount would pin the Mac awake forever while
+	// the mount is up (battery drain). This counter only advances during
+	// an actual copy/read-back, which is exactly when we must not sleep.
+	dataXferCount atomic.Int64
+
 	// [JM5] Write coalescing metrics
 	tcpFlushCount   atomic.Int64 // number of TCP flush syscalls
 	tcpBatchedCount atomic.Int64 // number of responses batched (>1 per flush)
@@ -91,6 +101,15 @@ func currentObserver() ObserverFunc {
 // RPCStats returns the current RPC performance counters.
 func RPCStats() (total, slow, flushes, batched int64) {
 	return rpcCount.Load(), slowRPCCount.Load(), tcpFlushCount.Load(), tcpBatchedCount.Load()
+}
+
+// DataXferActivity returns a monotonic counter that advances only when the
+// READ/WRITE handlers move file bytes. Used by the keep-awake loop to hold a
+// macOS power assertion during an active copy/read-back while still letting an
+// idle mount (metadata/liveness chatter only) release it and sleep. See the
+// dataXferCount declaration for why rpcCount is unsuitable here.
+func DataXferActivity() int64 {
+	return dataXferCount.Load()
 }
 
 // ResponseCode is a combination of accept_stat and reject_stat.

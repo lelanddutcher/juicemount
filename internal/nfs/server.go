@@ -88,6 +88,13 @@ func (s *Server) Serve(l net.Listener) error {
 		s.rpcSem = make(chan struct{}, DefaultRPCSemaphoreSize)
 	}
 
+	// [JM6] Hold a macOS power assertion while the NFS mount is in active use
+	// so a closed-lid / idle Mac can't idle-sleep and SUSPEND this process
+	// mid-copy (which surfaces to Finder as "device disappeared" and aborts an
+	// in-flight transfer). Activity-driven; releases after ~2 min of quiet so
+	// the Mac can still sleep when the share is unused. See keepawake.go.
+	startKeepAwake()
+
 	var tempDelay time.Duration
 
 	for {

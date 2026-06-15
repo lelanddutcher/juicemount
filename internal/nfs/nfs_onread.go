@@ -219,6 +219,11 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	if hitEOF {
 		resp.EOF = 1
 	}
+	if cnt > 0 {
+		// [JM6] Mark data-transfer activity so the keep-awake assertion
+		// holds during a read-back copy. Metadata RPCs never reach here.
+		dataXferCount.Add(1)
+	}
 
 	// [JM5] Use pooled response buffer instead of allocating.
 	writer := getResponseBuffer()

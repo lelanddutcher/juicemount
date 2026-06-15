@@ -121,6 +121,13 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		Log.Errorf("error closing: %v", err)
 		return &NFSStatusError{NFSStatusIO, err}
 	}
+	if writtenCount > 0 {
+		// [JM6] Mark data-transfer activity so the keep-awake assertion
+		// holds for the duration of a copy. This is the data-loss-critical
+		// path: a system sleep mid-write drops the loopback NFS server and
+		// aborts the Finder copy ("device disappeared").
+		dataXferCount.Add(1)
+	}
 
 	// Honor the requested write stability. UNSTABLE (the default, and what
 	// macOS uses for buffered copies) defers durability to a later COMMIT. But
