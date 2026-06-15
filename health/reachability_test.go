@@ -232,3 +232,50 @@ func waitFor(timeout time.Duration, cond func() bool) error {
 	}
 	return errors.New("timed out waiting for condition")
 }
+
+// TestReachabilityAdaptiveDialTimeout is the LAN-no-regress + WAN-tolerance
+// guard for the adaptive jitter fix (2026-06-15 cellular test: a fixed 1s dial
+// timeout flapped 80x/5min on a 500ms link with 900ms jitter spikes).
+func TestReachabilityAdaptiveDialTimeout(t *testing.T) {
+	// LAN: sub-ms RTT must leave the dial timeout at the floor — IDENTICAL to
+	// the pre-adaptive fixed behavior. This is the no-regression assertion.
+	lan := NewReachability("127.0.0.1:1")
+	for i := 0; i < 30; i++ {
+		lan.observeRTT(300 * time.Microsecond)
+	}
+	if got := lan.effectiveDialTimeout(); got != lan.dialTimeout {
+		t.Errorf("LAN regression: effectiveDialTimeout=%v, want floor %v", got, lan.dialTimeout)
+	}
+
+	// WAN/cellular: ~500ms RTT with 850ms jitter spikes must grow the timeout
+	// ABOVE the floor and comfortably PAST the spike (so a slow dial no longer
+	// false-fails), but never above the ceiling.
+	wan := NewReachability("127.0.0.1:1")
+	for i := 0; i < 60; i++ {
+		s := 500 * time.Millisecond
+		if i%3 == 0 {
+			s = 850 * time.Millisecond
+		}
+		wan.observeRTT(s)
+	}
+	got := wan.effectiveDialTimeout()
+	if got <= wan.dialTimeout {
+		t.Errorf("WAN: effectiveDialTimeout=%v did not grow above floor %v", got, wan.dialTimeout)
+	}
+	if got > wan.maxDialTimeout {
+		t.Errorf("WAN: effectiveDialTimeout=%v exceeded ceiling %v", got, wan.maxDialTimeout)
+	}
+	if got < 850*time.Millisecond {
+		t.Errorf("WAN: effectiveDialTimeout=%v must tolerate the 850ms jitter spike", got)
+	}
+
+	// Adaptive disabled: always the floor regardless of RTT.
+	off := NewReachability("127.0.0.1:1")
+	off.adaptive = false
+	for i := 0; i < 30; i++ {
+		off.observeRTT(800 * time.Millisecond)
+	}
+	if got := off.effectiveDialTimeout(); got != off.dialTimeout {
+		t.Errorf("adaptive-off: effectiveDialTimeout=%v, want fixed %v", got, off.dialTimeout)
+	}
+}

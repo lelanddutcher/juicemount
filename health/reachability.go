@@ -24,6 +24,7 @@ package health
 import (
 	"context"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -49,10 +50,24 @@ type dialer interface {
 // this machine. Concurrent-safe; one instance per app process.
 type Reachability struct {
 	target         string
-	dialTimeout    time.Duration
-	baseInterval   time.Duration
-	failsToOffline int // consecutive failures before flipping reachable→unreachable
-	passesToOnline int // consecutive successes before flipping unreachable→reachable
+	dialTimeout    time.Duration // FLOOR for the per-probe TCP dial timeout
+	baseInterval   time.Duration // FLOOR for the probe cadence
+	maxDialTimeout time.Duration // ceiling for the adaptive dial timeout
+	adaptive       bool          // grow dialTimeout/interval with observed RTT
+	failsToOffline int           // consecutive failures before flipping reachable→unreachable
+	passesToOnline int           // consecutive successes before flipping unreachable→reachable
+
+	// [JM6] Adaptive jitter tolerance (WAN/cellular). TCP-RTO-style smoothed
+	// RTT + variance, measured from SUCCESSFUL probe dials. Only the probe loop
+	// goroutine touches these (probe→update→next probe are sequential in loop()),
+	// so no lock is needed. The effective dial timeout is
+	// clamp(dialTimeout, 2*srtt + 4*rttvar, maxDialTimeout): on a LAN (sub-ms
+	// RTT) the formula is far below the dialTimeout floor, so it clamps to the
+	// floor and behavior is IDENTICAL to the fixed 1s/2s defaults — adaptation
+	// engages only when RTT climbs into the hundreds of ms (a real WAN link),
+	// where a fixed 1s timeout would otherwise flap on jitter spikes.
+	srtt   time.Duration
+	rttvar time.Duration
 
 	dialer dialer
 
@@ -116,6 +131,8 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 		target:         target,
 		dialTimeout:    1 * time.Second,
 		baseInterval:   2 * time.Second,
+		maxDialTimeout: 10 * time.Second,
+		adaptive:       true,
 		failsToOffline: 2,
 		passesToOnline: 1,
 		reachable:      true, // presumed reachable until proven otherwise
@@ -126,7 +143,53 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 	for _, opt := range opts {
 		opt(r)
 	}
+	// Env overrides (operator escape hatch; defaults are LAN-safe).
+	//   JM_REACH_ADAPTIVE=0        disable adaptive growth (fixed dialTimeout)
+	//   JM_REACH_MAX_DIAL_MS=<n>   ceiling for the adaptive dial timeout
+	if os.Getenv("JM_REACH_ADAPTIVE") == "0" {
+		r.adaptive = false
+	}
+	if v := os.Getenv("JM_REACH_MAX_DIAL_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms >= 1000 {
+			r.maxDialTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
 	return r
+}
+
+// effectiveDialTimeout returns the per-probe dial timeout, grown to tolerate WAN
+// jitter when adaptation is on. clamp(dialTimeout, 2*srtt+4*rttvar, maxDialTimeout):
+// on a LAN the RTT-based term is far below the floor so this returns dialTimeout
+// exactly (no behavior change); on a 500ms cellular link it grows to ~1.8s so a
+// jittery dial no longer false-fails. Called only from the probe loop goroutine.
+func (r *Reachability) effectiveDialTimeout() time.Duration {
+	if !r.adaptive {
+		return r.dialTimeout
+	}
+	want := 2*r.srtt + 4*r.rttvar
+	if want < r.dialTimeout {
+		return r.dialTimeout
+	}
+	if want > r.maxDialTimeout {
+		return r.maxDialTimeout
+	}
+	return want
+}
+
+// observeRTT folds a successful-probe dial duration into the smoothed RTT/var
+// (RFC 6298 style: alpha=1/8, beta=1/4). Loop-goroutine only.
+func (r *Reachability) observeRTT(sample time.Duration) {
+	if r.srtt == 0 {
+		r.srtt = sample
+		r.rttvar = sample / 2
+		return
+	}
+	diff := r.srtt - sample
+	if diff < 0 {
+		diff = -diff
+	}
+	r.rttvar += (diff - r.rttvar) / 4
+	r.srtt += (sample - r.srtt) / 8
 }
 
 // Start begins probing in a background goroutine. Safe to call once
@@ -221,15 +284,18 @@ func (r *Reachability) probeAndUpdate() {
 	r.applyResult(ok)
 }
 
-// probe attempts a single TCP dial with the configured timeout.
-// Returns true on success.
+// probe attempts a single TCP dial with the (possibly adaptive) timeout.
+// Returns true on success and folds the dial latency into the smoothed RTT so
+// the timeout self-tunes to the link.
 func (r *Reachability) probe() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), r.dialTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), r.effectiveDialTimeout())
 	defer cancel()
+	start := time.Now()
 	conn, err := r.dialer.DialContext(ctx, "tcp", r.target)
 	if err != nil {
 		return false
 	}
+	r.observeRTT(time.Since(start))
 	_ = conn.Close()
 	return true
 }
