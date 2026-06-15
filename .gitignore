@@ -40,6 +40,13 @@ app/JuiceMount/.build/
 # Credentials / infrastructure docs (not code)
 credentials.md
 
+# Local secrets + real-credential configs — never commit (your machine only).
+# The committed server/docker-compose.yml uses a CHANGEME placeholder; the
+# *.local.yml copy holds your actual passwords/paths for deployment.
+secrets/
+*.local.yml
+*.local.yaml
+
 # Claude Code
 .claude/
 /build/svg2png

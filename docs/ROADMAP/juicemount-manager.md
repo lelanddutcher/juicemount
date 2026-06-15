@@ -830,3 +830,40 @@ start slice-N until slice-N's blockers all show STATUS: COMPLETE.
 5. **Sub-agent context**: each slice's sub-agent prompt should
    include a pointer to this doc and the specific slice section.
    Sub-agents read the relevant section before implementing.
+
+---
+
+## Real-use feedback — 2026-06-15 (pre-launch Manager walkthrough)
+
+Leland opened the Manager against the live local instance and flagged the
+following. Pragmatic, indie-OSS scope — keep it lean.
+
+1. **Trash configuration — needs work.** The Trash tab / trash config isn't
+   finished. Tie this to the server default just shipped: new installs format
+   with `--trash-days 7`, existing volumes need the one-time
+   `juicefs config <metaURL> --trash-days 7`. The Manager should surface the
+   current `--trash-days` value and ideally let the operator set it (calls
+   `juicefs config`), plus the LOUD `.trash/` storage-accounting header already
+   noted above. (task)
+
+2. **Overview tab — simplify; cache stat errors.** The cache widget shows an
+   ERROR (hit-rate / reads-writes not reliably available), and it's arguably too
+   much tooling for the Overview anyway. **Remove cache hit-rate + reads/writes
+   from Overview.** Keep Overview to the things that reliably resolve (volume
+   liveness, MinIO/Redis health, capacity). Source: `internal/manager` +
+   `cmd/juicemount-manager`. (task — actionable now)
+
+3. **Migrations tab — complete EXCEPT two untested paths (earmark).** Host→JuiceFS
+   migration works end-to-end. NOT yet tested: **"out of JuiceFS"** (JuiceFS →
+   host/other) and **"JuiceFS → JuiceFS"**. Earmark for a test pass; not a launch
+   blocker. (Realistic indie-OSS scope — don't over-build.) (task)
+
+4. **Backups tab — open DESIGN question, not just impl.** Unclear what backups
+   even mean here: if the object store lives on an ENCRYPTED volume, a
+   block/snapshot backup of the encrypted dataset is opaque and a file-level
+   backup can't read it. Options to think through: (a) JuiceFS-native
+   `juicefs sync` to a second object store / remote (works at the JuiceFS layer,
+   above the encryption); (b) `juicefs dump`/`load` of the metadata + a separate
+   chunk sync; (c) punt backups to the storage layer (ZFS replication of the
+   bucket dataset) and have the Manager just document/trigger it. **Decide the
+   backup STRATEGY before building the tab.** (task — design first)
