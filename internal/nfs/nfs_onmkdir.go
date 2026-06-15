@@ -8,6 +8,8 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 )
 
 const (
@@ -44,17 +46,31 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 
 	newFolder := append(path, string(obj.Filename))
 	newFolderPath := fs.Join(newFolder...)
-	if s, err := fs.Stat(newFolderPath); err == nil {
+	// Existence + parent checks resolve from the metadata cache with NO FUSE
+	// round-trip (matches onCreate's cache-only checks). Two wins: (1) no
+	// ~800ms FUSE existence-stat per dir on a deep-tree copy; (2) — critically
+	// for offline — a FUSE Stat of the parent OFFLINE returns
+	// ErrOfflineNotAvailable, which the old code mapped to NFSStatusAccess and
+	// aborted an offline folder copy with Finder "the device disappeared". A
+	// cache MISS now just proceeds: MkdirAll is the real arbiter (offline it
+	// records the dir in the cache; online it creates it on FUSE). Reject only
+	// on a POSITIVE cache hit that contradicts the mkdir. Filesystems without
+	// the cache-only stat keep the old FUSE path with the FUSE-timeout guard.
+	if cs, ok := fs.(cacheStater); ok {
+		if s, found := cs.StatCacheOnly(newFolderPath); found && s.IsDir() {
+			return &NFSStatusError{NFSStatusExist, nil}
+		}
+		if s, found := cs.StatCacheOnly(fs.Join(path...)); found && !s.IsDir() {
+			return &NFSStatusError{NFSStatusNotDir, nil}
+		}
+	} else if s, err := fs.Stat(newFolderPath); err == nil {
 		if s.IsDir() {
 			return &NFSStatusError{NFSStatusExist, nil}
 		}
 	} else {
-		// A FUSE-stat TIMEOUT verifying the parent must NOT fail the mkdir:
-		// it would wrap ErrFUSETimeout → NFS3ERR_JUKEBOX → the client retries
-		// MKDIR, storming toward the ~40s soft-mount timeout ("error 100060")
-		// during a large copy (parent LRU-evicted + drain-contended FUSE). The
-		// parent exists by construction (Finder created it first); on an
-		// ambiguous timeout proceed and let MkdirAll arbitrate. See onCreate.
+		// FUSE-stat TIMEOUT verifying the parent must NOT fail the mkdir (it
+		// would JUKEBOX→retry-storm to "error 100060"); the parent exists by
+		// construction. Proceed on an ambiguous timeout. See onCreate.
 		if s, err := fs.Stat(fs.Join(path...)); err != nil {
 			if !errors.Is(err, ErrFUSETimeout) {
 				return &NFSStatusError{NFSStatusAccess, err}
@@ -72,7 +88,14 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 	changer := userHandle.Change(fs)
 	if changer != nil {
 		if err := attrs.Apply(changer, fs, newFolderPath); err != nil {
-			return &NFSStatusError{NFSStatusIO, err}
+			// Non-fatal. OFFLINE the dir is only in the metadata cache (lazy
+			// dir-creation), so attrs.Apply has nothing on FUSE to touch; ONLINE
+			// JuiceFS commonly rejects attrs on directories anyway (same class
+			// as the ._ sidecar attrs.Apply, handled non-fatally in onCreate).
+			// The dir was created either way — don't fail the mkdir over attrs.
+			if !pin.IsOffline() {
+				Log.Warnf("onMkdir: attrs.Apply failed (non-fatal): %v", err)
+			}
 		}
 	}
 
