@@ -2249,6 +2249,32 @@ func (f *cachedFile) CachedInfo() os.FileInfo {
 
 func (f *cachedFile) Name() string { return f.name }
 
+// cacheReaderServeEnabled gates the Priority-2 direct-SSD-cache serving read.
+// DEFAULT OFF. The direct read of JuiceFS's PRIVATE SSD block files is
+// fundamentally incoherent and was proven to SILENTLY corrupt reads:
+//
+//   - No length clamp: cache.Reader.readFromCache ReadAt's the caller's FULL
+//     buffer at the slice offset but never clamps to the slice's valid Len nor
+//     the block's real data length. JuiceFS block files are variable-length
+//     with a 4-byte CRC trailer and can pack multiple compacted slices, so an
+//     overrunning read returns correct head bytes + FOREIGN tail (CRC /
+//     adjacent slice) — a torn read within one file. The short read is even
+//     swallowed (err=nil when n>0), so onRead accepts it and never retries
+//     through coherent FUSE.
+//   - Incoherent + stale fd: the 5-min-cached block fd can read a block file
+//     mid-rewrite/evict by JuiceFS.
+//
+// Measured 2026-06-15: ~0.5-1.3% of files torn under 12-16-way concurrent NFS
+// reads of a freshly-drained 692-file/22.76GB set; SERIAL and raw-FUSE reads
+// were 100% correct and server read_fails/rpc_errors stayed 0 (silent). The
+// coherent FUSE path (Priority 3) is correct AND fast — JuiceFS serves its own
+// warm cache — and the buggy blockPath made P2 miss (→ FUSE) the vast majority
+// of the time anyway, so disabling it costs almost nothing. Re-enable ONLY
+// after cache.Reader is repaired (clamp to min(len, sliceLen, blockDataLen) +
+// correct on-disk blockPath layout + CRC validation + no-stale-fd). See task
+// "silent torn-read on concurrent NFS reads".
+var cacheReaderServeEnabled = os.Getenv("JM_ENABLE_CACHE_READER") == "1"
+
 func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	// Priority 1: Memory buffer (zero-syscall, for small files like .prproj, LUTs)
 	if f.memBuf != nil {
@@ -2273,8 +2299,10 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		}
 	}
 
-	// Priority 2: Direct SSD cache read (bypasses FUSE)
-	if f.cacheReader != nil {
+	// Priority 2: Direct SSD cache read (bypasses FUSE). DISABLED by default —
+	// incoherent + unclamped → silent torn reads under concurrency (see
+	// cacheReaderServeEnabled). Falls through to the coherent FUSE path below.
+	if f.cacheReader != nil && cacheReaderServeEnabled {
 		n, err := f.cacheReader.ReadBlock(context.Background(), f.inode, off, p)
 		if err == nil && n > 0 {
 			if f.readahead != nil {
@@ -2328,33 +2356,45 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 
 	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time).
 	n, err := f.fuseFD.ReadAt(p, off)
-	// [JM6 readback-resilience, 2026-06-14] A cold chunk fetch from MinIO
-	// under heavy concurrent read load can return a TRANSIENT EIO from
-	// JuiceFS/macFUSE even though the bytes are intact (a sequential re-read
-	// always succeeds). Surfacing that raw EIO maps to NFS3ERR_IO, which the
-	// kernel turns into EIO for read()-based consumers and SIGBUS for
-	// mmap-based ones — and many NLEs mmap their media, so they CRASH
-	// mid-readback with ZERO data actually lost. Root-caused via a 10-way
-	// concurrent readback of a freshly-copied 119 GB / 5387-file shoot:
-	// ~1-2.5% of cold large-file reads failed (rc=138 SIGBUS / dd EIO), 0
-	// sequentially, with server rpc_errors=0 the whole time (silent).
+	// [JM6 readback-resilience, 2026-06-14 / 2026-06-15] Two JuiceFS-under-
+	// concurrent-load transients corrupt a read even though the bytes at rest
+	// are intact (a sequential or retried re-read always succeeds):
 	//
-	// Retry a ZERO-progress, non-EOF, non-offline error a few times with
-	// short backoff. The mount budget is generous (soft,timeo=400 → ~40s per
-	// RPC) and onRead caps a single subread at 256 KiB, so a sub-second retry
-	// is comfortably inside the kernel's per-RPC window. A PARTIAL read (n>0)
-	// is returned as-is — the client reissues for the remainder — so we never
-	// re-read bytes already delivered. Offline errors stay fail-fast (the
-	// offline UX contract); EOF is a legitimate stop, not a transient error.
-	if err != nil && n == 0 && !errors.Is(err, io.EOF) && !pin.IsOfflineNotAvailable(err) {
+	//  (1) ZERO-progress EIO — surfaces as NFS3ERR_IO → EIO/SIGBUS at the
+	//      client (NLEs mmap media and CRASH). Root-caused via a 10-way readback
+	//      of a 119GB/5387-file shoot: ~1-2.5% of cold reads failed, 0 serially.
+	//
+	//  (2) PREMATURE EOF — io.EOF returned at an offset BEFORE the real end of
+	//      file. Propagating it sets NFS EOF=1 and TRUNCATES the file at the
+	//      client. Root-caused 2026-06-15: a 65MB file delivered as exactly its
+	//      first 1MB under 14-way reads; the server's own per-read log proved it
+	//      served the WHOLE file — the client stopped on the false EOF. SILENT:
+	//      read_fails/rpc_errors stayed 0, and a per-read DATA verify caught
+	//      nothing because every read's bytes were correct — only the EOF lied.
+	//
+	// Both retry via the coherent FUSE path. f.fileSize is the Open-time cached
+	// size; if 0/unknown we can't judge prematurity so EOF is trusted (no
+	// behavior change). A premature EOF arriving WITH data (n>0) has its EOF
+	// dropped (return n,nil) so the client reissues for the tail; a premature
+	// EOF with no data is retried, and if it persists we surface
+	// io.ErrUnexpectedEOF → NFS3ERR_IO so the client ERRORS rather than silently
+	// truncating. Offline errors stay fail-fast (the offline UX contract).
+	prematureEOF := func(nn int, e error) bool {
+		return f.fileSize > 0 && errors.Is(e, io.EOF) && off+int64(nn) < f.fileSize
+	}
+	zeroEIO := err != nil && n == 0 && !errors.Is(err, io.EOF) && !pin.IsOfflineNotAvailable(err)
+	if zeroEIO || (n == 0 && prematureEOF(n, err)) {
 		for attempt := 1; attempt <= fuseReadMaxRetries; attempt++ {
 			time.Sleep(fuseReadRetryBackoff * time.Duration(attempt))
 			metrics.Default().IncReadRetry()
 			n, err = f.fuseFD.ReadAt(p, off)
-			if n > 0 || err == nil || errors.Is(err, io.EOF) {
-				jmlog.Debug("cold FUSE read recovered on retry",
+			if n > 0 || err == nil {
+				jmlog.Debug("FUSE read recovered on retry",
 					"path", f.name, "off", off, "attempt", attempt)
 				break
+			}
+			if errors.Is(err, io.EOF) && !prematureEOF(n, err) {
+				break // genuine EOF at/after fileSize
 			}
 		}
 		if err != nil && n == 0 && !errors.Is(err, io.EOF) {
@@ -2362,6 +2402,33 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 			jmlog.Warn("cold FUSE read failed after retries; surfacing transient EIO to client",
 				"path", f.name, "off", off, "attempts", fuseReadMaxRetries, "err", err)
 		}
+	}
+	// Drop a premature EOF that came with data — there is more file beyond
+	// off+n, so an EOF here would truncate. Client reissues at off+n.
+	if n > 0 && prematureEOF(n, err) {
+		err = nil
+	}
+	// Still a premature zero+EOF after retries: surface a hard error, never a
+	// truncating EOF. io.ErrUnexpectedEOF maps to NFS3ERR_IO in onRead.
+	if n == 0 && prematureEOF(n, err) {
+		metrics.Default().IncReadFail()
+		jmlog.Warn("premature EOF before fileSize after retries; surfacing EIO not truncating EOF",
+			"path", f.name, "off", off, "fileSize", f.fileSize)
+		err = io.ErrUnexpectedEOF
+	}
+	// A PARTIAL read with a transient error (n>0, non-EOF, non-offline): the n
+	// bytes are valid (pread filled them before the shortfall); surfacing the
+	// error maps to NFS3ERR_IO, which the kernel turns into SIGBUS for an MMAP
+	// reader — and NLEs mmap their media, so they CRASH mid-playback. Deliver
+	// the partial bytes and DROP the error; the client reissues at off+n for the
+	// remainder (re-fetching the cold chunk). mmap-safe analogue of the n==0
+	// cold-EIO retry. Found 2026-06-15: 20/692 cold CONCURRENT mmap reads SIGBUS'd
+	// here while read_retries stayed 0 — the a3ba369 retry only covers n==0.
+	if n > 0 && err != nil && !errors.Is(err, io.EOF) && !pin.IsOfflineNotAvailable(err) {
+		metrics.Default().IncReadRetry()
+		jmlog.Debug("partial FUSE read salvaged (dropped transient EIO; client reissues)",
+			"path", f.name, "off", off, "n", n, "err", err)
+		err = nil
 	}
 	if n > 0 && f.readahead != nil {
 		f.readahead.OnRead(f.inode, off, n, f.name)
