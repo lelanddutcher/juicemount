@@ -181,3 +181,28 @@ Total: ~46 hours = ~6 working days of focused tier-2 work.
 | 2.E | Toggling preferences off silences notifications immediately (next event); on grants permission and emits |
 | 2.F | `appcast.xml` reachable; "Check for Updates" surfaces release notes |
 | 2.G | macOS Accessibility Inspector reports 0 issues; high-contrast mode is legible |
+
+---
+
+## 2.H — "Rebuilding index" progress indicator (added 2026-06-15)
+
+**Problem (observed on the Wi-Fi/cellular WAN test):** after a restart / app
+update / juicefs remount, the full-tree reconcile repopulates the local metadata
+cache (~261k entries: ~2 min on Wi-Fi, several minutes on a WAN link). The menu
+bar already shows "Connected", but during this settling window navigation is slow
+and freshly-created paths can transiently fail (post-remount stale handles) — and
+the user has **no signal that anything is happening in the background**, so it
+looks broken.
+
+**Build:** surface reconcile/rebuild progress.
+- Go core: expose an "indexing" state + progress — syncMetadata already tracks
+  `lastSyncEntries` / `lastSyncDuration`; add an in-progress flag and entries-
+  synced count (or %) on `/metrics` (or `/spool`/a status endpoint) and a "first
+  full reconcile complete" milestone.
+- Swift menu bar: show a **"Syncing… rebuilding index (N%)"** state (spinner +
+  determinate progress where possible) instead of a bare "Connected" until the
+  first post-remount reconcile completes. Especially important on first launch and
+  on slow links. (task #37)
+
+**Acceptance:** after a cold launch / remount, the menu bar shows a moving
+progress affordance until the index is rebuilt, then transitions to "Connected".
