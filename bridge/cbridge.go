@@ -1447,8 +1447,23 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 // surfaces EIO after ~120 s instead of ~60 s, which lengthens the worst-case
 // Finder /Volumes-enumeration hang in the dead-server case (see QA-29 below).
 func nfsMountOpts(port string) string {
+	// readahead=16 (was 128 — 8x the macOS default). [torn-read 2026-06-15]
+	// readahead=128 over-drives the macOS NFS client's prefetch machinery: under
+	// high concurrent reads the client occasionally DELIVERS A TRUNCATED FILE to
+	// the app (silent — server serves every byte correctly, proven via per-read
+	// logging; the client drops prefetched tail). ~0.5-1.3% of files at 12-18way.
+	// Backing off to the stock readahead is the leading mitigation. CANDIDATE —
+	// validate a concurrent-readback SHA sweep shows 0 torn before trusting it.
+	// hard (was soft): [mmap-SIGBUS 2026-06-15] a `soft` mount returns ETIMEDOUT
+	// (errno 60) when a read RPC times out under cold-fetch contention, and a
+	// timed-out mmap PAGEIN becomes SIGBUS — crashing any app that mmaps media
+	// (NLEs, Quick Look, Preview). Found: 8-26 of 692 cold concurrent mmap reads
+	// SIGBUS'd at 8-16way (0 serial, 0 warm). `hard` retries the read instead of
+	// timing out → no SIGBUS. The dead-backend hang `soft` guarded against is now
+	// covered by offline mode (auto-offline returns NXIO fast) + the FUSE
+	// watchdog, so a truly-unresponsive backend no longer hangs reads forever.
 	return fmt.Sprintf(
-		"port=%s,mountport=%s,soft,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp",
+		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,actimeo=3600,vers=3,tcp",
 		port, port)
 }
 
