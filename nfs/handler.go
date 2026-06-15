@@ -1442,11 +1442,22 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	if len(children) > 0 {
 		infos := make([]os.FileInfo, 0, len(children))
 		for _, e := range children {
-			// Skip macOS metadata files that Stat() would reject
 			base := e.Name
-			if strings.HasPrefix(base, "._") ||
-				base == ".DS_Store" ||
-				base == ".Spotlight-V100" ||
+			// Do NOT hide `._*` AppleDouble sidecars: they are created,
+			// stored, and stat/open/read-accessible (QA-13 removed them from
+			// the Stat/Open filter at handler.go ~1167 so they round-trip).
+			// Hiding them ONLY from readdir made them exist-but-unlisted —
+			// confirmed 2026-06-14 by a real Finder copy of EOS_DIGITAL/DCIM
+			// where `._<dir>` sidecars stat'd fine over NFS but never appeared
+			// in `ls`. That breaks rsync / Carbon Copy Cloner / Finder-compare
+			// (they enumerate via readdir, see the sidecar "missing", and
+			// re-copy it every run) and loses the apparent resource-fork /
+			// Finder-info metadata on a round-trip. List them like any entry.
+			//
+			// Still hide the macOS VOLUME-level system dirs: these are managed
+			// by macOS at the mount root, not user data, and surfacing them can
+			// make Finder try to manage them on our backend.
+			if base == ".Spotlight-V100" ||
 				base == ".Trashes" ||
 				base == ".fseventsd" ||
 				base == ".TemporaryItems" {
