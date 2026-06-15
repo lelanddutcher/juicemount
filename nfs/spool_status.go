@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -34,7 +35,18 @@ type SpoolStatusResponse struct {
 	StalledFiles        int              `json:"stalled_files"`
 	FailedFiles         int              `json:"failed_files"`
 	OldestPendingAgeSec int64            `json:"oldest_pending_age_sec"`
-	Entries             []SpoolEntryView `json:"entries"`
+	// StallWaiters is the number of writes currently PARKED in the capacity
+	// stall (spool full, blocking for headroom). Offline reports the current
+	// offline state. OfflineBufferFull is the derived UI trigger: while offline
+	// and the spool is full with writes waiting, the app should surface
+	// "Offline buffer full — N copies paused, reconnect to drain" instead of
+	// letting the bare NFS NOSPC read as "your disk is full". (With the graceful
+	// stall the copy no longer FAILS — it pauses — so this is the signal that
+	// tells the user WHY it paused and what to do.)
+	StallWaiters      int  `json:"stall_waiters"`
+	Offline           bool `json:"offline"`
+	OfflineBufferFull bool `json:"offline_buffer_full"`
+	Entries           []SpoolEntryView `json:"entries"`
 }
 
 // SpoolEntryView is a single row's worth of UI-facing state.
@@ -114,6 +126,14 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 	used, total := spool.Capacity()
 	resp.CapacityUsed = used
 	resp.CapacityTotal = total
+
+	// Offline-buffer-full signal (2026-06-15). With the graceful capacity stall
+	// a full spool PAUSES writes instead of failing them, so the app needs an
+	// explicit reason to show the user. OfflineBufferFull fires while offline
+	// with writes parked in the stall — the cue to reconnect to drain.
+	resp.StallWaiters = int(spool.StallWaiters())
+	resp.Offline = pin.IsOffline()
+	resp.OfflineBufferFull = resp.Offline && resp.StallWaiters > 0
 
 	// QA-38: only fetch the rows the view actually renders (active + the
 	// recent-done tail). The old ListAll() scanned the entire spool table —
