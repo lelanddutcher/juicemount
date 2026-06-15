@@ -265,6 +265,23 @@ func (mb *MemoryBuffer) loadFile(path, fusePath string, fileSize int64, entry *m
 		}
 	}
 
+	// [torn-read 2026-06-15] Reject a SHORT load. This background load runs
+	// CONCURRENTLY with other loads (loadSem-bounded), so its sequential read
+	// can hit the same premature-EOF transient that truncates the FUSE read
+	// path. Publishing data[:totalRead] with totalRead < fileSize would make
+	// memBuf serve a false EOF on every subsequent read of this file → the
+	// client TRUNCATES it (silent data loss). Discard instead: reads fall
+	// through to the retry-protected FUSE path (cachedFile.ReadAt P3), and a
+	// later Get re-attempts a clean full load. (A genuinely short file would
+	// have an accurate fileSize from the metadata cache, so totalRead==fileSize.)
+	if totalRead < int(fileSize) {
+		mb.mu.Lock()
+		delete(mb.entries, path)
+		mb.totalSize -= fileSize
+		mb.mu.Unlock()
+		return
+	}
+
 	mb.mu.Lock()
 	entry.data = data[:totalRead]
 	entry.size = int64(totalRead)
