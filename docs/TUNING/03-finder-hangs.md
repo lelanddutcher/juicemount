@@ -21,6 +21,17 @@ completes cleanly (10 s) once the link is stable.
 - A′ — when genuinely offline, fail FAST + CLEAN with `ErrOfflineNotAvailable`→`NXIO`
   (preserves the handle) instead of a 30 s retry-storm → `EIO`.
 
+**Refinement (measured 2026-06-15, 56 ms cellular, clean link):** a *single sequential*
+67 MB cold read completed in 11.8 s, byte-perfect, with **zero** metadata starvation —
+warm `stat` stayed 0 ms, LOOKUP/GETATTR mean stayed 0.02/0.03 ms, offline never engaged,
+`read_fails`=0 throughout. So "connection interrupted" is **not** triggered by a single
+clean read; it needs either (a) a **degraded link** so the read's retry storm starves the
+reachability heartbeat, or (b) **read concurrency** that fills the single TCP connection.
+The xattr storm (§H2 — hundreds of near-parallel cold reads) is exactly case (b) and is
+the more reliable repro. Implication: B′ (don't-offline-while-transferring) helps, but the
+durable fix is **read-admission isolation** so neither a retry storm nor a read fan-out can
+starve the heartbeat/metadata lane.
+
 ## H2 — Cold first-browse of a large dir: the xattr/AppleDouble READ-storm  (#35)
 
 **This was previously mis-attributed to slow metadata.** Measured 2026-06-15 over 56 ms
