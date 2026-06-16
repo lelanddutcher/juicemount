@@ -99,9 +99,45 @@ behavior, then validate the fast policies deliberately.
 
 ---
 
-## Pending: nav-sluggishness (reconcile) fixes
+## Nav-sluggishness fixes (root-caused via workflow wf_80bcef8b-876, 2026-06-16)
 
-Root-cause workflow `wf_80bcef8b-876` is producing the fix plan for the
-reconcile-SCAN-storm that starves FUSE readdir on cellular. **Each fix added here will follow
-the same rules:** class-gated where possible, an env kill-switch, an isolated named commit, and
-an entry in this log with its 10GbE risk. _(section to be filled in.)_
+Root cause (verified against juicemount.log): the DOMINANT driver of "loading bar that never
+cures" is NOT the reconcile SCAN — it is the **FUSE-stale watchdog SIGKILLing a live-but-slow
+juicefs** (~469 escalations / day on 06-15, ~6% remount success, FUSE dead 30-45s per cycle).
+The reconcile SCAN storm is a secondary, co-symptom (metered-data burn + evening contention).
+Both fixed below, class-gated.
+
+### R1 — watchdog: don't SIGKILL a slow-but-alive juicefs on a slow link
+- **Files:** `health/fuse.go` — `staleEscalateTicks()`, `confirmProbeTimeout()` helpers +
+  `fuseWatchdogLinkAware` var; call sites in `monitorLoop` (the escalate-tick check + the
+  confirm-probe). Test: `health/fuse_linkaware_test.go`.
+- **What:** the escalation-to-remount threshold and the "is it wedged or just slow" confirm
+  probe now scale with link class. metered: 27 ticks (~270s) + 90s confirm; slow: 18 ticks
+  (~180s) + 45s confirm; **medium/fast: 9 ticks (~90s) + 25s confirm — UNCHANGED.**
+- **Why:** on cellular the 5s readdir stale-probe times out tick after tick (legit-slow, not
+  wedged) and the 25s confirm probe also false-fails, so the watchdog killed a live juicefs.
+- **10GbE risk:** NONE — medium/fast are byte-for-byte the historical 9/25s (locked by the
+  test). The only metered/slow trade-off is that a GENUINELY-wedged mount on cellular recovers
+  later (270s vs 90s); acceptable since false-kills were ~469/day and true wedges are rare.
+- **Revert:** `JM_FUSE_WATCHDOG_LINKAWARE=0` (fixed 9/25s), or `JM_NET_ADAPTIVE=0`
+  (class=medium → historical), or revert the commit. NOTE: the menu-bar "stale" indicator
+  still shows during cellular slowness (honest) — we only changed the destructive escalation.
+
+### R2 — reconcile: debounce flap-triggered full SCANs
+- **Files:** `metadata/redis.go` — `flapDebounceInterval()` + `reconcileFlapDebounce` var +
+  `lastSyncStartedAt` field; gate in the `reconcileLoop` `syncNowCh` case.
+- **What:** a NETWORK-CHANGE-triggered reconcile is suppressed if a sync started/finished
+  within the class-aware window (metered 60s, slow 30s, **medium/fast 0 = no debounce**). The
+  periodic ticker is untouched, so any real drift is still caught within the cadence.
+- **Why:** the flaky cellular link flaps constantly and each recovery fired a full 87-178s
+  SCAN that ~93% of the time found zero changes — back-to-back, burning metered data.
+- **10GbE risk:** NONE — window is 0 on medium/fast, so LAN fires on every flap exactly as
+  before. Correctness: only delays a redundant SCAN; never skips reconciliation (the ticker
+  still runs); cannot show stale data beyond the existing cadence latency.
+- **Revert:** `JM_RECONCILE_FLAP_DEBOUNCE=0`, or `JM_NET_ADAPTIVE=0` (window→0), or revert the commit.
+
+### Deferred (P1, not yet implemented — larger/riskier, see workflow plan)
+- Skip-if-fresh / incremental reconcile (avoid the ~93% zero-change full SCANs). HIGH
+  correctness-attention (prune ladder) — needs a periodic full-SCAN safety floor.
+- Cold-readdir / per-file phantom-GETATTR decoupling on degraded/metered (faster mirror-miss).
+- Pace the SCAN between batches on metered (defense-in-depth).
