@@ -78,10 +78,26 @@ block reads, cache hits filtered out), now drives the **server-side** `Readahead
   regression); `fast` (10GbE) → **16 blocks / 8 workers** to chase pipe saturation.
 - Exposed on `/metrics` as `network{class,rtt_ms,bandwidth_mbps,readahead_*}`.
 
-**Phase 2 — TODO:** the NFS-client `readahead=16` and juicefs `--prefetch 3` are *mount-time*
-flags; making them adaptive needs a remount-on-sustained-class-change strategy. Until then a
-small read still pulls the client's ~16 MB floor; Phase 1 removes our 32 MB contribution on
-slow/metered and raises it on fast.
+**Phase 1 — VALIDATED LIVE (cellular, 2026-06-15) + a key limit found.** Deployed: the
+`/metrics network{}` block correctly read `class=slow`, `rtt_ms≈45`, `blocks=2 seq=4
+workers=2` (dialed down from 8/3/4) — netprofile, the RTT-observer wiring, policy derivation,
+and metrics all work end-to-end. **BUT the amplification did NOT shrink:** a cold 4 KB read
+still pulled the whole **64,872 KB** file, and `throughput_samples` stayed **0**. Conclusion:
+**our server-side ReadaheadManager is NOT the dominant prefetcher** — at `blocks=2` it can
+only account for ~8 MB, so the rest is **juicefs's own internal sequential readahead**
+(`--buffer-size 4096` + `--prefetch 3`) firing once the NFS-client `readahead=16` starts a
+sequential pattern. juicefs pre-pulls the whole file before our prefetch path even runs,
+which is also why our throughput sampling saw nothing.
+
+**Phase 2 — the real levers are all MOUNT-TIME:**
+1. **juicefs flags are the big one:** lower `--buffer-size` (caps how far juicefs reads
+   ahead) and `--prefetch` on slow/metered links — needs a juicefs remount-on-class-change.
+2. NFS-client `readahead=16` → lower on slow links (NFS remount).
+3. **Move throughput sampling to the main read path** (`cachedFile.ReadAt` cold subreads), not
+   just our prefetch path, so the profile actually learns bandwidth (today it only
+   RTT-bootstraps; BW never populates because juicefs beats our prefetch to the bytes).
+Phase 1 stands as the link-estimator + policy infrastructure Phase 2 plugs into; on its own
+its read-amplification effect on cellular is negligible because juicefs dominates.
 
 ## Open tuning questions
 
