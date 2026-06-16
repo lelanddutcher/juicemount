@@ -49,8 +49,13 @@ file. The cascade (all three confirmed in code/config):
 2. Those land server-side as sequential reads → after `sequentialThreshold=3` our
    **`ReadaheadManager` fires** and prefetches `readaheadBlocks=8 × 4 MB = 32 MB` ahead
    (`nfs/readahead.go`).
-3. JuiceFS's own block prefetch + the **4 MB BlockSize** (so the *minimum* fetch unit is
-   4 MB even for a 4 KB read) top it off → the whole file lands in cache.
+3. JuiceFS's own **`--prefetch 3`** (3 × 4 MB concurrent block prefetch) + the **4 MB
+   BlockSize** (the *minimum* fetch unit is 4 MB even for a 4 KB read) top it off → the
+   whole file lands in cache.
+
+**Three independent prefetchers stack** — NFS client `readahead=16`, juicefs `--prefetch 3`,
+and our `ReadaheadManager` — none aware of the others or of link cost. That's the knob set
+to tune together for #16.
 
 **Why it matters on a metered/cellular link:**
 - **Browsing** a folder: Finder/`ls -la` xattr-probe every file (§[H2](03-finder-hangs.md)),
