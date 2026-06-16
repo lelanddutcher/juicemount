@@ -104,12 +104,37 @@ taught us:**
   `readahead=16`** fanning one 4 KB touch into 16 sequential 1 MB reads, which juicefs then
   extends. **juicefs flags at those values are NOT the lever.**
 
-**Phase 2.5 — the actual lever (built `b26908b`, NOT yet deployed):** make the NFS-client
-`readahead` mount option link-aware — lower to 4 (slow) / 2 (metered), keep 16 on
-medium/fast. We only ever LOWER it: 16 is the truncation mitigation (#18/#19, bug at 128), so
-smaller is strictly safer for that bug AND shrinks the amplification. Next deploy validates
-whether the 66 MB→? pull actually shrinks. (10GbE throughput is a separate lever —
-juicefs-side concurrency / our server RA fast policy — not client readahead.)
+**Phase 2.5 — NFS-client readahead made link-aware (built `b26908b`, deployed). Result:
+also DID NOT shrink the pull** — a cold 4 KB read still pulled 67 MB with `readahead=4`
+(confirmed live in `nfsstat`).
+
+### ⭐⭐ The decisive finding: the whole-file pull is macOS UBC, not anything we control
+
+The same cold 4 KB read, two paths (measured 2026-06-15):
+- **via NFS** (`/Volumes/zpool-dev`): pulled **67 MB** — the whole file.
+- **FUSE-direct** (`~/.juicemount/fuse-internal`, bypassing NFS+UBC): pulled **8 MB**.
+
+So **juicefs only fetches ~8 MB** for a 4 KB read; the extra ~58 MB is **macOS's NFS
+client / UBC cluster-readahead**, which reads the whole file on an explicit `read()` and
+**ignores the `readahead=` mount option** (4 × 1 MB should cap at ~4 MB; UBC pulled 66 MB).
+**No knob on our side — juicefs `--buffer-size`/`--prefetch`, server ReadaheadManager, or
+NFS `readahead`— can stop it, because it's a macOS VFS-layer behavior on explicit reads.**
+
+Scope check — this is NOT the folder-browse case: the `ls -la` xattr-probe storm pulled
+~4 MB blocks, not whole files (the cache didn't balloon). Whole-file UBC readahead fires on
+explicit data `read()`s (QuickLook, double-click, copy-out, `dd`), where pulling the file is
+mostly what you WANT anyway. The real pain (QuickLook a 60 MB file → beach-ball) is the read
+**saturating the one TCP connection** (H1/#39), addressed by read-admission isolation +
+don't-go-offline-while-transferring — NOT by reducing the bytes.
+
+### What the adaptive infrastructure IS good for
+
+The netprofile + adaptive readahead/mount-flags work (Phases 1–2.5) correctly tunes **our**
+prefetch contribution by link — which matters for **throughput**: dial UP on 10GbE (the 3-of-
+10 Gbit/s starve) and DOWN on metered (less of our own prefetch overhead). It just can't
+override macOS UBC's whole-file readahead on explicit reads. Validated end-to-end live:
+class detection (RTT + windowed BW), juicefs flags (`--buffer-size 1024 --prefetch 1` on
+slow), NFS `readahead=4`, server RA `blocks=2` — all applied correctly per link.
 
 ## Open tuning questions
 
