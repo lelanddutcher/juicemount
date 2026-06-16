@@ -68,11 +68,20 @@ to tune together for #16.
 
 **The tension:** `readahead=16` was deliberately set to fix concurrent-read truncation
 (#18/#19) and aggressive prefetch makes LAN copy-out/playback fast. It is exactly wrong on
-a metered WAN. → **Adaptive readahead by measured link (#16):** aggressive on fast/cheap
-LAN, minimal on cellular/metered. Levers: lower client `readahead` on slow links, raise the
-server `sequentialThreshold` / shrink `readaheadBlocks`, and don't let an xattr/Quick-Look
-probe escalate to a whole-file prefetch. **No code changed yet — needs a rebuild+deploy
-(mount churn), so hold for a deliberate session.**
+a metered WAN. → **Adaptive readahead by measured link (#16).**
+
+**Phase 1 — BUILT (commit `b32a9f5`, branch claude/cache-tuning):** `internal/netprofile`,
+a passively-fed link estimator (RTT from the reachability probe + throughput from prefetch
+block reads, cache hits filtered out), now drives the **server-side** `ReadaheadManager`:
+- `metered` (<3 MB/s) → our prefetch **disabled** (an xattr/Quick-Look probe can't escalate
+  to a whole-file pull); `slow` → 2 blocks; `medium` → 8 (== historical default, no LAN
+  regression); `fast` (10GbE) → **16 blocks / 8 workers** to chase pipe saturation.
+- Exposed on `/metrics` as `network{class,rtt_ms,bandwidth_mbps,readahead_*}`.
+
+**Phase 2 — TODO:** the NFS-client `readahead=16` and juicefs `--prefetch 3` are *mount-time*
+flags; making them adaptive needs a remount-on-sustained-class-change strategy. Until then a
+small read still pulls the client's ~16 MB floor; Phase 1 removes our 32 MB contribution on
+slow/metered and raises it on fast.
 
 ## Open tuning questions
 
