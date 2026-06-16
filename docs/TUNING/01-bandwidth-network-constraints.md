@@ -26,6 +26,14 @@ metadata reconcile are latency/bandwidth-bound.
   graceful stall paces it). Implication: surface "N GB still uploading" clearly.
 - **Cold reads are bandwidth+loss-bound + retry-heavy.** 4.1 MB/s over cellular with
   hundreds of `read_retries` to grind through packet loss — byte-perfect, but slow.
+  Per-RPC READ latency over 56 ms cellular: **mean ~1 s, p99 9.4 s, max 9.4 s.**
+- **The hidden read amplifier: xattr/AppleDouble probing.** `ls -la`/Finder issue a
+  per-file extended-attribute probe; NFSv3 has no xattr RPC, so macOS emulates it with a
+  cold first-block READ per file. A warm-mirror `ls -la` of 692 files still fired **240
+  cold READs in 18 s and timed out** — the reads, not the metadata, are the wall. These
+  reads serialize on the single macOS NFS TCP connection, so they also starve the
+  reachability heartbeat (→ false offline → "connection interrupted", H1/#39). Full
+  analysis: [03-finder-hangs.md](03-finder-hangs.md) §H2.
 - **Reachability probe was LAN-tuned** (1 s dial, 2 fails). Fixed: adaptive timeout
   (`health/reachability.go`, commit 96b25bc) — clamps to 1 s on LAN, grows to ~1.8 s at
   500 ms so jitter stops flapping. **Validated: 0 flaps post-fix.**
