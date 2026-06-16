@@ -38,6 +38,37 @@ metadata reconcile are latency/bandwidth-bound.
   (`health/reachability.go`, commit 96b25bc) — clamps to 1 s on LAN, grows to ~1.8 s at
   500 ms so jitter stops flapping. **Validated: 0 flaps post-fix.**
 
+## ⭐ Read amplification — the WAN data-cost surprise (measured 2026-06-15)
+
+**A single 4 KB read of a cold file pulled the WHOLE 53 MB file from MinIO** (`dd
+bs=4096 count=1` → 8 s, cache grew +52,984 KB). Touching one byte fetches the entire
+file. The cascade (all three confirmed in code/config):
+
+1. **NFS client `readahead=16`** (× `rsize=1 MB`) turns one small read into up to **16 MB**
+   of speculative sequential readahead RPCs.
+2. Those land server-side as sequential reads → after `sequentialThreshold=3` our
+   **`ReadaheadManager` fires** and prefetches `readaheadBlocks=8 × 4 MB = 32 MB` ahead
+   (`nfs/readahead.go`).
+3. JuiceFS's own block prefetch + the **4 MB BlockSize** (so the *minimum* fetch unit is
+   4 MB even for a 4 KB read) top it off → the whole file lands in cache.
+
+**Why it matters on a metered/cellular link:**
+- **Browsing** a folder: Finder/`ls -la` xattr-probe every file (§[H2](03-finder-hangs.md)),
+  each probe = a cold first-block read = ≥4 MB (one block) fetched. A 692-file dir ≈
+  **2.7 GB just to look at it**, and that's if readahead *doesn't* escalate to whole files.
+- **Previewing/opening** one file (Quick Look, double-click): the sequential read trips the
+  full cascade → the entire file (here 53 MB) is pulled in one burst → **8–12 s beach-ball**
+  and saturates the single TCP connection. This IS the user's "preview a 60 MB file →
+  connection interrupted" symptom ([H1](03-finder-hangs.md)).
+
+**The tension:** `readahead=16` was deliberately set to fix concurrent-read truncation
+(#18/#19) and aggressive prefetch makes LAN copy-out/playback fast. It is exactly wrong on
+a metered WAN. → **Adaptive readahead by measured link (#16):** aggressive on fast/cheap
+LAN, minimal on cellular/metered. Levers: lower client `readahead` on slow links, raise the
+server `sequentialThreshold` / shrink `readaheadBlocks`, and don't let an xattr/Quick-Look
+probe escalate to a whole-file prefetch. **No code changed yet — needs a rebuild+deploy
+(mount churn), so hold for a deliberate session.**
+
 ## Open tuning questions
 
 - Can prefetch/readahead be tuned per measured bandwidth? (#16 adaptive timeouts)

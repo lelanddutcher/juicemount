@@ -7,6 +7,13 @@ Catalog of where Finder blocks or errors, the mechanism, and the fix/status.
 **Symptom:** preview/download a cold (uncached, unpinned) ~60 MB file on cellular →
 Finder beach-balls ~30 s → "the server connection was interrupted."
 
+**Amplifier (measured 2026-06-15):** the read is burstier than the file is big — the
+readahead cascade (NFS client `readahead=16` → server `ReadaheadManager` +32 MB → JuiceFS
+prefetch, see [01-bandwidth §Read amplification](01-bandwidth-network-constraints.md))
+pulls the *whole* file in one aggressive burst (a 4 KB `dd` pulled 53 MB). That burst is
+what saturates the single TCP connection and starves the heartbeat below. Dialing
+readahead down on metered links (#16) shrinks the burst and is complementary to B′.
+
 **Mechanism (live log, 19:30–19:32):** the big read **saturates the cellular link** →
 the reachability TCP-dial probe gets starved → declares "backend unreachable for
 sustained window" → **auto-offline engages** → the in-flight cold read can no longer
