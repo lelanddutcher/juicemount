@@ -24,6 +24,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/metadata"
@@ -348,7 +349,7 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		store:     store,
 		fusePath:  fusePath,
 		fdPool:    fdPool,
-		readahead: NewReadaheadManager(fusePath, fdPool),
+		readahead: NewReadaheadManager(fusePath, fdPool, netprofile.Default()),
 		// NewMemoryBuffer maps <= 0 to the package defaults.
 		memBuf:        NewMemoryBuffer(ho.memBufThreshold, ho.memBufBudget),
 		writeSizes:    make(map[string]int64),

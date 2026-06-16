@@ -192,6 +192,28 @@ type Registry struct {
 	// Health hook — set by main.go so /health can answer accurately.
 	healthMu sync.RWMutex
 	healthFn func() HealthSnapshot
+
+	// Network hook — set by the bridge so /metrics can report the adaptive
+	// link estimate (class, RTT, bandwidth, live readahead policy). Decoupled
+	// via a provider so this package needn't import netprofile.
+	netMu sync.RWMutex
+	netFn func() *NetworkSnapshot
+}
+
+// NetworkSnapshot mirrors the netprofile link estimate for /metrics.
+type NetworkSnapshot struct {
+	Class           string  `json:"class"`
+	RTTMs           float64 `json:"rtt_ms"`
+	BandwidthMBps   float64 `json:"bandwidth_mbps"`
+	HaveRTT         bool    `json:"have_rtt"`
+	HaveBandwidth   bool    `json:"have_bandwidth"`
+	ThroughputN     int64   `json:"throughput_samples"`
+	BootstrappedRTT bool    `json:"bootstrapped_from_rtt"`
+	// Live readahead policy derived from the class.
+	ReadaheadEnabled bool `json:"readahead_enabled"`
+	ReadaheadSeq     int  `json:"readahead_seq_threshold"`
+	ReadaheadBlocks  int  `json:"readahead_blocks_ahead"`
+	ReadaheadWorkers int  `json:"readahead_workers"`
 }
 
 // HealthSnapshot is the JSON-friendly payload returned by /health.
@@ -225,6 +247,14 @@ func (r *Registry) SetHealthProvider(fn func() HealthSnapshot) {
 	r.healthMu.Lock()
 	defer r.healthMu.Unlock()
 	r.healthFn = fn
+}
+
+// SetNetworkProvider registers a callback used by /metrics to report the
+// adaptive link estimate. Safe to leave unset (the field is then omitted).
+func (r *Registry) SetNetworkProvider(fn func() *NetworkSnapshot) {
+	r.netMu.Lock()
+	defer r.netMu.Unlock()
+	r.netFn = fn
 }
 
 // histFor returns (and lazily creates) the histogram for an RPC type.
@@ -285,6 +315,7 @@ type Snapshot struct {
 	ReadRetries  uint64                 `json:"read_retries"`
 	ReadFails    uint64                 `json:"read_fails"`
 	RPCs         map[string]RPCSnapshot `json:"rpcs"`
+	Network      *NetworkSnapshot       `json:"network,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -308,6 +339,13 @@ func (r *Registry) Snapshot() Snapshot {
 		ReadRetries:  r.readRetries.Load(),
 		ReadFails:    r.readFails.Load(),
 		RPCs:         make(map[string]RPCSnapshot, len(trackedTypes)),
+	}
+
+	r.netMu.RLock()
+	netFn := r.netFn
+	r.netMu.RUnlock()
+	if netFn != nil {
+		out.Network = netFn()
 	}
 
 	r.histsMu.RLock()

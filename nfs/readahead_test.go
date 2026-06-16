@@ -8,7 +8,7 @@ import (
 )
 
 func TestReadaheadSequentialDetection(t *testing.T) {
-	rm := NewReadaheadManager(testFUSEPath, nil)
+	rm := NewReadaheadManager(testFUSEPath, nil, nil)
 	defer rm.Stop()
 
 	inode := uint64(42)
@@ -28,7 +28,7 @@ func TestReadaheadSequentialDetection(t *testing.T) {
 }
 
 func TestReadaheadRandomNoTrigger(t *testing.T) {
-	rm := NewReadaheadManager(testFUSEPath, nil)
+	rm := NewReadaheadManager(testFUSEPath, nil, nil)
 	defer rm.Stop()
 
 	inode := uint64(42)
@@ -104,7 +104,7 @@ func TestReadaheadThroughNFS(t *testing.T) {
 }
 
 func TestReadaheadCleanup(t *testing.T) {
-	rm := NewReadaheadManager(testFUSEPath, nil)
+	rm := NewReadaheadManager(testFUSEPath, nil, nil)
 	defer rm.Stop()
 
 	// Add some trackers

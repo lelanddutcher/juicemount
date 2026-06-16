@@ -31,6 +31,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
@@ -348,7 +349,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// in the UI. For now this is purely observational — it logs
 	// transitions but does not yet affect any other state.
 	if reachAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL); reachAddr != "" {
-		globalReach = health.NewReachability(reachAddr)
+		// Feed successful-probe RTT into the network-profile link estimator so
+		// adaptive readahead can bootstrap link class (fast LAN vs slow WAN)
+		// before any throughput sample arrives (internal/netprofile).
+		globalReach = health.NewReachability(reachAddr,
+			health.WithRTTObserver(netprofile.Default().ObserveRTT))
 		globalReach.OnChange(func(reachable bool, reason string) {
 			offlineEngageMu.Lock()
 			defer offlineEngageMu.Unlock()
@@ -771,6 +776,25 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			Healthy:    st.Overall,
 			Components: comps,
 			Reason:     reason,
+		}
+	})
+
+	// Expose the adaptive link estimate on /metrics for observability + tuning.
+	metrics.Default().SetNetworkProvider(func() *metrics.NetworkSnapshot {
+		s := netprofile.Default().Snapshot()
+		ra := netprofile.Default().Readahead()
+		return &metrics.NetworkSnapshot{
+			Class:            s.Class.String(),
+			RTTMs:            float64(s.RTT.Microseconds()) / 1000.0,
+			BandwidthMBps:    s.BytesPerSec / (1024 * 1024),
+			HaveRTT:          s.HaveRTT,
+			HaveBandwidth:    s.HaveBW,
+			ThroughputN:      s.ThroughputN,
+			BootstrappedRTT:  s.BootstrappedRTT,
+			ReadaheadEnabled: ra.Enabled,
+			ReadaheadSeq:     ra.SeqThreshold,
+			ReadaheadBlocks:  ra.Blocks,
+			ReadaheadWorkers: ra.Workers,
 		}
 	})
 

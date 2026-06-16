@@ -69,6 +69,13 @@ type Reachability struct {
 	srtt   time.Duration
 	rttvar time.Duration
 
+	// rttObserver, if set, receives every successful-probe dial latency. The
+	// network profile (netprofile) uses it to bootstrap link classification from
+	// RTT before any throughput sample arrives. Kept as a plain func so this
+	// package stays free of a netprofile import (clean layering). Called from the
+	// probe loop goroutine; MUST NOT block.
+	rttObserver func(time.Duration)
+
 	dialer dialer
 
 	mu               sync.RWMutex
@@ -119,6 +126,13 @@ func WithSuccessThreshold(n int) ReachabilityOption {
 // production code never needs it.
 func withDialer(d dialer) ReachabilityOption {
 	return func(r *Reachability) { r.dialer = d }
+}
+
+// WithRTTObserver registers a callback invoked with the dial latency of every
+// SUCCESSFUL probe. Used to feed the network-profile link estimator. The
+// callback runs on the probe-loop goroutine and MUST NOT block.
+func WithRTTObserver(fn func(time.Duration)) ReachabilityOption {
+	return func(r *Reachability) { r.rttObserver = fn }
 }
 
 // NewReachability constructs a monitor against the given "host:port"
@@ -295,7 +309,11 @@ func (r *Reachability) probe() bool {
 	if err != nil {
 		return false
 	}
-	r.observeRTT(time.Since(start))
+	rtt := time.Since(start)
+	r.observeRTT(rtt)
+	if r.rttObserver != nil {
+		r.rttObserver(rtt)
+	}
 	_ = conn.Close()
 	return true
 }
