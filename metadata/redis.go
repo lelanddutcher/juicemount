@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
@@ -75,6 +76,7 @@ type RedisClient struct {
 	mu               sync.RWMutex
 	lastSyncDuration time.Duration
 	lastSyncTime     time.Time
+	lastSyncStartedAt time.Time // when the most recent sync BEGAN (for flap debounce)
 	lastSyncEntries  int
 	connected        bool
 	lastDisconnect   time.Time
@@ -543,6 +545,30 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 	}
 }
 
+// reconcileFlapDebounce gates the flap-triggered-reconcile debounce. Default ON.
+// JM_RECONCILE_FLAP_DEBOUNCE=0 (or master JM_NET_ADAPTIVE=0, which pins
+// class=medium → window 0) restores the old fire-on-every-flap behavior. See
+// docs/TUNING/REVERT_LOG.md (R2).
+var reconcileFlapDebounce = os.Getenv("JM_RECONCILE_FLAP_DEBOUNCE") != "0"
+
+// flapDebounceInterval is the minimum time since the last sync start/finish below
+// which a NETWORK-CHANGE-triggered reconcile is suppressed. Class-aware: only
+// slow/metered links debounce; LAN (medium/fast) returns 0 (no change — flaps are
+// rare and SCANs are 2-10s there).
+func flapDebounceInterval() time.Duration {
+	if !reconcileFlapDebounce {
+		return 0
+	}
+	switch netprofile.Default().Class() {
+	case netprofile.ClassMetered:
+		return 60 * time.Second
+	case netprofile.ClassSlow:
+		return 30 * time.Second
+	default:
+		return 0
+	}
+}
+
 // reconcileLoop runs periodic batch reconciliation with exponential backoff
 // on failure (network transitions, Redis unreachable). It also listens for
 // immediate sync requests via syncNowCh (triggered by network changes).
@@ -559,6 +585,27 @@ func (rc *RedisClient) reconcileLoop() {
 		case <-ticker.C:
 			rc.doReconcile(&consecutiveFailures, &backoff, baseInterval, maxBackoff, ticker)
 		case <-rc.syncNowCh:
+			// Flap debounce (2026-06-16): on a flaky cellular link the reachability
+			// monitor flaps constantly and EACH recovery fires a full-keyspace SCAN
+			// (87-178s on cellular, ~93% finding zero changes), stacking back-to-back
+			// and burning metered data + contending the link. Suppress a flap-trigger
+			// if a sync STARTED or COMPLETED within the class-aware debounce window;
+			// the periodic ticker still catches any real drift within the cadence.
+			// LAN (medium/fast) → window 0 → NO debounce, behavior unchanged.
+			if d := flapDebounceInterval(); d > 0 {
+				rc.mu.RLock()
+				recent := rc.lastSyncStartedAt
+				if rc.lastSyncTime.After(recent) {
+					recent = rc.lastSyncTime
+				}
+				rc.mu.RUnlock()
+				if !recent.IsZero() && time.Since(recent) < d {
+					jmlog.Info("flap-triggered reconcile suppressed (recent sync within debounce window)",
+						"since_last_sec", int(time.Since(recent).Seconds()),
+						"debounce_sec", int(d.Seconds()))
+					continue
+				}
+			}
 			jmlog.Info("reconciliation triggered by network change")
 			rc.doReconcile(&consecutiveFailures, &backoff, baseInterval, maxBackoff, ticker)
 		case <-rc.stopCh:
@@ -906,6 +953,11 @@ return out
 // syncMetadata performs a full batch reconciliation: Lua tree pull → SQLite sync.
 func (rc *RedisClient) syncMetadata() error {
 	start := time.Now()
+	// Record sync START so the flap debounce (reconcileLoop) can tell a sync is
+	// in-flight or just-ran and suppress redundant network-change triggers.
+	rc.mu.Lock()
+	rc.lastSyncStartedAt = start
+	rc.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
