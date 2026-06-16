@@ -101,6 +101,29 @@ func (p *Profile) JuiceFS() JuiceFSPolicy {
 	}
 }
 
+// NFSReadahead returns the macOS NFS-client `readahead` mount option for the
+// current link. This is the prefetcher that turns a single small touch into a
+// sequential burst (16 × rsize) which juicefs then extends to a whole-file pull
+// (validated 2026-06-15: juicefs --buffer-size/--prefetch alone did NOT cap it;
+// the client-side fan-out is what triggers juicefs's sequential readahead).
+//
+// We only ever LOWER it from the default 16 — never raise it — because 16 is the
+// concurrent-read-TRUNCATION mitigation (#18/#19, the bug appeared at 128). A
+// smaller value is strictly safer for that bug AND shrinks the amplification, so
+// metered/slow are pure wins; medium/fast keep the validated 16 (10GbE throughput
+// comes from juicefs-side concurrency, not client readahead — not worth the
+// truncation risk of raising it). Mount-time only.
+func (p *Profile) NFSReadahead() int {
+	switch p.Class() {
+	case ClassMetered:
+		return 2
+	case ClassSlow:
+		return 4
+	default: // medium + fast: keep the truncation-validated default
+		return 16
+	}
+}
+
 // Snapshot is an immutable read of the profile for metrics/observability.
 type Snapshot struct {
 	Class           LinkClass

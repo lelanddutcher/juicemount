@@ -1486,9 +1486,16 @@ func nfsMountOpts(port string) string {
 	// timing out → no SIGBUS. The dead-backend hang `soft` guarded against is now
 	// covered by offline mode (auto-offline returns NXIO fast) + the FUSE
 	// watchdog, so a truly-unresponsive backend no longer hangs reads forever.
+	// [#16 phase 2.5] Link-aware readahead. The juicefs FUSE mount (which runs
+	// first at startup) has already fed netprofile an RTT sample, so the class is
+	// known here. We only ever LOWER readahead below 16 on slow/metered links
+	// (strictly safer for the truncation bug + shrinks the whole-file
+	// amplification); medium/fast keep 16. nfsReadahead() falls back to 16 if
+	// netprofile has no signal, so behavior is unchanged absent a classification.
+	ra := netprofile.Default().NFSReadahead()
 	return fmt.Sprintf(
-		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,actimeo=3600,vers=3,tcp",
-		port, port)
+		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,actimeo=3600,vers=3,tcp",
+		port, port, ra)
 }
 
 // unmountNFS removes the NFS mount.
