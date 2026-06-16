@@ -7,11 +7,23 @@ import (
 
 func mb(f float64) int64 { return int64(f * 1024 * 1024) }
 
-// A real backend transfer sample: `bytes` moved over the time implied by `bps`.
+// fakeClock drives the windowed throughput estimator deterministically.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time      { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+// sampleFor feeds `blocks` 4 MB backend reads at the given bytes/sec, driving an
+// installed fake clock so the aggregate-bytes/wall-time window sees real
+// elapsed intervals. Each read advances the clock by its own duration (the
+// sequential, non-overlapping case).
 func sampleFor(p *Profile, bps float64, blocks int) {
+	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	p.now = c.now
 	bytes := int64(4 * 1024 * 1024) // one 4 MB block
 	dur := time.Duration(float64(bytes) / bps * float64(time.Second))
 	for i := 0; i < blocks; i++ {
+		c.advance(dur)
 		p.ObserveThroughput(bytes, dur)
 	}
 }
@@ -153,6 +165,26 @@ func TestJuiceFSPolicyByClass(t *testing.T) {
 	fp := fast.JuiceFS()
 	if fp.Prefetch <= med.Prefetch {
 		t.Fatalf("fast prefetch %d must exceed medium %d (fill 10GbE)", fp.Prefetch, med.Prefetch)
+	}
+}
+
+func TestWindowedAggregatesConcurrentReads(t *testing.T) {
+	// The concurrent-storm case: 1 MB reads each REPORT a 100 ms (queued)
+	// duration but complete 10 ms apart on the wall clock. Per-read bytes/dur
+	// would say ~10 MB/s; the aggregate-over-wall-time estimate must be much
+	// higher because the bytes really moved concurrently. This is the exact
+	// under-count the live deploy exposed (36 KB/s during a readahead storm).
+	p := New()
+	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	p.now = c.now
+	for i := 0; i < 12; i++ {
+		c.advance(10 * time.Millisecond)
+		p.ObserveThroughput(1<<20, 100*time.Millisecond)
+	}
+	bw := p.Snapshot().BytesPerSec
+	perRead := float64(int64(1<<20)) / 0.1 // 10 MB/s
+	if bw <= perRead*2 {
+		t.Fatalf("windowed bw %.0f B/s must be >> per-read %.0f B/s (concurrency captured)", bw, perRead)
 	}
 }
 

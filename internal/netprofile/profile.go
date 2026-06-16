@@ -152,13 +152,24 @@ type Profile struct {
 	bwBps       float64
 	haveBW      bool
 	bwSamples   int64
-	lastBWAt    time.Time
 	forcedClass *LinkClass // operator/OS override (e.g. detected metered link); nil = auto
+
+	// Windowed throughput accumulator. Bandwidth is measured as AGGREGATE bytes
+	// over WALL-CLOCK time within an active read window — not per-read bytes/dur,
+	// which underestimates badly under concurrency (8 parallel 1 MB reads each
+	// look like 1 MB/s when the link is really doing 8 MB/s). All bytes that land
+	// in the same wall-clock window are summed, so concurrency is captured.
+	winStart   time.Time
+	winLastEnd time.Time
+	winBytes   int64
+
+	// now is the clock (injectable for tests). Production uses time.Now.
+	now func() time.Time
 }
 
 // New builds a fresh profile in the "unknown → medium-safe" state: until a
 // sample arrives, policy is the historical defaults so behavior is unchanged.
-func New() *Profile { return &Profile{} }
+func New() *Profile { return &Profile{now: time.Now} }
 
 var (
 	def     *Profile
@@ -243,25 +254,65 @@ const (
 	minThroughputDur   = 3 * time.Millisecond
 )
 
-// ObserveThroughput folds a measured backend transfer (bytes over dur) into the
-// smoothed bandwidth estimate. Samples too small/fast to reflect the wire (cache
-// hits) are ignored. EWMA alpha=1/4 so the estimate tracks link changes (Wi-Fi↔
-// cellular) within a handful of cold blocks without thrashing on one slow chunk.
+// throughput window tuning.
+const (
+	// A window flushes to a rate sample once it spans this long OR accumulates
+	// this many bytes — whichever first. The time bound keeps a slow link's
+	// divisor a real interval (not a sub-ms blip); the byte bound lets a FAST
+	// link (where a whole read sequence may be < 120 ms) still register, dividing
+	// a healthy multi-MB sum by a small-but-real elapsed.
+	bwWindowFlush      = 120 * time.Millisecond
+	bwWindowFlushBytes = 8 << 20 // 8 MiB
+	// Reads more than this far apart start a fresh window — we don't want an idle
+	// gap diluting the aggregate-bytes/wall-time rate.
+	bwIdleGap = 400 * time.Millisecond
+)
+
+// ObserveThroughput folds a measured backend transfer into the bandwidth
+// estimate using an AGGREGATE bytes-over-wall-time window (not per-read
+// bytes/dur, which under-counts under concurrency). Cache hits (sub-threshold
+// bytes/dur) are ignored so only wire transfers move the estimate. The windowed
+// rate is EWMA-smoothed (alpha=1/4) so it tracks link changes within a few
+// windows without thrashing.
+//
+// `dur` is the read's own duration, used both as the cache-hit filter and to
+// anchor a fresh window's start (the read began ~dur before now).
 func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 	if bytes < minThroughputBytes || dur < minThroughputDur {
 		return
 	}
-	bps := float64(bytes) / dur.Seconds()
+	now := p.now()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Start a fresh window if this is the first sample or the link went idle.
+	if p.winStart.IsZero() || now.Sub(p.winLastEnd) > bwIdleGap {
+		p.winStart = now.Add(-dur)
+		p.winBytes = 0
+	}
+	p.winBytes += bytes
+	p.winLastEnd = now
+
+	elapsed := now.Sub(p.winStart)
+	if elapsed < bwWindowFlush && p.winBytes < bwWindowFlushBytes {
+		return // keep accumulating; not enough wall-time or bytes yet
+	}
+	if elapsed <= 0 {
+		return // guard against a zero divisor (clock didn't advance)
+	}
+	rate := float64(p.winBytes) / elapsed.Seconds()
+	// Tumble the window so concurrent reads in the next interval aren't
+	// double-counted against this one's already-folded bytes.
+	p.winStart = now
+	p.winBytes = 0
+
 	p.bwSamples++
-	p.lastBWAt = time.Now()
 	if !p.haveBW {
-		p.bwBps = bps
+		p.bwBps = rate
 		p.haveBW = true
 		return
 	}
-	p.bwBps += (bps - p.bwBps) / 4
+	p.bwBps += (rate - p.bwBps) / 4
 }
 
 // ForceClass pins the link class (e.g. when the OS reports a metered/expensive
