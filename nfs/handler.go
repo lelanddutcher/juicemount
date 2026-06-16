@@ -2356,6 +2356,7 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time).
+	readStart := time.Now()
 	n, err := f.fuseFD.ReadAt(p, off)
 	// [JM6 readback-resilience, 2026-06-14 / 2026-06-15] Two JuiceFS-under-
 	// concurrent-load transients corrupt a read even though the bytes at rest
@@ -2436,6 +2437,12 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	}
 	if n > 0 {
 		metrics.Default().AddBytesRead(int64(n))
+		// [#16 phase 2] Feed the link estimator from the MAIN read path. This is
+		// the signal the prefetch-only sampler missed (juicefs pre-pulls whole
+		// files before our readahead runs, so our prefetch reads were all cache
+		// hits). A cold subread here is a real backend transfer; ObserveThroughput
+		// filters warm/sub-256KB reads so only wire-speed moves the estimate.
+		netprofile.Default().ObserveThroughput(int64(n), time.Since(readStart))
 	}
 	return n, err
 }

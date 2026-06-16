@@ -131,6 +131,31 @@ func TestTinySamplesIgnored(t *testing.T) {
 	}
 }
 
+func TestJuiceFSPolicyByClass(t *testing.T) {
+	// medium (no signal) == historical mount defaults exactly.
+	med := New().JuiceFS()
+	if med.BufferSizeMB != 4096 || med.Prefetch != 3 {
+		t.Fatalf("medium juicefs policy %+v != historical {4096,3}", med)
+	}
+	// metered: prefetch off, buffer still >= a single media file.
+	metered := New()
+	sampleFor(metered, 1.5*1024*1024, 6)
+	mp := metered.JuiceFS()
+	if mp.Prefetch != 0 {
+		t.Fatalf("metered must set --prefetch 0, got %d", mp.Prefetch)
+	}
+	if mp.BufferSizeMB < 256 {
+		t.Fatalf("metered buffer %d MB too small to absorb a single media write", mp.BufferSizeMB)
+	}
+	// fast: wider prefetch than medium to fill the pipe.
+	fast := New()
+	sampleFor(fast, 800*1024*1024, 8)
+	fp := fast.JuiceFS()
+	if fp.Prefetch <= med.Prefetch {
+		t.Fatalf("fast prefetch %d must exceed medium %d (fill 10GbE)", fp.Prefetch, med.Prefetch)
+	}
+}
+
 func TestForceClass(t *testing.T) {
 	p := New()
 	sampleFor(p, 800*1024*1024, 8) // would be fast

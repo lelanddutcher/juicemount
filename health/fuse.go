@@ -16,13 +16,43 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
+
+// linkAwareJuiceFSPolicy picks the mount-time juicefs prefetch flags
+// (--buffer-size / --prefetch) for the current link. JuiceFS's own sequential
+// readahead is the dominant prefetcher (validated 2026-06-15: a cold 4 KB read
+// pulls the whole file even with our server readahead capped) and these flags
+// are mount-time only, so we classify the link HERE, at mount, from a single
+// cheap TCP dial to the backend — the same passive philosophy as the
+// reachability probe (no synthetic load on a link we may already suspect).
+//
+// On any parse/dial failure we feed no RTT sample and fall through to the
+// profile's default (medium == the historical mount flags), so a transient
+// backend hiccup never degrades the mount config.
+func (fm *FUSEManager) linkAwareJuiceFSPolicy() netprofile.JuiceFSPolicy {
+	if u, err := url.Parse(fm.cfg.RedisURL); err == nil && u.Host != "" {
+		start := time.Now()
+		conn, derr := net.DialTimeout("tcp", u.Host, 2*time.Second)
+		if derr == nil {
+			rtt := time.Since(start)
+			_ = conn.Close()
+			netprofile.Default().ObserveRTT(rtt)
+			jmlog.Info("link-aware mount probe",
+				"backend", u.Host,
+				"rtt_ms", rtt.Milliseconds(),
+				"class", netprofile.Default().Class().String())
+		}
+	}
+	return netprofile.Default().JuiceFS()
+}
 
 // redactURLCreds returns a copy of `raw` with any user:password component
 // of a parseable URL replaced by `<redacted>`. Used to keep credentials
@@ -241,13 +271,20 @@ func (fm *FUSEManager) Mount() error {
 	if os.Getenv("JM_FUSE_VERBOSE") != "" {
 		args = append(args, "--verbose")
 	}
+	// Link-aware prefetch (#16 phase 2): juicefs's own sequential readahead is
+	// the dominant prefetcher; pick --buffer-size/--prefetch from the measured
+	// link so a metered/cellular mount doesn't pull whole files for a 4 KB touch,
+	// while a 10GbE mount keeps blocks in flight. Medium == historical defaults.
+	jfp := fm.linkAwareJuiceFSPolicy()
 	args = append(args,
 		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
 		"-d", // daemon mode
 		"--no-usage-report",
-		// --buffer-size 4 GiB: write buffer to absorb chunky-render bursts.
-		"--buffer-size", "4096", // 4 GiB
-		"--prefetch", "3", // prefetch 3 blocks ahead
+		// --buffer-size also backs write-burst absorption, but writes land on the
+		// spool first and durability is independent of it, so scaling it by link
+		// costs only throughput (already upload-bound on a slow link).
+		"--buffer-size", strconv.Itoa(jfp.BufferSizeMB),
+		"--prefetch", strconv.Itoa(jfp.Prefetch),
 		"-o", "nobrowse", // hide from Finder (MNT_DONTBROWSE flag)
 	)
 	// DATA-LOSS FIX (2026-06-13): --writeback is DISABLED by default.

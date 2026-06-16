@@ -66,6 +66,41 @@ type ReadaheadPolicy struct {
 	Workers      int  // max concurrent prefetch goroutines
 }
 
+// JuiceFSPolicy is the link-aware juicefs MOUNT-time flag set. These are the
+// DOMINANT prefetchers (validated 2026-06-15: with our server readahead capped
+// at 2 blocks a cold 4 KB read still pulled the whole 64 MB file — juicefs's own
+// sequential readahead, driven by --buffer-size + --prefetch, did it). Because
+// they're mount flags they can only change on a (re)mount; the bridge picks them
+// from a one-shot RTT probe at mount time. ClassMedium == the historical mount
+// defaults exactly, so a normal LAN mount is unchanged.
+//
+// Note --buffer-size also backs write-burst absorption, but writes land on the
+// SPOOL first and durability is independent of it (writeback is off), so a
+// smaller buffer on a slow link costs only throughput — which is already
+// upload-bound there. We never shrink it below a single media file's size.
+type JuiceFSPolicy struct {
+	BufferSizeMB int // --buffer-size
+	Prefetch     int // --prefetch (concurrent blocks)
+}
+
+// JuiceFS maps the current link class to mount-time prefetch flags.
+func (p *Profile) JuiceFS() JuiceFSPolicy {
+	switch p.Class() {
+	case ClassMetered:
+		// Minimize readahead + metered-data waste. 512 MB still absorbs any
+		// single CR3/RAW write; prefetch 0 kills the concurrent block pull.
+		return JuiceFSPolicy{BufferSizeMB: 512, Prefetch: 0}
+	case ClassSlow:
+		return JuiceFSPolicy{BufferSizeMB: 1024, Prefetch: 1}
+	case ClassFast:
+		// 10GbE: keep the big buffer and widen concurrent prefetch to keep more
+		// 4 MB blocks in flight to MinIO (addresses the ~3-of-10 Gbit/s starve).
+		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 8}
+	default: // ClassMedium — the historical mount defaults
+		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 3}
+	}
+}
+
 // Snapshot is an immutable read of the profile for metrics/observability.
 type Snapshot struct {
 	Class           LinkClass
