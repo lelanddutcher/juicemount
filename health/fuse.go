@@ -912,6 +912,56 @@ func (fm *FUSEManager) stillInMountTable() bool {
 // minutes. Var, not const, so tests can shorten it.
 var FUSEStaleEscalateTicks = 9
 
+// fuseWatchdogLinkAware gates the link-aware scaling of the escalation thresholds
+// below. Default ON. Set JM_FUSE_WATCHDOG_LINKAWARE=0 (or the master
+// JM_NET_ADAPTIVE=0, which pins class=medium) to restore the fixed historical
+// thresholds. See docs/TUNING/REVERT_LOG.md (R1).
+var fuseWatchdogLinkAware = os.Getenv("JM_FUSE_WATCHDOG_LINKAWARE") != "0"
+
+// staleEscalateTicks returns how many CONTINUOUS stale-but-alive ticks to tolerate
+// before escalating to the destructive SIGKILL+remount, scaled UP on slow/metered
+// links. ROOT CAUSE (2026-06-16, root-caused from juicemount.log): on cellular the
+// 5s readdir stale-probe times out tick after tick because the JuiceFS->Redis
+// readdir is legitimately SLOW (not wedged); at the fixed 9 ticks the watchdog
+// then SIGKILL'd a perfectly-alive juicefs ~469 times in a day, with ~6% remount
+// success, leaving FUSE dead for 30-45s per cycle = the "loading bar that never
+// cures." medium/fast keep the validated 9 (~90s) BYTE-FOR-BYTE; metered/slow get
+// a wide margin so a slow-but-alive mount is never mistaken for a wedge. A truly
+// wedged mount still escalates, just later. Tests (class=medium, no signal) are
+// unaffected.
+func (fm *FUSEManager) staleEscalateTicks() int {
+	if !fuseWatchdogLinkAware {
+		return FUSEStaleEscalateTicks
+	}
+	switch netprofile.Default().Class() {
+	case netprofile.ClassMetered:
+		return FUSEStaleEscalateTicks * 3 // ~270s
+	case netprofile.ClassSlow:
+		return FUSEStaleEscalateTicks * 2 // ~180s
+	default:
+		return FUSEStaleEscalateTicks // ~90s — unchanged on LAN/medium/fast
+	}
+}
+
+// confirmProbeTimeout returns the GENEROUS "is it actually wedged or just slow"
+// probe budget before the destructive remount, scaled UP on slow/metered. The
+// historical 25s is too short for a cellular FUSE-root readdir under Redis
+// contention (so the probe false-fails and the kill proceeds — the bug above).
+// medium/fast keep 25s unchanged.
+func (fm *FUSEManager) confirmProbeTimeout() time.Duration {
+	if !fuseWatchdogLinkAware {
+		return fuseConfirmProbeTimeout
+	}
+	switch netprofile.Default().Class() {
+	case netprofile.ClassMetered:
+		return 90 * time.Second
+	case netprofile.ClassSlow:
+		return 45 * time.Second
+	default:
+		return fuseConfirmProbeTimeout // 25s — unchanged on LAN/medium/fast
+	}
+}
+
 // backendReachable does a cheap TCP dial to the metadata (Redis) host to
 // decide whether a remount could even succeed. Mirrors the reachability
 // monitor's probe so the watchdog does NOT kill+remount juicefs during a real
@@ -1013,7 +1063,7 @@ func (fm *FUSEManager) monitorLoop() {
 				// flapping never accumulates to the threshold.
 				staleWhileAliveTicks++
 				consecutiveFailures = 0
-				if staleWhileAliveTicks >= FUSEStaleEscalateTicks {
+				if staleWhileAliveTicks >= fm.staleEscalateTicks() {
 					// CONFIRM truly-wedged before the destructive SIGKILL+remount.
 					// The 5s isMountedLocked probe flips to "stale" under mere
 					// SLOWNESS (reconcile/backend contention); accumulating that
@@ -1021,10 +1071,11 @@ func (fm *FUSEManager) monitorLoop() {
 					// the macFUSE remount thrash (2026-06-14). A slow-but-alive
 					// mount answers a generous probe — if it does, it is NOT
 					// wedged; reset and keep deferring instead of remounting.
-					if fm.mountResponsiveWithin(fuseConfirmProbeTimeout) {
+					confirmTimeout := fm.confirmProbeTimeout()
+					if fm.mountResponsiveWithin(confirmTimeout) {
 						jmlog.Warn("fuse stale at escalation threshold but a generous probe succeeded — NOT remounting (slow, not wedged)",
 							"stale_ticks", staleWhileAliveTicks,
-							"confirm_timeout_sec", int(fuseConfirmProbeTimeout.Seconds()))
+							"confirm_timeout_sec", int(confirmTimeout.Seconds()))
 						staleWhileAliveTicks = 0
 						continue
 					}
