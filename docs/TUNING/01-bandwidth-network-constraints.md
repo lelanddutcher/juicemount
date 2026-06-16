@@ -89,15 +89,27 @@ only account for ~8 MB, so the rest is **juicefs's own internal sequential reada
 sequential pattern. juicefs pre-pulls the whole file before our prefetch path even runs,
 which is also why our throughput sampling saw nothing.
 
-**Phase 2 — the real levers are all MOUNT-TIME:**
-1. **juicefs flags are the big one:** lower `--buffer-size` (caps how far juicefs reads
-   ahead) and `--prefetch` on slow/metered links — needs a juicefs remount-on-class-change.
-2. NFS-client `readahead=16` → lower on slow links (NFS remount).
-3. **Move throughput sampling to the main read path** (`cachedFile.ReadAt` cold subreads), not
-   just our prefetch path, so the profile actually learns bandwidth (today it only
-   RTT-bootstraps; BW never populates because juicefs beats our prefetch to the bytes).
-Phase 1 stands as the link-estimator + policy infrastructure Phase 2 plugs into; on its own
-its read-amplification effect on cellular is negligible because juicefs dominates.
+**Phase 2 — BUILT + DEPLOYED on cellular (commits `0b1243f`, `b26908b`). What the deploy
+taught us:**
+- ✅ **Mount-flag adaptation works:** at mount the one-shot RTT probe read `class=slow` and
+  juicefs mounted `--buffer-size 1024 --prefetch 1` (from hardcoded 4096/3). Logged live.
+- ✅ **Read-path bandwidth sampling works:** after a real cold read the profile reclassified
+  `slow → metered` from measured throughput and disabled our server readahead. (Caveat: the
+  per-subread bytes/sec during a readahead *storm* reflects queueing, not clean link BW —
+  good enough to classify, not a true bandwidth number. Refine later: sample the first cold
+  subread of a sequence, or aggregate bytes/wall-time.)
+- ❌ **But the whole-file pull PERSISTED:** a cold 4 KB read still pulled the whole 66 MB
+  file under `--buffer-size 1024/--prefetch 1`. Why: 1024 MB ≫ a 66 MB file (juicefs fills
+  the buffer once sequential), and the **sequential pattern itself comes from the NFS-client
+  `readahead=16`** fanning one 4 KB touch into 16 sequential 1 MB reads, which juicefs then
+  extends. **juicefs flags at those values are NOT the lever.**
+
+**Phase 2.5 — the actual lever (built `b26908b`, NOT yet deployed):** make the NFS-client
+`readahead` mount option link-aware — lower to 4 (slow) / 2 (metered), keep 16 on
+medium/fast. We only ever LOWER it: 16 is the truncation mitigation (#18/#19, bug at 128), so
+smaller is strictly safer for that bug AND shrinks the amplification. Next deploy validates
+whether the 66 MB→? pull actually shrinks. (10GbE throughput is a separate lever —
+juicefs-side concurrency / our server RA fast policy — not client readahead.)
 
 ## Open tuning questions
 
