@@ -187,6 +187,17 @@ func Default() *Profile {
 				def.forcedClass = &c
 			}
 		}
+		// MASTER KILL-SWITCH (revert safety). JM_NET_ADAPTIVE=0 pins the link class
+		// to medium == the historical hard-coded defaults for EVERY consumer
+		// (server ReadaheadManager, juicefs --buffer-size/--prefetch, NFS-client
+		// readahead). One env var fully disables all #16 adaptive-link behavior and
+		// restores byte-for-byte original behavior — the escape hatch for returning
+		// to 10GbE if the adaptive (esp. fast-class) policies cause trouble. Takes
+		// precedence over JM_NET_FORCE_CLASS. See docs/TUNING/REVERT_LOG.md.
+		if os.Getenv("JM_NET_ADAPTIVE") == "0" {
+			c := ClassMedium
+			def.forcedClass = &c
+		}
 	})
 	return def
 }
