@@ -35,9 +35,53 @@ per lookup (one round-trip each). So cold-start isn't "broken," it's "slow until
    and navigation latency DURING the rebuild (cold FUSE-fallback) vs AFTER (mirror).
 6. The rebuilt mirror is correct (from Redis) — no restore needed; backup is safety only.
 
-## Results
+## Results — measured 2026-06-15, 64 ms cellular, mirror wiped (block cache kept)
 
-> (filled by the measurement run — see the run log)
+| Metric | Value |
+|---|---|
+| relaunch → app healthy + tree fully fast | **~121 s** |
+| full mirror rebuild from empty (261,302 entries) | **110.8 s** (`dur=110831ms`) |
+| nav post-rebuild (`ls` 692-file dir) | **instant** (mirror-served) |
+| rebuilt mirror size | 288 MB |
+
+Extrapolated: ~8× over a 500 ms link → **~15 min first-launch**. This is the single
+biggest WAN-UX gap, and it's entirely the metadata mirror.
+
+### Where the 110 s goes
+
+The reconcile runs a Lua `SCAN cursor MATCH 'd[0-9]*' COUNT 500` + server-side `HGETALL`
+per batch (`metadata/redis.go:890,919`). Decomposition over the 64 ms link:
+- **~33 s round-trips:** 261k ÷ 500 = ~522 SCAN batches × 64 ms RTT.
+- **~70 s payload transfer:** the full ~288 MB of metadata down the cellular pipe (~4 MB/s).
+
+So it's **both RTT- and throughput-bound.** And the full SCAN runs on *every* startup (it's
+also how prune/diff works) — so a pre-seeded/snapshot mirror does NOT avoid the cost unless
+the app stops *blocking* startup on the full SCAN.
+
+### Key insight
+
+Navigation already works *during* the rebuild via FUSE→Redis fallback (one round-trip per
+lookup) — it's slow, not broken. So the win is **not** "rebuild faster" but **"don't block
+on the rebuild":** make the tree usable immediately + build the mirror in the background +
+show progress (#37). The full eager mirror exists for offline-full-tree browsing (#3), so
+the right shape is a **hybrid: lazy/on-navigate warming for instant start + background full
+sync for offline coverage.**
+
+## Tuning experiments (ranked by leverage)
+
+1. **Non-blocking startup + background reconcile** (biggest UX win, no WAN-cost change):
+   tree usable from FUSE-fallback immediately; mirror builds behind a progress indicator.
+2. **Lazy mirror + background full-sync hybrid:** populate navigated dirs first (instant
+   first-browse), full SCAN continues in the background for offline coverage.
+3. **Bigger `scanCount` (500 → 1–2k):** cuts the ~33 s RTT portion ~2–4× — BUT a longer Lua
+   per batch risks the Redis-BUSY monopolization the chunked-SCAN fix (5ee6dcb / #15)
+   solved. Bounded win, test carefully.
+4. **Compress the reconcile payload:** the ~70 s is structured metadata (highly
+   compressible) over a slow pipe; gzip in the Lua + decompress client-side could cut it
+   materially. Bigger change.
+5. **Skip the SCAN when the mirror is recent + trust pub-sub:** do the full reconcile lazily
+   (e.g., first idle window) instead of at startup, relying on the <100 ms SUBSCRIBE channel
+   for live changes. Risky for prune-correctness; needs care.
 
 ## Tuning ideas to test
 
