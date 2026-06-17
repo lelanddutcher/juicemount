@@ -211,7 +211,37 @@ See `VISION/feature-roadmap-ranked.md` for full scoring and rationale.
 
 ---
 
-## Deferred / future
+## Pre-launch UX & reliability needs (from field testing, 2026-06-16)
+
+Surfaced while hammer-testing the mount across cellular / wifi / 10GbE. These are polish/
+trust items, not big features — but they shape the "feels trustworthy" first impression.
+
+### 4.8 "Clear failed files" action
+**Status:** Not started. Small.
+The drainer already auto-RetryFailed on reconnect (#17), but a file that's *permanently*
+failed (e.g. its source was deleted, or a quarantine) lingers in `/spool` `failed_files`
+forever with no user way to dismiss it. Add a manual **Clear failed files** button (menu-bar /
+Manager) backed by a control-plane action (e.g. `POST /spool/clear-failed`, sibling to the
+existing retry path) so the count can be acknowledged/reset. Must distinguish "retry" (try the
+drain again) from "clear" (give up + remove from the failed set) and never silently drop
+un-drained user data without confirmation.
+
+### 4.9 Confirm cache/pins survive restart without a full re-warm
+**Status:** Under code dissection (workflow `wf_ecd85331-f62`, 2026-06-16).
+Verify — at the code level, not just empirically — that a system/app restart does NOT force a
+full re-download of the JuiceFS block cache or pinned content. Empirically the on-disk cache
+(`~/.juicefs/cache`) survived a recent reboot (49 GB still populated), but we need certainty on
+(a) no startup wipe path and (b) the pin **prefetcher** skipping already-cached blocks rather
+than re-reading every pinned file on boot. (Separate concern already known: a big unrelated
+ingest can LRU-evict a user's working set — argues for pin cache-priority, see Deferred.)
+
+### 4.10 Background-operation activity surface ("why is Finder slow right now")
+**Status:** Not started. Extends #37 (post-remount "rebuilding index" indicator).
+When reconcile / drain / pin-prefetch / warmup are running, Finder can feel sluggish and the
+user has no idea why. Surface a plain-language **activity indicator** (menu-bar + Manager):
+e.g. "Rebuilding index 62%", "Uploading 412 files (38 GB) to backend", "Warming pinned project
+(120/180 GB)", "Catching up after reconnect" — so a slow moment reads as *a known background
+task in progress*, not *the product is broken*. Include an ETA/throughput where cheap.
 
 - **NFS v4.1**: server-initiated callbacks (delegations) for instant invalidation. Major protocol change.
 - **Redis Streams**: replace SUBSCRIBE + Lua SCAN with a Redis Stream for change tracking. Requires JuiceFS cooperation or a sidecar.
