@@ -2175,17 +2175,26 @@ func handleActivityHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. Prefetch — warming pinned content into the local cache.
+	// 3. Prefetch — warming pinned content into the local cache. "Warming"
+	// counts files NOT yet Ready and NOT Failed — i.e. both Pending (queued)
+	// and Prefetching (actively reading). AggregateStats exposes only Ready /
+	// Pending / Failed counts, so the in-flight Prefetching set is the
+	// remainder: Total − Ready − Failed (NOT just PendingFiles, which misses
+	// the file the worker is actively reading — caught in live test 2026-06-17).
 	if pinStore != nil {
 		if agg, err := pinStore.AggregateStats(); err == nil && agg.TotalFiles > 0 {
-			op := activityOperation{Kind: "prefetch", Active: agg.PendingFiles > 0, Files: agg.PendingFiles, Bytes: agg.CachedBytes}
+			warming := agg.TotalFiles - agg.ReadyFiles - agg.FailedFiles
+			if warming < 0 {
+				warming = 0
+			}
+			op := activityOperation{Kind: "prefetch", Active: warming > 0, Files: warming, Bytes: agg.CachedBytes}
 			if op.Active {
 				pct := 0.0
 				if agg.TotalBytes > 0 {
 					pct = 100 * float64(agg.CachedBytes) / float64(agg.TotalBytes)
 				}
-				op.Detail = fmt.Sprintf("Warming %d pinned file(s) — %.0f%% cached", agg.PendingFiles, pct)
-				working = append(working, fmt.Sprintf("warming %d pinned files", agg.PendingFiles))
+				op.Detail = fmt.Sprintf("Warming %d pinned file(s) — %.0f%% cached", warming, pct)
+				working = append(working, fmt.Sprintf("warming %d pinned files", warming))
 			} else {
 				op.Detail = fmt.Sprintf("%d pinned file(s) cached", agg.ReadyFiles)
 			}
