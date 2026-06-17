@@ -682,6 +682,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// and per-entry details. 503 when the spool is disabled
 			// (JM_SPOOL_ENABLE != 1) or hasn't been wired yet.
 			"/spool": handleSpoolHTTP,
+			// Background-operation activity surface (roadmap 4.10): plain-language
+			// view of reconcile / drain / prefetch so the UI can explain why
+			// Finder is momentarily slow ("Uploading 412 files", "Rebuilding
+			// index…", "Warming pinned project"). GET, loopback.
+			"/activity": handleActivityHTTP,
 			// Spool recovery actions (LB-5): ?action=retry-failed
 			// requeues failed rows whose spool file survives;
 			// ?action=clear-stalled force-finalizes leaked-handle
@@ -2100,6 +2105,107 @@ func handleSpoolHTTP(w http.ResponseWriter, r *http.Request) {
 	jmnfs.WriteSpoolStatusJSON(w, spool, drainer)
 }
 
+// activityOperation is one background task surfaced to the user by /activity.
+type activityOperation struct {
+	Kind   string `json:"kind"`   // reconcile | drain | prefetch
+	Active bool   `json:"active"` // running right now?
+	Detail string `json:"detail"` // plain-language, UI-ready
+	Files  int    `json:"files,omitempty"`
+	Bytes  int64  `json:"bytes,omitempty"`
+}
+
+// handleActivityHTTP (roadmap 4.10) aggregates the background operations that
+// can make Finder feel sluggish — the metadata reconcile (index rebuild), the
+// spool drain (uploading to the backend), and the pin prefetch (warming pinned
+// content) — into a single plain-language view. The menu-bar / Manager polls
+// this so a slow moment reads as "a known task is in progress", not "broken".
+// GET, loopback. Always 200 with a JSON body; absent subsystems are omitted.
+func handleActivityHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	globalMu.Lock()
+	rc := globalRC
+	spool := globalSpool
+	drainer := globalDrainer
+	pinStore := globalPinStore
+	globalMu.Unlock()
+
+	var ops []activityOperation
+	var working []string
+
+	// 1. Reconcile — the metadata index rebuild (full Redis SCAN).
+	if rc != nil {
+		op := activityOperation{Kind: "reconcile", Active: rc.IsSyncing()}
+		if op.Active {
+			op.Detail = "Rebuilding index…"
+			working = append(working, "rebuilding index")
+		} else {
+			last := rc.LastSyncTime()
+			op.Files = rc.LastSyncEntries()
+			if last.IsZero() {
+				op.Detail = "Index not yet built"
+			} else {
+				op.Detail = fmt.Sprintf("Index up to date — %d entries, synced %s ago",
+					op.Files, time.Since(last).Round(time.Second))
+			}
+		}
+		ops = append(ops, op)
+	}
+
+	// 2. Drain — uploading spooled writes to the backend.
+	if spool != nil {
+		if st, err := jmnfs.BuildSpoolStatus(spool, drainer); err == nil && st.Enabled {
+			op := activityOperation{
+				Kind:   "drain",
+				Active: st.PendingFiles > 0 || st.InProgress > 0,
+				Files:  st.PendingFiles,
+				Bytes:  st.PendingBytes,
+			}
+			switch {
+			case st.OfflineBufferFull:
+				op.Detail = fmt.Sprintf("Offline buffer full — %d copies paused, reconnect to drain", st.StallWaiters)
+				working = append(working, "uploads paused (offline)")
+			case op.Active:
+				op.Detail = fmt.Sprintf("Uploading %d file(s) (%.1f GB) to backend",
+					st.PendingFiles, float64(st.PendingBytes)/(1<<30))
+				working = append(working, fmt.Sprintf("uploading %d files", st.PendingFiles))
+			default:
+				op.Detail = "All uploads complete"
+			}
+			ops = append(ops, op)
+		}
+	}
+
+	// 3. Prefetch — warming pinned content into the local cache.
+	if pinStore != nil {
+		if agg, err := pinStore.AggregateStats(); err == nil && agg.TotalFiles > 0 {
+			op := activityOperation{Kind: "prefetch", Active: agg.PendingFiles > 0, Files: agg.PendingFiles, Bytes: agg.CachedBytes}
+			if op.Active {
+				pct := 0.0
+				if agg.TotalBytes > 0 {
+					pct = 100 * float64(agg.CachedBytes) / float64(agg.TotalBytes)
+				}
+				op.Detail = fmt.Sprintf("Warming %d pinned file(s) — %.0f%% cached", agg.PendingFiles, pct)
+				working = append(working, fmt.Sprintf("warming %d pinned files", agg.PendingFiles))
+			} else {
+				op.Detail = fmt.Sprintf("%d pinned file(s) cached", agg.ReadyFiles)
+			}
+			ops = append(ops, op)
+		}
+	}
+
+	busy := len(working) > 0
+	summary := "Idle — no background work"
+	if busy {
+		summary = "Working — " + strings.Join(working, "; ")
+	}
+	data, _ := json.Marshal(map[string]any{
+		"busy":       busy,
+		"summary":    summary,
+		"operations": ops,
+	})
+	w.Write(data)
+}
+
 // handleSpoolRecoverHTTP is the operator-facing recovery action behind the
 // LB-5 stuck-spool UI affordance. Loopback-only GET with query params —
 // the same mutation convention as /offline?on=true.
@@ -2144,9 +2250,44 @@ func handleSpoolRecoverHTTP(w http.ResponseWriter, r *http.Request) {
 		n := spool.RecoverStalled()
 		jmlog.Info("spool-recover: clear-stalled", "finalized", n)
 		fmt.Fprintf(w, `{"ok":true,"action":"clear-stalled","recovered":%d}`, n)
+	case "clear-failed":
+		// DESTRUCTIVE: discards the un-drained local bytes of permanently-failed
+		// rows. Two-phase for safety: without &confirm=true it returns a PREVIEW
+		// (no mutation) so the UI can warn before the user commits; with
+		// &confirm=true it deletes the spool files + rows. See ClearFailed.
+		confirm := r.URL.Query().Get("confirm") == "true"
+		items, cleared, bytes, err := spool.ClearFailed(confirm)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+			return
+		}
+		var totalBytes int64
+		for _, it := range items {
+			totalBytes += it.Size
+		}
+		resp := map[string]any{
+			"ok":     true,
+			"action": "clear-failed",
+		}
+		if !confirm {
+			resp["preview"] = true
+			resp["would_clear"] = len(items)
+			resp["would_free_bytes"] = totalBytes
+			resp["items"] = items
+			resp["note"] = "no changes made — these files never reached the backend; re-call with &confirm=true to discard them"
+			jmlog.Info("spool-recover: clear-failed PREVIEW", "would_clear", len(items), "bytes", totalBytes)
+		} else {
+			resp["preview"] = false
+			resp["cleared"] = cleared
+			resp["freed_bytes"] = bytes
+			jmlog.Warn("spool-recover: clear-failed CONFIRMED — discarded un-drained files", "cleared", cleared, "bytes", bytes)
+		}
+		data, _ := json.Marshal(resp)
+		w.Write(data)
 	default:
 		w.WriteHeader(http.StatusBadRequest)
-		msg := fmt.Sprintf("unknown action %q (want retry-failed | clear-stalled)", action)
+		msg := fmt.Sprintf("unknown action %q (want retry-failed | clear-stalled | clear-failed)", action)
 		fmt.Fprintf(w, `{"ok":false,"error":%q}`, msg)
 	}
 }

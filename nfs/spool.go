@@ -1306,6 +1306,71 @@ func (s *SpoolStore) RetryFailed() (int, error) {
 	return n, nil
 }
 
+// ClearFailedItem describes one FAILED spool entry that ClearFailed would
+// discard. The JSON-friendly preview the UI shows before the user confirms.
+type ClearFailedItem struct {
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	Attempts  int    `json:"attempts"`
+	LastError string `json:"last_error"`
+}
+
+// ClearFailed PERMANENTLY discards FAILED spool rows: it removes the DB row and
+// deletes the local spool file (the bytes that never reached the backend). This
+// is DESTRUCTIVE — for a file whose source no longer exists, the spool file is
+// the only copy. So it mutates ONLY when confirm=true; with confirm=false it
+// returns the preview list (and total bytes) and changes nothing, letting the UI
+// warn ("N files / X GB never uploaded — discard?") before the user commits.
+//
+// Failed rows are NOT part of the `used` capacity budget (failPermanent already
+// released them, see RetryFailed's note), so we do NOT touch s.used here. A
+// NEWER row for the same path is irrelevant to clearing (unlike retry, we're not
+// resurrecting bytes) — we still discard this terminal failed row. Returns the
+// preview items (always), the count actually cleared (0 when !confirm), and the
+// bytes freed.
+func (s *SpoolStore) ClearFailed(confirm bool) (items []ClearFailedItem, cleared int, bytes int64, err error) {
+	rows, err := s.meta.ListAll()
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	for _, r := range rows {
+		if r.DrainState != metadata.DrainFailed {
+			continue
+		}
+		items = append(items, ClearFailedItem{
+			Path:      r.NFSPath,
+			Size:      r.Size,
+			Attempts:  r.DrainAttempts,
+			LastError: r.LastError,
+		})
+		if !confirm {
+			continue
+		}
+		// Delete the un-drained local spool file first. A leaked file is a
+		// far better failure mode than a dangling DB row, so we proceed to
+		// delete the row even if the unlink fails (ENOENT is expected for
+		// quarantined/boot-scrubbed rows whose file already moved).
+		if r.SpoolFile != "" {
+			if rmErr := os.Remove(r.SpoolFile); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("spool: clear-failed remove file %d (%s): %v", r.ID, r.SpoolFile, rmErr)
+			}
+		}
+		if delErr := s.meta.Delete(r.ID); delErr != nil {
+			log.Printf("spool: clear-failed delete row %d (%s): %v", r.ID, r.NFSPath, delErr)
+			continue
+		}
+		cleared++
+		bytes += r.Size
+		jmlog.Info("spool: clear-failed discarded a permanently-failed entry",
+			"path", r.NFSPath, "bytes", r.Size, "attempts", r.DrainAttempts, "last_error", r.LastError)
+	}
+	if confirm && cleared > 0 {
+		jmlog.Warn("spool: clear-failed discarded failed entries (un-drained bytes deleted)",
+			"cleared", cleared, "bytes", bytes)
+	}
+	return items, cleared, bytes, nil
+}
+
 // RecoverStalled force-finalizes every stalled `writing` entry NOW
 // instead of waiting for the sweeper's next pass: entries with leaked
 // handles quiescent beyond the escalation window go through the same
