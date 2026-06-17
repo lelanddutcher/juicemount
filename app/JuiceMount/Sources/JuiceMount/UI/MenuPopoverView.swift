@@ -51,12 +51,20 @@ struct MenuPopoverView: View {
     @State private var prevBytesReadAt: Date = .distantPast
     @State private var readRateMBps: Double = 0
     @State private var lastMetricsFetchedAt: Date = .distantPast
+    // Background-operation activity (4.10): polled from /activity on the same
+    // 2s tick. nil until the first fetch lands; the row hides when not busy.
+    @State private var activity: NFSBridge.Activity?
+    // Clear-failed confirm flow (4.8): the preview result drives an alert that
+    // shows what will be discarded BEFORE the destructive confirm.
+    @State private var showClearFailedConfirm = false
+    @State private var clearFailedPreview: NFSBridge.ClearFailedResult?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
             volumeSection
+            activitySection
             Divider()
             healthSection
             Divider()
@@ -144,6 +152,11 @@ struct MenuPopoverView: View {
                     prevBytesReadAt = now
                     lastMetricsFetchedAt = now
                 }
+            }
+            // /activity — background-op surface (4.10). Leaves the prior value
+            // intact on a failed fetch (same fire-and-forget discipline).
+            if let act = NFSBridge.activity(metricsAddr: metricsAddr) {
+                DispatchQueue.main.async { activity = act }
             }
         }
     }
@@ -750,6 +763,8 @@ struct MenuPopoverView: View {
                             if s.failedFiles > 0 {
                                 Button("Retry failed") { runSpoolRecover("retry-failed") }
                                     .help("Re-queue failed uploads whose data is still on this Mac's spool.")
+                                Button("Clear failed") { startClearFailed() }
+                                    .help("Permanently discard failed uploads. You'll be asked to confirm first — these files never reached your storage.")
                             }
                             if s.stalledFiles > 0 {
                                 Button("Recover stalled") { runSpoolRecover("clear-stalled") }
@@ -762,6 +777,16 @@ struct MenuPopoverView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(spoolRecoverInFlight)
+                        // Clear-failed confirm (4.8): destructive, so the user sees
+                        // exactly what will be discarded before committing.
+                        .alert("Discard failed uploads?", isPresented: $showClearFailedConfirm, presenting: clearFailedPreview) { preview in
+                            Button("Cancel", role: .cancel) { clearFailedPreview = nil }
+                            Button("Discard \(preview.wouldClear) file\(preview.wouldClear == 1 ? "" : "s")", role: .destructive) {
+                                confirmClearFailed()
+                            }
+                        } message: { preview in
+                            Text("\(preview.wouldClear) file\(preview.wouldClear == 1 ? "" : "s") (\(formatBytes(preview.wouldFreeBytes))) failed to upload and never reached your storage. Discarding removes them from the spool permanently — this cannot be undone.")
+                        }
                     }
                 } else {
                     Text("All uploads drained — writes are caught up with your storage.")
@@ -882,6 +907,72 @@ struct MenuPopoverView: View {
                 if let result, !result.ok, let err = result.error {
                     NFSBridge.appLog("spool-recover \(action) failed: \(err)")
                 }
+                server.refreshCacheStatus()
+            }
+        }
+    }
+
+    // MARK: - Background activity row (4.10)
+
+    /// A compact "what's happening in the background" line, shown only while
+    /// something is running (reconcile / drain / prefetch). Explains a slow
+    /// Finder moment as a known task in progress. Hidden when idle.
+    @ViewBuilder
+    private var activitySection: some View {
+        if let act = activity, act.busy {
+            HStack(alignment: .top, spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text(act.summary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .help(act.operations.filter { $0.active }.map(\.detail).joined(separator: "\n"))
+        }
+    }
+
+    // MARK: - Clear failed files (4.8)
+
+    /// Step 1: PREVIEW. Fetch the count/bytes that would be discarded, then
+    /// raise the confirm alert. No mutation here — the destructive call only
+    /// happens on the user's explicit confirm (confirmClearFailed).
+    private func startClearFailed() {
+        spoolRecoverInFlight = true
+        let addr = server.preferences.metricsAddr
+        Task {
+            let preview = await Task.detached { NFSBridge.spoolClearFailed(confirm: false, metricsAddr: addr) }.value
+            await MainActor.run {
+                spoolRecoverInFlight = false
+                if let preview, preview.wouldClear > 0 {
+                    clearFailedPreview = preview
+                    showClearFailedConfirm = true
+                } else {
+                    // Nothing left to clear (e.g. a concurrent retry drained them).
+                    server.refreshCacheStatus()
+                }
+            }
+        }
+    }
+
+    /// Step 2: CONFIRM. The user accepted the destructive discard — call with
+    /// confirm=true, then refresh so the failed count drops to zero.
+    private func confirmClearFailed() {
+        spoolRecoverInFlight = true
+        let addr = server.preferences.metricsAddr
+        Task {
+            let result = await Task.detached { NFSBridge.spoolClearFailed(confirm: true, metricsAddr: addr) }.value
+            await MainActor.run {
+                spoolRecoverInFlight = false
+                if let result, result.ok {
+                    NFSBridge.appLog("clear-failed: discarded \(result.cleared) file(s), freed \(result.freedBytes) bytes")
+                } else if let err = result?.error {
+                    NFSBridge.appLog("clear-failed confirm failed: \(err)")
+                }
+                clearFailedPreview = nil
                 server.refreshCacheStatus()
             }
         }

@@ -566,6 +566,132 @@ public enum NFSBridge {
         return result
     }
 
+    // MARK: - Clear failed files (roadmap 4.8)
+
+    /// Result of `/spool-recover?action=clear-failed`. Two-phase: a PREVIEW
+    /// (confirm=false) reports `wouldClear` / `wouldFreeBytes` and mutates
+    /// nothing; a CONFIRM (confirm=true) reports `cleared` / `freedBytes`.
+    /// Mirrors the clear-failed branch in handleSpoolRecoverHTTP.
+    public struct ClearFailedResult: Codable, Equatable {
+        public var ok: Bool = false
+        public var preview: Bool = false
+        public var wouldClear: Int = 0
+        public var wouldFreeBytes: Int64 = 0
+        public var cleared: Int = 0
+        public var freedBytes: Int64 = 0
+        public var error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case ok, preview, cleared, error
+            case wouldClear = "would_clear"
+            case wouldFreeBytes = "would_free_bytes"
+            case freedBytes = "freed_bytes"
+        }
+
+        /// Tolerant decode — same JSON-null discipline as SpoolStatus.
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.ok = try c.decodeIfPresent(Bool.self, forKey: .ok) ?? false
+            self.preview = try c.decodeIfPresent(Bool.self, forKey: .preview) ?? false
+            self.wouldClear = try c.decodeIfPresent(Int.self, forKey: .wouldClear) ?? 0
+            self.wouldFreeBytes = try c.decodeIfPresent(Int64.self, forKey: .wouldFreeBytes) ?? 0
+            self.cleared = try c.decodeIfPresent(Int.self, forKey: .cleared) ?? 0
+            self.freedBytes = try c.decodeIfPresent(Int64.self, forKey: .freedBytes) ?? 0
+            self.error = try c.decodeIfPresent(String.self, forKey: .error)
+        }
+    }
+
+    /// Clear (or preview clearing) permanently-failed spool entries. Blocking —
+    /// call from a background queue. `confirm=false` is a safe PREVIEW (no
+    /// mutation); `confirm=true` permanently discards the un-drained bytes. The
+    /// UI MUST preview first, show the count/bytes, and only confirm on the
+    /// user's explicit OK. Endpoint: `/spool-recover?action=clear-failed`.
+    public static func spoolClearFailed(confirm: Bool, metricsAddr: String = "127.0.0.1:11050") -> ClearFailedResult? {
+        var comps = URLComponents()
+        comps.scheme = "http"
+        let parts = metricsAddr.split(separator: ":", maxSplits: 1)
+        comps.host = parts.first.map(String.init) ?? "127.0.0.1"
+        comps.port = parts.count > 1 ? Int(parts[1]) : nil
+        comps.path = "/spool-recover"
+        comps.queryItems = [URLQueryItem(name: "action", value: "clear-failed")]
+        if confirm { comps.queryItems?.append(URLQueryItem(name: "confirm", value: "true")) }
+        guard let url = comps.url else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 15
+        let sem = DispatchSemaphore(value: 0)
+        var result: ClearFailedResult?
+        let session = loopbackSession()
+        session.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            do {
+                result = try JSONDecoder().decode(ClearFailedResult.self, from: data)
+            } catch {
+                appLog("spoolClearFailed(confirm:\(confirm)) decode failed: \(error)")
+            }
+        }.resume()
+        sem.wait()
+        session.finishTasksAndInvalidate()
+        return result
+    }
+
+    // MARK: - Background activity (roadmap 4.10)
+
+    /// One background operation surfaced by `/activity`. Mirrors
+    /// activityOperation in cbridge.go.
+    public struct ActivityOperation: Codable, Equatable, Identifiable {
+        public var kind: String = ""
+        public var active: Bool = false
+        public var detail: String = ""
+        public var id: String { kind }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? ""
+            self.active = try c.decodeIfPresent(Bool.self, forKey: .active) ?? false
+            self.detail = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
+        }
+        enum CodingKeys: String, CodingKey { case kind, active, detail }
+    }
+
+    /// The `/activity` snapshot — what background work (reconcile / drain /
+    /// prefetch) is running, with a plain-language `summary`.
+    public struct Activity: Codable, Equatable {
+        public var busy: Bool = false
+        public var summary: String = ""
+        public var operations: [ActivityOperation] = []
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.busy = try c.decodeIfPresent(Bool.self, forKey: .busy) ?? false
+            self.summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
+            self.operations = try c.decodeIfPresent([ActivityOperation].self, forKey: .operations) ?? []
+        }
+        enum CodingKeys: String, CodingKey { case busy, summary, operations }
+    }
+
+    /// Fetch the background-activity snapshot. Blocking — call from a
+    /// background queue. Endpoint: `/activity` (GET). Returns nil only when the
+    /// metrics server is unreachable.
+    public static func activity(metricsAddr: String = "127.0.0.1:11050") -> Activity? {
+        guard let url = URL(string: "http://\(metricsAddr)/activity") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 5
+        let sem = DispatchSemaphore(value: 0)
+        var result: Activity?
+        let session = loopbackSession()
+        session.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            result = try? JSONDecoder().decode(Activity.self, from: data)
+        }.resume()
+        sem.wait()
+        session.finishTasksAndInvalidate()
+        return result
+    }
+
     // MARK: - Mount Now (LB-2)
 
     /// Result of `/mount-now` — the control-plane action that re-runs the
