@@ -413,6 +413,16 @@ func (rc *RedisClient) LastSyncEntries() int {
 	return rc.lastSyncEntries
 }
 
+// IsSyncing reports whether a reconcile (metadata index rebuild) is running
+// right now — i.e. the most recent sync STARTED after the most recent sync
+// COMPLETED. Used by /activity to surface "Rebuilding index…" while a full
+// SCAN is in flight (the period when Finder can feel sluggish on cold paths).
+func (rc *RedisClient) IsSyncing() bool {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	return !rc.lastSyncStartedAt.IsZero() && rc.lastSyncStartedAt.After(rc.lastSyncTime)
+}
+
 // SyncOnce performs a single batch reconciliation (Lua tree pull → SQLite).
 func (rc *RedisClient) SyncOnce() error {
 	return rc.syncMetadata()
