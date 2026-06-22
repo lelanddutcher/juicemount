@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -208,6 +209,22 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		return C.CString("error: " + errMsg)
 	}
 
+	// R-4 (start-while-offline): probe the metadata backend ONCE, up front, with
+	// a cheap short TCP dial. When it's unreachable (laptop opened on a plane,
+	// NAS asleep, router down) startup takes the offline path: skip the
+	// synchronous boot-time FUSE mount (which would otherwise stall ~30s on a
+	// dead Redis before failing), don't burn ~31s on connect retries, build a
+	// deferred Redis client, and pre-engage auto-offline so directory navigation
+	// serves from the SQLite mirror while reads fail-fast. The watchdog +
+	// reconcile loop recover everything automatically when the backend returns.
+	// A reachable backend — the overwhelmingly common case — takes the unchanged
+	// online path.
+	backendUp := backendReachableQuick(cfg.RedisURL, 1500*time.Millisecond)
+	if !backendUp {
+		jmlog.Warn("metadata backend unreachable at startup — taking the start-while-offline path (serving cached navigation; reads resume when the backend returns)",
+			"redis_url", cfg.RedisURL)
+	}
+
 	// Mount JuiceFS FUSE if not already mounted. This is what the standalone
 	// CLI (cmd/jm5/main.go) does on startup; the c-archive bridge needs to do
 	// it too, otherwise NFS will be pointing at an empty directory.
@@ -279,10 +296,22 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// app with NO FUSE self-heal at all. The watchdog retries once the
 			// backend is reachable; registering globalFUSE keeps a later retry
 			// from leaking a second monitor goroutine.
-			mountErr := fm.Mount()
+			// R-4: skip the SYNCHRONOUS boot-time mount when the backend is
+			// unreachable. juicefs mount needs Redis as its metadata engine, so
+			// fm.Mount() would block up to ~30s before failing — the dominant
+			// offline-boot stall. We still StartMonitor + register globalFUSE so
+			// the watchdog mounts it the moment the backend returns (the same
+			// self-heal path a failed mount already relies on).
+			var mountErr error
+			if backendUp {
+				mountErr = fm.Mount()
+			}
 			fm.StartMonitor()
 			globalFUSE = fm
-			if mountErr != nil {
+			if !backendUp {
+				jmlog.Warn("deferred FUSE mount — backend unreachable at startup; the watchdog will mount it once the backend returns",
+					"path", cfg.FUSEPath)
+			} else if mountErr != nil {
 				// Launch-time mount failed — almost always a transient backend
 				// blip during startup. Do NOT abort startup: the watchdog
 				// (started above) brings FUSE up once the backend is reachable.
@@ -295,15 +324,16 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				// self-heals.
 				jmlog.Error("juicefs FUSE mount failed at launch — continuing startup; watchdog will mount it once the backend is reachable",
 					"error", mountErr.Error())
+			} else {
+				// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
+				// the *effective* config from the mount, not the user input —
+				// otherwise the user reads "100 GiB" and is confused why the
+				// daemon was actually launched with 800 GiB.
+				jmlog.Info("juicefs FUSE mounted",
+					"path", cfg.FUSEPath,
+					"effective_cache_size_mb", fm.EffectiveCacheSize(),
+					"free_space_ratio", "0.01")
 			}
-			// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
-			// the *effective* config from the mount, not the user input —
-			// otherwise the user reads "100 GiB" and is confused why the
-			// daemon was actually launched with 800 GiB.
-			jmlog.Info("juicefs FUSE mounted",
-				"path", cfg.FUSEPath,
-				"effective_cache_size_mb", fm.EffectiveCacheSize(),
-				"free_space_ratio", "0.01")
 		}
 	}
 
@@ -322,10 +352,40 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// even though the NAS comes back 3 seconds later.
 	//
 	// Retry schedule: 1s, 2s, 4s, 8s, 16s = 5 attempts, ~31s total worst case.
-	rc, err := connectRedisWithRetry(cfg.RedisURL, store, 5)
+	// R-4: when the up-front probe already found the backend down, don't burn
+	// those ~31s — one quick attempt, then take the offline-start path.
+	connectAttempts := 5
+	if !backendUp {
+		connectAttempts = 1
+	}
+	startedOffline := false
+	rc, err := connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
 	if err != nil {
-		store.Close()
-		return C.CString(fmt.Sprintf("error: redis: %v", err))
+		// R-4: do NOT abort. Start offline. A DEFERRED Redis client
+		// (connected=false) keeps every downstream rc.* call site working
+		// unchanged and self-heals via the reconcile loop (which flips
+		// connected=true on its first successful sync once the backend returns).
+		// Directory navigation serves from the SQLite mirror; file reads
+		// fail-fast with NXIO until the watchdog remounts FUSE.
+		drc, derr := metadata.NewRedisClientDeferred(cfg.RedisURL, store)
+		if derr != nil {
+			// Only a malformed Redis URL reaches here (ParseRedisURL) — a real
+			// config error the user must fix, not a transient outage.
+			store.Close()
+			return C.CString(fmt.Sprintf("error: redis: %v", derr))
+		}
+		jmlog.Warn("started offline — metadata backend unreachable; serving cached navigation, will recover automatically",
+			"reason", err.Error())
+		rc = drc
+		startedOffline = true
+		// Engage offline mode NOW (don't wait the ~22s reachability debounce) so
+		// the open/read gates AND the readdir empty-fast path are live from the
+		// first RPC. LOAD-BEARING (not cosmetic): without it, navigating into an
+		// un-synced subtree falls through to a FUSE timeout instead of returning
+		// fast. connected=false on the deferred client also makes RecentlyDegraded
+		// true, which suppresses the phantom-purge so the offline session can't
+		// delete real entries from the mirror.
+		pin.SetAutoOffline(true, offlineStartReason)
 	}
 	globalRC = rc
 	// QA-30 (2026-05-25): give the reconcile loop the path config it needs
@@ -403,12 +463,26 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				})
 			}
 		})
+		// R-4: if we started offline, seed the monitor "unreachable" so the FIRST
+		// successful probe is a real unreachable→reachable transition that fires
+		// the OnChange(true) branch above → pin.SetAutoOffline(false) + TriggerSync.
+		// Without this the monitor boots "presumed reachable" and a backend that
+		// returns quickly never transitions, leaving the boot-engaged offline mode
+		// stuck on. Must precede Start() (it seeds the state the first probe moves off).
+		if startedOffline {
+			globalReach.SeedUnreachable()
+		}
 		globalReach.Start()
 	}
 
-	// Initial sync
-	if err := rc.SyncOnce(); err != nil {
-		jmlog.Warn("initial sync failed", "error", err.Error())
+	// Initial sync. R-4: skip when started offline — it would only fail against
+	// the dead backend. rc.Start() still launches the reconcile loop, which
+	// flips connected=true and catches up the mirror on its first success once
+	// the backend returns.
+	if !startedOffline {
+		if err := rc.SyncOnce(); err != nil {
+			jmlog.Warn("initial sync failed", "error", err.Error())
+		}
 	}
 	rc.Start()
 
@@ -824,6 +898,14 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		runAndStoreSelfTest()
 	}()
 
+	// R-4: when started offline, hand Swift a "started_offline:" status so it
+	// enters .running with the "showing cached state" banner instead of treating
+	// the start as a failure. The NFS share is already mounted (above); the
+	// listen addr remains available via the stats path. Recovery is automatic
+	// (watchdog remounts FUSE; reachability OnChange lifts auto-offline).
+	if startedOffline {
+		return C.CString("started_offline: " + offlineStartReason)
+	}
 	return C.CString(srv.Addr())
 }
 
@@ -2752,6 +2834,31 @@ func handleOfflineHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(pin.State())
+}
+
+// offlineStartReason is the human-readable reason surfaced (via pin.SetAutoOffline
+// → pin.State().Reason and the "started_offline:" start result) when the app
+// boots with the metadata backend unreachable (R-4). The UI shows it in the
+// "Started offline — showing cached state" banner.
+const offlineStartReason = "Started offline — backend unreachable at launch"
+
+// backendReachableQuick does a single cheap TCP dial to the metadata host so
+// startup can decide up front whether to take the normal (online) path or the
+// start-while-offline path (R-4). It MUST be cheap and short — it gates startup
+// latency. Returns true (assume reachable, fall through to the normal connect)
+// when the URL can't be parsed, so a parse quirk never forces a spurious
+// offline start.
+func backendReachableQuick(redisURL string, timeout time.Duration) bool {
+	addr, _, err := metadata.ParseRedisURL(redisURL)
+	if err != nil || addr == "" {
+		return true
+	}
+	conn, derr := net.DialTimeout("tcp", addr, timeout)
+	if derr != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // connectRedisWithRetry wraps metadata.NewRedisClient with exponential

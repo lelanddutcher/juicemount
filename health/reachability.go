@@ -206,6 +206,24 @@ func (r *Reachability) observeRTT(sample time.Duration) {
 	r.srtt += (sample - r.srtt) / 8
 }
 
+// SeedUnreachable forces the monitor's initial state to "unreachable" BEFORE
+// Start(), so the FIRST successful probe produces a real unreachable→reachable
+// transition (firing OnChange(true)). R-4 (start-while-offline): when the app
+// boots with the backend down and pre-engages auto-offline, recovery depends on
+// that false→true transition to call SetAutoOffline(false). Without seeding, the
+// monitor's default "presumed reachable" state means a backend that returns
+// quickly never transitions, and the boot-engaged offline mode would never lift
+// — leaving the mount stuck read-refused. Idempotent; must be called before
+// Start() (it seeds the state the first probe will move off of).
+func (r *Reachability) SeedUnreachable() {
+	r.mu.Lock()
+	r.reachable = false
+	r.consecutivePass = 0
+	r.consecutiveFails = r.failsToOffline // already "fully failed"; next success flips
+	r.lastTransitionAt = time.Now()
+	r.mu.Unlock()
+}
+
 // Start begins probing in a background goroutine. Safe to call once
 // per instance; subsequent calls are no-ops.
 func (r *Reachability) Start() {

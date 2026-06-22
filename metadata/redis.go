@@ -284,6 +284,48 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 	}, nil
 }
 
+// NewRedisClientDeferred builds a RedisClient WITHOUT requiring the backend to
+// be reachable — it skips the connectivity Ping and starts in the disconnected
+// state. Used by the start-while-offline path (R-4): the app boots with the
+// backend down (e.g. a laptop opened on a plane), serves directory NAVIGATION
+// from the local SQLite mirror, and this client's reconcile loop flips
+// connected=true and catches up automatically once the backend returns.
+//
+// The returned client is structurally identical to NewRedisClient's (every
+// field initialized — stopCh, the buffered syncNowCh that TriggerSync's
+// non-blocking send needs, pruneAbsent, reconcileInterval) so every downstream
+// rc.* call site works unchanged; the ONLY differences are connected=false and
+// a non-zero lastDisconnect. connected=false matters beyond cosmetics: it makes
+// RecentlyDegraded() true, which suppresses the FUSE-Lstat phantom-purge in the
+// Stat/open paths so an offline session can't delete real entries from the
+// mirror while the backend is unreachable. The reconcile loop (rc.Start) lifts
+// connected once a reconcile succeeds; redis.NewClient itself is lazy (it dials
+// on first use), so no network happens here.
+func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error) {
+	addr, db, err := ParseRedisURL(redisURL)
+	if err != nil {
+		return nil, err
+	}
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         addr,
+		DB:           db,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		DialTimeout:  10 * time.Second,
+	})
+	return &RedisClient{
+		rdb:               rdb,
+		redisURL:          redisURL,
+		store:             store,
+		reconcileInterval: DefaultReconcileInterval,
+		stopCh:            make(chan struct{}),
+		syncNowCh:         make(chan struct{}, 1),
+		connected:         false,
+		lastDisconnect:    time.Now(),
+		pruneAbsent:       make(map[string]int),
+	}, nil
+}
+
 // Store returns the underlying metadata store.
 func (rc *RedisClient) Store() *Store { return rc.store }
 

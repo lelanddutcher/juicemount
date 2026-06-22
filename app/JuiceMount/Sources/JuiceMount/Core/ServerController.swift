@@ -51,6 +51,13 @@ public final class ServerController {
     /// uploads" section reads this and renders only when `.enabled`.
     public private(set) var spoolStatus: NFSBridge.SpoolStatus?
 
+    /// R-4 (start-while-offline): set to the reason string when the server
+    /// booted with the backend unreachable (Go returned "started_offline:").
+    /// Drives the "Started offline — showing cached state" banner. Cleared
+    /// automatically once auto-offline lifts (the backend came back), in
+    /// refreshCacheStatus — so the banner is self-dismissing on recovery.
+    public private(set) var offlineStartupReason: String?
+
     /// LB-2 state honesty: false when the server is running but the
     /// user-visible NFS volume is NOT in the kernel mount table (the
     /// health monitor's "nfs" component reports "not mounted" — see
@@ -140,8 +147,23 @@ public final class ServerController {
             guard let self else { return }
             do {
                 let addr = try NFSBridge.start(config: cfg)
+                // R-4: the Go core hands back "started_offline: <reason>" when it
+                // booted with the backend unreachable — the NFS share is mounted
+                // and serving cached navigation, so this is a SUCCESS (.running),
+                // not a start failure. Auto-offline is already engaged on the Go
+                // side; the reason drives the "showing cached state" banner and
+                // auto-clears when the backend returns.
+                let offlinePrefix = "started_offline:"
+                let startedOffline = addr.hasPrefix(offlinePrefix)
                 Task { @MainActor in
-                    self.log.info("Server started at \(addr, privacy: .public)")
+                    if startedOffline {
+                        let reason = String(addr.dropFirst(offlinePrefix.count)).trimmingCharacters(in: .whitespaces)
+                        self.log.warning("Server started OFFLINE — \(reason, privacy: .public)")
+                        self.offlineStartupReason = reason
+                    } else {
+                        self.log.info("Server started at \(addr, privacy: .public)")
+                        self.offlineStartupReason = nil
+                    }
                     self.state = .running
                     self.lastError = nil
                     self.startPolling()
@@ -344,6 +366,11 @@ public final class ServerController {
                         self.notifyOfflineTransition(autoEngaged: o.auto_offline, reason: o.reason)
                     }
                     self.hasCompletedInitialOfflineFetch = true
+                    // R-4: the backend came back (auto-offline lifted) — drop the
+                    // "started offline" banner so it's self-dismissing on recovery.
+                    if !o.auto_offline && self.offlineStartupReason != nil {
+                        self.offlineStartupReason = nil
+                    }
                 }
                 // If o is nil: leave offlineState as-is (stale rather
                 // than misleadingly reset to "online"). Next successful

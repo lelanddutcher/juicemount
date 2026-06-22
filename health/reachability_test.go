@@ -133,6 +133,47 @@ func TestReachability_RecoveryAfterFailure(t *testing.T) {
 	}
 }
 
+// TestReachability_SeedUnreachableFiresRecoveryOnFirstSuccess locks in the R-4
+// boot-race fix. When the app starts offline and pre-engages auto-offline, it
+// seeds the monitor "unreachable" so that even a backend that is reachable from
+// the very first probe still produces an unreachable→reachable transition — the
+// event that calls SetAutoOffline(false). Without the seed (the default
+// "presumed reachable" state) an immediately-reachable backend fires NO
+// transition, and the boot-engaged offline mode would never lift.
+func TestReachability_SeedUnreachableFiresRecoveryOnFirstSuccess(t *testing.T) {
+	d := &fakeDialer{reachable: true} // backend is UP from the first probe
+	r := NewReachability("ignored:0",
+		withDialer(d),
+		WithBaseInterval(10*time.Millisecond),
+		WithSuccessThreshold(1),
+	)
+	var states []bool
+	var statesMu sync.Mutex
+	r.OnChange(func(reachable bool, _ string) {
+		statesMu.Lock()
+		states = append(states, reachable)
+		statesMu.Unlock()
+	})
+
+	r.SeedUnreachable()
+	if r.Reachable() {
+		t.Fatal("after SeedUnreachable, Reachable() must be false before the first probe")
+	}
+
+	r.Start()
+	defer r.Stop()
+
+	// The first successful probe must produce a false→true transition.
+	if err := waitFor(200*time.Millisecond, func() bool { return r.Reachable() }); err != nil {
+		t.Fatalf("seeded recovery transition didn't fire: %v", err)
+	}
+	statesMu.Lock()
+	defer statesMu.Unlock()
+	if len(states) != 1 || !states[0] {
+		t.Fatalf("expected exactly one [true] transition from seeded-unreachable boot, got %v", states)
+	}
+}
+
 // TestReachability_SingleFailureDoesNotFlip confirms the debounce
 // works at the boundary: one failure followed by a success should
 // not produce a transition.

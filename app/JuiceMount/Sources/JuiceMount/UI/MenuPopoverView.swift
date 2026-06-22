@@ -609,6 +609,22 @@ struct MenuPopoverView: View {
                 offlineToggle
             }
 
+            // R-4: started-offline banner. The app booted with the backend
+            // unreachable and is serving the cached file list; it auto-hides
+            // (offlineStartupReason clears) once the backend reconnects.
+            if server.offlineStartupReason != nil {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Image(systemName: "wifi.slash")
+                        .font(.caption2)
+                        .foregroundStyle(.blue)
+                    Text("Started offline — showing the cached file list. Files open and updates resume automatically when the backend reconnects.")
+                        .font(.caption2)
+                        .foregroundStyle(.blue)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.vertical, 2)
+            }
+
             // Pin Folder button — always visible. Pops a native NSOpenPanel
             // rooted in the JuiceMount volume.
             HStack(spacing: 6) {
