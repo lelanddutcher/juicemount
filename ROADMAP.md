@@ -289,9 +289,15 @@ Serve the website version(s) on localhost for another review pass.
 Audit JuiceMount Manager against what was scoped; Trash and Destinations pages reported inop.
 (See tasks #31–34.)
 
-### R-8 Menu-bar mount-state reporting edge cases
+### R-8 Menu-bar mount-state reporting edge cases — ✅ FIXED 2026-06-22 (awaiting deploy)
 Internet disconnect/change makes the mount go offline → reconnect → responsive, but the menu
-bar still reports DISCONNECTED. Audit the color/text state machine. (Task #30.)
+bar still reports DISCONNECTED. Audit the color/text state machine. (Task #30.) ROOT CAUSE (adversarial
+multi-agent investigation): criterion asymmetry — `.disconnected` is ENTERED on FUSE-only, but both
+recovery backstops gated on `/health` Overall (which ANDs in NFS); the loopback NFS mount recovers
+~180s slower than the backend, so the red latch stuck while reads worked. FIX: HealthProbe.coreHealthy
+(fuse/redis/minio, ignoring NFS) gates both backstops; glanceState reads the reliable in-process
+cacheStatus.offline_mode (not the HTTP /offline fetch that's kept stale on nil) so the blue "Offline
+files" icon also clears promptly. NFS-mount health stays surfaced via volumeMounted (amber, "Mount Now").
 
 ### R-9 Settings clarity + design sprint — ✅ SHIPPED 2026-06-22
 Settings text fields aren't obviously editable (users miss that they can change the volume
