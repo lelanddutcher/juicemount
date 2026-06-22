@@ -557,12 +557,18 @@ public final class ServerController {
         let metricsAddr = preferences.metricsAddr
         workQueue.async { [weak self] in
             guard let probe = NFSBridge.healthProbe(metricsAddr: metricsAddr) else { return }
-            guard probe.healthy else { return }
+            // R-8: gate on coreHealthy (FUSE/Redis/MinIO), NOT probe.healthy
+            // (= /health Overall, which ANDs in NFS). The loopback NFS mount
+            // recovers on a slower timeline (deferred remount up to ~180s) than
+            // the backend, so gating on Overall left the red "Disconnected"
+            // latched while reads already worked. NFS-mount health drives
+            // volumeMounted separately, not the connected/disconnected verdict.
+            guard probe.coreHealthy else { return }
             Task { @MainActor in
                 guard let self else { return }
                 switch self.state {
                 case .disconnected, .degraded:
-                    self.log.warning("backstop: /health probe says healthy while state=\(self.state.displayLabel, privacy: .public) for \(self.stuckTicks) ticks — forcing transition to .running")
+                    self.log.warning("backstop: /health probe says core-healthy while state=\(self.state.displayLabel, privacy: .public) for \(self.stuckTicks) ticks — forcing transition to .running")
                     self.state = .running
                     self.stuckTicks = 0
                     // Refresh ancillary state too so the popover doesn't
@@ -616,7 +622,12 @@ public final class ServerController {
         // missed (it only covered .disconnected/.degraded).
         let metricsAddr = preferences.metricsAddr
         recoveryQueue.async { [weak self] in
-            guard let probe = NFSBridge.healthProbe(metricsAddr: metricsAddr), probe.healthy else { return }
+            // R-8: coreHealthy (FUSE/Redis/MinIO), NOT probe.healthy (NFS-
+            // inclusive Overall). This watchdog is the ONLY recovery path that
+            // survives a wedged workQueue — but while it gated on Overall it
+            // no-op'd for the entire NFS-recovery lag, so a flap left the menu
+            // bar stuck "Disconnected" even though the backend was reachable.
+            guard let probe = NFSBridge.healthProbe(metricsAddr: metricsAddr), probe.coreHealthy else { return }
             Task { @MainActor in
                 guard let self, !self.userStopRequested else { return }
                 if Int(Date().timeIntervalSince(self.lastPollTickAt)) > 15 {
@@ -742,19 +753,29 @@ public extension ServerController {
     ///     with "Mount Now" as the popover remedy).
     ///  5. healthy  — .running/.syncing with the volume mounted.
     var glanceState: GlanceState {
+        // R-8: trust cacheStatus.offline_mode (read via the in-process cgo
+        // NFSServerCacheStatus on every refresh — it CANNOT go stale the way the
+        // separate HTTP /offline fetch can, which is kept last-known on a nil
+        // response). offlineState.offline lagged up to a full poll after a
+        // reconnect, leaving the blue "Offline files" icon up while the core had
+        // already cleared auto-offline. This also matches the offline TOGGLE,
+        // which already binds to cacheStatus.offline_mode — so icon and toggle
+        // never disagree. (offlineState is still used for auto-offline
+        // notification edges, which want the reason/since metadata.)
+        let effectivelyOffline = cacheStatus.offline_mode
         switch state {
         case .error, .disconnected:
             return .fault
         case .idle:
             return .idle
         case .starting:
-            return offlineState.offline ? .offlineFiles : .degraded
+            return effectivelyOffline ? .offlineFiles : .degraded
         case .degraded:
             if !volumeMounted { return .degraded }
-            return offlineState.offline ? .offlineFiles : .degraded
+            return effectivelyOffline ? .offlineFiles : .degraded
         case .running, .syncing:
             if !volumeMounted { return .degraded }
-            return offlineState.offline ? .offlineFiles : .healthy
+            return effectivelyOffline ? .offlineFiles : .healthy
         }
     }
 

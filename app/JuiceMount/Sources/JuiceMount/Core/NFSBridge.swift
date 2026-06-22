@@ -367,6 +367,19 @@ public enum NFSBridge {
             self.components = try c.decodeIfPresent([String: String].self, forKey: .components) ?? [:]
             self.reason = try c.decodeIfPresent(String.self, forKey: .reason)
         }
+
+        /// Core backend reachability — FUSE/Redis/MinIO all "ok", IGNORING NFS.
+        /// R-8: the menu-bar `.disconnected` state is ENTERED on a FUSE-only
+        /// criterion, but the loopback NFS mount recovers on a slower timeline
+        /// than the backend (deferred remount up to ~180s). `healthy` (= /health
+        /// Overall) ANDs in NFS, so gating recovery on it leaves the red
+        /// "Disconnected" latched while the backend — and actual reads — are
+        /// already fine. Recovery backstops gate on THIS instead, matching the
+        /// `fullyHealthy = FUSE&&Redis&&MinIO` criterion the primary state path
+        /// uses. NFS-mount health is surfaced separately via `volumeMounted`.
+        public var coreHealthy: Bool {
+            components["fuse"] == "ok" && components["redis"] == "ok" && components["minio"] == "ok"
+        }
     }
 
     public static func healthProbe(metricsAddr: String = "127.0.0.1:11050") -> HealthProbe? {
