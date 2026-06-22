@@ -250,14 +250,20 @@ task in progress*, not *the product is broken*. Include an ETA/throughput where 
 
 Working through as a loop. Code bugs first, then features/planning, then UI/audits.
 
-### R-1 Pinned dir larger than disk → prefetch loops forever
+Progress (2026-06-22): R-1, R-2, R-9 **SHIPPED** (built, deployed, backend-validated — verdict
+math confirmed against live REEL_0065 pins). R-3 noted, R-5 ideated. **#43** (offline gate trusted
+the stale pin "Ready" flag → tarpit/empty offline read; the *real* root cause of the original
+"offline broke" report — R-1 proved it was never a capacity problem) coded + committed, awaiting a
+deploy + real offline validation. Remaining: R-4, R-6, R-7, R-8.
+
+### R-1 Pinned dir larger than disk → prefetch loops forever — ✅ SHIPPED 2026-06-22
 Pinning a directory whose bytes exceed the usable cache capacity never converges: JuiceFS
 LRU-evicts as the prefetcher warms, so files never all stay Ready and the re-warm loop runs
 forever. FIX: at pin time compute pinned-bytes vs available cache capacity; if it can't fit,
 surface a clear "pinned set (X) exceeds available cache (Y) — free space or pin less" state and
 stop the infinite re-warm. (Root-caused 2026-06-17: 180 GB pinned, 139 GB free → never converges.)
 
-### R-2 Pinning a folder doesn't take effect on first attempt / tens-of-seconds delay
+### R-2 Pinning a folder doesn't take effect on first attempt / tens-of-seconds delay — ✅ SHIPPED 2026-06-22
 After selecting a dir in the Finder pin picker and clicking Pin, nothing changes in the pinned
 UI for tens of seconds. Likely the PullPending 5s poll + slow UI refresh. FIX: signal the
 prefetcher immediately on pin (don't wait for the poll), and refresh the pin UI promptly so the
@@ -287,10 +293,20 @@ Audit JuiceMount Manager against what was scoped; Trash and Destinations pages r
 Internet disconnect/change makes the mount go offline → reconnect → responsive, but the menu
 bar still reports DISCONNECTED. Audit the color/text state machine. (Task #30.)
 
-### R-9 Settings clarity + design sprint
+### R-9 Settings clarity + design sprint — ✅ SHIPPED 2026-06-22
 Settings text fields aren't obviously editable (users miss that they can change the volume
 name); move the volume-name field down to the "mounts at" row; run a design sprint to make the
-whole settings pane cleaner/clearer.
+whole settings pane cleaner/clearer. DONE: composed `/Volumes/[name]` Mounts-at row with a bordered
+editable volume-name field, custom mount point moved to a disclosure, `.roundedBorder` on all
+address fields.
+
+### #43 Offline gate trusted the stale pin "Ready" flag — ✅ FIXED 2026-06-22 (awaiting deploy)
+The read-time offline gate exempted pinned files, trusting the pin "Ready" flag as proof the bytes
+were resident. After LRU eviction that flag is stale → offline reads tarpitted on an unreachable
+backend GET / returned empties. The original "offline access to a pinned reel broke" report. FIX:
+pinned files now use the same bounded-read-then-refuse path as un-pinned (4s bound vs 1.5s) — a
+resident block is served, an evicted one refuses cleanly with ErrOfflineNotAvailable. Safe by
+construction (never returns wrong bytes; offline-only cost).
 
 - **NFS v4.1**: server-initiated callbacks (delegations) for instant invalidation. Major protocol change.
 - **Redis Streams**: replace SUBSCRIBE + Lua SCAN with a Redis Stream for change tracking. Requires JuiceFS cooperation or a sidecar.
