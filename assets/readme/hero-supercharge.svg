@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 380" width="1200" height="380" role="img" aria-label="JuiceMount hero banner: Supercharge video editing off your NAS. An isometric stack shows an NLE timeline with a moving playhead, an SSD cache warming, NAS drives, and footage streaming up the stack.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 380" width="1200" height="380" role="img" aria-label="JuiceMount hero: Supercharge video editing off your NAS. An isometric stack shows an NLE timeline, an SSD cache warming green, NAS drives, film strips threading footage up the stack, and blocks rising from the drives.">
 <title>Supercharge video editing off your NAS</title>
-<desc>Hero banner for indie filmmakers and small post teams. Left side shows the headline and two buttons: Set it up on your NAS, and Install from GitHub. Right side shows an animated isometric stack: an NLE timeline with a wandering playhead, an SSD cache with cells pulsing green, NAS drives, and green footage blocks rising from the NAS up to the cache.</desc>
+<desc>Animated isometric stack: an NLE timeline with a wandering playhead, film strips threading footage up into it, an SSD cache with cells pulsing green, four NAS drive bays, and green blocks rising from the drives to the cache.</desc>
 <style>
   .ph{animation:playhead 8s ease-in-out infinite;transform-box:fill-box}
   .cache-a{animation:cachePulse 8s ease-in-out infinite}
@@ -11,56 +11,50 @@
   .rise3{animation:rise 6s ease-in-out infinite;animation-delay:-4s;transform-box:fill-box}
   .clipA{animation:clipGlow 8s ease-in-out infinite}
   .clipB{animation:clipGlow 8s ease-in-out infinite;animation-delay:-4s}
+  .thr1{animation:thread 7s linear infinite}
+  .thr2{animation:thread 8.2s linear infinite}
+  .thr3{animation:thread 6.3s linear infinite}
   @keyframes playhead{0%{transform:translate(0,0)}25%{transform:translate(96px,0)}50%{transform:translate(150px,0)}75%{transform:translate(54px,0)}100%{transform:translate(0,0)}}
-  @keyframes cachePulse{0%,100%{opacity:.18}45%{opacity:1}55%{opacity:1}}
+  @keyframes cachePulse{0%,100%{opacity:.18}45%,55%{opacity:1}}
   @keyframes clipGlow{0%,100%{opacity:.55}50%{opacity:1}}
-  @keyframes rise{0%{transform:translate(0,0);opacity:0}12%{opacity:1}85%{opacity:1}100%{transform:translate(0,-118px);opacity:0}}
+  @keyframes rise{0%{transform:translate(0,0);opacity:0}12%{opacity:1}85%{opacity:1}100%{transform:translate(0,-120px);opacity:0}}
+  @keyframes thread{from{transform:translate(0,0)}to{transform:translate(0,-126px)}}
   @media (prefers-reduced-motion: reduce){*{animation:none !important}}
 </style>
-
+<defs>
+  <clipPath id="fs1"><rect x="704" y="102" width="22" height="120"/></clipPath>
+  <clipPath id="fs2"><rect x="729" y="102" width="22" height="120"/></clipPath>
+  <clipPath id="fs3"><rect x="754" y="102" width="22" height="120"/></clipPath>
+</defs>
 <rect x="0" y="0" width="1200" height="380" rx="22" fill="#17181B"/>
 <rect x="0.5" y="0.5" width="1199" height="379" rx="21.5" fill="none" stroke="#34353a" stroke-width="1"/>
-
 <text x="70" y="84" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="14" letter-spacing="0.6" fill="rgba(250,253,232,0.72)">for indie filmmakers and small post teams</text>
-
 <text x="69" y="156" font-family="Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="50" font-weight="600" fill="#FAFDE8">Supercharge video</text>
 <text x="69" y="210" font-family="Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="50" font-weight="600" fill="#FAFDE8">editing off your NAS.</text>
-
 <text x="70" y="250" font-family="Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" fill="rgba(250,253,232,0.72)">Self-hosted cache that streams footage straight from your drives.</text>
-
-<g>
-  <rect x="70" y="284" width="226" height="50" rx="25" fill="#AACD58"/>
-  <text x="183" y="314" text-anchor="middle" font-family="Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#17181B">Set it up on your NAS</text>
-</g>
-<g>
-  <rect x="312" y="284" width="216" height="50" rx="25" fill="none" stroke="#3a3b3e" stroke-width="1.5"/>
-  <text x="420" y="314" text-anchor="middle" font-family="Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="500" fill="#FAFDE8">Install from GitHub</text>
-</g>
-
-<!-- isometric stack: scaled + positioned to fit the right half with margin -->
+<g><rect x="70" y="284" width="226" height="50" rx="25" fill="#AACD58"/><text x="183" y="314" text-anchor="middle" font-family="Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#17181B">Set it up on your NAS</text></g>
+<g><rect x="312" y="284" width="216" height="50" rx="25" fill="none" stroke="#3a3b3e" stroke-width="1.5"/><text x="420" y="314" text-anchor="middle" font-family="Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="500" fill="#FAFDE8">Install from GitHub</text></g>
 <g transform="translate(158,52) scale(0.80)">
-
-  <!-- NLE timeline (top floor) -->
-  <g transform="translate(700,40) matrix(0.866 -0.28 0.5 0.484 0 0)">
-    <rect x="0" y="0" width="290" height="150" rx="6" fill="#0e0f11" stroke="#34353a" stroke-width="1"/>
-    <rect class="clipA" x="14" y="16" width="80" height="16" rx="3" fill="#378ADD"/>
-    <rect x="100" y="16" width="44" height="16" rx="3" fill="#54565a"/>
-    <rect class="clipB" x="150" y="16" width="64" height="16" rx="3" fill="#AACD58"/>
-    <rect x="220" y="16" width="54" height="16" rx="3" fill="#54565a"/>
-    <rect x="14" y="42" width="58" height="16" rx="3" fill="#54565a"/>
-    <rect class="clipB" x="78" y="42" width="92" height="16" rx="3" fill="#378ADD"/>
-    <rect x="176" y="42" width="48" height="16" rx="3" fill="#54565a"/>
-    <rect class="clipA" x="230" y="42" width="44" height="16" rx="3" fill="#AACD58"/>
-    <rect x="14" y="68" width="70" height="16" rx="3" fill="#54565a"/>
-    <rect x="90" y="68" width="60" height="16" rx="3" fill="#378ADD"/>
-    <rect x="156" y="68" width="50" height="16" rx="3" fill="#54565a"/>
-    <rect x="212" y="68" width="62" height="16" rx="3" fill="#54565a"/>
-    <g class="ph">
-      <rect x="40" y="8" width="3" height="92" fill="#FAFDE8"/>
-    </g>
+  <g transform="translate(720,320) matrix(0.866 -0.28 0.5 0.484 0 0)">
+    <rect x="0" y="0" width="290" height="62" rx="6" fill="#0e0f11" stroke="#34353a" stroke-width="1"/>
+    <rect x="16" y="14" width="58" height="34" rx="3" fill="#16171a" stroke="#34353a" stroke-width="1"/>
+    <rect x="24" y="24" width="32" height="3.5" rx="1.5" fill="#378ADD"/>
+    <rect x="24" y="32" width="24" height="3.5" rx="1.5" fill="#54565a"/>
+    <rect x="84" y="14" width="58" height="34" rx="3" fill="#16171a" stroke="#34353a" stroke-width="1"/>
+    <rect x="92" y="24" width="32" height="3.5" rx="1.5" fill="#378ADD"/>
+    <rect x="92" y="32" width="24" height="3.5" rx="1.5" fill="#54565a"/>
+    <rect x="152" y="14" width="58" height="34" rx="3" fill="#16171a" stroke="#34353a" stroke-width="1"/>
+    <rect x="160" y="24" width="32" height="3.5" rx="1.5" fill="#378ADD"/>
+    <rect x="160" y="32" width="24" height="3.5" rx="1.5" fill="#54565a"/>
+    <rect x="220" y="14" width="58" height="34" rx="3" fill="#16171a" stroke="#34353a" stroke-width="1"/>
+    <rect x="228" y="24" width="32" height="3.5" rx="1.5" fill="#378ADD"/>
+    <rect x="228" y="32" width="24" height="3.5" rx="1.5" fill="#54565a"/>
   </g>
-
-  <!-- SSD cache (middle floor) -->
+  <g>
+    <rect class="rise1" x="852" y="298" width="20" height="12" rx="2" fill="#AACD58"/>
+    <rect class="rise2" x="892" y="304" width="20" height="12" rx="2" fill="#AACD58"/>
+    <rect class="rise3" x="826" y="296" width="20" height="12" rx="2" fill="#AACD58"/>
+  </g>
   <g transform="translate(700,200) matrix(0.866 -0.28 0.5 0.484 0 0)">
     <rect x="0" y="0" width="290" height="80" rx="6" fill="#0e0f11" stroke="#34353a" stroke-width="1"/>
     <rect x="18" y="16" width="40" height="22" rx="3" fill="#222418"/>
@@ -77,28 +71,27 @@
     <rect x="162" y="44" width="40" height="22" rx="3" fill="#222418"/>
     <rect x="210" y="44" width="40" height="22" rx="3" fill="#222418"/>
   </g>
-
-  <!-- footage blocks rising from NAS → cache (straight up) -->
-  <g>
-    <rect class="rise1" x="852" y="300" width="20" height="12" rx="2" fill="#AACD58"/>
-    <rect class="rise2" x="892" y="306" width="20" height="12" rx="2" fill="#AACD58"/>
-    <rect class="rise3" x="826" y="298" width="20" height="12" rx="2" fill="#AACD58"/>
+  <g clip-path="url(#fs1)"><g class="thr1"><rect x="704" y="102" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="108" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="108" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="710" y="106" width="10" height="10" rx="1" fill="#378ADD"/><rect x="704" y="120" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="126" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="126" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="704" y="138" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="144" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="144" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="710" y="142" width="10" height="10" rx="1" fill="#AACD58"/><rect x="704" y="156" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="162" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="162" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="704" y="174" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="180" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="180" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="710" y="178" width="10" height="10" rx="1" fill="#54565a"/><rect x="704" y="192" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="198" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="198" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="710" y="196" width="10" height="10" rx="1" fill="#378ADD"/><rect x="704" y="210" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="216" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="216" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="704" y="228" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="234" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="234" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="710" y="232" width="10" height="10" rx="1" fill="#378ADD"/><rect x="704" y="246" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="252" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="252" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="704" y="264" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="270" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="270" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="710" y="268" width="10" height="10" rx="1" fill="#AACD58"/><rect x="704" y="282" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="288" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="288" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="704" y="300" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="306" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="306" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="710" y="304" width="10" height="10" rx="1" fill="#54565a"/><rect x="704" y="318" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="324" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="324" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="710" y="322" width="10" height="10" rx="1" fill="#378ADD"/><rect x="704" y="336" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="706.5" y="342" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="721.5" y="342" width="2" height="6" rx="0.5" fill="#34353a"/></g></g>
+  <g clip-path="url(#fs2)"><g class="thr2"><rect x="729" y="102" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="108" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="108" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="729" y="120" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="126" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="126" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="735" y="124" width="10" height="10" rx="1" fill="#AACD58"/><rect x="729" y="138" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="144" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="144" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="729" y="156" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="162" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="162" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="735" y="160" width="10" height="10" rx="1" fill="#378ADD"/><rect x="729" y="174" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="180" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="180" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="729" y="192" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="198" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="198" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="735" y="196" width="10" height="10" rx="1" fill="#54565a"/><rect x="729" y="210" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="216" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="216" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="735" y="214" width="10" height="10" rx="1" fill="#AACD58"/><rect x="729" y="228" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="234" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="234" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="729" y="246" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="252" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="252" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="735" y="250" width="10" height="10" rx="1" fill="#AACD58"/><rect x="729" y="264" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="270" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="270" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="729" y="282" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="288" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="288" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="735" y="286" width="10" height="10" rx="1" fill="#378ADD"/><rect x="729" y="300" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="306" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="306" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="729" y="318" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="324" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="324" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="735" y="322" width="10" height="10" rx="1" fill="#54565a"/><rect x="729" y="336" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="731.5" y="342" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="746.5" y="342" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="735" y="340" width="10" height="10" rx="1" fill="#AACD58"/></g></g>
+  <g clip-path="url(#fs3)"><g class="thr3"><rect x="754" y="102" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="108" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="108" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="760" y="106" width="10" height="10" rx="1" fill="#54565a"/><rect x="754" y="120" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="126" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="126" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="754" y="138" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="144" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="144" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="760" y="142" width="10" height="10" rx="1" fill="#378ADD"/><rect x="754" y="156" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="162" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="162" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="760" y="160" width="10" height="10" rx="1" fill="#AACD58"/><rect x="754" y="174" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="180" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="180" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="754" y="192" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="198" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="198" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="754" y="210" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="216" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="216" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="760" y="214" width="10" height="10" rx="1" fill="#378ADD"/><rect x="754" y="228" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="234" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="234" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="760" y="232" width="10" height="10" rx="1" fill="#54565a"/><rect x="754" y="246" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="252" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="252" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="754" y="264" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="270" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="270" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="760" y="268" width="10" height="10" rx="1" fill="#378ADD"/><rect x="754" y="282" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="288" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="288" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="760" y="286" width="10" height="10" rx="1" fill="#AACD58"/><rect x="754" y="300" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="306" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="306" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="754" y="318" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="324" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="324" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="754" y="336" width="22" height="18" fill="#0e0f11" stroke="#34353a" stroke-width="0.75"/><rect x="756.5" y="342" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="771.5" y="342" width="2" height="6" rx="0.5" fill="#34353a"/><rect x="760" y="340" width="10" height="10" rx="1" fill="#378ADD"/></g></g>
+  <g transform="translate(700,40) matrix(0.866 -0.28 0.5 0.484 0 0)">
+    <rect x="0" y="0" width="290" height="150" rx="6" fill="#0e0f11" stroke="#34353a" stroke-width="1"/>
+    <rect class="clipA" x="14" y="16" width="80" height="16" rx="3" fill="#378ADD"/>
+    <rect x="100" y="16" width="44" height="16" rx="3" fill="#54565a"/>
+    <rect class="clipB" x="150" y="16" width="64" height="16" rx="3" fill="#AACD58"/>
+    <rect x="220" y="16" width="54" height="16" rx="3" fill="#54565a"/>
+    <rect x="14" y="42" width="58" height="16" rx="3" fill="#54565a"/>
+    <rect class="clipB" x="78" y="42" width="92" height="16" rx="3" fill="#378ADD"/>
+    <rect x="176" y="42" width="48" height="16" rx="3" fill="#54565a"/>
+    <rect class="clipA" x="230" y="42" width="44" height="16" rx="3" fill="#AACD58"/>
+    <rect x="14" y="68" width="70" height="16" rx="3" fill="#54565a"/>
+    <rect x="90" y="68" width="60" height="16" rx="3" fill="#378ADD"/>
+    <rect x="156" y="68" width="50" height="16" rx="3" fill="#54565a"/>
+    <rect x="212" y="68" width="62" height="16" rx="3" fill="#54565a"/>
+    <g class="ph"><rect x="40" y="8" width="3" height="92" fill="#FAFDE8"/></g>
   </g>
-
-  <!-- NAS drives (bottom floor) -->
-  <g transform="translate(720,320) matrix(0.866 -0.28 0.5 0.484 0 0)">
-    <rect x="0" y="0" width="290" height="62" rx="6" fill="#0e0f11" stroke="#34353a" stroke-width="1"/>
-    <rect x="18" y="14" width="120" height="34" rx="4" fill="#16171a" stroke="#34353a" stroke-width="1"/>
-    <rect x="26" y="26" width="48" height="4" rx="2" fill="#378ADD"/>
-    <rect x="26" y="36" width="34" height="4" rx="2" fill="#54565a"/>
-    <rect x="152" y="14" width="120" height="34" rx="4" fill="#16171a" stroke="#34353a" stroke-width="1"/>
-    <rect x="160" y="26" width="48" height="4" rx="2" fill="#378ADD"/>
-    <rect x="160" y="36" width="34" height="4" rx="2" fill="#54565a"/>
-  </g>
-
-  <!-- labels (left of each floor) -->
-  <text x="690" y="120" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="15" letter-spacing="0.4" fill="rgba(250,253,232,0.72)">NLE timeline</text>
-  <text x="690" y="270" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="15" letter-spacing="0.4" fill="rgba(250,253,232,0.72)">SSD cache</text>
-  <text x="712" y="356" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="15" letter-spacing="0.4" fill="rgba(250,253,232,0.72)">NAS · drives</text>
 </g>
+<text x="688" y="88" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="14" letter-spacing="0.4" fill="rgba(250,253,232,0.72)">NLE timeline</text>
+<text x="688" y="200" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="14" letter-spacing="0.4" fill="rgba(250,253,232,0.72)">SSD cache</text>
+<text x="688" y="296" text-anchor="end" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="14" letter-spacing="0.4" fill="rgba(250,253,232,0.72)">NAS · drives</text>
 </svg>
