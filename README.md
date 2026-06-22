@@ -7,11 +7,11 @@
 [![Built on JuiceFS](assets/readme/badges/built-on-juicefs.svg)](https://github.com/juicedata/juicefs)
 ![Status: beta](assets/readme/badges/status-beta.svg)
 
-**Edit video straight off your NAS.** Your storage shows up in Finder as a real volume, and footage streams in as you scrub — only the blocks you touch. Premiere, Resolve, and Final Cut see a local drive. **$0 per seat, no storage contract**, on the NAS you already own.
+**Edit video straight off your NAS.** Your storage shows up in Finder as a real volume, and footage streams in as you scrub: only the blocks you touch. Premiere, Resolve, and Final Cut see a local drive. **$0 per seat, no storage contract**, on the NAS you already own.
 
-> The open-source alternative to LucidLink, Suite, Shade, and Iconik — running entirely on hardware you control.
+> The open-source alternative to LucidLink, Suite, Shade, and Iconik, running entirely on hardware you control.
 
-> **Status:** beta, macOS-only, self-hosted. It's been hardened hard for zero data loss on real ingest, but it's pre-1.0 and there's a server side you run yourself. If you want a managed service with a support line, this isn't that — see [What JuiceMount is not](#what-juicemount-is-not).
+> **Status:** beta, macOS-only, self-hosted. It's been hardened for zero data loss on real ingest, but it's pre-1.0 and there's a server side you run yourself. If you want a managed service with a support line, this isn't that. See [What JuiceMount is not](#what-juicemount-is-not).
 
 ---
 
@@ -19,11 +19,11 @@
 
 You already know the trade you've been making.
 
-**Cloud editing storage** — LucidLink, Suite, Shade — gives you a drive that mounts and streams beautifully, and a per-seat, per-terabyte bill that grows with the one thing video makes most of. Your library lives inside someone else's filesystem.
+**Cloud editing storage** (LucidLink, Suite, Shade) gives you a drive that mounts and streams beautifully, plus a per-seat, per-terabyte bill that grows with the one thing video makes most of. Your library lives inside someone else's filesystem.
 
-**A NAS over plain SMB** is fast on the LAN and it's yours — but Finder grinds for a full minute opening a big project, there's no offline, and there's no good story the moment you leave the building.
+**A NAS over plain SMB** is fast on the LAN and it's yours. But Finder grinds for a full minute opening a big project, there's no offline, and there's no good story the moment you leave the building.
 
-**Sync tools** — Dropbox, Nextcloud, Seafile — own your bytes but move whole files. Open one shot to check focus on a 100 GB take and you wait for all 100 GB.
+**Sync tools** (Dropbox, Nextcloud, Seafile) own your bytes but move whole files. Open one shot to check focus on a 100 GB take and you wait for all 100 GB.
 
 JuiceMount is the combination that didn't exist: **a real mounted volume that streams only the blocks you touch, caches to your local SSD, keeps working offline, and runs on storage you already own.** Point it at a TrueNAS, a Synology, a QNAP, or any box that runs Docker. Your editors mount `/Volumes/<name>` and cut. No per-seat bill, no storage contract, nobody else holding your footage.
 
@@ -35,7 +35,7 @@ JuiceMount is the combination that didn't exist: **a real mounted volume that st
 
 Most tools treat a video file as one object: to touch any of it, you move all of it. JuiceMount stores every file on your NAS as 4 MB blocks ([JuiceFS](https://github.com/juicedata/juicefs)'s open, documented format), and blocks travel independently.
 
-Want three seconds from the middle of an 8 GB take? Three blocks — about **12 MB** — come over the wire. The rest never move. Scrub the timeline and the blocks you land on page into your local SSD cache and stay there, so the next pass is instant. That's why a 100 GB R3D opens and scrubs like it's sitting on your desk, even over a modest link.
+Want three seconds from the middle of an 8 GB take? Three blocks, about **12 MB**, come over the wire. The rest never move. Scrub the timeline and the blocks you land on page into your local SSD cache and stay there, so the next pass is instant. That's why a 100 GB R3D opens and scrubs like it's sitting on your desk, even over a modest link.
 
 And the format is open: if JuiceMount vanished tomorrow, the free stock `juicefs` client still mounts the volume and reads every byte. Your library is never locked inside this app.
 
@@ -43,38 +43,40 @@ And the format is open: if JuiceMount vanished tomorrow, the free stock `juicefs
 
 ## What editing on it feels like
 
-- **It mounts for real — no relinking.** `/Volumes/<name>` is a genuine Finder volume, because to macOS it *is* one (a Finder-tuned NFS share served from localhost). It's the same absolute path on every Mac, so a teammate's `.prproj` / `.drp` / `.fcpx` opens with media already online — nobody spends the morning relinking.
+- **It mounts for real, no relinking.** `/Volumes/<name>` is a genuine Finder volume, because to macOS it *is* one (a Finder-tuned NFS share served from localhost). It's the same absolute path on every Mac, so a teammate's `.prproj` / `.drp` / `.fcpx` opens with media already online. Nobody spends the morning relinking.
 
-- **Find anything in about 29 ms.** Press ⌘⇧F from any app. The search window answers from an index that lives on your Mac (SQLite, on your own SSD) — it never round-trips to the NAS. Filename search across ~131,000 entries comes back in ~29 ms. Spacebar for Quick Look, Enter to reveal in Finder, or drag a result straight into a Premiere / Resolve / Final Cut timeline.
+- **Find anything in about 29 ms.** Press ⌘⇧F from any app. The search window answers from an index that lives on your Mac (SQLite, on your own SSD), so it never round-trips to the NAS. Filename search across ~131,000 entries comes back in ~29 ms. Spacebar for Quick Look, Enter to reveal in Finder, or drag a result straight into a Premiere / Resolve / Final Cut timeline.
 
-- **Pin a project and keep cutting on a plane.** Pin a folder and a prefetcher pulls every byte to local SSD with per-folder progress. Flip on offline mode (cellular, plane, NAS asleep): pinned files keep reading at SSD speed, and un-pinned reads refuse in milliseconds instead of beachballing Finder on a 30-second timeout. Back online, it re-syncs itself. It can even **boot fully offline** — open the lid on a plane and your last-known library is right there to browse.
+- **Pin a project and keep cutting on a plane.** Pin a folder and a prefetcher pulls every byte to local SSD with per-folder progress. Flip on offline mode (cellular, plane, NAS asleep): pinned files keep reading at SSD speed, and un-pinned reads refuse in milliseconds instead of beachballing Finder on a 30-second timeout. Back online, it re-syncs itself. It can even **boot fully offline**: open the lid on a plane and your last-known library is right there to browse.
 
-- **Drop a render and move on.** With the write spool on, a write is acknowledged the instant it's durable on your local SSD, then trickle-uploads to the NAS in the background — SHA-256-verified at every hop. A 2 GB Finder copy over a WAN feels like a local copy; the menu bar shows what's still uploading until it drains.
+- **Drop a render and move on.** With the write spool on, a write is acknowledged the instant it's durable on your local SSD, then trickle-uploads to the NAS in the background, SHA-256-verified at every hop. A 2 GB Finder copy over a WAN feels like a local copy, and the menu bar shows what's still uploading until it drains.
 
-- **You drive it from the menu bar.** A state-tinted icon tells you at a glance whether your footage is safe (green), uploading, degraded (amber), or offline (blue). Create the mount, pin projects, flip offline, check the health of each backend — without babysitting a daemon.
+- **You drive it from the menu bar.** A state-tinted icon tells you at a glance whether your footage is safe (green), uploading, degraded (amber), or offline (blue). Create the mount, pin projects, flip offline, and check the health of each backend, all without babysitting a daemon.
 
 ---
 
 ## Requirements
 
-Honest list — this is a self-hosted system, and there is a server side.
+Honest list. This is a self-hosted system, and there is a server side.
 
 **On the Mac (client):**
 
 - macOS 14 (Sonoma) or later (`Package.swift` targets `.macOS(.v14)`). Developed and tested on Apple Silicon; Intel Macs are untested (the build scripts produce host-architecture binaries, so an Intel build *should* work from source, but no one has verified it).
-- [macFUSE](https://macfuse.github.io/) — required by the JuiceFS client. The first-run Setup Assistant preflight checks that it's installed and walks you through it if not.
+- [macFUSE](https://macfuse.github.io/), required by the JuiceFS client. The first-run Setup Assistant preflight checks that it's installed and walks you through it if not.
 - The `juicefs` binary (`brew install juicefs`; auto-detected from `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, then `$PATH`).
 - **An admin password prompt, once per session**, the first time JuiceMount mounts: macOS restricts `mount_nfs`/`umount` to root, so the app escalates through the standard macOS auth dialog (and macOS caches the authorization for the session). Optionally set up a [scoped passwordless-sudo rule](docs/dev-setup.md) to remove the prompt entirely.
-- To build from source (currently the only way to get the app — no prebuilt/notarized DMG yet): Go 1.26+ and Xcode command-line tools (Swift 5.9+).
+- To build from source (currently the only way to get the app, no prebuilt or notarized DMG yet): Go 1.26+ and Xcode command-line tools (Swift 5.9+).
 
 **On the server (any of these):**
 
-- TrueNAS SCALE (the production-tested path — paste-the-YAML install, see [`server/INSTALL-TrueNAS.md`](server/INSTALL-TrueNAS.md)), or
+- TrueNAS SCALE (the production-tested path: paste-the-YAML install, see [`server/INSTALL-TrueNAS.md`](server/INSTALL-TrueNAS.md)), or
 - Any Linux box / Synology DSM 7+ / laptop with Docker + Docker Compose.
 - Disk for two things: the MinIO object bucket (your actual media) and a small Redis dataset (metadata; AOF-persisted).
-- A LAN you trust — the stack's Redis and MinIO ports are LAN-exposed by default; firewall them if untrusted clients share the network (see [`server/README.md` § Security notes](server/README.md)).
+- A LAN you trust: the stack's Redis and MinIO ports are LAN-exposed by default. Firewall them if untrusted clients share the network (see [`server/README.md` § Security notes](server/README.md)).
 
-**Network:** anything from hotel Wi-Fi (with pinned files + the write spool) up to 10 GbE (where the throughput ceiling becomes your disks). For WAN use the author runs Tailscale; any VPN that gives the Mac a route to the Redis + MinIO ports works.
+**Network:** anything from hotel Wi-Fi (with pinned files and the write spool) up to 10 GbE, where the throughput ceiling becomes your disks.
+
+**Editing from outside the LAN (remote access):** put the Mac and the server on the same [Tailscale](https://tailscale.com) tailnet, then point the app at the server's tailnet IP. Tailscale is what the author runs for WAN editing: it gives you an encrypted, peer-to-peer path with no port-forwarding and no public exposure of Redis or MinIO. Any other WireGuard/VPN that routes the Mac to those two ports works the same way. Pin the projects you'll touch first, and the write spool keeps uploads moving on whatever bandwidth the link gives you.
 
 ---
 
@@ -126,22 +128,22 @@ Hit **Start**. Enter your admin password at the mount prompt (once per session).
 
 ## Under the mount
 
-The editor-facing half is simple — a Finder volume. The half that makes it fast is below it.
+The editor-facing half is simple: a Finder volume. The half that makes it fast is below it.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/arch-diagram-dark.svg">
   <img src="assets/readme/arch-diagram-light.svg" alt="Architecture: Finder, Resolve, and Premiere open files on /Volumes/(name) through the macOS NFS client, served by the JuiceMount app's localhost-only NFS server. An SQLite mirror, an SSD cache with pins, and an opt-in write spool keep the hot path local. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your server, where MinIO or any S3-compatible store holds file data in JuiceFS's open chunk format and Redis holds file metadata" width="100%">
 </picture>
 
-Your NLE talks to a normal Finder volume — an **NFS share served from `127.0.0.1`, tuned for the way Finder hammers metadata.** Behind it, the hot path stays on your Mac:
+Your NLE talks to a normal Finder volume: an **NFS share served from `127.0.0.1`, tuned for the way Finder hammers metadata.** Behind it, the hot path stays on your Mac:
 
-- **Metadata** is answered from a **local SQLite mirror** — directory opens that take 3–10 s through raw FUSE complete in **15–120 ms**, because Finder never has to ask the NAS just to list a folder.
+- **Metadata** is answered from a **local SQLite mirror**, so directory opens that take 3–10 s through raw FUSE complete in **15–120 ms**. Finder never has to ask the NAS just to list a folder.
 - **Reads** are served in priority order: memory buffer (small files like `.prproj`/LUTs) → a direct SSD-cache read that bypasses FUSE entirely → JuiceFS → your object store. Only a genuine cache miss crosses the wire, and only for the blocks involved.
 - **Writes** (with the spool on) land on local SSD first and drain to the NAS in the background, SHA-256-verified at every hop, with boot-time crash recovery so an interrupted upload re-sends instead of vanishing.
 
-Underneath all of that, **JuiceFS** breaks file data into chunks stored as S3 objects in MinIO (or any S3-compatible store), with file metadata in Redis. The hidden FUSE mount that JuiceFS needs lives at a dotfile path your NLE never browses. The object store can also be a cloud bucket (Backblaze B2, Cloudflare R2, Wasabi — anything S3-compatible JuiceFS supports), with Redis still on your box — though the self-hosted MinIO/TrueNAS path is the one this project's QA actually exercises.
+Underneath all of that, **JuiceFS** breaks file data into chunks stored as S3 objects in MinIO (or any S3-compatible store), with file metadata in Redis. The hidden FUSE mount that JuiceFS needs lives at a dotfile path your NLE never browses. The object store can also be a cloud bucket (Backblaze B2, Cloudflare R2, Wasabi, anything S3-compatible JuiceFS supports), with Redis still on your box, though the self-hosted MinIO/TrueNAS path is the one this project's QA actually exercises.
 
-**Your footage stays safe and yours.** Writes ack locally and re-send after a crash, the metadata map is backed up (not just the bytes), and the on-disk format is open and documented. The exit door is always unlocked: copy from the mounted volume, run `juicefs sync`, or mount the volume with the stock `juicefs` client — no JuiceMount involved.
+**Your footage stays safe and yours.** Writes ack locally and re-send after a crash, the metadata map is backed up (not just the bytes), and the on-disk format is open and documented. The exit door is always unlocked: copy from the mounted volume, run `juicefs sync`, or mount the volume with the stock `juicefs` client. No JuiceMount involved.
 
 Full architecture, the data-safety story, and the honest limits live in [`ARCHITECTURE_juicemount.md`](ARCHITECTURE_juicemount.md) and [`MENU_BAR_APP.md`](MENU_BAR_APP.md).
 
@@ -149,7 +151,7 @@ Full architecture, the data-safety story, and the honest limits live in [`ARCHIT
 
 ## Performance
 
-All numbers below were **measured by the author on his own setup** (Apple-Silicon Mac ↔ TrueNAS SCALE over 10 GbE; methodology, workload scripts, and the regression harness in [`docs/PERFORMANCE_METHODOLOGY.md`](docs/PERFORMANCE_METHODOLOGY.md)). They are honest measurements, not marketing benchmarks — your hardware will differ.
+All numbers below were **measured by the author on his own setup** (Apple-Silicon Mac ↔ TrueNAS SCALE over 10 GbE; methodology, workload scripts, and the regression harness in [`docs/PERFORMANCE_METHODOLOGY.md`](docs/PERFORMANCE_METHODOLOGY.md)). They are honest measurements, not marketing benchmarks. Your hardware will differ.
 
 | What | Measured |
 |---|---|
@@ -161,7 +163,7 @@ All numbers below were **measured by the author on his own setup** (Apple-Silico
 | Filename search across ~131 K entries | ~29 ms |
 | Un-pinned read refusal in offline mode | 4–67 ms (vs. a 30 s NFS retry hang) |
 
-The point isn't a single hero number — it's that you don't trade speed, ownership, or an offline story against each other. On the author's LAN, fully-cached reads are local-SSD fast, a cold scrub pulls only the blocks it touches, and the whole thing runs on hardware that's already paid for.
+The point isn't a single hero number. It's that you don't trade speed, ownership, or an offline story against each other. On the author's LAN, fully-cached reads are local-SSD fast, a cold scrub pulls only the blocks it touches, and the whole thing runs on hardware that's already paid for.
 
 ---
 
@@ -170,17 +172,17 @@ The point isn't a single hero number — it's that you don't trade speed, owners
 Stating this up front saves everyone time:
 
 - **Not a SaaS.** No hosted offering, no accounts, no billing. You run the server.
-- **Not a review platform.** No browser viewer, comments, or approvals — Frame.io and friends own that lane and pair fine with this.
+- **Not a review platform.** No browser viewer, comments, or approvals. Frame.io and friends own that lane and pair fine with this.
 - **Not AI media search.** Filename search is instant today; content-aware search is on the roadmap, not a current feature.
 - **Not multi-OS.** macOS only today. The server side runs anywhere Docker does.
-- **Not a backup.** It's primary storage with a cache. Run real backups of the MinIO bucket and Redis — the Manager has backup-scheduling tooling, but the 3-2-1 discipline is yours.
+- **Not a backup.** It's primary storage with a cache. Run real backups of the MinIO bucket and Redis. The Manager has backup-scheduling tooling, but the 3-2-1 discipline is yours.
 - **Not zero-ops.** A failed disk on your NAS is your failed disk. That's the deal that makes it free.
 
 ---
 
 ## Roadmap
 
-JuiceMount is past the hard part — the read/write/offline hot path has been hardened for zero data loss on real photo and video ingest. What's next is less about the edit experience and more about making it effortless to *stand up* and to *share* with a team.
+JuiceMount is past the hard part: the read/write/offline hot path has been hardened for zero data loss on real photo and video ingest. What's next is less about the edit experience and more about making it effortless to *stand up* and to *share* with a team.
 
 **Recently shipped**
 
@@ -190,10 +192,11 @@ JuiceMount is past the hard part — the read/write/offline hot path has been ha
 
 **Next up**
 
-1. **One-step server setup.** Today the biggest friction is standing up the NAS side. The next big sprint is a guided, near-one-click install — a first-class TrueNAS app and a single-command bring-up for any Docker host — so getting from "I have a NAS" to "my editors are mounting it" doesn't require hand-editing compose files.
-2. **Deeper search.** Filename search is instant today; next is searching across more than names — richer metadata, and eventually content-aware search.
+1. **One-step server setup.** Today the biggest friction is standing up the NAS side. The next big sprint is a guided, near-one-click install: a first-class TrueNAS app and a single-command bring-up for any Docker host, so getting from "I have a NAS" to "my editors are mounting it" doesn't require hand-editing compose files.
+2. **Deeper search.** Filename search is instant today. Next is searching across more than names: richer metadata, and eventually content-aware search.
 3. **Teams, done safely.** Multi-editor support with real collision handling: cooperative file locking so two people can't clobber the same project, presence ("who has this open"), and a simple admin tool to add people and hand out **editor** or **viewer** seats.
-4. **A web interface.** A browser-based file manager for the volume — browse, upload, share links — most likely built on a proven open-source file browser rather than reinventing one.
+4. **A web interface.** A browser-based file manager for the volume (browse, upload, share links), most likely built on a proven open-source file browser rather than reinventing one.
+5. **Remote access, built in.** Today you bring your own VPN. Next, an optional Tailscale service baked right into the server compose, so a fresh deployment comes up on a tailnet with no port-forwarding and no manual networking. Longer term, a slicker first-class integration: one toggle to share a volume with a remote editor, encrypted end to end, so cutting from anywhere doesn't mean touching network config.
 
 **Exploring**
 
