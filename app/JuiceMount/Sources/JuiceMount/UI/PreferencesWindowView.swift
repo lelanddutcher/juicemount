@@ -24,6 +24,7 @@ struct PreferencesWindowView: View {
 
     @State private var selectedTab: Tab = .general
     @State private var advancedAddressesExpanded = false
+    @State private var customMountExpanded = false
     /// Last non-empty sanitized volume name — the comparison anchor for the
     /// name→mount-point derivation (see deriveMountPoint).
     @State private var derivationAnchor = ""
@@ -63,7 +64,7 @@ struct PreferencesWindowView: View {
     private var idealHeight: CGFloat {
         switch selectedTab {
         case .general:      return 360
-        case .connection:   return advancedAddressesExpanded ? 660 : 545
+        case .connection:   return advancedAddressesExpanded ? 660 : customMountExpanded ? 615 : 545
         case .cacheStorage: return 610
         case .maintenance:  return 500
         }
@@ -138,33 +139,53 @@ struct PreferencesWindowView: View {
     private var connectionTab: some View {
         Form {
             Section {
-                LabeledContent("Volume name") {
-                    TextField("zpool", text: $preferences.volumeName)
-                        .frame(width: 200)
-                        .multilineTextAlignment(.trailing)
-                        .onChange(of: preferences.volumeName) { oldName, newName in
-                            deriveMountPoint(oldName: oldName, newName: newName)
-                        }
-                }
+                // Composed "mounts at" row: a fixed /Volumes/ prefix followed by
+                // the EDITABLE, bordered volume name — so the name field is
+                // unmistakably a field, and the name↔mount-path link is visible
+                // (editing the tail derives mountPoint via the unchanged
+                // deriveMountPoint machinery). R-9 design sprint, 2026-06-17.
                 LabeledContent("Mounts at") {
-                    Text(preferences.mountPoint)
-                        .font(.body.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    HStack(spacing: 2) {
+                        Text("/Volumes/")
+                            .font(.body.monospaced())
+                            .foregroundStyle(.secondary)
+                        TextField("zpool", text: $preferences.volumeName)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.body.monospaced())
+                            .frame(width: 180, alignment: .leading)
+                            .onChange(of: preferences.volumeName) { oldName, newName in
+                                deriveMountPoint(oldName: oldName, newName: newName)
+                            }
+                    }
+                }
+                footnote("This name is what Finder shows for the volume — type to rename it. The mount path updates as you type.")
+
+                // Power-user escape hatch, grouped WITH the volume (a custom mount
+                // location is a volume-identity decision, not a network address).
+                DisclosureGroup("Use a custom location instead", isExpanded: $customMountExpanded) {
+                    LabeledContent("Mount point") {
+                        HStack(spacing: 6) {
+                            TextField("/Volumes/zpool", text: $preferences.mountPoint)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.body.monospaced())
+                                .frame(width: 240, alignment: .leading)
+                            Button("Choose…") { chooseMountPoint() }
+                        }
+                    }
+                    footnote("Overrides the derived /Volumes/<name> path. Use this only if you need the volume somewhere other than /Volumes.")
                 }
             } header: {
                 Text("Volume")
             } footer: {
-                footnote("The volume appears in Finder at /Volumes/<name>. Renaming applies after Stop everything → Start — Restart keeps the current Finder mount in place. A custom mount point can be set under Advanced addresses.")
+                footnote("Renaming or moving the volume applies after Stop everything → Start — Restart keeps the current Finder mount in place.")
             }
 
             Section {
                 LabeledContent("Redis URL") {
                     TextField("redis://127.0.0.1:6379/1", text: $preferences.redisURL)
+                        .textFieldStyle(.roundedBorder)
                         .font(.body.monospaced())
-                        .frame(width: 300)
-                        .multilineTextAlignment(.trailing)
+                        .frame(width: 300, alignment: .leading)
                         .onChange(of: preferences.redisURL) { _, newValue in
                             let clean = stripWhitespace(newValue)
                             if clean != newValue { preferences.redisURL = clean }
@@ -172,9 +193,9 @@ struct PreferencesWindowView: View {
                 }
                 LabeledContent("S3 endpoint override") {
                     TextField("http://<server-ip>:9000/<bucket>", text: $preferences.s3EndpointOverride)
+                        .textFieldStyle(.roundedBorder)
                         .font(.body.monospaced())
-                        .frame(width: 300)
-                        .multilineTextAlignment(.trailing)
+                        .frame(width: 300, alignment: .leading)
                         .onChange(of: preferences.s3EndpointOverride) { _, newValue in
                             let clean = stripWhitespace(newValue)
                             if clean != newValue { preferences.s3EndpointOverride = clean }
@@ -190,9 +211,9 @@ struct PreferencesWindowView: View {
                 DisclosureGroup("Advanced addresses", isExpanded: $advancedAddressesExpanded) {
                     LabeledContent("NFS listen address") {
                         TextField("127.0.0.1:11049", text: $preferences.nfsListenAddr)
+                            .textFieldStyle(.roundedBorder)
                             .font(.body.monospaced())
-                            .frame(width: 200)
-                            .multilineTextAlignment(.trailing)
+                            .frame(width: 200, alignment: .leading)
                             .onChange(of: preferences.nfsListenAddr) { _, newValue in
                                 let clean = stripWhitespace(newValue)
                                 if clean != newValue { preferences.nfsListenAddr = clean }
@@ -200,26 +221,17 @@ struct PreferencesWindowView: View {
                     }
                     LabeledContent("Metrics address") {
                         TextField("127.0.0.1:11050", text: $preferences.metricsAddr)
+                            .textFieldStyle(.roundedBorder)
                             .font(.body.monospaced())
-                            .frame(width: 200)
-                            .multilineTextAlignment(.trailing)
+                            .frame(width: 200, alignment: .leading)
                             .onChange(of: preferences.metricsAddr) { _, newValue in
                                 let clean = stripWhitespace(newValue)
                                 if clean != newValue { preferences.metricsAddr = clean }
                             }
                     }
-                    LabeledContent("Custom mount point") {
-                        HStack(spacing: 6) {
-                            TextField("/Volumes/zpool", text: $preferences.mountPoint)
-                                .font(.body.monospaced())
-                                .frame(width: 220)
-                                .multilineTextAlignment(.trailing)
-                            Button("Choose…") { chooseMountPoint() }
-                        }
-                    }
                 }
             } footer: {
-                footnote("Local loopback endpoints for the built-in NFS server and its control plane. The NFS listen address and mount point take effect after Stop everything → Start (the Finder mount must re-target them); the metrics address applies on the next start — Restart Server is enough. After editing the metrics address, health readouts in the popover pause until that restart.")
+                footnote("Local loopback endpoints for the built-in NFS server and its control plane. The NFS listen address takes effect after Stop everything → Start (the Finder mount must re-target it); the metrics address applies on the next start — Restart Server is enough. After editing the metrics address, health readouts in the popover pause until that restart.")
             }
         }
         .formStyle(.grouped)

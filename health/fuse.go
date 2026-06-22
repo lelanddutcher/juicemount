@@ -243,6 +243,24 @@ func (fm *FUSEManager) Mount() error {
 				"reason", "max(configured, pinned) clamped to keep >=10GiB free")
 		}
 
+		// R-1 startup diagnostic: if the pinned set is larger than the disk can
+		// physically keep resident (free space + the floor it must preserve),
+		// it will never fully cache no matter how high cache-size goes —
+		// JuiceFS evicts to honor --free-space-ratio. The live verdict (pin.
+		// CapacityLoop) surfaces this to the user; logging it here makes the
+		// condition obvious at mount time. Compares against FREE disk, not
+		// total — the prior policy's blind spot.
+		if free, ferr := volumeFreeBytes("/"); ferr == nil {
+			if sustainable := free - cacheFreeFloorBytes; sustainable > 0 && fm.cfg.PinnedBytes > sustainable {
+				jmlog.Warn("pinned set exceeds free disk — cannot stay fully cached offline",
+					"pinned_gb", fm.cfg.PinnedBytes>>30,
+					"free_gb", free>>30,
+					"sustainable_gb", sustainable>>30,
+					"shortfall_gb", (fm.cfg.PinnedBytes-sustainable)>>30,
+					"action", "free disk space or unpin a folder")
+			}
+		}
+
 		// Raise --free-space-ratio so JuiceFS keeps >= 10 GiB free dynamically
 		// (the absolute floor that prevents boot-disk starvation). max() so we
 		// never weaken an already-stricter configured ratio.

@@ -261,7 +261,6 @@ struct MenuPopoverView: View {
     /// vague "pinned > free" signal.
     private var diskSpaceRow: some View {
         let purgeable = max(0, diskImportantGB - diskFreeGB)
-        let pinnedGB = Double(cacheStatus.aggregate.TotalBytes) / 1e9
 
         // JuiceFS is launched with --free-space-ratio 0.01 — it skips cache
         // writes when free < 1% of total disk. Surface that operational
@@ -269,7 +268,15 @@ struct MenuPopoverView: View {
         let freeRatio = diskTotalGB > 0 ? diskFreeGB / diskTotalGB : 1.0
         let cacheOff = freeRatio < 0.01     // hard cutoff: JuiceFS already refusing
         let cacheCutoffSoon = freeRatio < 0.03 && !cacheOff
-        let pinnedExceedsTotal = diskTotalGB > 0 && pinnedGB > diskTotalGB
+        // R-1: the backend's capacity verdict is the accurate signal. It
+        // compares the pinned set against what the cache can sustainably hold
+        // (free disk + space the cache already occupies − the 10 GiB floor) —
+        // NOT against total disk, which counts the OS and unrelated files as if
+        // they were available. The old `pinnedGB > diskTotalGB` UI check only
+        // fired when the pinned set exceeded the WHOLE disk, so the common
+        // "180 GB pinned, 139 GB free" case silently churned with no banner.
+        let overCapacity = cacheStatus.capacity.over_capacity
+        let shortfallGB = Double(cacheStatus.capacity.shortfall_bytes) / 1e9
 
         return VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
@@ -315,12 +322,12 @@ struct MenuPopoverView: View {
                     color: .orange,
                     text: "Disk under 3% free — JuiceFS will stop caching at 1% free. Reclaim or unpin large folders to keep caching alive."
                 )
-            } else if pinnedExceedsTotal {
+            } else if overCapacity {
                 pressureBanner(
                     color: .red,
                     text: String(format:
-                        "Pinned set %.0f GB exceeds disk capacity %.0f GB. Some files will never fully cache.",
-                        pinnedGB, diskTotalGB)
+                        "Pinned set is %.0f GB too big for this disk — those files can't all stay cached offline. Free up space or unpin a folder.",
+                        max(1, shortfallGB))
                 )
             }
         }

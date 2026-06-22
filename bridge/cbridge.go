@@ -488,6 +488,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		pinCtx := globalPinCtx()
 		pf.Go(func() { pf.PullPending(pinCtx, 100) })
 		pf.Go(func() { pf.ReWarmupLoop(pinCtx, 6*time.Hour, 50) })
+		// R-1: keep the pinned-set-vs-disk-capacity verdict fresh. Gates the
+		// re-warm loop above (no futile thrash when the pinned set can't fit)
+		// and feeds the over-capacity banner in /cache-status. Empty cacheBaseDir
+		// uses the default ~/.juicefs/cache.
+		pf.Go(func() { pf.CapacityLoop(pinCtx, 60*time.Second, "") })
 		// Wire the pin store into the NFS handler so the offline-mode
 		// open gate can fail-fast on un-pinned reads. The mount point is
 		// the prefix the gate uses to canonicalize in-mount filenames into
@@ -1919,10 +1924,14 @@ func NFSServerUnpin(rootPath *C.char) *C.char {
 
 // CacheStatus is the JSON returned by NFSServerCacheStatus.
 type CacheStatus struct {
-	Aggregate   pin.AggregateStats `json:"aggregate"`
-	Roots       []pin.RootSummary  `json:"roots"`
-	LiveStats   pin.LiveStats      `json:"live"`
-	OfflineMode bool               `json:"offline_mode"`
+	Aggregate   pin.AggregateStats  `json:"aggregate"`
+	Roots       []pin.RootSummary   `json:"roots"`
+	LiveStats   pin.LiveStats       `json:"live"`
+	OfflineMode bool                `json:"offline_mode"`
+	// Capacity is the pinned-set-vs-disk verdict (R-1). OverCapacity true means
+	// the pinned set can't be kept fully resident; the UI shows a "free disk or
+	// unpin" banner with ShortfallBytes.
+	Capacity pin.CapacityVerdict `json:"capacity"`
 }
 
 //export NFSServerCacheStatus
@@ -1938,7 +1947,7 @@ func NFSServerCacheStatus() *C.char {
 	if pinStore == nil {
 		return jsonStr(CacheStatus{OfflineMode: pin.IsOffline(), Roots: []pin.RootSummary{}})
 	}
-	cs := CacheStatus{OfflineMode: pin.IsOffline()}
+	cs := CacheStatus{OfflineMode: pin.IsOffline(), Capacity: pin.Capacity()}
 	if a, err := pinStore.AggregateStats(); err == nil {
 		cs.Aggregate = a
 	}

@@ -151,16 +151,50 @@ public enum NFSBridge {
         public var Workers: Int = 0
     }
 
+    /// Pinned-set-vs-disk-capacity verdict (R-1). `over_capacity` true means the
+    /// pinned set is larger than the cache disk can keep fully resident, so some
+    /// pinned files will never be available offline until the user frees disk or
+    /// unpins a folder. `shortfall_bytes` is how much to free / unpin.
+    public struct CapacityVerdict: Codable, Equatable {
+        public var over_capacity: Bool = false
+        public var pinned_bytes: Int64 = 0
+        public var cache_capacity_bytes: Int64 = 0
+        public var shortfall_bytes: Int64 = 0
+        public var disk_free_bytes: Int64 = 0
+        public var cache_usage_bytes: Int64 = 0
+
+        public init() {}
+
+        private enum CodingKeys: String, CodingKey {
+            case over_capacity, pinned_bytes, cache_capacity_bytes
+            case shortfall_bytes, disk_free_bytes, cache_usage_bytes
+        }
+
+        // Absence-tolerant: an older Go core (or the no-pinstore branch) omits
+        // `capacity`, and JSON null on any field must not abort the parent
+        // CacheStatus decode (the roots:null lesson — see CacheStatus below).
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.over_capacity = try c.decodeIfPresent(Bool.self, forKey: .over_capacity) ?? false
+            self.pinned_bytes = try c.decodeIfPresent(Int64.self, forKey: .pinned_bytes) ?? 0
+            self.cache_capacity_bytes = try c.decodeIfPresent(Int64.self, forKey: .cache_capacity_bytes) ?? 0
+            self.shortfall_bytes = try c.decodeIfPresent(Int64.self, forKey: .shortfall_bytes) ?? 0
+            self.disk_free_bytes = try c.decodeIfPresent(Int64.self, forKey: .disk_free_bytes) ?? 0
+            self.cache_usage_bytes = try c.decodeIfPresent(Int64.self, forKey: .cache_usage_bytes) ?? 0
+        }
+    }
+
     public struct CacheStatus: Codable, Equatable {
         public var aggregate: AggregateStats = AggregateStats()
         public var roots: [RootSummary] = []
         public var live: LiveCacheStats = LiveCacheStats()
         public var offline_mode: Bool = false
+        public var capacity: CapacityVerdict = CapacityVerdict()
 
         public init() {}
 
         private enum CodingKeys: String, CodingKey {
-            case aggregate, roots, live, offline_mode
+            case aggregate, roots, live, offline_mode, capacity
         }
 
         /// Null/absence-tolerant decode. ROOT CAUSE of the long-standing
@@ -184,6 +218,7 @@ public enum NFSBridge {
             self.roots = try c.decodeIfPresent([RootSummary].self, forKey: .roots) ?? []
             self.live = try c.decodeIfPresent(LiveCacheStats.self, forKey: .live) ?? LiveCacheStats()
             self.offline_mode = try c.decodeIfPresent(Bool.self, forKey: .offline_mode) ?? false
+            self.capacity = try c.decodeIfPresent(CapacityVerdict.self, forKey: .capacity) ?? CapacityVerdict()
         }
     }
 

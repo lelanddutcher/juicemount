@@ -179,6 +179,17 @@ func (p *Prefetcher) ReWarmupLoop(ctx context.Context, ttl time.Duration, batchS
 		case <-p.stopCh:
 			return
 		case <-tick.C:
+			// R-1: never re-warm an over-capacity pinned set. Re-reading a
+			// stale-but-Ready file evicts blocks another pinned file just
+			// downloaded (JuiceFS holds the volume above its free-space
+			// floor), so re-warm degenerates into perpetual evict-and-refetch
+			// thrash that the set can never escape — and burns WAN bandwidth.
+			// PullPending already warmed everything that fits; leave it. The
+			// over-capacity verdict is surfaced to the user so they can free
+			// disk or unpin a folder.
+			if IsOverCapacity() {
+				continue
+			}
 			stale, err := p.store.Stale(ttl, batchSize)
 			if err != nil || len(stale) == 0 {
 				continue
@@ -186,6 +197,33 @@ func (p *Prefetcher) ReWarmupLoop(ctx context.Context, ttl time.Duration, batchS
 			for _, e := range stale {
 				p.Enqueue(e)
 			}
+		}
+	}
+}
+
+// CapacityLoop periodically recomputes the pinned-set-vs-disk verdict (R-1)
+// and publishes it via pin.Capacity()/IsOverCapacity(). The single cost is a
+// walk of the JuiceFS cache tree, so it runs on a slow cadence well off the
+// read hot path. cacheBaseDir empty falls back to the default (~/.juicefs/cache).
+// Call via Prefetcher.Go (QA-7a — same pin.db lifetime concern as PullPending).
+func (p *Prefetcher) CapacityLoop(ctx context.Context, interval time.Duration, cacheBaseDir string) {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	// Compute once up front so the UI and the re-warm gate have a verdict
+	// before the first tick — otherwise a freshly-launched over-capacity mount
+	// would re-warm for a full interval before anyone noticed.
+	ComputeCapacity(p.store, cacheBaseDir)
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.stopCh:
+			return
+		case <-tick.C:
+			ComputeCapacity(p.store, cacheBaseDir)
 		}
 	}
 }
