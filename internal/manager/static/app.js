@@ -857,11 +857,6 @@
       setField(card, 'endpoint', v.endpoint || '—');
       setField(card, 'latency', v.latency_ms != null ? v.latency_ms + ' ms' : '—');
     });
-    renderOverviewCard('cache', snap.cache, (card, v) => {
-      setField(card, 'hit', v.available ? (v.hit_rate_pct || 0).toFixed(1) + '%' : 'unavailable');
-      setField(card, 'reads', v.available ? (v.read_ops_per_s || 0).toFixed(1) : 'unavailable');
-      setField(card, 'writes', v.available ? (v.write_ops_per_s || 0).toFixed(1) : 'unavailable');
-    });
     renderOverviewJobs(snap.jobs);
   }
 

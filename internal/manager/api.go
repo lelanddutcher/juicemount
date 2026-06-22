@@ -139,7 +139,7 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	if overviewMeta == "" {
 		overviewMeta = cfg.MetaURL
 	}
-	a.overview = newOverviewSource(mgr, cfg.JuiceFSBin, overviewMeta, cfg.MinIOURL, cfg.FUSEMount)
+	a.overview = newOverviewSource(mgr, cfg.JuiceFSBin, overviewMeta, cfg.MinIOURL)
 	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
 	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))
 	// SLICE 1: /api/browse-jfs walks the JuiceFS FUSE mount tree.

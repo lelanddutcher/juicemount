@@ -44,7 +44,6 @@ type OverviewSnapshot struct {
 	Volume      VolumeStatusSection `json:"volume"`
 	Redis       RedisStatusSection  `json:"redis"`
 	MinIO       MinIOStatusSection  `json:"minio"`
-	Cache       CacheStatsSection   `json:"cache"`
 	Jobs        RecentJobsSection   `json:"jobs"`
 }
 
@@ -86,18 +85,6 @@ type MinIOStatusSection struct {
 	Error     string `json:"error,omitempty"`
 }
 
-// CacheStatsSection captures the local block-cache hit rate sourced
-// from `juicefs stats`. Available is false when parsing fails (e.g.
-// juicefs binary missing, FUSE mount not present in standalone mode);
-// the section then renders as "unavailable" rather than zero.
-type CacheStatsSection struct {
-	Available    bool    `json:"available"`
-	HitRatePct   float64 `json:"hit_rate_pct,omitempty"`
-	ReadOpsPerS  float64 `json:"read_ops_per_s,omitempty"`
-	WriteOpsPerS float64 `json:"write_ops_per_s,omitempty"`
-	Error        string  `json:"error,omitempty"`
-}
-
 // RecentJobsSection mirrors the Migrations tab's last-N jobs in a
 // stripped-down shape suitable for the Overview's compact summary.
 // Reverse-chronological so the most recent job is first.
@@ -129,11 +116,6 @@ type overviewSource struct {
 	juicefsBin string
 	metaURL    string
 	minioURL   string
-	// fuseMount is the local mountpoint juicefs stats needs (it takes
-	// a mountpoint, NOT a Redis URL — passing metaURL would silently
-	// fail every poll). Empty means we're in standalone mode without
-	// a local mount; the cache probe degrades to "unavailable".
-	fuseMount string
 
 	// Probe hooks. Default implementations call real backends; tests
 	// swap these for mocked sync.Func-style closures. Each MUST honor
@@ -141,25 +123,22 @@ type overviewSource struct {
 	probeVolume func(ctx context.Context) VolumeStatusSection
 	probeRedis  func(ctx context.Context) RedisStatusSection
 	probeMinIO  func(ctx context.Context) MinIOStatusSection
-	probeCache  func(ctx context.Context) CacheStatsSection
 	probeJobs   func(ctx context.Context) RecentJobsSection
 }
 
 // newOverviewSource constructs an overviewSource wired up to the real
 // backends. Tests build their own struct directly with mocked probe
 // fields rather than going through this constructor.
-func newOverviewSource(mgr *JobManager, juicefsBin, metaURL, minioURL, fuseMount string) *overviewSource {
+func newOverviewSource(mgr *JobManager, juicefsBin, metaURL, minioURL string) *overviewSource {
 	s := &overviewSource{
 		mgr:        mgr,
 		juicefsBin: juicefsBin,
 		metaURL:    metaURL,
 		minioURL:   minioURL,
-		fuseMount:  fuseMount,
 	}
 	s.probeVolume = s.realProbeVolume
 	s.probeRedis = s.realProbeRedis
 	s.probeMinIO = s.realProbeMinIO
-	s.probeCache = s.realProbeCache
 	s.probeJobs = s.realProbeJobs
 	return s
 }
@@ -201,7 +180,6 @@ func (s *overviewSource) collectOverview(ctx context.Context) OverviewSnapshot {
 	run(func(pctx context.Context) { snap.Volume = s.probeVolume(pctx) })
 	run(func(pctx context.Context) { snap.Redis = s.probeRedis(pctx) })
 	run(func(pctx context.Context) { snap.MinIO = s.probeMinIO(pctx) })
-	run(func(pctx context.Context) { snap.Cache = s.probeCache(pctx) })
 	run(func(pctx context.Context) { snap.Jobs = s.probeJobs(pctx) })
 
 	wg.Wait()
@@ -227,7 +205,6 @@ func (a *API) handleOverview(w http.ResponseWriter, r *http.Request) {
 			Volume:      VolumeStatusSection{Error: "overview not configured"},
 			Redis:       RedisStatusSection{Error: "overview not configured"},
 			MinIO:       MinIOStatusSection{Error: "overview not configured"},
-			Cache:       CacheStatsSection{Error: "overview not configured"},
 			Jobs:        RecentJobsSection{Error: "overview not configured"},
 		})
 		return
@@ -392,129 +369,6 @@ func (s *overviewSource) realProbeMinIO(ctx context.Context) MinIOStatusSection 
 	}
 }
 
-// realProbeCache runs `juicefs stats --no-color --schemas u --interval 1
-// --count 1` and parses the single-row output. juicefs stats's "u"
-// schema covers the FUSE-side counters: ops/s, rate, hit ratio. The
-// flag set is specifically chosen so the command emits a header line +
-// a single data row and exits — no streaming, no interactive UI.
-//
-// Falls back to Available=false on any error so the dashboard renders
-// "unavailable" rather than a misleading zero. The schema row may also
-// be missing in standalone mode (no FUSE mount, no in-process cache)
-// — same fallback path.
-func (s *overviewSource) realProbeCache(ctx context.Context) CacheStatsSection {
-	bin := s.juicefsBin
-	if bin == "" {
-		bin = "juicefs"
-	}
-	// juicefs stats takes a MOUNTPOINT (e.g. /jfs), not a Redis URL.
-	// Standalone mode without a local FUSE mount can't observe the
-	// per-mount cache counters — degrade to unavailable rather than
-	// shell out with a bogus argument.
-	if s.fuseMount == "" {
-		return CacheStatsSection{Available: false, Error: "no local FUSE mount (standalone mode)"}
-	}
-	cmd := exec.CommandContext(ctx, bin, "stats",
-		"--no-color",
-		"--schemas", "u",
-		"--interval", "1",
-		"--count", "1",
-		s.fuseMount,
-	)
-	out, err := cmd.Output()
-	if err != nil {
-		return CacheStatsSection{Available: false, Error: fmt.Sprintf("juicefs stats failed: %v", trimErr(err))}
-	}
-	return parseJuicefsStatsU(out)
-}
-
-// parseJuicefsStatsU parses the output of `juicefs stats --schemas u
-// --interval 1 --count 1`. Expected format (whitespace-aligned table):
-//
-//	  usage     |   fuse-ops   |   ...
-//	cpu   mem   |   ops   lat  | ...
-//	0.5%  120m  |   10   1.5ms | ...
-//
-// We grep for known column headers and extract the value at the same
-// column index in the data row. Tolerant — any unparseable row leaves
-// the corresponding field zero and surfaces Available=false only when
-// NO useful field was extracted.
-func parseJuicefsStatsU(raw []byte) CacheStatsSection {
-	scanner := bufio.NewScanner(strings.NewReader(string(raw)))
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	var lines []string
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		lines = append(lines, line)
-	}
-	if len(lines) < 2 {
-		return CacheStatsSection{Available: false, Error: "juicefs stats produced no rows"}
-	}
-	// Locate the data row — `juicefs stats` prints two header lines (the
-	// schema group and the column names) then one data line per tick.
-	// With --count 1 we expect exactly three lines; we tolerate extras
-	// by taking the LAST whitespace-only-numeric row.
-	var headerLine string
-	var dataLine string
-	for i := len(lines) - 1; i >= 0; i-- {
-		fields := strings.Fields(lines[i])
-		if len(fields) == 0 {
-			continue
-		}
-		// A data row is mostly numeric; a header is mostly letters.
-		numeric := 0
-		for _, f := range fields {
-			if isNumericish(f) {
-				numeric++
-			}
-		}
-		if numeric*2 >= len(fields) && dataLine == "" {
-			dataLine = lines[i]
-			continue
-		}
-		if dataLine != "" && headerLine == "" {
-			headerLine = lines[i]
-			break
-		}
-	}
-	if dataLine == "" {
-		return CacheStatsSection{Available: false, Error: "no data row in juicefs stats output"}
-	}
-	headers := strings.Fields(headerLine)
-	values := strings.Fields(dataLine)
-	out := CacheStatsSection{Available: true}
-	gotAny := false
-	for i, h := range headers {
-		if i >= len(values) {
-			break
-		}
-		switch strings.ToLower(h) {
-		case "read", "read/s":
-			if v, err := strconv.ParseFloat(stripTrailingUnit(values[i]), 64); err == nil {
-				out.ReadOpsPerS = v
-				gotAny = true
-			}
-		case "write", "write/s":
-			if v, err := strconv.ParseFloat(stripTrailingUnit(values[i]), 64); err == nil {
-				out.WriteOpsPerS = v
-				gotAny = true
-			}
-		case "hit", "hit%", "hits":
-			if v, err := strconv.ParseFloat(stripTrailingUnit(values[i]), 64); err == nil {
-				out.HitRatePct = v
-				gotAny = true
-			}
-		}
-	}
-	if !gotAny {
-		return CacheStatsSection{Available: false, Error: "juicefs stats columns not recognized"}
-	}
-	return out
-}
-
 // realProbeJobs surfaces the last recentJobsLimit jobs from the
 // JobManager in reverse insertion order. Bounded under read of the
 // JobManager's mutex via List() — no separate locks needed.
@@ -567,43 +421,6 @@ func trimErr(err error) string {
 		msg = msg[:i]
 	}
 	return msg
-}
-
-// isNumericish returns true if `s` parses as a number, possibly with a
-// trailing single-character unit (e.g. "120m", "1.5K"). Used to
-// classify rows in the `juicefs stats` output as header vs. data.
-func isNumericish(s string) bool {
-	if s == "" {
-		return false
-	}
-	// Trim a single trailing unit char (juicefs uses K/M/G/T/m/s/%/ms).
-	t := stripTrailingUnit(s)
-	if t == "" {
-		return false
-	}
-	_, err := strconv.ParseFloat(t, 64)
-	return err == nil
-}
-
-// stripTrailingUnit removes a trailing unit suffix from a juicefs
-// stats value. juicefs uses single-letter unit suffixes (K/M/G/T) for
-// counters and "ms" / "%" for latency / ratios. We only strip the
-// suffix character(s); the caller decides what the resulting float
-// means in context (Hit% is already a percent, no extra conversion).
-func stripTrailingUnit(s string) string {
-	if s == "" {
-		return s
-	}
-	// Strip "ms" first (two-char unit).
-	s = strings.TrimSuffix(s, "ms")
-	// Then single-char units.
-	for _, u := range []string{"%", "K", "M", "G", "T", "k", "m", "g", "t", "s"} {
-		if strings.HasSuffix(s, u) {
-			s = s[:len(s)-len(u)]
-			break
-		}
-	}
-	return s
 }
 
 // parseRedisAddr extracts host:port and db from a redis:// URL. Local

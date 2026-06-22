@@ -52,9 +52,6 @@ func TestCollectOverview(t *testing.T) {
 		probeMinIO: func(ctx context.Context) MinIOStatusSection {
 			return MinIOStatusSection{Reachable: true, LatencyMs: 5, Endpoint: "http://127.0.0.1:9000"}
 		},
-		probeCache: func(ctx context.Context) CacheStatsSection {
-			return CacheStatsSection{Available: true, HitRatePct: 99.5, ReadOpsPerS: 10, WriteOpsPerS: 2}
-		},
 		probeJobs: func(ctx context.Context) RecentJobsSection {
 			// Run the REAL realProbeJobs against the mgr — this is the
 			// path we actually care about and the easiest mock is
@@ -90,12 +87,6 @@ func TestCollectOverview(t *testing.T) {
 	}
 	if snap.MinIO.Error != "" {
 		t.Errorf("MinIO.Error = %q, want empty on success", snap.MinIO.Error)
-	}
-	if !snap.Cache.Available {
-		t.Errorf("Cache.Available = false, want true")
-	}
-	if snap.Cache.HitRatePct != 99.5 {
-		t.Errorf("Cache.HitRatePct = %v want 99.5", snap.Cache.HitRatePct)
 	}
 	if snap.Jobs.Error != "" {
 		t.Errorf("Jobs.Error = %q, want empty when mgr is configured", snap.Jobs.Error)
@@ -140,9 +131,6 @@ func TestCollectOverviewDegraded(t *testing.T) {
 		probeMinIO: func(ctx context.Context) MinIOStatusSection {
 			return MinIOStatusSection{Reachable: true, LatencyMs: 5, Endpoint: "http://127.0.0.1:9000"}
 		},
-		probeCache: func(ctx context.Context) CacheStatsSection {
-			return CacheStatsSection{Available: true, HitRatePct: 80, ReadOpsPerS: 1, WriteOpsPerS: 0}
-		},
 		probeJobs: func(ctx context.Context) RecentJobsSection {
 			return RecentJobsSection{Items: []RecentJob{}}
 		},
@@ -170,12 +158,6 @@ func TestCollectOverviewDegraded(t *testing.T) {
 	}
 	if !snap.MinIO.Reachable {
 		t.Errorf("MinIO.Reachable = false despite mock returning true")
-	}
-	if snap.Cache.Error != "" {
-		t.Errorf("Cache.Error = %q, expected empty when only Redis fails", snap.Cache.Error)
-	}
-	if !snap.Cache.Available {
-		t.Errorf("Cache.Available = false despite mock returning true")
 	}
 	if snap.Jobs.Error != "" {
 		t.Errorf("Jobs.Error = %q, expected empty when only Redis fails", snap.Jobs.Error)
