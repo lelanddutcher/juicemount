@@ -273,10 +273,18 @@ user sees "Pending/Warming" instantly.
 When files are deleted from a pinned directory, that count surfaces as failed pins. User says
 no guard needed yet — **note for QA** so it isn't mistaken for a real failure.
 
-### R-4 Start-while-offline
+### R-4 Start-while-offline — ✅ IMPLEMENTED 2026-06-22 (awaiting live offline-boot test)
 Boot the app + serve the NFS share with ZERO network / no server connection, exposing cached
 content in its last-known state. Needs the startup path to not hard-depend on a reachable
-backend, plus a clear "started offline — showing cached state" modal/banner.
+backend, plus a clear "started offline — showing cached state" modal/banner. DESIGN (adversarial
+multi-agent workflow): the honest scope is NAVIGATION offline (served from the SQLite mirror, zero
+Redis) — file-byte reads genuinely require Redis (JuiceFS metadata engine + cache-reader slice maps),
+so reads fail-fast cleanly until FUSE remounts on recovery. IMPLEMENTED: backendReachableQuick probe
+→ skip the 30s boot-time FUSE mount + use a deferred Redis client (connected=false, self-heals via
+reconcile) + engage auto-offline immediately + SeedUnreachable fixes the recovery boot-race +
+"started_offline:" signal → Swift .running + self-dismissing banner. Approach C (offline byte reads)
+rejected as a JuiceFS-reimplementation / silent-corruption risk. REAL TEST PENDING: backend-down boot
+→ navigate → backend-up → reads resume (needs an outage simulation on a live mount).
 
 ### R-5 Multi-user collision & sync-back (ideation)
 Plan/ideate concurrent multi-user access: what collision/sync semantics do we have today
