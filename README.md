@@ -38,7 +38,7 @@ S3 and cloud collaboration platforms have their place — this exists because at
 
 ## What you get
 
-All of the below is shipped and exercised in the current codebase (see [`ROADMAP.md`](ROADMAP.md) for validation status):
+All of the below is shipped and exercised in the current codebase:
 
 - **Block-level partial reads.** Files are stored as chunked objects (JuiceFS). Scrubbing 3 seconds of a 100 GB OCF streams only those blocks — no full-file download, ever.
 - **Local SSD cache that respects your disk.** Set a cache size; JuiceMount grows it only as far as needed to keep your pinned content fully cached, and never squeezes the boot disk below a hard 10 GiB free floor. It also reclaims APFS purgeable space (Time Machine local snapshots) at mount time and on demand, so "disk full" usually isn't.
@@ -229,7 +229,7 @@ Pin what you need first (popover → *Pin Folder for Offline…*, or Finder righ
 
 **What happens to my writes if the network drops or the server dies mid-copy?**
 
-With the write spool enabled (Preferences → Cache & Storage), a write is acknowledged the moment it's durable on local SSD; a background drainer uploads it once the server is reachable, SHA-256-verified at every hop. The popover shows pending / in-flight / stalled / failed uploads with per-entry age and last error, offers *Retry failed* and *Recover stalled*, and the app guards quit and spool-disable while uploads are pending so spooled data isn't stranded. With the spool off (the default), writes go through to the server synchronously — if the backend is unreachable, the write fails the way it would on any network drive. Note that offline-files mode gates *reads*; it doesn't make un-spooled writes safe. <!-- sources: docs/dev-setup.md (write path), MENU_BAR_APP.md (spool UI), docs/OPEN_BUGS.md launch-hardening closures (quit/disable drain guards); the offline open gate in nfs/handler.go applies to reads only -->
+With the write spool enabled (Preferences → Cache & Storage), a write is acknowledged the moment it's durable on local SSD; a background drainer uploads it once the server is reachable, SHA-256-verified at every hop. The popover shows pending / in-flight / stalled / failed uploads with per-entry age and last error, offers *Retry failed* and *Recover stalled*, and the app guards quit and spool-disable while uploads are pending so spooled data isn't stranded. With the spool off (the default), writes go through to the server synchronously — if the backend is unreachable, the write fails the way it would on any network drive. Note that offline-files mode gates *reads*; it doesn't make un-spooled writes safe. <!-- sources: docs/dev-setup.md (write path), MENU_BAR_APP.md (spool UI); the offline open gate in nfs/handler.go applies to reads only -->
 
 **Can two Macs mount the same volume?**
 
@@ -260,14 +260,14 @@ JuiceMount is built on JuiceFS and says so loudly (see the credit section below 
 <details>
 <summary><strong>Does it phone home?</strong></summary>
 
-No. The app's network connections are the Redis and S3 endpoints you configure, plus a loopback control plane on `127.0.0.1`. JuiceFS's own anonymous usage reporting is explicitly disabled — the app passes `--no-usage-report` when mounting. There's no crash reporting, no update check, no analytics; "no telemetry without opt-in" is a stated non-negotiable (see [Contributing](#contributing)). Diagnostics exist only as a local zip you create yourself with Export Diagnostics and choose to share. <!-- verified: health/fuse.go passes the no-usage-report flag to juicefs mount; the app's only URLSession targets are loopback control-plane routes; non-negotiables in Contributing + docs/VISION.md -->
+No. The app's network connections are the Redis and S3 endpoints you configure, plus a loopback control plane on `127.0.0.1`. JuiceFS's own anonymous usage reporting is explicitly disabled — the app passes `--no-usage-report` when mounting. There's no crash reporting, no update check, no analytics; "no telemetry without opt-in" is a stated non-negotiable (see [Contributing](#contributing)). Diagnostics exist only as a local zip you create yourself with Export Diagnostics and choose to share. <!-- verified: health/fuse.go passes the no-usage-report flag to juicefs mount; the app's only URLSession targets are loopback control-plane routes; non-negotiables in Contributing -->
 
 </details>
 
 <details>
 <summary><strong>Why is the write spool off by default?</strong></summary>
 
-It's the newest piece of the write path, and a change to where your data's durability boundary sits should earn default-on status. The spool's integrity story is strong — per-hop SHA-256, boot-time crash recovery, drain guards on quit and disable, exercised through the launch-hardening QA gates — but a planned 24-hour live soak is still on the books ([`docs/OPEN_BUGS.md`](docs/OPEN_BUGS.md)). With the spool off, writes use the unchanged direct path. Flip it on in Preferences → Cache & Storage when background-upload writes are worth it to you; over a WAN they're transformative.
+It's the newest piece of the write path, and a change to where your data's durability boundary sits should earn default-on status. The spool's integrity story is strong — per-hop SHA-256, boot-time crash recovery, drain guards on quit and disable, exercised through the launch-hardening QA gates — but a planned 24-hour live soak is still on the books. With the spool off, writes use the unchanged direct path. Flip it on in Preferences → Cache & Storage when background-upload writes are worth it to you; over a WAN they're transformative.
 
 </details>
 
@@ -300,7 +300,7 @@ The popover's health rows (Redis / MinIO / FUSE / NFS mount) are the first thing
 
 **The volume doesn't appear in Finder.** Open the popover: if the NFS row says "Volume not mounted", click **Mount Now** — a privileged re-mount that may show the admin prompt once. (Scriptable as `/mount-now` on the control plane; it's single-flighted and returns 409 while a mount is already in progress.) If the prompt itself is the obstacle — headless Mac, automated restarts — set up the [scoped sudoers rule](docs/dev-setup.md). Also check that something else doesn't already own the path: `mount | grep <volume-name>`.
 
-**Finder says "not responding", or the icon turns amber.** Amber means degraded: running, but a backend (Redis / MinIO / FUSE / NFS) is unhealthy or recovering — the popover names which one and why. Give it a moment: the health monitor force-remounts a wedged FUSE daemon once the backend is reachable again (in the controlled long-outage repro this took about 15 s after the network returned), and an independent watchdog keeps the menu-bar state converging on reality instead of sticking. If the kernel mount itself is wedged — server died, every Finder access hangs — **Force Eject** in the popover is the last resort: a privileged kernel-level unmount behind a confirmation dialog, after which in-flight operations on the volume fail with I/O errors rather than hanging. <!-- self-heal story: QA-36 and QA-38 closure notes in docs/OPEN_BUGS.md; Force Eject: MenuPopoverView.swift -->
+**Finder says "not responding", or the icon turns amber.** Amber means degraded: running, but a backend (Redis / MinIO / FUSE / NFS) is unhealthy or recovering — the popover names which one and why. Give it a moment: the health monitor force-remounts a wedged FUSE daemon once the backend is reachable again (in the controlled long-outage repro this took about 15 s after the network returned), and an independent watchdog keeps the menu-bar state converging on reality instead of sticking. If the kernel mount itself is wedged — server died, every Finder access hangs — **Force Eject** in the popover is the last resort: a privileged kernel-level unmount behind a confirmation dialog, after which in-flight operations on the volume fail with I/O errors rather than hanging. <!-- self-heal story: health/monitor.go watchdog + ServerController recovery watchdog; Force Eject: MenuPopoverView.swift -->
 
 **Uploads look stuck.** With the spool enabled, the popover's *Pending uploads* section shows pending / in-flight / stalled / failed counts with per-entry age and last error; **Retry failed** and **Recover stalled** act on them directly (scriptable as `/spool` and `/spool-recover` on the control plane). A full spool surfaces to Finder as "disk full" rather than a mystery error.
 
@@ -314,7 +314,7 @@ The popover's health rows (Redis / MinIO / FUSE / NFS mount) are the first thing
 
 ## Roadmap
 
-Next up (full ranked list in [`ROADMAP.md`](ROADMAP.md) and `VISION/feature-roadmap-ranked.md`):
+Next up:
 
 1. Codec-aware Quick Look proxies (R3D / ARRI / BRAW / ProRes RAW)
 2. Content-hash backup verification with a traffic-light inventory
@@ -335,8 +335,8 @@ If JuiceFS itself fits your (non-video, non-macOS) problem, use it directly — 
 ## Contributing
 
 - **Bugs:** open an issue with the diagnostic zip (menu-bar → Export Diagnostics) — it bundles logs, mount table, and backend health.
-- **Code:** one theme per PR — stability fixes never share a commit with features. Run `go vet ./...` and `go test -race` on touched packages; request-path changes get an adversarial review pass (see `docs/QA-procedure.md`).
-- **Testing on real hardware** is the most valuable contribution: different NAS vendors, network shapes, and NLE versions. Real Finder/Resolve/Premiere testing beats synthetic checks — that rule is earned, see the QA history in `docs/`.
+- **Code:** one theme per PR — stability fixes never share a commit with features. Run `go vet ./...` and `go test -race` on touched packages; request-path changes get an adversarial review pass.
+- **Testing on real hardware** is the most valuable contribution: different NAS vendors, network shapes, and NLE versions. Real Finder/Resolve/Premiere testing beats synthetic checks — that rule is earned.
 - **Developer setup** (passwordless mount for fast test cycles, headless CLI, config reference): [`docs/dev-setup.md`](docs/dev-setup.md).
 
 *Non-negotiables, so you don't waste a PR:* no telemetry without opt-in, no proprietary dependencies for self-hosters, no FileProviderExtension (ever — `docs/no-fileprovider.md` is the postmortem), reliability beats novelty.

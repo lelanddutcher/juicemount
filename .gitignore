@@ -50,3 +50,21 @@ secrets/
 # Claude Code
 .claude/
 /build/svg2png
+
+# Internal planning / business / vision docs — NOT for the public repo.
+# These stay on the maintainer's machine; only user- and contributor-facing
+# docs (README, LICENSE, NOTICE, CHANGELOG, ARCHITECTURE, server/, docs/
+# dev-setup|signing|no-fileprovider|PERFORMANCE_METHODOLOGY) ship publicly.
+# (A NEW, public-facing ROADMAP.md is intentionally NOT ignored.)
+/VISION/
+/docs/ROADMAP/
+/docs/TUNING/
+/docs/COMPETITIVE/
+/docs/screenshots/
+/docs/STATE.md
+/docs/OPEN_BUGS.md
+/docs/LAUNCH_PLAN.md
+/docs/HANDOFF_truenas_connectx_flapping.md
+/docs/README_DRAFT.md
+/docs/VISION.md
+/docs/QA-procedure.md
