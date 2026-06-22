@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="Files become blocks: sync tools move the whole 8 GB file across the wire, while JuiceMount moves only the 3 changed blocks.">
+<title>Your files become blocks</title>
+<desc>Two panels compare moving an entire file versus moving only the changed blocks. Left: a 12-cell film strip slides slowly across a wire as one heavy object. Right: only 3 juice-green blocks detach and travel quickly, the other 9 stay put.</desc>
+<style>
+  :root{}
+  .bg{fill:#17181B}
+  .well{fill:#0e0f11}
+  .hair{stroke:#34353a;stroke-width:1}
+  .h1{font-family:Inter,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-weight:600;fill:#FAFDE8}
+  .sub{font-family:Inter,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-weight:400;fill:rgba(250,253,232,0.72)}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,monospace}
+  .ttl{fill:#FAFDE8;font-size:13px}
+  .cap{fill:rgba(250,253,232,0.72);font-size:12px}
+  .cell{fill:#0e0f11;stroke:#378ADD;stroke-width:1.2}
+  .cellfill{fill:rgba(55,138,221,0.14)}
+  .idle{fill:#0e0f11;stroke:#54565a;stroke-width:1.2}
+  .green{fill:rgba(170,205,88,0.18);stroke:#AACD58;stroke-width:1.4}
+  .sprk{fill:#378ADD}
+  .gsprk{fill:#AACD58}
+
+  /* LEFT: whole strip travels together, slow + heavy */
+  #leftStrip{transform-box:fill-box;transform-origin:center;animation:leftSlide 6s cubic-bezier(.45,0,.55,1) infinite}
+  @keyframes leftSlide{
+    0%   {transform:translateX(0);opacity:1}
+    8%   {transform:translateX(0);opacity:1}
+    66%  {transform:translateX(330px);opacity:1}
+    74%  {transform:translateX(330px);opacity:0}
+    74.01%{transform:translateX(0);opacity:0}
+    82%  {transform:translateX(0);opacity:1}
+    100% {transform:translateX(0);opacity:1}
+  }
+  /* heavy "drag" pulse on the wire under the left strip */
+  #leftPulse{transform-box:fill-box;transform-origin:left center;animation:leftPulse 6s linear infinite}
+  @keyframes leftPulse{
+    0%,8%{opacity:0;transform:scaleX(.02)}
+    10%{opacity:.9}
+    66%{opacity:.9;transform:scaleX(1)}
+    74%,100%{opacity:0;transform:scaleX(1)}
+  }
+
+  /* RIGHT: only 3 green blocks detach, quick + light */
+  .gblock{transform-box:fill-box;transform-origin:center}
+  #gb1{animation:gMove 6s cubic-bezier(.3,.7,.3,1) infinite}
+  #gb2{animation:gMove 6s cubic-bezier(.3,.7,.3,1) infinite;animation-delay:.18s}
+  #gb3{animation:gMove 6s cubic-bezier(.3,.7,.3,1) infinite;animation-delay:.36s}
+  @keyframes gMove{
+    0%   {transform:translate(0,0);opacity:1}
+    14%  {transform:translate(0,-12px);opacity:1}
+    44%  {transform:translate(312px,-12px);opacity:1}
+    52%  {transform:translate(312px,0);opacity:1}
+    60%  {transform:translate(312px,0);opacity:0}
+    60.01%{transform:translate(0,0);opacity:0}
+    70%  {transform:translate(0,0);opacity:1}
+    100% {transform:translate(0,0);opacity:1}
+  }
+  /* light spark gliding along the right wire */
+  #rspark{transform-box:fill-box;transform-origin:center;animation:rSpark 6s linear infinite}
+  @keyframes rSpark{
+    0%,12%{opacity:0;transform:translateX(0)}
+    16%{opacity:1}
+    50%{opacity:1;transform:translateX(300px)}
+    56%,100%{opacity:0;transform:translateX(300px)}
+  }
+  /* destination slot glow on right when blocks land */
+  #rland{transform-box:fill-box;transform-origin:center;animation:rLand 6s ease-in-out infinite}
+  @keyframes rLand{
+    0%,44%{opacity:0}
+    52%{opacity:.55}
+    66%{opacity:0}
+    100%{opacity:0}
+  }
+
+  @media (prefers-reduced-motion: reduce){ *{animation:none !important} }
+</style>
+
+<rect x="0" y="0" width="1200" height="360" rx="18" class="bg"/>
+
+<text x="40" y="48" class="h1" font-size="30">Your files become blocks. That&#39;s the magic.</text>
+<text x="40" y="78" class="sub" font-size="15">Most tools move the whole file. JuiceMount moves only the blocks you touch.</text>
+
+<!-- ===================== LEFT PANEL ===================== -->
+<g>
+  <rect x="40" y="104" width="544" height="224" rx="12" class="well hair"/>
+  <text x="64" y="134" class="mono ttl">one object &#8212; sync tools</text>
+
+  <!-- wire -->
+  <line x1="64" y1="206" x2="560" y2="206" class="hair" stroke="#378ADD" stroke-opacity="0.5"/>
+  <!-- heavy drag pulse on wire -->
+  <rect id="leftPulse" x="78" y="204" width="330" height="4" rx="2" fill="#378ADD" fill-opacity="0.35"/>
+
+  <!-- entire strip moves together -->
+  <g id="leftStrip">
+    <!-- film strip backing bar -->
+    <rect x="76" y="180" width="156" height="52" rx="6" fill="#0e0f11" stroke="#378ADD" stroke-width="1" stroke-opacity="0.55"/>
+    <!-- sprocket dots top/bottom -->
+    <g fill="#378ADD" fill-opacity="0.5">
+      <circle cx="86" cy="185" r="1.6"/><circle cx="98" cy="185" r="1.6"/><circle cx="110" cy="185" r="1.6"/><circle cx="122" cy="185" r="1.6"/><circle cx="134" cy="185" r="1.6"/><circle cx="146" cy="185" r="1.6"/><circle cx="158" cy="185" r="1.6"/><circle cx="170" cy="185" r="1.6"/><circle cx="182" cy="185" r="1.6"/><circle cx="194" cy="185" r="1.6"/><circle cx="206" cy="185" r="1.6"/><circle cx="218" cy="185" r="1.6"/>
+      <circle cx="86" cy="227" r="1.6"/><circle cx="98" cy="227" r="1.6"/><circle cx="110" cy="227" r="1.6"/><circle cx="122" cy="227" r="1.6"/><circle cx="134" cy="227" r="1.6"/><circle cx="146" cy="227" r="1.6"/><circle cx="158" cy="227" r="1.6"/><circle cx="170" cy="227" r="1.6"/><circle cx="182" cy="227" r="1.6"/><circle cx="194" cy="227" r="1.6"/><circle cx="206" cy="227" r="1.6"/><circle cx="218" cy="227" r="1.6"/>
+    </g>
+    <!-- 12 frame cells -->
+    <g>
+      <rect x="84" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="96" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="108" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="120" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="132" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="144" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="156" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="168" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="180" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="192" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="204" y="192" width="9" height="28" rx="1.5" class="cell"/>
+      <rect x="216" y="192" width="9" height="28" rx="1.5" class="cell"/>
+    </g>
+  </g>
+
+  <text x="64" y="312" class="mono cap">the whole 8 GB crosses first</text>
+</g>
+
+<!-- ===================== RIGHT PANEL ===================== -->
+<g>
+  <rect x="616" y="104" width="544" height="224" rx="12" class="well hair"/>
+  <text x="640" y="134" class="mono ttl">blocks &#8212; JuiceMount</text>
+
+  <!-- wire -->
+  <line x1="640" y1="206" x2="1136" y2="206" class="hair" stroke="#378ADD" stroke-opacity="0.5"/>
+  <!-- light spark on wire -->
+  <circle id="rspark" cx="824" cy="206" r="3.2" class="gsprk"/>
+
+  <!-- destination landing slots (where 3 green arrive) -->
+  <g id="rland">
+    <rect x="1100" y="192" width="9" height="28" rx="1.5" fill="rgba(170,205,88,0.18)" stroke="#AACD58" stroke-width="1.2"/>
+    <rect x="1112" y="192" width="9" height="28" rx="1.5" fill="rgba(170,205,88,0.18)" stroke="#AACD58" stroke-width="1.2"/>
+    <rect x="1124" y="192" width="9" height="28" rx="1.5" fill="rgba(170,205,88,0.18)" stroke="#AACD58" stroke-width="1.2"/>
+  </g>
+
+  <!-- film strip backing (stays put) -->
+  <rect x="652" y="180" width="156" height="52" rx="6" fill="#0e0f11" stroke="#54565a" stroke-width="1" stroke-opacity="0.55"/>
+  <g fill="#54565a" fill-opacity="0.5">
+    <circle cx="662" cy="185" r="1.6"/><circle cx="674" cy="185" r="1.6"/><circle cx="686" cy="185" r="1.6"/><circle cx="698" cy="185" r="1.6"/><circle cx="710" cy="185" r="1.6"/><circle cx="722" cy="185" r="1.6"/><circle cx="734" cy="185" r="1.6"/><circle cx="746" cy="185" r="1.6"/><circle cx="758" cy="185" r="1.6"/><circle cx="770" cy="185" r="1.6"/><circle cx="782" cy="185" r="1.6"/><circle cx="794" cy="185" r="1.6"/>
+    <circle cx="662" cy="227" r="1.6"/><circle cx="674" cy="227" r="1.6"/><circle cx="686" cy="227" r="1.6"/><circle cx="698" cy="227" r="1.6"/><circle cx="710" cy="227" r="1.6"/><circle cx="722" cy="227" r="1.6"/><circle cx="734" cy="227" r="1.6"/><circle cx="746" cy="227" r="1.6"/><circle cx="758" cy="227" r="1.6"/><circle cx="770" cy="227" r="1.6"/><circle cx="782" cy="227" r="1.6"/><circle cx="794" cy="227" r="1.6"/>
+  </g>
+
+  <!-- 9 idle cells that stay put (gray) -->
+  <g>
+    <rect x="660" y="192" width="9" height="28" rx="1.5" class="idle"/>
+    <rect x="672" y="192" width="9" height="28" rx="1.5" class="idle"/>
+    <rect x="696" y="192" width="9" height="28" rx="1.5" class="idle"/>
+    <rect x="708" y="192" width="9" height="28" rx="1.5" class="idle"/>
+    <rect x="720" y="192" width="9" height="28" rx="1.5" class="idle"/>
+    <rect x="744" y="192" width="9" height="28" rx="1.5" class="idle"/>
+    <rect x="756" y="192" width="9" height="28" rx="1.5" class="idle"/>
+    <rect x="768" y="192" width="9" height="28" rx="1.5" class="idle"/>
+    <rect x="792" y="192" width="9" height="28" rx="1.5" class="idle"/>
+  </g>
+
+  <!-- 3 green blocks that detach + travel (positions 3, 7, 11 in the row) -->
+  <rect id="gb1" class="gblock green" x="684" y="192" width="9" height="28" rx="1.5"/>
+  <rect id="gb2" class="gblock green" x="732" y="192" width="9" height="28" rx="1.5"/>
+  <rect id="gb3" class="gblock green" x="780" y="192" width="9" height="28" rx="1.5"/>
+
+  <text x="640" y="312" class="mono cap">3 blocks &#183; 12 MB. the rest never move.</text>
+</g>
+</svg>
