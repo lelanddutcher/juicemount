@@ -242,6 +242,55 @@ user has no idea why. Surface a plain-language **activity indicator** (menu-bar 
 e.g. "Rebuilding index 62%", "Uploading 412 files (38 GB) to backend", "Warming pinned project
 (120/180 GB)", "Catching up after reconnect" — so a slow moment reads as *a known background
 task in progress*, not *the product is broken*. Include an ETA/throughput where cheap.
+**Status: SHIPPED 2026-06-17** (4.8 clear-failed + 4.10 /activity backend + popover UI).
+
+---
+
+## Release punch list (2026-06-17, blocking public launch)
+
+Working through as a loop. Code bugs first, then features/planning, then UI/audits.
+
+### R-1 Pinned dir larger than disk → prefetch loops forever
+Pinning a directory whose bytes exceed the usable cache capacity never converges: JuiceFS
+LRU-evicts as the prefetcher warms, so files never all stay Ready and the re-warm loop runs
+forever. FIX: at pin time compute pinned-bytes vs available cache capacity; if it can't fit,
+surface a clear "pinned set (X) exceeds available cache (Y) — free space or pin less" state and
+stop the infinite re-warm. (Root-caused 2026-06-17: 180 GB pinned, 139 GB free → never converges.)
+
+### R-2 Pinning a folder doesn't take effect on first attempt / tens-of-seconds delay
+After selecting a dir in the Finder pin picker and clicking Pin, nothing changes in the pinned
+UI for tens of seconds. Likely the PullPending 5s poll + slow UI refresh. FIX: signal the
+prefetcher immediately on pin (don't wait for the poll), and refresh the pin UI promptly so the
+user sees "Pending/Warming" instantly.
+
+### R-3 (QA note only) Removing files from a pinned dir shows them as "failed to download/pin"
+When files are deleted from a pinned directory, that count surfaces as failed pins. User says
+no guard needed yet — **note for QA** so it isn't mistaken for a real failure.
+
+### R-4 Start-while-offline
+Boot the app + serve the NFS share with ZERO network / no server connection, exposing cached
+content in its last-known state. Needs the startup path to not hard-depend on a reachable
+backend, plus a clear "started offline — showing cached state" modal/banner.
+
+### R-5 Multi-user collision & sync-back (ideation)
+Plan/ideate concurrent multi-user access: what collision/sync semantics do we have today
+(JuiceFS + Redis), what breaks with two writers, and the path to safe cooperative editing.
+
+### R-6 Run the marketing website locally for feedback
+Serve the website version(s) on localhost for another review pass.
+
+### R-7 Manager / dashboard scope audit — Trash + Destinations inoperative
+Audit JuiceMount Manager against what was scoped; Trash and Destinations pages reported inop.
+(See tasks #31–34.)
+
+### R-8 Menu-bar mount-state reporting edge cases
+Internet disconnect/change makes the mount go offline → reconnect → responsive, but the menu
+bar still reports DISCONNECTED. Audit the color/text state machine. (Task #30.)
+
+### R-9 Settings clarity + design sprint
+Settings text fields aren't obviously editable (users miss that they can change the volume
+name); move the volume-name field down to the "mounts at" row; run a design sprint to make the
+whole settings pane cleaner/clearer.
 
 - **NFS v4.1**: server-initiated callbacks (delegations) for instant invalidation. Major protocol change.
 - **Redis Streams**: replace SUBSCRIBE + Lua SCAN with a Redis Stream for change tracking. Requires JuiceFS cooperation or a sidecar.
