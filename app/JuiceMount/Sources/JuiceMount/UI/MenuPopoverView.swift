@@ -645,6 +645,12 @@ struct MenuPopoverView: View {
             if !cacheStatus.live.CurrentFile.isEmpty {
                 livePrefetchRow
             }
+            // R-2: roots mid-enumeration show a spinner the instant Pin is
+            // clicked, before any pinned rows exist — so a big folder no longer
+            // reads as "nothing happened."
+            if !cacheStatus.scanning.isEmpty {
+                scanningRootsList
+            }
             if !cacheStatus.roots.isEmpty {
                 rootsList
             }
@@ -1099,6 +1105,11 @@ struct MenuPopoverView: View {
                             presentRemediation(.pinFailed,
                                                rawError: err,
                                                extraContext: "folder: \(url.lastPathComponent)")
+                        } else if result.scanning {
+                            // R-2: the walk runs async now — files land in
+                            // /cache-status as enumeration completes. The
+                            // "Scanning…" row gives the user immediate feedback.
+                            NSLog("[JuiceMount] Scanning \(url.lastPathComponent) for files to pin…")
                         } else {
                             // Brief notification — don't be too noisy
                             NSLog("[JuiceMount] Pinned \(result.files_pinned) files under \(url.lastPathComponent)")
@@ -1283,6 +1294,31 @@ struct MenuPopoverView: View {
             Text("\(cacheStatus.live.FilesPrefetched) done")
                 .font(.caption2.monospaced())
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// R-2: roots still being enumerated. A spinner + "Scanning…" appears the
+    /// instant Pin is clicked (the walk runs async on the Go side), so a large
+    /// folder no longer looks like nothing happened. Once the rows are inserted
+    /// the backend drops the root from `scanning` and it reappears in rootsList.
+    private var scanningRootsList: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(cacheStatus.scanning) { s in
+                HStack {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .frame(width: 12)
+                    Text(URL(fileURLWithPath: s.root).lastPathComponent)
+                        .font(.caption2.monospaced())
+                        .lineLimit(1)
+                    Spacer()
+                    Text(s.files_found > 0
+                         ? "found \(s.files_found)…"
+                         : "scanning…")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 

@@ -28,6 +28,7 @@ type Prefetcher struct {
 
 	jobs   chan jobReq
 	stopCh chan struct{}
+	wakeCh chan struct{} // R-2: nudge PullPending to drain now, not on the next tick
 	wg     sync.WaitGroup
 
 	// Live progress counters (atomic for cheap concurrent reads)
@@ -58,6 +59,7 @@ func NewPrefetcher(store *Store, fusePath, mountPoint string, workers int) *Pref
 		workers:    workers,
 		jobs:       make(chan jobReq, 256),
 		stopCh:     make(chan struct{}),
+		wakeCh:     make(chan struct{}, 1), // buffered+coalesced: one pending wake is enough
 	}
 	for i := 0; i < workers; i++ {
 		p.wg.Add(1)
@@ -72,6 +74,18 @@ func (p *Prefetcher) Stop() {
 	close(p.stopCh)
 	close(p.jobs)
 	p.wg.Wait()
+}
+
+// Wake nudges PullPending to drain the Pending queue immediately instead of
+// waiting for its next tick. Non-blocking and coalescing — call it right after
+// inserting new pins (R-2) so warming starts within milliseconds, not up to a
+// full tick later. Safe to call from any goroutine, including after Stop (the
+// send just no-ops against the buffer or is ignored once the loop exits).
+func (p *Prefetcher) Wake() {
+	select {
+	case p.wakeCh <- struct{}{}:
+	default: // a wake is already pending; one is enough
+	}
 }
 
 // Enqueue queues a single file for prefetch. Non-blocking — returns false if
@@ -146,17 +160,27 @@ func (p *Prefetcher) PullPending(ctx context.Context, batchSize int) {
 		case <-p.stopCh:
 			return
 		case <-tick.C:
-			pending, err := p.store.Pending(batchSize)
-			if err != nil || len(pending) == 0 {
-				continue
-			}
-			for _, e := range pending {
-				if !p.Enqueue(e) {
-					break // queue full, try next tick
-				}
-				p.store.UpdateStatus(e.Path, StatusPrefetching, 0, "")
-			}
+			p.drainPending(batchSize)
+		case <-p.wakeCh:
+			// R-2: a fresh pin just landed — drain now instead of waiting up
+			// to 2s for the next tick, so warming visibly starts right away.
+			p.drainPending(batchSize)
 		}
+	}
+}
+
+// drainPending pulls one batch of Pending entries and enqueues them, marking
+// each Prefetching. Shared by the PullPending ticker and the Wake signal.
+func (p *Prefetcher) drainPending(batchSize int) {
+	pending, err := p.store.Pending(batchSize)
+	if err != nil || len(pending) == 0 {
+		return
+	}
+	for _, e := range pending {
+		if !p.Enqueue(e) {
+			break // queue full, try next tick
+		}
+		p.store.UpdateStatus(e.Path, StatusPrefetching, 0, "")
 	}
 }
 

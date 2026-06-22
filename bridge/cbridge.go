@@ -1862,6 +1862,15 @@ type PinResult struct {
 	FilesPinned int    `json:"files_pinned"`
 	BytesTotal  int64  `json:"bytes_total"`
 	Error       string `json:"error,omitempty"`
+	// Scanning is true when the pin's subtree enumeration was kicked off
+	// asynchronously (R-2). FilesPinned/BytesTotal are 0 in that case — the
+	// real counts land in /cache-status as the walk completes. The UI shows a
+	// "Scanning…" row meanwhile (see pin.ScanningRoots).
+	//
+	// NOT omitempty: Swift's synthesized Codable uses required decode() for
+	// this non-optional Bool, so a missing key throws keyNotFound and aborts
+	// the whole PinResult decode (the roots:null lesson). Always emit it.
+	Scanning bool `json:"scanning"`
 }
 
 // NFSServerPin pins a file or directory tree for offline availability.
@@ -1870,15 +1879,20 @@ type PinResult struct {
 // every regular file to the pin registry. The prefetcher daemon picks
 // them up and warms the cache.
 //
+// R-2: the subtree walk can take TENS OF SECONDS on a large reel. Doing it
+// synchronously left the menu-bar UI dead (no spinner, no new root) until it
+// finished — "pinning looks broken." We now mark the root as scanning, return
+// immediately, and run the walk + insert on a background goroutine. The UI
+// shows "Scanning <folder>…" (pin.ScanningRoots in /cache-status) the instant
+// the click lands, then the real pinned-root row takes over once rows exist.
+//
 //export NFSServerPin
 func NFSServerPin(rootPath *C.char) *C.char {
-	// Snapshot under the lock; the slow walk + DB inserts run unlocked.
-	// pin.CountFilesUnder walks a directory tree (can be seconds on a
-	// large project); PinMany does a multi-batch SQL transaction.
 	globalMu.Lock()
 	pinStore := globalPinStore
 	mountPath := globalMountPath
 	fusePath := globalFUSEPath
+	prefetcher := globalPrefetcher
 	globalMu.Unlock()
 
 	if pinStore == nil {
@@ -1886,22 +1900,46 @@ func NFSServerPin(rootPath *C.char) *C.char {
 	}
 	root := C.GoString(rootPath)
 	walkPath := translateMountToFUSE(root, mountPath, fusePath)
-	entries, err := pin.CountFilesUnder(walkPath)
-	if err != nil {
-		return jsonStr(PinResult{Error: err.Error()})
-	}
-	for i := range entries {
-		entries[i].Path = translateFUSEToMount(entries[i].Path, fusePath, mountPath)
-		entries[i].PinRoot = root
-	}
-	if err := pinStore.PinMany(entries); err != nil {
-		return jsonStr(PinResult{Error: err.Error()})
-	}
-	var totalBytes int64
-	for _, e := range entries {
-		totalBytes += e.Size
-	}
-	return jsonStr(PinResult{OK: true, FilesPinned: len(entries), BytesTotal: totalBytes})
+
+	// Surface the spinner before the (slow) walk starts; return immediately.
+	pin.MarkScanning(root)
+	go func() {
+		// Detached: a panic here must never take down the process, and the
+		// scanning marker must always be cleared even on an early error.
+		defer func() {
+			if rec := recover(); rec != nil {
+				jmlog.Warn("pin walk panicked (recovered)", "root", root, "panic", fmt.Sprint(rec))
+			}
+			pin.ClearScanning(root)
+		}()
+
+		entries, err := pin.CountFilesUnder(walkPath)
+		if err != nil {
+			jmlog.Warn("pin walk failed", "root", root, "error", err.Error())
+			return
+		}
+		var totalBytes int64
+		for i := range entries {
+			entries[i].Path = translateFUSEToMount(entries[i].Path, fusePath, mountPath)
+			entries[i].PinRoot = root
+			totalBytes += entries[i].Size
+		}
+		// Brief "found N files" beat before the rows exist, so a long insert
+		// still reads as progress rather than a stall.
+		pin.UpdateScanProgress(root, len(entries), totalBytes)
+		if err := pinStore.PinMany(entries); err != nil {
+			jmlog.Warn("pin insert failed", "root", root, "files", len(entries), "error", err.Error())
+			return
+		}
+		jmlog.Info("pinned folder", "root", root, "files", len(entries), "gb", totalBytes>>30)
+		// Drain now rather than on the prefetcher's next 2s tick.
+		if prefetcher != nil {
+			prefetcher.Wake()
+		}
+	}()
+
+	// FilesPinned/BytesTotal are filled in via /cache-status as the walk lands.
+	return jsonStr(PinResult{OK: true, Scanning: true})
 }
 
 // NFSServerUnpin removes a pin root and all its files from the registry.
@@ -1932,6 +1970,10 @@ type CacheStatus struct {
 	// the pinned set can't be kept fully resident; the UI shows a "free disk or
 	// unpin" banner with ShortfallBytes.
 	Capacity pin.CapacityVerdict `json:"capacity"`
+	// Scanning lists pin roots whose subtree is still being enumerated (R-2).
+	// The UI renders a "Scanning <folder>…" row until the real pinned root
+	// appears in Roots.
+	Scanning []pin.ScanningRoot `json:"scanning"`
 }
 
 //export NFSServerCacheStatus
@@ -1945,9 +1987,9 @@ func NFSServerCacheStatus() *C.char {
 	globalMu.Unlock()
 
 	if pinStore == nil {
-		return jsonStr(CacheStatus{OfflineMode: pin.IsOffline(), Roots: []pin.RootSummary{}})
+		return jsonStr(CacheStatus{OfflineMode: pin.IsOffline(), Roots: []pin.RootSummary{}, Scanning: []pin.ScanningRoot{}})
 	}
-	cs := CacheStatus{OfflineMode: pin.IsOffline(), Capacity: pin.Capacity()}
+	cs := CacheStatus{OfflineMode: pin.IsOffline(), Capacity: pin.Capacity(), Scanning: pin.ScanningRoots()}
 	if a, err := pinStore.AggregateStats(); err == nil {
 		cs.Aggregate = a
 	}

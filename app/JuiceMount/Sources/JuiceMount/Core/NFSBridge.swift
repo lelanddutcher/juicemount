@@ -184,17 +184,43 @@ public enum NFSBridge {
         }
     }
 
+    /// One pin root whose subtree is still being enumerated (R-2). Rendered as
+    /// a "Scanning <folder>…" row so a click on Pin shows feedback immediately,
+    /// before any pinned_files rows exist.
+    public struct ScanningRoot: Codable, Identifiable, Equatable {
+        public var root: String = ""
+        public var files_found: Int = 0
+        public var bytes_found: Int64 = 0
+        public var since_sec: Int64 = 0
+        public var id: String { root }
+
+        public init() {}
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.root = try c.decodeIfPresent(String.self, forKey: .root) ?? ""
+            self.files_found = try c.decodeIfPresent(Int.self, forKey: .files_found) ?? 0
+            self.bytes_found = try c.decodeIfPresent(Int64.self, forKey: .bytes_found) ?? 0
+            self.since_sec = try c.decodeIfPresent(Int64.self, forKey: .since_sec) ?? 0
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case root, files_found, bytes_found, since_sec
+        }
+    }
+
     public struct CacheStatus: Codable, Equatable {
         public var aggregate: AggregateStats = AggregateStats()
         public var roots: [RootSummary] = []
         public var live: LiveCacheStats = LiveCacheStats()
         public var offline_mode: Bool = false
         public var capacity: CapacityVerdict = CapacityVerdict()
+        public var scanning: [ScanningRoot] = []
 
         public init() {}
 
         private enum CodingKeys: String, CodingKey {
-            case aggregate, roots, live, offline_mode, capacity
+            case aggregate, roots, live, offline_mode, capacity, scanning
         }
 
         /// Null/absence-tolerant decode. ROOT CAUSE of the long-standing
@@ -219,6 +245,7 @@ public enum NFSBridge {
             self.live = try c.decodeIfPresent(LiveCacheStats.self, forKey: .live) ?? LiveCacheStats()
             self.offline_mode = try c.decodeIfPresent(Bool.self, forKey: .offline_mode) ?? false
             self.capacity = try c.decodeIfPresent(CapacityVerdict.self, forKey: .capacity) ?? CapacityVerdict()
+            self.scanning = try c.decodeIfPresent([ScanningRoot].self, forKey: .scanning) ?? []
         }
     }
 
@@ -227,6 +254,10 @@ public enum NFSBridge {
         public var files_pinned: Int = 0
         public var bytes_total: Int64 = 0
         public var error: String?
+        /// R-2: true when the subtree walk was kicked off asynchronously —
+        /// files_pinned/bytes_total are 0 and the real counts arrive via
+        /// /cache-status as the walk lands. Defaults false for older cores.
+        public var scanning: Bool = false
     }
 
     @discardableResult
