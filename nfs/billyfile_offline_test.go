@@ -1,9 +1,9 @@
 package nfs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
@@ -15,6 +15,13 @@ import (
 // a file opened during a brief online window before offline-toggle could
 // keep streaming through FUSE → backend after the toggle, defeating the
 // fail-fast guarantee on cellular.
+//
+// The refusal error is pin.ErrOfflineNotAvailable (the protocol layer maps it
+// to NXIO, which — unlike a generic IO error — does not invalidate the kernel's
+// file handle cache). For a PINNED file the gate no longer trusts the "Ready"
+// flag blindly: it bounds the read so an evicted block refuses cleanly rather
+// than tarpitting on a backend GET (#43). A genuinely-local block (this test's
+// temp file) returns instantly and is served.
 func TestBillyFileOfflineGate(t *testing.T) {
 	// Create a real file we can wrap with billyFile.
 	dir := t.TempDir()
@@ -40,18 +47,20 @@ func TestBillyFileOfflineGate(t *testing.T) {
 		t.Errorf("online un-pinned ReadAt: n=%d err=%v, want bytes", n, err)
 	}
 
-	// Offline + un-pinned: reads must EIO.
+	// Offline + un-pinned: reads must refuse with ErrOfflineNotAvailable.
 	pin.SetOffline(true)
-	if _, err := bf.ReadAt(buf, 0); err != syscall.EIO {
-		t.Errorf("offline un-pinned ReadAt: err=%v, want EIO", err)
+	if _, err := bf.ReadAt(buf, 0); !errors.Is(err, pin.ErrOfflineNotAvailable) {
+		t.Errorf("offline un-pinned ReadAt: err=%v, want ErrOfflineNotAvailable", err)
 	}
-	if _, err := bf.Read(buf); err != syscall.EIO {
-		t.Errorf("offline un-pinned Read: err=%v, want EIO", err)
+	if _, err := bf.Read(buf); !errors.Is(err, pin.ErrOfflineNotAvailable) {
+		t.Errorf("offline un-pinned Read: err=%v, want ErrOfflineNotAvailable", err)
 	}
 
-	// Offline + pinned: reads succeed (FUSE LRU is local, safe to use).
+	// Offline + pinned: a locally-readable block is served (bounded read
+	// completes well within the timeout). This is the no-regression case for
+	// genuinely-resident pinned files.
 	bf2 := &billyFile{File: osFile, name: "sample.bin", pinned: true}
 	if n, err := bf2.ReadAt(buf, 0); err != nil || n == 0 {
-		t.Errorf("offline pinned ReadAt: n=%d err=%v, want bytes", n, err)
+		t.Errorf("offline pinned ReadAt (local hit): n=%d err=%v, want bytes", n, err)
 	}
 }

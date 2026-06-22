@@ -2138,6 +2138,17 @@ const (
 	// returns in well under this; an S3 GET on a slow link is 30s+, so this
 	// cleanly separates "served from local cache" from "needs the backend".
 	offlineLocalReadTimeout = 1500 * time.Millisecond
+
+	// offlinePinnedReadTimeout is the same bound for PINNED files (#43,
+	// 2026-06-22). Pinned files are SUPPOSED to be resident, so we wait longer
+	// before concluding a block was evicted — this avoids false-refusing a
+	// slow-but-local read under heavy concurrent load, while still cleanly
+	// separating a local hit (ms) from an S3 fetch (30s+). The old code trusted
+	// the pin "Ready" flag and let pinned reads fall through UNBOUNDED; after
+	// LRU eviction that flag goes stale and the unbounded read tarpitted on S3
+	// (offline) or returned empties — the root cause of "offline access to a
+	// pinned reel broke."
+	offlinePinnedReadTimeout = 4 * time.Second
 )
 
 // readAtBounded runs fd.ReadAt in a goroutine and returns (n, err, true) if it
@@ -2314,34 +2325,42 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		}
 	}
 
-	// Offline mode short-circuit: if the user has flipped to offline, we
-	// don't fall through to FUSE for un-pinned files. JuiceFS would
-	// otherwise try to GET the missing block from S3, which on cellular
-	// can take 30+ seconds and will tarpit the NLE waiting for the read.
-	// Return EIO immediately so the NLE shows "media offline" instead of
-	// beachballing.
+	// Offline mode short-circuit: if the user has flipped to offline, we don't
+	// fall through to an UNBOUNDED FUSE read. JuiceFS would otherwise try to GET
+	// a missing block from S3, which on cellular can take 30+ seconds and
+	// tarpits the NLE waiting for the read. We bound the read instead: a block
+	// in JuiceFS's local LRU returns fast (served); a block that would need the
+	// backend blocks past the bound → refuse with ErrOfflineNotAvailable so the
+	// NLE shows "media offline" instead of beachballing.
 	//
-	// PINNED files are exempt: JuiceFS already has their bytes in its
-	// local LRU cache (the prefetcher pulled them at pin time), so a FUSE
-	// read is fully local and safe even on cellular. Without this exemption
-	// the read-time gate would refuse pinned files whose blocks happen to
-	// not be in our SSD cache reader (different cache layer than JuiceFS),
-	// re-introducing the very "media offline" UX cliff the offline-pin
-	// feature exists to prevent.
-	if pin.IsOffline() && !f.pinned {
-		// Offline + un-pinned: the bytes MIGHT be local — JuiceFS's own LRU has
-		// them (recently read/written/just-copied), or the user toggled offline
+	// PINNED files are NOT exempt (#43, 2026-06-22). The old code trusted the
+	// pin "Ready" flag as proof the bytes were in JuiceFS's LRU and let pinned
+	// reads fall through unbounded. But that flag goes STALE after LRU eviction
+	// (cache pressure, /cache-clear, watchdog remount): the file is still marked
+	// Ready while its blocks are gone. Offline, that produced a silent tarpit /
+	// empty read — the root cause of "offline access to a pinned reel broke."
+	// We bound pinned reads too, just with a more generous timeout (they're
+	// supposed to be resident, so we wait longer before concluding "evicted" to
+	// avoid false-refusing a slow-but-local read under load). A genuinely-cached
+	// pinned block still returns in well under the bound → served, no regression.
+	if pin.IsOffline() {
+		// The bytes MIGHT be local — JuiceFS's own LRU has them (recently
+		// read/written/just-copied/pinned-and-warm), or the user toggled offline
 		// while the network is actually up (Redis/JuiceFS reachable, just don't
-		// want S3 traffic). Don't refuse blindly (the old behavior, which made a
-		// just-copied-then-drained file unreadable offline — 2026-06-14
-		// offline-ingest sprint). Attempt the FUSE read with a SHORT bound: a
-		// local hit returns within it → serve it; a read that would need an
-		// S3/MinIO fetch blocks past it → THEN refuse with
-		// ErrOfflineNotAvailable, preserving the tarpit-avoidance the offline
-		// mode exists for. A PRIVATE buffer is used so a bound-exceeded read's
-		// still-running goroutine can never scribble into the caller's pooled p.
+		// want S3 traffic). Don't refuse blindly (the old un-pinned behavior,
+		// which made a just-copied-then-drained file unreadable offline —
+		// 2026-06-14 offline-ingest sprint). Attempt the FUSE read with a bound:
+		// a local hit returns within it → serve; a read that would need an
+		// S3/MinIO fetch blocks past it → THEN refuse with ErrOfflineNotAvailable,
+		// preserving the tarpit-avoidance offline mode exists for. A PRIVATE
+		// buffer is used so a bound-exceeded read's still-running goroutine can
+		// never scribble into the caller's pooled p.
+		bound := offlineLocalReadTimeout
+		if f.pinned {
+			bound = offlinePinnedReadTimeout
+		}
 		tmp := make([]byte, len(p))
-		bn, berr, done := readAtBounded(f.fuseFD, tmp, off, offlineLocalReadTimeout)
+		bn, berr, done := readAtBounded(f.fuseFD, tmp, off, bound)
 		if !done || (berr != nil && bn == 0 && !errors.Is(berr, io.EOF)) {
 			return 0, pin.ErrOfflineNotAvailable
 		}
@@ -2625,7 +2644,8 @@ func (f *billyFile) Truncate(size int64) error {
 }
 
 // Read overrides *os.File.Read to enforce the read-time offline gate on
-// un-pinned files. Pinned files fall through to FUSE/JuiceFS LRU as usual.
+// un-pinned files. Pinned files fall through; ReadAt below is the bounded NFS
+// data path (#43) — Read (no offset) isn't used for NFS READ RPCs.
 func (f *billyFile) Read(p []byte) (int, error) {
 	if pin.IsOffline() && !f.pinned {
 		return 0, pin.ErrOfflineNotAvailable
@@ -2635,8 +2655,24 @@ func (f *billyFile) Read(p []byte) (int, error) {
 
 // ReadAt is the hot path for NFS READ RPCs (which always carry an offset).
 func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
-	if pin.IsOffline() && !f.pinned {
-		return 0, pin.ErrOfflineNotAvailable
+	if pin.IsOffline() {
+		if !f.pinned {
+			return 0, pin.ErrOfflineNotAvailable
+		}
+		// Pinned (#43, 2026-06-22): don't trust the pin "Ready" flag as proof
+		// the bytes are resident — it goes stale after LRU eviction. Bound the
+		// read so an evicted block refuses cleanly (ErrOfflineNotAvailable)
+		// instead of tarpitting on a backend GET that can't complete offline. A
+		// genuinely-local block returns in well under the bound and is served.
+		tmp := make([]byte, len(p))
+		bn, berr, done := readAtBounded(f.File, tmp, off, offlinePinnedReadTimeout)
+		if !done || (berr != nil && bn == 0 && !errors.Is(berr, io.EOF)) {
+			return 0, pin.ErrOfflineNotAvailable
+		}
+		if bn > 0 {
+			copy(p, tmp[:bn])
+		}
+		return bn, berr
 	}
 	return f.File.ReadAt(p, off)
 }
