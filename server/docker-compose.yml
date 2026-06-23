@@ -164,7 +164,7 @@ services:
   # manager owns write access to your data — don't leave it open on
   # the public internet). Empty admin key = LAN-only / no auth.
   juicemount-manager:
-    image: ghcr.io/lelanddutcher/juicemount-manager:production-hardening
+    image: ghcr.io/lelanddutcher/juicemount-manager:latest
     pull_policy: always
     restart: unless-stopped
     depends_on:

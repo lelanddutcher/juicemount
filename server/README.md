@@ -119,7 +119,7 @@ Take a backup first.
 | `juicefs-init` exited 4               | MinIO credentials empty, whitespace, or placeholder |
 | `juicefs-init` exited 5               | `JM_BUCKET_URL` missing `http://` |
 | `juicefs-init` exited 6               | `juicefs format` errored — read the log for the JuiceFS-side reason |
-| Manager copy reports "0 files / 0 B" | Stale image — pull `ghcr.io/lelanddutcher/juicemount-manager:production-hardening` and redeploy |
+| Manager copy reports "0 files / 0 B" | Stale image — pull `ghcr.io/lelanddutcher/juicemount-manager:latest` and redeploy |
 | Mac can't open copied files           | Source had restrictive perms; either un-tick Preserve permissions before migrating, or `chmod -R u+rwX,g+rwX,o+rX` on the destination |
 
 Use `docker compose logs <service>` for the full output of any

@@ -208,7 +208,7 @@ services:
   # metrics). Bind-mount as many existing datasets read-only as you
   # want. Omit this service entirely if you have no existing data.
   juicemount-manager:
-    image: ghcr.io/lelanddutcher/juicemount-manager:production-hardening
+    image: ghcr.io/lelanddutcher/juicemount-manager:latest
     pull_policy: always
     restart: unless-stopped
     depends_on:
@@ -278,10 +278,10 @@ image tag, SLICE 0 of the manager roadmap renamed the binary, image,
 HTTP prefix, and state-file path. The transition is one-release
 backward-compatible:
 
-- Both `juicemount-manager:production-hardening` and the legacy
-  `juicemount-migrator:production-hardening` image tags publish from CI.
-  Existing apps with `pull_policy: always` on the migrator tag keep
-  working.
+- Both `juicemount-manager:latest` and the legacy
+  `juicemount-migrator:latest` image tags publish from CI (alongside the
+  pinned `:vX.Y.Z` release tags). Existing apps with `pull_policy: always`
+  on the migrator tag keep working.
 - HTTP requests to `/migrator/*` are 301-redirected to `/manager/*`.
 - The container reads `/var/lib/migrator/jobs.json` as a fallback if
   `/var/lib/manager/state.json` doesn't exist yet, then writes going
