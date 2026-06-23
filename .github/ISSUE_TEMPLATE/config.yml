@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and help
+    url: https://github.com/lelanddutcher/juicemount/discussions
+    about: For setup help, "how do I…", and general discussion, use Discussions. Issues are for confirmed bugs and concrete feature requests.
+  - name: Security vulnerability
+    url: https://github.com/lelanddutcher/juicemount/security/advisories/new
+    about: Report security issues privately, never as a public issue.
+  - name: Website
+    url: https://juicemount.com
+    about: What JuiceMount is and who it's for.

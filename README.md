@@ -7,6 +7,8 @@
 [![Built on JuiceFS](assets/readme/badges/built-on-juicefs.svg)](https://github.com/juicedata/juicefs)
 ![Status: beta](assets/readme/badges/status-beta.svg)
 
+**[juicemount.com](https://juicemount.com)** · [Install](#quick-start) · [Roadmap](#roadmap) · [FAQ](#faq)
+
 **Edit video straight off your NAS.** Your storage shows up in Finder as a real volume, and footage streams in as you scrub: only the blocks you touch. Premiere, Resolve, and Final Cut see a local drive. **$0 per seat, no storage contract**, on the NAS you already own.
 
 > The open-source alternative to LucidLink, Suite, Shade, and Iconik, running entirely on hardware you control.

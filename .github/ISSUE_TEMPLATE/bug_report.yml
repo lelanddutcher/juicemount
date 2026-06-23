@@ -1,0 +1,83 @@
+name: Bug report
+description: Something is broken or behaving wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The single most useful thing you can attach is the
+        **Export Diagnostics** zip (menu-bar → Export Diagnostics, or Preferences →
+        Maintenance). It bundles logs, the mount table, and backend health, and is
+        built locally — review it before attaching.
+
+        For a security problem, do **not** file here — see [SECURITY.md](../blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What went wrong, and what you expected instead.
+      placeholder: Finder beachballs when I open a large project folder over the WAN...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact sequence that triggers it.
+      placeholder: |
+        1. Mount the volume
+        2. Open /Volumes/<name>/Project in Premiere
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: jm-version
+    attributes:
+      label: JuiceMount version
+      description: Menu-bar → About, or the release tag / commit you built.
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version and Mac
+      placeholder: macOS 14.5, Apple Silicon (M2 Pro)
+    validations:
+      required: true
+  - type: dropdown
+    id: server
+    attributes:
+      label: Server setup
+      options:
+        - TrueNAS SCALE
+        - Synology DSM
+        - Plain Linux + Docker
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: network
+    attributes:
+      label: Network shape
+      description: LAN speed, WAN, VPN/Tailscale, Wi-Fi — whatever applies.
+      placeholder: 10 GbE LAN / Tailscale over home fiber / hotel Wi-Fi
+  - type: input
+    id: nle
+    attributes:
+      label: NLE and version (if relevant)
+      placeholder: DaVinci Resolve 19, Premiere 25.x, Final Cut 10.8
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics and logs
+      description: Drag the Export Diagnostics zip here, or paste relevant lines from `~/Library/Logs/JuiceMount/juicemount.log`.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I'm on the latest release (or a recent `main` build) and the issue still happens.
+          required: true
+        - label: I checked the popover health rows (Redis / MinIO / FUSE / NFS) and the Troubleshooting section of the README.
+          required: true
