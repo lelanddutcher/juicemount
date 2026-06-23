@@ -67,7 +67,7 @@ Honest list. This is a self-hosted system, and there is a server side.
 - [macFUSE](https://macfuse.github.io/), required by the JuiceFS client. The first-run Setup Assistant preflight checks that it's installed and walks you through it if not.
 - The `juicefs` binary (`brew install juicefs`; auto-detected from `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, then `$PATH`).
 - **An admin password prompt, once per session**, the first time JuiceMount mounts: macOS restricts `mount_nfs`/`umount` to root, so the app escalates through the standard macOS auth dialog (and macOS caches the authorization for the session). Optionally set up a [scoped passwordless-sudo rule](docs/dev-setup.md) to remove the prompt entirely.
-- To build from source (currently the only way to get the app, no prebuilt or notarized DMG yet): Go 1.26+ and Xcode command-line tools (Swift 5.9+).
+- Only if you build from source instead of using the [prebuilt release](https://github.com/lelanddutcher/juicemount/releases/latest) (needed for Intel, which is untested): Go 1.26+ and Xcode command-line tools (Swift 5.9+).
 
 **On the server (any of these):**
 
@@ -104,18 +104,27 @@ Already have terabytes on the NAS? Open the **JuiceMount Manager** web UI at `ht
 
 ### 2. Mac
 
+Install the runtime dependencies:
+
 ```sh
 brew install juicefs
 brew install --cask macfuse           # approve the system extension if macOS asks
+```
 
+Then get the app:
+
+**Download (recommended).** Grab the latest notarized build from [**Releases**](https://github.com/lelanddutcher/juicemount/releases/latest) (Apple Silicon), unzip, and drag `JuiceMount.app` to `/Applications`. It's signed and notarized, so Gatekeeper opens it after the standard one-time "downloaded from the internet" confirmation.
+
+**Or build from source** (required for Intel, which is untested):
+
+```sh
 git clone https://github.com/lelanddutcher/juicemount
 cd juicemount
 ./scripts/build-app.sh                # Go c-archive + Swift app + codesign
 ./scripts/install.sh                  # → /Applications  (add --launchd for login start)
-open /Applications/JuiceMount.app
 ```
 
-A locally built app is not quarantined, so Gatekeeper won't object. If you instead obtained a pre-built `JuiceMount.app` from someone else (it's unsigned/ad-hoc-signed), macOS will block it: either remove the quarantine flag with `xattr -d com.apple.quarantine /Applications/JuiceMount.app`, or launch once and approve it under **System Settings → Privacy & Security → Open Anyway**.
+A locally built app is not quarantined, so Gatekeeper won't object.
 
 On first launch the **Setup Assistant** opens automatically: it preflight-checks `juicefs`, macFUSE, and backend reachability, and walks you through pointing the app at your box (also reachable later via menu-bar icon → Setup Assistant…, or **Preferences → Connection**):
 
