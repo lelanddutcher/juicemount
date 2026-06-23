@@ -79,8 +79,10 @@ jobs:
           tags: |
             # branch name on branch push
             type=ref,event=branch
-            # branch + short sha on branch push (immutable per commit)
-            type=sha,prefix={{branch}}-,format=short
+            # branch + short sha on branch push (immutable per commit).
+            # Gated to branch pushes: on a tag push {{branch}} is empty,
+            # which would emit the invalid tag ":-<sha>" and fail the build.
+            type=sha,prefix={{branch}}-,format=short,enable=${{ github.ref_type == 'branch' }}
             # semver tags on git tag push
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

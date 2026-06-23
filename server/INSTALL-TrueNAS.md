@@ -280,8 +280,8 @@ backward-compatible:
 
 - Both `juicemount-manager:latest` and the legacy
   `juicemount-migrator:latest` image tags publish from CI (alongside the
-  pinned `:vX.Y.Z` release tags). Existing apps with `pull_policy: always`
-  on the migrator tag keep working.
+  pinned `:X.Y.Z` / `:X.Y` version tags cut from each `vX.Y.Z` git tag).
+  Existing apps with `pull_policy: always` on the migrator tag keep working.
 - HTTP requests to `/migrator/*` are 301-redirected to `/manager/*`.
 - The container reads `/var/lib/migrator/jobs.json` as a fallback if
   `/var/lib/manager/state.json` doesn't exist yet, then writes going
