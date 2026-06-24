@@ -254,13 +254,13 @@ func (p *Prefetcher) CapacityLoop(ctx context.Context, interval time.Duration, c
 
 // VerifyReport summarizes a pin-coverage verification pass.
 type VerifyReport struct {
-	TotalPinned       int    // files marked Ready in the pin store
-	Reenqueued        int    // files re-queued for prefetch
-	AlreadyComplete   int    // files we believe are fully cached (not re-queued)
-	QueueOverflow     int    // files we couldn't enqueue (worker pool saturated)
-	Bytes             int64  // total bytes covered by re-queued files
-	StartedAt         string // RFC3339
-	Note              string // human-readable summary
+	TotalPinned     int    // files marked Ready in the pin store
+	Reenqueued      int    // files re-queued for prefetch
+	AlreadyComplete int    // files we believe are fully cached (not re-queued)
+	QueueOverflow   int    // files we couldn't enqueue (worker pool saturated)
+	Bytes           int64  // total bytes covered by re-queued files
+	StartedAt       string // RFC3339
+	Note            string // human-readable summary
 }
 
 // VerifyAndRepair walks every pinned-Ready entry and re-enqueues it for
@@ -370,10 +370,10 @@ func (p *Prefetcher) prefetch(e Entry) error {
 
 // LiveStats reports counters since process start. For UI progress bars.
 type LiveStats struct {
-	BytesPrefetched int64
-	FilesPrefetched int64
-	CurrentFile     string // empty if idle
-	Workers         int
+	BytesPrefetched int64  `json:"bytes_prefetched"`
+	FilesPrefetched int64  `json:"files_prefetched"`
+	CurrentFile     string `json:"current_file"` // empty if idle
+	Workers         int    `json:"workers"`
 }
 
 func (p *Prefetcher) LiveStats() LiveStats {
@@ -392,9 +392,9 @@ func (p *Prefetcher) LiveStats() LiveStats {
 // stripMountPrefix turns canonical pin-store paths (anchored to the user's
 // mount point) into FUSE-relative paths. For the default "/Volumes/zpool":
 //
-//   "/Volumes/zpool/foo/bar" → "foo/bar"
-//   "/Volumes/zpool"         → ""
-//   "/other/path"            → "/other/path" (no-op fallback)
+//	"/Volumes/zpool/foo/bar" → "foo/bar"
+//	"/Volumes/zpool"         → ""
+//	"/other/path"            → "/other/path" (no-op fallback)
 func (p *Prefetcher) stripMountPrefix(path string) string {
 	mp := p.mountPoint
 	if mp == "" {

@@ -261,6 +261,54 @@ func TestContractLiveConformance(t *testing.T) {
 	}
 }
 
+// TestCacheStatusSnakeCaseTags is the JM-3 proof: the inner cache-status structs
+// (pin.AggregateStats / RootSummary / LiveStats) now marshal with snake_case wire
+// keys and no longer leak capitalized Go field names. Deterministic — avoids the
+// runtime disk/capacity fields a full /cache-status seed would carry.
+func TestCacheStatusSnakeCaseTags(t *testing.T) {
+	cases := []struct {
+		name        string
+		v           any
+		wantKeys    []string
+		bannedCaped []string
+	}{
+		{"aggregate",
+			pin.AggregateStats{TotalFiles: 142, ReadyFiles: 130, PendingFiles: 12, TotalBytes: 3400000000, CachedBytes: 2800000000},
+			[]string{"total_files", "ready_files", "pending_files", "failed_files", "total_bytes", "cached_bytes"},
+			[]string{"TotalFiles", "CachedBytes"}},
+		{"root",
+			pin.RootSummary{Root: "/Volumes/zpool/Project_Foo", TotalFiles: 142, CachedBytes: 2800000000},
+			[]string{"root", "total_files", "ready_files", "pending_files", "failed_files", "total_bytes", "cached_bytes"},
+			[]string{"Root", "TotalFiles", "CachedBytes"}},
+		{"live",
+			pin.LiveStats{BytesPrefetched: 1500000000, FilesPrefetched: 30, CurrentFile: "x.mov", Workers: 4},
+			[]string{"bytes_prefetched", "files_prefetched", "current_file", "workers"},
+			[]string{"BytesPrefetched", "CurrentFile", "Workers"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var m map[string]any
+			if err := json.Unmarshal(b, &m); err != nil {
+				t.Fatal(err)
+			}
+			for _, k := range tc.wantKeys {
+				if _, ok := m[k]; !ok {
+					t.Errorf("%s: missing snake_case key %q in %s", tc.name, k, b)
+				}
+			}
+			for _, k := range tc.bannedCaped {
+				if _, ok := m[k]; ok {
+					t.Errorf("%s: still emits capitalized key %q in %s", tc.name, k, b)
+				}
+			}
+		})
+	}
+}
+
 // assertStructEqual compares two decoded JSON objects, ignoring volatileFields
 // and comparing the capabilities array as an unordered set.
 func assertStructEqual(t *testing.T, name string, got, want any) {

@@ -169,17 +169,17 @@ func cmdStatus(args []string) {
 		os.Exit(1)
 	}
 
-	// Aggregate
+	// Aggregate (snake_case wire keys — contract JM-3)
 	if a, ok := res["aggregate"].(map[string]any); ok {
 		fmt.Println("=== Aggregate ===")
 		fmt.Printf("  %d total files (%s)\n",
-			intOf(a["TotalFiles"]),
-			humanBytes(int64Of(a["TotalBytes"])))
+			intOf(a["total_files"]),
+			humanBytes(int64Of(a["total_bytes"])))
 		fmt.Printf("  ready:    %d  (%s cached)\n",
-			intOf(a["ReadyFiles"]),
-			humanBytes(int64Of(a["CachedBytes"])))
-		fmt.Printf("  pending:  %d\n", intOf(a["PendingFiles"]))
-		fmt.Printf("  failed:   %d\n", intOf(a["FailedFiles"]))
+			intOf(a["ready_files"]),
+			humanBytes(int64Of(a["cached_bytes"])))
+		fmt.Printf("  pending:  %d\n", intOf(a["pending_files"]))
+		fmt.Printf("  failed:   %d\n", intOf(a["failed_files"]))
 	}
 
 	// Roots
@@ -187,14 +187,14 @@ func cmdStatus(args []string) {
 		fmt.Println("\n=== Pin roots ===")
 		for _, r := range rs {
 			rm, _ := r.(map[string]any)
-			fmt.Printf("  %s\n", rm["Root"])
+			fmt.Printf("  %s\n", rm["root"])
 			fmt.Printf("    %d files | ready=%d pending=%d failed=%d | %s of %s cached\n",
-				intOf(rm["TotalFiles"]),
-				intOf(rm["ReadyFiles"]),
-				intOf(rm["PendingFiles"]),
-				intOf(rm["FailedFiles"]),
-				humanBytes(int64Of(rm["CachedBytes"])),
-				humanBytes(int64Of(rm["TotalBytes"])))
+				intOf(rm["total_files"]),
+				intOf(rm["ready_files"]),
+				intOf(rm["pending_files"]),
+				intOf(rm["failed_files"]),
+				humanBytes(int64Of(rm["cached_bytes"])),
+				humanBytes(int64Of(rm["total_bytes"])))
 		}
 	}
 
@@ -202,12 +202,12 @@ func cmdStatus(args []string) {
 	if lv, ok := res["live"].(map[string]any); ok {
 		fmt.Println("\n=== Live ===")
 		fmt.Printf("  prefetched this session: %d files (%s)\n",
-			intOf(lv["FilesPrefetched"]),
-			humanBytes(int64Of(lv["BytesPrefetched"])))
-		if cur, _ := lv["CurrentFile"].(string); cur != "" {
+			intOf(lv["files_prefetched"]),
+			humanBytes(int64Of(lv["bytes_prefetched"])))
+		if cur, _ := lv["current_file"].(string); cur != "" {
 			fmt.Printf("  currently working on: %s\n", cur)
 		}
-		fmt.Printf("  workers: %d\n", intOf(lv["Workers"]))
+		fmt.Printf("  workers: %d\n", intOf(lv["workers"]))
 	}
 
 	// Offline

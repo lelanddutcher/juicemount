@@ -469,13 +469,13 @@ func (s *Store) Get(path string) (*Entry, bool) {
 
 // PinRoots returns the distinct pin roots and aggregate stats per root.
 type RootSummary struct {
-	Root         string
-	TotalFiles   int
-	ReadyFiles   int
-	PendingFiles int
-	FailedFiles  int
-	TotalBytes   int64
-	CachedBytes  int64
+	Root         string `json:"root"`
+	TotalFiles   int    `json:"total_files"`
+	ReadyFiles   int    `json:"ready_files"`
+	PendingFiles int    `json:"pending_files"`
+	FailedFiles  int    `json:"failed_files"`
+	TotalBytes   int64  `json:"total_bytes"`
+	CachedBytes  int64  `json:"cached_bytes"`
 }
 
 func (s *Store) PinRoots() ([]RootSummary, error) {
@@ -519,12 +519,12 @@ func (s *Store) PinRoots() ([]RootSummary, error) {
 
 // AggregateStats returns whole-database counters.
 type AggregateStats struct {
-	TotalFiles   int
-	ReadyFiles   int
-	PendingFiles int
-	FailedFiles  int
-	TotalBytes   int64
-	CachedBytes  int64
+	TotalFiles   int   `json:"total_files"`
+	ReadyFiles   int   `json:"ready_files"`
+	PendingFiles int   `json:"pending_files"`
+	FailedFiles  int   `json:"failed_files"`
+	TotalBytes   int64 `json:"total_bytes"`
+	CachedBytes  int64 `json:"cached_bytes"`
 }
 
 func (s *Store) AggregateStats() (AggregateStats, error) {

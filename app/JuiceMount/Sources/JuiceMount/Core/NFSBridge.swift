@@ -131,6 +131,14 @@ public enum NFSBridge {
         public var FailedFiles: Int = 0
         public var TotalBytes: Int64 = 0
         public var CachedBytes: Int64 = 0
+
+        // Contract JM-3: the Go core emits snake_case wire keys (was capitalized
+        // Go field names). Map them to the existing Swift property names.
+        private enum CodingKeys: String, CodingKey {
+            case TotalFiles = "total_files", ReadyFiles = "ready_files"
+            case PendingFiles = "pending_files", FailedFiles = "failed_files"
+            case TotalBytes = "total_bytes", CachedBytes = "cached_bytes"
+        }
     }
 
     public struct RootSummary: Codable, Identifiable, Equatable {
@@ -142,6 +150,14 @@ public enum NFSBridge {
         public var TotalBytes: Int64 = 0
         public var CachedBytes: Int64 = 0
         public var id: String { Root }
+
+        // Contract JM-3: snake_case wire keys.
+        private enum CodingKeys: String, CodingKey {
+            case Root = "root"
+            case TotalFiles = "total_files", ReadyFiles = "ready_files"
+            case PendingFiles = "pending_files", FailedFiles = "failed_files"
+            case TotalBytes = "total_bytes", CachedBytes = "cached_bytes"
+        }
     }
 
     public struct LiveCacheStats: Codable, Equatable {
@@ -149,6 +165,12 @@ public enum NFSBridge {
         public var FilesPrefetched: Int64 = 0
         public var CurrentFile: String = ""
         public var Workers: Int = 0
+
+        // Contract JM-3: snake_case wire keys.
+        private enum CodingKeys: String, CodingKey {
+            case BytesPrefetched = "bytes_prefetched", FilesPrefetched = "files_prefetched"
+            case CurrentFile = "current_file", Workers = "workers"
+        }
     }
 
     /// Pinned-set-vs-disk-capacity verdict (R-1). `over_capacity` true means the

@@ -24,19 +24,19 @@
 //   - "health_degraded":        /health.healthy flipped true → false
 //   - "rpc_error_burst":        rpc_errors_delta > 10 in one tick
 //   - "p99_spike":              any RPC's max_us exceeds 2x its
-//                               previous-tick max (sustained, not
-//                               single-sample)
+//     previous-tick max (sustained, not
+//     single-sample)
 //   - "pin_progress_stalled":   pin store has work queued but
-//                               bytes_pinned hasn't moved in 60s
+//     bytes_pinned hasn't moved in 60s
 //
 // Usage:
 //
-//   juicemount-watch \
-//       [--metrics URL]   \  default http://127.0.0.1:11050
-//       [--interval D]    \  default 10s
-//       [--duration D]    \  default 0 (unbounded; SIGINT to stop)
-//       [--out PATH]      \  default stdout
-//       [--alert PATH]    \  optional; touched on first anomaly
+//	juicemount-watch \
+//	    [--metrics URL]   \  default http://127.0.0.1:11050
+//	    [--interval D]    \  default 10s
+//	    [--duration D]    \  default 0 (unbounded; SIGINT to stop)
+//	    [--out PATH]      \  default stdout
+//	    [--alert PATH]    \  optional; touched on first anomaly
 //
 // Output: JSONL on the chosen sink. One line per tick. Stable schema —
 // additions are additive, deletions require a new field.
@@ -127,8 +127,8 @@ type watcher struct {
 	client     http.Client
 
 	// Previous-tick state for delta computation.
-	prev           *snapshot
-	alertFired     atomic.Bool
+	prev            *snapshot
+	alertFired      atomic.Bool
 	pinStalledSince time.Time // wall time when bytes_pinned last moved
 }
 
@@ -401,13 +401,13 @@ func (w *watcher) detectPinStalled(snap *snapshot, now time.Time) string {
 		w.pinStalledSince = time.Time{}
 		return ""
 	}
-	queue := getNumber(agg, "PendingFiles")
+	queue := getNumber(agg, "pending_files")
 	if queue <= 0 {
 		// Nothing to pin → not stalled.
 		w.pinStalledSince = time.Time{}
 		return ""
 	}
-	curBytes := getNumber(agg, "CachedBytes")
+	curBytes := getNumber(agg, "cached_bytes")
 	if w.prev == nil || w.prev.Cache == nil {
 		w.pinStalledSince = now
 		return ""
@@ -417,7 +417,7 @@ func (w *watcher) detectPinStalled(snap *snapshot, now time.Time) string {
 		w.pinStalledSince = now
 		return ""
 	}
-	prevBytes := getNumber(prevAgg, "CachedBytes")
+	prevBytes := getNumber(prevAgg, "cached_bytes")
 	if curBytes > prevBytes {
 		// Pin store made progress — reset the stall clock.
 		w.pinStalledSince = now
@@ -446,14 +446,14 @@ type snapshot struct {
 }
 
 type tickRecord struct {
-	T         string            `json:"t"`
-	Down      []string          `json:"down,omitempty"`
-	Anomalies []string          `json:"anomalies,omitempty"`
-	Metrics   map[string]any    `json:"metrics,omitempty"`
-	Health    map[string]any    `json:"health,omitempty"`
-	Offline   map[string]any    `json:"offline,omitempty"`
-	Cache     map[string]any    `json:"cache,omitempty"`
-	Delta     *snapshotDelta    `json:"delta,omitempty"`
+	T         string         `json:"t"`
+	Down      []string       `json:"down,omitempty"`
+	Anomalies []string       `json:"anomalies,omitempty"`
+	Metrics   map[string]any `json:"metrics,omitempty"`
+	Health    map[string]any `json:"health,omitempty"`
+	Offline   map[string]any `json:"offline,omitempty"`
+	Cache     map[string]any `json:"cache,omitempty"`
+	Delta     *snapshotDelta `json:"delta,omitempty"`
 }
 
 // snapshotDelta surfaces the human-eyeballable deltas between ticks.
@@ -490,7 +490,7 @@ func computeDelta(prev, cur *snapshot) *snapshotDelta {
 		curAgg, ok1 := cur.Cache["aggregate"].(map[string]any)
 		prevAgg, ok2 := prev.Cache["aggregate"].(map[string]any)
 		if ok1 && ok2 {
-			d.BytesPinnedDelta = getNumber(curAgg, "CachedBytes") - getNumber(prevAgg, "CachedBytes")
+			d.BytesPinnedDelta = getNumber(curAgg, "CachedBytes") - getNumber(prevAgg, "cached_bytes")
 		}
 	}
 	return d
