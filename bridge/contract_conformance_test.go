@@ -149,10 +149,15 @@ func seedControlPlane(t *testing.T) func() {
 		t.Fatalf("metadata.Open: %v", err)
 	}
 	mt := time.Unix(seedMtime, 0)
+	// REGRESSION GUARD (path-anchoring bug): the real `entries` mirror is keyed
+	// VOLUME-RELATIVE ("Project_Foo/clip.mov"), while the queries + pin store use
+	// the full "/Volumes/zpool/..." path. Seed entries relative so the handler is
+	// forced to translate the full query path; if it ever stops, exists→false and
+	// these cases fail.
 	for _, e := range []*metadata.Entry{
-		{Path: clip031, Name: "clip_031.mov", ParentPath: "/Volumes/zpool/Project_Foo", Size: 880000000, Inode: 1180417, Mtime: mt},
-		{Path: clip204, Name: "clip_204.mov", ParentPath: "/Volumes/zpool/Project_Foo", Size: 1240000000, Inode: 1180620, Mtime: mt},
-		{Path: clip205, Name: "clip_205.mov", ParentPath: "/Volumes/zpool/Project_Foo", Size: 1240000000, Inode: 1180621, Mtime: mt},
+		{Path: "Project_Foo/clip_031.mov", Name: "clip_031.mov", ParentPath: "Project_Foo", Size: 880000000, Inode: 1180417, Mtime: mt},
+		{Path: "Project_Foo/clip_204.mov", Name: "clip_204.mov", ParentPath: "Project_Foo", Size: 1240000000, Inode: 1180620, Mtime: mt},
+		{Path: "Project_Foo/clip_205.mov", Name: "clip_205.mov", ParentPath: "Project_Foo", Size: 1240000000, Inode: 1180621, Mtime: mt},
 	} {
 		mstore.InsertToCache(e)
 	}

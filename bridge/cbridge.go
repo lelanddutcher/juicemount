@@ -2232,6 +2232,15 @@ func writeContractJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// metaRelPath maps a user-facing NFS path ("/Volumes/<vol>/a/b") to the
+// volume-relative key the metadata mirror + spool store use ("a/b"). The
+// `entries` and `spool_entries` tables are anchored at the volume root, NOT the
+// mount point. (The pin store, by contrast, is keyed by the full user-facing
+// path — do NOT translate pin lookups.)
+func metaRelPath(path, mountPoint string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(path, mountPoint), "/")
+}
+
 // handleWhoamiHTTP serves GET /whoami (contract JM-1): JuiceMount identity,
 // public version, contract_version, and the DERIVED capability list. Reads the
 // identity captured at Start. This is the GUI (cbridge) variant; jm5 has its
@@ -2297,13 +2306,21 @@ func handleResidencyHTTP(w http.ResponseWriter, r *http.Request) {
 	store := globalStore
 	pinStore := globalPinStore
 	spool := globalSpool
+	mp := globalMountPath
+	if mp == "" {
+		mp = globalWantMountPoint
+	}
 	globalMu.Unlock()
+
+	// entries + spool are keyed VOLUME-RELATIVE; the pin store is keyed by the
+	// full user-facing path. Translate once for the relative-keyed stores.
+	rel := metaRelPath(path, mp)
 
 	resp := residencyResponse{Path: path, CheckedAt: time.Now().Unix()}
 
 	var entry *metadata.Entry
 	if store != nil {
-		entry = store.LookupByPath(path)
+		entry = store.LookupByPath(rel)
 	}
 	if entry == nil {
 		// exists=false ⇒ all flags false, bytes 0, inode omitted (schema rule).
@@ -2330,7 +2347,7 @@ func handleResidencyHTTP(w http.ResponseWriter, r *http.Request) {
 	// spool store only retains writing/ready/draining rows, so a fully-drained
 	// file reports null (not "done").
 	if spool != nil {
-		if row, err := spool.Meta().LookupByPath(path); err == nil && row != nil {
+		if row, err := spool.Meta().LookupByPath(rel); err == nil && row != nil {
 			s := string(row.DrainState)
 			resp.UploadState = &s
 		}
@@ -2369,10 +2386,13 @@ func handleLookupHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	globalMu.Unlock()
 
+	// entries are keyed VOLUME-RELATIVE; translate before lookup. nas_rel_path
+	// is that same relative key.
+	rel := metaRelPath(path, mp)
 	resp := lookupResponse{Path: path}
 	var entry *metadata.Entry
 	if store != nil {
-		entry = store.LookupByPath(path)
+		entry = store.LookupByPath(rel)
 	}
 	if entry == nil {
 		writeContractJSON(w, resp) // {path, exists:false}
@@ -2381,7 +2401,6 @@ func handleLookupHTTP(w http.ResponseWriter, r *http.Request) {
 	resp.Exists = true
 	in := entry.Inode
 	resp.Inode = &in
-	rel := strings.TrimPrefix(strings.TrimPrefix(path, mp), "/")
 	resp.NASRelPath = &rel
 	isDir := entry.IsDir
 	resp.IsDir = &isDir
