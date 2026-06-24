@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/activity.schema.json",
+  "title": "Activity",
+  "description": "GET /activity — what JuiceMount is doing right now (reconcile / drain / prefetch), aggregated for a human-readable status line. Grounded in origin/main (handleActivityHTTP bridge/cbridge.go:2256; activityOperation struct :2242; body is an ad-hoc map, only the per-op element is a named struct). Always HTTP 200. This is the cleanest single source for OpenLoupe's 'what's happening now' inspector line — preferred over stitching /cache-status.live + /spool.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["busy", "summary", "operations"],
+  "properties": {
+    "busy": { "type": "boolean", "description": "true iff any operation is active." },
+    "summary": { "type": "string", "description": "Human-readable, e.g. 'Working — uploading 12 files; warming 30 pinned files' or 'Idle — no background work'." },
+    "operations": {
+      "type": "array",
+      "description": "Up to three subsystems; absent subsystems are omitted from the array.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "active", "detail"],
+        "properties": {
+          "kind": { "enum": ["reconcile", "drain", "prefetch"] },
+          "active": { "type": "boolean" },
+          "detail": { "type": "string" },
+          "files": { "type": "integer", "minimum": 0, "description": "Omitted (omitempty) when 0." },
+          "bytes": { "type": "integer", "minimum": 0, "description": "Omitted (omitempty) when 0." }
+        }
+      }
+    }
+  }
+}

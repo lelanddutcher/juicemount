@@ -29,10 +29,12 @@ import (
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/health"
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/cplane"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
-	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
+	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/internal/version"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
@@ -99,6 +101,16 @@ var (
 	// /spool returns 503 between Stop and the next Start.
 	globalSpool   *jmnfs.SpoolStore
 	globalDrainer *jmnfs.Drainer
+
+	// Control-plane / contract identity (JM-1 /whoami, JM-6 version-of-record).
+	// Captured at Start because cfg.MountPoint/DBPath/MetricsAddr are otherwise
+	// local to NFSServerStart; the /whoami handler needs them later. Read under
+	// globalMu like every other global in this block.
+	globalDBPath       string   // cfg.DBPath — metadata.db path + instance-id dir
+	globalMetricsAddr  string   // cfg.MetricsAddr — control-plane bind addr
+	globalVolumeName   string   // basename of the mount point
+	globalInstanceID   string   // stable per-install UUID (minted/persisted once)
+	globalCapabilities []string // capabilities DERIVED from this binary's routes
 )
 
 // offlineEngageDelay is how long the backend must be CONTINUOUSLY unreachable
@@ -185,6 +197,14 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if cfg.MetricsAddr == "" {
 		cfg.MetricsAddr = "127.0.0.1:11050"
 	}
+
+	// Capture control-plane identity for /whoami (JM-1). These config values
+	// are local to this function; the handler reads them later under globalMu.
+	// instance_id is minted+persisted once next to metadata.db.
+	globalDBPath = cfg.DBPath
+	globalMetricsAddr = cfg.MetricsAddr
+	globalVolumeName = filepath.Base(cfg.MountPoint)
+	globalInstanceID = cplane.LoadOrMintInstanceID(cfg.DBPath)
 
 	// Initialize structured logging early so all subsequent log lines
 	// flow through the JSON sink (and optional log file).
@@ -735,7 +755,14 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/unpin":        handleUnpinHTTP,
 			"/cache-status": handleCacheStatusHTTP,
 			"/offline":      handleOfflineHTTP,
-			"/reclaim":      handleReclaimHTTP,
+			// Contract endpoints (juicemount-contract v1). /whoami: identity +
+			// version + capabilities handshake (JM-1). /residency: honest
+			// per-path cache residency for OpenLoupe's green badge (JM-2).
+			// /lookup: stable (inode, nas_rel_path) identity (JM-4).
+			"/whoami":    handleWhoamiHTTP,
+			"/residency": handleResidencyHTTP,
+			"/lookup":    handleLookupHTTP,
+			"/reclaim":   handleReclaimHTTP,
 			// Clears the on-disk JuiceFS chunk cache. POST-only.
 			// Optional ?keep-pinned=true reissues a verify-pins after
 			// the clear so pinned content immediately starts re-caching.
@@ -787,6 +814,14 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/debug/pprof/symbol":  pprof.Symbol,
 			"/debug/pprof/trace":   pprof.Trace,
 		}
+		// Derive the contract capability list (JM-1) from the routes this binary
+		// actually serves plus the metrics-server built-ins (/health, /metrics),
+		// so /whoami can never advertise a route that isn't registered.
+		served := []string{"/health", "/metrics"}
+		for route := range ms.ExtraRoutes {
+			served = append(served, route)
+		}
+		globalCapabilities = cplane.DeriveCapabilities(served)
 		if err := ms.Start(); err != nil {
 			jmlog.Warn("metrics server failed to start",
 				"addr", cfg.MetricsAddr, "error", err.Error())
@@ -2044,10 +2079,10 @@ func NFSServerUnpin(rootPath *C.char) *C.char {
 
 // CacheStatus is the JSON returned by NFSServerCacheStatus.
 type CacheStatus struct {
-	Aggregate   pin.AggregateStats  `json:"aggregate"`
-	Roots       []pin.RootSummary   `json:"roots"`
-	LiveStats   pin.LiveStats       `json:"live"`
-	OfflineMode bool                `json:"offline_mode"`
+	Aggregate   pin.AggregateStats `json:"aggregate"`
+	Roots       []pin.RootSummary  `json:"roots"`
+	LiveStats   pin.LiveStats      `json:"live"`
+	OfflineMode bool               `json:"offline_mode"`
 	// Capacity is the pinned-set-vs-disk verdict (R-1). OverCapacity true means
 	// the pinned set can't be kept fully resident; the UI shows a "free disk or
 	// unpin" banner with ShortfallBytes.
@@ -2189,6 +2224,172 @@ func handleUnpinHTTP(w http.ResponseWriter, r *http.Request) {
 	defer NFSServerFreeString(cstr)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(C.GoString(cstr)))
+}
+
+// writeContractJSON marshals v as the JSON body of a control-plane response.
+func writeContractJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// handleWhoamiHTTP serves GET /whoami (contract JM-1): JuiceMount identity,
+// public version, contract_version, and the DERIVED capability list. Reads the
+// identity captured at Start. This is the GUI (cbridge) variant; jm5 has its
+// own (cmd/jm5) that reports deployment:"cli" and the smaller capability set.
+func handleWhoamiHTTP(w http.ResponseWriter, r *http.Request) {
+	globalMu.Lock()
+	mp := globalMountPath
+	if mp == "" {
+		mp = globalWantMountPoint
+	}
+	addr := globalMetricsAddr
+	if globalMetrics != nil {
+		addr = globalMetrics.Addr()
+	}
+	who := cplane.WhoAmI{
+		App:             "JuiceMount",
+		Version:         version.Version,
+		ContractVersion: cplane.ContractVersion,
+		InstanceID:      globalInstanceID,
+		VolumeName:      globalVolumeName,
+		MountPoint:      mp,
+		NASRoot:         mp,
+		ControlPlane:    "http://" + addr,
+		MetadataDBPath:  globalDBPath,
+		Deployment:      "gui",
+		Capabilities:    append([]string(nil), globalCapabilities...),
+	}
+	globalMu.Unlock()
+	writeContractJSON(w, who)
+}
+
+// residencyResponse is the GET /residency body. Schema:
+// contract/spec/schema/residency.schema.json. Pointer fields so inode is
+// omitted on exists=false and upload_state serializes as null (not absent).
+type residencyResponse struct {
+	Path        string  `json:"path"`
+	Exists      bool    `json:"exists"`
+	Inode       *uint64 `json:"inode,omitempty"`
+	Resident    bool    `json:"resident"`
+	Pinned      bool    `json:"pinned"`
+	BytesCached int64   `json:"bytes_cached"`
+	Total       int64   `json:"total"`
+	Streaming   bool    `json:"streaming"`
+	UploadState *string `json:"upload_state"` // null when no active spool row
+	CheckedAt   int64   `json:"checked_at"`
+}
+
+// handleResidencyHTTP serves GET /residency?path=<abs> (contract JM-2): the
+// honest per-path residency that OpenLoupe's green "resident" badge depends on.
+//
+// The hard rule: per-byte cache accounting exists ONLY for files with a
+// pinned_files row. resident=true is emitted only when that row shows
+// bytes_cached >= size; any path with no pin row reports resident=false,
+// streaming=true, bytes_cached=0 — the honest under-claim. Never invent cached
+// bytes for an unpinned file.
+func handleResidencyHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "missing ?path", 400)
+		return
+	}
+	globalMu.Lock()
+	store := globalStore
+	pinStore := globalPinStore
+	spool := globalSpool
+	globalMu.Unlock()
+
+	resp := residencyResponse{Path: path, CheckedAt: time.Now().Unix()}
+
+	var entry *metadata.Entry
+	if store != nil {
+		entry = store.LookupByPath(path)
+	}
+	if entry == nil {
+		// exists=false ⇒ all flags false, bytes 0, inode omitted (schema rule).
+		writeContractJSON(w, resp)
+		return
+	}
+	resp.Exists = true
+	in := entry.Inode
+	resp.Inode = &in
+	resp.Total = entry.Size
+
+	if pinStore != nil {
+		if pe, ok := pinStore.Get(path); ok {
+			resp.Pinned = true
+			resp.BytesCached = pe.BytesCached
+			if pe.BytesCached >= entry.Size && entry.Size > 0 {
+				resp.Resident = true
+			}
+		}
+	}
+	resp.Streaming = resp.Exists && !resp.Resident
+
+	// upload_state mirrors an ACTIVE spool row's drain_state, else null. The
+	// spool store only retains writing/ready/draining rows, so a fully-drained
+	// file reports null (not "done").
+	if spool != nil {
+		if row, err := spool.Meta().LookupByPath(path); err == nil && row != nil {
+			s := string(row.DrainState)
+			resp.UploadState = &s
+		}
+	}
+	writeContractJSON(w, resp)
+}
+
+// lookupResponse is the GET /lookup body. Schema:
+// contract/spec/schema/lookup.schema.json. Pointer fields so the per-field
+// set collapses to {path, exists:false} when the path is unknown, and is_dir
+// serializes even when false.
+type lookupResponse struct {
+	Path       string  `json:"path"`
+	Exists     bool    `json:"exists"`
+	Inode      *uint64 `json:"inode,omitempty"`
+	NASRelPath *string `json:"nas_rel_path,omitempty"`
+	IsDir      *bool   `json:"is_dir,omitempty"`
+	Size       *int64  `json:"size,omitempty"`
+	Mtime      *int64  `json:"mtime,omitempty"`
+}
+
+// handleLookupHTTP serves GET /lookup?path=<abs> (contract JM-4): durable
+// identity (inode + nas_rel_path) for a path so OpenLoupe never opens
+// JuiceMount's SQLite. nas_rel_path is computed as path minus the mount point.
+func handleLookupHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "missing ?path", 400)
+		return
+	}
+	globalMu.Lock()
+	store := globalStore
+	mp := globalMountPath
+	if mp == "" {
+		mp = globalWantMountPoint
+	}
+	globalMu.Unlock()
+
+	resp := lookupResponse{Path: path}
+	var entry *metadata.Entry
+	if store != nil {
+		entry = store.LookupByPath(path)
+	}
+	if entry == nil {
+		writeContractJSON(w, resp) // {path, exists:false}
+		return
+	}
+	resp.Exists = true
+	in := entry.Inode
+	resp.Inode = &in
+	rel := strings.TrimPrefix(strings.TrimPrefix(path, mp), "/")
+	resp.NASRelPath = &rel
+	isDir := entry.IsDir
+	resp.IsDir = &isDir
+	size := entry.Size
+	resp.Size = &size
+	mtime := entry.Mtime.Unix()
+	resp.Mtime = &mtime
+	writeContractJSON(w, resp)
 }
 
 func handleCacheStatusHTTP(w http.ResponseWriter, r *http.Request) {

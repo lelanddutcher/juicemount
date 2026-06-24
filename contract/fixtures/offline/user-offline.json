@@ -1,0 +1,8 @@
+{
+  "offline": true,
+  "user_offline": true,
+  "auto_offline": false,
+  "reason": "user toggled offline",
+  "since": "2025-06-15T15:06:40Z",
+  "since_sec": 1750000000
+}

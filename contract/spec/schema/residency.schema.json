@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/residency.schema.json",
+  "title": "Residency",
+  "description": "GET /residency?path=<abs> — honest, live per-path residency. JM-2 (new endpoint). Blocks OpenLoupe's green 'resident' badge: until this exists, OpenLoupe must not claim resident.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path", "exists", "resident", "pinned", "bytes_cached", "total", "streaming", "checked_at"],
+  "properties": {
+    "path": { "type": "string", "description": "Echo of the queried absolute path." },
+    "exists": { "type": "boolean", "description": "Does the path exist in the JuiceMount metadata mirror." },
+    "inode": { "type": "integer", "description": "entries.inode (omitted when exists=false). The inode half of durable identity." },
+    "resident": { "type": "boolean", "description": "ALL bytes are cached on SSD right now — NOT merely 'is pinned'. The only field that may light the green badge. IMPLEMENTATION RULE: JuiceMount has per-byte cache accounting ONLY for files with a pinned_files row. For any path with no pinned_files row it MUST report resident=false, streaming=true, bytes_cached=0 (honest under-claim). resident=true is emitted only when a pinned_files row shows bytes_cached>=total." },
+    "pinned": { "type": "boolean", "description": "Is the path (or its pin_root) in pin.db." },
+    "bytes_cached": { "type": "integer", "minimum": 0, "description": "Bytes currently on SSD." },
+    "total": { "type": "integer", "minimum": 0, "description": "File size in bytes (0 when exists=false)." },
+    "streaming": { "type": "boolean", "description": "exists && !resident — reachable but served block-by-block from the backend." },
+    "upload_state": {
+      "type": ["string", "null"],
+      "enum": ["writing", "ready", "draining", "done", "failed", null],
+      "description": "Mirror of spool_entries.drain_state if mid-upload to the NAS, else null (or \"done\")."
+    },
+    "checked_at": { "type": "integer", "description": "Unix seconds when this was computed (freshness)." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "exists": { "const": false } } },
+      "then": {
+        "properties": {
+          "resident": { "const": false },
+          "streaming": { "const": false },
+          "pinned": { "const": false },
+          "bytes_cached": { "const": 0 },
+          "total": { "const": 0 }
+        }
+      }
+    }
+  ]
+}

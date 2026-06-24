@@ -1,0 +1,38 @@
+{
+  "aggregate": {
+    "total_files": 142,
+    "ready_files": 130,
+    "pending_files": 12,
+    "failed_files": 0,
+    "total_bytes": 3400000000,
+    "cached_bytes": 2800000000
+  },
+  "roots": [
+    {
+      "root": "/Volumes/zpool/Project_Foo",
+      "total_files": 142,
+      "ready_files": 130,
+      "pending_files": 12,
+      "failed_files": 0,
+      "total_bytes": 3400000000,
+      "cached_bytes": 2800000000
+    }
+  ],
+  "live": {
+    "bytes_prefetched": 1500000000,
+    "files_prefetched": 30,
+    "current_file": "/Volumes/zpool/Project_Foo/clip_031.mov",
+    "workers": 4
+  },
+  "offline_mode": false,
+  "capacity": {
+    "over_capacity": false,
+    "pinned_bytes": 3400000000,
+    "cache_capacity_bytes": 107374182400,
+    "shortfall_bytes": 0,
+    "disk_free_bytes": 64424509440,
+    "cache_usage_bytes": 2800000000,
+    "computed_sec": 3
+  },
+  "scanning": []
+}

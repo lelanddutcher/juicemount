@@ -26,22 +26,28 @@ import (
 type Status int
 
 const (
-	StatusUnknown   Status = iota
-	StatusPending          // pinned but not yet prefetched
-	StatusPrefetching      // currently being read into cache
-	StatusReady            // bytes confirmed cached
-	StatusFailed           // last prefetch attempt failed
-	StatusUnpinned         // user removed; eligible for eviction
+	StatusUnknown     Status = iota
+	StatusPending            // pinned but not yet prefetched
+	StatusPrefetching        // currently being read into cache
+	StatusReady              // bytes confirmed cached
+	StatusFailed             // last prefetch attempt failed
+	StatusUnpinned           // user removed; eligible for eviction
 )
 
 func (s Status) String() string {
 	switch s {
-	case StatusPending:     return "pending"
-	case StatusPrefetching: return "prefetching"
-	case StatusReady:       return "ready"
-	case StatusFailed:      return "failed"
-	case StatusUnpinned:    return "unpinned"
-	default:                return "unknown"
+	case StatusPending:
+		return "pending"
+	case StatusPrefetching:
+		return "prefetching"
+	case StatusReady:
+		return "ready"
+	case StatusFailed:
+		return "failed"
+	case StatusUnpinned:
+		return "unpinned"
+	default:
+		return "unknown"
 	}
 }
 
@@ -74,8 +80,8 @@ CREATE INDEX IF NOT EXISTS idx_pinned_root ON pinned_files(pin_root);
 
 // Store is a thread-safe SQLite-backed pinned-paths registry.
 type Store struct {
-	db    *sql.DB
-	mu    sync.RWMutex
+	db *sql.DB
+	mu sync.RWMutex
 
 	// QA-35 (2026-05-26): in-memory cache for IsPinnedReady. The
 	// pre-cache implementation ran a SQLite SELECT on every call.
@@ -93,9 +99,9 @@ type Store struct {
 	// Negative results (path not in map) ARE cacheable — pin counts
 	// are small (<1000 typically), so storing the full ready-set is
 	// cheap. A read for a non-pinned path == map-miss == false.
-	readyMu          sync.RWMutex
-	ready            map[string]struct{}
-	readyValidUntil  time.Time
+	readyMu         sync.RWMutex
+	ready           map[string]struct{}
+	readyValidUntil time.Time
 }
 
 // readyTTL is the maximum staleness of the IsPinnedReady cache. Short
@@ -243,11 +249,11 @@ func (s *Store) UpdateStatus(path string, status Status, bytesCached int64, errM
 // IsPinnedReady checks whether a single path is "good enough" to be
 // served while offline mode is on. A path qualifies if either:
 //
-//   1. status = Ready, OR
-//   2. status = Prefetching AND bytes_cached >= size — i.e. the prefetcher
-//      has finished pulling bytes but hasn't flipped the status row yet.
-//      This eliminates a small (~1s) window where a fully-cached file
-//      would otherwise be refused after the user toggles offline ON.
+//  1. status = Ready, OR
+//  2. status = Prefetching AND bytes_cached >= size — i.e. the prefetcher
+//     has finished pulling bytes but hasn't flipped the status row yet.
+//     This eliminates a small (~1s) window where a fully-cached file
+//     would otherwise be refused after the user toggles offline ON.
 //
 // Hot-path-friendly — uses the path primary key. Called on every NFS
 // OpenFile when offline mode is on.
@@ -436,6 +442,31 @@ func (s *Store) All() ([]Entry, error) {
 	return scanEntries(rows)
 }
 
+// Get returns the pin row for exactly this path, or (nil, false) when the path
+// has no pinned_files row. Unlike IsPinnedReady (a boolean offline-gate check),
+// Get exposes the per-file bytes_cached/size/status — the per-path residency
+// truth the control-plane /residency endpoint (contract JM-2) depends on.
+// Not a hot path; one indexed lookup on the path primary key.
+func (s *Store) Get(path string) (*Entry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT path, size, status, bytes_cached, last_prefetched, last_error, pinned_at, pin_root
+		FROM pinned_files
+		WHERE path = ?
+		LIMIT 1`, path)
+	if err != nil {
+		return nil, false
+	}
+	defer rows.Close()
+	entries, err := scanEntries(rows)
+	if err != nil || len(entries) == 0 {
+		return nil, false
+	}
+	e := entries[0]
+	return &e, true
+}
+
 // PinRoots returns the distinct pin roots and aggregate stats per root.
 type RootSummary struct {
 	Root         string
@@ -488,12 +519,12 @@ func (s *Store) PinRoots() ([]RootSummary, error) {
 
 // AggregateStats returns whole-database counters.
 type AggregateStats struct {
-	TotalFiles    int
-	ReadyFiles    int
-	PendingFiles  int
-	FailedFiles   int
-	TotalBytes    int64
-	CachedBytes   int64
+	TotalFiles   int
+	ReadyFiles   int
+	PendingFiles int
+	FailedFiles  int
+	TotalBytes   int64
+	CachedBytes  int64
 }
 
 func (s *Store) AggregateStats() (AggregateStats, error) {

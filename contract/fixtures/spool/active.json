@@ -1,0 +1,37 @@
+{
+  "enabled": true,
+  "pending_files": 1,
+  "pending_bytes": 540000000,
+  "in_progress": 1,
+  "succeeded": 0,
+  "failed": 0,
+  "quarantined": 0,
+  "capacity_used": 1420000000,
+  "capacity_total": 53687091200,
+  "stalled_files": 0,
+  "failed_files": 0,
+  "oldest_pending_age_sec": 42,
+  "stall_waiters": 0,
+  "offline": false,
+  "offline_buffer_full": false,
+  "entries": [
+    {
+      "path": "/Volumes/zpool/incoming/take_07.mov",
+      "size": 880000000,
+      "drain_state": "draining",
+      "drain_attempts": 0,
+      "updated_at_unix": 1750000000,
+      "age_sec": 42,
+      "stalled": false
+    },
+    {
+      "path": "/Volumes/zpool/incoming/take_08.mov",
+      "size": 540000000,
+      "drain_state": "ready",
+      "drain_attempts": 0,
+      "updated_at_unix": 1750000001,
+      "age_sec": 18,
+      "stalled": false
+    }
+  ]
+}

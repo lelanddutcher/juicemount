@@ -1,0 +1,13 @@
+{
+  "app": "JuiceMount",
+  "version": "0.1.0",
+  "contract_version": 1,
+  "instance_id": "A1B2C3D4-0000-4E6D-8F2A-0C110C110C11",
+  "volume_name": "zpool",
+  "mount_point": "/Volumes/zpool",
+  "nas_root": "/Volumes/zpool",
+  "control_plane": "http://127.0.0.1:11050",
+  "metadata_db_path": "/Users/leland/.juicemount/metadata.db",
+  "deployment": "cli",
+  "capabilities": ["health", "spool", "metrics", "whoami"]
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/whoami.schema.json",
+  "title": "WhoAmI",
+  "description": "GET /whoami — JuiceMount identity, version, contract handshake, and capability list. JM-1 (new endpoint).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["app", "version", "contract_version", "instance_id", "volume_name", "mount_point", "control_plane", "deployment", "capabilities"],
+  "properties": {
+    "app": { "const": "JuiceMount" },
+    "version": { "type": "string", "description": "The public release version string, e.g. \"0.1.0\" (the notarized release / git tag). Sourced from a single version-of-record (JM-6), distinct from contract_version." },
+    "contract_version": { "type": "integer", "minimum": 1, "description": "Integer from this repo's VERSION." },
+    "instance_id": { "type": "string", "minLength": 1, "description": "Stable per-install UUID, minted once and persisted. The jm_instance half of durable (instance,inode) identity." },
+    "volume_name": { "type": "string", "description": "JuiceFS/NFS volume name, e.g. \"zpool\"." },
+    "mount_point": { "type": "string", "description": "Absolute user-facing mount path, e.g. \"/Volumes/zpool\"." },
+    "nas_root": { "type": "string", "description": "Root the paths are anchored to. Today == mount_point; a distinct field so it can diverge later." },
+    "control_plane": { "type": "string", "format": "uri", "description": "Base URL of this control plane, e.g. \"http://127.0.0.1:11050\"." },
+    "metadata_db_path": { "type": "string", "description": "Absolute path to metadata.db (optional; for the dev-only direct-DB FTS path)." },
+    "deployment": { "enum": ["gui", "cli"], "description": "gui = full cbridge control plane; cli = jm5 (partial: health/spool/metrics only)." },
+    "capabilities": {
+      "type": "array",
+      "items": { "enum": ["health","whoami","residency","lookup","cache-status","offline","spool","activity","pin","unpin","self-test","verify-pins","metrics"] },
+      "description": "DERIVED (never hardcoded) as: the intersection of the routes THIS binary serves with the contract's known capability vocabulary (this enum). Operational/UI routes (reclaim, cache-clear, force-eject, stop, mount-now, spool-recover, debug/pprof, manager, migrator) are NOT capabilities and are excluded. Because a binary that answers /whoami is by definition serving the whoami route, 'whoami' is always present. The ONLY correct way to feature-detect. NOTE: a token only asserts the route EXISTS — for cache-status, also require contract_version>=1 before parsing snake_case keys (pre-JM-3 JuiceMount emits capitalized keys).",
+      "examples": [["health","whoami","residency","lookup","cache-status","offline","spool","activity","pin","unpin","self-test","verify-pins","metrics"]]
+    }
+  }
+}

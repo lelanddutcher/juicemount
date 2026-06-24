@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/health.schema.json",
+  "title": "HealthSnapshot",
+  "description": "GET /health — confirm a detected mount is live JuiceMount. Grounded in JuiceMount6 (internal/metrics/metrics.go). HTTP 503 when healthy=false, else 200.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["healthy"],
+  "properties": {
+    "healthy": { "type": "boolean" },
+    "components": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Per-component status; value is \"ok\" when healthy else a message. Keys observed: redis, minio, fuse, nfs. Omitted when no provider is set.",
+      "examples": [{ "redis": "ok", "minio": "ok", "fuse": "ok", "nfs": "ok" }]
+    },
+    "reason": { "type": "string", "description": "\"degraded\" when overall unhealthy, else \"\"/omitted." }
+  }
+}

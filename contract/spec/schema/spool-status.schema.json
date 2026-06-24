@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/spool-status.schema.json",
+  "title": "SpoolStatusResponse",
+  "description": "GET /spool — write-spool (upload-to-NAS) state, per file. Grounded in origin/main (SpoolStatusResponse + SpoolEntryView at nfs/spool_status.go:17-71). HTTP 503 with enabled=false when the spool is not enabled (JM_SPOOL_ENABLE=1). entries capped at 200, newest-first active rows + a short recently-done tail. Served by BOTH the GUI and the jm5 CLI.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["enabled", "pending_files", "pending_bytes", "in_progress", "succeeded", "failed", "quarantined", "capacity_used", "capacity_total", "stalled_files", "failed_files", "oldest_pending_age_sec", "stall_waiters", "offline", "offline_buffer_full"],
+  "properties": {
+    "enabled": { "type": "boolean" },
+    "error": { "type": "string", "description": "Present when disabled or on SQL error." },
+    "pending_files": { "type": "integer", "minimum": 0 },
+    "pending_bytes": { "type": "integer", "minimum": 0 },
+    "in_progress": { "type": "integer", "minimum": 0 },
+    "succeeded": { "type": "integer", "minimum": 0 },
+    "failed": { "type": "integer", "minimum": 0 },
+    "quarantined": { "type": "integer", "minimum": 0 },
+    "capacity_used": { "type": "integer", "minimum": 0 },
+    "capacity_total": { "type": "integer", "minimum": 0 },
+    "stalled_files": { "type": "integer", "minimum": 0 },
+    "failed_files": { "type": "integer", "minimum": 0, "description": "Distinct from top-level 'failed' (a counter); this is the current count of files in the failed drain_state." },
+    "oldest_pending_age_sec": { "type": "integer", "minimum": 0 },
+    "stall_waiters": { "type": "integer", "minimum": 0 },
+    "offline": { "type": "boolean", "description": "Spool is holding because the volume is offline." },
+    "offline_buffer_full": { "type": "boolean" },
+    "entries": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "size", "drain_state", "drain_attempts", "updated_at_unix", "age_sec", "stalled"],
+        "properties": {
+          "path": { "type": "string", "description": "Absolute nfs_path of the spooled file." },
+          "size": { "type": "integer", "minimum": 0 },
+          "drain_state": { "enum": ["writing", "ready", "draining", "done", "failed"], "description": "Active rows are newest-first; a short recently-done tail may appear." },
+          "drain_attempts": { "type": "integer", "minimum": 0 },
+          "last_error": { "type": "string" },
+          "updated_at_unix": { "type": "integer" },
+          "age_sec": { "type": "integer", "minimum": 0 },
+          "stalled": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

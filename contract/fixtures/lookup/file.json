@@ -1,0 +1,9 @@
+{
+  "path": "/Volumes/zpool/Project_Foo/clip_031.mov",
+  "exists": true,
+  "inode": 1180417,
+  "nas_rel_path": "Project_Foo/clip_031.mov",
+  "is_dir": false,
+  "size": 880000000,
+  "mtime": 1700000000
+}

@@ -1,0 +1,13 @@
+{
+  "app": "JuiceMount",
+  "version": "0.1.0",
+  "contract_version": 1,
+  "instance_id": "5C7E0E2A-9B41-4E6D-8F2A-1A2B3C4D5E6F",
+  "volume_name": "zpool",
+  "mount_point": "/Volumes/zpool",
+  "nas_root": "/Volumes/zpool",
+  "control_plane": "http://127.0.0.1:11050",
+  "metadata_db_path": "/Users/leland/Library/Application Support/JuiceMount/metadata.db",
+  "deployment": "gui",
+  "capabilities": ["health", "whoami", "residency", "lookup", "cache-status", "offline", "spool", "activity", "pin", "unpin", "self-test", "verify-pins", "metrics"]
+}

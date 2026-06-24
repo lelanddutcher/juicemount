@@ -1,0 +1,11 @@
+{
+  "path": "/Volumes/zpool/Project_Foo/deleted_take.mov",
+  "exists": false,
+  "resident": false,
+  "pinned": false,
+  "bytes_cached": 0,
+  "total": 0,
+  "streaming": false,
+  "upload_state": null,
+  "checked_at": 1750000000
+}

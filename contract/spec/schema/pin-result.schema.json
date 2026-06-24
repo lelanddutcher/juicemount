@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/pin-result.schema.json",
+  "title": "PinResult",
+  "description": "POST /pin?path=<abs> and POST /unpin?path=<abs>. Grounded in origin/main (PinResult struct bridge/cbridge.go:1942; handlePinHTTP :2170; handleUnpinHTTP :2182). A fresh /pin walks asynchronously and returns scanning=true with files_pinned/bytes_total=0 — real counts land via /cache-status. /unpin returns files_pinned = count removed, bytes_total=0, scanning=false.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ok", "scanning"],
+  "properties": {
+    "ok": { "type": "boolean" },
+    "files_pinned": { "type": "integer", "minimum": 0, "description": "On /pin: files pinned so far (0 while scanning). On /unpin: files removed." },
+    "bytes_total": { "type": "integer", "minimum": 0, "description": "Total bytes across pinned files (0 for /unpin, 0 while a /pin is still scanning)." },
+    "error": { "type": "string", "description": "Present (and ok=false) on a JSON failure response. NOTE: the missing-?path case returns HTTP 400 with a text/plain body 'missing ?path', not this JSON shape." },
+    "scanning": { "type": "boolean", "description": "ALWAYS present (deliberately not omitempty — Swift required-decode would throw on absence). true = the pin walk is still in progress and counts are not yet final; poll /cache-status for progress." }
+  }
+}

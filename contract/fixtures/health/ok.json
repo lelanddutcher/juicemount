@@ -1,0 +1,9 @@
+{
+  "healthy": true,
+  "components": {
+    "redis": "ok",
+    "minio": "ok",
+    "fuse": "ok",
+    "nfs": "ok"
+  }
+}

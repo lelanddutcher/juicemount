@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/cache-status.schema.json",
+  "title": "CacheStatus",
+  "description": "GET /cache-status — aggregate + per-root warm progress, live prefetcher state, capacity verdict, and in-flight scans. Grounded in origin/main (CacheStatus bridge/cbridge.go:2046). NORMALIZATION REQUIRED (JM-3): the inner aggregate/roots/live structs (pin.AggregateStats store.go:490, RootSummary store.go:440, LiveStats prefetcher.go:372) still carry NO json tags on main, so they marshal with capitalized Go field names. v1 specifies snake_case via added json tags; the fixtures are the TARGET (snake_case) form. capacity and scanning ALREADY carry snake_case tags and are always present.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["aggregate", "live", "offline_mode", "capacity", "scanning"],
+  "properties": {
+    "aggregate": { "$ref": "#/$defs/rootStats" },
+    "roots": {
+      "type": ["array", "null"],
+      "description": "Per-pin-root summaries; null/absent when no pin roots.",
+      "items": {
+        "allOf": [{ "$ref": "#/$defs/rootStats" }],
+        "type": "object",
+        "required": ["root"],
+        "properties": { "root": { "type": "string", "description": "Absolute pin-root path." } }
+      }
+    },
+    "live": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bytes_prefetched", "files_prefetched", "current_file", "workers"],
+      "properties": {
+        "bytes_prefetched": { "type": "integer", "minimum": 0 },
+        "files_prefetched": { "type": "integer", "minimum": 0 },
+        "current_file": { "type": "string", "description": "Path being prefetched now, or \"\"." },
+        "workers": { "type": "integer", "minimum": 0 }
+      },
+      "description": "Live prefetcher state (pin.LiveStats). Zero-valued when prefetcher is nil."
+    },
+    "offline_mode": { "type": "boolean" },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["over_capacity", "pinned_bytes", "cache_capacity_bytes", "shortfall_bytes", "disk_free_bytes", "cache_usage_bytes", "computed_sec"],
+      "description": "pin.CapacityVerdict (capacity.go:46) — always present, snake_case already.",
+      "properties": {
+        "over_capacity": { "type": "boolean" },
+        "pinned_bytes": { "type": "integer", "minimum": 0 },
+        "cache_capacity_bytes": { "type": "integer", "minimum": 0 },
+        "shortfall_bytes": { "type": "integer", "minimum": 0 },
+        "disk_free_bytes": { "type": "integer", "minimum": 0 },
+        "cache_usage_bytes": { "type": "integer", "minimum": 0 },
+        "computed_sec": { "type": "integer", "description": "Unix seconds the verdict was computed." }
+      }
+    },
+    "scanning": {
+      "type": "array",
+      "description": "pin.ScanningRoot[] (scanning.go:24) — in-flight pin-tree scans. Normalized to [] (never null).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["root", "files_found", "bytes_found", "since_sec"],
+        "properties": {
+          "root": { "type": "string" },
+          "files_found": { "type": "integer", "minimum": 0 },
+          "bytes_found": { "type": "integer", "minimum": 0 },
+          "since_sec": { "type": "integer" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "rootStats": {
+      "type": "object",
+      "required": ["total_files", "ready_files", "pending_files", "failed_files", "total_bytes", "cached_bytes"],
+      "properties": {
+        "total_files": { "type": "integer", "minimum": 0 },
+        "ready_files": { "type": "integer", "minimum": 0, "description": "Fully-resident files (warm progress = cached_bytes/total_bytes)." },
+        "pending_files": { "type": "integer", "minimum": 0 },
+        "failed_files": { "type": "integer", "minimum": 0 },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "cached_bytes": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

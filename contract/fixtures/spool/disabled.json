@@ -1,0 +1,19 @@
+{
+  "enabled": false,
+  "error": "spool not enabled (set JM_SPOOL_ENABLE=1 to opt in)",
+  "pending_files": 0,
+  "pending_bytes": 0,
+  "in_progress": 0,
+  "succeeded": 0,
+  "failed": 0,
+  "quarantined": 0,
+  "capacity_used": 0,
+  "capacity_total": 0,
+  "stalled_files": 0,
+  "failed_files": 0,
+  "oldest_pending_age_sec": 0,
+  "stall_waiters": 0,
+  "offline": false,
+  "offline_buffer_full": false,
+  "entries": null
+}

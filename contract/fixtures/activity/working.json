@@ -1,0 +1,26 @@
+{
+  "busy": true,
+  "summary": "Working — uploading 12 files; warming 30 pinned files",
+  "operations": [
+    {
+      "kind": "reconcile",
+      "active": false,
+      "detail": "Index up to date — 18234 entries, synced 12s ago",
+      "files": 18234
+    },
+    {
+      "kind": "drain",
+      "active": true,
+      "detail": "Uploading 12 file(s) (3.2 GB) to backend",
+      "files": 12,
+      "bytes": 3400000000
+    },
+    {
+      "kind": "prefetch",
+      "active": true,
+      "detail": "Warming 30 pinned file(s) — 92% cached",
+      "files": 30,
+      "bytes": 49392123904
+    }
+  ]
+}

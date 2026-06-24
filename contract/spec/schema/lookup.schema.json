@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/lookup.schema.json",
+  "title": "Lookup",
+  "description": "GET /lookup?path=<abs> — durable identity for a path without OpenLoupe opening JuiceMount's SQLite. JM-4 (new endpoint).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path", "exists"],
+  "properties": {
+    "path": { "type": "string", "description": "Echo of the queried absolute path." },
+    "exists": { "type": "boolean" },
+    "inode": { "type": "integer", "description": "entries.inode — stable across remount/rename (omitted when exists=false)." },
+    "nas_rel_path": { "type": "string", "description": "DEFINED BY THIS CONTRACT as path minus mount_point (no such column exists today — JuiceMount computes it). Human-debuggable secondary identity." },
+    "is_dir": { "type": "boolean" },
+    "size": { "type": "integer", "minimum": 0, "description": "Bytes (entries.size)." },
+    "mtime": { "type": "integer", "description": "Unix seconds (entries.mtime)." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "exists": { "const": true } }, "required": ["exists"] },
+      "then": { "required": ["inode", "nas_rel_path", "is_dir", "size", "mtime"] }
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "aggregate": {
+    "total_files": 0,
+    "ready_files": 0,
+    "pending_files": 0,
+    "failed_files": 0,
+    "total_bytes": 0,
+    "cached_bytes": 0
+  },
+  "roots": null,
+  "live": {
+    "bytes_prefetched": 0,
+    "files_prefetched": 0,
+    "current_file": "",
+    "workers": 0
+  },
+  "offline_mode": false,
+  "capacity": {
+    "over_capacity": false,
+    "pinned_bytes": 0,
+    "cache_capacity_bytes": 107374182400,
+    "shortfall_bytes": 0,
+    "disk_free_bytes": 64424509440,
+    "cache_usage_bytes": 0,
+    "computed_sec": 0
+  },
+  "scanning": []
+}

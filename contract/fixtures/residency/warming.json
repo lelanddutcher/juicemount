@@ -1,0 +1,12 @@
+{
+  "path": "/Volumes/zpool/Project_Foo/clip_205.mov",
+  "exists": true,
+  "inode": 1180621,
+  "resident": false,
+  "pinned": true,
+  "bytes_cached": 620000000,
+  "total": 1240000000,
+  "streaming": true,
+  "upload_state": null,
+  "checked_at": 1750000000
+}

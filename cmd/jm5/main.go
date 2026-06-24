@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -20,10 +21,12 @@ import (
 
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/health"
+	"github.com/lelanddutcher/juicemount/internal/cplane"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/manager"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/internal/version"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
@@ -351,6 +354,36 @@ func main() {
 	}
 	metricsSrv.ExtraRoutes["/spool"] = func(w http.ResponseWriter, r *http.Request) {
 		jmnfs.WriteSpoolStatusJSON(w, spoolStore, drainer)
+	}
+
+	// /whoami (contract JM-1). The jm5 CLI serves a SMALLER control plane than
+	// the GUI core — only health/metrics/spool — so deployment="cli" and the
+	// capability list derives to ["health","metrics","spool","whoami"].
+	jm5InstanceID := cplane.LoadOrMintInstanceID(*dbPath)
+	metricsSrv.ExtraRoutes["/whoami"] = func(w http.ResponseWriter, r *http.Request) {
+		served := []string{"/health", "/metrics", "/whoami"}
+		for route := range metricsSrv.ExtraRoutes {
+			served = append(served, route)
+		}
+		addr := *metricsAddr
+		if a := metricsSrv.Addr(); a != "" {
+			addr = a
+		}
+		who := cplane.WhoAmI{
+			App:             "JuiceMount",
+			Version:         version.Version,
+			ContractVersion: cplane.ContractVersion,
+			InstanceID:      jm5InstanceID,
+			VolumeName:      filepath.Base(*mountPoint),
+			MountPoint:      *mountPoint,
+			NASRoot:         *mountPoint,
+			ControlPlane:    "http://" + addr,
+			MetadataDBPath:  *dbPath,
+			Deployment:      "cli",
+			Capabilities:    cplane.DeriveCapabilities(served),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(who)
 	}
 
 	if err := metricsSrv.Start(); err != nil {

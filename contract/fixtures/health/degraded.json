@@ -1,0 +1,10 @@
+{
+  "healthy": false,
+  "components": {
+    "redis": "ok",
+    "minio": "dial tcp 127.0.0.1:9000: connect: connection refused",
+    "fuse": "ok",
+    "nfs": "ok"
+  },
+  "reason": "degraded"
+}

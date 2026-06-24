@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/offline-state.schema.json",
+  "title": "OfflineState",
+  "description": "GET /offline (no ?on) returns this snapshot. POST /offline?on=true|false toggles and returns {ok, offline_mode} (see offline-toggle below). Grounded in JuiceMount6 (internal/cache/pin/offline.go:127).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["offline", "user_offline", "auto_offline", "since_sec"],
+  "properties": {
+    "offline": { "type": "boolean", "description": "Effective offline state (user OR auto)." },
+    "user_offline": { "type": "boolean", "description": "User explicitly toggled offline." },
+    "auto_offline": { "type": "boolean", "description": "Auto-engaged (e.g. backend unreachable)." },
+    "reason": { "type": "string", "description": "Omitted when empty." },
+    "since": { "type": "string", "format": "date-time", "description": "RFC3339; omitted when zero." },
+    "since_sec": { "type": "integer", "description": "Unix seconds the state began (0 if never)." }
+  },
+  "$defs": {
+    "offline-toggle": {
+      "description": "Response shape of POST /offline?on=... (the toggle path).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "offline_mode"],
+      "properties": {
+        "ok": { "const": true },
+        "offline_mode": { "type": "boolean" }
+      }
+    }
+  }
+}
