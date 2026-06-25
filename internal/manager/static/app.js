@@ -38,6 +38,7 @@
   // to the same index.html and the JS picks the section.
   const TABS = [
     'overview',
+    'farm',
     'migrations',
     'trash',
     'destinations',
@@ -86,6 +87,12 @@
       startOverviewPolling();
     } else {
       stopOverviewPolling();
+    }
+    // Farm tab (read-only): poll /api/farm while visible.
+    if (name === 'farm') {
+      startFarmPolling();
+    } else {
+      stopFarmPolling();
     }
     // SLICE 3: lazy-init Trash on first activation. Subsequent
     // activations call refreshTrash() so the list reflects any
@@ -813,6 +820,79 @@
     if (!overviewState.timer) return;
     clearInterval(overviewState.timer);
     overviewState.timer = null;
+  }
+
+  // ---- Farm tab (Phase 1, read-only): poll /api/farm while visible. The farm
+  // pre-aggregates into farm-status.json; we just relay + render coverage.
+  let farmTimer = null;
+  function startFarmPolling() {
+    loadFarm();
+    if (!farmTimer) farmTimer = setInterval(loadFarm, 10000);
+  }
+  function stopFarmPolling() {
+    if (farmTimer) { clearInterval(farmTimer); farmTimer = null; }
+  }
+  async function loadFarm() {
+    let res;
+    try { res = await api('GET', '/api/farm'); } catch (e) { return; }
+    const empty = $('#farm-empty');
+    const content = $('#farm-content');
+    if (!res || !res.available) {
+      empty.textContent = (res && res.reason) || 'Farm status unavailable.';
+      empty.hidden = false;
+      content.hidden = true;
+      return;
+    }
+    empty.hidden = true;
+    content.hidden = false;
+    const s = res.status || {};
+    const idx = s.index || {};
+    const sweep = s.last_sweep || {};
+
+    const dl = $('#farm-sweep');
+    dl.innerHTML = '';
+    const proc = (sweep.processed != null ? sweep.processed : 0) +
+      (sweep.failed ? (' · ' + sweep.failed + ' failed') : '');
+    const rows = [
+      ['Mode', sweep.mode || '—'],
+      ['Producer', sweep.producer || '—'],
+      ['Target', sweep.target || '—'],
+      ['Processed', String(proc)],
+      ['Duration', sweep.duration_ms != null ? (sweep.duration_ms + ' ms') : '—'],
+    ];
+    for (const [k, v] of rows) {
+      const dt = document.createElement('dt'); dt.textContent = k;
+      const dd = document.createElement('dd'); dd.textContent = String(v);
+      dl.appendChild(dt); dl.appendChild(dd);
+    }
+
+    $('#farm-assets').textContent = (idx.total_assets != null ? idx.total_assets : 0) + ' assets';
+    const tb = $('#farm-kinds');
+    tb.innerHTML = '';
+    const byKind = idx.by_kind || {};
+    const kinds = Object.keys(byKind).sort();
+    if (kinds.length === 0) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 3; td.textContent = 'No derivatives generated yet.';
+      tr.appendChild(td); tb.appendChild(tr);
+    } else {
+      kinds.forEach((kind) => {
+        const ks = byKind[kind] || {};
+        const failed = ks.failed != null ? ks.failed : 0;
+        const tr = document.createElement('tr');
+        [kind, String(ks.ready != null ? ks.ready : 0), String(failed)].forEach((cell, i) => {
+          const td = document.createElement('td');
+          td.textContent = cell;
+          if (i === 2 && failed > 0) td.classList.add('farm-failed');
+          tr.appendChild(td);
+        });
+        tb.appendChild(tr);
+      });
+    }
+    if (s.written_at) {
+      $('#farm-updated').textContent = '· updated ' + new Date(s.written_at * 1000).toLocaleTimeString();
+    }
   }
 
   async function pollOverview() {

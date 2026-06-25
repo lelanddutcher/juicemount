@@ -96,9 +96,12 @@ must cap the farm so it never starves the live mount / other apps.
   ever has one) is a future knob.
 
 ## 5. Suggested phasing
-1. **Read-only first (cheap, high value):** a Farm tab that shows **coverage + failures** from `derivatives.db`
-   and **live progress** from the `since=` feed — no farm changes needed, pure manager UI over data that
-   already exists.
+1. **Read-only first — ✅ DONE (Phase 1):** a Farm tab showing **coverage by kind** (ready/failed) + **last
+   sweep** + auto-refresh. The manager is CGO-free, so the farm emits a pre-aggregated `farm-status.json`
+   rollup (`jmfarm -status`, `internal/farm.WriteFarmStatus` over `derivatives.Store.Stats`); the manager
+   relays it via `GET /api/farm` + the Farm tab (`internal/manager/farm.go` + static). Compose mounts
+   juicefarm-state read-only into the manager (`JM_FARM_STATUS`). Per-folder coverage + live since=-feed
+   progress are the Phase-1.5 follow-ups.
 2. **Triggered sweeps:** manager launches one-shot farm jobs (path + modes + a CPU/concurrency cap) via the
    jobs framework.
 3. **Throttling controls:** `--cpus` slider + split proxy-concurrency + off-peak window.

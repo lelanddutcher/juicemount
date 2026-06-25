@@ -262,6 +262,62 @@ func (s *Store) PutDeriv(inode uint64, d DerivRow) error {
 	return err
 }
 
+// KindStat is the ready/failed tally for one derivative kind.
+type KindStat struct {
+	Ready  int `json:"ready"`
+	Failed int `json:"failed"`
+}
+
+// Stats is a rollup of the index for an operator dashboard (the manager Farm tab):
+// how many distinct assets are covered, the ready/failed counts per kind, and the
+// most recent write. Cheap aggregate query; reflects what THIS index has (the
+// server farm's own db, or the Mac's after JM-15 reconcile).
+type Stats struct {
+	TotalAssets int                 `json:"total_assets"`
+	ByKind      map[string]KindStat `json:"by_kind"`
+	LastUpdated int64               `json:"last_updated"`
+}
+
+// Stats returns the index rollup.
+func (s *Store) Stats() (Stats, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := Stats{ByKind: map[string]KindStat{}}
+
+	rows, err := s.db.Query(`SELECT kind, status, COUNT(*) FROM derivatives GROUP BY kind, status`)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind, status string
+		var n int
+		if err := rows.Scan(&kind, &status, &n); err != nil {
+			return out, err
+		}
+		ks := out.ByKind[kind]
+		switch status {
+		case "ready":
+			ks.Ready += n
+		case "failed":
+			ks.Failed += n
+		}
+		out.ByKind[kind] = ks
+	}
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+
+	var total sql.NullInt64
+	var last sql.NullInt64
+	if err := s.db.QueryRow(`SELECT COUNT(DISTINCT inode), MAX(updated_at) FROM derivatives`).Scan(&total, &last); err != nil {
+		return out, err
+	}
+	out.TotalAssets = int(total.Int64)
+	out.LastUpdated = last.Int64
+	return out, nil
+}
+
 // ChangeRow is one entry in the /derivatives/changes delta feed.
 type ChangeRow struct {
 	Inode     uint64  `json:"inode"`

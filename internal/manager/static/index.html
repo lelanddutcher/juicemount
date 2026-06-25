@@ -21,6 +21,7 @@
     <nav id="sidebar" class="sidebar" aria-label="Manager sections">
       <ul class="sidebar-list">
         <li><a href="#/overview"     data-tab-link="overview">Overview</a></li>
+        <li><a href="#/farm"         data-tab-link="farm">Farm</a></li>
         <li><a href="#/migrations"   data-tab-link="migrations">Migrations</a></li>
         <li><a href="#/trash"        data-tab-link="trash">Trash</a></li>
         <li><a href="#/destinations" data-tab-link="destinations">Destinations</a></li>
@@ -82,6 +83,37 @@
             <ul class="overview-jobs" data-field="items"></ul>
             <p class="overview-error" hidden></p>
           </article>
+        </div>
+      </section>
+
+      <!-- Farm tab (Phase 1, read-only) — the server-side juicefarm's
+           generation coverage + last sweep, read from the farm's
+           farm-status.json rollup via /api/farm. No farm control here
+           yet (throttle/trigger come later); this is the "what has the
+           farm produced" glance. -->
+      <section data-tab="farm" class="tab-pane farm-pane" hidden>
+        <div class="overview-header">
+          <h2>Farm</h2>
+          <p class="hint">
+            Server-side derivative + AI generation coverage. Refreshed every 10 seconds while this tab is open.
+            <span id="farm-updated" class="overview-updated"></span>
+          </p>
+        </div>
+        <p id="farm-empty" class="hint" hidden></p>
+        <div id="farm-content" hidden>
+          <div class="overview-grid">
+            <article class="overview-card">
+              <header><h3>Last sweep</h3></header>
+              <dl id="farm-sweep"></dl>
+            </article>
+            <article class="overview-card">
+              <header><h3>Coverage by kind</h3><span class="overview-card-state" id="farm-assets"></span></header>
+              <table class="farm-table">
+                <thead><tr><th>Kind</th><th>Ready</th><th>Failed</th></tr></thead>
+                <tbody id="farm-kinds"></tbody>
+              </table>
+            </article>
+          </div>
         </div>
       </section>
 

@@ -28,6 +28,7 @@ MODE="${JM_FARM_MODE:-all}"
 WORKERS="${JM_FARM_WORKERS:-4}"
 INTERVAL="${JM_FARM_INTERVAL:-900}"
 VCODEC="${JM_FARM_VCODEC:-libx264}"
+STATUS="${JM_FARM_STATUS:-/state/farm-status.json}"
 mkdir -p "$(dirname "$DB")"
 
 # resolve_model: accept a path (use as-is) OR a bare model name to fetch into
@@ -64,7 +65,7 @@ echo "[juicefarm] mounted; target=$TARGET mode=$MODE producer=$PRODUCER"
 # proxy transcode, then the AI transcript.
 do_pass() {
   echo "[juicefarm] sweep: jmfarm $* -root $TARGET"
-  jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" "$@" -root "$TARGET" || true
+  jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" -status "$STATUS" "$@" -root "$TARGET" || true
 }
 
 run_sweep() {

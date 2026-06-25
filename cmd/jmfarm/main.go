@@ -57,6 +57,7 @@ func main() {
 		version  = flag.Int("version", 1, "producer version")
 		dryRun   = flag.Bool("dry-run", false, "probe + report, do not write")
 		verbose  = flag.Bool("verbose", false, "per-file logging")
+		status   = flag.String("status", "", "after the sweep, write a rollup status JSON here (manager Farm tab)")
 	)
 	flag.Parse()
 
@@ -220,6 +221,21 @@ func main() {
 		fmt.Printf("first errors (%d shown):\n", len(firstErrs))
 		for _, e := range firstErrs {
 			fmt.Printf("  - %s\n", e)
+		}
+	}
+
+	if *status != "" && !*dryRun && store != nil {
+		target := *root
+		if target == "" {
+			target = "files:" + *files
+		}
+		sweep := farm.SweepInfo{
+			Mode: mode, Producer: *producer, Target: target,
+			Processed: int(ok), Failed: int(failed),
+			StartedAt: start.Unix(), DurationMS: time.Since(start).Milliseconds(),
+		}
+		if err := farm.WriteFarmStatus(store, *status, sweep); err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm: status write: %v\n", err)
 		}
 	}
 	if failed > 0 && ok == 0 {

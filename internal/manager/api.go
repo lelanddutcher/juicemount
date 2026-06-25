@@ -21,13 +21,14 @@ var staticFS embed.FS
 
 // API holds the HTTP handlers and their shared state.
 type API struct {
-	jobs        *JobManager
-	sourceRoots []string // allowable host paths under /browse
-	destMount   string   // user-facing prefix used in destination paths (e.g. /jfs)
-	adminKey    string   // empty = no auth
-	prefix      string   // route-mount prefix (e.g. "/manager"); empty for standalone
-	fuseMount   string   // for ModeEmbedded dest-traversal check; empty in standalone
-	volName     string   // for ModeStandalone dest-validation
+	jobs           *JobManager
+	sourceRoots    []string // allowable host paths under /browse
+	destMount      string   // user-facing prefix used in destination paths (e.g. /jfs)
+	adminKey       string   // empty = no auth
+	prefix         string   // route-mount prefix (e.g. "/manager"); empty for standalone
+	fuseMount      string   // for ModeEmbedded dest-traversal check; empty in standalone
+	volName        string   // for ModeStandalone dest-validation
+	farmStatusPath string   // juicefarm rollup JSON path (farm-status.json); empty = Farm tab shows "not configured"
 
 	// overview is the SLICE-2 fan-out aggregator. Nil only in unit
 	// tests that hand-construct an API without going through Register
@@ -77,14 +78,15 @@ type API struct {
 //     (juicefs sync's URL-alias convention). Used when the manager
 //     runs as its own container without a local FUSE mount.
 type Config struct {
-	JuiceFSBin  string   // path to juicefs binary (or "juicefs" for PATH lookup)
-	FUSEMount   string   // embedded mode: in-process FUSE mount path
-	MetaURL     string   // standalone mode: redis://host:port/db
-	VolName     string   // standalone mode: JuiceFS volume name (e.g. "zpool")
-	SourceRoots []string // host paths the user is allowed to browse from
-	DestMount   string   // user-facing destination prefix (e.g. /jfs)
-	AdminKey    string   // empty = no auth (LAN-only)
-	StateFile   string   // optional JSON path for job-history persistence (empty = ephemeral)
+	JuiceFSBin     string   // path to juicefs binary (or "juicefs" for PATH lookup)
+	FUSEMount      string   // embedded mode: in-process FUSE mount path
+	MetaURL        string   // standalone mode: redis://host:port/db
+	VolName        string   // standalone mode: JuiceFS volume name (e.g. "zpool")
+	SourceRoots    []string // host paths the user is allowed to browse from
+	DestMount      string   // user-facing destination prefix (e.g. /jfs)
+	AdminKey       string   // empty = no auth (LAN-only)
+	StateFile      string   // optional JSON path for job-history persistence (empty = ephemeral)
+	FarmStatusPath string   // optional path to the juicefarm rollup (farm-status.json) for the Farm tab
 	// MinIOURL is the http endpoint the SLICE-2 Overview tab pings via
 	// /minio/health/live. Optional — when empty the MinIO card on the
 	// dashboard renders an "endpoint not configured" hint rather than a
@@ -121,13 +123,14 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mgr := NewJobManager(cfg.JuiceFSBin, spec)
 	mgr.SetStateFile(cfg.StateFile)
 	a := &API{
-		jobs:        mgr,
-		sourceRoots: cfg.SourceRoots,
-		destMount:   cfg.DestMount,
-		adminKey:    cfg.AdminKey,
-		prefix:      prefix,
-		fuseMount:   cfg.FUSEMount,
-		volName:     cfg.VolName,
+		jobs:           mgr,
+		sourceRoots:    cfg.SourceRoots,
+		farmStatusPath: cfg.FarmStatusPath,
+		destMount:      cfg.DestMount,
+		adminKey:       cfg.AdminKey,
+		prefix:         prefix,
+		fuseMount:      cfg.FUSEMount,
+		volName:        cfg.VolName,
 	}
 	// SLICE 2: wire the overview aggregator. Picks OverviewMetaURL when
 	// set (embedded mode passes it explicitly so the dashboard can probe
@@ -158,6 +161,7 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// so a hung Redis doesn't break the entire dashboard. Auth-wrapped
 	// like every other endpoint (no auth bypass).
 	mux.HandleFunc(prefix+"/api/overview", a.auth(a.handleOverview))
+	mux.HandleFunc(prefix+"/api/farm", a.auth(a.handleFarm))
 	// SLICE 3: Trash tab — list/restore/delete/empty/config.
 	// /api/trash/empty enforces a typed-confirmation header
 	// (X-Confirm-Empty: yes) server-side so a typo'd curl can't wipe

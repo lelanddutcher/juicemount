@@ -177,6 +177,7 @@ services:
       JM_ADMIN_KEY: ""               # EDIT — set to a 32+ char random string for prod
       JM_STATE_FILE: "/var/lib/manager/state.json"   # persists job history + future control-plane state across container restart
       JM_MINIO_URL: "http://minio:9000"              # SLICE 2: Overview MinIO liveness probe target (internal docker DNS)
+      JM_FARM_STATUS: "/farmstate/farm-status.json"  # Farm tab: the juicefarm rollup (juicefarm-state mounted read-only below)
     ports:
       - "30190:8080"                 # web UI
     volumes:
@@ -192,6 +193,9 @@ services:
       # you want to keep that history, additionally bind-mount the
       # OLD migrator-state dataset at /var/lib/migrator (read-only is fine).
       - /mnt/zSSD/juicemount/manager-state:/var/lib/manager
+      # Read-only view of the juicefarm's state so the Farm tab can read
+      # farm-status.json. Additive; safe if juicefarm hasn't run yet.
+      - /mnt/zSSD/juicemount/juicefarm-state:/farmstate:ro
 
   # ── juicefarm: server-side derivative + AI generation farm ───────
   # Generates the PORTABLE derivatives (tech/poster/filmstrip/waveform) and

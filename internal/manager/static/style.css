@@ -1275,3 +1275,9 @@ footer {
 
 footer a { color: var(--accent); text-decoration: none; }
 footer a:hover { text-decoration: underline; }
+
+/* Farm tab (Phase 1) — coverage table */
+.farm-table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+.farm-table th, .farm-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.farm-table th { color: var(--text-muted); font-weight: 600; }
+.farm-table td.farm-failed { color: var(--danger); font-weight: 600; }

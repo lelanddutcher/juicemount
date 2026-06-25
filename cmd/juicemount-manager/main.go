@@ -51,6 +51,7 @@ func main() {
 	adminKey := flag.String("admin-key", os.Getenv("JM_ADMIN_KEY"), "Admin key for X-JuiceMount-Admin-Key auth (empty = disabled)")
 	stateFile := flag.String("state-file", os.Getenv("JM_STATE_FILE"), "Optional JSON path for job-history persistence (empty = jobs lost on restart). Bind-mount the dir to make history survive container churn.")
 	minioURL := flag.String("minio-url", envOr("JM_MINIO_URL", ""), "SLICE 2: MinIO base URL the Overview dashboard pings via /minio/health/live. Empty disables the MinIO probe (Overview card shows an actionable hint). Use the same URL Mac clients connect to so the dashboard reflects what they see.")
+	farmStatus := flag.String("farm-status", envOr("JM_FARM_STATUS", ""), "Path to the juicefarm rollup (farm-status.json) for the Farm tab. Empty = Farm tab shows an empty state. Mount the juicefarm-state volume read-only to enable.")
 	flag.Parse()
 
 	roots := splitNonEmpty(*sourceRoots, ",")
@@ -69,15 +70,16 @@ func main() {
 
 	mux := http.NewServeMux()
 	cfg := manager.Config{
-		JuiceFSBin:  *juicefsBin,
-		FUSEMount:   *fuseMount, // embedded mode if non-empty
-		MetaURL:     *metaURL,   // standalone mode if non-empty
-		VolName:     *volName,
-		SourceRoots: roots,
-		DestMount:   *destMount,
-		AdminKey:    *adminKey,
-		StateFile:   *stateFile,
-		MinIOURL:    *minioURL,
+		JuiceFSBin:     *juicefsBin,
+		FUSEMount:      *fuseMount, // embedded mode if non-empty
+		MetaURL:        *metaURL,   // standalone mode if non-empty
+		VolName:        *volName,
+		SourceRoots:    roots,
+		DestMount:      *destMount,
+		AdminKey:       *adminKey,
+		StateFile:      *stateFile,
+		MinIOURL:       *minioURL,
+		FarmStatusPath: *farmStatus,
 	}
 	mgr := manager.Register(mux, "", cfg)
 
