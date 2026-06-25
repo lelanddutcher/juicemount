@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/loupe-ai.schema.json",
+  "title": "LoupeAI (ai.loupe.json)",
+  "description": "The BYTES of the `ai` derivative blob the farm writes to /.juicemount/derivatives/<inode>/ai.loupe.json and registers via POST /derivatives/register (OL-1 / JM-17). This is a LoupeJSON document, not a control-plane response. OpenLoupe's D6 consume (applyLoupeJSON) ingests it as a DESTRUCTIVE REPLACE, so two invariants are load-bearing: (Rule A) every delivery is the COMPLETE current bundle — present what's computed, explicit null for the rest, never a per-kind partial; (Rule B) the `media` block carries the FULL tech every time — a sparse media block NULL-binds good tech columns. This schema enforces Rule B by requiring all 10 media fields with additionalProperties:false. Keys are explicit snake_case; embedding vectors are base64 of a packed little-endian Float32 array, L2-normalized; times are integer milliseconds. Authored from internal/farm/transcript.go (LoupeJSON Codable structs) and AI_DELIVERY_SPEC.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["loupe_version", "schema_version", "indexed_at", "media"],
+  "properties": {
+    "loupe_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "LoupeJSON envelope version. Farm stamps 1."
+    },
+    "schema_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Producer schema/algo version of the bundle, e.g. \"1.0\"."
+    },
+    "indexed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 / ISO8601 timestamp the bundle was produced."
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "FULL tech block (Rule B). applyLoupeJSON refreshes the asset's width/height/duration_ms/fps/codec/color_space/log_format/hash_xxh3 columns from here and NULL-binds any MISSING field — so all 10 fields are REQUIRED. Genuinely-absent color_space/log_format are explicit null (still present). A sparse media block is a data-loss hazard and MUST fail this schema.",
+      "required": ["filename", "type", "codec", "duration_ms", "width", "height", "fps", "color_space", "log_format", "hash_xxh3"],
+      "properties": {
+        "filename": { "type": "string", "minLength": 1, "description": "Basename of the source asset." },
+        "type": { "enum": ["video", "audio", "image"], "description": "Top-level media class. Farm emits \"video\" (or \"audio\" for audio-only)." },
+        "codec": { "type": "string", "description": "Primary stream codec, e.g. \"hevc\", \"h264\", \"prores\"." },
+        "duration_ms": { "type": "integer", "minimum": 0, "description": "Source duration in integer milliseconds." },
+        "width": { "type": "integer", "minimum": 0 },
+        "height": { "type": "integer", "minimum": 0 },
+        "fps": { "type": "number", "minimum": 0, "description": "Frames per second (may be fractional, e.g. 59.94)." },
+        "color_space": { "type": ["string", "null"], "description": "Matrix coefficients / color space, e.g. \"bt709\", \"bt2020nc\". Explicit null when unknown (still present — Rule B)." },
+        "log_format": { "type": ["string", "null"], "description": "Camera log curve, e.g. \"slog3\", \"logc4\". Explicit null for non-log (still present — Rule B)." },
+        "hash_xxh3": {
+          "type": "string",
+          "minLength": 1,
+          "description": "xxh3 hex of the SOURCE bytes the AI was computed from. MUST equal the manifest's source_hash for this inode; OpenLoupe's D6 gate compares them and fails closed on mismatch."
+        }
+      }
+    },
+    "ai": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "description": "The AI sub-bundle. Optional at the envelope level (may be omitted/null before any AI lands), but when present every sub-kind is stated explicitly: present what's computed, null what isn't (Rule A — always the COMPLETE current set, never a per-kind regression).",
+      "properties": {
+        "image_embedding_global": {
+          "type": ["string", "null"],
+          "description": "One CLIP ViT-L/14 vector for the whole clip: base64 of a packed little-endian Float32[768], L2-normalized. null until embeddings land (OL-2)."
+        },
+        "scene_embeddings": {
+          "type": ["array", "null"],
+          "description": "Per-scene CLIP vectors. null until embeddings land.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["t_ms", "embedding"],
+            "properties": {
+              "t_ms": { "type": "integer", "minimum": 0, "description": "Scene timestamp in ms from clip start." },
+              "embedding": { "type": "string", "minLength": 1, "description": "base64 Float32[768], L2-normalized (same space as image_embedding_global)." },
+              "auto_tags": {
+                "type": ["array", "null"],
+                "items": { "type": "string" },
+                "description": "Discrete labels. Farm leaves null (CLIP/ImageNet labels won't match OpenLoupe's VNClassify vocabulary — contribute embeddings, not tags)."
+              }
+            }
+          }
+        },
+        "faces": {
+          "type": ["array", "null"],
+          "description": "Detected/clustered faces. null until faces land (OL-2: dlib/resnet-v1-128, dim 128).",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["cluster_id", "t_ms", "bbox", "confidence"],
+            "properties": {
+              "cluster_id": { "type": "string", "minLength": 1, "description": "Stable cluster identity for the face." },
+              "t_ms": { "type": "integer", "minimum": 0, "description": "Timestamp in ms of the detection frame." },
+              "bbox": {
+                "type": "array",
+                "items": { "type": "number", "minimum": 0, "maximum": 1 },
+                "minItems": 4,
+                "maxItems": 4,
+                "description": "Normalized [x, y, w, h] in 0..1."
+              },
+              "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "Detection confidence 0..1." }
+            }
+          }
+        },
+        "transcript": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "ASR transcript. null when the clip has no audio / no speech (NEVER an empty segments:[] — omit/null instead). The farm's current target.",
+          "required": ["language", "model", "segments"],
+          "properties": {
+            "language": { "type": "string", "minLength": 1, "description": "ISO-639-1 (\"en\") or whisper's detected lang code." },
+            "model": { "type": "string", "minLength": 1, "description": "provider/model id, e.g. \"whisper.cpp/large-v3\". The invalidation key OpenLoupe stamps + shows for provenance." },
+            "segments": {
+              "type": "array",
+              "minItems": 1,
+              "description": "Ordered by start_ms, ascending, non-overlapping; phrase/sentence granularity (~5-15 words) for the karaoke Transcript Theater. Never empty (a transcript with no segments must be delivered as null, not []).",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["start_ms", "end_ms", "text"],
+                "properties": {
+                  "start_ms": { "type": "integer", "minimum": 0, "description": "Segment start in ms from clip start." },
+                  "end_ms": { "type": "integer", "minimum": 0, "description": "Segment end in ms; start_ms <= end_ms." },
+                  "text": { "type": "string", "description": "Trimmed segment text; punctuation/casing preserved." }
+                }
+              }
+            }
+          }
+        },
+        "ocr": {
+          "type": ["array", "null"],
+          "description": "On-screen text lines (Tesseract/PaddleOCR → ocr_text FTS). DELIBERATELY NOT the destructive-replace rule of the other AI kinds: omit/null ⇒ OpenLoupe leaves existing OCR alone; [] ⇒ clears OCR; non-empty ⇒ replaces. So if the farm does NOT do OCR for a clip, OMIT this key (do not send []).",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["t_ms", "text"],
+            "properties": {
+              "t_ms": { "type": "integer", "minimum": 0, "description": "Timestamp in ms of the recognized line." },
+              "text": { "type": "string", "minLength": 1, "description": "One recognized on-screen line." },
+              "confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "OCR confidence 0..1; optional, defaults to 1.0." }
+            }
+          }
+        },
+        "ai_provider_summary": {
+          "type": ["object", "null"],
+          "additionalProperties": { "type": "string" },
+          "description": "Map of sub-kind → provider/model id (e.g. {\"transcript\":\"whisper.cpp/large-v3\",\"embeddings\":\"OpenCLIP/ViT-L-14/LAION-2B\"}) for provenance."
+        }
+      }
+    }
+  }
+}

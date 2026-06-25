@@ -2703,10 +2703,16 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	if req.Dim > 0 {
 		dimP = &req.Dim
 	}
+	// Persist the authoritative (re-stat'd) source size+mtime on the row so any
+	// other client's read-gate can stat-verify off the manifest directly.
+	srcSize := fi.Size()
+	srcMtime := fi.ModTime().Unix()
 	row := derivatives.DerivRow{
 		Kind: "ai", Status: "ready", Producer: req.Producer, Version: 1,
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mt, Model: modelP, Dim: dimP,
-		UpdatedAt: time.Now().Unix(),
+		UpdatedAt:   time.Now().Unix(),
+		SourceSize:  &srcSize,
+		SourceMtime: &srcMtime,
 	}
 	if err := ds.PutSource(req.Inode, &hash); err != nil {
 		http.Error(w, "put source: "+err.Error(), 500)

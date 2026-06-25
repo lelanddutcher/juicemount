@@ -35,6 +35,13 @@ type DerivRow struct {
 	Model       *string `json:"model"`
 	Dim         *int    `json:"dim"`
 	UpdatedAt   int64   `json:"updated_at"`
+	// SourceSize / SourceMtime are the source file's size (bytes) + mtime (unix)
+	// at generation time. They let a consumer stat-verify a derivative directly
+	// off the manifest (OpenLoupe's read-gate: live /lookup size == source_size)
+	// without a separate `tech` row. omitempty for backward-compat with rows that
+	// predate the columns + the closed-key conformance fixtures.
+	SourceSize  *int64 `json:"source_size,omitempty"`
+	SourceMtime *int64 `json:"source_mtime,omitempty"`
 	// Filmstrip is the sprite-sheet geometry (JM-16), present ONLY for
 	// kind=="filmstrip". Persisted in the row's kind-specific `extra` JSON
 	// column. omitempty so every other kind omits it on the wire.
@@ -79,6 +86,8 @@ CREATE TABLE IF NOT EXISTS derivatives (
     dim           INTEGER,
     updated_at    INTEGER NOT NULL,
     extra         TEXT,
+    source_size   INTEGER,
+    source_mtime  INTEGER,
     PRIMARY KEY (inode, kind)
 );
 CREATE TABLE IF NOT EXISTS metadata (
@@ -123,6 +132,14 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("derivatives: migrate extra: %w", err)
 	}
+	// Migration: source_size / source_mtime (consumer read-gate). Same
+	// duplicate-column-is-fine pattern as `extra`.
+	for _, col := range []string{"source_size INTEGER", "source_mtime INTEGER"} {
+		if _, err := db.Exec(`ALTER TABLE derivatives ADD COLUMN ` + col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("derivatives: migrate %s: %w", col, err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 
@@ -150,7 +167,7 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
-		SELECT kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra
+		SELECT kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime
 		FROM derivatives WHERE inode = ? ORDER BY kind`, int64(inode))
 	if err != nil {
 		return nil, err
@@ -160,8 +177,8 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 	for rows.Next() {
 		var d DerivRow
 		var hash, blob, mt, model, extra sql.NullString
-		var dim sql.NullInt64
-		if err := rows.Scan(&d.Kind, &d.Status, &d.Producer, &d.Version, &hash, &blob, &mt, &model, &dim, &d.UpdatedAt, &extra); err != nil {
+		var dim, srcSize, srcMtime sql.NullInt64
+		if err := rows.Scan(&d.Kind, &d.Status, &d.Producer, &d.Version, &hash, &blob, &mt, &model, &dim, &d.UpdatedAt, &extra, &srcSize, &srcMtime); err != nil {
 			return nil, err
 		}
 		d.Hash = nullStr(hash)
@@ -171,6 +188,14 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 		if dim.Valid {
 			v := int(dim.Int64)
 			d.Dim = &v
+		}
+		if srcSize.Valid {
+			v := srcSize.Int64
+			d.SourceSize = &v
+		}
+		if srcMtime.Valid {
+			v := srcMtime.Int64
+			d.SourceMtime = &v
 		}
 		// kind-specific `extra`: filmstrip geometry today (JM-16).
 		if d.Kind == "filmstrip" && extra.Valid && extra.String != "" {
@@ -223,14 +248,16 @@ func (s *Store) PutDeriv(inode uint64, d DerivRow) error {
 		d.UpdatedAt = time.Now().Unix()
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(inode, kind) DO UPDATE SET
 		    status=excluded.status, producer=excluded.producer, version=excluded.version,
 		    hash=excluded.hash, blob_rel_path=excluded.blob_rel_path, media_type=excluded.media_type,
-		    model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra`,
+		    model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra,
+		    source_size=excluded.source_size, source_mtime=excluded.source_mtime`,
 		int64(inode), d.Kind, d.Status, d.Producer, d.Version, strOrNil(d.Hash),
-		strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), d.UpdatedAt, extraJSON(d))
+		strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), d.UpdatedAt, extraJSON(d),
+		int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime))
 	return err
 }
 
@@ -281,14 +308,16 @@ func (s *Store) IngestTech(inode uint64, hash *string, producer string, version 
 		if ts == 0 {
 			ts = now
 		}
-		if _, err := tx.Exec(`INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+		if _, err := tx.Exec(`INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(inode, kind) DO UPDATE SET
 				status=excluded.status, producer=excluded.producer, version=excluded.version,
 				hash=excluded.hash, blob_rel_path=excluded.blob_rel_path, media_type=excluded.media_type,
-				model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra`,
+				model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra,
+				source_size=excluded.source_size, source_mtime=excluded.source_mtime`,
 			int64(inode), d.Kind, d.Status, d.Producer, d.Version, strOrNil(d.Hash),
-			strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), ts, extraJSON(d)); err != nil {
+			strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), ts, extraJSON(d),
+			int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime)); err != nil {
 			return err
 		}
 	}
@@ -309,6 +338,13 @@ func strOrNil(p *string) any {
 	return *p
 }
 func intOrNil(p *int) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+func int64OrNil(p *int64) any {
 	if p == nil {
 		return nil
 	}

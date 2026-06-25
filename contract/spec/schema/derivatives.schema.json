@@ -46,6 +46,8 @@
           "model": { "type": ["string", "null"], "description": "Embedding model id+version for kind=embedding/faces/ai (so kNN partitions by model). null otherwise." },
           "dim": { "type": ["integer", "null"], "description": "Embedding dimensionality for kind=embedding/faces/ai." },
           "updated_at": { "type": "integer", "description": "Unix seconds the derivative was last produced." },
+          "source_size": { "type": ["integer", "null"], "description": "Source file size (bytes) at generation time — lets a consumer stat-verify the derivative off the manifest (live /lookup size == source_size) without a separate tech row. Omitted on rows that predate this field." },
+          "source_mtime": { "type": ["integer", "null"], "description": "Source file mtime (unix seconds) at generation time; the companion stat-guard to source_size." },
           "filmstrip": {
             "type": "object",
             "additionalProperties": false,

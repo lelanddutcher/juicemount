@@ -11,6 +11,8 @@
     "media_type": "application/json",
     "model": "apple-featureprint-v1",
     "dim": 768,
-    "updated_at": 1750000000
+    "updated_at": 1750000000,
+    "source_size": 880000000,
+    "source_mtime": 1700000000
   }
 }

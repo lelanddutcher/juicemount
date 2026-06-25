@@ -53,6 +53,16 @@ func DerivBlobDir(mount string, inode uint64) string {
 	return filepath.Join(mount, ".juicemount", "derivatives", strconv.FormatUint(inode, 10))
 }
 
+// stampSource records the source file's size + mtime on a derivative row so a
+// consumer can stat-verify the derivative directly off the manifest (the
+// read-gate: live /lookup size == row.source_size) without a separate tech row.
+func stampSource(row *derivatives.DerivRow, fi os.FileInfo) {
+	sz := fi.Size()
+	mt := fi.ModTime().Unix()
+	row.SourceSize = &sz
+	row.SourceMtime = &mt
+}
+
 // Process derives all artifacts for one file and writes them through the store:
 // source_assets (inode+hash), metadata(kind=tech), a tech manifest row, and —
 // when Options.Blobs — a poster thumbnail blob + its manifest row. Idempotent
@@ -161,6 +171,11 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 			})
 			res.WaveWrote = true
 		}
+	}
+
+	// Stamp the source size+mtime on every row (consumer read-gate).
+	for i := range rows {
+		stampSource(&rows[i], fi)
 	}
 
 	if err := store.IngestTech(inode, &hash, opt.Producer, opt.Version, payload, rows); err != nil {

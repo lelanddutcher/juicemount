@@ -270,6 +270,17 @@
       "note": "JM-18 BBC audiowaveform format; data.length == length*2*channels"
     },
     {
+      "file": "ai/transcript-only.loupe.json",
+      "endpoint": "(blob)",
+      "method": "GET",
+      "request": {
+        "note": "bytes of the `ai` derivative blob (ai.loupe.json) at /.juicemount/derivatives/<inode>/, not a control-plane response"
+      },
+      "schema": "loupe-ai.schema.json",
+      "http_status": 200,
+      "note": "JM-17 LoupeJSON ai bundle — transcript-only snapshot (Path A): full media (Rule B), transcript populated, embeddings/faces null"
+    },
+    {
       "file": "derivatives/register-ok.json",
       "endpoint": "/derivatives/register",
       "method": "POST",

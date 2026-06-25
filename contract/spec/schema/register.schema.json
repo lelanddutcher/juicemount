@@ -24,7 +24,9 @@
         "media_type": { "const": "application/json" },
         "model": { "type": ["string", "null"], "description": "Embedding model id+version so kNN partitions by space (e.g. apple-featureprint-v1 vs the portable openclip-vit-b32-v1)." },
         "dim": { "type": ["integer", "null"], "description": "Embedding dimensionality." },
-        "updated_at": { "type": "integer" }
+        "updated_at": { "type": "integer" },
+        "source_size": { "type": ["integer", "null"], "description": "The server's authoritative (re-stat'd) source size in bytes — echoes the vouched value on accept, so any client's read-gate can stat-verify off the manifest." },
+        "source_mtime": { "type": ["integer", "null"], "description": "The server's authoritative (re-stat'd) source mtime (unix seconds)." }
       }
     }
   }

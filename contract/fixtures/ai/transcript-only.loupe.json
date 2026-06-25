@@ -1,0 +1,33 @@
+{
+  "loupe_version": 1,
+  "schema_version": "1.0",
+  "indexed_at": "2026-06-25T16:00:00Z",
+  "media": {
+    "filename": "A_0065C938H260612_115032EJ_LAD04.mov",
+    "type": "video",
+    "codec": "hevc",
+    "duration_ms": 12331,
+    "width": 1080,
+    "height": 1920,
+    "fps": 59.94,
+    "color_space": "bt709",
+    "log_format": null,
+    "hash_xxh3": "2e9cf3ae98300fda"
+  },
+  "ai": {
+    "transcript": {
+      "language": "en",
+      "model": "whisper.cpp/large-v3",
+      "segments": [
+        { "start_ms": 0,     "end_ms": 2480,  "text": "All grown up, summer classics." },
+        { "start_ms": 2480,  "end_ms": 5120,  "text": "Frozen monkey rocket." },
+        { "start_ms": 5120,  "end_ms": 8800,  "text": "Down at the wharf the boats come in." },
+        { "start_ms": 8800,  "end_ms": 12331, "text": "Golden hour over the water." }
+      ]
+    },
+    "scene_embeddings": null,
+    "image_embedding_global": null,
+    "faces": null,
+    "ai_provider_summary": { "transcript": "whisper.cpp/large-v3" }
+  }
+}

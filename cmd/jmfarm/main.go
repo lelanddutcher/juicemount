@@ -47,6 +47,7 @@ func main() {
 		wave     = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
 		waveSPP  = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
 		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.loupe.json (instead of basic derivatives)")
+		proxyGen = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
 		wModel   = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
 		wBin     = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
 		limit    = flag.Int("limit", 0, "max files to process (0 = no limit)")
@@ -98,12 +99,14 @@ func main() {
 	mode := "derivatives"
 	if *transcr {
 		mode = "transcript(AI)"
+	} else if *proxyGen {
+		mode = "proxy"
 	}
 	fmt.Printf("jmfarm: %d files → %s  (mode=%s, producer=%s v%d, dry-run=%v, workers=%d)\n",
 		len(targets), *dbPath, mode, *producer, *version, *dryRun, *conc)
 
 	start := time.Now()
-	var ok, failed, thumbs, strips, waves, speech int64
+	var ok, failed, thumbs, strips, waves, speech, proxies int64
 	var mu sync.Mutex
 	var firstErrs []string
 
@@ -127,6 +130,26 @@ func main() {
 				atomic.AddInt64(&ok, 1)
 				if *verbose {
 					fmt.Printf("  [dry] %-50s %s %dms\n", filepath.Base(p), tech.Container, tech.DurationMS)
+				}
+				return
+			}
+
+			if *proxyGen {
+				pr := farm.GenerateProxy(store, p, opt)
+				if pr.Err != nil {
+					atomic.AddInt64(&failed, 1)
+					recordErr(&mu, &firstErrs, p, pr.Err)
+					if *verbose {
+						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), pr.Inode, pr.Err)
+					}
+					return
+				}
+				atomic.AddInt64(&ok, 1)
+				if pr.Wrote {
+					atomic.AddInt64(&proxies, 1)
+				}
+				if *verbose {
+					fmt.Printf("  [ok] %-50s inode=%d proxy=%v\n", filepath.Base(p), pr.Inode, pr.Wrote)
 				}
 				return
 			}
@@ -185,6 +208,9 @@ func main() {
 	if *transcr {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d with-speech (transcribed) — %d total\n",
 			time.Since(start).Round(time.Millisecond), ok, failed, speech, len(targets))
+	} else if *proxyGen {
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d proxies — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, failed, proxies, len(targets))
 	} else {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails, %d filmstrips, %d waveforms — %d total\n",
 			time.Since(start).Round(time.Millisecond), ok, failed, thumbs, strips, waves, len(targets))

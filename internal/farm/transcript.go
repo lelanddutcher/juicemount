@@ -261,6 +261,7 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 		Kind: "ai", Status: "ready", Producer: opt.Producer, Version: 1,
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mt, Model: &model,
 	}
+	stampSource(&row, fi)
 	if err := store.PutSource(inode, &hash); err != nil {
 		res.Err = fmt.Errorf("put source: %w", err)
 		return res
