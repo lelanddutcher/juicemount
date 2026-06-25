@@ -936,6 +936,29 @@ var FUSEStaleEscalateTicks = 9
 // thresholds. See docs/TUNING/REVERT_LOG.md (R1).
 var fuseWatchdogLinkAware = os.Getenv("JM_FUSE_WATCHDOG_LINKAWARE") != "0"
 
+// fuseColdStartGrace is how long after the watchdog starts (≈ app start / first
+// mount) the escalation to a destructive SIGKILL+remount is SUPPRESSED. During
+// cold start the JuiceFS mount is legitimately busy warming caches and serving
+// the initial ~200k-entry reconcile, so its FUSE-root readdir can be unresponsive
+// to even the generous probe for minutes — NOT wedged, just saturated. Escalating
+// then SIGKILLs a healthy-but-busy juicefs and, because the app's NFS server is
+// holding the FUSE mount open, the follow-up unmount fails and leaves a ZOMBIE
+// mount (kernel entry, no daemon) that breaks all data reads (observed live
+// 2026-06-25, post-redeploy cold start). Within the grace window the watchdog
+// defers and lets the mount recover on its own — it does, once the reconcile
+// settles. A mount that wedges LATER (steady state) still escalates normally.
+// Env override JM_FUSE_COLDSTART_GRACE_SEC (0 disables the grace).
+var fuseColdStartGrace = coldStartGraceFromEnv()
+
+func coldStartGraceFromEnv() time.Duration {
+	if v := os.Getenv("JM_FUSE_COLDSTART_GRACE_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 6 * time.Minute
+}
+
 // staleEscalateTicks returns how many CONTINUOUS stale-but-alive ticks to tolerate
 // before escalating to the destructive SIGKILL+remount, scaled UP on slow/metered
 // links. ROOT CAUSE (2026-06-16, root-caused from juicemount.log): on cellular the
@@ -1041,8 +1064,9 @@ func (fm *FUSEManager) monitorLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	consecutiveFailures := 0  // ticks where the mount is stale AND juicefs is gone
-	staleWhileAliveTicks := 0 // ticks where the mount is stale but juicefs is alive
+	watchdogStart := time.Now() // for the cold-start escalation grace window
+	consecutiveFailures := 0    // ticks where the mount is stale AND juicefs is gone
+	staleWhileAliveTicks := 0   // ticks where the mount is stale but juicefs is alive
 	for {
 		select {
 		case <-fm.stopCh:
@@ -1082,6 +1106,18 @@ func (fm *FUSEManager) monitorLoop() {
 				staleWhileAliveTicks++
 				consecutiveFailures = 0
 				if staleWhileAliveTicks >= fm.staleEscalateTicks() {
+					// COLD-START GRACE: within the warm-up window a busy-but-alive
+					// mount must never be SIGKILL'd — the app's NFS server holds the
+					// FUSE mount, so the follow-up unmount fails and leaves a zombie
+					// (2026-06-25). Defer; the mount recovers on its own once the
+					// initial reconcile/cache-warm settles.
+					if fuseColdStartGrace > 0 && time.Since(watchdogStart) < fuseColdStartGrace {
+						jmlog.Warn("fuse stale at escalation threshold but within cold-start grace — deferring (busy warming, not wedged)",
+							"stale_ticks", staleWhileAliveTicks,
+							"grace_remaining_sec", int((fuseColdStartGrace-time.Since(watchdogStart)).Seconds()))
+						staleWhileAliveTicks = 0
+						continue
+					}
 					// CONFIRM truly-wedged before the destructive SIGKILL+remount.
 					// The 5s isMountedLocked probe flips to "stale" under mere
 					// SLOWNESS (reconcile/backend contention); accumulating that
