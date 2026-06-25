@@ -27,6 +27,7 @@ type Options struct {
 	FFmpegBin     string // override; "" → "ffmpeg" on PATH
 	WhisperBin    string // whisper.cpp CLI; "" → "whisper-cli" on PATH (transcripts)
 	WhisperModel  string // path to a ggml whisper model (required for transcripts)
+	ProxyVCodec   string // proxy H.264 encoder; "" → "libx264" (GPU: h264_nvenc/qsv/vaapi)
 }
 
 // Result is the per-file outcome (for CLI reporting / JM-15 accounting). Err is a

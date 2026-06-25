@@ -48,6 +48,7 @@ func main() {
 		waveSPP  = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
 		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.loupe.json (instead of basic derivatives)")
 		proxyGen = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
+		vcodec   = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
 		wModel   = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
 		wBin     = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
 		limit    = flag.Int("limit", 0, "max files to process (0 = no limit)")
@@ -93,7 +94,7 @@ func main() {
 		Producer: *producer, Version: *version, Mount: *mount,
 		Blobs: *blobs, ThumbMaxDim: *thumbDim, Filmstrip: *filmstr, FilmstripCell: *filmCell,
 		Waveform: *wave, WaveformSPP: *waveSPP,
-		WhisperBin: *wBin, WhisperModel: *wModel,
+		WhisperBin: *wBin, WhisperModel: *wModel, ProxyVCodec: *vcodec,
 	}
 
 	mode := "derivatives"

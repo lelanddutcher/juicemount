@@ -24,11 +24,16 @@ import (
 //
 // CRF + preset are the farm's QUALITY knob (size/quality only, not
 // playability/interchange): the farm encodes OFFLINE so it picks quality-oriented
-// -crf 21 -preset slow per OL-3, NOT OpenLoupe's realtime fallback values. The
-// HTTP Range/206 serving requirement is a SEPARATE lane (the media HTTP layer).
-func Proxy(ffmpegBin, srcPath, outPath string) error {
+// -crf 21 -preset slow per OL-3, NOT OpenLoupe's realtime fallback values. vcodec
+// defaults to libx264 (CPU); pass a hardware encoder (h264_nvenc/qsv/vaapi) on a
+// GPU/APU NAS — the locked container/pix_fmt/audio stay identical so the blob is
+// still interchangeable. The HTTP Range/206 serving is a SEPARATE lane.
+func Proxy(ffmpegBin, vcodec, srcPath, outPath string) error {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
+	}
+	if vcodec == "" {
+		vcodec = "libx264"
 	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return err
@@ -37,7 +42,7 @@ func Proxy(ffmpegBin, srcPath, outPath string) error {
 	// originals included), the lowest-common-denominator both decoders accept.
 	cmd := exec.Command(ffmpegBin, "-y", "-loglevel", "error",
 		"-i", srcPath,
-		"-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "21", "-preset", "slow",
+		"-c:v", vcodec, "-pix_fmt", "yuv420p", "-crf", "21", "-preset", "slow",
 		"-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
 		"-movflags", "+faststart",
 		outPath)
@@ -100,7 +105,7 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mt,
 	}
 	stampSource(&row, fi)
-	if err := Proxy(opt.FFmpegBin, path, out); err != nil {
+	if err := Proxy(opt.FFmpegBin, opt.ProxyVCodec, path, out); err != nil {
 		// Non-fatal: publish a failed row so the consumer regenerates locally.
 		res.Err = err
 		row.Status = "failed"
