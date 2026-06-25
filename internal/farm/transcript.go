@@ -28,25 +28,32 @@ type LoupeJSON struct {
 	AI            *LoupeAI   `json:"ai,omitempty"`
 }
 
+// LoupeMedia is the FULL tech block. Per AI_DELIVERY_SPEC Rule B, OpenLoupe's
+// applyLoupeJSON refreshes the asset's tech columns from this and NULL-binds any
+// missing field — so every field the farm knows is emitted (no omitempty);
+// genuinely-absent color_space/log_format are explicit null.
 type LoupeMedia struct {
 	Filename   string  `json:"filename"`
 	Type       string  `json:"type"`
-	Codec      string  `json:"codec,omitempty"`
-	DurationMs int     `json:"duration_ms,omitempty"`
-	Width      int     `json:"width,omitempty"`
-	Height     int     `json:"height,omitempty"`
-	FPS        float64 `json:"fps,omitempty"`
-	ColorSpace string  `json:"color_space,omitempty"`
-	LogFormat  string  `json:"log_format,omitempty"`
-	HashXXH3   string  `json:"hash_xxh3,omitempty"`
+	Codec      string  `json:"codec"`
+	DurationMs int     `json:"duration_ms"`
+	Width      int     `json:"width"`
+	Height     int     `json:"height"`
+	FPS        float64 `json:"fps"`
+	ColorSpace *string `json:"color_space"`
+	LogFormat  *string `json:"log_format"`
+	HashXXH3   string  `json:"hash_xxh3"`
 }
 
+// LoupeAI — every sub-kind is emitted explicitly (null when absent) so each
+// delivery is a complete, self-consistent Path-A snapshot matching the spec
+// fixture; all fields are optional Swift-side, so null decodes to nil safely.
 type LoupeAI struct {
-	ImageEmbeddingGlobal *string           `json:"image_embedding_global,omitempty"`
-	SceneEmbeddings      []LoupeScene      `json:"scene_embeddings,omitempty"`
-	Faces                []LoupeFace       `json:"faces,omitempty"`
-	Transcript           *LoupeTranscript  `json:"transcript,omitempty"`
-	AIProviderSummary    map[string]string `json:"ai_provider_summary,omitempty"`
+	ImageEmbeddingGlobal *string           `json:"image_embedding_global"`
+	SceneEmbeddings      []LoupeScene      `json:"scene_embeddings"`
+	Faces                []LoupeFace       `json:"faces"`
+	Transcript           *LoupeTranscript  `json:"transcript"`
+	AIProviderSummary    map[string]string `json:"ai_provider_summary"`
 }
 
 type LoupeScene struct {
@@ -135,7 +142,7 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 		return nil, fmt.Errorf("transcribe: parse whisper json: %w", err)
 	}
 
-	tr := &LoupeTranscript{Language: wj.Result.Language, Model: filepath.Base(modelPath)}
+	tr := &LoupeTranscript{Language: wj.Result.Language, Model: whisperModelID(modelPath)}
 	for _, s := range wj.Transcription {
 		text := strings.TrimSpace(s.Text)
 		if text == "" || isNonSpeechMarker(text) {
@@ -147,6 +154,19 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 		return nil, nil // silence / non-speech only
 	}
 	return tr, nil
+}
+
+// whisperModelID turns a ggml model path into the contract's provider/model id
+// (AI_DELIVERY_SPEC §2.1), e.g. "/models/ggml-base.en.bin" → "whisper.cpp/base.en".
+// The id is the invalidation key OpenLoupe stamps + shows for provenance.
+func whisperModelID(modelPath string) string {
+	b := filepath.Base(modelPath)
+	b = strings.TrimSuffix(b, ".bin")
+	b = strings.TrimPrefix(b, "ggml-")
+	if b == "" {
+		b = "unknown"
+	}
+	return "whisper.cpp/" + b
 }
 
 func isNonSpeechMarker(t string) bool {
@@ -211,19 +231,24 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	res.HasSpeech = true
 	res.Segments = len(tr.Segments)
 
+	// Path A (AI_DELIVERY_SPEC Rule A): the consumer's apply is a destructive
+	// replace, so we always re-write the COMPLETE bundle — preserve any prior
+	// sub-kinds (embeddings/faces) and set the transcript into the same bundle.
 	rel := "ai.loupe.json"
 	blobPath := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
-	doc := loadOrNewLoupe(blobPath, path, tech, hash)
-	if doc.AI == nil {
-		doc.AI = &LoupeAI{}
+	ai := loadExistingAI(blobPath)
+	ai.Transcript = tr
+	if ai.AIProviderSummary == nil {
+		ai.AIProviderSummary = map[string]string{}
 	}
-	doc.AI.Transcript = tr
-	if doc.AI.AIProviderSummary == nil {
-		doc.AI.AIProviderSummary = map[string]string{}
+	ai.AIProviderSummary["transcript"] = tr.Model
+	doc := &LoupeJSON{
+		LoupeVersion:  1,
+		SchemaVersion: "1.0",
+		IndexedAt:     time.Now().UTC().Format(time.RFC3339),
+		Media:         buildMedia(path, tech, hash), // full block every time (Rule B)
+		AI:            ai,
 	}
-	doc.AI.AIProviderSummary["transcript"] = opt.Producer + ":whisper.cpp/" + filepath.Base(opt.WhisperModel)
-	doc.IndexedAt = time.Now().UTC().Format(time.RFC3339)
-	doc.Media.HashXXH3 = hash // keep the trust anchor pinned to the canonical xxh3
 
 	if err := writeLoupe(blobPath, doc); err != nil {
 		res.Err = fmt.Errorf("write ai.loupe.json: %w", err)
@@ -247,15 +272,23 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	return res
 }
 
-// loadOrNewLoupe reads an existing ai.loupe.json (to merge into) or builds a fresh
-// doc with the media block derived from tech.
-func loadOrNewLoupe(blobPath, srcPath string, tech *Tech, hash string) *LoupeJSON {
+// loadExistingAI returns the asset's current AI sub-bundle (embeddings/faces from
+// a prior pass) so the new sub-kind merges INTO it — Path A: we always re-write
+// the COMPLETE bundle so the consumer's destructive-replace never drops a kind.
+func loadExistingAI(blobPath string) *LoupeAI {
 	if raw, err := os.ReadFile(blobPath); err == nil {
 		var d LoupeJSON
-		if json.Unmarshal(raw, &d) == nil && d.Media.Filename != "" {
-			return &d
+		if json.Unmarshal(raw, &d) == nil && d.AI != nil {
+			return d.AI
 		}
 	}
+	return &LoupeAI{}
+}
+
+// buildMedia assembles the FULL media block from tech (Rule B). color_space ←
+// ffprobe color_space (the matrix coefficients); log_format/color_space are
+// emitted as explicit null when absent.
+func buildMedia(srcPath string, tech *Tech, hash string) LoupeMedia {
 	m := LoupeMedia{
 		Filename:   filepath.Base(srcPath),
 		Type:       "video",
@@ -267,16 +300,13 @@ func loadOrNewLoupe(blobPath, srcPath string, tech *Tech, hash string) *LoupeJSO
 		m.Width = tech.Video.Width
 		m.Height = tech.Video.Height
 		m.FPS = tech.Video.FPS
-		if tech.Video.ColorPrimaries != nil {
-			m.ColorSpace = *tech.Video.ColorPrimaries
-		}
-		if tech.Video.LogFormat != nil {
-			m.LogFormat = *tech.Video.LogFormat
-		}
-	} else {
+		m.ColorSpace = tech.Video.Matrix
+		m.LogFormat = tech.Video.LogFormat
+	} else if len(tech.Audio) > 0 {
 		m.Type = "audio"
+		m.Codec = tech.Audio[0].Codec
 	}
-	return &LoupeJSON{LoupeVersion: 1, SchemaVersion: "1.0", Media: m}
+	return m
 }
 
 func writeLoupe(blobPath string, doc *LoupeJSON) error {
