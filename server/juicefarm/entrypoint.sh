@@ -34,6 +34,11 @@ PRESET="${JM_FARM_PRESET:-slow}"
 # the cheap passes so a full sweep can't saturate the NAS (manager governor sets it).
 PROXY_WORKERS="${JM_FARM_PROXY_WORKERS:-2}"
 STATUS="${JM_FARM_STATUS:-/state/farm-status.json}"
+# Yield CPU + IO to interactive load so a sweep never starves the live mount.
+# JM_FARM_NICE: niceness 0-19 (higher = nicer). JM_FARM_IONICE: best-effort IO
+# class 3=idle; set empty to disable. Both are guarded by command -v.
+NICE="${JM_FARM_NICE:-10}"
+IONICE="${JM_FARM_IONICE:-3}"
 mkdir -p "$(dirname "$DB")"
 
 # resolve_model: accept a path (use as-is) OR a bare model name to fetch into
@@ -69,8 +74,12 @@ echo "[juicefarm] mounted; target=$TARGET mode=$MODE producer=$PRODUCER"
 # separate passes: fast derivatives first (publish immediately), then the slow
 # proxy transcode, then the AI transcript.
 do_pass() {
-  echo "[juicefarm] sweep: jmfarm $* -root $TARGET"
-  jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" -status "$STATUS" "$@" -root "$TARGET" || true
+  echo "[juicefarm] sweep: jmfarm $* -root $TARGET (nice=$NICE ionice=${IONICE:-off})"
+  wrap=""
+  command -v nice >/dev/null 2>&1 && wrap="nice -n $NICE"
+  if [ -n "$IONICE" ] && command -v ionice >/dev/null 2>&1; then wrap="ionice -c $IONICE $wrap"; fi
+  # shellcheck disable=SC2086
+  $wrap jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" -status "$STATUS" "$@" -root "$TARGET" || true
 }
 
 run_sweep() {
