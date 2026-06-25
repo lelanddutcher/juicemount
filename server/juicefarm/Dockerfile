@@ -56,7 +56,7 @@ RUN cd /w && bash ./models/download-ggml-model.sh ${WHISPER_MODEL} \
 FROM juicedata/mount:ce-v1.3.1
 ARG WHISPER_MODEL=medium.en
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg ca-certificates libgomp1 \
+        ffmpeg ca-certificates libgomp1 util-linux \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
 COPY --from=whisper /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
