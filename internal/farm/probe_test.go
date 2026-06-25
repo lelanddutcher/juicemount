@@ -193,14 +193,21 @@ func TestBitDepthFromPixFmt(t *testing.T) {
 	cases := map[string]int{
 		"yuv420p10le": 10, "yuv422p10le": 10, "yuv444p12le": 12,
 		"yuv420p": 8, "yuvj420p": 8, "rgb24": 8, "": 0,
+		// semi-planar + packed high-bit-depth (review MEDIUM #2):
+		"p010le": 10, "p016le": 16, "gray16le": 16, "gray12le": 12,
+		"rgb48le": 16, "rgba64le": 16, "bgr48be": 16,
 	}
 	for in, want := range cases {
 		if got := bitDepthFromPixFmt(in, ""); got != want {
 			t.Errorf("bitDepthFromPixFmt(%q) = %d, want %d", in, got, want)
 		}
 	}
+	// bits_per_raw_sample is authoritative when present (wins over pix_fmt).
 	if got := bitDepthFromPixFmt("", "12"); got != 12 {
 		t.Errorf("bits_per_raw_sample fallback = %d, want 12", got)
+	}
+	if got := bitDepthFromPixFmt("yuv420p", "10"); got != 10 {
+		t.Errorf("bits_per_raw_sample should win over pix_fmt: got %d, want 10", got)
 	}
 }
 

@@ -178,7 +178,10 @@ func collectTargets(root, files string, limit int) ([]string, error) {
 
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // skip unreadable entries, keep walking
+			// Skip unreadable entries but make it audible — a stale/partial
+			// mount can silently drop a whole subtree otherwise.
+			fmt.Fprintf(os.Stderr, "jmfarm: skip unreadable %q: %v\n", p, err)
+			return nil
 		}
 		if info.IsDir() {
 			if strings.HasPrefix(info.Name(), ".") && p != root {

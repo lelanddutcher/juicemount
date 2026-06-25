@@ -42,19 +42,26 @@ func SampleHash(path string, size int64) (string, error) {
 	}
 	if head > 0 {
 		buf := make([]byte, head)
-		if _, err := io.ReadFull(f, buf); err != nil && err != io.ErrUnexpectedEOF {
-			return "", err
+		// A real I/O error MUST surface: silently hashing a short/zero-padded
+		// buffer would yield a different hash than a clean re-read of the same
+		// bytes, which then fails the consumer's hash==source_hash gate on a
+		// perfectly valid derivative. ErrUnexpectedEOF here means the file
+		// shrank between Stat and read (TOCTOU) — also an error worth surfacing.
+		if _, err := io.ReadFull(f, buf); err != nil {
+			return "", fmt.Errorf("samplehash read head: %w", err)
 		}
 		_, _ = h.Write(buf)
 	}
 	// Tail only when it wouldn't overlap the head (file bigger than 2 windows).
 	if size > int64(2*sampleWindow) {
-		if _, err := f.Seek(-int64(sampleWindow), io.SeekEnd); err == nil {
-			buf := make([]byte, sampleWindow)
-			if _, err := io.ReadFull(f, buf); err == nil {
-				_, _ = h.Write(buf)
-			}
+		if _, err := f.Seek(-int64(sampleWindow), io.SeekEnd); err != nil {
+			return "", fmt.Errorf("samplehash seek tail: %w", err)
 		}
+		buf := make([]byte, sampleWindow)
+		if _, err := io.ReadFull(f, buf); err != nil {
+			return "", fmt.Errorf("samplehash read tail: %w", err)
+		}
+		_, _ = h.Write(buf)
 	}
 	return fmt.Sprintf("%016x", h.Sum64()), nil
 }

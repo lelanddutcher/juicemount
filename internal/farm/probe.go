@@ -198,19 +198,30 @@ func parseFPS(rates ...string) float64 {
 	return 0
 }
 
-// bitDepthFromPixFmt reads the component depth from the pixel format (yuv420p10le
-// → 10, yuv422p12le → 12, plain yuv420p → 8). Falls back to bits_per_raw_sample.
+// bitDepthFromPixFmt reads the per-component depth from the pixel format.
+// bits_per_raw_sample wins when ffprobe provides it (authoritative, and set for
+// most high-bit formats). Otherwise: planar/semi-planar carry the depth as a
+// suffix (yuv420p10le→10, p010le→10, gray16le→16); packed RGB names TOTAL bits
+// across channels (rgb48le→16/ch, rgba64le→16/ch); plain yuv420p→8.
 func bitDepthFromPixFmt(pixFmt, bitsPerRaw string) int {
-	for _, d := range []int{16, 14, 12, 10} {
-		if strings.Contains(pixFmt, "p"+strconv.Itoa(d)) || strings.Contains(pixFmt, strconv.Itoa(d)+"le") || strings.Contains(pixFmt, strconv.Itoa(d)+"be") {
-			return d
-		}
-	}
 	if b := int(parseInt(bitsPerRaw, 0)); b > 0 {
 		return b
 	}
+	for _, d := range []int{16, 14, 12, 10} {
+		ds := strconv.Itoa(d)
+		// yuv420p10le / yuv422p12le (planar) | p010le / p016le (semi-planar) | gray16le
+		if strings.Contains(pixFmt, "p"+ds) || strings.HasPrefix(pixFmt, "p0"+ds) || strings.HasPrefix(pixFmt, "gray"+ds) {
+			return d
+		}
+	}
+	switch {
+	case strings.Contains(pixFmt, "64"): // rgba64/bgra64 = 16 bits/channel
+		return 16
+	case strings.Contains(pixFmt, "48"): // rgb48/bgr48 = 16 bits/channel
+		return 16
+	}
 	if pixFmt != "" {
-		return 8 // a known pixel format with no depth suffix is 8-bit
+		return 8 // a known pixel format with no depth marker is 8-bit
 	}
 	return 0
 }

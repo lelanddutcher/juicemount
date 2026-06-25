@@ -213,6 +213,55 @@ func (s *Store) PutMetadata(inode uint64, kind, producer string, version int, ha
 	return err
 }
 
+// IngestTech atomically writes an asset's source row, its `tech` metadata, and a
+// set of derivative manifest rows in ONE transaction. This closes the
+// half-written-asset window: a consumer never observes a source row (exists=true)
+// without its tech/derivatives — they appear together or not at all (rollback on
+// any error). The producer (internal/farm) and the JM-15 sync feed use this so
+// /derivatives and /metadata stay mutually consistent under partial failures.
+//
+// hash is written as both the source_hash and the tech metadata hash; each row in
+// rows carries its own hash (the producer sets them equal to hash so the
+// consumer's hash==source_hash gate is exact). updated_at defaults to now per row.
+func (s *Store) IngestTech(inode uint64, hash *string, producer string, version int, techPayload json.RawMessage, rows []DerivRow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // no-op once Commit succeeds
+
+	if _, err := tx.Exec(`INSERT INTO source_assets (inode, hash) VALUES (?, ?)
+		ON CONFLICT(inode) DO UPDATE SET hash = excluded.hash`, int64(inode), strOrNil(hash)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO metadata (inode, kind, producer, version, hash, payload) VALUES (?,?,?,?,?,?)
+		ON CONFLICT(inode, kind) DO UPDATE SET
+			producer=excluded.producer, version=excluded.version, hash=excluded.hash, payload=excluded.payload`,
+		int64(inode), "tech", producer, version, strOrNil(hash), string(techPayload)); err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	for _, d := range rows {
+		ts := d.UpdatedAt
+		if ts == 0 {
+			ts = now
+		}
+		if _, err := tx.Exec(`INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(inode, kind) DO UPDATE SET
+				status=excluded.status, producer=excluded.producer, version=excluded.version,
+				hash=excluded.hash, blob_rel_path=excluded.blob_rel_path, media_type=excluded.media_type,
+				model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at`,
+			int64(inode), d.Kind, d.Status, d.Producer, d.Version, strOrNil(d.Hash),
+			strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), ts); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func nullStr(n sql.NullString) *string {
 	if n.Valid {
 		v := n.String

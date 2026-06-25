@@ -57,6 +57,8 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		res.Err = fmt.Errorf("stat: no syscall.Stat_t for %q", path)
 		return res
 	}
+	// st.Ino is uint64 on darwin/linux; this is the JuiceFS inode the NFS mount
+	// exposes and /lookup returns, so the consumer queries by the same value.
 	inode := uint64(st.Ino)
 	size := fi.Size()
 	res.Inode = inode
@@ -82,48 +84,40 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		return res
 	}
 
-	// Tier-B writes. source first (drives /derivatives exists + source_hash),
-	// then the structured tech, then the manifest row pointing at it.
-	if err := store.PutSource(inode, &hash); err != nil {
-		res.Err = fmt.Errorf("put source: %w", err)
-		return res
+	// Assemble the manifest rows. The tech row is always present; the thumbnail
+	// blob is generated FIRST (slow, external) so its row reflects reality, then
+	// everything is committed in a single transaction (IngestTech) — the asset
+	// never appears half-written to the serving side.
+	rows := []derivatives.DerivRow{
+		{Kind: "tech", Status: "ready", Producer: opt.Producer, Version: opt.Version, Hash: &hash},
 	}
-	if err := store.PutMetadata(inode, "tech", opt.Producer, opt.Version, &hash, payload); err != nil {
-		res.Err = fmt.Errorf("put metadata: %w", err)
-		return res
-	}
-	if err := store.PutDeriv(inode, derivatives.DerivRow{
-		Kind: "tech", Status: "ready", Producer: opt.Producer, Version: opt.Version, Hash: &hash,
-	}); err != nil {
-		res.Err = fmt.Errorf("put tech deriv: %w", err)
-		return res
-	}
-
-	// Tier-A poster blob (optional, video only).
+	var thumbErr error
 	if opt.Blobs && tech.Video != nil {
 		rel := "poster.jpg"
+		mt := "image/jpeg"
 		out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
 		if err := Thumbnail(opt.FFmpegBin, path, out, opt.ThumbMaxDim); err != nil {
-			// Non-fatal: the tech row is already written and useful on its own.
-			// Record a failed thumbnail row so the manifest is honest.
-			mt := "image/jpeg"
-			_ = store.PutDeriv(inode, derivatives.DerivRow{
+			thumbErr = err // record a failed row, but still publish the tech
+			rows = append(rows, derivatives.DerivRow{
 				Kind: "thumbnail", Status: "failed", Producer: opt.Producer, Version: opt.Version,
 				Hash: &hash, BlobRelPath: &rel, MediaType: &mt,
 			})
-			res.Err = fmt.Errorf("thumbnail: %w", err)
-			return res
+		} else {
+			rows = append(rows, derivatives.DerivRow{
+				Kind: "thumbnail", Status: "ready", Producer: opt.Producer, Version: opt.Version,
+				Hash: &hash, BlobRelPath: &rel, MediaType: &mt,
+			})
+			res.ThumbWrote = true
 		}
-		mt := "image/jpeg"
-		if err := store.PutDeriv(inode, derivatives.DerivRow{
-			Kind: "thumbnail", Status: "ready", Producer: opt.Producer, Version: opt.Version,
-			Hash: &hash, BlobRelPath: &rel, MediaType: &mt,
-		}); err != nil {
-			res.Err = fmt.Errorf("put thumbnail deriv: %w", err)
-			return res
-		}
-		res.ThumbWrote = true
 	}
 
+	if err := store.IngestTech(inode, &hash, opt.Producer, opt.Version, payload, rows); err != nil {
+		res.Err = fmt.Errorf("ingest: %w", err)
+		res.ThumbWrote = false
+		return res
+	}
+	if thumbErr != nil {
+		res.Err = fmt.Errorf("thumbnail: %w", thumbErr)
+	}
 	return res
 }
