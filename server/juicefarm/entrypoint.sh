@@ -32,20 +32,25 @@ juicefs mount --cache-dir /jfs-cache --cache-size 20000 --backup-meta 0 "$JM_MET
 i=0; until mountpoint -q "$MNT"; do i=$((i+1)); [ "$i" -gt 60 ] && { echo "[juicefarm] mount timeout" >&2; exit 1; }; sleep 1; done
 echo "[juicefarm] mounted; target=$TARGET mode=$MODE producer=$PRODUCER"
 
+# do_pass runs jmfarm once with an explicit mode's flags. proxy + transcript are
+# their OWN modes (each ignores the basic-derivative flags), so "all" runs three
+# separate passes: fast derivatives first (publish immediately), then the slow
+# proxy transcode, then the AI transcript.
+do_pass() {
+  echo "[juicefarm] sweep: jmfarm $* -root $TARGET"
+  jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" "$@" -root "$TARGET" || true
+}
+
 run_sweep() {
   case "$MODE" in
-    transcript) FLAGS="-transcript -whisper-model $MODEL" ;;
-    derivatives) FLAGS="-blobs -filmstrip -waveform" ;;
-    all|*) FLAGS="-blobs -filmstrip -waveform" ;;  # basic derivatives pass...
+    transcript)  do_pass -transcript -whisper-model "$MODEL" ;;
+    proxy)       do_pass -proxy ;;
+    derivatives) do_pass -blobs -filmstrip -waveform ;;
+    all|*)
+      do_pass -blobs -filmstrip -waveform
+      do_pass -proxy
+      do_pass -transcript -whisper-model "$MODEL" ;;
   esac
-  echo "[juicefarm] sweep: jmfarm $FLAGS -root $TARGET"
-  # shellcheck disable=SC2086
-  jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" $FLAGS -root "$TARGET" || true
-  if [ "$MODE" = "all" ]; then
-    echo "[juicefarm] sweep: jmfarm -transcript (AI pass)"
-    jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" \
-      -transcript -whisper-model "$MODEL" -root "$TARGET" || true
-  fi
 }
 
 if [ "${JM_FARM_ONCE:-0}" = "1" ]; then
