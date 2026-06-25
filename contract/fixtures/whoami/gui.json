@@ -9,5 +9,5 @@
   "control_plane": "http://127.0.0.1:11050",
   "metadata_db_path": "/Users/leland/Library/Application Support/JuiceMount/metadata.db",
   "deployment": "gui",
-  "capabilities": ["health", "whoami", "residency", "lookup", "cache-status", "offline", "spool", "activity", "pin", "unpin", "self-test", "verify-pins", "metrics", "derivatives", "metadata", "contribute"]
+  "capabilities": ["health", "whoami", "residency", "lookup", "cache-status", "offline", "spool", "activity", "pin", "unpin", "self-test", "verify-pins", "metrics", "derivatives", "metadata", "contribute", "changes"]
 }

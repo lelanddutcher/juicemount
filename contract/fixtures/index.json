@@ -9,7 +9,7 @@
       "request": {},
       "schema": "whoami.schema.json",
       "http_status": 200,
-      "note": "GUI (cbridge) \u2014 full capabilities"
+      "note": "GUI (cbridge) — full capabilities"
     },
     {
       "file": "whoami/cli.json",
@@ -18,7 +18,7 @@
       "request": {},
       "schema": "whoami.schema.json",
       "http_status": 200,
-      "note": "jm5 CLI \u2014 partial capabilities"
+      "note": "jm5 CLI — partial capabilities"
     },
     {
       "file": "residency/resident.json",
@@ -29,7 +29,7 @@
       },
       "schema": "residency.schema.json",
       "http_status": 200,
-      "note": "all bytes on SSD \u2014 only state that lights the green badge"
+      "note": "all bytes on SSD — only state that lights the green badge"
     },
     {
       "file": "residency/streaming.json",
@@ -51,7 +51,7 @@
       },
       "schema": "residency.schema.json",
       "http_status": 200,
-      "note": "partial \u2014 bytes_cached < total"
+      "note": "partial — bytes_cached < total"
     },
     {
       "file": "residency/uploading.json",
@@ -104,7 +104,7 @@
       },
       "schema": "derivatives.schema.json",
       "http_status": 200,
-      "note": "JM-14 manifest \u2014 tech/thumb/strip/wave ready, proxy pending, embedding (model-stamped)"
+      "note": "JM-14 manifest — tech/thumb/strip/wave ready, proxy pending, embedding (model-stamped)"
     },
     {
       "file": "derivatives/absent.json",
@@ -115,7 +115,7 @@
       },
       "schema": "derivatives.schema.json",
       "http_status": 200,
-      "note": "unknown inode \u2192 exists:false, empty derivatives"
+      "note": "unknown inode → exists:false, empty derivatives"
     },
     {
       "file": "metadata/tech.json",
@@ -127,7 +127,7 @@
       },
       "schema": "metadata.schema.json",
       "http_status": 200,
-      "note": "JM-14 structured tech/EXIF \u2014 OpenLoupe's first consume slice"
+      "note": "JM-14 structured tech/EXIF — OpenLoupe's first consume slice"
     },
     {
       "file": "metadata/absent.json",
@@ -164,7 +164,7 @@
       "request": {},
       "schema": "cache-status.schema.json",
       "http_status": 200,
-      "note": "snake_case TARGET form \u2014 requires JM-3 struct tags"
+      "note": "snake_case TARGET form — requires JM-3 struct tags"
     },
     {
       "file": "cache-status/idle.json",
@@ -173,7 +173,7 @@
       "request": {},
       "schema": "cache-status.schema.json",
       "http_status": 200,
-      "note": "no pin roots \u2014 roots:null, live zeroed"
+      "note": "no pin roots — roots:null, live zeroed"
     },
     {
       "file": "offline/online.json",
@@ -226,7 +226,7 @@
       "request": {},
       "schema": "activity.schema.json",
       "http_status": 200,
-      "note": "what JuiceMount is doing now \u2014 cleanest source for the inspector 'activity' line"
+      "note": "what JuiceMount is doing now — cleanest source for the inspector 'activity' line"
     },
     {
       "file": "activity/idle.json",
@@ -296,7 +296,18 @@
       },
       "schema": "register.schema.json",
       "http_status": 200,
-      "note": "OL-1 on-device AI contribute-back; matching size/mtime \u2192 200 + row. Stale size/mtime \u2192 409 (no fixture body)."
+      "note": "OL-1 on-device AI contribute-back; matching size/mtime → 200 + row. Stale size/mtime → 409 (no fixture body)."
+    },
+    {
+      "file": "derivatives/changes.json",
+      "endpoint": "/derivatives/changes",
+      "method": "GET",
+      "request": {
+        "since": 1750000000
+      },
+      "schema": "derivatives-changes.schema.json",
+      "http_status": 200,
+      "note": "since= delta feed — array of changed derivative rows (capability `changes`)"
     }
   ]
 }

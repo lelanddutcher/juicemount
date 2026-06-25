@@ -1,0 +1,5 @@
+[
+  { "inode": 695453, "kind": "ai", "status": "ready", "hash": "2e9cf3ae98300fda", "updated_at": 1750000100 },
+  { "inode": 695453, "kind": "proxy", "status": "ready", "hash": "2e9cf3ae98300fda", "updated_at": 1750000200 },
+  { "inode": 1180417, "kind": "ai", "status": "ready", "hash": "9f2b1c0a4e7d8b30", "updated_at": 1750000300 }
+]

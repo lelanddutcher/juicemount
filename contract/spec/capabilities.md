@@ -59,7 +59,7 @@ detect mount (signature) ──► GET /health (confirm live JuiceMount)
 The canonical vocabulary — the **only** tokens that may appear in `capabilities`:
 
 `health`, `whoami`, `residency`, `lookup`, `cache-status`, `offline`, `spool`, `activity`, `pin`, `unpin`,
-`self-test`, `verify-pins`, `metrics`, `derivatives`, `metadata`, `contribute`.
+`self-test`, `verify-pins`, `metrics`, `derivatives`, `metadata`, `contribute`, `changes`.
 
 (`derivatives` + `metadata` are the JM-14 shared-derivative-platform reads — GUI-only, like residency/lookup.)
 

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/derivatives-changes.schema.json",
+  "title": "Derivatives changes feed",
+  "description": "GET /derivatives/changes?since=<unix_seconds> — the poll-based delta feed (capability `changes`). A JSON ARRAY of every derivative row with updated_at > since, ascending by (updated_at, inode, kind). OpenLoupe polls this on its bounded refresh cadence (NOT SSE), keys its badge cache by (inode,kind) so re-delivery is idempotent, and swaps a farm derivative onto an on-screen asset when it appears. A strict `>` excludes same-second rows (poll since-1 for at-least-once). Missing/garbage `since` ⇒ full history. SSE is the browser web UI's path, not this.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["inode", "kind", "status", "hash", "updated_at"],
+    "properties": {
+      "inode": { "type": "integer", "description": "The asset inode (the key everything else is fetched by)." },
+      "kind": { "type": "string", "description": "Derivative kind (tech/thumbnail/filmstrip/waveform/proxy/ai/...)." },
+      "status": { "type": "string", "description": "ready | failed | pending." },
+      "hash": { "type": ["string", "null"], "description": "The row's source_hash (xxh3); null if unset." },
+      "updated_at": { "type": "integer", "description": "Unix seconds — the cursor the consumer advances `since` to." }
+    }
+  }
+}

@@ -45,6 +45,7 @@ var capabilityVocab = map[string]bool{
 	"cache-status": true, "offline": true, "spool": true, "activity": true,
 	"pin": true, "unpin": true, "self-test": true, "verify-pins": true,
 	"metrics": true, "derivatives": true, "metadata": true, "contribute": true,
+	"changes": true,
 }
 
 // routeCapAlias maps a served route (no leading slash) to a capability token when
@@ -53,6 +54,7 @@ var capabilityVocab = map[string]bool{
 // trimmed path isn't itself a vocabulary token).
 var routeCapAlias = map[string]string{
 	"derivatives/register": "contribute",
+	"derivatives/changes":  "changes",
 }
 
 // DeriveCapabilities computes the capability list as the intersection of the

@@ -788,8 +788,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// exist + their integrity hash). /metadata?inode=N&kind=tech:
 			// structured ffprobe tech/EXIF. Keyed by durable inode (from
 			// /lookup); read-only + fail-closed.
-			"/derivatives": handleDerivativesHTTP,
-			"/metadata":    handleMetadataHTTP,
+			"/derivatives":         handleDerivativesHTTP,
+			"/derivatives/changes": handleDerivativesChangesHTTP,
+			"/metadata":            handleMetadataHTTP,
 			// OL-1 on-device AI contribute-back (write). POST: a consumer that
 			// wrote ai.loupe.json through the mount registers it so the server
 			// indexes it for every client + the web UI. Capability token =
@@ -2535,6 +2536,39 @@ func handleDerivativesHTTP(w http.ResponseWriter, r *http.Request) {
 		resp.Derivatives = rows
 	}
 	writeContractJSON(w, resp)
+}
+
+// handleDerivativesChangesHTTP serves GET /derivatives/changes?since=<unix> — the
+// poll-based delta feed: a JSON array [{inode,kind,status,hash,updated_at}] of
+// derivative rows with updated_at > since, ascending. OpenLoupe polls this on its
+// refresh cadence (NOT SSE — bounded probes), folds it into the badge cache, and
+// swaps a farm derivative onto an on-screen asset when it appears. A missing or
+// unparseable `since` returns full history (cold-start has no cursor).
+func handleDerivativesChangesHTTP(w http.ResponseWriter, r *http.Request) {
+	var since int64
+	if v := r.URL.Query().Get("since"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			since = n
+		}
+	}
+	var limit int
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	globalMu.Lock()
+	ds := globalDerivStore
+	globalMu.Unlock()
+	out := []derivatives.ChangeRow{}
+	if ds != nil {
+		if rows, err := ds.ListChangedSince(since, limit); err != nil {
+			jmlog.Warn("derivatives changes query failed", "since", since, "error", err.Error())
+		} else if rows != nil {
+			out = rows
+		}
+	}
+	writeContractJSON(w, out)
 }
 
 // metadataResponse is the GET /metadata body. Schema:

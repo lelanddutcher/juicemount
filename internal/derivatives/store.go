@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS derivatives (
     source_mtime  INTEGER,
     PRIMARY KEY (inode, kind)
 );
+CREATE INDEX IF NOT EXISTS idx_deriv_updated ON derivatives(updated_at);
 CREATE TABLE IF NOT EXISTS metadata (
     inode    INTEGER NOT NULL,
     kind     TEXT NOT NULL,
@@ -259,6 +260,49 @@ func (s *Store) PutDeriv(inode uint64, d DerivRow) error {
 		strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), d.UpdatedAt, extraJSON(d),
 		int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime))
 	return err
+}
+
+// ChangeRow is one entry in the /derivatives/changes delta feed.
+type ChangeRow struct {
+	Inode     uint64  `json:"inode"`
+	Kind      string  `json:"kind"`
+	Status    string  `json:"status"`
+	Hash      *string `json:"hash"`
+	UpdatedAt int64   `json:"updated_at"`
+}
+
+// ListChangedSince returns derivative rows with updated_at > since, ascending, for
+// a consumer's poll-based delta feed (the `since=` cursor). The consumer keys its
+// cache by (inode,kind) so re-delivery is idempotent; a strict `>` excludes rows
+// written in the same second as the cursor (the consumer can poll since-1 for
+// at-least-once). Bounded by limit (default/cap 10000).
+func (s *Store) ListChangedSince(since int64, limit int) ([]ChangeRow, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 || limit > 10000 {
+		limit = 10000
+	}
+	rows, err := s.db.Query(`
+		SELECT inode, kind, status, hash, updated_at
+		FROM derivatives WHERE updated_at > ? ORDER BY updated_at ASC, inode ASC, kind ASC LIMIT ?`,
+		since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChangeRow
+	for rows.Next() {
+		var c ChangeRow
+		var inode int64
+		var hash sql.NullString
+		if err := rows.Scan(&inode, &c.Kind, &c.Status, &hash, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		c.Inode = uint64(inode)
+		c.Hash = nullStr(hash)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // PutMetadata upserts the structured metadata for a kind.
