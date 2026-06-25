@@ -30,6 +30,7 @@ import (
 	"github.com/lelanddutcher/juicemount/health"
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/cplane"
+	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
@@ -75,6 +76,13 @@ var (
 	// Pin / offline / prefetch globals
 	globalPinStore   *pin.Store
 	globalPrefetcher *pin.Prefetcher
+
+	// Tier-B shared-derivative index (contract JM-14). Backs /derivatives +
+	// /metadata. Its own SQLite file (sibling of metadata.db / pin.db) so it
+	// doesn't contend on their WALs. Server-side truth, mirror-synced via JM-15
+	// later; for now the farm (JM-16) and tests populate it. Read-only on the
+	// query path. nil between Stop and the next Start ⇒ endpoints fail closed.
+	globalDerivStore *derivatives.Store
 
 	// [JM6 tier-1.7-1.10] Reachability monitor for offline-mode
 	// auto-engage. Runs independently of the health monitor: the
@@ -597,6 +605,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		jmlog.Warn("pin store open failed (offline-pin disabled)", "error", err.Error())
 	}
 
+	// Tier-B shared-derivative index (contract JM-14). Its own SQLite file
+	// alongside metadata.db / pin.db. Read-only query path (/derivatives,
+	// /metadata); the farm (JM-16) + JM-15 sync populate it later. Open failure
+	// is non-fatal — the endpoints fail closed (exists:false) until it's back.
+	derivDBPath := derivStorePath(cfg.DBPath)
+	if ds, err := derivatives.Open(derivDBPath); err == nil {
+		globalDerivStore = ds
+		jmlog.Info("derivative index ready", "path", derivDBPath)
+	} else {
+		jmlog.Warn("derivative index open failed (JM-14 reads disabled)", "error", err.Error())
+	}
+
 	// Spool wiring (Option 2). Env-gated by JM_SPOOL_ENABLE so the
 	// pre-spool behavior is preserved by default until the rollout
 	// completes (docs/ROADMAP/option-2-spool.md section 9). When
@@ -762,7 +782,14 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/whoami":    handleWhoamiHTTP,
 			"/residency": handleResidencyHTTP,
 			"/lookup":    handleLookupHTTP,
-			"/reclaim":   handleReclaimHTTP,
+			// JM-14 Tier-B shared-derivative reads. /derivatives?inode=N: the
+			// per-asset derivative manifest (what machine-derived artifacts
+			// exist + their integrity hash). /metadata?inode=N&kind=tech:
+			// structured ffprobe tech/EXIF. Keyed by durable inode (from
+			// /lookup); read-only + fail-closed.
+			"/derivatives": handleDerivativesHTTP,
+			"/metadata":    handleMetadataHTTP,
+			"/reclaim":     handleReclaimHTTP,
 			// Clears the on-disk JuiceFS chunk cache. POST-only.
 			// Optional ?keep-pinned=true reissues a verify-pins after
 			// the clear so pinned content immediately starts re-caching.
@@ -1009,6 +1036,7 @@ func stopServerLocked() {
 	reach := globalReach
 	spool := globalSpool
 	drainer := globalDrainer
+	derivStore := globalDerivStore
 	globalMetrics = nil
 	globalMonitor = nil
 	globalServer = nil
@@ -1021,6 +1049,7 @@ func stopServerLocked() {
 	globalReach = nil
 	globalSpool = nil
 	globalDrainer = nil
+	globalDerivStore = nil
 	globalMu.Unlock()
 
 	// Now run the slow shutdown work on the snapshots, no lock held.
@@ -1064,6 +1093,9 @@ func stopServerLocked() {
 	}
 	if pinStore != nil {
 		pinStore.Close()
+	}
+	if derivStore != nil {
+		derivStore.Close()
 	}
 	if store != nil {
 		store.Close()
@@ -1940,6 +1972,22 @@ func pinStorePath(metadataDBPath string) string {
 	return dir + "/pin.db"
 }
 
+// derivStorePath puts the Tier-B derivative index (JM-14) next to the metadata
+// DB as its own SQLite file, so it doesn't contend on metadata.db / pin.db WALs.
+func derivStorePath(metadataDBPath string) string {
+	if metadataDBPath == "" || metadataDBPath == ":memory:" {
+		return ":memory:"
+	}
+	dir := metadataDBPath
+	for i := len(dir) - 1; i >= 0; i-- {
+		if dir[i] == '/' {
+			dir = dir[:i]
+			break
+		}
+	}
+	return dir + "/derivatives.db"
+}
+
 // globalPinCtx returns a long-lived context whose lifecycle is tied to
 // the cbridge process. Workers running against this context die only on
 // process exit.
@@ -2408,6 +2456,134 @@ func handleLookupHTTP(w http.ResponseWriter, r *http.Request) {
 	resp.Size = &size
 	mtime := entry.Mtime.Unix()
 	resp.Mtime = &mtime
+	writeContractJSON(w, resp)
+}
+
+// derivativesResponse is the GET /derivatives body. Schema:
+// contract/spec/schema/derivatives.schema.json. `derivatives` is always a
+// non-nil slice (serializes as [] not null — the schema requires an array, and
+// exists=false demands maxItems:0). source_hash is null until the farm computes
+// it.
+type derivativesResponse struct {
+	Inode       uint64                 `json:"inode"`
+	Exists      bool                   `json:"exists"`
+	SourceHash  *string                `json:"source_hash"`
+	Derivatives []derivatives.DerivRow `json:"derivatives"`
+}
+
+// parseInodeQuery reads the required ?inode=N (unsigned). Returns false (and
+// writes a 400) when absent or unparseable.
+func parseInodeQuery(w http.ResponseWriter, r *http.Request) (uint64, bool) {
+	raw := r.URL.Query().Get("inode")
+	if raw == "" {
+		http.Error(w, "missing ?inode", 400)
+		return 0, false
+	}
+	inode, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid ?inode", 400)
+		return 0, false
+	}
+	return inode, true
+}
+
+// handleDerivativesHTTP serves GET /derivatives?inode=N (contract JM-14): the
+// derivative MANIFEST for one asset — which machine-derived artifacts exist,
+// their status/producer/version/integrity-hash, and (for blob kinds) the
+// volume-relative blob path. Read-only + fail-closed: an unknown inode (or a
+// torn-down store) reports exists:false with an empty manifest and null hash,
+// never a guess. Keyed by the durable JuiceFS inode (from /lookup).
+func handleDerivativesHTTP(w http.ResponseWriter, r *http.Request) {
+	inode, ok := parseInodeQuery(w, r)
+	if !ok {
+		return
+	}
+	globalMu.Lock()
+	ds := globalDerivStore
+	globalMu.Unlock()
+
+	resp := derivativesResponse{Inode: inode, Derivatives: []derivatives.DerivRow{}}
+	if ds == nil {
+		// No index wired (pre-Start / post-Stop / open failed) ⇒ fail closed.
+		writeContractJSON(w, resp)
+		return
+	}
+	known, srcHash := ds.Known(inode)
+	if !known {
+		// exists=false ⇒ empty manifest, source_hash:null (schema rule).
+		writeContractJSON(w, resp)
+		return
+	}
+	resp.Exists = true
+	resp.SourceHash = srcHash
+	rows, err := ds.Manifest(inode)
+	if err != nil {
+		jmlog.Warn("derivatives manifest query failed", "inode", inode, "error", err.Error())
+		// Known asset but the manifest read errored — return the honest
+		// exists:true with an empty list rather than a 500; the client
+		// fail-closes (regenerates) exactly as it would for status:absent.
+		writeContractJSON(w, resp)
+		return
+	}
+	if rows != nil {
+		resp.Derivatives = rows
+	}
+	writeContractJSON(w, resp)
+}
+
+// metadataResponse is the GET /metadata body. Schema:
+// contract/spec/schema/metadata.schema.json. On exists=false only
+// {inode,exists,kind,tech:null} is emitted (producer/version/hash omitted);
+// `tech` is a verbatim passthrough of the stored ffprobe payload (additive).
+type metadataResponse struct {
+	Inode    uint64          `json:"inode"`
+	Exists   bool            `json:"exists"`
+	Kind     string          `json:"kind"`
+	Producer string          `json:"producer,omitempty"`
+	Version  int             `json:"version,omitempty"`
+	Hash     *string         `json:"hash,omitempty"`
+	Tech     json.RawMessage `json:"tech"` // nil ⇒ marshals as null
+}
+
+// handleMetadataHTTP serves GET /metadata?inode=N&kind=tech (contract JM-14):
+// the structured machine-derived metadata for one asset. MVP kind = "tech"
+// (ffprobe container/video/audio/timecode/color). Read-only + fail-closed: a
+// kind with no produced row reports exists:false, tech:null. exists==true means
+// the source is present AND this kind has been produced.
+func handleMetadataHTTP(w http.ResponseWriter, r *http.Request) {
+	inode, ok := parseInodeQuery(w, r)
+	if !ok {
+		return
+	}
+	kind := r.URL.Query().Get("kind")
+	if kind == "" {
+		kind = "tech" // MVP default; the only kind served today.
+	}
+	globalMu.Lock()
+	ds := globalDerivStore
+	globalMu.Unlock()
+
+	resp := metadataResponse{Inode: inode, Kind: kind}
+	if ds == nil {
+		writeContractJSON(w, resp) // fail closed ⇒ exists:false, tech:null
+		return
+	}
+	tm, err := ds.Metadata(inode, kind)
+	if err != nil {
+		jmlog.Warn("metadata query failed", "inode", inode, "kind", kind, "error", err.Error())
+		writeContractJSON(w, resp)
+		return
+	}
+	if tm == nil {
+		// Not produced for this kind ⇒ exists:false, tech:null.
+		writeContractJSON(w, resp)
+		return
+	}
+	resp.Exists = true
+	resp.Producer = tm.Producer
+	resp.Version = tm.Version
+	resp.Hash = tm.Hash
+	resp.Tech = tm.Payload
 	writeContractJSON(w, resp)
 }
 

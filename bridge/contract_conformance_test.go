@@ -35,6 +35,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/cplane"
+	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -173,22 +174,35 @@ func seedControlPlane(t *testing.T) func() {
 	_ = pstore.Pin(clip205, 1240000000, "/Volumes/zpool/Project_Foo")
 	_ = pstore.UpdateStatus(clip205, pin.StatusPrefetching, 620000000, "")
 
+	// Tier-B derivative index (JM-14). Seed inode 1180417 (clip_031) to match
+	// contract/fixtures/derivatives/ready.json + metadata/tech.json exactly. The
+	// absent fixtures use inode 999999, which is intentionally NOT seeded so the
+	// handler's fail-closed exists:false path is exercised.
+	dstore, err := derivatives.Open(":memory:")
+	if err != nil {
+		t.Fatalf("derivatives.Open: %v", err)
+	}
+	seedDerivatives(t, dstore)
+
 	guiRoutes := []string{
 		"/health", "/metrics", "/pin", "/unpin", "/cache-status", "/offline",
-		"/whoami", "/residency", "/lookup", "/reclaim", "/cache-clear",
-		"/verify-pins", "/force-eject", "/stop", "/self-test", "/spool",
-		"/activity", "/spool-recover", "/mount-now", "/debug/pprof/",
+		"/whoami", "/residency", "/lookup", "/derivatives", "/metadata",
+		"/reclaim", "/cache-clear", "/verify-pins", "/force-eject", "/stop",
+		"/self-test", "/spool", "/activity", "/spool-recover", "/mount-now",
+		"/debug/pprof/",
 	}
 
 	globalMu.Lock()
 	old := struct {
 		store                             *metadata.Store
 		pin                               *pin.Store
+		deriv                             *derivatives.Store
 		mount, want, vol, dbp, addr, inst string
 		caps                              []string
-	}{globalStore, globalPinStore, globalMountPath, globalWantMountPoint, globalVolumeName, globalDBPath, globalMetricsAddr, globalInstanceID, globalCapabilities}
+	}{globalStore, globalPinStore, globalDerivStore, globalMountPath, globalWantMountPoint, globalVolumeName, globalDBPath, globalMetricsAddr, globalInstanceID, globalCapabilities}
 	globalStore = mstore
 	globalPinStore = pstore
+	globalDerivStore = dstore
 	globalMountPath = mp
 	globalWantMountPoint = mp
 	globalVolumeName = "zpool"
@@ -202,6 +216,7 @@ func seedControlPlane(t *testing.T) func() {
 		globalMu.Lock()
 		globalStore = old.store
 		globalPinStore = old.pin
+		globalDerivStore = old.deriv
 		globalMountPath = old.mount
 		globalWantMountPoint = old.want
 		globalVolumeName = old.vol
@@ -212,8 +227,49 @@ func seedControlPlane(t *testing.T) func() {
 		globalMu.Unlock()
 		mstore.Close()
 		pstore.Close()
+		dstore.Close()
 	}
 }
+
+// seedDerivatives loads inode 1180417 to match contract/fixtures/derivatives/
+// ready.json + metadata/tech.json byte-for-byte (updated_at pinned to the
+// fixture's 1750000000 so the live response compares equal). The 6 manifest
+// rows + the tech payload are the canonical JM-14 seed.
+func seedDerivatives(t *testing.T, ds *derivatives.Store) {
+	t.Helper()
+	const inode = 1180417
+	const srcHash = "9f2b1c0a4e7d8b30"
+	const updated = 1750000000
+	if err := ds.PutSource(inode, sp(srcHash)); err != nil {
+		t.Fatalf("PutSource: %v", err)
+	}
+	rows := []derivatives.DerivRow{
+		{Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), UpdatedAt: updated},
+		{Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), BlobRelPath: sp("poster.jpg"), MediaType: sp("image/jpeg"), UpdatedAt: updated},
+		{Kind: "filmstrip", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), BlobRelPath: sp("strip.jpg"), MediaType: sp("image/jpeg"), UpdatedAt: updated},
+		{Kind: "waveform", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), BlobRelPath: sp("wave.json"), MediaType: sp("application/json"), UpdatedAt: updated},
+		{Kind: "proxy", Status: "pending", Producer: "linux-farm", Version: 1, MediaType: sp("video/mp4"), UpdatedAt: updated},
+		{Kind: "embedding", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), Model: sp("openclip-vit-b32-v1"), Dim: ip(512), UpdatedAt: updated},
+	}
+	for _, r := range rows {
+		if err := ds.PutDeriv(inode, r); err != nil {
+			t.Fatalf("PutDeriv %s: %v", r.Kind, err)
+		}
+	}
+	techPayload := `{
+		"container": "mov",
+		"duration_ms": 12480,
+		"size_bytes": 880000000,
+		"video": { "codec": "hevc", "width": 3840, "height": 2160, "fps": 23.976, "pix_fmt": "yuv422p10le", "bit_depth": 10, "color_primaries": "bt2020", "transfer": "arib-std-b67", "matrix": "bt2020nc", "hdr": "hlg", "log_format": null, "timecode": "01:00:00:00" },
+		"audio": [ { "codec": "pcm_s24le", "channels": 2, "sample_rate": 48000, "bit_depth": 24, "language": null } ]
+	}`
+	if err := ds.PutMetadata(inode, "tech", "linux-farm", 1, sp(srcHash), json.RawMessage(techPayload)); err != nil {
+		t.Fatalf("PutMetadata: %v", err)
+	}
+}
+
+func sp(s string) *string { return &s }
+func ip(i int) *int       { return &i }
 
 // TestContractLiveConformance boots the real handlers against the seed and
 // asserts each response validates against its schema AND structurally matches
@@ -227,23 +283,31 @@ func TestContractLiveConformance(t *testing.T) {
 		endpoint string
 		handler  func(w http.ResponseWriter, r *http.Request)
 		path     string // ?path= (empty = none)
+		query    string // raw query string (e.g. "inode=N&kind=tech"); wins over path
 		fixture  string
 		schema   string
 	}{
-		{"whoami_gui", "/whoami", handleWhoamiHTTP, "", "whoami/gui.json", "whoami.schema.json"},
-		{"residency_resident", "/residency", handleResidencyHTTP, clip031, "residency/resident.json", "residency.schema.json"},
-		{"residency_streaming", "/residency", handleResidencyHTTP, clip204, "residency/streaming.json", "residency.schema.json"},
-		{"residency_warming", "/residency", handleResidencyHTTP, clip205, "residency/warming.json", "residency.schema.json"},
-		{"residency_absent", "/residency", handleResidencyHTTP, deleted, "residency/absent.json", "residency.schema.json"},
-		{"lookup_file", "/lookup", handleLookupHTTP, clip031, "lookup/file.json", "lookup.schema.json"},
-		{"lookup_missing", "/lookup", handleLookupHTTP, notHere, "lookup/missing.json", "lookup.schema.json"},
+		{"whoami_gui", "/whoami", handleWhoamiHTTP, "", "", "whoami/gui.json", "whoami.schema.json"},
+		{"residency_resident", "/residency", handleResidencyHTTP, clip031, "", "residency/resident.json", "residency.schema.json"},
+		{"residency_streaming", "/residency", handleResidencyHTTP, clip204, "", "residency/streaming.json", "residency.schema.json"},
+		{"residency_warming", "/residency", handleResidencyHTTP, clip205, "", "residency/warming.json", "residency.schema.json"},
+		{"residency_absent", "/residency", handleResidencyHTTP, deleted, "", "residency/absent.json", "residency.schema.json"},
+		{"lookup_file", "/lookup", handleLookupHTTP, clip031, "", "lookup/file.json", "lookup.schema.json"},
+		{"lookup_missing", "/lookup", handleLookupHTTP, notHere, "", "lookup/missing.json", "lookup.schema.json"},
+		// JM-14: derivative manifest + structured metadata, keyed by inode.
+		{"derivatives_ready", "/derivatives", handleDerivativesHTTP, "", "inode=1180417", "derivatives/ready.json", "derivatives.schema.json"},
+		{"derivatives_absent", "/derivatives", handleDerivativesHTTP, "", "inode=999999", "derivatives/absent.json", "derivatives.schema.json"},
+		{"metadata_tech", "/metadata", handleMetadataHTTP, "", "inode=1180417&kind=tech", "metadata/tech.json", "metadata.schema.json"},
+		{"metadata_absent", "/metadata", handleMetadataHTTP, "", "inode=999999&kind=tech", "metadata/absent.json", "metadata.schema.json"},
 	}
 
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			u := tc.endpoint
-			if tc.path != "" {
+			if tc.query != "" {
+				u += "?" + tc.query
+			} else if tc.path != "" {
 				u += "?" + url.Values{"path": {tc.path}}.Encode()
 			}
 			req := httptest.NewRequest("GET", u, nil)
@@ -340,9 +404,49 @@ func assertStructEqual(t *testing.T, name string, got, want any) {
 		delete(gm, k)
 		delete(wm, k)
 	}
+	// The JM-14 derivative manifest is an unordered set of per-kind rows, and
+	// each row's updated_at is runtime-volatile. Normalize both sides (strip
+	// updated_at, sort by kind) so the comparison reflects the contract's
+	// semantics rather than incidental ordering.
+	if _, ok := gm["derivatives"]; ok {
+		gm["derivatives"] = normalizeDerivatives(gm["derivatives"])
+		wm["derivatives"] = normalizeDerivatives(wm["derivatives"])
+	}
 	if !reflect.DeepEqual(gm, wm) {
 		t.Errorf("%s: structural mismatch:\n got=%#v\nwant=%#v", name, gm, wm)
 	}
+}
+
+// normalizeDerivatives returns a "derivatives" array with each row's volatile
+// updated_at removed and the rows sorted by kind — so the manifest compares as
+// an unordered set (mirrors the contract: kinds are unique per asset, order is
+// not meaningful, updated_at is volatile).
+func normalizeDerivatives(v any) any {
+	arr, ok := v.([]any)
+	if !ok {
+		return v
+	}
+	out := make([]any, 0, len(arr))
+	for _, e := range arr {
+		if em, ok := e.(map[string]any); ok {
+			cm := cloneMap(em)
+			delete(cm, "updated_at")
+			out = append(out, cm)
+		} else {
+			out = append(out, e)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return derivKind(out[i]) < derivKind(out[j]) })
+	return out
+}
+
+func derivKind(v any) string {
+	if m, ok := v.(map[string]any); ok {
+		if k, ok := m["kind"].(string); ok {
+			return k
+		}
+	}
+	return ""
 }
 
 func cloneMap(m map[string]any) map[string]any {

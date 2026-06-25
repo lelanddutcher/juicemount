@@ -1,0 +1,13 @@
+{
+  "inode": 1180417,
+  "exists": true,
+  "source_hash": "9f2b1c0a4e7d8b30",
+  "derivatives": [
+    { "kind": "tech",      "status": "ready",   "producer": "linux-farm", "version": 1, "hash": "9f2b1c0a4e7d8b30", "blob_rel_path": null,        "media_type": null,            "model": null,                 "dim": null, "updated_at": 1750000000 },
+    { "kind": "thumbnail", "status": "ready",   "producer": "linux-farm", "version": 1, "hash": "9f2b1c0a4e7d8b30", "blob_rel_path": "poster.jpg", "media_type": "image/jpeg",     "model": null,                 "dim": null, "updated_at": 1750000000 },
+    { "kind": "filmstrip", "status": "ready",   "producer": "linux-farm", "version": 1, "hash": "9f2b1c0a4e7d8b30", "blob_rel_path": "strip.jpg",  "media_type": "image/jpeg",     "model": null,                 "dim": null, "updated_at": 1750000000 },
+    { "kind": "waveform",  "status": "ready",   "producer": "linux-farm", "version": 1, "hash": "9f2b1c0a4e7d8b30", "blob_rel_path": "wave.json",  "media_type": "application/json","model": null,                 "dim": null, "updated_at": 1750000000 },
+    { "kind": "proxy",     "status": "pending", "producer": "linux-farm", "version": 1, "hash": null,               "blob_rel_path": null,        "media_type": "video/mp4",      "model": null,                 "dim": null, "updated_at": 1750000000 },
+    { "kind": "embedding", "status": "ready",   "producer": "linux-farm", "version": 1, "hash": "9f2b1c0a4e7d8b30", "blob_rel_path": null,        "media_type": null,            "model": "openclip-vit-b32-v1", "dim": 512, "updated_at": 1750000000 }
+  ]
+}

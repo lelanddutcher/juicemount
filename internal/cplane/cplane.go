@@ -44,7 +44,7 @@ var capabilityVocab = map[string]bool{
 	"health": true, "whoami": true, "residency": true, "lookup": true,
 	"cache-status": true, "offline": true, "spool": true, "activity": true,
 	"pin": true, "unpin": true, "self-test": true, "verify-pins": true,
-	"metrics": true,
+	"metrics": true, "derivatives": true, "metadata": true,
 }
 
 // DeriveCapabilities computes the capability list as the intersection of the

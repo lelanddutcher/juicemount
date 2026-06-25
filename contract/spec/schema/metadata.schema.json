@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/metadata.schema.json",
+  "title": "Metadata",
+  "description": "GET /metadata?inode=N&kind=tech — structured machine-derived metadata for one asset. JM-14. MVP kind = `tech` (ffprobe-derived: container/video/audio/timecode/color), the consume slice OpenLoupe builds first (biggest cold-mount payoff for the least code). Rebuildable cache — the media is the truth. The `tech` object is intentionally additive (additionalProperties:true) so the farm can enrich without a contract bump; clients read the fields they know. Keyed by durable inode.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["inode", "exists", "kind"],
+  "properties": {
+    "inode": { "type": "integer" },
+    "exists": { "type": "boolean", "description": "Source asset present AND this metadata kind has been produced." },
+    "kind": { "const": "tech" },
+    "producer": { "enum": ["linux-farm", "macos-node", "on-device"] },
+    "version": { "type": "integer", "minimum": 1 },
+    "hash": { "type": ["string", "null"], "description": "xxh3 of the source bytes; client fail-closes on mismatch." },
+    "tech": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "Flattened ffprobe-derived technical metadata; null when exists=false.",
+      "properties": {
+        "container": { "type": "string", "description": "e.g. \"mov\", \"mp4\", \"mxf\"." },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "video": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "codec": { "type": "string" },
+            "width": { "type": "integer" },
+            "height": { "type": "integer" },
+            "fps": { "type": "number" },
+            "pix_fmt": { "type": "string" },
+            "bit_depth": { "type": "integer" },
+            "color_primaries": { "type": ["string", "null"] },
+            "transfer": { "type": ["string", "null"] },
+            "matrix": { "type": ["string", "null"] },
+            "hdr": { "type": ["string", "null"], "description": "e.g. \"hdr10\", \"dolby_vision\", null for SDR." },
+            "log_format": { "type": ["string", "null"], "description": "detected camera log curve, e.g. \"slog3\", \"logc4\", null." },
+            "timecode": { "type": ["string", "null"], "description": "start timecode HH:MM:SS:FF (or ;FF for DF)." }
+          }
+        },
+        "audio": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "codec": { "type": "string" },
+              "channels": { "type": "integer" },
+              "sample_rate": { "type": "integer" },
+              "bit_depth": { "type": ["integer", "null"] },
+              "language": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "exists": { "const": false } }, "required": ["exists"] },
+      "then": { "properties": { "tech": { "const": null } } }
+    }
+  ]
+}

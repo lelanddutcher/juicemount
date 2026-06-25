@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/derivatives.schema.json",
+  "title": "Derivatives",
+  "description": "GET /derivatives?inode=N — the derivative MANIFEST for one asset: which machine-derived artifacts exist (thumbnail/filmstrip/waveform/proxy/tech/embedding/transcript/ocr/faces), their status, integrity hash, producer, and (for blob kinds) the volume-relative blob path. JM-14, the Tier-B foundation. CLIENT-AGNOSTIC: OpenLoupe (Swift) and the JuiceMount web UI consume this identically. Keyed by the durable JuiceFS inode (from /lookup), never the mount path. Machine-derived data is a rebuildable cache — the media is the truth — so a client that distrusts a derivative (hash mismatch) just regenerates it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["inode", "exists", "derivatives"],
+  "properties": {
+    "inode": { "type": "integer", "description": "Echo of the queried JuiceFS inode." },
+    "exists": { "type": "boolean", "description": "Is the source asset present in the metadata mirror." },
+    "source_hash": {
+      "type": ["string", "null"],
+      "description": "Content hash (xxh3 hex) of the CURRENT source. Clients compare each derivative's `hash` against this and FAIL CLOSED (drop + regenerate) on mismatch. null when not yet computed."
+    },
+    "derivatives": {
+      "type": "array",
+      "description": "One entry per derivative kind known for this asset. Absent kinds may be omitted or listed with status:absent.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "status", "producer", "version"],
+        "properties": {
+          "kind": {
+            "enum": ["thumbnail", "filmstrip", "waveform", "proxy", "tech", "embedding", "transcript", "ocr", "faces"],
+            "description": "Blob kinds (thumbnail/filmstrip/waveform/proxy) carry blob_rel_path; DB kinds (tech/embedding/transcript/ocr/faces) are fetched via /metadata."
+          },
+          "status": { "enum": ["ready", "pending", "failed", "absent"] },
+          "producer": {
+            "enum": ["linux-farm", "macos-node", "on-device"],
+            "description": "Which lane produced it. linux-farm = the portable NAS fast-lane; macos-node/on-device = Apple-framework AI."
+          },
+          "version": { "type": "integer", "minimum": 1, "description": "Producer schema/algo version; bump = re-derive." },
+          "hash": {
+            "type": ["string", "null"],
+            "description": "xxh3 of the SOURCE bytes this derivative was produced from. Client trusts the derivative only if hash == source_hash (fail-closed)."
+          },
+          "blob_rel_path": {
+            "type": ["string", "null"],
+            "description": "Volume-relative path under /.juicemount/derivatives/<inode>/ for blob kinds (e.g. \"poster.jpg\", \"strip.jpg\", \"proxy.m4s\"). null for DB-only kinds. The Mac client reads it through the mount; the web UI serves the same bytes over HTTP."
+          },
+          "media_type": {
+            "type": ["string", "null"],
+            "description": "MIME of the blob (web-native by design: image/jpeg, image/webp, application/json for waveforms, video/mp4 fMP4/HLS for proxies). null for DB kinds."
+          },
+          "model": { "type": ["string", "null"], "description": "Embedding model id+version for kind=embedding/faces (so kNN partitions by model). null otherwise." },
+          "dim": { "type": ["integer", "null"], "description": "Embedding dimensionality for kind=embedding/faces." },
+          "updated_at": { "type": "integer", "description": "Unix seconds the derivative was last produced." }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "exists": { "const": false } }, "required": ["exists"] },
+      "then": { "properties": { "derivatives": { "maxItems": 0 }, "source_hash": { "const": null } } }
+    }
+  ]
+}

@@ -14,6 +14,12 @@
     { "file": "lookup/file.json", "endpoint": "/lookup", "method": "GET", "request": { "path": "/Volumes/zpool/Project_Foo/clip_031.mov" }, "schema": "lookup.schema.json", "http_status": 200 },
     { "file": "lookup/missing.json", "endpoint": "/lookup", "method": "GET", "request": { "path": "/Volumes/zpool/Project_Foo/not_here.mov" }, "schema": "lookup.schema.json", "http_status": 200 },
 
+    { "file": "derivatives/ready.json", "endpoint": "/derivatives", "method": "GET", "request": { "inode": "1180417" }, "schema": "derivatives.schema.json", "http_status": 200, "note": "JM-14 manifest — tech/thumb/strip/wave ready, proxy pending, embedding (model-stamped)" },
+    { "file": "derivatives/absent.json", "endpoint": "/derivatives", "method": "GET", "request": { "inode": "999999" }, "schema": "derivatives.schema.json", "http_status": 200, "note": "unknown inode → exists:false, empty derivatives" },
+
+    { "file": "metadata/tech.json", "endpoint": "/metadata", "method": "GET", "request": { "inode": "1180417", "kind": "tech" }, "schema": "metadata.schema.json", "http_status": 200, "note": "JM-14 structured tech/EXIF — OpenLoupe's first consume slice" },
+    { "file": "metadata/absent.json", "endpoint": "/metadata", "method": "GET", "request": { "inode": "999999", "kind": "tech" }, "schema": "metadata.schema.json", "http_status": 200 },
+
     { "file": "health/ok.json", "endpoint": "/health", "method": "GET", "request": {}, "schema": "health.schema.json", "http_status": 200 },
     { "file": "health/degraded.json", "endpoint": "/health", "method": "GET", "request": {}, "schema": "health.schema.json", "http_status": 503, "note": "503 when healthy=false" },
 
