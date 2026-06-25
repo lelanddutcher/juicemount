@@ -1,0 +1,212 @@
+// jmfarm is the derivative-producer CLI (contract JM-14/JM-16 MVP). It walks a
+// directory of media on a mounted JuiceMount volume, derives tech/EXIF metadata
+// (and optionally poster thumbnails) for each file, and writes them into the
+// Tier-B index (derivatives.db) the control plane serves at /metadata +
+// /derivatives. Run it against a cached/pinned folder so ffprobe reads from SSD.
+//
+// It writes directly to the same derivatives.db the running app has open; SQLite
+// WAL makes that safe (one writer here, the app only reads on the query path).
+// The producer logic lives in internal/farm so JM-15 (in-process sync) and
+// JM-16 (the Linux fast lane) reuse it unchanged.
+//
+//	jmfarm --root "/Volumes/zpool/Film Projects/.../REEL_0065/Proxy" --blobs
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/derivatives"
+	"github.com/lelanddutcher/juicemount/internal/farm"
+)
+
+// mediaExts are the file types we probe. Extension gate is a cheap pre-filter;
+// ffprobe is the real arbiter (a non-media file just errors and is skipped).
+var mediaExts = map[string]bool{
+	".mov": true, ".mp4": true, ".m4v": true, ".mxf": true, ".mkv": true,
+	".avi": true, ".mts": true, ".m2ts": true, ".braw": true, ".r3d": true,
+	".wav": true, ".aif": true, ".aiff": true, ".flac": true, ".mp3": true, ".m4a": true,
+}
+
+func main() {
+	var (
+		dbPath   = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
+		root     = flag.String("root", "", "directory to walk for media (required unless -files)")
+		files    = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
+		mount    = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
+		blobs    = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
+		thumbDim = flag.Int("thumb-dim", 640, "poster fit box in px")
+		limit    = flag.Int("limit", 0, "max files to process (0 = no limit)")
+		conc     = flag.Int("concurrency", 4, "parallel workers")
+		producer = flag.String("producer", "macos-node", "producer tag")
+		version  = flag.Int("version", 1, "producer version")
+		dryRun   = flag.Bool("dry-run", false, "probe + report, do not write")
+		verbose  = flag.Bool("verbose", false, "per-file logging")
+	)
+	flag.Parse()
+
+	if *root == "" && *files == "" {
+		fmt.Fprintln(os.Stderr, "jmfarm: need -root <dir> or -files <a,b,c>")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	targets, err := collectTargets(*root, *files, *limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "jmfarm: %v\n", err)
+		os.Exit(1)
+	}
+	if len(targets) == 0 {
+		fmt.Fprintln(os.Stderr, "jmfarm: no media files found")
+		os.Exit(1)
+	}
+
+	var store *derivatives.Store
+	if !*dryRun {
+		store, err = derivatives.Open(*dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm: open %s: %v\n", *dbPath, err)
+			os.Exit(1)
+		}
+		defer store.Close()
+	}
+
+	opt := farm.Options{
+		Producer: *producer, Version: *version, Mount: *mount,
+		Blobs: *blobs, ThumbMaxDim: *thumbDim,
+	}
+
+	fmt.Printf("jmfarm: %d files → %s  (producer=%s v%d, blobs=%v, dry-run=%v, workers=%d)\n",
+		len(targets), *dbPath, *producer, *version, *blobs, *dryRun, *conc)
+
+	start := time.Now()
+	var ok, failed, thumbs int64
+	var mu sync.Mutex
+	var firstErrs []string
+
+	sem := make(chan struct{}, *conc)
+	var wg sync.WaitGroup
+	for _, p := range targets {
+		p := p
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if *dryRun {
+				tech, e := farm.Probe(opt.FFprobeBin, p, 0)
+				if e != nil {
+					atomic.AddInt64(&failed, 1)
+					recordErr(&mu, &firstErrs, p, e)
+					return
+				}
+				atomic.AddInt64(&ok, 1)
+				if *verbose {
+					fmt.Printf("  [dry] %-50s %s %dms\n", filepath.Base(p), tech.Container, tech.DurationMS)
+				}
+				return
+			}
+
+			r := farm.Process(store, p, opt)
+			if r.Err != nil {
+				atomic.AddInt64(&failed, 1)
+				recordErr(&mu, &firstErrs, p, r.Err)
+				if *verbose {
+					fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), r.Inode, r.Err)
+				}
+				return
+			}
+			atomic.AddInt64(&ok, 1)
+			if r.ThumbWrote {
+				atomic.AddInt64(&thumbs, 1)
+			}
+			if *verbose {
+				fmt.Printf("  [ok] %-50s inode=%d hash=%s %dms vid=%v thumb=%v\n",
+					filepath.Base(p), r.Inode, r.Hash, r.DurationMS, r.HasVideo, r.ThumbWrote)
+			}
+		}()
+	}
+	wg.Wait()
+
+	fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails — %d total\n",
+		time.Since(start).Round(time.Millisecond), ok, failed, thumbs, len(targets))
+	if len(firstErrs) > 0 {
+		fmt.Printf("first errors (%d shown):\n", len(firstErrs))
+		for _, e := range firstErrs {
+			fmt.Printf("  - %s\n", e)
+		}
+	}
+	if failed > 0 && ok == 0 {
+		os.Exit(1)
+	}
+}
+
+func recordErr(mu *sync.Mutex, errs *[]string, path string, err error) {
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*errs) < 10 {
+		*errs = append(*errs, fmt.Sprintf("%s: %v", filepath.Base(path), err))
+	}
+}
+
+func collectTargets(root, files string, limit int) ([]string, error) {
+	var out []string
+	add := func(p string) bool {
+		if limit > 0 && len(out) >= limit {
+			return false
+		}
+		out = append(out, p)
+		return true
+	}
+
+	if files != "" {
+		for _, f := range strings.Split(files, ",") {
+			f = strings.TrimSpace(f)
+			if f != "" && !add(f) {
+				break
+			}
+		}
+		return out, nil
+	}
+
+	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries, keep walking
+		}
+		if info.IsDir() {
+			if strings.HasPrefix(info.Name(), ".") && p != root {
+				return filepath.SkipDir // skip dotdirs (incl. .juicemount)
+			}
+			return nil
+		}
+		if strings.HasPrefix(info.Name(), "._") {
+			return nil // AppleDouble sidecar
+		}
+		if !mediaExts[strings.ToLower(filepath.Ext(p))] {
+			return nil
+		}
+		if !add(p) {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func defaultDBPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "derivatives.db"
+	}
+	return filepath.Join(home, "Library", "Application Support", "JuiceMount", "derivatives.db")
+}

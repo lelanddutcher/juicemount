@@ -12,6 +12,7 @@ require (
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	github.com/willscott/go-nfs v0.0.3
 	github.com/willscott/go-nfs-client v0.0.0-20251022144359-801f10d98886
+	github.com/zeebo/xxh3 v1.0.2
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sys v0.45.0
 	modernc.org/sqlite v1.47.0
@@ -21,6 +22,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
