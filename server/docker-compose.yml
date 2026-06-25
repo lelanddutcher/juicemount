@@ -192,3 +192,52 @@ services:
       # you want to keep that history, additionally bind-mount the
       # OLD migrator-state dataset at /var/lib/migrator (read-only is fine).
       - /mnt/zSSD/juicemount/manager-state:/var/lib/manager
+
+  # ── juicefarm: server-side derivative + AI generation farm ───────
+  # Generates the PORTABLE derivatives (tech/poster/filmstrip/waveform) and
+  # whisper.cpp transcripts server-side → Tier-A blobs under
+  # /jfs/.juicemount/derivatives/<inode>/ (shared with every client) + a
+  # server-side index. Replaces on-device generation; OpenLoupe falls back to
+  # local gen only when a derivative is absent. Apple-only AI (embeddings,
+  # aesthetics) stays on-device and pushes back via POST /derivatives/register.
+  #
+  # Built ON the host (native x86_64 — bundles ffmpeg + whisper.cpp + the
+  # ggml-base.en model + the CGO jmfarm binary):
+  #   docker build -f server/juicefarm/Dockerfile -t juicefarm:local .
+  #
+  # SAFE LIVE DEPLOY (no full-stack churn): the juicefs container runs its OWN
+  # FUSE mount, so juicefarm can be started ADDITIVELY on the existing
+  # ix-juicemount network WITHOUT re-applying this whole app YAML — re-applying
+  # would restart redis/minio and disrupt the Mac client. One-shot example:
+  #   docker run -d --name juicefarm --network ix-juicemount_default \
+  #     --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
+  #     -e JM_META=redis://redis:6379/1 -e JM_FARM_TARGET=/jfs/<project> \
+  #     -e JM_FARM_MODE=all -e JM_FARM_ONCE=1 \
+  #     -v /mnt/zSSD/juicemount/cache:/jfs-cache \
+  #     -v /mnt/zSSD/juicemount/juicefarm-state:/state juicefarm:local
+  juicefarm:
+    build:
+      context: ../..
+      dockerfile: server/juicefarm/Dockerfile
+    image: juicefarm:local
+    restart: unless-stopped
+    depends_on:
+      juicefs-init:
+        condition: service_completed_successfully
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      JM_META: "redis://redis:6379/1"
+      JM_FARM_TARGET: "/jfs"          # EDIT — a subpath to limit each sweep
+      JM_FARM_MODE: "all"             # all | derivatives | transcript
+      JM_FARM_PRODUCER: "linux-farm"
+      JM_FARM_DB: "/state/derivatives.db"
+      JM_FARM_INTERVAL: "900"
+      JM_FARM_WORKERS: "4"
+    volumes:
+      - /mnt/zSSD/juicemount/cache:/jfs-cache         # shares the SSD cache dataset
+      - /mnt/zSSD/juicemount/juicefarm-state:/state   # server-side derivatives index
