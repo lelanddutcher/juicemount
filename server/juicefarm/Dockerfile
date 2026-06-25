@@ -18,17 +18,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
+# Static-link (CGO sqlite) so the binary carries no glibc version dependency —
+# the juicedata/mount runtime ships an older glibc than the bookworm builder.
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /out/jmfarm ./cmd/jmfarm
+    CGO_ENABLED=1 GOOS=linux go build -tags sqlite_omit_load_extension \
+      -ldflags="-s -w -linkmode external -extldflags '-static'" -o /out/jmfarm ./cmd/jmfarm
 
 # ----- Stage 2: whisper.cpp (whisper-cli) + the ggml model -----
-FROM debian:bookworm AS whisper
+# Bullseye matches the juicedata/mount runtime's glibc 2.31 + libstdc++, so
+# whisper-cli links cleanly there (BUILD_SHARED_LIBS=OFF folds in whisper/ggml).
+FROM debian:bullseye AS whisper
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git cmake build-essential ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp /w \
     && cd /w \
-    && cmake -B build -DWHISPER_BUILD_TESTS=OFF -DGGML_NATIVE=OFF \
+    && cmake -B build -DWHISPER_BUILD_TESTS=OFF -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF \
     && cmake --build build --config Release -j "$(nproc)" \
     && cp build/bin/whisper-cli /usr/local/bin/whisper-cli
 # Bake the base.en model (~142MB) so the image is self-contained.
