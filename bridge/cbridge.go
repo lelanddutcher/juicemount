@@ -31,6 +31,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/cplane"
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
+	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
@@ -789,7 +790,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// /lookup); read-only + fail-closed.
 			"/derivatives": handleDerivativesHTTP,
 			"/metadata":    handleMetadataHTTP,
-			"/reclaim":     handleReclaimHTTP,
+			// OL-1 on-device AI contribute-back (write). POST: a consumer that
+			// wrote ai.loupe.json through the mount registers it so the server
+			// indexes it for every client + the web UI. Capability token =
+			// `contribute` (route-aliased in cplane.DeriveCapabilities).
+			"/derivatives/register": handleDerivativesRegisterHTTP,
+			"/reclaim":              handleReclaimHTTP,
 			// Clears the on-disk JuiceFS chunk cache. POST-only.
 			// Optional ?keep-pinned=true reissues a verify-pins after
 			// the clear so pinned content immediately starts re-caching.
@@ -2585,6 +2591,134 @@ func handleMetadataHTTP(w http.ResponseWriter, r *http.Request) {
 	resp.Hash = tm.Hash
 	resp.Tech = tm.Payload
 	writeContractJSON(w, resp)
+}
+
+// registerRequest is the POST /derivatives/register body (OL-1 on-device AI
+// contribute-back). The consumer wrote ai.loupe.json through the mount, then
+// vouches with source_size+source_mtime (it cannot compute the contract xxh3).
+type registerRequest struct {
+	Inode       uint64 `json:"inode"`
+	Kind        string `json:"kind"`
+	Producer    string `json:"producer"`
+	Model       string `json:"model"`
+	Dim         int    `json:"dim"`
+	SourceSize  int64  `json:"source_size"`
+	SourceMtime int64  `json:"source_mtime"`
+	BlobRelPath string `json:"blob_rel_path"`
+}
+
+// registerResponse is the 200 body. Schema: contract/spec/schema/register.schema.json.
+type registerResponse struct {
+	Inode      uint64               `json:"inode"`
+	Registered bool                 `json:"registered"`
+	Derivative derivatives.DerivRow `json:"derivative"`
+}
+
+// handleDerivativesRegisterHTTP serves POST /derivatives/register (OL-1): the
+// on-device AI contribute-back. A consumer (OpenLoupe) that computed expensive,
+// identity-bearing AI on-device — and already wrote the ai.loupe.json blob
+// through the mount — registers it so JuiceMount indexes it for every other
+// client + the web UI.
+//
+// AI-only. Trust model: the consumer can't produce the contract's xxh3 (it uses
+// xxh64), so the SERVER is the source-hash authority — the consumer vouches with
+// source_size+source_mtime (the live stat it computed the AI against); we re-stat
+// the live source and accept ONLY on a match (else 409 — the AI was computed
+// against stale bytes), then stamp the canonical sampled xxh3 ourselves. The blob
+// itself the consumer wrote; we only index the manifest row.
+func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req registerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json body", 400)
+		return
+	}
+	if req.Inode == 0 {
+		http.Error(w, "missing inode", 400)
+		return
+	}
+	if req.Kind != "ai" {
+		http.Error(w, `OL-1 register is AI-only (kind must be "ai")`, 400)
+		return
+	}
+	if req.Producer != "on-device" && req.Producer != "macos-node" {
+		http.Error(w, "producer must be on-device or macos-node", 400)
+		return
+	}
+	rel := req.BlobRelPath
+	if rel == "" {
+		rel = "ai.loupe.json"
+	}
+
+	globalMu.Lock()
+	store := globalStore
+	ds := globalDerivStore
+	fusePath := globalFUSEPath
+	globalMu.Unlock()
+
+	if store == nil || ds == nil {
+		http.Error(w, "control plane not ready", 503)
+		return
+	}
+	entry := store.LookupByInode(req.Inode)
+	if entry == nil {
+		http.Error(w, "inode not found", 404)
+		return
+	}
+
+	// Re-stat the live source via the FUSE mount (direct JuiceFS — no NFS
+	// self-loop). entry.Path is volume-relative. Gate: the AI must have been
+	// computed against the CURRENT bytes.
+	src := filepath.Join(fusePath, entry.Path)
+	fi, err := os.Stat(src)
+	if err != nil {
+		http.Error(w, "source unreadable: "+err.Error(), http.StatusConflict)
+		return
+	}
+	if fi.Size() != req.SourceSize || fi.ModTime().Unix() != req.SourceMtime {
+		http.Error(w, fmt.Sprintf("stale: live size/mtime (%d/%d) != vouched (%d/%d) — AI computed against old bytes",
+			fi.Size(), fi.ModTime().Unix(), req.SourceSize, req.SourceMtime), http.StatusConflict)
+		return
+	}
+
+	// Stamp the canonical source_hash (sampled xxh3) — the server is the hash
+	// authority. (The consumer wrote the blob; we do not re-verify its bytes,
+	// matching OL-1 "the server only indexes it" — a phantom row degrades
+	// gracefully: a reader's blob read fails closed → regenerate locally.)
+	hash, err := farm.SampleHash(src, fi.Size())
+	if err != nil {
+		http.Error(w, "hash source: "+err.Error(), 500)
+		return
+	}
+
+	mt := "application/json"
+	var modelP *string
+	if req.Model != "" {
+		modelP = &req.Model
+	}
+	var dimP *int
+	if req.Dim > 0 {
+		dimP = &req.Dim
+	}
+	row := derivatives.DerivRow{
+		Kind: "ai", Status: "ready", Producer: req.Producer, Version: 1,
+		Hash: &hash, BlobRelPath: &rel, MediaType: &mt, Model: modelP, Dim: dimP,
+		UpdatedAt: time.Now().Unix(),
+	}
+	if err := ds.PutSource(req.Inode, &hash); err != nil {
+		http.Error(w, "put source: "+err.Error(), 500)
+		return
+	}
+	if err := ds.PutDeriv(req.Inode, row); err != nil {
+		http.Error(w, "put deriv: "+err.Error(), 500)
+		return
+	}
+	jmlog.Info("OL-1 AI contribute-back registered",
+		"inode", req.Inode, "producer", req.Producer, "model", req.Model, "hash", hash)
+	writeContractJSON(w, registerResponse{Inode: req.Inode, Registered: true, Derivative: row})
 }
 
 func handleCacheStatusHTTP(w http.ResponseWriter, r *http.Request) {

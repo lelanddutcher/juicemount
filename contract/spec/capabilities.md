@@ -59,9 +59,14 @@ detect mount (signature) ──► GET /health (confirm live JuiceMount)
 The canonical vocabulary — the **only** tokens that may appear in `capabilities`:
 
 `health`, `whoami`, `residency`, `lookup`, `cache-status`, `offline`, `spool`, `activity`, `pin`, `unpin`,
-`self-test`, `verify-pins`, `metrics`, `derivatives`, `metadata`.
+`self-test`, `verify-pins`, `metrics`, `derivatives`, `metadata`, `contribute`.
 
 (`derivatives` + `metadata` are the JM-14 shared-derivative-platform reads — GUI-only, like residency/lookup.)
+
+(`contribute` is the OL-1 on-device-AI contribute-back **write** — `POST /derivatives/register`. GUI-only;
+fail-open: a consumer that doesn't see it keeps its AI local, as today. The served route is
+`/derivatives/register`, but the capability token is `contribute`, so the derivation maps that one route → the
+`contribute` token rather than using the literal route string.)
 
 (`activity` is GUI-only — `jm5` does not serve it, so it appears in the GUI list but not the CLI list.)
 

@@ -19,9 +19,9 @@
     "deployment": { "enum": ["gui", "cli"], "description": "gui = full cbridge control plane; cli = jm5 (partial: health/spool/metrics only)." },
     "capabilities": {
       "type": "array",
-      "items": { "enum": ["health","whoami","residency","lookup","cache-status","offline","spool","activity","pin","unpin","self-test","verify-pins","metrics","derivatives","metadata"] },
+      "items": { "enum": ["health","whoami","residency","lookup","cache-status","offline","spool","activity","pin","unpin","self-test","verify-pins","metrics","derivatives","metadata","contribute"] },
       "description": "DERIVED (never hardcoded) as: the intersection of the routes THIS binary serves with the contract's known capability vocabulary (this enum). Operational/UI routes (reclaim, cache-clear, force-eject, stop, mount-now, spool-recover, debug/pprof, manager, migrator) are NOT capabilities and are excluded. Because a binary that answers /whoami is by definition serving the whoami route, 'whoami' is always present. The ONLY correct way to feature-detect. NOTE: a token only asserts the route EXISTS — for cache-status, also require contract_version>=1 before parsing snake_case keys (pre-JM-3 JuiceMount emits capitalized keys).",
-      "examples": [["health","whoami","residency","lookup","cache-status","offline","spool","activity","pin","unpin","self-test","verify-pins","metrics","derivatives","metadata"]]
+      "examples": [["health","whoami","residency","lookup","cache-status","offline","spool","activity","pin","unpin","self-test","verify-pins","metrics","derivatives","metadata","contribute"]]
     }
   }
 }

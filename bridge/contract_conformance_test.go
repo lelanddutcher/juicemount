@@ -187,6 +187,7 @@ func seedControlPlane(t *testing.T) func() {
 	guiRoutes := []string{
 		"/health", "/metrics", "/pin", "/unpin", "/cache-status", "/offline",
 		"/whoami", "/residency", "/lookup", "/derivatives", "/metadata",
+		"/derivatives/register", // OL-1 → contribute capability
 		"/reclaim", "/cache-clear", "/verify-pins", "/force-eject", "/stop",
 		"/self-test", "/spool", "/activity", "/spool-recover", "/mount-now",
 		"/debug/pprof/",

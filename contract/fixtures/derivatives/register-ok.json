@@ -1,0 +1,16 @@
+{
+  "inode": 1180417,
+  "registered": true,
+  "derivative": {
+    "kind": "ai",
+    "status": "ready",
+    "producer": "on-device",
+    "version": 1,
+    "hash": "9f2b1c0a4e7d8b30",
+    "blob_rel_path": "ai.loupe.json",
+    "media_type": "application/json",
+    "model": "apple-featureprint-v1",
+    "dim": 768,
+    "updated_at": 1750000000
+  }
+}

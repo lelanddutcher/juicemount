@@ -268,6 +268,24 @@
       "schema": "waveform.schema.json",
       "http_status": 200,
       "note": "JM-18 BBC audiowaveform format; data.length == length*2*channels"
+    },
+    {
+      "file": "derivatives/register-ok.json",
+      "endpoint": "/derivatives/register",
+      "method": "POST",
+      "request": {
+        "inode": 1180417,
+        "kind": "ai",
+        "producer": "on-device",
+        "model": "apple-featureprint-v1",
+        "dim": 768,
+        "source_size": 880000000,
+        "source_mtime": 1700000000,
+        "blob_rel_path": "ai.loupe.json"
+      },
+      "schema": "register.schema.json",
+      "http_status": 200,
+      "note": "OL-1 on-device AI contribute-back; matching size/mtime \u2192 200 + row. Stale size/mtime \u2192 409 (no fixture body)."
     }
   ]
 }

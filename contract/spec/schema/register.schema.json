@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/register.schema.json",
+  "title": "DerivativeRegister",
+  "description": "POST /derivatives/register — the on-device AI contribute-back (OL-1). A consumer that computed expensive, identity-bearing AI on-device (Apple FeaturePrint/Vision embeddings, faces, OCR, Speech transcripts, auto-tags, aesthetics — the LoupeJSON `ai` block) FIRST writes the blob through the mount to <nas_root>/.juicemount/derivatives/<inode>/ai.loupe.json (it has write access), THEN calls this to make the server index it so every other client + the web UI reuses it. AI-ONLY (kind:\"ai\"); tech/thumbnail/filmstrip/waveform/proxy are the server lane's job and never pushed back. The server is the source-hash authority: the consumer cannot compute the contract xxh3 (it uses xxh64), so it VOUCHES with source_size+source_mtime (the live stat it computed the AI against); the server re-stats and accepts ONLY on a size+mtime match (else 409 — the AI was computed against stale bytes), then stamps the canonical xxh3 itself.\n\nREQUEST body (application/json): { inode:int, kind:\"ai\", producer:\"on-device\", model:string, dim:int, source_size:int, source_mtime:int, blob_rel_path:\"ai.loupe.json\" }.\n\nThis document is the 200 RESPONSE.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["inode", "registered", "derivative"],
+  "properties": {
+    "inode": { "type": "integer", "description": "Echo of the registered asset's JuiceFS inode." },
+    "registered": { "type": "boolean", "description": "true on a successful register (200). A stale-bytes register returns HTTP 409 with no body validated here." },
+    "derivative": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The manifest row the server wrote — identical shape to a derivatives.schema.json entry. The server stamped source_hash (its own xxh3), updated_at, and status:ready.",
+      "required": ["kind", "status", "producer", "version", "hash", "blob_rel_path", "media_type", "updated_at"],
+      "properties": {
+        "kind": { "const": "ai", "description": "OL-1 is AI-only." },
+        "status": { "const": "ready" },
+        "producer": { "enum": ["on-device", "macos-node"], "description": "Who computed it. on-device = Apple frameworks / BYO cloud key on a Mac." },
+        "version": { "type": "integer", "minimum": 1 },
+        "hash": { "type": ["string", "null"], "description": "The server's canonical xxh3 of the source (== source_hash). On-device consumers verify with size/mtime, not this; an xxh3-capable client/web UI can verify by hash." },
+        "blob_rel_path": { "const": "ai.loupe.json", "description": "Volume-relative under /.juicemount/derivatives/<inode>/. The consumer wrote the bytes; the server only indexes the row." },
+        "media_type": { "const": "application/json" },
+        "model": { "type": ["string", "null"], "description": "Embedding model id+version so kNN partitions by space (e.g. apple-featureprint-v1 vs the portable openclip-vit-b32-v1)." },
+        "dim": { "type": ["integer", "null"], "description": "Embedding dimensionality." },
+        "updated_at": { "type": "integer" }
+      }
+    }
+  }
+}

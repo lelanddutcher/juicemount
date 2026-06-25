@@ -44,7 +44,15 @@ var capabilityVocab = map[string]bool{
 	"health": true, "whoami": true, "residency": true, "lookup": true,
 	"cache-status": true, "offline": true, "spool": true, "activity": true,
 	"pin": true, "unpin": true, "self-test": true, "verify-pins": true,
-	"metrics": true, "derivatives": true, "metadata": true,
+	"metrics": true, "derivatives": true, "metadata": true, "contribute": true,
+}
+
+// routeCapAlias maps a served route (no leading slash) to a capability token when
+// the token differs from the route path. OL-1: the write route is
+// "/derivatives/register" but the capability is `contribute` (a route whose
+// trimmed path isn't itself a vocabulary token).
+var routeCapAlias = map[string]string{
+	"derivatives/register": "contribute",
 }
 
 // DeriveCapabilities computes the capability list as the intersection of the
@@ -63,6 +71,8 @@ func DeriveCapabilities(servedRoutes []string) []string {
 		token := strings.TrimPrefix(strings.TrimSpace(r), "/")
 		if capabilityVocab[token] {
 			caps[token] = true
+		} else if alias, ok := routeCapAlias[token]; ok {
+			caps[alias] = true
 		}
 	}
 	out := make([]string, 0, len(caps))
