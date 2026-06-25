@@ -116,5 +116,8 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		res.Err = fmt.Errorf("put proxy deriv: %w", err)
 		return res
 	}
+	if opt.Mount != "" {
+		_ = WriteManifestSidecar(store, opt.Mount, inode) // JM-15: best-effort
+	}
 	return res
 }

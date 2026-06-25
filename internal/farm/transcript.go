@@ -270,6 +270,9 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 		res.Err = fmt.Errorf("put ai deriv: %w", err)
 		return res
 	}
+	if opt.Mount != "" {
+		_ = WriteManifestSidecar(store, opt.Mount, inode) // JM-15: best-effort
+	}
 	return res
 }
 

@@ -186,5 +186,12 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	// Blob failures are non-fatal — the tech row is published and the manifest
 	// carries failed blob rows; the consumer regenerates those locally.
 	res.BlobErr = errors.Join(blobErrs...)
+	// JM-15: mirror the committed manifest to a volume sidecar so the Mac can
+	// reconcile server-generated rows. Best-effort (recoverable next pass).
+	if opt.Mount != "" {
+		if err := WriteManifestSidecar(store, opt.Mount, inode); err != nil {
+			res.BlobErr = errors.Join(res.BlobErr, fmt.Errorf("sidecar: %w", err))
+		}
+	}
 	return res
 }
