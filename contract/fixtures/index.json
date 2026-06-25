@@ -2,41 +2,272 @@
   "contract_version": 1,
   "description": "Machine-readable manifest of every golden fixture: which endpoint/method/request it represents, which schema it must validate against, and the expected HTTP status. Both sides' test harnesses iterate this.",
   "fixtures": [
-    { "file": "whoami/gui.json", "endpoint": "/whoami", "method": "GET", "request": {}, "schema": "whoami.schema.json", "http_status": 200, "note": "GUI (cbridge) — full capabilities" },
-    { "file": "whoami/cli.json", "endpoint": "/whoami", "method": "GET", "request": {}, "schema": "whoami.schema.json", "http_status": 200, "note": "jm5 CLI — partial capabilities" },
-
-    { "file": "residency/resident.json", "endpoint": "/residency", "method": "GET", "request": { "path": "/Volumes/zpool/Project_Foo/clip_031.mov" }, "schema": "residency.schema.json", "http_status": 200, "note": "all bytes on SSD — only state that lights the green badge" },
-    { "file": "residency/streaming.json", "endpoint": "/residency", "method": "GET", "request": { "path": "/Volumes/zpool/Project_Foo/clip_204.mov" }, "schema": "residency.schema.json", "http_status": 200, "note": "reachable but not cached" },
-    { "file": "residency/warming.json", "endpoint": "/residency", "method": "GET", "request": { "path": "/Volumes/zpool/Project_Foo/clip_205.mov" }, "schema": "residency.schema.json", "http_status": 200, "note": "partial — bytes_cached < total" },
-    { "file": "residency/uploading.json", "endpoint": "/residency", "method": "GET", "request": { "path": "/Volumes/zpool/incoming/take_07.mov" }, "schema": "residency.schema.json", "http_status": 200, "note": "resident but still draining to NAS" },
-    { "file": "residency/absent.json", "endpoint": "/residency", "method": "GET", "request": { "path": "/Volumes/zpool/Project_Foo/deleted_take.mov" }, "schema": "residency.schema.json", "http_status": 200, "note": "exists=false forces all flags false / bytes 0 / inode omitted" },
-
-    { "file": "lookup/file.json", "endpoint": "/lookup", "method": "GET", "request": { "path": "/Volumes/zpool/Project_Foo/clip_031.mov" }, "schema": "lookup.schema.json", "http_status": 200 },
-    { "file": "lookup/missing.json", "endpoint": "/lookup", "method": "GET", "request": { "path": "/Volumes/zpool/Project_Foo/not_here.mov" }, "schema": "lookup.schema.json", "http_status": 200 },
-
-    { "file": "derivatives/ready.json", "endpoint": "/derivatives", "method": "GET", "request": { "inode": "1180417" }, "schema": "derivatives.schema.json", "http_status": 200, "note": "JM-14 manifest — tech/thumb/strip/wave ready, proxy pending, embedding (model-stamped)" },
-    { "file": "derivatives/absent.json", "endpoint": "/derivatives", "method": "GET", "request": { "inode": "999999" }, "schema": "derivatives.schema.json", "http_status": 200, "note": "unknown inode → exists:false, empty derivatives" },
-
-    { "file": "metadata/tech.json", "endpoint": "/metadata", "method": "GET", "request": { "inode": "1180417", "kind": "tech" }, "schema": "metadata.schema.json", "http_status": 200, "note": "JM-14 structured tech/EXIF — OpenLoupe's first consume slice" },
-    { "file": "metadata/absent.json", "endpoint": "/metadata", "method": "GET", "request": { "inode": "999999", "kind": "tech" }, "schema": "metadata.schema.json", "http_status": 200 },
-
-    { "file": "health/ok.json", "endpoint": "/health", "method": "GET", "request": {}, "schema": "health.schema.json", "http_status": 200 },
-    { "file": "health/degraded.json", "endpoint": "/health", "method": "GET", "request": {}, "schema": "health.schema.json", "http_status": 503, "note": "503 when healthy=false" },
-
-    { "file": "cache-status/warming.json", "endpoint": "/cache-status", "method": "GET", "request": {}, "schema": "cache-status.schema.json", "http_status": 200, "note": "snake_case TARGET form — requires JM-3 struct tags" },
-    { "file": "cache-status/idle.json", "endpoint": "/cache-status", "method": "GET", "request": {}, "schema": "cache-status.schema.json", "http_status": 200, "note": "no pin roots — roots:null, live zeroed" },
-
-    { "file": "offline/online.json", "endpoint": "/offline", "method": "GET", "request": {}, "schema": "offline-state.schema.json", "http_status": 200 },
-    { "file": "offline/user-offline.json", "endpoint": "/offline", "method": "GET", "request": {}, "schema": "offline-state.schema.json", "http_status": 200 },
-    { "file": "offline/toggle.json", "endpoint": "/offline", "method": "POST", "request": { "on": "true" }, "schema": "offline-state.schema.json#/$defs/offline-toggle", "http_status": 200, "note": "toggle path returns {ok, offline_mode}" },
-
-    { "file": "spool/active.json", "endpoint": "/spool", "method": "GET", "request": {}, "schema": "spool-status.schema.json", "http_status": 200 },
-    { "file": "spool/disabled.json", "endpoint": "/spool", "method": "GET", "request": {}, "schema": "spool-status.schema.json", "http_status": 503, "note": "503 when spool not enabled" },
-
-    { "file": "activity/working.json", "endpoint": "/activity", "method": "GET", "request": {}, "schema": "activity.schema.json", "http_status": 200, "note": "what JuiceMount is doing now — cleanest source for the inspector 'activity' line" },
-    { "file": "activity/idle.json", "endpoint": "/activity", "method": "GET", "request": {}, "schema": "activity.schema.json", "http_status": 200 },
-
-    { "file": "pin/ok.json", "endpoint": "/pin", "method": "POST", "request": { "path": "/Volumes/zpool/Project_Foo" }, "schema": "pin-result.schema.json", "http_status": 200, "note": "fresh pin returns scanning=true with 0 counts; real counts via /cache-status" },
-    { "file": "pin/unpin-ok.json", "endpoint": "/unpin", "method": "POST", "request": { "path": "/Volumes/zpool/Project_Foo" }, "schema": "pin-result.schema.json", "http_status": 200, "note": "files_pinned = count removed; bytes_total = 0" }
+    {
+      "file": "whoami/gui.json",
+      "endpoint": "/whoami",
+      "method": "GET",
+      "request": {},
+      "schema": "whoami.schema.json",
+      "http_status": 200,
+      "note": "GUI (cbridge) \u2014 full capabilities"
+    },
+    {
+      "file": "whoami/cli.json",
+      "endpoint": "/whoami",
+      "method": "GET",
+      "request": {},
+      "schema": "whoami.schema.json",
+      "http_status": 200,
+      "note": "jm5 CLI \u2014 partial capabilities"
+    },
+    {
+      "file": "residency/resident.json",
+      "endpoint": "/residency",
+      "method": "GET",
+      "request": {
+        "path": "/Volumes/zpool/Project_Foo/clip_031.mov"
+      },
+      "schema": "residency.schema.json",
+      "http_status": 200,
+      "note": "all bytes on SSD \u2014 only state that lights the green badge"
+    },
+    {
+      "file": "residency/streaming.json",
+      "endpoint": "/residency",
+      "method": "GET",
+      "request": {
+        "path": "/Volumes/zpool/Project_Foo/clip_204.mov"
+      },
+      "schema": "residency.schema.json",
+      "http_status": 200,
+      "note": "reachable but not cached"
+    },
+    {
+      "file": "residency/warming.json",
+      "endpoint": "/residency",
+      "method": "GET",
+      "request": {
+        "path": "/Volumes/zpool/Project_Foo/clip_205.mov"
+      },
+      "schema": "residency.schema.json",
+      "http_status": 200,
+      "note": "partial \u2014 bytes_cached < total"
+    },
+    {
+      "file": "residency/uploading.json",
+      "endpoint": "/residency",
+      "method": "GET",
+      "request": {
+        "path": "/Volumes/zpool/incoming/take_07.mov"
+      },
+      "schema": "residency.schema.json",
+      "http_status": 200,
+      "note": "resident but still draining to NAS"
+    },
+    {
+      "file": "residency/absent.json",
+      "endpoint": "/residency",
+      "method": "GET",
+      "request": {
+        "path": "/Volumes/zpool/Project_Foo/deleted_take.mov"
+      },
+      "schema": "residency.schema.json",
+      "http_status": 200,
+      "note": "exists=false forces all flags false / bytes 0 / inode omitted"
+    },
+    {
+      "file": "lookup/file.json",
+      "endpoint": "/lookup",
+      "method": "GET",
+      "request": {
+        "path": "/Volumes/zpool/Project_Foo/clip_031.mov"
+      },
+      "schema": "lookup.schema.json",
+      "http_status": 200
+    },
+    {
+      "file": "lookup/missing.json",
+      "endpoint": "/lookup",
+      "method": "GET",
+      "request": {
+        "path": "/Volumes/zpool/Project_Foo/not_here.mov"
+      },
+      "schema": "lookup.schema.json",
+      "http_status": 200
+    },
+    {
+      "file": "derivatives/ready.json",
+      "endpoint": "/derivatives",
+      "method": "GET",
+      "request": {
+        "inode": "1180417"
+      },
+      "schema": "derivatives.schema.json",
+      "http_status": 200,
+      "note": "JM-14 manifest \u2014 tech/thumb/strip/wave ready, proxy pending, embedding (model-stamped)"
+    },
+    {
+      "file": "derivatives/absent.json",
+      "endpoint": "/derivatives",
+      "method": "GET",
+      "request": {
+        "inode": "999999"
+      },
+      "schema": "derivatives.schema.json",
+      "http_status": 200,
+      "note": "unknown inode \u2192 exists:false, empty derivatives"
+    },
+    {
+      "file": "metadata/tech.json",
+      "endpoint": "/metadata",
+      "method": "GET",
+      "request": {
+        "inode": "1180417",
+        "kind": "tech"
+      },
+      "schema": "metadata.schema.json",
+      "http_status": 200,
+      "note": "JM-14 structured tech/EXIF \u2014 OpenLoupe's first consume slice"
+    },
+    {
+      "file": "metadata/absent.json",
+      "endpoint": "/metadata",
+      "method": "GET",
+      "request": {
+        "inode": "999999",
+        "kind": "tech"
+      },
+      "schema": "metadata.schema.json",
+      "http_status": 200
+    },
+    {
+      "file": "health/ok.json",
+      "endpoint": "/health",
+      "method": "GET",
+      "request": {},
+      "schema": "health.schema.json",
+      "http_status": 200
+    },
+    {
+      "file": "health/degraded.json",
+      "endpoint": "/health",
+      "method": "GET",
+      "request": {},
+      "schema": "health.schema.json",
+      "http_status": 503,
+      "note": "503 when healthy=false"
+    },
+    {
+      "file": "cache-status/warming.json",
+      "endpoint": "/cache-status",
+      "method": "GET",
+      "request": {},
+      "schema": "cache-status.schema.json",
+      "http_status": 200,
+      "note": "snake_case TARGET form \u2014 requires JM-3 struct tags"
+    },
+    {
+      "file": "cache-status/idle.json",
+      "endpoint": "/cache-status",
+      "method": "GET",
+      "request": {},
+      "schema": "cache-status.schema.json",
+      "http_status": 200,
+      "note": "no pin roots \u2014 roots:null, live zeroed"
+    },
+    {
+      "file": "offline/online.json",
+      "endpoint": "/offline",
+      "method": "GET",
+      "request": {},
+      "schema": "offline-state.schema.json",
+      "http_status": 200
+    },
+    {
+      "file": "offline/user-offline.json",
+      "endpoint": "/offline",
+      "method": "GET",
+      "request": {},
+      "schema": "offline-state.schema.json",
+      "http_status": 200
+    },
+    {
+      "file": "offline/toggle.json",
+      "endpoint": "/offline",
+      "method": "POST",
+      "request": {
+        "on": "true"
+      },
+      "schema": "offline-state.schema.json#/$defs/offline-toggle",
+      "http_status": 200,
+      "note": "toggle path returns {ok, offline_mode}"
+    },
+    {
+      "file": "spool/active.json",
+      "endpoint": "/spool",
+      "method": "GET",
+      "request": {},
+      "schema": "spool-status.schema.json",
+      "http_status": 200
+    },
+    {
+      "file": "spool/disabled.json",
+      "endpoint": "/spool",
+      "method": "GET",
+      "request": {},
+      "schema": "spool-status.schema.json",
+      "http_status": 503,
+      "note": "503 when spool not enabled"
+    },
+    {
+      "file": "activity/working.json",
+      "endpoint": "/activity",
+      "method": "GET",
+      "request": {},
+      "schema": "activity.schema.json",
+      "http_status": 200,
+      "note": "what JuiceMount is doing now \u2014 cleanest source for the inspector 'activity' line"
+    },
+    {
+      "file": "activity/idle.json",
+      "endpoint": "/activity",
+      "method": "GET",
+      "request": {},
+      "schema": "activity.schema.json",
+      "http_status": 200
+    },
+    {
+      "file": "pin/ok.json",
+      "endpoint": "/pin",
+      "method": "POST",
+      "request": {
+        "path": "/Volumes/zpool/Project_Foo"
+      },
+      "schema": "pin-result.schema.json",
+      "http_status": 200,
+      "note": "fresh pin returns scanning=true with 0 counts; real counts via /cache-status"
+    },
+    {
+      "file": "pin/unpin-ok.json",
+      "endpoint": "/unpin",
+      "method": "POST",
+      "request": {
+        "path": "/Volumes/zpool/Project_Foo"
+      },
+      "schema": "pin-result.schema.json",
+      "http_status": 200,
+      "note": "files_pinned = count removed; bytes_total = 0"
+    },
+    {
+      "file": "waveform.json",
+      "endpoint": "(blob)",
+      "method": "GET",
+      "request": {
+        "note": "bytes of the waveform derivative blob, not a control-plane response"
+      },
+      "schema": "waveform.schema.json",
+      "http_status": 200,
+      "note": "JM-18 BBC audiowaveform format; data.length == length*2*channels"
+    }
   ]
 }

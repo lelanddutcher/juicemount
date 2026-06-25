@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/waveform.schema.json",
+  "title": "Waveform",
+  "description": "JM-18 audio waveform overview — the BYTES of the `waveform` derivative blob at /.juicemount/derivatives/<inode>/waveform.json (not a control-plane response). De-facto-standard BBC audiowaveform / waveform-data.js JSON so OpenLoupe and an off-the-shelf web renderer parse it identically. Lets a client skip a local PCM decode.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "channels", "sample_rate", "samples_per_pixel", "bits", "length", "data"],
+  "properties": {
+    "version": { "const": 2 },
+    "channels": { "type": "integer", "minimum": 1 },
+    "sample_rate": { "type": "integer", "minimum": 1, "description": "PCM sample rate the overview was computed at." },
+    "samples_per_pixel": { "type": "integer", "minimum": 1, "description": "Samples summarized per pixel column; spp/sample_rate = seconds per pixel (the time↔pixel mapping)." },
+    "bits": { "enum": [8, 16], "description": "Peak resolution. 8 ⇒ values in [-128,127]; 16 ⇒ [-32768,32767]." },
+    "length": { "type": "integer", "minimum": 0, "description": "Pixel columns." },
+    "data": {
+      "type": "array",
+      "items": { "type": "integer" },
+      "description": "Flat interleaved min,max pairs per pixel, row-major by pixel then channel. data.length == length * 2 * channels; each consecutive (min,max) pair has min <= max; values within the bits range."
+    }
+  }
+}

@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,22 @@ type DerivRow struct {
 	Model       *string `json:"model"`
 	Dim         *int    `json:"dim"`
 	UpdatedAt   int64   `json:"updated_at"`
+	// Filmstrip is the sprite-sheet geometry (JM-16), present ONLY for
+	// kind=="filmstrip". Persisted in the row's kind-specific `extra` JSON
+	// column. omitempty so every other kind omits it on the wire.
+	Filmstrip *FilmstripGeo `json:"filmstrip,omitempty"`
+}
+
+// FilmstripGeo is the sprite-sheet geometry a scrubber needs to map a time to a
+// cell rect. Schema: derivatives.schema.json derivative-entry `filmstrip`.
+type FilmstripGeo struct {
+	FrameCount int `json:"frame_count"`
+	Cols       int `json:"cols"`
+	Rows       int `json:"rows"`
+	CellW      int `json:"cell_w"`
+	CellH      int `json:"cell_h"`
+	IntervalMS int `json:"interval_ms"`
+	DurationMS int `json:"duration_ms"`
 }
 
 // TechMeta is the structured tech/EXIF metadata for one asset (kind=tech).
@@ -61,6 +78,7 @@ CREATE TABLE IF NOT EXISTS derivatives (
     model         TEXT,
     dim           INTEGER,
     updated_at    INTEGER NOT NULL,
+    extra         TEXT,
     PRIMARY KEY (inode, kind)
 );
 CREATE TABLE IF NOT EXISTS metadata (
@@ -97,6 +115,14 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("derivatives: schema: %w", err)
 	}
+	// Migration: add the kind-specific `extra` JSON column (JM-16 filmstrip
+	// geometry) to a derivatives table created before it existed. Fresh DBs
+	// already have it from the CREATE above, so the duplicate-column error is
+	// expected and ignored.
+	if _, err := db.Exec(`ALTER TABLE derivatives ADD COLUMN extra TEXT`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, fmt.Errorf("derivatives: migrate extra: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -124,7 +150,7 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
-		SELECT kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at
+		SELECT kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra
 		FROM derivatives WHERE inode = ? ORDER BY kind`, int64(inode))
 	if err != nil {
 		return nil, err
@@ -133,9 +159,9 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 	var out []DerivRow
 	for rows.Next() {
 		var d DerivRow
-		var hash, blob, mt, model sql.NullString
+		var hash, blob, mt, model, extra sql.NullString
 		var dim sql.NullInt64
-		if err := rows.Scan(&d.Kind, &d.Status, &d.Producer, &d.Version, &hash, &blob, &mt, &model, &dim, &d.UpdatedAt); err != nil {
+		if err := rows.Scan(&d.Kind, &d.Status, &d.Producer, &d.Version, &hash, &blob, &mt, &model, &dim, &d.UpdatedAt, &extra); err != nil {
 			return nil, err
 		}
 		d.Hash = nullStr(hash)
@@ -145,6 +171,13 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 		if dim.Valid {
 			v := int(dim.Int64)
 			d.Dim = &v
+		}
+		// kind-specific `extra`: filmstrip geometry today (JM-16).
+		if d.Kind == "filmstrip" && extra.Valid && extra.String != "" {
+			var fg FilmstripGeo
+			if json.Unmarshal([]byte(extra.String), &fg) == nil {
+				d.Filmstrip = &fg
+			}
 		}
 		out = append(out, d)
 	}
@@ -190,14 +223,14 @@ func (s *Store) PutDeriv(inode uint64, d DerivRow) error {
 		d.UpdatedAt = time.Now().Unix()
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(inode, kind) DO UPDATE SET
 		    status=excluded.status, producer=excluded.producer, version=excluded.version,
 		    hash=excluded.hash, blob_rel_path=excluded.blob_rel_path, media_type=excluded.media_type,
-		    model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at`,
+		    model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra`,
 		int64(inode), d.Kind, d.Status, d.Producer, d.Version, strOrNil(d.Hash),
-		strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), d.UpdatedAt)
+		strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), d.UpdatedAt, extraJSON(d))
 	return err
 }
 
@@ -248,14 +281,14 @@ func (s *Store) IngestTech(inode uint64, hash *string, producer string, version 
 		if ts == 0 {
 			ts = now
 		}
-		if _, err := tx.Exec(`INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?)
+		if _, err := tx.Exec(`INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(inode, kind) DO UPDATE SET
 				status=excluded.status, producer=excluded.producer, version=excluded.version,
 				hash=excluded.hash, blob_rel_path=excluded.blob_rel_path, media_type=excluded.media_type,
-				model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at`,
+				model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra`,
 			int64(inode), d.Kind, d.Status, d.Producer, d.Version, strOrNil(d.Hash),
-			strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), ts); err != nil {
+			strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), ts, extraJSON(d)); err != nil {
 			return err
 		}
 	}
@@ -280,4 +313,16 @@ func intOrNil(p *int) any {
 		return nil
 	}
 	return *p
+}
+
+// extraJSON serializes a row's kind-specific sub-object into the `extra` column.
+// Filmstrip geometry today (JM-16); nil for every other kind.
+func extraJSON(d DerivRow) any {
+	if d.Filmstrip != nil {
+		b, err := json.Marshal(d.Filmstrip)
+		if err == nil {
+			return string(b)
+		}
+	}
+	return nil
 }

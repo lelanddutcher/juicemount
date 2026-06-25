@@ -42,6 +42,10 @@ func main() {
 		mount    = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
 		blobs    = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
 		thumbDim = flag.Int("thumb-dim", 640, "poster fit box in px")
+		filmstr  = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
+		filmCell = flag.Int("filmstrip-cell", 160, "filmstrip cell width in px")
+		wave     = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
+		waveSPP  = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
 		limit    = flag.Int("limit", 0, "max files to process (0 = no limit)")
 		conc     = flag.Int("concurrency", 4, "parallel workers")
 		producer = flag.String("producer", "macos-node", "producer tag")
@@ -79,14 +83,15 @@ func main() {
 
 	opt := farm.Options{
 		Producer: *producer, Version: *version, Mount: *mount,
-		Blobs: *blobs, ThumbMaxDim: *thumbDim,
+		Blobs: *blobs, ThumbMaxDim: *thumbDim, Filmstrip: *filmstr, FilmstripCell: *filmCell,
+		Waveform: *wave, WaveformSPP: *waveSPP,
 	}
 
-	fmt.Printf("jmfarm: %d files → %s  (producer=%s v%d, blobs=%v, dry-run=%v, workers=%d)\n",
-		len(targets), *dbPath, *producer, *version, *blobs, *dryRun, *conc)
+	fmt.Printf("jmfarm: %d files → %s  (producer=%s v%d, blobs=%v, filmstrip=%v, waveform=%v, dry-run=%v, workers=%d)\n",
+		len(targets), *dbPath, *producer, *version, *blobs, *filmstr, *wave, *dryRun, *conc)
 
 	start := time.Now()
-	var ok, failed, thumbs int64
+	var ok, failed, thumbs, strips, waves int64
 	var mu sync.Mutex
 	var firstErrs []string
 
@@ -127,16 +132,25 @@ func main() {
 			if r.ThumbWrote {
 				atomic.AddInt64(&thumbs, 1)
 			}
+			if r.FilmWrote {
+				atomic.AddInt64(&strips, 1)
+			}
+			if r.WaveWrote {
+				atomic.AddInt64(&waves, 1)
+			}
+			if r.BlobErr != nil { // non-fatal: tech published, a blob couldn't render
+				recordErr(&mu, &firstErrs, p, r.BlobErr)
+			}
 			if *verbose {
-				fmt.Printf("  [ok] %-50s inode=%d hash=%s %dms vid=%v thumb=%v\n",
-					filepath.Base(p), r.Inode, r.Hash, r.DurationMS, r.HasVideo, r.ThumbWrote)
+				fmt.Printf("  [ok] %-50s inode=%d hash=%s %dms vid=%v thumb=%v strip=%v wave=%v\n",
+					filepath.Base(p), r.Inode, r.Hash, r.DurationMS, r.HasVideo, r.ThumbWrote, r.FilmWrote, r.WaveWrote)
 			}
 		}()
 	}
 	wg.Wait()
 
-	fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails — %d total\n",
-		time.Since(start).Round(time.Millisecond), ok, failed, thumbs, len(targets))
+	fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails, %d filmstrips, %d waveforms — %d total\n",
+		time.Since(start).Round(time.Millisecond), ok, failed, thumbs, strips, waves, len(targets))
 	if len(firstErrs) > 0 {
 		fmt.Printf("first errors (%d shown):\n", len(firstErrs))
 		for _, e := range firstErrs {

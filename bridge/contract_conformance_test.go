@@ -246,10 +246,12 @@ func seedDerivatives(t *testing.T, ds *derivatives.Store) {
 	rows := []derivatives.DerivRow{
 		{Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), UpdatedAt: updated},
 		{Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), BlobRelPath: sp("poster.jpg"), MediaType: sp("image/jpeg"), UpdatedAt: updated},
-		{Kind: "filmstrip", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), BlobRelPath: sp("strip.jpg"), MediaType: sp("image/jpeg"), UpdatedAt: updated},
-		{Kind: "waveform", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), BlobRelPath: sp("wave.json"), MediaType: sp("application/json"), UpdatedAt: updated},
+		{Kind: "filmstrip", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), BlobRelPath: sp("strip.jpg"), MediaType: sp("image/jpeg"), UpdatedAt: updated,
+			Filmstrip: &derivatives.FilmstripGeo{FrameCount: 120, Cols: 12, Rows: 10, CellW: 160, CellH: 90, IntervalMS: 1000, DurationMS: 120000}},
+		{Kind: "waveform", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), BlobRelPath: sp("waveform.json"), MediaType: sp("application/json"), UpdatedAt: updated},
 		{Kind: "proxy", Status: "pending", Producer: "linux-farm", Version: 1, MediaType: sp("video/mp4"), UpdatedAt: updated},
 		{Kind: "embedding", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), Model: sp("openclip-vit-b32-v1"), Dim: ip(512), UpdatedAt: updated},
+		{Kind: "ai", Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp(srcHash), BlobRelPath: sp("ai.loupe.json"), MediaType: sp("application/json"), Model: sp("openclip-vit-b32-v1"), Dim: ip(512), UpdatedAt: updated},
 	}
 	for _, r := range rows {
 		if err := ds.PutDeriv(inode, r); err != nil {

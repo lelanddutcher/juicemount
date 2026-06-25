@@ -59,12 +59,17 @@ func TestProducerEndToEnd(t *testing.T) {
 
 	res := farm.Process(store, clip, farm.Options{
 		Producer: "macos-node", Version: 1, Mount: tmp, Blobs: true, ThumbMaxDim: 320,
+		Filmstrip: true, FilmstripCell: 80, Waveform: true,
 	})
 	if res.Err != nil {
 		t.Fatalf("farm.Process: %v", res.Err)
 	}
 	if res.Inode == 0 || res.Hash == "" || !res.HasVideo {
 		t.Fatalf("unexpected result: %+v", res)
+	}
+	if !res.ThumbWrote || !res.FilmWrote || !res.WaveWrote {
+		t.Fatalf("expected all blobs written, got thumb=%v film=%v wave=%v blobErr=%v",
+			res.ThumbWrote, res.FilmWrote, res.WaveWrote, res.BlobErr)
 	}
 
 	// The inode the handler is queried with == the file's stat inode == what
@@ -75,10 +80,21 @@ func TestProducerEndToEnd(t *testing.T) {
 		t.Fatalf("producer inode %d != stat inode %d", res.Inode, wantInode)
 	}
 
-	// The poster blob landed at the Tier-A location.
-	poster := filepath.Join(farm.DerivBlobDir(tmp, wantInode), "poster.jpg")
-	if st, err := os.Stat(poster); err != nil || st.Size() == 0 {
-		t.Fatalf("poster blob missing/empty at %s: err=%v", poster, err)
+	// The poster/strip/waveform blobs landed at the Tier-A location.
+	blobDir := farm.DerivBlobDir(tmp, wantInode)
+	for _, name := range []string{"poster.jpg", "strip.jpg", "waveform.json"} {
+		if st, err := os.Stat(filepath.Join(blobDir, name)); err != nil || st.Size() == 0 {
+			t.Fatalf("blob %s missing/empty: err=%v", name, err)
+		}
+	}
+	// The waveform blob is valid BBC-format JSON (JM-18).
+	wfBytes, _ := os.ReadFile(filepath.Join(blobDir, "waveform.json"))
+	var wf any
+	if err := json.Unmarshal(wfBytes, &wf); err != nil {
+		t.Fatalf("waveform.json not JSON: %v", err)
+	}
+	if err := compileSchema(t, "waveform.schema.json").Validate(wf); err != nil {
+		t.Errorf("waveform.json does not validate: %v", err)
 	}
 
 	// Wire the handler globals to this store, then boot the REAL handlers.
@@ -133,15 +149,44 @@ func TestProducerEndToEnd(t *testing.T) {
 			t.Errorf("derivative %v hash %q != source_hash %q", row["kind"], h, srcHash)
 		}
 	}
-	if !kinds["tech"] || !kinds["thumbnail"] {
-		t.Errorf("expected tech+thumbnail rows, got %v", kinds)
+	for _, k := range []string{"tech", "thumbnail", "filmstrip", "waveform"} {
+		if !kinds[k] {
+			t.Errorf("expected a %s row, got kinds %v", k, kinds)
+		}
 	}
-	// The thumbnail row's blob_rel_path must point at the file we found.
 	for _, raw := range d["derivatives"].([]any) {
 		row := raw.(map[string]any)
-		if row["kind"] == "thumbnail" {
+		switch row["kind"] {
+		case "thumbnail":
 			if row["blob_rel_path"] != "poster.jpg" || row["media_type"] != "image/jpeg" {
 				t.Errorf("thumbnail row blob/media wrong: %v", row)
+			}
+		case "filmstrip":
+			// JM-16: the filmstrip row carries geometry; absent on every other kind.
+			fg, ok := row["filmstrip"].(map[string]any)
+			if !ok {
+				t.Errorf("filmstrip row missing geometry: %v", row)
+				continue
+			}
+			for _, f := range []string{"frame_count", "cols", "rows", "cell_w", "cell_h", "interval_ms", "duration_ms"} {
+				if fg[f] == nil {
+					t.Errorf("filmstrip geometry missing %q: %v", f, fg)
+				}
+			}
+			if fc, _ := fg["frame_count"].(float64); fc > 0 {
+				if cols, _ := fg["cols"].(float64); cols > 0 {
+					if rows, _ := fg["rows"].(float64); fc > cols*rows {
+						t.Errorf("frame_count %v > cols*rows %v", fc, cols*rows)
+					}
+				}
+			}
+		case "waveform":
+			if row["blob_rel_path"] != "waveform.json" {
+				t.Errorf("waveform row blob wrong: %v", row)
+			}
+		default:
+			if _, hasGeo := row["filmstrip"]; hasGeo {
+				t.Errorf("non-filmstrip kind %v must NOT carry filmstrip geometry", row["kind"])
 			}
 		}
 	}
