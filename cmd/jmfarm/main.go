@@ -46,6 +46,9 @@ func main() {
 		filmCell = flag.Int("filmstrip-cell", 160, "filmstrip cell width in px")
 		wave     = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
 		waveSPP  = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
+		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.loupe.json (instead of basic derivatives)")
+		wModel   = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
+		wBin     = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
 		limit    = flag.Int("limit", 0, "max files to process (0 = no limit)")
 		conc     = flag.Int("concurrency", 4, "parallel workers")
 		producer = flag.String("producer", "macos-node", "producer tag")
@@ -81,17 +84,26 @@ func main() {
 		defer store.Close()
 	}
 
+	if *transcr && *wModel == "" {
+		fmt.Fprintln(os.Stderr, "jmfarm: -transcript requires -whisper-model <ggml model path>")
+		os.Exit(2)
+	}
 	opt := farm.Options{
 		Producer: *producer, Version: *version, Mount: *mount,
 		Blobs: *blobs, ThumbMaxDim: *thumbDim, Filmstrip: *filmstr, FilmstripCell: *filmCell,
 		Waveform: *wave, WaveformSPP: *waveSPP,
+		WhisperBin: *wBin, WhisperModel: *wModel,
 	}
 
-	fmt.Printf("jmfarm: %d files → %s  (producer=%s v%d, blobs=%v, filmstrip=%v, waveform=%v, dry-run=%v, workers=%d)\n",
-		len(targets), *dbPath, *producer, *version, *blobs, *filmstr, *wave, *dryRun, *conc)
+	mode := "derivatives"
+	if *transcr {
+		mode = "transcript(AI)"
+	}
+	fmt.Printf("jmfarm: %d files → %s  (mode=%s, producer=%s v%d, dry-run=%v, workers=%d)\n",
+		len(targets), *dbPath, mode, *producer, *version, *dryRun, *conc)
 
 	start := time.Now()
-	var ok, failed, thumbs, strips, waves int64
+	var ok, failed, thumbs, strips, waves, speech int64
 	var mu sync.Mutex
 	var firstErrs []string
 
@@ -115,6 +127,27 @@ func main() {
 				atomic.AddInt64(&ok, 1)
 				if *verbose {
 					fmt.Printf("  [dry] %-50s %s %dms\n", filepath.Base(p), tech.Container, tech.DurationMS)
+				}
+				return
+			}
+
+			if *transcr {
+				tr := farm.GenerateTranscript(store, p, opt)
+				if tr.Err != nil {
+					atomic.AddInt64(&failed, 1)
+					recordErr(&mu, &firstErrs, p, tr.Err)
+					if *verbose {
+						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), tr.Inode, tr.Err)
+					}
+					return
+				}
+				atomic.AddInt64(&ok, 1)
+				if tr.HasSpeech {
+					atomic.AddInt64(&speech, 1)
+				}
+				if *verbose {
+					fmt.Printf("  [ok] %-50s inode=%d speech=%v segments=%d\n",
+						filepath.Base(p), tr.Inode, tr.HasSpeech, tr.Segments)
 				}
 				return
 			}
@@ -149,8 +182,13 @@ func main() {
 	}
 	wg.Wait()
 
-	fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails, %d filmstrips, %d waveforms — %d total\n",
-		time.Since(start).Round(time.Millisecond), ok, failed, thumbs, strips, waves, len(targets))
+	if *transcr {
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d with-speech (transcribed) — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, failed, speech, len(targets))
+	} else {
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails, %d filmstrips, %d waveforms — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, failed, thumbs, strips, waves, len(targets))
+	}
 	if len(firstErrs) > 0 {
 		fmt.Printf("first errors (%d shown):\n", len(firstErrs))
 		for _, e := range firstErrs {

@@ -25,6 +25,8 @@ type Options struct {
 	WaveformSPP   int    // waveform samples-per-pixel; 0 → 1024
 	FFprobeBin    string // override; "" → "ffprobe" on PATH
 	FFmpegBin     string // override; "" → "ffmpeg" on PATH
+	WhisperBin    string // whisper.cpp CLI; "" → "whisper-cli" on PATH (transcripts)
+	WhisperModel  string // path to a ggml whisper model (required for transcripts)
 }
 
 // Result is the per-file outcome (for CLI reporting / JM-15 accounting). Err is a
