@@ -49,6 +49,9 @@ func main() {
 		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.loupe.json (instead of basic derivatives)")
 		proxyGen = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
 		vcodec   = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
+		pCRF     = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")
+		pPreset  = flag.String("preset", "slow", "proxy x264 preset (faster preset = quicker, larger)")
+		pConc    = flag.Int("proxy-concurrency", 0, "separate (lower) worker count for proxy mode; 0 = use -concurrency (proxy transcode is the CPU hog)")
 		wModel   = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
 		wBin     = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
 		limit    = flag.Int("limit", 0, "max files to process (0 = no limit)")
@@ -95,7 +98,15 @@ func main() {
 		Producer: *producer, Version: *version, Mount: *mount,
 		Blobs: *blobs, ThumbMaxDim: *thumbDim, Filmstrip: *filmstr, FilmstripCell: *filmCell,
 		Waveform: *wave, WaveformSPP: *waveSPP,
-		WhisperBin: *wBin, WhisperModel: *wModel, ProxyVCodec: *vcodec,
+		WhisperBin: *wBin, WhisperModel: *wModel,
+		ProxyVCodec: *vcodec, ProxyCRF: *pCRF, ProxyPreset: *pPreset,
+	}
+
+	// Proxy transcode pins a core per clip, so it gets its own (lower)
+	// concurrency when requested — the manager's CPU governor sets this.
+	effConc := *conc
+	if *proxyGen && *pConc > 0 {
+		effConc = *pConc
 	}
 
 	mode := "derivatives"
@@ -105,14 +116,14 @@ func main() {
 		mode = "proxy"
 	}
 	fmt.Printf("jmfarm: %d files → %s  (mode=%s, producer=%s v%d, dry-run=%v, workers=%d)\n",
-		len(targets), *dbPath, mode, *producer, *version, *dryRun, *conc)
+		len(targets), *dbPath, mode, *producer, *version, *dryRun, effConc)
 
 	start := time.Now()
 	var ok, failed, thumbs, strips, waves, speech, proxies int64
 	var mu sync.Mutex
 	var firstErrs []string
 
-	sem := make(chan struct{}, *conc)
+	sem := make(chan struct{}, effConc)
 	var wg sync.WaitGroup
 	for _, p := range targets {
 		p := p

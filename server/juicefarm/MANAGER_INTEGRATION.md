@@ -78,9 +78,10 @@ must cap the farm so it never starves the live mount / other apps.
 
 ## 3. What the FARM must grow to enable the above (farm-side TODOs)
 
-- **`-proxy-concurrency` / `JM_FARM_PROXY_WORKERS`** — separate, lower parallelism for the transcode pass
-  (the §B core ask). Small change to `cmd/jmfarm` + the proxy worker pool.
-- **`-crf` / `-preset` flags** (proxy) + `-whisper-model` is already a flag — surface them as env.
+- ✅ **`-proxy-concurrency` / `JM_FARM_PROXY_WORKERS`** — DONE. Separate (default 2) worker count for the
+  proxy pass so a transcode storm can't saturate the NAS; the manager governor just sets the env.
+- ✅ **`-crf` / `-preset` flags** (proxy) + `JM_FARM_CRF` / `JM_FARM_PRESET` env — DONE (quality dial).
+  `-whisper-model` + `JM_FARM_VCODEC` (GPU encoder) are already flags/env. Still TODO: `nice`/`ionice`.
 - **A sweep-progress signal** beyond exit code — e.g. write a `progress` row / heartbeat, or rely on the
   `since=` feed (probably sufficient: the manager counts rows appearing).
 - **A trigger mechanism the manager can call** — simplest is "manager `docker run`s a one-shot with env"; if

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
@@ -28,21 +29,28 @@ import (
 // defaults to libx264 (CPU); pass a hardware encoder (h264_nvenc/qsv/vaapi) on a
 // GPU/APU NAS — the locked container/pix_fmt/audio stay identical so the blob is
 // still interchangeable. The HTTP Range/206 serving is a SEPARATE lane.
-func Proxy(ffmpegBin, vcodec, srcPath, outPath string) error {
+func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) error {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
 	if vcodec == "" {
 		vcodec = "libx264"
 	}
+	if crf <= 0 {
+		crf = 21
+	}
+	if preset == "" {
+		preset = "slow"
+	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return err
 	}
 	// -pix_fmt yuv420p forces 8-bit 4:2:0 from any source (10-bit/HDR/422
 	// originals included), the lowest-common-denominator both decoders accept.
+	// crf/preset are the quality knob (size/quality only — interchange-safe).
 	cmd := exec.Command(ffmpegBin, "-y", "-loglevel", "error",
 		"-i", srcPath,
-		"-c:v", vcodec, "-pix_fmt", "yuv420p", "-crf", "21", "-preset", "slow",
+		"-c:v", vcodec, "-pix_fmt", "yuv420p", "-crf", strconv.Itoa(crf), "-preset", preset,
 		"-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
 		"-movflags", "+faststart",
 		outPath)
@@ -105,7 +113,7 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mt,
 	}
 	stampSource(&row, fi)
-	if err := Proxy(opt.FFmpegBin, opt.ProxyVCodec, path, out); err != nil {
+	if err := Proxy(opt.FFmpegBin, opt.ProxyVCodec, opt.ProxyCRF, opt.ProxyPreset, path, out); err != nil {
 		// Non-fatal: publish a failed row so the consumer regenerates locally.
 		res.Err = err
 		row.Status = "failed"

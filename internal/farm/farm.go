@@ -28,6 +28,8 @@ type Options struct {
 	WhisperBin    string // whisper.cpp CLI; "" → "whisper-cli" on PATH (transcripts)
 	WhisperModel  string // path to a ggml whisper model (required for transcripts)
 	ProxyVCodec   string // proxy H.264 encoder; "" → "libx264" (GPU: h264_nvenc/qsv/vaapi)
+	ProxyCRF      int    // proxy quality; 0 → 21 (lower = sharper/bigger)
+	ProxyPreset   string // proxy x264 preset; "" → "slow" (faster preset = quicker, larger)
 }
 
 // Result is the per-file outcome (for CLI reporting / JM-15 accounting). Err is a

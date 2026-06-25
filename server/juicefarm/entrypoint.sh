@@ -28,6 +28,11 @@ MODE="${JM_FARM_MODE:-all}"
 WORKERS="${JM_FARM_WORKERS:-4}"
 INTERVAL="${JM_FARM_INTERVAL:-900}"
 VCODEC="${JM_FARM_VCODEC:-libx264}"
+CRF="${JM_FARM_CRF:-21}"
+PRESET="${JM_FARM_PRESET:-slow}"
+# Proxy transcode pins a core per clip — default it to a LOWER worker count than
+# the cheap passes so a full sweep can't saturate the NAS (manager governor sets it).
+PROXY_WORKERS="${JM_FARM_PROXY_WORKERS:-2}"
 STATUS="${JM_FARM_STATUS:-/state/farm-status.json}"
 mkdir -p "$(dirname "$DB")"
 
@@ -71,11 +76,11 @@ do_pass() {
 run_sweep() {
   case "$MODE" in
     transcript)  do_pass -transcript -whisper-model "$MODEL" ;;
-    proxy)       do_pass -proxy -vcodec "$VCODEC" ;;
+    proxy)       do_pass -proxy -vcodec "$VCODEC" -crf "$CRF" -preset "$PRESET" -proxy-concurrency "$PROXY_WORKERS" ;;
     derivatives) do_pass -blobs -filmstrip -waveform ;;
     all|*)
       do_pass -blobs -filmstrip -waveform
-      do_pass -proxy -vcodec "$VCODEC"
+      do_pass -proxy -vcodec "$VCODEC" -crf "$CRF" -preset "$PRESET" -proxy-concurrency "$PROXY_WORKERS"
       do_pass -transcript -whisper-model "$MODEL" ;;
   esac
 }
