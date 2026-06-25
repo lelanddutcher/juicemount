@@ -1114,7 +1114,7 @@ func (fm *FUSEManager) monitorLoop() {
 					if fuseColdStartGrace > 0 && time.Since(watchdogStart) < fuseColdStartGrace {
 						jmlog.Warn("fuse stale at escalation threshold but within cold-start grace — deferring (busy warming, not wedged)",
 							"stale_ticks", staleWhileAliveTicks,
-							"grace_remaining_sec", int((fuseColdStartGrace-time.Since(watchdogStart)).Seconds()))
+							"grace_remaining_sec", int((fuseColdStartGrace - time.Since(watchdogStart)).Seconds()))
 						staleWhileAliveTicks = 0
 						continue
 					}
