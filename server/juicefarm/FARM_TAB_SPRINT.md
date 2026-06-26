@@ -57,10 +57,13 @@ The answer to "estimated file sizes" + the read-only half of the near-same-size-
 - Folder-level proxy-economics summary card
 - *(P3 follow-up):* the bloat radar identifies clips by **inode** today (proxy rows store no source path) — store the source basename on the proxy row (the `extra` column) so the radar shows **filenames**, making it actionable
 
-## Phase 4 — The sweep-trigger linchpin *(the one new control path)* — L (trigger) + M (knobs)
-Manager OWNS a sweep as a tracked job: pick a `/jfs` subtree + passes → launch a one-shot
-`juicefarm` container with chosen `--cpus` + `-e JM_FARM_*`, tracked via the existing JobManager.
-**Zero farm code for the launch** (entrypoint already honors `JM_FARM_ONCE` + every env).
+## Phase 4 — The sweep-trigger linchpin *(the one new control path)* — ✅ TRIGGER BUILT (2026-06-25)
+**DECISION (Leland): farm-queue endpoint, NOT docker-socket** (the production manager has no docker-socket
+access; the queue also serves the OpenLoupe FARM_CONTROL_SURFACE — built once, two producers). Shipped as a
+shared Redis job queue (`internal/farmqueue`) the manager enqueues to (`POST /api/farm/sweep` + `GET
+/api/farm/jobs`, Farm-tab "Generate on the farm" UI) and a **standing worker** drains (`jmfarm -queue`,
+`JM_FARM_QUEUE=1`). Smoke-verified end-to-end with real generators (commit fea9e82, local-only). Remaining
+Phase-4 knobs below ride this surface; standing-worker production rollout is the next step.
 - Sweep trigger + tracked job (the path that makes every SET knob real)
 - **CPU lane allocator** — "give the farm up to N cores" + separate proxy lane (the write half of "CPU lanes")
 - Quality dials — CRF/preset + whisper model + which passes
