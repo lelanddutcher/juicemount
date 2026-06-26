@@ -73,7 +73,11 @@ Phase-4 knobs below ride this surface; standing-worker production rollout is the
 
 ## Phase 5 — Scope governance & scheduling *(rides the launcher)* — M each
 WHERE and WHEN the farm spends CPU — the whitelist/blacklist ask + off-peak + the skip policy.
-- **`.nojuicefarm` marker** (per-folder opt-out; S, works even from Finder, no launcher needed)
+- **`.juicefarm` opt-IN marker** (per-folder; S, works even from Finder, no launcher needed) — the load-bearing
+  default-deny gate (resolved by an upward walk, fail-closed, cached per-directory). Matches the locked opt-IN
+  decision above; the worker's `collectTargets` blind `filepath.Walk` must gain the same re-check. The marker's
+  content schema (empty = whole-subtree vs a parsed whitelist/exclude + per-folder skip-threshold) needs defining.
+  See [`WATCH_FOLDER_DESIGN.md`](WATCH_FOLDER_DESIGN.md) — this marker is its load-bearing prerequisite.
 - Manager-owned **exclude-path set** injected on the sweep (`-exclude` glob / `JM_FARM_EXCLUDE`)
 - **Skip-if-delta-below-threshold** size budget — operationalizes the size-delta worry; records a `skipped` status distinct from `failed`
 - Off-peak window + interval via the manager's existing `/api/schedules` framework
