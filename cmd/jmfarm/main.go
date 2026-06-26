@@ -62,6 +62,12 @@ func main() {
 		verbose   = flag.Bool("verbose", false, "per-file logging")
 		status    = flag.String("status", "", "after the sweep, write a rollup status JSON here (manager Farm tab)")
 		reconcile = flag.Bool("reconcile", false, "JM-15: ingest volume manifest.json sidecars into -db (no media processing); closes the farm→client discovery loop")
+		// Informational governor knobs: the entrypoint actually APPLIES these via
+		// nice/ionice + its sleep loop; jmfarm only RECORDS them in the status
+		// stamp so the manager's read-only knob inspector shows real values.
+		gNice     = flag.Int("nice", 0, "informational: CPU niceness the entrypoint applied (recorded in status, not applied here)")
+		gIONice   = flag.Int("ionice", 0, "informational: best-effort IO class the entrypoint applied (recorded in status, not applied here)")
+		gInterval = flag.Int("interval", 0, "informational: seconds between sweeps the entrypoint loops on (recorded in status, not applied here)")
 	)
 	flag.Parse()
 
@@ -269,7 +275,12 @@ func main() {
 			Processed: int(ok), Failed: int(failed),
 			StartedAt: start.Unix(), DurationMS: time.Since(start).Milliseconds(),
 		}
-		if err := farm.WriteFarmStatus(store, *status, sweep); err != nil {
+		// Stamp the RESOLVED run settings so the manager's read-only knob
+		// inspector shows real values. nice/ionice/interval are recorded here
+		// but applied by the entrypoint (nice/ionice + sleep loop).
+		gov := farm.NewGovernor(*wModel, *vcodec, *pPreset, mode,
+			*pCRF, *conc, *pConc, *gNice, *gIONice, *gInterval)
+		if err := farm.WriteFarmStatus(store, *status, sweep, gov); err != nil {
 			fmt.Fprintf(os.Stderr, "jmfarm: status write: %v\n", err)
 		}
 	}

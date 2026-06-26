@@ -823,15 +823,118 @@
   }
 
   // ---- Farm tab (Phase 1, read-only): poll /api/farm while visible. The farm
-  // pre-aggregates into farm-status.json; we just relay + render coverage.
+  // pre-aggregates into farm-status.json; we relay + render it as plain-English
+  // education for a NON-ENGINEER: a "what is the farm?" explainer, a per-kind
+  // process-provenance table, the last sweep as a sentence, coverage health with
+  // micro progress bars, and a read-only governor (knob) inspector.
+  //
+  // Security note: every value that comes off the wire is rendered with
+  // textContent / DOM nodes (never innerHTML), so an untrusted target path or
+  // model string can't inject markup.
   let farmTimer = null;
+  let farmExplainerInited = false;
+  const FARM_EXPLAINER_KEY = 'jm-farm-explainer-dismissed';
+
   function startFarmPolling() {
+    initFarmExplainerOnce();
     loadFarm();
     if (!farmTimer) farmTimer = setInterval(loadFarm, 10000);
   }
   function stopFarmPolling() {
     if (farmTimer) { clearInterval(farmTimer); farmTimer = null; }
   }
+
+  // initFarmExplainerOnce wires the dismissible "What is the farm?" banner.
+  // Dismissal persists in localStorage so it doesn't nag on every visit; a
+  // missing/blocked localStorage degrades to "always shown" rather than erroring.
+  function initFarmExplainerOnce() {
+    if (farmExplainerInited) return;
+    farmExplainerInited = true;
+    const box = $('#farm-explainer');
+    const dismiss = $('#farm-explainer-dismiss');
+    let dismissed = false;
+    try { dismissed = localStorage.getItem(FARM_EXPLAINER_KEY) === '1'; } catch (_) {}
+    if (box) box.hidden = dismissed;
+    if (dismiss) {
+      dismiss.addEventListener('click', () => {
+        if (box) box.hidden = true;
+        try { localStorage.setItem(FARM_EXPLAINER_KEY, '1'); } catch (_) {}
+      });
+    }
+  }
+
+  // FARM_PROVENANCE maps each derivative kind to the real process that produces
+  // it. Static knowledge (the farm always uses these tools); the proxy + ai rows
+  // get LIVE governor values spliced in by farmToolLabel when present.
+  const FARM_PROVENANCE = [
+    { kind: 'tech',      label: 'Tech metadata', tool: 'ffprobe',
+      desc: 'Reads codec, resolution, duration and bitrate. Read-only — never touches the file.' },
+    { kind: 'poster',    label: 'Poster frame',  tool: 'ffmpeg',
+      desc: 'Grabs one representative frame as a 320px JPEG thumbnail.' },
+    { kind: 'filmstrip', label: 'Filmstrip',     tool: 'ffmpeg',
+      desc: 'Renders a sprite sheet of evenly-spaced frames for hover-scrubbing.' },
+    { kind: 'waveform',  label: 'Waveform',      tool: 'ffmpeg + audiowaveform',
+      desc: 'Decodes the audio and emits a compact JSON waveform for the timeline.' },
+    { kind: 'proxy',     label: 'Proxy',         tool: 'ffmpeg (libx264)',
+      desc: 'Transcodes a lightweight, fast-to-scrub editing copy.' },
+    { kind: 'ai',        label: 'AI transcript', tool: 'whisper.cpp',
+      desc: 'Transcribes spoken audio to searchable, time-coded text.' },
+  ];
+
+  // GOVERNOR_FIELDS describes the read-only knob inspector. Each entry pulls one
+  // field off status.governor, formats it for humans, and carries a plain-English
+  // tooltip. format() returns '' to mean "unknown/unset" → that row is skipped.
+  const GOVERNOR_FIELDS = [
+    { key: 'mode',          label: 'Mode',
+      tip: 'Which passes the farm runs: all derivatives, just proxies, or just transcripts.',
+      format: (g) => g.mode || '' },
+    { key: 'workers',       label: 'Workers',
+      tip: 'How many files the farm processes in parallel for the main passes.',
+      format: (g) => g.workers ? String(g.workers) : '' },
+    { key: 'proxy_workers', label: 'Proxy lane',
+      tip: 'A separate, smaller worker pool just for the heavy proxy transcodes so they do not starve the rest.',
+      format: (g) => g.proxy_workers ? String(g.proxy_workers) + ' worker(s)' : '' },
+    { key: 'vcodec',        label: 'Video codec',
+      tip: 'The video encoder used for proxy files (e.g. libx264 = H.264).',
+      format: (g) => g.vcodec || '' },
+    { key: 'crf',           label: 'Quality (CRF)',
+      tip: 'Constant Rate Factor for proxies: lower = higher quality and bigger files. ~18-24 is typical.',
+      format: (g) => (g.crf != null && g.crf !== 0) ? String(g.crf) : '' },
+    { key: 'preset',        label: 'Encode preset',
+      tip: 'ffmpeg speed/efficiency trade-off (slower presets = smaller files for the same quality).',
+      format: (g) => g.preset || '' },
+    { key: 'model',         label: 'Whisper model',
+      tip: 'The whisper.cpp speech model used for AI transcripts. Bigger = more accurate and slower.',
+      format: (g) => g.model || '' },
+    { key: 'nice',          label: 'CPU priority (nice)',
+      tip: 'How politely the farm shares CPU. Higher nice = lower priority, so interactive work stays snappy.',
+      format: (g) => (g.nice != null && g.nice !== 0) ? String(g.nice) : '' },
+    { key: 'ionice',        label: 'Disk priority (ionice)',
+      tip: 'How politely the farm shares disk I/O. Higher = yields to foreground reads/writes first.',
+      format: (g) => (g.ionice != null && g.ionice !== 0) ? String(g.ionice) : '' },
+    { key: 'interval_sec',  label: 'Sweep interval',
+      tip: 'How often the farm wakes up to look for new files to process.',
+      format: (g) => g.interval_sec ? formatInterval(g.interval_sec) : '' },
+  ];
+
+  // formatInterval renders a seconds count as a friendly cadence label.
+  function formatInterval(sec) {
+    if (!sec || sec < 0) return '';
+    if (sec % 3600 === 0) { const h = sec / 3600; return 'every ' + h + ' hour' + (h === 1 ? '' : 's'); }
+    if (sec % 60 === 0)   { const m = sec / 60;   return 'every ' + m + ' min'; }
+    return 'every ' + sec + 's';
+  }
+
+  // KIND_PLURALS gives a human noun for each derivative kind in coverage copy
+  // ("142 of 150 proxies ready"). Unknown kinds fall back to "<kind> derivatives".
+  const KIND_PLURALS = {
+    tech: 'tech reads', poster: 'posters', filmstrip: 'filmstrips',
+    waveform: 'waveforms', proxy: 'proxies', ai: 'transcripts',
+  };
+  function kindNoun(kind) {
+    return KIND_PLURALS[kind] || (kind + ' derivatives');
+  }
+
   async function loadFarm() {
     let res;
     try { res = await api('GET', '/api/farm'); } catch (e) { return; }
@@ -848,51 +951,216 @@
     const s = res.status || {};
     const idx = s.index || {};
     const sweep = s.last_sweep || {};
+    const governor = s.governor || null;
 
-    const dl = $('#farm-sweep');
-    dl.innerHTML = '';
-    const proc = (sweep.processed != null ? sweep.processed : 0) +
-      (sweep.failed ? (' · ' + sweep.failed + ' failed') : '');
-    const rows = [
-      ['Mode', sweep.mode || '—'],
-      ['Producer', sweep.producer || '—'],
-      ['Target', sweep.target || '—'],
-      ['Processed', String(proc)],
-      ['Duration', sweep.duration_ms != null ? (sweep.duration_ms + ' ms') : '—'],
-    ];
-    for (const [k, v] of rows) {
-      const dt = document.createElement('dt'); dt.textContent = k;
-      const dd = document.createElement('dd'); dd.textContent = String(v);
-      dl.appendChild(dt); dl.appendChild(dd);
-    }
+    renderFarmSweepSentence(sweep);
+    renderFarmCoverage(idx);
+    renderFarmProvenance(governor);
+    renderFarmGovernor(governor);
 
-    $('#farm-assets').textContent = (idx.total_assets != null ? idx.total_assets : 0) + ' assets';
-    const tb = $('#farm-kinds');
-    tb.innerHTML = '';
-    const byKind = idx.by_kind || {};
-    const kinds = Object.keys(byKind).sort();
-    if (kinds.length === 0) {
-      const tr = document.createElement('tr');
-      const td = document.createElement('td');
-      td.colSpan = 3; td.textContent = 'No derivatives generated yet.';
-      tr.appendChild(td); tb.appendChild(tr);
-    } else {
-      kinds.forEach((kind) => {
-        const ks = byKind[kind] || {};
-        const failed = ks.failed != null ? ks.failed : 0;
-        const tr = document.createElement('tr');
-        [kind, String(ks.ready != null ? ks.ready : 0), String(failed)].forEach((cell, i) => {
-          const td = document.createElement('td');
-          td.textContent = cell;
-          if (i === 2 && failed > 0) td.classList.add('farm-failed');
-          tr.appendChild(td);
-        });
-        tb.appendChild(tr);
-      });
-    }
     if (s.written_at) {
       $('#farm-updated').textContent = '· updated ' + new Date(s.written_at * 1000).toLocaleTimeString();
     }
+  }
+
+  // renderFarmSweepSentence turns the raw SweepInfo into one plain-English line:
+  //   "Last sweep: all passes on <target>, 13 of 14 files in 14m, 1 failed."
+  // Degrades gracefully when no sweep has produced a target yet.
+  function renderFarmSweepSentence(sweep) {
+    const el = $('#farm-sweep-sentence');
+    if (!sweep || (!sweep.mode && !sweep.target && !sweep.processed && !sweep.failed)) {
+      el.textContent = 'No sweep has run yet — the farm will report here after its first pass.';
+      return;
+    }
+    const processed = sweep.processed != null ? sweep.processed : 0;
+    const failed = sweep.failed != null ? sweep.failed : 0;
+    const attempted = processed + failed;
+    const succeeded = processed; // "processed" = files successfully produced this sweep
+    const passes = farmModePhrase(sweep.mode);
+
+    let txt = 'Last sweep: ' + passes;
+    if (sweep.target) txt += ' on ' + sweep.target;
+    txt += ', ' + succeeded.toLocaleString() + ' of ' + attempted.toLocaleString() +
+           ' file' + (attempted === 1 ? '' : 's');
+    if (sweep.duration_ms != null && sweep.duration_ms > 0) {
+      txt += ' in ' + formatDuration(sweep.duration_ms);
+    }
+    if (failed > 0) {
+      txt += ', ' + failed.toLocaleString() + ' failed';
+    }
+    txt += '.';
+    el.textContent = txt;
+  }
+
+  // farmModePhrase maps the farm's mode string to readable copy. The producer
+  // emits "derivatives" | "transcript(AI)" | "proxy" (see cmd/jmfarm); anything
+  // else passes through verbatim so a new mode still reads sensibly.
+  function farmModePhrase(mode) {
+    switch (mode) {
+      case 'all':            return 'all passes';
+      case 'derivatives':    return 'the derivative passes';
+      case 'transcript(AI)': return 'AI transcript pass';
+      case 'proxy':          return 'proxy pass';
+      case '':
+      case undefined:
+      case null:             return 'a sweep';
+      default:               return mode + ' pass';
+    }
+  }
+
+  // renderFarmCoverage renders one health line + micro progress bar per kind,
+  // derived from index.by_kind ({ready, failed}) against total_assets:
+  //   "142 of 150 proxies ready — 8 to do"
+  function renderFarmCoverage(idx) {
+    const total = idx.total_assets != null ? idx.total_assets : 0;
+    $('#farm-assets').textContent = total.toLocaleString() + ' asset' + (total === 1 ? '' : 's');
+
+    const list = $('#farm-coverage-list');
+    list.innerHTML = '';
+    const byKind = idx.by_kind || {};
+    const kinds = Object.keys(byKind).sort();
+    if (kinds.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'farm-coverage-empty';
+      li.textContent = 'No derivatives generated yet — the farm has nothing to show for these assets so far.';
+      list.appendChild(li);
+      return;
+    }
+    kinds.forEach((kind) => {
+      const ks = byKind[kind] || {};
+      const ready = ks.ready != null ? ks.ready : 0;
+      const failed = ks.failed != null ? ks.failed : 0;
+      // Denominator: prefer total_assets; if it's missing or smaller than what
+      // we've already produced (stale rollup), fall back to ready+failed so the
+      // bar never overflows or reads as >100%.
+      let denom = total;
+      if (denom < ready + failed) denom = ready + failed;
+      const remaining = Math.max(0, denom - ready - failed);
+      const pct = denom > 0 ? Math.round((ready / denom) * 100) : 0;
+
+      const li = document.createElement('li');
+      li.className = 'farm-coverage-row';
+
+      const head = document.createElement('div');
+      head.className = 'farm-coverage-head';
+
+      const label = document.createElement('span');
+      label.className = 'farm-coverage-label';
+      // Sentence: "142 of 150 proxies ready — 8 to do".
+      let sentence = ready.toLocaleString() + ' of ' + denom.toLocaleString() + ' ' +
+                     kindNoun(kind) + ' ready';
+      if (remaining > 0) sentence += ' — ' + remaining.toLocaleString() + ' to do';
+      label.textContent = sentence;
+      head.appendChild(label);
+
+      const pctEl = document.createElement('span');
+      pctEl.className = 'farm-coverage-pct';
+      pctEl.textContent = pct + '%';
+      head.appendChild(pctEl);
+
+      li.appendChild(head);
+
+      const bar = document.createElement('div');
+      bar.className = 'farm-coverage-bar';
+      const fill = document.createElement('div');
+      fill.className = 'farm-coverage-fill';
+      if (failed > 0 && ready === 0) fill.classList.add('failed');
+      fill.style.width = pct + '%';
+      bar.appendChild(fill);
+      li.appendChild(bar);
+
+      if (failed > 0) {
+        const fnote = document.createElement('div');
+        fnote.className = 'farm-coverage-failed';
+        fnote.textContent = failed.toLocaleString() + ' failed and will be retried next sweep';
+        li.appendChild(fnote);
+      }
+
+      list.appendChild(li);
+    });
+  }
+
+  // renderFarmProvenance fills the static process-provenance table, splicing in
+  // live governor values for the proxy (crf/preset/vcodec) and ai (model) rows.
+  function renderFarmProvenance(governor) {
+    const tb = $('#farm-provenance');
+    tb.innerHTML = '';
+    FARM_PROVENANCE.forEach((row) => {
+      const tr = document.createElement('tr');
+
+      const kindTd = document.createElement('td');
+      kindTd.className = 'farm-prov-kind';
+      kindTd.textContent = row.label;
+      tr.appendChild(kindTd);
+
+      const toolTd = document.createElement('td');
+      toolTd.className = 'farm-prov-tool';
+      toolTd.textContent = farmToolLabel(row, governor);
+      tr.appendChild(toolTd);
+
+      const descTd = document.createElement('td');
+      descTd.className = 'farm-prov-desc';
+      descTd.textContent = row.desc;
+      tr.appendChild(descTd);
+
+      tb.appendChild(tr);
+    });
+  }
+
+  // farmToolLabel returns the tool-column text, enriched with live governor
+  // settings for proxy/ai when the governor object reports them.
+  function farmToolLabel(row, governor) {
+    if (!governor) return row.tool;
+    if (row.kind === 'proxy') {
+      const codec = governor.vcodec || 'libx264';
+      const bits = [];
+      if (governor.crf != null && governor.crf !== 0) bits.push('CRF ' + governor.crf);
+      if (governor.preset) bits.push(governor.preset);
+      let t = 'ffmpeg (' + codec + ')';
+      if (bits.length) t += ' · ' + bits.join(', ');
+      return t;
+    }
+    if (row.kind === 'ai' && governor.model) {
+      return 'whisper.cpp · ' + governor.model;
+    }
+    return row.tool;
+  }
+
+  // renderFarmGovernor renders the read-only knob inspector from status.governor.
+  // Degrades to "settings not yet reported" when the governor object is absent
+  // (older farm builds that predate the governor field in farm-status.json).
+  function renderFarmGovernor(governor) {
+    const dl = $('#farm-governor');
+    const emptyHint = $('#farm-governor-empty');
+    dl.innerHTML = '';
+    if (!governor) {
+      dl.hidden = true;
+      emptyHint.hidden = false;
+      return;
+    }
+    let shown = 0;
+    GOVERNOR_FIELDS.forEach((f) => {
+      const val = f.format(governor);
+      if (val === null || val === undefined || val === '') return;
+      shown++;
+      const dt = document.createElement('dt');
+      dt.className = 'farm-governor-key';
+      dt.textContent = f.label;
+      dt.title = f.tip; // plain-English tooltip
+      const dd = document.createElement('dd');
+      dd.className = 'farm-governor-val';
+      dd.textContent = val;
+      dl.appendChild(dt);
+      dl.appendChild(dd);
+    });
+    // A present-but-all-zero governor reads as "no usable settings" → same hint.
+    if (shown === 0) {
+      dl.hidden = true;
+      emptyHint.hidden = false;
+      return;
+    }
+    dl.hidden = false;
+    emptyHint.hidden = true;
   }
 
   async function pollOverview() {

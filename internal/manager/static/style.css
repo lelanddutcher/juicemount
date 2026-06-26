@@ -1276,8 +1276,170 @@ footer {
 footer a { color: var(--accent); text-decoration: none; }
 footer a:hover { text-decoration: underline; }
 
-/* Farm tab (Phase 1) — coverage table */
+/* Farm tab (Phase 1) — education UI. Reuses the .overview-card / .overview-grid
+   vocabulary so the Farm pane reads like the rest of the dark dashboard. The
+   pieces below add: a dismissible explainer, plain-English sweep + coverage,
+   a process-provenance table, and a read-only governor (knob) inspector. */
+.farm-pane .overview-header { margin: 0 0 1rem; }
+.farm-pane .overview-header h2 { margin: 0; font-size: 1.4rem; font-weight: 600; }
+.farm-pane .overview-header .hint { margin: 0.25rem 0 0; }
+
+/* "What is the farm?" explainer — calm accent-tinted banner with a dismiss
+   button on the right. Echoes the trash-banner treatment but in the accent
+   color (informational, not a warning). */
+.farm-explainer {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  margin: 0 0 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-bg);
+}
+.farm-explainer[hidden] { display: none; }
+.farm-explainer-body { flex: 1; min-width: 0; }
+.farm-explainer-body h3 {
+  margin: 0 0 0.25rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+.farm-explainer-body p {
+  margin: 0;
+  font-size: 0.88rem;
+  color: var(--text);
+  line-height: 1.55;
+}
+.farm-explainer-dismiss {
+  flex-shrink: 0;
+  align-self: center;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 0.3rem 0.75rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+.farm-explainer-dismiss:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Last sweep, rendered as one sentence. */
+.farm-sweep-sentence {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.9rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.92rem;
+  color: var(--text);
+}
+
+/* Per-card sub-explainer line under the card header. */
+.farm-card-sub {
+  margin: -0.25rem 0 0.75rem;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* Coverage health: one row per kind = a plain-English line + micro bar. */
+.farm-coverage-list { list-style: none; margin: 0; padding: 0; }
+.farm-coverage-empty {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.85rem;
+  padding: 0.25rem 0;
+}
+.farm-coverage-row {
+  padding: 0.5rem 0;
+  border-bottom: 1px dashed var(--border);
+}
+.farm-coverage-row:last-child { border-bottom: none; }
+.farm-coverage-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.35rem;
+}
+.farm-coverage-label { font-size: 0.88rem; color: var(--text); }
+.farm-coverage-pct {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.farm-coverage-bar {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.farm-coverage-fill {
+  height: 100%;
+  background: var(--success);
+  border-radius: 3px;
+  transition: width 0.3s ease-out;
+}
+.farm-coverage-fill.failed { background: var(--danger); }
+.farm-coverage-failed {
+  margin-top: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--danger);
+}
+
+/* Process-provenance + (legacy) coverage table share .farm-table. */
 .farm-table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
-.farm-table th, .farm-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
-.farm-table th { color: var(--text-muted); font-weight: 600; }
+.farm-table th, .farm-table td {
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.farm-table tbody tr:last-child td { border-bottom: none; }
+.farm-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.72rem;
+}
 .farm-table td.farm-failed { color: var(--danger); font-weight: 600; }
+
+.farm-provenance-table .farm-prov-kind { font-weight: 600; white-space: nowrap; }
+.farm-provenance-table .farm-prov-tool {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.82rem;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.farm-provenance-table .farm-prov-desc {
+  color: var(--text-muted);
+  font-size: 0.83rem;
+  line-height: 1.5;
+}
+
+/* Governor (knob) inspector — a two-column dl, same shape as overview-card dl. */
+.farm-governor-grid {
+  margin: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.3rem 1rem;
+  font-size: 0.85rem;
+}
+.farm-governor-grid[hidden] { display: none; }
+.farm-governor-key {
+  color: var(--text-muted);
+  font-weight: 500;
+  cursor: help;
+  border-bottom: 1px dotted var(--border);
+  width: max-content;
+}
+.farm-governor-val {
+  margin: 0;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  color: var(--text);
+  word-break: break-word;
+}

@@ -25,6 +25,7 @@ type Tech struct {
 	Container  string       `json:"container"`
 	DurationMS int64        `json:"duration_ms"`
 	SizeBytes  int64        `json:"size_bytes"`
+	BitRate    int64        `json:"bit_rate,omitempty"` // overall container bitrate, bits/sec (format.bit_rate); 0/omitted when unknown
 	Video      *VideoTrack  `json:"video"`
 	Audio      []AudioTrack `json:"audio"`
 }
@@ -44,6 +45,7 @@ type VideoTrack struct {
 	HDR            *string `json:"hdr"`
 	LogFormat      *string `json:"log_format"`
 	Timecode       *string `json:"timecode"`
+	BitRate        int64   `json:"bit_rate,omitempty"` // video-stream bitrate, bits/sec (stream.bit_rate); 0/omitted when unknown
 }
 
 // AudioTrack mirrors metadata.schema.json tech.audio[].
@@ -78,6 +80,7 @@ type ffStream struct {
 	Channels         int               `json:"channels"`
 	SampleRate       string            `json:"sample_rate"`
 	Duration         string            `json:"duration"`
+	BitRate          string            `json:"bit_rate"`
 	Tags             map[string]string `json:"tags"`
 }
 
@@ -114,6 +117,7 @@ func mapTech(p *ffProbe, fallbackSize int64) *Tech {
 		Container:  firstToken(p.Format.FormatName),
 		DurationMS: durationMS(p),
 		SizeBytes:  parseInt(p.Format.Size, fallbackSize),
+		BitRate:    parseInt(p.Format.BitRate, 0), // overall container bitrate, bits/sec
 		Audio:      []AudioTrack{},
 	}
 	for i := range p.Streams {
@@ -126,6 +130,10 @@ func mapTech(p *ffProbe, fallbackSize int64) *Tech {
 		case "audio":
 			t.Audio = append(t.Audio, mapAudio(s))
 		}
+	}
+	// Prefer format.bit_rate; fall back to the video stream's when the container omits it.
+	if t.BitRate == 0 && t.Video != nil {
+		t.BitRate = t.Video.BitRate
 	}
 	return t
 }
@@ -144,6 +152,7 @@ func mapVideo(s *ffStream) *VideoTrack {
 		HDR:            deriveHDR(s.ColorTransfer, s.ColorPrimaries),
 		LogFormat:      deriveLog(s),
 		Timecode:       tag(s.Tags, "timecode"),
+		BitRate:        parseInt(s.BitRate, 0), // video-stream bitrate, bits/sec
 	}
 	return v
 }

@@ -78,8 +78,13 @@ do_pass() {
   wrap=""
   command -v nice >/dev/null 2>&1 && wrap="nice -n $NICE"
   if [ -n "$IONICE" ] && command -v ionice >/dev/null 2>&1; then wrap="ionice -c $IONICE $wrap"; fi
+  # Pass the governor knobs informationally so jmfarm stamps them in the status
+  # file (the manager's read-only inspector). IONICE may be empty (disabled) →
+  # record 0. These are recorded for display; the wrap above actually applies them.
+  ion="${IONICE:-0}"
   # shellcheck disable=SC2086
-  $wrap jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" -status "$STATUS" "$@" -root "$TARGET" || true
+  $wrap jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" -status "$STATUS" \
+    -nice "$NICE" -ionice "$ion" -interval "$INTERVAL" "$@" -root "$TARGET" || true
 }
 
 run_sweep() {

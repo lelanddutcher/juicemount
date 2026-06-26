@@ -99,19 +99,68 @@
             <span id="farm-updated" class="overview-updated"></span>
           </p>
         </div>
+        <!-- "What is the farm?" explainer (Phase 1). Dismissible — the
+             dismissal sticks in localStorage so it doesn't nag on every
+             visit. Aimed squarely at a non-engineer: one short paragraph
+             explaining WHY the NAS does this work ahead of time. -->
+        <aside id="farm-explainer" class="farm-explainer" hidden>
+          <div class="farm-explainer-body">
+            <h3>What is the farm?</h3>
+            <p>
+              The farm is a background worker on your NAS that pre-generates the
+              previews, proxies, and transcripts your media needs — so OpenLoupe
+              and this web UI can show thumbnails, scrub clips, and search speech
+              instantly instead of regenerating everything on your laptop.
+            </p>
+          </div>
+          <button type="button" id="farm-explainer-dismiss" class="farm-explainer-dismiss"
+                  aria-label="Dismiss explainer">Got it</button>
+        </aside>
+
         <p id="farm-empty" class="hint" hidden></p>
+
         <div id="farm-content" hidden>
+          <!-- Last sweep, rendered as a plain-English sentence rather than a
+               raw dl. Populated by loadFarm(); falls back to the empty
+               summary if no sweep has run. -->
+          <p id="farm-sweep-sentence" class="farm-sweep-sentence"></p>
+
           <div class="overview-grid">
-            <article class="overview-card">
-              <header><h3>Last sweep</h3></header>
-              <dl id="farm-sweep"></dl>
+            <!-- Coverage health per kind: plain-English line + micro
+                 progress bar, derived from index.by_kind + total_assets. -->
+            <article class="overview-card overview-card-wide" data-card="farm-coverage">
+              <header>
+                <h3>Coverage</h3>
+                <span class="overview-card-state" id="farm-assets"></span>
+              </header>
+              <ul id="farm-coverage-list" class="farm-coverage-list"></ul>
             </article>
-            <article class="overview-card">
-              <header><h3>Coverage by kind</h3><span class="overview-card-state" id="farm-assets"></span></header>
-              <table class="farm-table">
-                <thead><tr><th>Kind</th><th>Ready</th><th>Failed</th></tr></thead>
-                <tbody id="farm-kinds"></tbody>
+
+            <!-- Process provenance: maps each derivative kind to the real
+                 process that produces it. Static knowledge; the proxy + ai
+                 rows show live governor values when present. -->
+            <article class="overview-card overview-card-wide" data-card="farm-provenance">
+              <header><h3>How each derivative is made</h3></header>
+              <p class="farm-card-sub">
+                Every preview is produced by a real, inspectable tool on the NAS —
+                nothing is invented. Here is what runs for each kind.
+              </p>
+              <table class="farm-table farm-provenance-table">
+                <thead><tr><th>Derivative</th><th>Tool</th><th>What it does</th></tr></thead>
+                <tbody id="farm-provenance"></tbody>
               </table>
+            </article>
+
+            <!-- Knob inspector: read-only view of status.governor. Degrades
+                 to a "settings not yet reported" hint when governor absent. -->
+            <article class="overview-card overview-card-wide" data-card="farm-governor">
+              <header><h3>Farm settings</h3></header>
+              <p class="farm-card-sub">
+                Read-only. These are the knobs the farm is running with right now
+                (set on the NAS, not editable here). Hover a label for what it means.
+              </p>
+              <p id="farm-governor-empty" class="hint" hidden>Settings not yet reported by the farm.</p>
+              <dl id="farm-governor" class="farm-governor-grid"></dl>
             </article>
           </div>
         </div>
