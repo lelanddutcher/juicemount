@@ -61,13 +61,28 @@ func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult,
 		if !e.IsDir() {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(base, e.Name(), "manifest.json"))
+		scPath := filepath.Join(base, e.Name(), "manifest.json")
+		raw, err := os.ReadFile(scPath)
 		if err != nil {
 			continue // no sidecar for this inode (blob-only dir)
 		}
 		res.Sidecars++
+		// A sidecar freshly (re)written server-side can read back torn/partial on
+		// the client mount (JuiceFS eventual consistency). Retry the read a few
+		// times before giving up — a clean copy almost always lands within ms.
 		var sc ManifestSidecar
-		if json.Unmarshal(raw, &sc) != nil || sc.Inode == 0 {
+		parsed := false
+		for try := 0; try < 4; try++ {
+			if json.Unmarshal(raw, &sc) == nil && sc.Inode != 0 {
+				parsed = true
+				break
+			}
+			time.Sleep(150 * time.Millisecond)
+			if r, e := os.ReadFile(scPath); e == nil {
+				raw = r
+			}
+		}
+		if !parsed {
 			res.Errs++
 			continue
 		}
