@@ -2,8 +2,10 @@ package farm
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
@@ -61,54 +63,84 @@ func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult,
 		if !e.IsDir() {
 			continue
 		}
-		scPath := filepath.Join(base, e.Name(), "manifest.json")
-		raw, err := os.ReadFile(scPath)
-		if err != nil {
-			continue // no sidecar for this inode (blob-only dir)
+		inode, perr := strconv.ParseUint(e.Name(), 10, 64)
+		if perr != nil {
+			continue // not an inode-named dir
 		}
-		res.Sidecars++
-		// A sidecar freshly (re)written server-side can read back torn/partial on
-		// the client mount (JuiceFS eventual consistency). Retry the read a few
-		// times before giving up — a clean copy almost always lands within ms.
-		var sc ManifestSidecar
-		parsed := false
-		for try := 0; try < 4; try++ {
-			if json.Unmarshal(raw, &sc) == nil && sc.Inode != 0 {
-				parsed = true
-				break
-			}
-			time.Sleep(150 * time.Millisecond)
-			if r, e := os.ReadFile(scPath); e == nil {
-				raw = r
-			}
-		}
-		if !parsed {
-			res.Errs++
-			continue
-		}
-		if err := store.PutSource(sc.Inode, sc.SourceHash); err != nil {
-			res.Errs++
-			continue
-		}
-		// Repopulate /metadata?kind=tech (D1 consume + AI size-guard fallback).
-		if sc.Tech != nil && len(sc.Tech.Payload) > 0 {
-			_ = store.PutMetadata(sc.Inode, "tech", sc.Tech.Producer, sc.Tech.Version, sc.Tech.Hash, sc.Tech.Payload)
-		}
-		ok := true
-		for _, row := range sc.Derivatives {
-			if err := store.PutDeriv(sc.Inode, row); err != nil {
-				ok = false
-				break
-			}
-			res.Rows++
-		}
-		if ok {
-			res.Assets++
-		} else {
-			res.Errs++
-		}
+		r := reconcileOneSidecarInto(store, mount, inode)
+		res.Sidecars += r.Sidecars
+		res.Assets += r.Assets
+		res.Rows += r.Rows
+		res.Errs += r.Errs
 	}
 	return res, nil
+}
+
+// ReconcileOneSidecar lazily ingests a SINGLE inode's manifest sidecar if one
+// exists on the volume — the on-demand half of the JM-15 reconcile. The
+// /derivatives handler calls this when an inode MISSES the local store, so that
+// navigating to a farm-derived asset surfaces it on the fly, without a full sweep
+// or an app restart (the auto-reconcile bridge). found=true means a sidecar was
+// present and ingested; an absent sidecar is (false, nil) — not an error.
+// Idempotent (upserts), safe to call under the WAL the running app reads from.
+func ReconcileOneSidecar(store *derivatives.Store, mount string, inode uint64) (found bool, err error) {
+	r := reconcileOneSidecarInto(store, mount, inode)
+	if r.Sidecars == 0 {
+		return false, nil // no sidecar on the volume for this inode
+	}
+	if r.Assets == 0 && r.Errs > 0 {
+		return false, fmt.Errorf("reconcile inode %d: sidecar present but ingest failed", inode)
+	}
+	return true, nil
+}
+
+// reconcileOneSidecarInto reads + ingests <mount>/.juicemount/derivatives/<inode>/
+// manifest.json into the store, returning per-call counts. The shared core of
+// both the full walk (ReconcileSidecars) and the on-miss path (ReconcileOneSidecar).
+func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint64) ReconcileResult {
+	var res ReconcileResult
+	scPath := filepath.Join(DerivBlobDir(mount, inode), "manifest.json")
+	raw, err := os.ReadFile(scPath)
+	if err != nil {
+		return res // no sidecar for this inode (blob-only dir / absent)
+	}
+	res.Sidecars++
+	// A sidecar freshly (re)written server-side can read back torn/partial on
+	// the client mount (JuiceFS eventual consistency). Retry the read a few
+	// times before giving up — a clean copy almost always lands within ms.
+	var sc ManifestSidecar
+	parsed := false
+	for try := 0; try < 4; try++ {
+		if json.Unmarshal(raw, &sc) == nil && sc.Inode != 0 {
+			parsed = true
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+		if r, e := os.ReadFile(scPath); e == nil {
+			raw = r
+		}
+	}
+	if !parsed {
+		res.Errs++
+		return res
+	}
+	if err := store.PutSource(sc.Inode, sc.SourceHash); err != nil {
+		res.Errs++
+		return res
+	}
+	// Repopulate /metadata?kind=tech (D1 consume + AI size-guard fallback).
+	if sc.Tech != nil && len(sc.Tech.Payload) > 0 {
+		_ = store.PutMetadata(sc.Inode, "tech", sc.Tech.Producer, sc.Tech.Version, sc.Tech.Hash, sc.Tech.Payload)
+	}
+	for _, row := range sc.Derivatives {
+		if err := store.PutDeriv(sc.Inode, row); err != nil {
+			res.Errs++
+			return res
+		}
+		res.Rows++
+	}
+	res.Assets++
+	return res
 }
 
 // WriteManifestSidecar serializes the asset's current manifest (source hash + all

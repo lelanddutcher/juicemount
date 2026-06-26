@@ -2517,6 +2517,24 @@ func handleDerivativesHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	known, srcHash := ds.Known(inode)
 	if !known {
+		// On-miss lazy reconcile (the JM-15 auto-reconcile bridge): the farm may
+		// have written a sidecar on the volume this app hasn't ingested yet (there's
+		// no full periodic derivatives reconcile in-app). Try ingesting JUST this
+		// inode's sidecar on the fly so navigating to a farm-derived asset surfaces
+		// it without a manual `jmfarm -reconcile`. Best-effort + bounded (one inode,
+		// only on a miss; ingested rows are cached, so the next query hits the DB).
+		globalMu.Lock()
+		mount := globalMountPath
+		globalMu.Unlock()
+		if mount != "" {
+			if found, ferr := farm.ReconcileOneSidecar(ds, mount, inode); ferr != nil {
+				jmlog.Warn("derivatives on-miss reconcile failed", "inode", inode, "error", ferr.Error())
+			} else if found {
+				known, srcHash = ds.Known(inode)
+			}
+		}
+	}
+	if !known {
 		// exists=false ⇒ empty manifest, source_hash:null (schema rule).
 		writeContractJSON(w, resp)
 		return
