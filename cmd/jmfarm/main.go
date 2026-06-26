@@ -36,33 +36,57 @@ var mediaExts = map[string]bool{
 
 func main() {
 	var (
-		dbPath   = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
-		root     = flag.String("root", "", "directory to walk for media (required unless -files)")
-		files    = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
-		mount    = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
-		blobs    = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
-		thumbDim = flag.Int("thumb-dim", 640, "poster fit box in px")
-		filmstr  = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
-		filmCell = flag.Int("filmstrip-cell", 160, "filmstrip cell width in px")
-		wave     = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
-		waveSPP  = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
-		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.loupe.json (instead of basic derivatives)")
-		proxyGen = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
-		vcodec   = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
-		pCRF     = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")
-		pPreset  = flag.String("preset", "slow", "proxy x264 preset (faster preset = quicker, larger)")
-		pConc    = flag.Int("proxy-concurrency", 0, "separate (lower) worker count for proxy mode; 0 = use -concurrency (proxy transcode is the CPU hog)")
-		wModel   = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
-		wBin     = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
-		limit    = flag.Int("limit", 0, "max files to process (0 = no limit)")
-		conc     = flag.Int("concurrency", 4, "parallel workers")
-		producer = flag.String("producer", "macos-node", "producer tag")
-		version  = flag.Int("version", 1, "producer version")
-		dryRun   = flag.Bool("dry-run", false, "probe + report, do not write")
-		verbose  = flag.Bool("verbose", false, "per-file logging")
-		status   = flag.String("status", "", "after the sweep, write a rollup status JSON here (manager Farm tab)")
+		dbPath    = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
+		root      = flag.String("root", "", "directory to walk for media (required unless -files)")
+		files     = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
+		mount     = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
+		blobs     = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
+		thumbDim  = flag.Int("thumb-dim", 640, "poster fit box in px")
+		filmstr   = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
+		filmCell  = flag.Int("filmstrip-cell", 160, "filmstrip cell width in px")
+		wave      = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
+		waveSPP   = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
+		transcr   = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.loupe.json (instead of basic derivatives)")
+		proxyGen  = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
+		vcodec    = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
+		pCRF      = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")
+		pPreset   = flag.String("preset", "slow", "proxy x264 preset (faster preset = quicker, larger)")
+		pConc     = flag.Int("proxy-concurrency", 0, "separate (lower) worker count for proxy mode; 0 = use -concurrency (proxy transcode is the CPU hog)")
+		wModel    = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
+		wBin      = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
+		limit     = flag.Int("limit", 0, "max files to process (0 = no limit)")
+		conc      = flag.Int("concurrency", 4, "parallel workers")
+		producer  = flag.String("producer", "macos-node", "producer tag")
+		version   = flag.Int("version", 1, "producer version")
+		dryRun    = flag.Bool("dry-run", false, "probe + report, do not write")
+		verbose   = flag.Bool("verbose", false, "per-file logging")
+		status    = flag.String("status", "", "after the sweep, write a rollup status JSON here (manager Farm tab)")
+		reconcile = flag.Bool("reconcile", false, "JM-15: ingest volume manifest.json sidecars into -db (no media processing); closes the farm→client discovery loop")
 	)
 	flag.Parse()
+
+	// JM-15 reconcile mode: walk the volume sidecars → local db, then exit. The
+	// running app serves the same db (WAL), so reconciled rows appear live.
+	if *reconcile {
+		if *mount == "" {
+			fmt.Fprintln(os.Stderr, "jmfarm: -reconcile requires -mount <volume>")
+			os.Exit(2)
+		}
+		store, err := derivatives.Open(*dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm: open %s: %v\n", *dbPath, err)
+			os.Exit(1)
+		}
+		defer store.Close()
+		res, err := farm.ReconcileSidecars(store, *mount)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm: reconcile: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("jmfarm reconcile: %d sidecars → %d assets, %d rows ingested, %d errors (db=%s)\n",
+			res.Sidecars, res.Assets, res.Rows, res.Errs, *dbPath)
+		return
+	}
 
 	if *root == "" && *files == "" {
 		fmt.Fprintln(os.Stderr, "jmfarm: need -root <dir> or -files <a,b,c>")

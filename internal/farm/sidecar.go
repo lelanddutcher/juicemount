@@ -24,6 +24,61 @@ type ManifestSidecar struct {
 	WrittenAt   int64                  `json:"written_at"` // unix seconds the farm last refreshed the sidecar
 }
 
+// ReconcileResult reports a JM-15 reconcile pass.
+type ReconcileResult struct {
+	Sidecars int // sidecars found
+	Assets   int // assets ingested
+	Rows     int // derivative rows ingested
+	Errs     int // sidecars that failed to parse/ingest
+}
+
+// ReconcileSidecars is the JM-15 Mac-side reconcile: it walks the volume's
+// per-inode manifest.json sidecars (written by the farm) and ingests them into
+// the local store — PutSource(inode, source_hash) + PutDeriv(each row). The
+// running app serves the SAME db (WAL concurrent reads), so reconciled rows
+// appear in /derivatives immediately, with no app restart. Idempotent (upserts).
+func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult, error) {
+	var res ReconcileResult
+	base := filepath.Join(mount, ".juicemount", "derivatives")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return res, err
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(base, e.Name(), "manifest.json"))
+		if err != nil {
+			continue // no sidecar for this inode (blob-only dir)
+		}
+		res.Sidecars++
+		var sc ManifestSidecar
+		if json.Unmarshal(raw, &sc) != nil || sc.Inode == 0 {
+			res.Errs++
+			continue
+		}
+		if err := store.PutSource(sc.Inode, sc.SourceHash); err != nil {
+			res.Errs++
+			continue
+		}
+		ok := true
+		for _, row := range sc.Derivatives {
+			if err := store.PutDeriv(sc.Inode, row); err != nil {
+				ok = false
+				break
+			}
+			res.Rows++
+		}
+		if ok {
+			res.Assets++
+		} else {
+			res.Errs++
+		}
+	}
+	return res, nil
+}
+
 // WriteManifestSidecar serializes the asset's current manifest (source hash + all
 // derivative rows) to <mount>/.juicemount/derivatives/<inode>/manifest.json. Call
 // it AFTER the store writes for a pass, so the sidecar reflects the full,
