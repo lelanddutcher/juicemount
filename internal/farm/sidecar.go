@@ -21,7 +21,20 @@ type ManifestSidecar struct {
 	Inode       uint64                 `json:"inode"`
 	SourceHash  *string                `json:"source_hash"`
 	Derivatives []derivatives.DerivRow `json:"derivatives"`
-	WrittenAt   int64                  `json:"written_at"` // unix seconds the farm last refreshed the sidecar
+	// Tech is the structured `tech` metadata payload (ffprobe JSON) so the
+	// reconcile can repopulate /metadata?kind=tech — needed for the consumer's
+	// D1 tech consume AND its AI size-guard fallback (serverSize ← tech.size_bytes
+	// when the row's source_size isn't served by an older control plane).
+	Tech      *TechSidecar `json:"tech,omitempty"`
+	WrittenAt int64        `json:"written_at"` // unix seconds the farm last refreshed the sidecar
+}
+
+// TechSidecar mirrors the `tech` metadata row for the sidecar.
+type TechSidecar struct {
+	Producer string          `json:"producer"`
+	Version  int             `json:"version"`
+	Hash     *string         `json:"hash"`
+	Payload  json.RawMessage `json:"payload"`
 }
 
 // ReconcileResult reports a JM-15 reconcile pass.
@@ -61,6 +74,10 @@ func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult,
 		if err := store.PutSource(sc.Inode, sc.SourceHash); err != nil {
 			res.Errs++
 			continue
+		}
+		// Repopulate /metadata?kind=tech (D1 consume + AI size-guard fallback).
+		if sc.Tech != nil && len(sc.Tech.Payload) > 0 {
+			_ = store.PutMetadata(sc.Inode, "tech", sc.Tech.Producer, sc.Tech.Version, sc.Tech.Hash, sc.Tech.Payload)
 		}
 		ok := true
 		for _, row := range sc.Derivatives {
@@ -102,6 +119,10 @@ func WriteManifestSidecar(store *derivatives.Store, mount string, inode uint64) 
 		SourceHash:  srcHash,
 		Derivatives: rows,
 		WrittenAt:   time.Now().Unix(),
+	}
+	// Carry the tech metadata payload so the reconcile can repopulate /metadata.
+	if tm, err := store.Metadata(inode, "tech"); err == nil && tm != nil {
+		sc.Tech = &TechSidecar{Producer: tm.Producer, Version: tm.Version, Hash: tm.Hash, Payload: tm.Payload}
 	}
 	b, err := json.MarshalIndent(sc, "", "  ")
 	if err != nil {
