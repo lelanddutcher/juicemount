@@ -20,6 +20,20 @@ knob inspector** showing the live governor. One S-effort farm add earns its plac
 the *resolved* governor values + live vcodec/crf/preset/model into `farm-status.json` so the
 inspector shows real values (degrades to documented defaults if it lands a beat later).
 
+## Decisions locked (Leland, 2026-06-25)
+- **Pre-generation = OFF volume-wide by default.** A folder is **opted IN per directory** (whitelist),
+  with **whitelistable subfolders** inside an opted-in tree. So Phase 5 leads with an **opt-in `.juicefarm`
+  marker** (or a manager-stored whitelist), NOT a blacklist. **Rationale (load-bearing):** DaVinci/Premiere
+  write their OWN proxies into the project tree — we must NOT make *proxies of proxies*. Those NLE proxy
+  folders won't be opened in OpenLoupe, and OpenLoupe already filters those file types, so default-off + opt-in
+  is the safe shape (a giant folder landing on the volume never triggers a surprise full-volume sweep either).
+- **Proxy skip-threshold = a user-exposed setting** (NOT a hardcoded default). It's something to experiment
+  with, so surface the saving-% cutoff as an editable field (global default + per-folder override), backed by
+  the Phase-3 estimator + actual-size radar that calibrate what a sane number is.
+- **Triggering = scheduled + manual, Jellyfin-style.** Model the UX on open-source media managers (Jellyfin
+  library scans): a **"Scan / generate now"** manual button AND a **scheduled** recurring sweep, via the
+  manager's existing `/api/schedules` framework. The farm stays a thin one-shot the schedule/button launches.
+
 ## Phase 1 — Educate & expose *(read-only, zero new endpoints)* — S–M
 Make a non-engineer understand what runs, on what, how covered they are, under what governor.
 - Plain-language "What is the farm?" panel
