@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 )
 
 // WaveformJSON is the de-facto-standard BBC audiowaveform / waveform-data.js
@@ -38,9 +37,19 @@ func Waveform(ffmpegBin, srcPath, outPath string, samplesPerPixel int) (int, err
 	if samplesPerPixel <= 0 {
 		samplesPerPixel = 1024
 	}
-	cmd := exec.Command(ffmpegBin, "-v", "quiet",
-		"-i", srcPath, "-map", "0:a:0", "-ac", "1", "-ar", strconv.Itoa(waveformSampleRate),
-		"-f", "s16le", "-")
+	// Fold ALL audio streams + channels to mono (the silent-data-loss fix —
+	// audioFoldArgs). -v error (not quiet) so a real decode failure surfaces in
+	// stderr + trips the cmd.Wait() error path instead of a silent flatline.
+	foldArgs, hasAudio, ferr := audioFoldArgs(ffmpegBin, srcPath, waveformSampleRate)
+	if ferr != nil {
+		return 0, fmt.Errorf("waveform: probe audio %q: %w", srcPath, ferr)
+	}
+	if !hasAudio {
+		return 0, nil // no audio ⇒ no waveform
+	}
+	cmdArgs := append([]string{"-v", "error", "-i", srcPath}, foldArgs...)
+	cmdArgs = append(cmdArgs, "-f", "s16le", "-")
+	cmd := exec.Command(ffmpegBin, cmdArgs...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return 0, err

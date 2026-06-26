@@ -117,11 +117,22 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 	defer os.RemoveAll(tmp)
 	wav := filepath.Join(tmp, "a.wav")
 
-	// 16kHz mono s16le — whisper.cpp's required input.
-	ext := exec.Command(ffmpegBin, "-v", "error", "-y", "-i", srcPath,
-		"-map", "0:a:0", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav)
+	// Fold ALL audio streams + channels down to 16kHz mono s16le (whisper.cpp's
+	// required input). Folding every stream — not just 0:a:0 — is the silent-data-
+	// loss fix (audioFoldArgs): on multi-mono camera clips the first stream is
+	// often the dead mic, so a:0-only transcribed pure silence.
+	foldArgs, hasAudio, ferr := audioFoldArgs(ffmpegBin, srcPath, 16000)
+	if ferr != nil {
+		return nil, fmt.Errorf("transcribe: probe audio %q: %w", srcPath, ferr)
+	}
+	if !hasAudio {
+		return nil, nil // no audio ⇒ no transcript, not an error
+	}
+	extArgs := append([]string{"-v", "error", "-y", "-i", srcPath}, foldArgs...)
+	extArgs = append(extArgs, "-c:a", "pcm_s16le", wav)
+	ext := exec.Command(ffmpegBin, extArgs...)
 	if out, err := ext.CombinedOutput(); err != nil {
-		// No audio track ⇒ no transcript, not an error.
+		// Belt-and-suspenders: a stream-map miss ⇒ no audio, not an error.
 		if strings.Contains(string(out), "Stream map") || strings.Contains(string(out), "matches no streams") {
 			return nil, nil
 		}
