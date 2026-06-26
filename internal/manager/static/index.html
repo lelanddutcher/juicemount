@@ -120,9 +120,26 @@
         <p id="farm-empty" class="hint" hidden></p>
 
         <div id="farm-content" hidden>
+          <!-- P2 live-activity banner. Shown only while status.in_progress is
+               present (an active sweep); hidden when idle so the last-sweep
+               sentence below tells the resting story. The progress bar + ETA
+               are computed client-side from done/total/started_at. -->
+          <div id="farm-live" class="farm-live" hidden>
+            <div class="farm-live-head">
+              <span class="farm-live-dot" aria-hidden="true"></span>
+              <span id="farm-live-headline" class="farm-live-headline"></span>
+              <span id="farm-live-eta" class="farm-live-eta"></span>
+            </div>
+            <div class="farm-live-bar">
+              <div id="farm-live-fill" class="farm-live-fill"></div>
+            </div>
+            <p id="farm-live-sub" class="farm-live-sub"></p>
+          </div>
+
           <!-- Last sweep, rendered as a plain-English sentence rather than a
                raw dl. Populated by loadFarm(); falls back to the empty
-               summary if no sweep has run. -->
+               summary if no sweep has run. Hidden while a sweep is live (the
+               banner above takes over). -->
           <p id="farm-sweep-sentence" class="farm-sweep-sentence"></p>
 
           <div class="overview-grid">
@@ -161,6 +178,29 @@
               </p>
               <p id="farm-governor-empty" class="hint" hidden>Settings not yet reported by the farm.</p>
               <dl id="farm-governor" class="farm-governor-grid"></dl>
+            </article>
+
+            <!-- P3 proxy economics: a rollup over generated proxy blobs.
+                 Headline = average saving + total bytes saved; the bloat
+                 radar flags clips whose proxy barely shrank (already-
+                 compressed phone/h264 footage). Hidden when the farm has
+                 not measured any proxies yet. -->
+            <article id="farm-economics" class="overview-card overview-card-wide" data-card="farm-economics" hidden>
+              <header><h3>Proxy economics</h3></header>
+              <p class="farm-card-sub">
+                How much space the editing proxies actually save versus the
+                original footage. Measured from the proxy files on disk.
+              </p>
+              <p id="farm-economics-headline" class="farm-econ-headline"></p>
+              <div id="farm-economics-bloat-wrap" class="farm-econ-bloat-wrap" hidden>
+                <h4 class="farm-econ-bloat-title">Bloat radar</h4>
+                <p class="farm-card-sub">
+                  Already-compressed footage (phone clips, h264) barely shrinks,
+                  so these proxies cost storage without buying much speed — they
+                  may not be worth generating.
+                </p>
+                <ul id="farm-economics-bloat" class="farm-econ-bloat"></ul>
+              </div>
             </article>
           </div>
         </div>

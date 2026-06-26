@@ -952,15 +952,159 @@
     const idx = s.index || {};
     const sweep = s.last_sweep || {};
     const governor = s.governor || null;
+    const inProgress = s.in_progress || null;
+    const economics = s.proxy_economics || null;
 
-    renderFarmSweepSentence(sweep);
+    // P2: when a sweep is live, the banner takes over and we hide the
+    // resting last-sweep sentence; otherwise the sentence tells the story.
+    renderFarmLive(inProgress);
+    const sentenceEl = $('#farm-sweep-sentence');
+    if (inProgress) {
+      sentenceEl.hidden = true;
+    } else {
+      sentenceEl.hidden = false;
+      renderFarmSweepSentence(sweep);
+    }
     renderFarmCoverage(idx);
     renderFarmProvenance(governor);
     renderFarmGovernor(governor);
+    renderFarmEconomics(economics);
 
     if (s.written_at) {
       $('#farm-updated').textContent = '· updated ' + new Date(s.written_at * 1000).toLocaleTimeString();
     }
+  }
+
+  // ---- P2: live sweep banner ----
+  // renderFarmLive shows/hides the prominent "Sweep running" banner from
+  // status.in_progress. When absent, the banner hides and the resting
+  // last-sweep sentence (handled in loadFarm) takes over. The ETA is computed
+  // entirely client-side from started_at/done/total so it ticks forward with
+  // every 10s poll without the backend having to estimate.
+  function renderFarmLive(ip) {
+    const box = $('#farm-live');
+    if (!ip) { box.hidden = true; return; }
+    box.hidden = false;
+
+    const total = ip.total != null ? ip.total : 0;
+    const done = ip.done != null ? ip.done : 0;
+    const failed = ip.failed != null ? ip.failed : 0;
+    const pass = farmModePhrase(ip.pass);
+
+    // Headline: "Sweep running — proxy pass, 7 of 14 files".
+    $('#farm-live-headline').textContent =
+      'Sweep running — ' + pass + ', ' +
+      done.toLocaleString() + ' of ' + total.toLocaleString() +
+      ' file' + (total === 1 ? '' : 's');
+
+    // Progress bar: done/total, clamped to [0,100]. With total==0 we show a
+    // 0% bar rather than dividing by zero.
+    const pct = total > 0 ? Math.min(100, Math.max(0, Math.round((done / total) * 100))) : 0;
+    $('#farm-live-fill').style.width = pct + '%';
+
+    // ETA: elapsed = now - started_at; rate = elapsed/done; eta = rate*(total-done).
+    // "estimating…" until at least one file is done (no rate yet).
+    const etaEl = $('#farm-live-eta');
+    const remaining = Math.max(0, total - done);
+    if (done <= 0 || remaining === 0 || !ip.started_at) {
+      etaEl.textContent = remaining === 0 && total > 0 ? 'finishing…' : 'estimating…';
+    } else {
+      const nowSec = Date.now() / 1000;
+      const elapsed = Math.max(0, nowSec - ip.started_at);
+      const etaSec = Math.round((elapsed / done) * remaining);
+      etaEl.textContent = '~' + formatEta(etaSec) + ' left';
+    }
+
+    // Sub-line: percent + any failures so far.
+    let sub = pct + '% complete';
+    if (failed > 0) {
+      sub += ' · ' + failed.toLocaleString() + ' failed so far';
+    }
+    $('#farm-live-sub').textContent = sub;
+  }
+
+  // formatEta renders a seconds count as a friendly "left" label: "~45s",
+  // "~3 min", "~1 hr 5 min". Distinct from formatDuration (which the jobs
+  // pane uses) because this rounds to coarse, reassuring units for a human
+  // watching a long sweep — not exact ms-derived precision.
+  function formatEta(sec) {
+    if (!sec || sec < 0) return '0s';
+    if (sec < 60) return sec + 's';
+    const totalMin = Math.round(sec / 60);
+    if (totalMin < 60) return totalMin + ' min';
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    return h + ' hr' + (m > 0 ? ' ' + m + ' min' : '');
+  }
+
+  // ---- P3: proxy economics ----
+  // renderFarmEconomics renders the savings headline + bloat radar from
+  // status.proxy_economics. Hidden when absent or measured==0. Every value is
+  // placed via textContent / DOM nodes so an untrusted clip name can't inject
+  // markup.
+  function renderFarmEconomics(econ) {
+    const card = $('#farm-economics');
+    if (!econ || !(econ.measured > 0)) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+
+    const srcBytes = econ.total_source_bytes != null ? econ.total_source_bytes : 0;
+    const proxyBytes = econ.total_proxy_bytes != null ? econ.total_proxy_bytes : 0;
+    const saved = Math.max(0, srcBytes - proxyBytes);
+    const avgPct = econ.avg_saving_pct != null ? econ.avg_saving_pct : 0;
+    const measured = econ.measured;
+
+    // Headline: "Proxies are 69% smaller than the originals on average —
+    // saved 524 MB across 13 proxies."
+    $('#farm-economics-headline').textContent =
+      'Proxies are ' + avgPct + '% smaller than the originals on average — saved ' +
+      formatBytesHuman(saved) + ' across ' + measured.toLocaleString() +
+      ' prox' + (measured === 1 ? 'y' : 'ies') + '.';
+
+    const wrap = $('#farm-economics-bloat-wrap');
+    const list = $('#farm-economics-bloat');
+    list.innerHTML = '';
+    const bloat = Array.isArray(econ.bloat) ? econ.bloat : [];
+    if (bloat.length === 0) {
+      wrap.hidden = true;
+      return;
+    }
+    wrap.hidden = false;
+    bloat.forEach((b) => {
+      const li = document.createElement('li');
+      li.className = 'farm-econ-bloat-row';
+
+      const name = document.createElement('span');
+      name.className = 'farm-econ-bloat-name';
+      name.textContent = b.name || ('inode ' + (b.inode != null ? b.inode : '?'));
+      li.appendChild(name);
+
+      // "proxy is 94% of the original (only 6% saved)".
+      const saving = b.saving_pct != null ? b.saving_pct : 0;
+      const ofOriginal = Math.max(0, 100 - saving);
+      const note = document.createElement('span');
+      note.className = 'farm-econ-bloat-note';
+      note.textContent = 'proxy is ' + ofOriginal + '% of the original (only ' +
+        saving + '% saved)';
+      li.appendChild(note);
+
+      list.appendChild(li);
+    });
+  }
+
+  // formatBytesHuman is the KB/MB/GB human-bytes formatter for the economics
+  // copy. Mirrors formatBytes() but kept local to the farm pane so the P3
+  // wording ("saved 524 MB") reads naturally regardless of the migrator's
+  // formatting choices.
+  function formatBytesHuman(b) {
+    if (!b || b < 0) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    let i = 0;
+    let n = b;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i ? (n < 10 ? 1 : 0) : 0) + ' ' + u[i];
   }
 
   // renderFarmSweepSentence turns the raw SweepInfo into one plain-English line:

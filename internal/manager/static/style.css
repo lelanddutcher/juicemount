@@ -1443,3 +1443,115 @@ footer a:hover { text-decoration: underline; }
   color: var(--text);
   word-break: break-word;
 }
+
+/* P2 — live sweep banner. Prominent accent-tinted card above the coverage
+   grid; only visible while status.in_progress is present. A pulsing dot signals
+   "this is happening right now"; the bar fills done/total and the ETA sits on
+   the right of the head row. */
+.farm-live {
+  margin: 0 0 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--accent);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-bg);
+}
+.farm-live[hidden] { display: none; }
+.farm-live-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.farm-live-dot {
+  flex-shrink: 0;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--running);
+  align-self: center;
+  animation: farm-live-pulse 1.4s ease-in-out infinite;
+}
+@keyframes farm-live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.75); }
+}
+.farm-live-headline {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.farm-live-eta {
+  flex-shrink: 0;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.farm-live-bar {
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.farm-live-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.4s ease-out;
+}
+.farm-live-sub {
+  margin: 0.4rem 0 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* P3 — proxy economics card. Headline reads the average saving; the bloat
+   radar lists the worst-shrinking clips in a warn color so already-compressed
+   footage stands out. */
+.farm-econ-headline {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.5;
+}
+.farm-econ-bloat-wrap { margin-top: 1rem; }
+.farm-econ-bloat-wrap[hidden] { display: none; }
+.farm-econ-bloat-title {
+  margin: 0 0 0.25rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--running);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.farm-econ-bloat {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+}
+.farm-econ-bloat-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  margin-bottom: 0.35rem;
+  border-left: 3px solid var(--running);
+  background: rgba(255, 149, 0, 0.08);
+  border-radius: 0 4px 4px 0;
+}
+.farm-econ-bloat-row:last-child { margin-bottom: 0; }
+.farm-econ-bloat-name {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-all;
+}
+.farm-econ-bloat-note {
+  font-size: 0.82rem;
+  color: var(--running);
+}

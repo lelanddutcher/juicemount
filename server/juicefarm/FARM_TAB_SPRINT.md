@@ -55,6 +55,7 @@ The answer to "estimated file sizes" + the read-only half of the near-same-size-
 - Record **actual** proxy size + delta on the row (os.Stat → the `extra` JSON column, FilmstripGeo precedent)
 - **Proxy-bloat radar** — batch view flagging clips where proxy ≥ X% of original (the iPhone/h264 case)
 - Folder-level proxy-economics summary card
+- *(P3 follow-up):* the bloat radar identifies clips by **inode** today (proxy rows store no source path) — store the source basename on the proxy row (the `extra` column) so the radar shows **filenames**, making it actionable
 
 ## Phase 4 — The sweep-trigger linchpin *(the one new control path)* — L (trigger) + M (knobs)
 Manager OWNS a sweep as a tracked job: pick a `/jfs` subtree + passes → launch a one-shot

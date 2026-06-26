@@ -153,6 +153,56 @@ func main() {
 	var mu sync.Mutex
 	var firstErrs []string
 
+	// Resolve the target + governor stamp up front so the live progress ticker
+	// (below) can write the same sweep/governor shape the final write uses.
+	target := *root
+	if target == "" {
+		target = "files:" + *files
+	}
+	gov := farm.NewGovernor(*wModel, *vcodec, *pPreset, mode,
+		*pCRF, *conc, *pConc, *gNice, *gIONice, *gInterval)
+
+	// Live progress: while the sweep runs, write farm-status.json every ~3s with an
+	// in_progress block {pass, total, done, failed, started_at} so the manager Farm
+	// tab can show a progress bar + ETA. Cheap by design (Stats GROUP BY only; the
+	// proxy_economics stat-walk is skipped until the final write). Only when a status
+	// path is set and we're really writing (store!=nil, !dry-run). The ticker is
+	// stopped before the final WriteFarmStatus so the last write (which clears
+	// in_progress) always wins.
+	stopProgress := make(chan struct{})
+	var progressWG sync.WaitGroup
+	if *status != "" && !*dryRun && store != nil {
+		progressWG.Add(1)
+		go func() {
+			defer progressWG.Done()
+			tick := time.NewTicker(3 * time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-stopProgress:
+					return
+				case <-tick.C:
+					done := atomic.LoadInt64(&ok) + atomic.LoadInt64(&failed)
+					ip := farm.InProgress{
+						Pass:      mode,
+						Total:     len(targets),
+						Done:      int(done),
+						Failed:    int(atomic.LoadInt64(&failed)),
+						StartedAt: start.Unix(),
+					}
+					sweep := farm.SweepInfo{
+						Mode: mode, Producer: *producer, Target: target,
+						Processed: int(done), Failed: int(atomic.LoadInt64(&failed)),
+						StartedAt: start.Unix(), DurationMS: time.Since(start).Milliseconds(),
+					}
+					if err := farm.WriteFarmProgress(store, *status, *mount, sweep, gov, ip); err != nil {
+						fmt.Fprintf(os.Stderr, "jmfarm: progress write: %v\n", err)
+					}
+				}
+			}
+		}()
+	}
+
 	sem := make(chan struct{}, effConc)
 	var wg sync.WaitGroup
 	for _, p := range targets {
@@ -248,6 +298,11 @@ func main() {
 	}
 	wg.Wait()
 
+	// Stop the live ticker before the final write so the final status (which clears
+	// in_progress + measures proxy_economics) is the last thing on disk.
+	close(stopProgress)
+	progressWG.Wait()
+
 	if *transcr {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d with-speech (transcribed) — %d total\n",
 			time.Since(start).Round(time.Millisecond), ok, failed, speech, len(targets))
@@ -266,21 +321,16 @@ func main() {
 	}
 
 	if *status != "" && !*dryRun && store != nil {
-		target := *root
-		if target == "" {
-			target = "files:" + *files
-		}
 		sweep := farm.SweepInfo{
 			Mode: mode, Producer: *producer, Target: target,
 			Processed: int(ok), Failed: int(failed),
 			StartedAt: start.Unix(), DurationMS: time.Since(start).Milliseconds(),
 		}
-		// Stamp the RESOLVED run settings so the manager's read-only knob
-		// inspector shows real values. nice/ionice/interval are recorded here
-		// but applied by the entrypoint (nice/ionice + sleep loop).
-		gov := farm.NewGovernor(*wModel, *vcodec, *pPreset, mode,
-			*pCRF, *conc, *pConc, *gNice, *gIONice, *gInterval)
-		if err := farm.WriteFarmStatus(store, *status, sweep, gov); err != nil {
+		// Final (idle) write: clears in_progress + measures proxy_economics (stat-
+		// walks the proxy blobs under *mount). gov was stamped before the sweep with
+		// the RESOLVED run settings so the manager's read-only knob inspector shows
+		// real values (nice/ionice/interval are applied by the entrypoint).
+		if err := farm.WriteFarmStatus(store, *status, *mount, sweep, gov); err != nil {
 			fmt.Fprintf(os.Stderr, "jmfarm: status write: %v\n", err)
 		}
 	}

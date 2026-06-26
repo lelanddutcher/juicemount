@@ -318,6 +318,47 @@ func (s *Store) Stats() (Stats, error) {
 	return out, nil
 }
 
+// ProxyRow is a minimal proxy-derivative tuple for the farm's proxy-economics
+// rollup: the asset inode + the source file size recorded at generation time.
+// It carries only what the economics measure needs (stat the blob for the proxy
+// bytes) — NO schema change, NO blob path (the farm derives it from the inode via
+// DerivBlobDir).
+type ProxyRow struct {
+	Inode      uint64
+	SourceSize *int64
+}
+
+// ListProxyRows returns the ready proxy derivative rows (inode + source_size).
+// Used by the farm's proxy-economics rollup, which os.Stats each inode's
+// proxy.mp4 blob to compare actual proxy bytes against the source size. Only
+// `ready` rows are returned (a failed proxy has no blob to measure).
+func (s *Store) ListProxyRows() ([]ProxyRow, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT inode, source_size FROM derivatives
+		WHERE kind = 'proxy' AND status = 'ready' ORDER BY inode`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProxyRow
+	for rows.Next() {
+		var inode int64
+		var srcSize sql.NullInt64
+		if err := rows.Scan(&inode, &srcSize); err != nil {
+			return nil, err
+		}
+		pr := ProxyRow{Inode: uint64(inode)}
+		if srcSize.Valid {
+			v := srcSize.Int64
+			pr.SourceSize = &v
+		}
+		out = append(out, pr)
+	}
+	return out, rows.Err()
+}
+
 // ChangeRow is one entry in the /derivatives/changes delta feed.
 type ChangeRow struct {
 	Inode     uint64  `json:"inode"`

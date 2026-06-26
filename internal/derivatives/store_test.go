@@ -149,3 +149,34 @@ func TestMetadataRoundTrip(t *testing.T) {
 		t.Errorf("Metadata(unproduced) = %v, %v; want nil, nil", tm2, err)
 	}
 }
+
+// i64p is an *int64 helper for source_size in proxy-economics tests.
+func i64p(v int64) *int64 { return &v }
+
+// TestListProxyRows: ListProxyRows returns ONLY ready proxy rows (inode +
+// source_size); failed proxies and other kinds are excluded. Drives the farm's
+// proxy-economics rollup, which stat-walks each returned inode's blob.
+func TestListProxyRows(t *testing.T) {
+	s := openTest(t)
+	// A ready proxy (measurable), a failed proxy (no blob → excluded), and a
+	// non-proxy kind (thumb → excluded).
+	if err := s.PutDeriv(10, DerivRow{Kind: "proxy", Status: "ready", Producer: "linux-farm", Version: 1, SourceSize: i64p(5_000_000)}); err != nil {
+		t.Fatalf("PutDeriv ready proxy: %v", err)
+	}
+	if err := s.PutDeriv(11, DerivRow{Kind: "proxy", Status: "failed", Producer: "linux-farm", Version: 1, SourceSize: i64p(9_000_000)}); err != nil {
+		t.Fatalf("PutDeriv failed proxy: %v", err)
+	}
+	if err := s.PutDeriv(12, DerivRow{Kind: "thumb", Status: "ready", Producer: "linux-farm", Version: 1}); err != nil {
+		t.Fatalf("PutDeriv thumb: %v", err)
+	}
+	rows, err := s.ListProxyRows()
+	if err != nil {
+		t.Fatalf("ListProxyRows: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListProxyRows len = %d, want 1 (only the ready proxy)", len(rows))
+	}
+	if rows[0].Inode != 10 || rows[0].SourceSize == nil || *rows[0].SourceSize != 5_000_000 {
+		t.Errorf("row = %+v, want inode=10 source_size=5000000", rows[0])
+	}
+}
