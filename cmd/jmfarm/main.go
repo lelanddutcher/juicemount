@@ -517,7 +517,27 @@ func runQueue(cfg queueConfig) {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: mark-running %s: %v\n", job.ID, err)
 		}
 
+		// Keep the heartbeat fresh DURING the job. A big sweep (1000s of files,
+		// proxy/transcript) runs for hours inside runJob; without this the 30s
+		// worker TTL expires mid-job and the worker falsely reads as "offline"
+		// (ActiveWorkers empty) even though it's actively processing. A ~10s
+		// ticker (well inside WorkerTTL) holds it alive until the job returns.
+		hbCtx, hbStop := context.WithCancel(ctx)
+		go func() {
+			t := time.NewTicker(10 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-hbCtx.Done():
+					return
+				case <-t.C:
+					_ = q.Heartbeat(context.Background(), worker)
+				}
+			}
+		}()
+
 		processed, failed, runErr := runJob(ctx, store, cfg, worker, job)
+		hbStop()
 		if runErr != nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: job %s failed: %v\n", job.ID, runErr)
 			if err := q.MarkFailed(context.Background(), job.ID, runErr.Error()); err != nil {
