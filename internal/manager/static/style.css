@@ -1555,3 +1555,220 @@ footer a:hover { text-decoration: underline; }
   font-size: 0.82rem;
   color: var(--running);
 }
+
+/* Phase 4 — "Generate on the farm" trigger. A self-contained card with three
+   parts: a worker-presence banner, a queue-a-sweep form, and a recent-jobs
+   list. Reuses the dark farm-* / overview-card vocabulary so it reads as part
+   of the same pane. */
+.farm-generate {
+  margin: 0 0 1rem;
+  padding: 1rem 1.25rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+}
+.farm-generate .overview-header { margin: 0 0 0.85rem; }
+.farm-generate-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.farm-generate .overview-header .hint { margin: 0.25rem 0 0; }
+
+/* Worker-presence banner. Green (online) = a worker is draining; muted
+   (offline) = jobs wait. Mirrors the farm-live banner's pulsing-dot grammar. */
+.farm-active-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+.farm-active-banner.online {
+  border-left: 4px solid var(--success);
+  background: rgba(0, 135, 90, 0.10);
+}
+.farm-active-banner.offline {
+  border-left: 4px solid var(--border);
+  background: var(--bg);
+}
+.farm-active-dot {
+  flex-shrink: 0;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.farm-active-banner.online .farm-active-dot {
+  background: var(--success);
+  animation: farm-live-pulse 1.6s ease-in-out infinite;
+}
+.farm-active-text { flex: 1; min-width: 0; color: var(--text); font-weight: 500; }
+.farm-active-banner.offline .farm-active-text { color: var(--text-muted); font-weight: 400; }
+.farm-active-depth {
+  flex-shrink: 0;
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-bg);
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+}
+.farm-active-depth[hidden] { display: none; }
+
+/* Queue-a-sweep form. */
+.farm-sweep-form { margin: 0 0 1.25rem; }
+.farm-sweep-form .field { margin-bottom: 0.85rem; }
+.farm-sweep-form .field input[type="text"] {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.85rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  width: 100%;
+}
+.farm-sweep-form .field input[type="text"]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+.farm-sweep-kinds {
+  margin: 0 0 0.85rem;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+.farm-sweep-kinds legend {
+  padding: 0 0.4rem;
+  font-weight: 600;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.farm-sweep-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+#farm-sweep-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 0.5rem 1.1rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+#farm-sweep-btn:hover:not(:disabled) { filter: brightness(1.05); }
+#farm-sweep-btn:disabled { background: var(--text-muted); cursor: not-allowed; }
+.farm-sweep-flash {
+  font-size: 0.85rem;
+  color: var(--success);
+  background: rgba(0, 135, 90, 0.12);
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+}
+.farm-sweep-flash[hidden] { display: none; }
+
+/* Recent-jobs list. */
+.farm-jobs-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.farm-jobs-list { list-style: none; margin: 0; padding: 0; }
+.farm-jobs-empty {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.85rem;
+  padding: 0.25rem 0;
+}
+.farm-job-row {
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+.farm-job-row:last-child { margin-bottom: 0; }
+.farm-job-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.35rem;
+}
+.farm-job-chip {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.12rem 0.5rem;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.farm-job-chip.queued  { background: rgba(155, 155, 155, 0.20); color: var(--text-muted); }
+.farm-job-chip.running { background: var(--accent-bg); color: var(--accent); animation: farm-chip-pulse 1.6s ease-in-out infinite; }
+.farm-job-chip.done    { background: rgba(0, 135, 90, 0.18); color: var(--success); }
+.farm-job-chip.failed  { background: rgba(215, 0, 21, 0.18); color: var(--danger); }
+@keyframes farm-chip-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.farm-job-when {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.farm-job-path {
+  font-family: ui-monospace, "SF Mono", "Menlo", monospace;
+  font-size: 0.82rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.farm-job-path-parent { color: var(--text-muted); }
+.farm-job-path-base { color: var(--text); font-weight: 600; }
+.farm-job-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+}
+.farm-job-kind {
+  font-size: 0.72rem;
+  color: var(--accent);
+  background: var(--accent-bg);
+  padding: 0.1rem 0.45rem;
+  border-radius: 10px;
+}
+.farm-job-count {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.farm-job-count.failed { color: var(--danger); font-weight: 500; }
+.farm-job-error {
+  margin: 0.4rem 0 0;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.78rem;
+  color: var(--danger);
+  background: rgba(215, 0, 21, 0.08);
+  border-radius: 4px;
+  word-break: break-word;
+}

@@ -14,9 +14,16 @@
 #   JM_FARM_VCODEC     proxy video encoder (default libx264; GPU: h264_nvenc /
 #                      h264_qsv / h264_vaapi when the host has an APU/GPU)
 #   JM_FARM_MODE       "transcript" | "derivatives" | "proxy" | "all" (default: all)
+#                      OR "queue" → standing queue-drain worker (see JM_FARM_QUEUE)
 #   JM_FARM_WORKERS    concurrency                          (default: 4)
 #   JM_FARM_ONCE       "1" → process once and exit; else loop every JM_FARM_INTERVAL
 #   JM_FARM_INTERVAL   seconds between sweeps               (default: 900)
+#   JM_FARM_QUEUE      "1" (or JM_FARM_MODE=queue) → run as a STANDING worker that
+#                      drains the shared juicefarm: queue on $JM_META instead of
+#                      doing one-shot/interval -root sweeps. The container stays up;
+#                      it heartbeats + BRPOPs jobs forever (exit on SIGTERM). All the
+#                      one-shot env above still supplies the per-job run defaults a
+#                      job's options override (CRF/preset/model/vcodec/workers).
 set -eu
 
 : "${JM_META:?JM_META (redis://redis:6379/1) is required}"
@@ -98,6 +105,25 @@ run_sweep() {
       do_pass -transcript -whisper-model "$MODEL" ;;
   esac
 }
+
+# Standing queue-drain worker: JM_FARM_QUEUE=1 (or JM_FARM_MODE=queue). Instead of
+# one-shot/interval -root sweeps, exec the worker — it heartbeats + drains the
+# shared juicefarm: queue on $JM_META and runs each job's passes scoped to the
+# job's path (reusing the same generators do_pass uses). Wrapped in the SAME
+# nice/ionice as do_pass so a queued sweep never starves the live mount. This is a
+# standing container: exec replaces the shell so SIGTERM reaches jmfarm directly.
+if [ "${JM_FARM_QUEUE:-0}" = "1" ] || [ "$MODE" = "queue" ]; then
+  ion="${IONICE:-0}"
+  wrap=""
+  command -v nice >/dev/null 2>&1 && wrap="nice -n $NICE"
+  if [ -n "$IONICE" ] && command -v ionice >/dev/null 2>&1; then wrap="ionice -c $IONICE $wrap"; fi
+  echo "[juicefarm] queue mode: draining $JM_META (nice=$NICE ionice=${IONICE:-off})"
+  # shellcheck disable=SC2086
+  exec $wrap jmfarm -queue -meta "$JM_META" -mount "$MNT" -db "$DB" -producer "$PRODUCER" \
+    -status "$STATUS" -nice "$NICE" -ionice "$ion" \
+    -concurrency "$WORKERS" -proxy-concurrency "$PROXY_WORKERS" \
+    -vcodec "$VCODEC" -crf "$CRF" -preset "$PRESET" -whisper-model "$MODEL"
+fi
 
 if [ "${JM_FARM_ONCE:-0}" = "1" ]; then
   run_sweep

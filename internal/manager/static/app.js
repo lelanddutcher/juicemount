@@ -835,13 +835,27 @@
   let farmExplainerInited = false;
   const FARM_EXPLAINER_KEY = 'jm-farm-explainer-dismissed';
 
+  // Phase 4: the "Generate on the farm" trigger polls /api/farm/jobs on its
+  // own ~5s cadence (faster than the 10s farm-status rollup so a freshly
+  // queued job + worker presence feel live). Its timer is started/stopped
+  // by the SAME tab lifecycle (startFarmPolling/stopFarmPolling) so there's
+  // never a second uncleared interval running after the tab is left.
+  let farmJobsTimer = null;
+  let farmGenerateInited = false;
+  const FARM_JOBS_INTERVAL_MS = 5000;
+  let farmSweepInFlight = false;
+
   function startFarmPolling() {
     initFarmExplainerOnce();
+    initFarmGenerateOnce();
     loadFarm();
+    loadFarmJobs();
     if (!farmTimer) farmTimer = setInterval(loadFarm, 10000);
+    if (!farmJobsTimer) farmJobsTimer = setInterval(loadFarmJobs, FARM_JOBS_INTERVAL_MS);
   }
   function stopFarmPolling() {
     if (farmTimer) { clearInterval(farmTimer); farmTimer = null; }
+    if (farmJobsTimer) { clearInterval(farmJobsTimer); farmJobsTimer = null; }
   }
 
   // initFarmExplainerOnce wires the dismissible "What is the farm?" banner.
@@ -861,6 +875,258 @@
         try { localStorage.setItem(FARM_EXPLAINER_KEY, '1'); } catch (_) {}
       });
     }
+  }
+
+  // ---- Phase 4: "Generate on the farm" trigger ----
+  // initFarmGenerateOnce wires the sweep form exactly once: the Queue button,
+  // the path input (button enabled only when non-empty), and the kind
+  // checkboxes. Polling of /api/farm/jobs is driven by startFarmPolling so it
+  // shares the tab lifecycle.
+  function initFarmGenerateOnce() {
+    if (farmGenerateInited) return;
+    farmGenerateInited = true;
+    const pathEl = $('#farm-sweep-path');
+    const btn = $('#farm-sweep-btn');
+    if (pathEl) {
+      pathEl.addEventListener('input', updateFarmSweepButton);
+      // Enter in the path field queues the sweep (when valid).
+      pathEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !btn.disabled) { e.preventDefault(); submitFarmSweep(); }
+      });
+    }
+    if (btn) btn.addEventListener('click', submitFarmSweep);
+    updateFarmSweepButton();
+  }
+
+  // updateFarmSweepButton keeps the Queue button disabled while in-flight or
+  // when the path is empty — the two states the form must never submit from.
+  function updateFarmSweepButton() {
+    const btn = $('#farm-sweep-btn');
+    if (!btn) return;
+    const path = ($('#farm-sweep-path').value || '').trim();
+    btn.disabled = farmSweepInFlight || path === '';
+  }
+
+  // farmSweepKinds returns the checked kind values, in canonical order.
+  function farmSweepKinds() {
+    const kinds = [];
+    if ($('#farm-kind-derivatives').checked) kinds.push('derivatives');
+    if ($('#farm-kind-proxy').checked) kinds.push('proxy');
+    if ($('#farm-kind-transcript').checked) kinds.push('transcript');
+    return kinds;
+  }
+
+  // submitFarmSweep POSTs /api/farm/sweep with the typed path + checked kinds.
+  // 200 → inline "Queued ✓ (id …)" + an immediate job-list refresh; 400 → the
+  // backend's error string; 503 → a plain-English "queue unavailable" line.
+  // The button stays disabled for the whole round-trip (farmSweepInFlight).
+  async function submitFarmSweep() {
+    const path = ($('#farm-sweep-path').value || '').trim();
+    if (!path || farmSweepInFlight) return;
+    const kinds = farmSweepKinds();
+    const errEl = $('#farm-sweep-error');
+    const flashEl = $('#farm-sweep-flash');
+    errEl.hidden = true;
+    flashEl.hidden = true;
+    if (kinds.length === 0) {
+      errEl.textContent = 'Pick at least one thing to generate (Derivatives, Proxy, or Transcript).';
+      errEl.hidden = false;
+      return;
+    }
+
+    farmSweepInFlight = true;
+    updateFarmSweepButton();
+    try {
+      const r = await fetch(apiURL('/farm/sweep'), {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ path, kinds }),
+      });
+      if (r.status === 200) {
+        let id = '';
+        try { const data = await r.json(); id = data.id || ''; } catch (_) {}
+        flashEl.textContent = 'Queued ✓' + (id ? ' (id ' + id + ')' : '');
+        flashEl.hidden = false;
+        // Refresh the job list immediately so the new row appears without
+        // waiting for the next 5s tick.
+        loadFarmJobs();
+      } else if (r.status === 503) {
+        errEl.textContent = "Farm queue unavailable — the manager isn't connected to Redis.";
+        errEl.hidden = false;
+      } else {
+        // 400 (and any other non-200): surface the backend's message.
+        let msg = '';
+        try {
+          const data = await r.clone().json();
+          msg = data && data.error ? data.error : '';
+        } catch (_) {}
+        if (!msg) { try { msg = (await r.text()).trim(); } catch (_) {} }
+        errEl.textContent = msg || (r.status + ' ' + r.statusText);
+        errEl.hidden = false;
+      }
+    } catch (err) {
+      errEl.textContent = 'Could not queue the sweep: ' + (err.message || err);
+      errEl.hidden = false;
+    } finally {
+      farmSweepInFlight = false;
+      updateFarmSweepButton();
+    }
+  }
+
+  // loadFarmJobs polls GET /api/farm/jobs and renders the active-worker banner
+  // + the recent-jobs list. Failures are swallowed (network blip / tab navigated
+  // mid-flight) so a transient error doesn't blank the panel mid-session.
+  async function loadFarmJobs() {
+    let res;
+    try { res = await api('GET', '/api/farm/jobs'); } catch (e) { return; }
+    if (!res) return;
+    renderFarmActiveBanner(!!res.available, res.queue_depth || 0);
+    renderFarmJobsList(Array.isArray(res.jobs) ? res.jobs : []);
+  }
+
+  // renderFarmActiveBanner shows worker presence: green + "draining the queue"
+  // when ≥1 worker, muted "offline" otherwise. The queue depth ("N waiting")
+  // rides along when there's anything queued so the user knows work is pending.
+  function renderFarmActiveBanner(available, depth) {
+    const banner = $('#farm-active-banner');
+    const text = $('#farm-active-text');
+    const depthEl = $('#farm-active-depth');
+    if (!banner) return;
+    banner.classList.toggle('online', available);
+    banner.classList.toggle('offline', !available);
+    if (available) {
+      text.textContent = 'Farm worker online — draining the queue';
+    } else {
+      text.textContent = 'Farm worker offline — queued jobs will run once it starts';
+    }
+    if (depth > 0) {
+      depthEl.textContent = depth.toLocaleString() + ' waiting';
+      depthEl.hidden = false;
+    } else {
+      depthEl.hidden = true;
+    }
+  }
+
+  // FARM_JOB_STATUS_LABEL maps a queue status to readable chip copy.
+  const FARM_JOB_STATUS_LABEL = {
+    queued: 'Queued', running: 'Running', done: 'Done', failed: 'Failed',
+  };
+
+  // renderFarmJobsList renders one row per JobStatus, newest first (the backend
+  // returns recent-first). Each row: a status chip, the path (basename bold +
+  // parent dir muted), the kinds, processed/failed counts when present, and a
+  // relative enqueue time. Failed rows surface .error. Everything goes through
+  // textContent / DOM nodes — no innerHTML on wire values.
+  function renderFarmJobsList(jobs) {
+    const list = $('#farm-jobs-list');
+    if (!list) return;
+    list.innerHTML = '';
+    if (jobs.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'farm-jobs-empty';
+      li.textContent = 'No jobs queued yet.';
+      list.appendChild(li);
+      return;
+    }
+    jobs.forEach((j) => {
+      const status = j.status || 'queued';
+      const li = document.createElement('li');
+      li.className = 'farm-job-row';
+
+      // Head: status chip + relative time.
+      const head = document.createElement('div');
+      head.className = 'farm-job-head';
+
+      const chip = document.createElement('span');
+      chip.className = 'farm-job-chip ' + status;
+      chip.textContent = FARM_JOB_STATUS_LABEL[status] || status;
+      head.appendChild(chip);
+
+      const when = document.createElement('span');
+      when.className = 'farm-job-when';
+      when.textContent = farmRelativeTime(j.enqueued_at);
+      head.appendChild(when);
+
+      li.appendChild(head);
+
+      // Path: basename prominent, parent dir muted.
+      const pathEl = document.createElement('div');
+      pathEl.className = 'farm-job-path';
+      const rawPath = j.path || '';
+      const slash = rawPath.lastIndexOf('/');
+      const base = slash >= 0 ? rawPath.slice(slash + 1) : rawPath;
+      const parent = slash > 0 ? rawPath.slice(0, slash + 1) : (slash === 0 ? '/' : '');
+      if (parent) {
+        const parentEl = document.createElement('span');
+        parentEl.className = 'farm-job-path-parent';
+        parentEl.textContent = parent;
+        pathEl.appendChild(parentEl);
+      }
+      const baseEl = document.createElement('span');
+      baseEl.className = 'farm-job-path-base';
+      baseEl.textContent = base || rawPath;
+      pathEl.appendChild(baseEl);
+      li.appendChild(pathEl);
+
+      // Meta: kinds + processed/failed counts.
+      const meta = document.createElement('div');
+      meta.className = 'farm-job-meta';
+
+      const kinds = (j.kinds || '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (kinds.length) {
+        kinds.forEach((k) => {
+          const pill = document.createElement('span');
+          pill.className = 'farm-job-kind';
+          pill.textContent = k;
+          meta.appendChild(pill);
+        });
+      }
+
+      const processed = j.processed != null && j.processed !== '' ? Number(j.processed) : null;
+      const failed = j.failed != null && j.failed !== '' ? Number(j.failed) : null;
+      if (processed != null && !Number.isNaN(processed) && processed > 0) {
+        const p = document.createElement('span');
+        p.className = 'farm-job-count';
+        p.textContent = processed.toLocaleString() + ' done';
+        meta.appendChild(p);
+      }
+      if (failed != null && !Number.isNaN(failed) && failed > 0) {
+        const f = document.createElement('span');
+        f.className = 'farm-job-count failed';
+        f.textContent = failed.toLocaleString() + ' failed';
+        meta.appendChild(f);
+      }
+
+      if (meta.childNodes.length) li.appendChild(meta);
+
+      // Failed rows surface the error string.
+      if (status === 'failed' && j.error) {
+        const errEl = document.createElement('p');
+        errEl.className = 'farm-job-error';
+        errEl.textContent = j.error;
+        li.appendChild(errEl);
+      }
+
+      list.appendChild(li);
+    });
+  }
+
+  // farmRelativeTime renders an RFC3339 timestamp as a calm "just now / 5 min
+  // ago / 2 hr ago / 3 days ago" label. Unparseable / missing → ''.
+  function farmRelativeTime(ts) {
+    if (!ts) return '';
+    const then = Date.parse(ts);
+    if (Number.isNaN(then)) return '';
+    let sec = Math.round((Date.now() - then) / 1000);
+    if (sec < 0) sec = 0;
+    if (sec < 10) return 'just now';
+    if (sec < 60) return sec + 's ago';
+    const min = Math.floor(sec / 60);
+    if (min < 60) return min + ' min ago';
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return hr + ' hr ago';
+    const days = Math.floor(hr / 24);
+    return days + ' day' + (days === 1 ? '' : 's') + ' ago';
   }
 
   // FARM_PROVENANCE maps each derivative kind to the real process that produces

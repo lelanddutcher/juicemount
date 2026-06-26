@@ -10,20 +10,32 @@
 // JM-16 (the Linux fast lane) reuse it unchanged.
 //
 //	jmfarm --root "/Volumes/zpool/Film Projects/.../REEL_0065/Proxy" --blobs
+//
+// Queue mode (JM-16, the standing farm worker): with -queue -meta <redis://…> it
+// drains the shared juicefarm: queue instead of doing a single -root sweep — it
+// dials the volume's JuiceFS Redis, then loops { heartbeat; BRPOP a job; run the
+// passes the job asks for scoped to job.Path; mark done/failed } until SIGTERM.
+// The same internal/farm generators + farm-status rollup the one-shot modes use
+// are reused per job, so results flow back the proven JM-15 way (sidecars →
+// reconcile → /derivatives). -mount stays the FUSE files path; -meta is the queue.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"github.com/lelanddutcher/juicemount/internal/farm"
+	"github.com/lelanddutcher/juicemount/internal/farmqueue"
 )
 
 // mediaExts are the file types we probe. Extension gate is a cheap pre-filter;
@@ -32,6 +44,211 @@ var mediaExts = map[string]bool{
 	".mov": true, ".mp4": true, ".m4v": true, ".mxf": true, ".mkv": true,
 	".avi": true, ".mts": true, ".m2ts": true, ".braw": true, ".r3d": true,
 	".wav": true, ".aif": true, ".aiff": true, ".flac": true, ".mp3": true, ".m4a": true,
+}
+
+// passOpts bundles everything a single sweep needs so runPasses can be shared by
+// the one-shot CLI modes and the queue loop. The booleans select the generator;
+// at most one of Transcript/Proxy is set (else basic derivatives run).
+type passOpts struct {
+	opt      farm.Options // resolved generator options (already merged with job overrides in queue mode)
+	mode     string       // "derivatives" | "proxy" | "transcript(AI)" — display + status stamp
+	transcr  bool
+	proxyGen bool
+	dryRun   bool
+	verbose  bool
+	effConc  int    // resolved worker count for this sweep
+	status   string // farm-status.json path ("" → don't write)
+	mount    string // for the Tier-A blob dir + proxy_economics stat-walk
+	producer string
+	target   string        // human label for the status rollup (root or "files:…")
+	gov      farm.Governor // resolved governor stamp for the status file
+	store    *derivatives.Store
+}
+
+// runPasses dispatches one sweep over targets with the worker pool + live
+// progress ticker + final farm-status rollup, exactly as the one-shot path does.
+// It returns the (processed, failed) counts so the queue loop can MarkDone with
+// them. The generator dispatch below is the single source of truth: the basic,
+// proxy and transcript modes all funnel through the same internal/farm calls.
+func runPasses(po passOpts, targets []string) (processed, failed int) {
+	start := time.Now()
+	var ok, fail, thumbs, strips, waves, speech, proxies int64
+	var mu sync.Mutex
+	var firstErrs []string
+
+	// Live progress: while the sweep runs, write farm-status.json every ~3s with an
+	// in_progress block {pass, total, done, failed, started_at} so the manager Farm
+	// tab can show a progress bar + ETA. Cheap by design (Stats GROUP BY only; the
+	// proxy_economics stat-walk is skipped until the final write). Only when a status
+	// path is set and we're really writing (store!=nil, !dry-run). The ticker is
+	// stopped before the final WriteFarmStatus so the last write (which clears
+	// in_progress) always wins.
+	stopProgress := make(chan struct{})
+	var progressWG sync.WaitGroup
+	if po.status != "" && !po.dryRun && po.store != nil {
+		progressWG.Add(1)
+		go func() {
+			defer progressWG.Done()
+			tick := time.NewTicker(3 * time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-stopProgress:
+					return
+				case <-tick.C:
+					done := atomic.LoadInt64(&ok) + atomic.LoadInt64(&fail)
+					ip := farm.InProgress{
+						Pass:      po.mode,
+						Total:     len(targets),
+						Done:      int(done),
+						Failed:    int(atomic.LoadInt64(&fail)),
+						StartedAt: start.Unix(),
+					}
+					sweep := farm.SweepInfo{
+						Mode: po.mode, Producer: po.producer, Target: po.target,
+						Processed: int(done), Failed: int(atomic.LoadInt64(&fail)),
+						StartedAt: start.Unix(), DurationMS: time.Since(start).Milliseconds(),
+					}
+					if err := farm.WriteFarmProgress(po.store, po.status, po.mount, sweep, po.gov, ip); err != nil {
+						fmt.Fprintf(os.Stderr, "jmfarm: progress write: %v\n", err)
+					}
+				}
+			}
+		}()
+	}
+
+	sem := make(chan struct{}, po.effConc)
+	var wg sync.WaitGroup
+	for _, p := range targets {
+		p := p
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if po.dryRun {
+				tech, e := farm.Probe(po.opt.FFprobeBin, p, 0)
+				if e != nil {
+					atomic.AddInt64(&fail, 1)
+					recordErr(&mu, &firstErrs, p, e)
+					return
+				}
+				atomic.AddInt64(&ok, 1)
+				if po.verbose {
+					fmt.Printf("  [dry] %-50s %s %dms\n", filepath.Base(p), tech.Container, tech.DurationMS)
+				}
+				return
+			}
+
+			if po.proxyGen {
+				pr := farm.GenerateProxy(po.store, p, po.opt)
+				if pr.Err != nil {
+					atomic.AddInt64(&fail, 1)
+					recordErr(&mu, &firstErrs, p, pr.Err)
+					if po.verbose {
+						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), pr.Inode, pr.Err)
+					}
+					return
+				}
+				atomic.AddInt64(&ok, 1)
+				if pr.Wrote {
+					atomic.AddInt64(&proxies, 1)
+				}
+				if po.verbose {
+					fmt.Printf("  [ok] %-50s inode=%d proxy=%v\n", filepath.Base(p), pr.Inode, pr.Wrote)
+				}
+				return
+			}
+
+			if po.transcr {
+				tr := farm.GenerateTranscript(po.store, p, po.opt)
+				if tr.Err != nil {
+					atomic.AddInt64(&fail, 1)
+					recordErr(&mu, &firstErrs, p, tr.Err)
+					if po.verbose {
+						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), tr.Inode, tr.Err)
+					}
+					return
+				}
+				atomic.AddInt64(&ok, 1)
+				if tr.HasSpeech {
+					atomic.AddInt64(&speech, 1)
+				}
+				if po.verbose {
+					fmt.Printf("  [ok] %-50s inode=%d speech=%v segments=%d\n",
+						filepath.Base(p), tr.Inode, tr.HasSpeech, tr.Segments)
+				}
+				return
+			}
+
+			r := farm.Process(po.store, p, po.opt)
+			if r.Err != nil {
+				atomic.AddInt64(&fail, 1)
+				recordErr(&mu, &firstErrs, p, r.Err)
+				if po.verbose {
+					fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), r.Inode, r.Err)
+				}
+				return
+			}
+			atomic.AddInt64(&ok, 1)
+			if r.ThumbWrote {
+				atomic.AddInt64(&thumbs, 1)
+			}
+			if r.FilmWrote {
+				atomic.AddInt64(&strips, 1)
+			}
+			if r.WaveWrote {
+				atomic.AddInt64(&waves, 1)
+			}
+			if r.BlobErr != nil { // non-fatal: tech published, a blob couldn't render
+				recordErr(&mu, &firstErrs, p, r.BlobErr)
+			}
+			if po.verbose {
+				fmt.Printf("  [ok] %-50s inode=%d hash=%s %dms vid=%v thumb=%v strip=%v wave=%v\n",
+					filepath.Base(p), r.Inode, r.Hash, r.DurationMS, r.HasVideo, r.ThumbWrote, r.FilmWrote, r.WaveWrote)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Stop the live ticker before the final write so the final status (which clears
+	// in_progress + measures proxy_economics) is the last thing on disk.
+	close(stopProgress)
+	progressWG.Wait()
+
+	if po.transcr {
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d with-speech (transcribed) — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, fail, speech, len(targets))
+	} else if po.proxyGen {
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d proxies — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, fail, proxies, len(targets))
+	} else {
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails, %d filmstrips, %d waveforms — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, fail, thumbs, strips, waves, len(targets))
+	}
+	if len(firstErrs) > 0 {
+		fmt.Printf("first errors (%d shown):\n", len(firstErrs))
+		for _, e := range firstErrs {
+			fmt.Printf("  - %s\n", e)
+		}
+	}
+
+	if po.status != "" && !po.dryRun && po.store != nil {
+		sweep := farm.SweepInfo{
+			Mode: po.mode, Producer: po.producer, Target: po.target,
+			Processed: int(ok), Failed: int(fail),
+			StartedAt: start.Unix(), DurationMS: time.Since(start).Milliseconds(),
+		}
+		// Final (idle) write: clears in_progress + measures proxy_economics (stat-
+		// walks the proxy blobs under mount). gov was stamped before the sweep with
+		// the RESOLVED run settings so the manager's read-only knob inspector shows
+		// real values (nice/ionice/interval are applied by the entrypoint).
+		if err := farm.WriteFarmStatus(po.store, po.status, po.mount, sweep, po.gov); err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm: status write: %v\n", err)
+		}
+	}
+	return int(ok), int(fail)
 }
 
 func main() {
@@ -62,6 +279,8 @@ func main() {
 		verbose   = flag.Bool("verbose", false, "per-file logging")
 		status    = flag.String("status", "", "after the sweep, write a rollup status JSON here (manager Farm tab)")
 		reconcile = flag.Bool("reconcile", false, "JM-15: ingest volume manifest.json sidecars into -db (no media processing); closes the farm→client discovery loop")
+		queue     = flag.Bool("queue", false, "JM-16: standing worker — drain the shared juicefarm: queue (-meta) instead of a one-shot -root sweep")
+		meta      = flag.String("meta", "", "redis:// URL for the queue (required with -queue; the same JM_META the volume uses)")
 		// Informational governor knobs: the entrypoint actually APPLIES these via
 		// nice/ionice + its sleep loop; jmfarm only RECORDS them in the status
 		// stamp so the manager's read-only knob inspector shows real values.
@@ -91,6 +310,35 @@ func main() {
 		}
 		fmt.Printf("jmfarm reconcile: %d sidecars → %d assets, %d rows ingested, %d errors (db=%s)\n",
 			res.Sidecars, res.Assets, res.Rows, res.Errs, *dbPath)
+		return
+	}
+
+	// JM-16 queue mode: a standing worker draining the shared juicefarm: queue.
+	// It needs BOTH -mount (the FUSE files path the generators read) and -meta
+	// (the Redis the queue lives in). All the other flags supply the run defaults
+	// a job's options override where non-zero.
+	if *queue {
+		runQueue(queueConfig{
+			meta:     *meta,
+			dbPath:   *dbPath,
+			mount:    *mount,
+			producer: *producer,
+			version:  *version,
+			status:   *status,
+			verbose:  *verbose,
+			conc:     *conc,
+			pConc:    *pConc,
+			vcodec:   *vcodec,
+			crf:      *pCRF,
+			preset:   *pPreset,
+			wModel:   *wModel,
+			wBin:     *wBin,
+			thumbDim: *thumbDim,
+			filmCell: *filmCell,
+			waveSPP:  *waveSPP,
+			gNice:    *gNice,
+			gIONice:  *gIONice,
+		})
 		return
 	}
 
@@ -148,13 +396,8 @@ func main() {
 	fmt.Printf("jmfarm: %d files → %s  (mode=%s, producer=%s v%d, dry-run=%v, workers=%d)\n",
 		len(targets), *dbPath, mode, *producer, *version, *dryRun, effConc)
 
-	start := time.Now()
-	var ok, failed, thumbs, strips, waves, speech, proxies int64
-	var mu sync.Mutex
-	var firstErrs []string
-
 	// Resolve the target + governor stamp up front so the live progress ticker
-	// (below) can write the same sweep/governor shape the final write uses.
+	// (inside runPasses) writes the same sweep/governor shape the final write uses.
 	target := *root
 	if target == "" {
 		target = "files:" + *files
@@ -162,182 +405,262 @@ func main() {
 	gov := farm.NewGovernor(*wModel, *vcodec, *pPreset, mode,
 		*pCRF, *conc, *pConc, *gNice, *gIONice, *gInterval)
 
-	// Live progress: while the sweep runs, write farm-status.json every ~3s with an
-	// in_progress block {pass, total, done, failed, started_at} so the manager Farm
-	// tab can show a progress bar + ETA. Cheap by design (Stats GROUP BY only; the
-	// proxy_economics stat-walk is skipped until the final write). Only when a status
-	// path is set and we're really writing (store!=nil, !dry-run). The ticker is
-	// stopped before the final WriteFarmStatus so the last write (which clears
-	// in_progress) always wins.
-	stopProgress := make(chan struct{})
-	var progressWG sync.WaitGroup
-	if *status != "" && !*dryRun && store != nil {
-		progressWG.Add(1)
-		go func() {
-			defer progressWG.Done()
-			tick := time.NewTicker(3 * time.Second)
-			defer tick.Stop()
-			for {
-				select {
-				case <-stopProgress:
-					return
-				case <-tick.C:
-					done := atomic.LoadInt64(&ok) + atomic.LoadInt64(&failed)
-					ip := farm.InProgress{
-						Pass:      mode,
-						Total:     len(targets),
-						Done:      int(done),
-						Failed:    int(atomic.LoadInt64(&failed)),
-						StartedAt: start.Unix(),
-					}
-					sweep := farm.SweepInfo{
-						Mode: mode, Producer: *producer, Target: target,
-						Processed: int(done), Failed: int(atomic.LoadInt64(&failed)),
-						StartedAt: start.Unix(), DurationMS: time.Since(start).Milliseconds(),
-					}
-					if err := farm.WriteFarmProgress(store, *status, *mount, sweep, gov, ip); err != nil {
-						fmt.Fprintf(os.Stderr, "jmfarm: progress write: %v\n", err)
-					}
-				}
-			}
-		}()
-	}
+	_, failed := runPasses(passOpts{
+		opt: opt, mode: mode, transcr: *transcr, proxyGen: *proxyGen,
+		dryRun: *dryRun, verbose: *verbose, effConc: effConc,
+		status: *status, mount: *mount, producer: *producer,
+		target: target, gov: gov, store: store,
+	}, targets)
 
-	sem := make(chan struct{}, effConc)
-	var wg sync.WaitGroup
-	for _, p := range targets {
-		p := p
-		sem <- struct{}{}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			if *dryRun {
-				tech, e := farm.Probe(opt.FFprobeBin, p, 0)
-				if e != nil {
-					atomic.AddInt64(&failed, 1)
-					recordErr(&mu, &firstErrs, p, e)
-					return
-				}
-				atomic.AddInt64(&ok, 1)
-				if *verbose {
-					fmt.Printf("  [dry] %-50s %s %dms\n", filepath.Base(p), tech.Container, tech.DurationMS)
-				}
-				return
-			}
-
-			if *proxyGen {
-				pr := farm.GenerateProxy(store, p, opt)
-				if pr.Err != nil {
-					atomic.AddInt64(&failed, 1)
-					recordErr(&mu, &firstErrs, p, pr.Err)
-					if *verbose {
-						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), pr.Inode, pr.Err)
-					}
-					return
-				}
-				atomic.AddInt64(&ok, 1)
-				if pr.Wrote {
-					atomic.AddInt64(&proxies, 1)
-				}
-				if *verbose {
-					fmt.Printf("  [ok] %-50s inode=%d proxy=%v\n", filepath.Base(p), pr.Inode, pr.Wrote)
-				}
-				return
-			}
-
-			if *transcr {
-				tr := farm.GenerateTranscript(store, p, opt)
-				if tr.Err != nil {
-					atomic.AddInt64(&failed, 1)
-					recordErr(&mu, &firstErrs, p, tr.Err)
-					if *verbose {
-						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), tr.Inode, tr.Err)
-					}
-					return
-				}
-				atomic.AddInt64(&ok, 1)
-				if tr.HasSpeech {
-					atomic.AddInt64(&speech, 1)
-				}
-				if *verbose {
-					fmt.Printf("  [ok] %-50s inode=%d speech=%v segments=%d\n",
-						filepath.Base(p), tr.Inode, tr.HasSpeech, tr.Segments)
-				}
-				return
-			}
-
-			r := farm.Process(store, p, opt)
-			if r.Err != nil {
-				atomic.AddInt64(&failed, 1)
-				recordErr(&mu, &firstErrs, p, r.Err)
-				if *verbose {
-					fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), r.Inode, r.Err)
-				}
-				return
-			}
-			atomic.AddInt64(&ok, 1)
-			if r.ThumbWrote {
-				atomic.AddInt64(&thumbs, 1)
-			}
-			if r.FilmWrote {
-				atomic.AddInt64(&strips, 1)
-			}
-			if r.WaveWrote {
-				atomic.AddInt64(&waves, 1)
-			}
-			if r.BlobErr != nil { // non-fatal: tech published, a blob couldn't render
-				recordErr(&mu, &firstErrs, p, r.BlobErr)
-			}
-			if *verbose {
-				fmt.Printf("  [ok] %-50s inode=%d hash=%s %dms vid=%v thumb=%v strip=%v wave=%v\n",
-					filepath.Base(p), r.Inode, r.Hash, r.DurationMS, r.HasVideo, r.ThumbWrote, r.FilmWrote, r.WaveWrote)
-			}
-		}()
-	}
-	wg.Wait()
-
-	// Stop the live ticker before the final write so the final status (which clears
-	// in_progress + measures proxy_economics) is the last thing on disk.
-	close(stopProgress)
-	progressWG.Wait()
-
-	if *transcr {
-		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d with-speech (transcribed) — %d total\n",
-			time.Since(start).Round(time.Millisecond), ok, failed, speech, len(targets))
-	} else if *proxyGen {
-		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d proxies — %d total\n",
-			time.Since(start).Round(time.Millisecond), ok, failed, proxies, len(targets))
-	} else {
-		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails, %d filmstrips, %d waveforms — %d total\n",
-			time.Since(start).Round(time.Millisecond), ok, failed, thumbs, strips, waves, len(targets))
-	}
-	if len(firstErrs) > 0 {
-		fmt.Printf("first errors (%d shown):\n", len(firstErrs))
-		for _, e := range firstErrs {
-			fmt.Printf("  - %s\n", e)
-		}
-	}
-
-	if *status != "" && !*dryRun && store != nil {
-		sweep := farm.SweepInfo{
-			Mode: mode, Producer: *producer, Target: target,
-			Processed: int(ok), Failed: int(failed),
-			StartedAt: start.Unix(), DurationMS: time.Since(start).Milliseconds(),
-		}
-		// Final (idle) write: clears in_progress + measures proxy_economics (stat-
-		// walks the proxy blobs under *mount). gov was stamped before the sweep with
-		// the RESOLVED run settings so the manager's read-only knob inspector shows
-		// real values (nice/ionice/interval are applied by the entrypoint).
-		if err := farm.WriteFarmStatus(store, *status, *mount, sweep, gov); err != nil {
-			fmt.Fprintf(os.Stderr, "jmfarm: status write: %v\n", err)
-		}
-	}
-	if failed > 0 && ok == 0 {
+	processed := len(targets) - failed
+	if failed > 0 && processed == 0 {
 		os.Exit(1)
 	}
 }
+
+// queueConfig carries the run-default flags into the standing worker loop. A
+// drained job's options override the matching field where it is non-zero.
+type queueConfig struct {
+	meta     string
+	dbPath   string
+	mount    string
+	producer string
+	version  int
+	status   string
+	verbose  bool
+	conc     int
+	pConc    int
+	vcodec   string
+	crf      int
+	preset   string
+	wModel   string
+	wBin     string
+	thumbDim int
+	filmCell int
+	waveSPP  int
+	gNice    int
+	gIONice  int
+}
+
+// runQueue is the JM-16 standing worker. It dials the queue Redis, opens the
+// derivatives store once, then loops { heartbeat; BRPOP; run the job's passes;
+// mark done/failed } until SIGTERM/SIGINT. Redis hiccups are logged and the loop
+// continues — a transient meta outage must not kill a standing container.
+func runQueue(cfg queueConfig) {
+	if cfg.meta == "" {
+		fmt.Fprintln(os.Stderr, "jmfarm: -queue requires -meta <redis:// URL>")
+		os.Exit(2)
+	}
+	if cfg.mount == "" {
+		fmt.Fprintln(os.Stderr, "jmfarm: -queue requires -mount <volume>")
+		os.Exit(2)
+	}
+
+	q, err := farmqueue.Open(cfg.meta)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "jmfarm: queue open %q: %v\n", cfg.meta, err)
+		os.Exit(1)
+	}
+	defer q.Close()
+
+	store, err := derivatives.Open(cfg.dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "jmfarm: open %s: %v\n", cfg.dbPath, err)
+		os.Exit(1)
+	}
+	defer store.Close()
+
+	// Cancel the loop on SIGTERM/SIGINT (container stop) for a clean exit.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	worker := farmqueue.Worker{ID: farmqueue.NewID(), StartedAt: time.Now().UTC().Format(time.RFC3339)}
+	fmt.Printf("jmfarm queue: worker %s draining %s (db=%s mount=%s producer=%s)\n",
+		worker.ID, cfg.meta, cfg.dbPath, cfg.mount, cfg.producer)
+
+	for {
+		if ctx.Err() != nil {
+			break
+		}
+
+		// Heartbeat (idle): publish presence so a producer sees the farm is draining.
+		worker.CurrentJob = ""
+		if err := q.Heartbeat(ctx, worker); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "jmfarm queue: heartbeat: %v\n", err)
+		}
+
+		// Block up to 5s for a job. The short timeout re-heartbeats us well within
+		// the 30s worker TTL even when the queue is idle.
+		job, ok, err := q.Dequeue(ctx, 5*time.Second)
+		if err != nil {
+			if ctx.Err() != nil {
+				break // cancelled mid-BRPOP → clean exit
+			}
+			// Redis disconnect / transient error: log + back off briefly, keep looping.
+			fmt.Fprintf(os.Stderr, "jmfarm queue: dequeue: %v\n", err)
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		if !ok {
+			continue // timeout, nothing waiting → loop re-heartbeats
+		}
+
+		// Claim the job: stamp current_job on the heartbeat, flip it to running.
+		worker.CurrentJob = job.ID
+		if err := q.Heartbeat(ctx, worker); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "jmfarm queue: heartbeat(claim): %v\n", err)
+		}
+		if err := q.MarkRunning(ctx, job.ID); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "jmfarm queue: mark-running %s: %v\n", job.ID, err)
+		}
+
+		processed, failed, runErr := runJob(ctx, store, cfg, worker, job)
+		if runErr != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm queue: job %s failed: %v\n", job.ID, runErr)
+			if err := q.MarkFailed(context.Background(), job.ID, runErr.Error()); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-failed %s: %v\n", job.ID, err)
+			}
+		} else if err := q.MarkDone(context.Background(), job.ID, processed, failed); err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm queue: mark-done %s: %v\n", job.ID, err)
+		}
+	}
+
+	fmt.Printf("jmfarm queue: worker %s stopping (signal)\n", worker.ID)
+}
+
+// runJob runs the passes a single dequeued job asks for, scoped to job.Path, with
+// the job's non-zero options overriding the container run-defaults. It returns
+// the summed processed/failed across the selected passes; a non-nil error is a
+// HARD failure (couldn't collect targets / nothing usable) → MarkFailed.
+func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, worker farmqueue.Worker, job farmqueue.Job) (processed, failed int, err error) {
+	// Resolve per-job overrides over the container defaults (zero ⇒ keep default).
+	crf := cfg.crf
+	if job.CRF != 0 {
+		crf = job.CRF
+	}
+	preset := cfg.preset
+	if job.Preset != "" {
+		preset = job.Preset
+	}
+	vcodec := cfg.vcodec
+	if job.VCodec != "" {
+		vcodec = job.VCodec
+	}
+	wModel := cfg.wModel
+	if job.Model != "" {
+		wModel = job.Model
+	}
+	conc := cfg.conc
+	if job.Workers > 0 {
+		conc = job.Workers
+	}
+	pConc := cfg.pConc
+	if job.ProxyWorkers > 0 {
+		pConc = job.ProxyWorkers
+	}
+
+	// Collect the media under the job's path once; every selected pass sweeps the
+	// same target set.
+	targets, cErr := collectTargets(job.Path, "", 0)
+	if cErr != nil {
+		return 0, 0, fmt.Errorf("collect %q: %w", job.Path, cErr)
+	}
+	if len(targets) == 0 {
+		return 0, 0, fmt.Errorf("no media files under %q", job.Path)
+	}
+
+	// Expand the job's kinds into the concrete passes to run, in cheap→expensive
+	// order so the fast derivatives publish before the slow proxy/transcript.
+	kinds := normalizeKinds(job.Kinds)
+
+	type pass struct {
+		mode     string
+		transcr  bool
+		proxyGen bool
+		effConc  int
+	}
+	var passes []pass
+	if kinds[KindDerivatives] {
+		passes = append(passes, pass{mode: "derivatives", effConc: conc})
+	}
+	if kinds[KindProxy] {
+		ec := conc
+		if pConc > 0 {
+			ec = pConc
+		}
+		passes = append(passes, pass{mode: "proxy", proxyGen: true, effConc: ec})
+	}
+	if kinds[KindTranscript] {
+		if wModel == "" {
+			return 0, 0, fmt.Errorf("transcript kind needs a whisper model (job.model or -whisper-model)")
+		}
+		passes = append(passes, pass{mode: "transcript(AI)", transcr: true, effConc: conc})
+	}
+	if len(passes) == 0 {
+		return 0, 0, fmt.Errorf("job %s has no runnable kinds (%v)", job.ID, job.Kinds)
+	}
+
+	base := farm.Options{
+		Producer: cfg.producer, Version: cfg.version, Mount: cfg.mount,
+		Blobs: true, ThumbMaxDim: cfg.thumbDim, Filmstrip: true, FilmstripCell: cfg.filmCell,
+		Waveform: true, WaveformSPP: cfg.waveSPP,
+		WhisperBin: cfg.wBin, WhisperModel: wModel,
+		ProxyVCodec: vcodec, ProxyCRF: crf, ProxyPreset: preset,
+	}
+
+	fmt.Printf("jmfarm queue: job %s path=%q kinds=%v files=%d\n",
+		job.ID, job.Path, job.Kinds, len(targets))
+
+	for _, p := range passes {
+		if ctx.Err() != nil {
+			break // cancelled between passes → stop cleanly, report what we did
+		}
+		gov := farm.NewGovernor(wModel, vcodec, preset, p.mode, crf, conc, pConc, cfg.gNice, cfg.gIONice, 0)
+		pr, pf := runPasses(passOpts{
+			opt: base, mode: p.mode, transcr: p.transcr, proxyGen: p.proxyGen,
+			dryRun: false, verbose: cfg.verbose, effConc: p.effConc,
+			status: cfg.status, mount: cfg.mount, producer: cfg.producer,
+			target: job.Path, gov: gov, store: store,
+		}, targets)
+		processed += pr
+		failed += pf
+	}
+	return processed, failed, nil
+}
+
+// normalizeKinds expands a job's kinds list into the concrete passes to run.
+// "all" (or an empty list) means the full pipeline; unknown kinds are ignored.
+func normalizeKinds(kinds []string) map[string]bool {
+	out := map[string]bool{}
+	if len(kinds) == 0 {
+		kinds = []string{KindAll}
+	}
+	for _, k := range kinds {
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case KindAll:
+			out[KindDerivatives], out[KindProxy], out[KindTranscript] = true, true, true
+		case KindDerivatives:
+			out[KindDerivatives] = true
+		case KindProxy:
+			out[KindProxy] = true
+		case KindTranscript:
+			out[KindTranscript] = true
+		}
+	}
+	return out
+}
+
+// Kind constants mirror farmqueue's so the dispatch reads locally; they are the
+// same wire strings.
+const (
+	KindDerivatives = farmqueue.KindDerivatives
+	KindProxy       = farmqueue.KindProxy
+	KindTranscript  = farmqueue.KindTranscript
+	KindAll         = farmqueue.KindAll
+)
 
 func recordErr(mu *sync.Mutex, errs *[]string, path string, err error) {
 	mu.Lock()

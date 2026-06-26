@@ -117,6 +117,72 @@
                   aria-label="Dismiss explainer">Got it</button>
         </aside>
 
+        <!-- Phase 4: "Generate on the farm" trigger. Unlike the read-only
+             panels below (which depend on farm-status.json being present),
+             this section is always shown so the user can queue a sweep even
+             before the farm has written its first rollup. It drives the
+             shared farm queue: POST /api/farm/sweep enqueues a job; GET
+             /api/farm/jobs reports worker presence + recent jobs. Every
+             wire value is rendered via textContent / DOM nodes so an
+             untrusted path or error string can't inject markup. -->
+        <section class="farm-generate" aria-label="Generate on the farm">
+          <div class="overview-header">
+            <h3 class="farm-generate-title">Generate on the farm</h3>
+            <p class="hint">
+              Queue a folder or file for the NAS to pre-generate previews, proxies,
+              and transcripts in the background. Jobs run as soon as a farm worker is online.
+            </p>
+          </div>
+
+          <!-- Farm-active banner: green when ≥1 worker heartbeats, muted otherwise. -->
+          <div id="farm-active-banner" class="farm-active-banner offline">
+            <span class="farm-active-dot" aria-hidden="true"></span>
+            <span id="farm-active-text" class="farm-active-text">Checking the farm…</span>
+            <span id="farm-active-depth" class="farm-active-depth" hidden></span>
+          </div>
+
+          <!-- Queue-a-sweep form. -->
+          <div class="farm-sweep-form">
+            <label class="field">
+              <span>Path to sweep (a folder or a single file)</span>
+              <input id="farm-sweep-path" type="text"
+                     placeholder="/jfs/Film Projects/…"
+                     autocomplete="off" spellcheck="false">
+            </label>
+            <fieldset class="farm-sweep-kinds">
+              <legend>What to generate</legend>
+              <label class="opt">
+                <input type="checkbox" id="farm-kind-derivatives" value="derivatives" checked>
+                <span><strong>Derivatives</strong>
+                  <em>Tech metadata, poster frame, filmstrip, waveform — the cheap previews.</em></span>
+              </label>
+              <label class="opt">
+                <input type="checkbox" id="farm-kind-proxy" value="proxy">
+                <span><strong>Proxy</strong>
+                  <em>A lightweight, fast-to-scrub editing copy. CPU-heavy.</em></span>
+              </label>
+              <label class="opt">
+                <input type="checkbox" id="farm-kind-transcript" value="transcript">
+                <span><strong>Transcript</strong>
+                  <em>Searchable, time-coded speech via whisper.cpp.</em></span>
+              </label>
+            </fieldset>
+            <div class="farm-sweep-actions">
+              <button id="farm-sweep-btn" type="button" disabled>Queue sweep</button>
+              <span id="farm-sweep-flash" class="farm-sweep-flash" hidden></span>
+            </div>
+            <p id="farm-sweep-error" class="error" hidden></p>
+          </div>
+
+          <!-- Recent jobs from the queue, newest first. -->
+          <div class="farm-jobs-wrap">
+            <h4 class="farm-jobs-title">Recent jobs</h4>
+            <ul id="farm-jobs-list" class="farm-jobs-list">
+              <li class="farm-jobs-empty">No jobs queued yet.</li>
+            </ul>
+          </div>
+        </section>
+
         <p id="farm-empty" class="hint" hidden></p>
 
         <div id="farm-content" hidden>

@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/farmqueue"
 )
 
 //go:embed static
@@ -62,6 +64,15 @@ type API struct {
 	// crypto surface in destinations.go + crypto.go untouched and the
 	// settings file purely orchestration.
 	settings *settingsStoreImpl
+
+	// farmQ is the JM-16 producer-side handle to the juicefarm: Redis
+	// job queue (shared with the farm worker + OpenLoupe). Nil when the
+	// manager has no meta/redis URL (e.g. embedded mode without
+	// OverviewMetaURL, or a hand-constructed API in tests) — the
+	// /api/farm/sweep + /api/farm/jobs handlers degrade to 503 /
+	// {available:false} rather than NPE'ing. Dialed once in Register
+	// from the same metaURL the Overview tab probes.
+	farmQ *farmqueue.Client
 }
 
 // Config bundles the fields needed to construct + register the API.
@@ -143,6 +154,24 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		overviewMeta = cfg.MetaURL
 	}
 	a.overview = newOverviewSource(mgr, cfg.JuiceFSBin, overviewMeta, cfg.MinIOURL)
+	// JM-16: dial the shared juicefarm: job queue on the volume's Redis so
+	// the Farm tab can enqueue server-side generation work + read job
+	// status back. Prefer MetaURL (standalone mode names the redis URL
+	// directly); fall back to OverviewMetaURL (embedded mode passes it
+	// explicitly since MetaURL stays unset there). When neither is set the
+	// queue is unavailable and the handlers return 503 / {available:false}
+	// rather than a nil-deref.
+	farmMeta := cfg.MetaURL
+	if farmMeta == "" {
+		farmMeta = cfg.OverviewMetaURL
+	}
+	if farmMeta != "" {
+		if fq, err := farmqueue.Open(farmMeta); err != nil {
+			log.Printf("manager: farm queue init failed: %v (Farm sweep/jobs will be unavailable)", err)
+		} else {
+			a.farmQ = fq
+		}
+	}
 	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
 	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))
 	// SLICE 1: /api/browse-jfs walks the JuiceFS FUSE mount tree.
@@ -162,6 +191,15 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// like every other endpoint (no auth bypass).
 	mux.HandleFunc(prefix+"/api/overview", a.auth(a.handleOverview))
 	mux.HandleFunc(prefix+"/api/farm", a.auth(a.handleFarm))
+	// JM-16: Farm producer surface. /api/farm is registered above as an
+	// EXACT pattern (no trailing slash) so these two more-specific exact
+	// patterns are distinct and win for their own paths — http.ServeMux
+	// only treats a "/api/farm/" subtree as a catch-all, which we don't
+	// register. POST /api/farm/sweep enqueues a generation job onto the
+	// shared juicefarm: queue; GET /api/farm/jobs reads worker liveness +
+	// queue depth + recent job status back. Both admin-key gated.
+	mux.HandleFunc(prefix+"/api/farm/sweep", a.auth(a.handleFarmSweep))
+	mux.HandleFunc(prefix+"/api/farm/jobs", a.auth(a.handleFarmJobs))
 	// SLICE 3: Trash tab — list/restore/delete/empty/config.
 	// /api/trash/empty enforces a typed-confirmation header
 	// (X-Confirm-Empty: yes) server-side so a typo'd curl can't wipe
