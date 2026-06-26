@@ -1,6 +1,8 @@
 package farm
 
 import (
+	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -77,6 +79,51 @@ func TestAudioFoldDownMergesAllStreams(t *testing.T) {
 }
 
 var meanVolRe = regexp.MustCompile(`mean_volume:\s*(-?[0-9.]+) dB`)
+
+// TestWaveformFoldsAllStreams proves the farm WAVEFORM (not just the transcript)
+// surfaces audio from a non-first stream: a 2-stream file (silent first, tone
+// second) must produce non-flatline peaks. The old -map 0:a:0 flatlined.
+func TestWaveformFoldsAllStreams(t *testing.T) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not available")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "two.mkv")
+	gen := exec.Command(ffmpeg, "-v", "error", "-y",
+		"-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono",
+		"-f", "lavfi", "-i", "sine=frequency=440:r=48000",
+		"-map", "0:a", "-map", "1:a", "-t", "1", "-c:a", "pcm_s24le", src)
+	if o, err := gen.CombinedOutput(); err != nil {
+		t.Fatalf("generate 2-stream fixture: %v\n%s", err, o)
+	}
+	out := filepath.Join(dir, "wave.json")
+	n, err := Waveform(ffmpeg, src, out, 1024)
+	if err != nil {
+		t.Fatalf("Waveform: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("waveform produced 0 pixels")
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wf WaveformJSON
+	if err := json.Unmarshal(raw, &wf); err != nil {
+		t.Fatalf("parse waveform json: %v", err)
+	}
+	nonzero := 0
+	for _, v := range wf.Data {
+		if v != 0 {
+			nonzero++
+		}
+	}
+	if nonzero == 0 {
+		t.Fatalf("waveform is a FLATLINE (all-zero peaks across %d samples) — the tone stream was dropped (the bug)", len(wf.Data))
+	}
+	t.Logf("waveform non-flat: %d/%d non-zero peak samples (tone from stream 1 survived)", nonzero, len(wf.Data))
+}
 
 func meanVolumeDB(t *testing.T, ffmpeg, path string) float64 {
 	t.Helper()
