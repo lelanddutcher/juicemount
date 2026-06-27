@@ -712,6 +712,8 @@ func flapDebounceInterval() time.Duration {
 // immediate sync requests via syncNowCh (triggered by network changes).
 func (rc *RedisClient) reconcileLoop() {
 	backoff := rc.currentBackstop()
+	lastBase := backoff // the base we last applied to the ticker; distinct from
+	// backoff, which doReconcile may STRETCH above this base (task #22).
 	maxBackoff := 5 * time.Minute
 	consecutiveFailures := 0
 
@@ -726,7 +728,15 @@ func (rc *RedisClient) reconcileLoop() {
 		// `baseInterval` captured-once bug.)
 		if consecutiveFailures == 0 {
 			want := rc.currentBackstop()
-			if want != backoff {
+			// Re-baseline only when the BASE itself changed (a keyspace engagement
+			// transition or a SetReconcileInterval write) — compare to lastBase,
+			// NOT backoff. backoff can legitimately sit ABOVE the base because
+			// doReconcile applied a task #22 adaptive STRETCH; comparing to backoff
+			// would clobber that stretch every turn, pulling the cadence back down
+			// to the base and defeating the 500GB-copy duty-cycle. On a real base
+			// change we re-baseline; doReconcile re-applies any stretch next sync.
+			if want != lastBase {
+				lastBase = want
 				backoff = want
 				ticker.Reset(backoff)
 			}
