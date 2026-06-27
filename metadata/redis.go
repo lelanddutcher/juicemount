@@ -82,6 +82,21 @@ type RedisClient struct {
 	lastDisconnect   time.Time
 	lastReconnect    time.Time
 
+	// backstopNanos is the CURRENT desired interval (in nanoseconds) for the
+	// periodic full-SCAN reconcile loop, read every loop turn so a running
+	// loop's cadence can be changed live (the reconcileLoop captures
+	// baseInterval once at entry, so a plain field would never take effect).
+	//
+	// When the keyspace-notification push is ENABLED and healthy, the
+	// keyspace loop sets this to a long, class-gated value (minutes/hours)
+	// — the full SCAN becomes a rare backstop. When push is DISABLED or
+	// DEGRADED it is reset to DefaultReconcileInterval (30s) so the periodic
+	// SCAN resumes as the authoritative fallback. doReconcile's backoff
+	// temporarily overrides this on failure and resets back to it on
+	// recovery (NOT to the captured baseInterval). Always holds a value >=
+	// 1; zero is treated as DefaultReconcileInterval by reconcileLoop.
+	backstopNanos atomic.Int64
+
 	// pruneAbsent tracks how many consecutive reconciliation cycles each path
 	// has been absent from Redis. Only paths absent for PruneThreshold+ cycles
 	// are actually deleted from SQLite. Guarded by mu.
@@ -95,6 +110,33 @@ type RedisClient struct {
 	// they happen on the single reconcile goroutine.
 	mountPoint string
 	fuseRoot   string
+
+	// Test seams for the keyspace-push path. Production leaves these nil and
+	// the real methods run. Tests set them to observe coalescer behavior
+	// (which dirs got reconciled, how many full-SCAN promotions) without a
+	// live Redis. See keyspaceReconcileDir / keyspaceTriggerSync below.
+	testReconcileDir func(uint64) error
+	testTriggerSync  func()
+}
+
+// keyspaceReconcileDir dispatches to the test seam when set, else the real
+// single-dir reconcile. Used by the coalescer so tests can count calls.
+func (rc *RedisClient) keyspaceReconcileDir(inode uint64) error {
+	if rc.testReconcileDir != nil {
+		return rc.testReconcileDir(inode)
+	}
+	return rc.reconcileDir(inode)
+}
+
+// keyspaceTriggerSync dispatches to the test seam when set, else the real
+// TriggerSync. Used by the coalescer (burst promotion) and reconcileDir
+// (unknown-ancestor defer) so tests can observe full-SCAN promotions.
+func (rc *RedisClient) keyspaceTriggerSync() {
+	if rc.testTriggerSync != nil {
+		rc.testTriggerSync()
+		return
+	}
+	rc.TriggerSync()
 }
 
 // SetPathConfig wires the mount point (e.g. "/Volumes/zpool") and the
@@ -272,7 +314,7 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 		return nil, fmt.Errorf("redis ping: %w", err)
 	}
 
-	return &RedisClient{
+	rc := &RedisClient{
 		rdb:               rdb,
 		redisURL:          redisURL,
 		store:             store,
@@ -281,7 +323,9 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 		syncNowCh:         make(chan struct{}, 1),
 		connected:         true,
 		pruneAbsent:       make(map[string]int),
-	}, nil
+	}
+	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+	return rc, nil
 }
 
 // NewRedisClientDeferred builds a RedisClient WITHOUT requiring the backend to
@@ -470,10 +514,19 @@ func (rc *RedisClient) SyncOnce() error {
 	return rc.syncMetadata()
 }
 
-// Start begins both the SUBSCRIBE listener and periodic batch reconciliation.
+// Start begins the SUBSCRIBE listener, periodic batch reconciliation, and —
+// when enabled — the Redis keyspace-notification push loop.
+//
+// The keyspace loop is strictly additive and flag-gated (JM_METADATA_KEYSPACE_PUSH).
+// When it is not engaged the system behaves byte-identically to before: 30s
+// full-SCAN reconcile + the self-write juicemount:metadata pub/sub. See
+// keyspace.go for the engagement state machine (DISABLED/ENABLED/DEGRADED).
 func (rc *RedisClient) Start() {
 	go rc.subscribeLoop()
 	go rc.reconcileLoop()
+	if rc.keyspacePushEnabled() {
+		go rc.keyspaceLoop()
+	}
 }
 
 // Stop halts all background goroutines and closes the Redis connection.
@@ -625,17 +678,30 @@ func flapDebounceInterval() time.Duration {
 // on failure (network transitions, Redis unreachable). It also listens for
 // immediate sync requests via syncNowCh (triggered by network changes).
 func (rc *RedisClient) reconcileLoop() {
-	baseInterval := rc.reconcileInterval
-	backoff := baseInterval
+	backoff := rc.currentBackstop()
 	maxBackoff := 5 * time.Minute
 	consecutiveFailures := 0
 
 	ticker := time.NewTicker(backoff)
 	defer ticker.Stop()
 	for {
+		// Re-read the desired backstop interval each turn so the keyspace
+		// loop can change a RUNNING loop's cadence live. Only Reset when we
+		// are NOT in a backoff streak — during backoff, doReconcile owns the
+		// ticker (short intervals) and must not be overridden by the long
+		// backstop value until it recovers. (Regression guard for the
+		// `baseInterval` captured-once bug.)
+		if consecutiveFailures == 0 {
+			want := rc.currentBackstop()
+			if want != backoff {
+				backoff = want
+				ticker.Reset(backoff)
+			}
+		}
+
 		select {
 		case <-ticker.C:
-			rc.doReconcile(&consecutiveFailures, &backoff, baseInterval, maxBackoff, ticker)
+			rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
 		case <-rc.syncNowCh:
 			// Flap debounce (2026-06-16): on a flaky cellular link the reachability
 			// monitor flaps constantly and EACH recovery fires a full-keyspace SCAN
@@ -659,14 +725,30 @@ func (rc *RedisClient) reconcileLoop() {
 				}
 			}
 			jmlog.Info("reconciliation triggered by network change")
-			rc.doReconcile(&consecutiveFailures, &backoff, baseInterval, maxBackoff, ticker)
+			rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
 		case <-rc.stopCh:
 			return
 		}
 	}
 }
 
-func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Duration, baseInterval, maxBackoff time.Duration, ticker *time.Ticker) {
+// currentBackstop returns the current desired reconcile interval, reading
+// the live backstopNanos atomic. Falls back to DefaultReconcileInterval if
+// unset/zero so a running loop never spins on a 0-duration ticker.
+func (rc *RedisClient) currentBackstop() time.Duration {
+	n := rc.backstopNanos.Load()
+	if n <= 0 {
+		return DefaultReconcileInterval
+	}
+	return time.Duration(n)
+}
+
+func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Duration, maxBackoff time.Duration, ticker *time.Ticker) {
+	// Backoff is computed off DefaultReconcileInterval, NOT the (possibly
+	// minutes/hours-long) backstop interval — a failure streak must drive
+	// the loop FASTER to detect recovery, never slower. The backstop only
+	// applies once we're connected+ENABLED and reset cleanly (below).
+	baseInterval := DefaultReconcileInterval
 	if err := rc.syncMetadata(); err != nil {
 		*consecutiveFailures++
 		*backoff = baseInterval * time.Duration(1<<min(*consecutiveFailures, 6))
@@ -714,25 +796,22 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 			*consecutiveFailures = 0
 		}
 
-		// [JM6] Adaptive reconcile cadence (task #22). syncMetadata
-		// re-reads the FULL backend tree and reconciles it against the
-		// local store; on a large tree (200k+ entries) that takes 4-5s
-		// and holds Redis/SQLite contention the whole time. At the fixed
-		// 30s base interval, a long-running metadata-heavy Finder copy
-		// eats a 4-5s stall every 30s — per-file CREATE/LOOKUP/SETATTR
-		// crawl ("anemic ingest" observed on the 500GB copy 2026-06-15).
-		//
-		// Self-tune the duty cycle to the measured sync cost: keep each
-		// sync to ~1/reconcileDutyDivisor of wall-clock so the copy has
-		// uncontended metadata access the rest of the time. Cheap syncs
-		// (small/idle tree) stay at the responsive base interval; only
-		// expensive syncs stretch out, clamped to maxBackoff so we never
-		// drift the local view too far from the backend.
-		next := baseInterval
+		// [JM6] Adaptive reconcile cadence (task #22) — now BASED on the LIVE
+		// keyspace backstop (rc.currentBackstop(): long when push is
+		// ENABLED+healthy, 30s otherwise) instead of the captured baseInterval, so
+		// the keyspace-driven backstop and the sync-cost duty-cycle COMPOSE rather
+		// than fight. syncMetadata re-reads the FULL backend tree (4-5s on 200k
+		// entries) holding Redis/SQLite contention; an expensive sync still
+		// stretches the interval further ON TOP of the backstop (the 500GB-copy
+		// "anemic ingest" fix, 2026-06-15), clamped to maxBackoff. With push
+		// ENABLED the backstop is already long, so the stretch rarely engages;
+		// with push DISABLED the backstop is 30s and the stretch behaves as before.
+		base := rc.currentBackstop()
+		next := base
 		if lastSync > reconcileAdaptiveThreshold {
 			scaled := lastSync * reconcileDutyDivisor
-			if scaled < baseInterval {
-				scaled = baseInterval
+			if scaled < base {
+				scaled = base
 			}
 			if scaled > maxBackoff {
 				scaled = maxBackoff
@@ -740,7 +819,7 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 			next = scaled
 		}
 		if next != *backoff {
-			if next > baseInterval {
+			if next > base {
 				jmlog.Info("reconcile cadence adapted to sync cost",
 					"last_sync_ms", lastSync.Milliseconds(),
 					"next_interval_sec", int64(next.Round(time.Second).Seconds()),

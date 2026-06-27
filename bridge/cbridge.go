@@ -102,6 +102,12 @@ var (
 	offlineEngageMu    sync.Mutex
 	offlineEngageTimer *time.Timer
 
+	// globalKeyspaceNetWatcher provides the active-interface NAME signal used
+	// to class-gate the metadata keyspace-push backstop cadence + coalescer
+	// (LAN/WiFi/tunnel). Only instantiated when JM_METADATA_KEYSPACE_PUSH=1;
+	// nil otherwise (class-gating then falls back to JM_WAN_MODE-only).
+	globalKeyspaceNetWatcher *health.NetWatcher
+
 	// Spool architecture (Option 2 / slices A-E). Set when
 	// JM_SPOOL_ENABLE=1 at startup. Both nil → spool path is fully
 	// dormant and the existing fdPool/FUSE write+read path runs
@@ -504,10 +510,28 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		globalReach.Start()
 	}
 
+	// [metadata keyspace push] Wire the class-gating signals BEFORE rc.Start so
+	// the keyspace loop (started inside Start when JM_METADATA_KEYSPACE_PUSH=1)
+	// can class-gate its rare-backstop cadence + coalescer from launch. We always
+	// pass globalReach.Reachable for online/offline; the active-interface NAME
+	// signal needs a NetWatcher, which we only spin up when the push feature is
+	// enabled (avoids an extra 1s-poll goroutine in the default-off case). When
+	// the NetWatcher is absent, class-gating falls back to JM_WAN_MODE + a WiFi
+	// default — safe and link-sparing.
+	if os.Getenv("JM_METADATA_KEYSPACE_PUSH") == "1" {
+		globalKeyspaceNetWatcher = health.NewNetWatcher(1 * time.Second)
+		globalKeyspaceNetWatcher.Start()
+		var reachFn func() bool
+		if globalReach != nil {
+			reachFn = globalReach.Reachable
+		}
+		metadata.SetClassSignals(globalKeyspaceNetWatcher.ActiveInterface, reachFn)
+	}
+
 	// Initial sync. R-4: skip when started offline — it would only fail against
-	// the dead backend. rc.Start() still launches the reconcile loop, which
-	// flips connected=true and catches up the mirror on its first success once
-	// the backend returns.
+	// the dead backend. rc.Start() still launches the reconcile loop, which flips
+	// connected=true and catches up the mirror on its first success once the
+	// backend returns.
 	if !startedOffline {
 		if err := rc.SyncOnce(); err != nil {
 			jmlog.Warn("initial sync failed", "error", err.Error())
@@ -1041,6 +1065,7 @@ func stopServerLocked() {
 	pinStore := globalPinStore
 	prefetcher := globalPrefetcher
 	reach := globalReach
+	keyspaceNW := globalKeyspaceNetWatcher
 	spool := globalSpool
 	drainer := globalDrainer
 	derivStore := globalDerivStore
@@ -1054,6 +1079,7 @@ func stopServerLocked() {
 	globalPinStore = nil
 	globalPrefetcher = nil
 	globalReach = nil
+	globalKeyspaceNetWatcher = nil
 	globalSpool = nil
 	globalDrainer = nil
 	globalDerivStore = nil
@@ -1094,6 +1120,9 @@ func stopServerLocked() {
 	}
 	if reach != nil {
 		reach.Stop()
+	}
+	if keyspaceNW != nil {
+		keyspaceNW.Stop()
 	}
 	if prefetcher != nil {
 		prefetcher.Stop()
