@@ -64,7 +64,17 @@ type MetadataEvent struct {
 //  1. SUBSCRIBE: event-driven, <100ms propagation for real-time changes
 //  2. Batch reconciliation: periodic full tree pull, catches anything SUBSCRIBE missed
 type RedisClient struct {
-	rdb      *redis.Client
+	// rdb is an atomic.Pointer because Reconnect() swaps the underlying
+	// *redis.Client (on a network-interface change) concurrently with readers
+	// on other goroutines — the periodic SCAN (syncMetadata), the self-write
+	// pub/sub (subscribeLoop/PublishEvent), AND the keyspace-push loop
+	// (ConfigGet/PSubscribe/HGetAll/Get). Reconnect() is wired to
+	// NetWatcher.OnChange, and the keyspace feature explicitly targets cellular
+	// where interface flaps (=> Reconnect) are frequent, so an unsynchronized
+	// word-level read/write of this field is a reachable data race. Mirrors the
+	// lstatFnPtr atomic.Pointer idiom already in this file. Access via
+	// rc.redisDB(); never read the field directly.
+	rdb      atomic.Pointer[redis.Client]
 	redisURL string // stored for reconnect
 	store    *Store
 
@@ -72,6 +82,15 @@ type RedisClient struct {
 	stopCh            chan struct{}
 	stopOnce          sync.Once
 	syncNowCh         chan struct{} // signals reconcileLoop to run immediately
+
+	// syncMu single-flights syncMetadata. Originally the full SCAN had exactly
+	// one caller goroutine (reconcileLoop), so pruneAbsent (a plain map) was a
+	// safe single-writer. The keyspace gap-fill now also runs SyncOnce
+	// SYNCHRONOUSLY on the keyspace goroutine (so push is only trusted after the
+	// baseline SCAN completes — EDGE Bug C), giving syncMetadata two possible
+	// callers. This mutex serializes them so they never overlap, preserving the
+	// pruneAbsent single-writer invariant and avoiding two concurrent full SCANs.
+	syncMu sync.Mutex
 
 	mu               sync.RWMutex
 	lastSyncDuration time.Duration
@@ -315,7 +334,6 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 	}
 
 	rc := &RedisClient{
-		rdb:               rdb,
 		redisURL:          redisURL,
 		store:             store,
 		reconcileInterval: DefaultReconcileInterval,
@@ -324,6 +342,7 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 		connected:         true,
 		pruneAbsent:       make(map[string]int),
 	}
+	rc.rdb.Store(rdb)
 	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
 	return rc, nil
 }
@@ -337,14 +356,14 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 //
 // The returned client is structurally identical to NewRedisClient's (every
 // field initialized — stopCh, the buffered syncNowCh that TriggerSync's
-// non-blocking send needs, pruneAbsent, reconcileInterval) so every downstream
-// rc.* call site works unchanged; the ONLY differences are connected=false and
-// a non-zero lastDisconnect. connected=false matters beyond cosmetics: it makes
-// RecentlyDegraded() true, which suppresses the FUSE-Lstat phantom-purge in the
-// Stat/open paths so an offline session can't delete real entries from the
-// mirror while the backend is unreachable. The reconcile loop (rc.Start) lifts
-// connected once a reconcile succeeds; redis.NewClient itself is lazy (it dials
-// on first use), so no network happens here.
+// non-blocking send needs, pruneAbsent, reconcileInterval, backstopNanos) so
+// every downstream rc.* call site works unchanged; the ONLY differences are
+// connected=false and a non-zero lastDisconnect. connected=false matters beyond
+// cosmetics: it makes RecentlyDegraded() true, which suppresses the FUSE-Lstat
+// phantom-purge in the Stat/open paths so an offline session can't delete real
+// entries from the mirror while the backend is unreachable. The reconcile loop
+// (rc.Start) lifts connected once a reconcile succeeds; redis.NewClient itself is
+// lazy (it dials on first use), so no network happens here.
 func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error) {
 	addr, db, err := ParseRedisURL(redisURL)
 	if err != nil {
@@ -357,8 +376,7 @@ func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error)
 		WriteTimeout: 10 * time.Second,
 		DialTimeout:  10 * time.Second,
 	})
-	return &RedisClient{
-		rdb:               rdb,
+	rc := &RedisClient{
 		redisURL:          redisURL,
 		store:             store,
 		reconcileInterval: DefaultReconcileInterval,
@@ -367,8 +385,16 @@ func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error)
 		connected:         false,
 		lastDisconnect:    time.Now(),
 		pruneAbsent:       make(map[string]int),
-	}, nil
+	}
+	rc.rdb.Store(rdb) // rdb is atomic.Pointer (see the field doc / Reconnect race)
+	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+	return rc, nil
 }
+
+// redisDB returns the current *redis.Client via an atomic load, so callers
+// see a consistent pointer even while Reconnect() swaps it. Never read the
+// rc.rdb field directly.
+func (rc *RedisClient) redisDB() *redis.Client { return rc.rdb.Load() }
 
 // Store returns the underlying metadata store.
 func (rc *RedisClient) Store() *Store { return rc.store }
@@ -439,7 +465,7 @@ func (rc *RedisClient) Reconnect() error {
 	}
 
 	// Close the old connection (ignore errors — it may already be broken)
-	rc.rdb.Close()
+	rc.redisDB().Close()
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:         addr,
@@ -459,7 +485,7 @@ func (rc *RedisClient) Reconnect() error {
 		return fmt.Errorf("redis reconnect ping: %w", err)
 	}
 
-	rc.rdb = rdb
+	rc.rdb.Store(rdb)
 	rc.mu.Lock()
 	rc.connected = true
 	rc.lastReconnect = time.Now()
@@ -533,7 +559,7 @@ func (rc *RedisClient) Start() {
 func (rc *RedisClient) Stop() {
 	rc.stopOnce.Do(func() {
 		close(rc.stopCh)
-		rc.rdb.Close()
+		rc.redisDB().Close()
 	})
 }
 
@@ -543,7 +569,7 @@ func (rc *RedisClient) PublishEvent(ctx context.Context, evt MetadataEvent) erro
 	if err != nil {
 		return err
 	}
-	return rc.rdb.Publish(ctx, SubscribeChannel, string(data)).Err()
+	return rc.redisDB().Publish(ctx, SubscribeChannel, string(data)).Err()
 }
 
 // subscribeLoop listens for real-time metadata events via Redis SUBSCRIBE.
@@ -580,7 +606,7 @@ func (rc *RedisClient) runSubscribe() {
 		}
 	}()
 
-	sub := rc.rdb.Subscribe(ctx, SubscribeChannel)
+	sub := rc.redisDB().Subscribe(ctx, SubscribeChannel)
 	defer sub.Close()
 
 	ch := sub.Channel()
@@ -1082,7 +1108,15 @@ return out
 `
 
 // syncMetadata performs a full batch reconciliation: Lua tree pull → SQLite sync.
+//
+// Single-flighted by syncMu: the periodic reconcileLoop and the keyspace
+// gap-fill can both reach here, but never concurrently — preserving the
+// pruneAbsent single-writer invariant and preventing two overlapping full
+// SCANs from racing each other's diff.
 func (rc *RedisClient) syncMetadata() error {
+	rc.syncMu.Lock()
+	defer rc.syncMu.Unlock()
+
 	start := time.Now()
 	// Record sync START so the flap debounce (reconcileLoop) can tell a sync is
 	// in-flight or just-ran and suppress redundant network-change triggers.
@@ -1111,7 +1145,7 @@ func (rc *RedisClient) syncMetadata() error {
 	rev := make(map[string][2]string) // childInode → {parentInode, name}
 	cursor := "0"
 	for {
-		res, err := rc.rdb.Eval(ctx, luaScanBatch, nil, cursor, scanCount).StringSlice()
+		res, err := rc.redisDB().Eval(ctx, luaScanBatch, nil, cursor, scanCount).StringSlice()
 		if err != nil {
 			return fmt.Errorf("redis SCAN batch: %w", err)
 		}

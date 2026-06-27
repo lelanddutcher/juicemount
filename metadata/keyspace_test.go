@@ -369,6 +369,70 @@ func TestCurrentBackstopReflectsLiveWrites(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// EDGE Bug A regression: a foreign delete of a TOP-LEVEL entry (under root)
+// must be pruned by the push path. The store indexes root's children under
+// childrenIdx["."] (each child's ParentPath = path.Dir("movies") == "."), so
+// scopedPrune MUST be driven with the "." key, not "". Before the fix
+// reconcileDir passed parentPath="" to scopedPrune, making ListChildren("")
+// empty and the root-level scoped prune DEAD CODE. This test exercises
+// scopedPrune directly against a real Store (no Redis needed) and would fail
+// if scopedPrune were called with "" for the root.
+// ---------------------------------------------------------------------------
+
+func TestScopedPruneRootKey(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer store.Close()
+
+	mt := time.Unix(1700000000, 0)
+	// Two top-level entries; both are indexed under childrenIdx["."].
+	for _, e := range []*Entry{
+		MakeEntry("movies", true, 0, mt, 10),
+		MakeEntry("notes.txt", false, 4444, mt, 30),
+	} {
+		store.InsertToCache(e)
+		if err := store.Insert(e); err != nil {
+			t.Fatalf("Insert %q: %v", e.Path, err)
+		}
+	}
+
+	rc := &RedisClient{store: store} // no fuseRoot, no pin checker
+
+	// Sanity: the root children live under "." not "".
+	if c, _ := store.ListChildren("."); len(c) != 2 {
+		t.Fatalf("precondition: ListChildren(\".\") = %d, want 2", len(c))
+	}
+	if c, _ := store.ListChildren(""); len(c) != 0 {
+		t.Fatalf("precondition: ListChildren(\"\") = %d, want 0 (root keyed under \".\")", len(c))
+	}
+
+	// Foreign delete of /notes.txt: fresh Redis set for root now has only
+	// "movies". Drive the prune with the ROOT store key ("."), exactly as the
+	// fixed reconcileDir(1) does.
+	fresh := map[string]struct{}{"movies": {}}
+	rc.scopedPrune(".", fresh)
+
+	if store.LookupByPath("notes.txt") != nil {
+		t.Error("EDGE Bug A: top-level notes.txt was NOT pruned (scopedPrune root-key mismatch)")
+	}
+	if store.LookupByPath("movies") == nil {
+		t.Error("movies (still present in Redis) must survive the prune")
+	}
+
+	// Guard: driving the prune with the WRONG key ("") must be a no-op — this
+	// is the pre-fix behavior, asserted here so a regression that reverts to
+	// "" is caught.
+	store.InsertToCache(MakeEntry("notes.txt", false, 4444, mt, 30))
+	_ = store.Insert(MakeEntry("notes.txt", false, 4444, mt, 30))
+	rc.scopedPrune("", map[string]struct{}{"movies": {}})
+	if store.LookupByPath("notes.txt") == nil {
+		t.Error("scopedPrune(\"\") should be a no-op for root children (sanity for the regression guard)")
+	}
+}
+
 // ===========================================================================
 // LIVE-REDIS tests (skip cleanly when no local Redis is reachable). These
 // exercise reconcileDir end-to-end and the PARITY gate: incremental store

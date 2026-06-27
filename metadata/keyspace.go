@@ -268,7 +268,7 @@ func keyspaceNotifySufficient(flags string) bool {
 // whether the live config is sufficient, along with the raw flags string for
 // logging. On any error it returns (false, "") — fail safe to DISABLED.
 func (rc *RedisClient) probeKeyspaceConfig(ctx context.Context) (sufficient bool, flags string) {
-	vals, err := rc.rdb.ConfigGet(ctx, "notify-keyspace-events").Result()
+	vals, err := rc.redisDB().ConfigGet(ctx, "notify-keyspace-events").Result()
 	if err != nil {
 		return false, ""
 	}
@@ -292,13 +292,24 @@ func (rc *RedisClient) keyspaceLoop() {
 		default:
 		}
 
-		rc.runKeyspaceSubscribe()
+		established := rc.runKeyspaceSubscribe()
 
-		// Subscription lost (or never established). DEGRADE immediately so the
-		// periodic SCAN resumes as the fallback BEFORE the retry sleep, and
-		// keep RecentlyDegraded fresh.
+		// Reset the backstop to 30s so the periodic SCAN resumes as the fallback
+		// BEFORE the retry sleep (regardless of how this iteration ended).
 		rc.setEngagement(keyspaceDegraded)
-		rc.markKeyspaceDisconnected()
+
+		// Only mark the connection DEGRADED (which makes RecentlyDegraded report
+		// true, gating the QA-30 prune skipIncrement and the NFS phantom-purge)
+		// when a subscription was ACTUALLY established this iteration and then
+		// dropped. If we never subscribed — notify-keyspace-events insufficient
+		// (the live NAS today with the kill switch on), URL parse error, or
+		// PSUBSCRIBE failure — Redis itself is still healthy and reachable, so
+		// flipping connected=false here would wrongly suppress legitimate
+		// prune/purge work and fight the reconcileLoop (which sets
+		// connected=true). See EDGE Bug B.
+		if established {
+			rc.markKeyspaceDisconnected()
+		}
 
 		select {
 		case <-rc.stopCh:
@@ -311,14 +322,22 @@ func (rc *RedisClient) keyspaceLoop() {
 
 // runKeyspaceSubscribe establishes the PSUBSCRIBE, runs the gap-fill SCAN, and
 // pumps events into the coalescer until the subscription drops or stop fires.
+// It returns true iff a subscription was ACTUALLY established (PSUBSCRIBE
+// confirmed) this iteration — keyspaceLoop uses that to decide whether to mark
+// the connection DEGRADED on return (EDGE Bug B: never flip connected=false on
+// a healthy-but-unconfigured NAS where we never subscribed).
 //
 // CRITICAL ORDERING (subscribe-before-SCAN): establish the PSUBSCRIBE FIRST,
-// confirm it active, THEN run the full gap-fill SCAN. Events landing during
-// the SCAN are double-processed (idempotent upsert — harmless) but NONE are
-// lost. This fires on initial connect AND every reconnect — a reconnect is the
-// only window the subscriber was ever absent, so this closes the
-// "events lost while disconnected" hole.
-func (rc *RedisClient) runKeyspaceSubscribe() {
+// confirm it active, START draining its channel into the coalescer, THEN run
+// the full gap-fill SCAN. Events landing during the SCAN are coalesced and
+// double-processed (idempotent upsert — harmless) but NONE are lost. We do NOT
+// flip to ENABLED (and the backstop does NOT go long) until the gap-fill SCAN
+// has actually COMPLETED successfully — otherwise push would be trusted, and
+// the 30s SCAN demoted to the rare backstop, before the gap-fill that closes
+// the "events lost while disconnected" hole has run (EDGE Bug C). This fires on
+// initial connect AND every reconnect — a reconnect is the only window the
+// subscriber was ever absent.
+func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -336,7 +355,7 @@ func (rc *RedisClient) runKeyspaceSubscribe() {
 	_, db, err := ParseRedisURL(rc.redisURL)
 	if err != nil {
 		jmlog.Warn("metadata keyspace push: cannot parse redis URL, disabling", "error", err.Error())
-		return
+		return false
 	}
 
 	// Re-probe CONFIG on every (re)connect — the NAS config can change under
@@ -354,55 +373,81 @@ func (rc *RedisClient) runKeyspaceSubscribe() {
 		case <-rc.stopCh:
 		case <-time.After(60 * time.Second):
 		}
-		return
+		return false
 	}
 
 	pattern := "__keyspace@" + strconv.Itoa(db) + "__:d*"
 	prefix := "__keyspace@" + strconv.Itoa(db) + "__:" // strip to get the bare key (e.g. "d732093")
 
-	sub := rc.rdb.PSubscribe(ctx, pattern)
+	sub := rc.redisDB().PSubscribe(ctx, pattern)
 	defer sub.Close()
 
 	// Confirm the subscription is actually active before the gap-fill SCAN.
 	// Receive() blocks for the subscription confirmation; a failure here means
-	// PSUBSCRIBE never took effect, so we must NOT mark ENABLED.
+	// PSUBSCRIBE never took effect, so we must NOT mark ENABLED or report
+	// established.
 	if _, err := sub.Receive(ctx); err != nil {
 		jmlog.Warn("metadata keyspace push: PSUBSCRIBE failed", "error", err.Error(), "pattern", pattern)
-		return
+		return false
 	}
 
 	rc.markKeyspaceConnected()
 	jmlog.Info("metadata keyspace push: subscribed", "pattern", pattern, "flags", flags, "class", currentLinkClass().String())
 
-	// Gap-fill: one immediate authoritative full SCAN now that the subscriber
-	// is established. Covers any change that happened while we were absent.
-	rc.TriggerSync()
-
-	// Now ENABLED — push carries deltas; the periodic SCAN goes long.
-	rc.setEngagement(keyspaceEnabled)
-
-	// Pump events into the coalescer.
+	// Start draining the subscription channel into the coalescer IMMEDIATELY —
+	// before the gap-fill SCAN — so events arriving during the (cellular: long)
+	// SCAN are coalesced rather than backing up in the connection buffer, and so
+	// none are lost. The coalescer's reconcileDir is idempotent w.r.t. the SCAN.
 	co := newInodeCoalescer(rc)
 	defer co.stop()
 
-	ch := sub.Channel()
-	for {
-		select {
-		case <-rc.stopCh:
-			return
-		case msg, ok := <-ch:
-			if !ok {
-				// Channel closed -> subscription ended. Return so keyspaceLoop
-				// degrades + retries.
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		ch := sub.Channel()
+		for {
+			select {
+			case <-rc.stopCh:
 				return
+			case msg, ok := <-ch:
+				if !ok {
+					// Channel closed -> subscription ended.
+					return
+				}
+				inode, ok := parseDirInodeFromChannel(msg.Channel, prefix)
+				if !ok {
+					continue
+				}
+				co.add(inode)
 			}
-			inode, ok := parseDirInodeFromChannel(msg.Channel, prefix)
-			if !ok {
-				continue
-			}
-			co.add(inode)
 		}
+	}()
+
+	// Gap-fill: one immediate authoritative full SCAN, run SYNCHRONOUSLY now
+	// that the subscriber is established and draining. Covers any change that
+	// happened while we were absent. We only flip to ENABLED (long backstop,
+	// trust push deltas) AFTER it succeeds — on error we stay DEGRADED/30s and
+	// let keyspaceLoop retry, so push is never trusted before its baseline
+	// exists (EDGE Bug C). The SCAN is single-flighted internally, so a
+	// concurrent periodic doReconcile cannot double-run it.
+	if err := rc.SyncOnce(); err != nil {
+		jmlog.Warn("metadata keyspace push: gap-fill SCAN failed, staying DEGRADED",
+			"error", err.Error())
+		// Return; defers stop the coalescer and close the subscription. The
+		// subscription WAS established, so keyspaceLoop should mark DEGRADED.
+		return true
 	}
+
+	// Gap-fill complete — NOW ENABLED. Push carries deltas; the periodic SCAN
+	// demotes to the rare class-gated backstop.
+	rc.setEngagement(keyspaceEnabled)
+
+	// Block until the pump exits (subscription dropped or stop fired).
+	select {
+	case <-rc.stopCh:
+	case <-pumpDone:
+	}
+	return true
 }
 
 // parseDirInodeFromChannel extracts the parent inode from a keyspace channel
@@ -629,14 +674,23 @@ func decodeInodeAttr(attr []byte) (mtime int64, size int64, ok bool) {
 // via TriggerSync and returns; it NEVER re-walks Redis ancestors (that
 // re-incurs the SCAN cost the whole feature exists to avoid).
 func (rc *RedisClient) reconcileDir(dirInode uint64) error {
-	// Resolve parent path. Root inode 1 is the tree root; metadata.Store keys
-	// children of root with ParentPath "" (path.Dir of a top-level name is
-	// "."). syncMetadata builds top-level entries with ParentPath=path.Dir(name)
-	// == "." for a bare name, so we mirror that by using "" as the parent path
-	// passed to child construction and letting path.Dir/Base derive the rest.
-	var parentPath string
+	// Resolve two distinct path values:
+	//
+	//   parentPath  — the prefix used to BUILD each child's path (root: "", so a
+	//                 top-level child path is just its bare name, e.g. "movies").
+	//   storeParent — the key the Store indexes those children UNDER, which is
+	//                 each child's ParentPath = path.Dir(childPath). For a bare
+	//                 top-level name path.Dir("movies") == ".", so root children
+	//                 live in childrenIdx["."], NOT childrenIdx[""]. The NFS
+	//                 handler and syncMetadata both ListChildren(".") for the
+	//                 root. scopedPrune MUST use storeParent, or a foreign
+	//                 delete/rmdir of a TOP-LEVEL entry (fired as hdel/del on d1)
+	//                 would never be pruned by the push path — scopedPrune("")
+	//                 hits an empty index and is a no-op (EDGE Bug A).
+	var parentPath, storeParent string
 	if dirInode == 1 {
-		parentPath = "" // tree root
+		parentPath = "" // tree root: children's paths are bare names
+		storeParent = "."
 	} else {
 		ent := rc.store.LookupByInode(dirInode)
 		if ent == nil {
@@ -645,13 +699,15 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 			return nil
 		}
 		parentPath = ent.Path
+		storeParent = ent.Path // non-root: path.Dir(parent+"/"+name) == parent
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	rdb := rc.redisDB()
 	key := "d" + strconv.FormatUint(dirInode, 10)
-	raw, err := rc.rdb.HGetAll(ctx, key).Result()
+	raw, err := rdb.HGetAll(ctx, key).Result()
 	if err != nil {
 		return err
 	}
@@ -686,7 +742,7 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 		// attr leaves mtime/size 0 — identical to the Lua's behavior.
 		var mtime time.Time
 		var size int64
-		if attrStr, aerr := rc.rdb.Get(ctx, "i"+strconv.FormatUint(childInode, 10)).Result(); aerr == nil {
+		if attrStr, aerr := rdb.Get(ctx, "i"+strconv.FormatUint(childInode, 10)).Result(); aerr == nil {
 			if mt, sz, ok := decodeInodeAttr([]byte(attrStr)); ok {
 				if mt > 0 {
 					mtime = time.Unix(mt, 0)
@@ -734,11 +790,12 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 		}
 	}
 
-	// Scoped prune: any store child of parentPath whose name is NOT in the
+	// Scoped prune: any store child of storeParent whose name is NOT in the
 	// fresh Redis set is a removal candidate — but only after the SAME QA-30
 	// guards syncMetadata uses (Layer C pin guard, Layer A FUSE-present guard).
 	// Reusing these guards is mandatory to not re-open the QA-30 ESTALE bug.
-	rc.scopedPrune(parentPath, freshNames)
+	// storeParent (not parentPath) is the children-index key — see above.
+	rc.scopedPrune(storeParent, freshNames)
 
 	jmlog.Info("metadata keyspace push: reconcileDir",
 		"inode", dirInode, "parent", parentPath, "children", len(raw), "upserted", len(toUpsert))
