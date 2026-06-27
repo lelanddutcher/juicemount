@@ -64,3 +64,18 @@ scoped prune path; coalescer collapse + burst-promotion; wrong-db channel
 rejection. **Pending:** REAL Finder/VLC validation on a live mount with the NAS
 reconfigured to `Kghx` (unit tests give false positives on this codebase per
 testing-feedback discipline).
+
+## 2026-06-27 — cellular backstop capped 45m → 5m + LSEnvironment flag
+
+- `backstopForClass(classTunnel)` 45m → **5m** (metadata/keyspace.go). QA flagged that a 45m
+  backstop stretched the two backstop-bounded staleness windows (foreign in-place attr edits;
+  a delete missed during a reconnect gap, healed via PruneThreshold×backstop) to hours on
+  cellular. 5m bounds attr drift to ≤5m and a missed-delete ghost to PruneThreshold×5m (~50m)
+  while still a 6×+ reduction from the old constant 30s cadence. REVERT: restore 45m if the
+  5m SCAN re-introduces link contention on cellular (push remains the freshness mechanism;
+  the SCAN is only a backstop, so a longer interval trades staleness for link headroom).
+- `JM_METADATA_KEYSPACE_PUSH=1` set via `LSEnvironment` in app/JuiceMount/Resources/Info.plist
+  (timing-safe: in environ at process launch, before the Go runtime caches it). REVERT/kill:
+  remove the LSEnvironment key (or set notify-keyspace-events empty on the NAS → auto-fallback
+  to the classic 30s SCAN). The core auto-detects via CONFIG GET, so the flag is dormant unless
+  the NAS Redis has notify-keyspace-events sufficient (K && (A || (g && h))).

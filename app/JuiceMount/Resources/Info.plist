@@ -28,6 +28,16 @@
     <string>14.0</string>
     <key>LSUIElement</key>
     <true/>
+    <!-- Enable the Redis keyspace-notification metadata push (demotes the 30s
+         full SCAN to a rare class-gated backstop). Set at process launch so the
+         Go core's os.Getenv sees it before the runtime caches environ. SAFE: the
+         core auto-detects notify-keyspace-events via CONFIG GET and falls back to
+         the classic 30s SCAN if the NAS Redis isn't configured for it. -->
+    <key>LSEnvironment</key>
+    <dict>
+        <key>JM_METADATA_KEYSPACE_PUSH</key>
+        <string>1</string>
+    </dict>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 Leland Dutcher. All rights reserved.</string>
     <key>NSHighResolutionCapable</key>

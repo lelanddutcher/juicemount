@@ -172,17 +172,22 @@ func reachableNow() bool {
 }
 
 // backstopForClass returns the long, class-gated backstop interval used when
-// the subscription is ENABLED+healthy. The whole motivation is that the
-// cellular 87-178s SCAN must become RARE, so tunnel/cellular gets the longest
-// interval.
+// the subscription is ENABLED+healthy. The motivation is that the cellular
+// 87-178s SCAN must become RARE — but NOT so rare that the two backstop-bounded
+// staleness windows (foreign in-place size/mtime edits, which fire no d* event;
+// and a delete missed during a subscriber-down window, which heals only via the
+// PruneThreshold ladder) stretch to hours. So tunnel/cellular is CAPPED at 5 min:
+// still a 6x+ reduction from the old 30s cadence (the link-saturation fix holds),
+// while bounding attr drift to <=5 min and a missed-delete ghost to
+// PruneThreshold x 5 min instead of x 45 min. See QA residual risks / REVERT_LOG.
 func backstopForClass(c linkClass) time.Duration {
 	switch c {
 	case classLAN:
 		return 10 * time.Minute
 	case classWiFi:
 		return 15 * time.Minute
-	default: // tunnel / cellular / WAN
-		return 45 * time.Minute
+	default: // tunnel / cellular / WAN — capped low to bound staleness windows
+		return 5 * time.Minute
 	}
 }
 
