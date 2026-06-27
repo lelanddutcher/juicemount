@@ -273,6 +273,50 @@ func TestBackstopAndTuningOrdering(t *testing.T) {
 	SetClassSignals(nil, nil) // reset global hooks for other tests
 }
 
+// TestNetworkChangeDeferralPredicate locks the exact gate the reconcileLoop
+// syncNowCh handler uses to DEFER a network-change full SCAN to the keyspace
+// push: currentBackstop() > DefaultReconcileInterval. That is true IFF the push
+// is ENABLED + reachable (PSUBSCRIBE up, deltas flowing) — the one state in
+// which a per-flap full 200k SCAN is redundant, because the keyspace loop owns
+// reconnect gap-fill and the rare backstop is the safety net. In every other
+// state (DISABLED / DEGRADED / ENABLED-but-unreachable) the gate is false and
+// the classic flap-debounce + SCAN fires as the authoritative fallback —
+// byte-identical to pre-push behavior. If a future setEngagement change set a
+// long backstop in a non-ENABLED state, this test fails before the live
+// regression (a flaky link silently losing its convergence SCAN) ever ships.
+func TestNetworkChangeDeferralPredicate(t *testing.T) {
+	// Mirrors the reconcileLoop syncNowCh gate exactly.
+	deferred := func(rc *RedisClient) bool {
+		return rc.currentBackstop() > DefaultReconcileInterval
+	}
+	rc := &RedisClient{}
+	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+
+	// ENABLED + reachable -> DEFER (push carries deltas; per-flap SCAN redundant).
+	SetClassSignals(func() string { return "en0" }, func() bool { return true })
+	rc.setEngagement(keyspaceEnabled)
+	if !deferred(rc) {
+		t.Errorf("ENABLED+reachable must DEFER the network-change SCAN (backstop=%v)", rc.currentBackstop())
+	}
+	// DEGRADED -> do NOT defer (PSUBSCRIBE dropped; the SCAN is the fallback).
+	rc.setEngagement(keyspaceDegraded)
+	if deferred(rc) {
+		t.Errorf("DEGRADED must NOT defer; classic SCAN must fire (backstop=%v)", rc.currentBackstop())
+	}
+	// DISABLED -> do NOT defer (no push; byte-identical classic 30s behavior).
+	rc.setEngagement(keyspaceDisabled)
+	if deferred(rc) {
+		t.Errorf("DISABLED must NOT defer (backstop=%v)", rc.currentBackstop())
+	}
+	// ENABLED but UNREACHABLE -> do NOT defer (push delivery is down).
+	SetClassSignals(func() string { return "en0" }, func() bool { return false })
+	rc.setEngagement(keyspaceEnabled)
+	if deferred(rc) {
+		t.Errorf("ENABLED+unreachable must NOT defer (backstop=%v)", rc.currentBackstop())
+	}
+	SetClassSignals(nil, nil)
+}
+
 // ---------------------------------------------------------------------------
 // Coalescer: collapse a burst on one dir to ONE reconcile; promote a wide
 // burst to ONE full SCAN.

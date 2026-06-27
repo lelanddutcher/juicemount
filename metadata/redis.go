@@ -746,6 +746,24 @@ func (rc *RedisClient) reconcileLoop() {
 		case <-ticker.C:
 			rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
 		case <-rc.syncNowCh:
+			// Keyspace-push deferral (2026-06-27): when the push is actively
+			// ENABLED the backstop is long (setEngagement stores a >30s interval
+			// ONLY for ENABLED+reachable). In that state a network-change/reconnect
+			// must NOT fire a full SCAN here — the keyspace loop OWNS reconnect
+			// convergence (PSUBSCRIBE-then-gap-fill on its OWN (re)connect), and the
+			// rare backstop is the safety net. On a flaky link — cellular, or a
+			// false-positive reachability blip that never actually dropped the
+			// PSUBSCRIBE (observed: backend pinging at 16ms while the probe flapped
+			// "unreachable" every ~10s) — this path otherwise fires a full 200k SCAN
+			// PER flap, the exact contention the push was built to remove. When the
+			// push is NOT carrying deltas (backstop == 30s: DISABLED / DEGRADED /
+			// unreachable) we fall through to the classic flap-debounce + SCAN, which
+			// is then the authoritative convergence path (byte-identical to before).
+			if rc.currentBackstop() > DefaultReconcileInterval {
+				jmlog.Info("network-change reconcile deferred to keyspace push",
+					"reason", "push ENABLED; keyspace loop owns reconnect gap-fill")
+				continue
+			}
 			// Flap debounce (2026-06-16): on a flaky cellular link the reachability
 			// monitor flaps constantly and EACH recovery fires a full-keyspace SCAN
 			// (87-178s on cellular, ~93% finding zero changes), stacking back-to-back
