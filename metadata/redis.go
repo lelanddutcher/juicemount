@@ -92,14 +92,14 @@ type RedisClient struct {
 	// pruneAbsent single-writer invariant and avoiding two concurrent full SCANs.
 	syncMu sync.Mutex
 
-	mu               sync.RWMutex
-	lastSyncDuration time.Duration
-	lastSyncTime     time.Time
+	mu                sync.RWMutex
+	lastSyncDuration  time.Duration
+	lastSyncTime      time.Time
 	lastSyncStartedAt time.Time // when the most recent sync BEGAN (for flap debounce)
-	lastSyncEntries  int
-	connected        bool
-	lastDisconnect   time.Time
-	lastReconnect    time.Time
+	lastSyncEntries   int
+	connected         bool
+	lastDisconnect    time.Time
+	lastReconnect     time.Time
 
 	// backstopNanos is the CURRENT desired interval (in nanoseconds) for the
 	// periodic full-SCAN reconcile loop, read every loop turn so a running
@@ -179,6 +179,13 @@ func (rc *RedisClient) SetReconcileInterval(d time.Duration) {
 		return
 	}
 	rc.reconcileInterval = d
+	// Seed the live backstop so the configured cadence actually takes effect:
+	// reconcileLoop reads backstopNanos (via currentBackstop), not
+	// reconcileInterval, on every turn. setEngagement (the keyspace loop) may
+	// override this live once push is engaged — but until then this is the
+	// authoritative periodic-SCAN interval, so the LB-4 preference is honored
+	// from launch rather than staying a placebo behind DefaultReconcileInterval.
+	rc.backstopNanos.Store(int64(d))
 }
 
 // lstatFunc is the type of the package-level Lstat hook. Aliased so we can
