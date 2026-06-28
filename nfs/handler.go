@@ -1260,6 +1260,19 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 				// RPC tax in the playback workload.
 			} else if jfs.handler.redisClient != nil && jfs.handler.redisClient.RecentlyDegraded(60*time.Second) {
 				// Treat the cache entry as authoritative. Skip purge.
+			} else if strings.HasPrefix(path.Base(filename), "._") {
+				// QA-31 (2026-06-28): NEVER phantom-purge a ._AppleDouble sidecar.
+				// macOS writes one ._X per copied item; the handler deliberately
+				// scan-filters ._* out of the backend SCAN (see ReadDir), so the
+				// SCAN never re-confirms them and "FUSE says ENOENT" is an
+				// unreliable phantom signal for them — a ._ file already drained
+				// out of the spool index (HasPending==false) but still transiently
+				// ENOENT on FUSE would be wrongly purged, destroying the inode→
+				// handle mapping → FromHandle STALE → intermittent copy stall
+				// (the residual 1-per-960 that slipped the spool guard). ._
+				// sidecars are transient metadata; a lingering cache entry is
+				// harmless (overwritten on the next create), so keeping it is
+				// strictly safer than risking a STALE on Finder's open handle.
 			} else if jfs.handler.spool != nil && jfs.handler.spool.HasPending(filename) {
 				// QA-30 Layer D, on-Stat purge twin (2026-06-28): NEVER purge a
 				// spool-pending file. A file Finder wrote-and-closed sits in the
@@ -1737,6 +1750,17 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 					// the copy. Keep the entry; the read just returns ENOENT
 					// until the drainer lands it. See the Stat purge gate.
 					jmlog.Debug("open ENOENT but spool-pending — NOT purging (queued to drain)",
+						"path", filename)
+					return nil, err
+				}
+				if strings.HasPrefix(path.Base(filename), "._") {
+					// QA-31 (2026-06-28): NEVER phantom-purge a ._AppleDouble sidecar
+					// on open. They are scan-filtered from the backend SCAN, so FUSE
+					// ENOENT is an unreliable phantom signal; a drained-and-evicted ._
+					// file (HasPending==false) that is transiently ENOENT would be
+					// wrongly purged -> FromHandle STALE -> intermittent stall. Sidecars
+					// are transient; keep the entry, just return ENOENT. See the Stat gate.
+					jmlog.Debug("open ENOENT on ._ sidecar - NOT purging (scan-filtered, transient)",
 						"path", filename)
 					return nil, err
 				}
