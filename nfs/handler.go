@@ -1260,6 +1260,22 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 				// RPC tax in the playback workload.
 			} else if jfs.handler.redisClient != nil && jfs.handler.redisClient.RecentlyDegraded(60*time.Second) {
 				// Treat the cache entry as authoritative. Skip purge.
+			} else if jfs.handler.spool != nil && jfs.handler.spool.HasPending(filename) {
+				// QA-30 Layer D, on-Stat purge twin (2026-06-28): NEVER purge a
+				// spool-pending file. A file Finder wrote-and-closed sits in the
+				// spool — no active writer, no open FD, not yet on FUSE — until
+				// the drainer flushes it. FUSE ENOENT here is EXPECTED, not proof
+				// of a phantom. Purging destroys the cache entry → the inode the
+				// NFS handle resolves to vanishes → Finder's next FromHandle on
+				// that path returns STALE → the copy freezes. filterSpoolPending
+				// guards the reconcile prune identically (metadata/keyspace.go);
+				// this is the missing guard for the Stat/Open phantom-purge.
+				// Repro: a Finder copy of Desktop+Downloads writes one ._AppleDouble
+				// per item; each is purged in the closed-but-not-drained window →
+				// a burst of "FromHandle STALE" → hard stall at ~2.4 GB. HasPending
+				// self-clears on drain success and on terminal drain failure (via
+				// EvictIndex), so this can never perma-pin a stale entry.
+				jmlog.Debug("stat ENOENT but spool-pending — NOT purging (in-flight, queued to drain)", "path", filename)
 			} else {
 				fusePath := jfs.fullPath(filename)
 				isNotExist, ok := lstatNotExistWithTimeout(fusePath, 2*time.Second)
@@ -1710,6 +1726,17 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 				}
 				if jfs.handler.hasActiveWriter(filename) {
 					jmlog.Debug("open ENOENT but active writer present — NOT purging",
+						"path", filename)
+					return nil, err
+				}
+				if jfs.handler.spool != nil && jfs.handler.spool.HasPending(filename) {
+					// QA-30 Layer D twin (2026-06-28): spool-pending file —
+					// written+closed but not yet drained, so FUSE ENOENT is
+					// expected, not a phantom. Purging it destroys the cache
+					// entry and STALEs Finder's handle (FromHandle), freezing
+					// the copy. Keep the entry; the read just returns ENOENT
+					// until the drainer lands it. See the Stat purge gate.
+					jmlog.Debug("open ENOENT but spool-pending — NOT purging (queued to drain)",
 						"path", filename)
 					return nil, err
 				}
