@@ -1,0 +1,21 @@
+{
+  "schema": "loupe.assertions/1",
+  "asset_key": "xxh3:2e9cf3ae98300fda",
+  "media_filename": "A_0065C938H260612_115032EJ_LAD04.mov",
+  "assertions": [
+    {
+      "namespace": "log_profile",
+      "key": "value",
+      "value": "clog3",
+      "asserted_by": "ol:leland@lelanddutcher.com/MacBook",
+      "asserted_at": "2026-06-27T18:40:00Z"
+    },
+    {
+      "namespace": "person",
+      "key": "c_3f",
+      "value": "Bob",
+      "asserted_by": "ol:leland@lelanddutcher.com/MacBook",
+      "asserted_at": "2026-06-27T18:41:12Z"
+    }
+  ]
+}

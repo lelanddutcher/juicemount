@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/blob-range.schema.json",
+  "title": "BlobRange",
+  "description": "PROXY-CODEC range-serve conformance descriptor (PROXY_CODEC_SPEC §JuiceMount ratification §3 / correction #2). NOT a control-plane JSON body — the blob endpoint streams raw blob bytes. This fixture is a machine-readable description of the EXPECTED HTTP STATUS + RESPONSE HEADERS for a Range request and an unranged GET against the proxy-blob HTTP endpoint (GET /blob?inode=N&kind=proxy). The provider's conformance test asserts these header contracts directly (bridge/contract_conformance_test.go); the consumer's player relies on them for progressive HTTP + seek (without 206/Accept-Ranges every player buffers the whole file before playback). The contract is codec-independent: faststart + byte-range serving is identical for h264/hevc/av1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ranged", "unranged"],
+  "properties": {
+    "ranged": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The response to GET with Range: bytes=0-1 — the spec's named conformance case.",
+      "required": ["request_range", "status", "headers"],
+      "properties": {
+        "request_range": { "const": "bytes=0-1" },
+        "status": { "const": 206 },
+        "headers": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["Accept-Ranges", "Content-Range", "Content-Length", "Content-Type"],
+          "properties": {
+            "Accept-Ranges": { "const": "bytes" },
+            "Content-Range": {
+              "type": "string",
+              "pattern": "^bytes 0-1/[0-9]+$",
+              "description": "bytes 0-1/<total blob size>. The total is the actual proxy.mp4 size (== blob_size)."
+            },
+            "Content-Length": { "const": "2", "description": "Exactly 2 bytes for bytes=0-1 (inclusive range)." },
+            "Content-Type": { "const": "video/mp4" }
+          }
+        }
+      }
+    },
+    "unranged": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The response to a plain GET (no Range header).",
+      "required": ["status", "headers"],
+      "properties": {
+        "status": { "const": 200 },
+        "headers": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["Accept-Ranges", "Content-Length", "Content-Type"],
+          "properties": {
+            "Accept-Ranges": { "const": "bytes", "description": "Advertised so a client knows it may issue Range requests." },
+            "Content-Length": { "type": "string", "pattern": "^[0-9]+$", "description": "Full blob size in bytes (== blob_size)." },
+            "Content-Type": { "const": "video/mp4" }
+          }
+        }
+      }
+    }
+  }
+}

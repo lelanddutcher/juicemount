@@ -1,0 +1,20 @@
+{
+  "ranged": {
+    "request_range": "bytes=0-1",
+    "status": 206,
+    "headers": {
+      "Accept-Ranges": "bytes",
+      "Content-Range": "bytes 0-1/20447232",
+      "Content-Length": "2",
+      "Content-Type": "video/mp4"
+    }
+  },
+  "unranged": {
+    "status": 200,
+    "headers": {
+      "Accept-Ranges": "bytes",
+      "Content-Length": "20447232",
+      "Content-Type": "video/mp4"
+    }
+  }
+}

@@ -59,9 +59,20 @@ detect mount (signature) ──► GET /health (confirm live JuiceMount)
 The canonical vocabulary — the **only** tokens that may appear in `capabilities`:
 
 `health`, `whoami`, `residency`, `lookup`, `cache-status`, `offline`, `spool`, `activity`, `pin`, `unpin`,
-`self-test`, `verify-pins`, `metrics`, `derivatives`, `metadata`, `contribute`, `changes`.
+`self-test`, `verify-pins`, `metrics`, `derivatives`, `metadata`, `contribute`, `changes`, `assertions`, `blob`.
 
 (`derivatives` + `metadata` are the JM-14 shared-derivative-platform reads — GUI-only, like residency/lookup.)
+
+(`blob` is the PROXY-CODEC byte-range blob delivery — `GET /blob?inode=N&kind=proxy` (PROXY_CODEC_SPEC §JuiceMount
+ratification §3). GUI-only. Streams a derivative blob (proxy.mp4 etc.) with `Accept-Ranges: bytes`, answers `Range`
+with `206 Partial Content` (`Content-Range`/`Content-Length`), `Content-Type` from the manifest media_type, and
+`200`+`Content-Length` unranged — what a browser `<video>` and a remote AVPlayer need to seek over HTTP. The route
+path == the token.)
+
+(`assertions` is the JM-ASSERT portable-human-metadata channel — `POST`/`GET /assertions` (ASSERTIONS_SIDECAR.md).
+GUI-only. POST writes the `<media>.loupe.json` sidecar (the source of truth — atomic, LWW, merge-not-clobber) +
+upserts JuiceMount's rebuildable, content-hash-`asset_key`-keyed Tier-B index; GET reads the resolved set by
+`asset_key`, or by `inode`/`path` resolved to `asset_key`. The route path == the token.)
 
 (`contribute` is the OL-1 on-device-AI contribute-back **write** — `POST /derivatives/register`. GUI-only;
 fail-open: a consumer that doesn't see it keeps its AI local, as today. The served route is

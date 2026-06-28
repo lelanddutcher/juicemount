@@ -240,6 +240,13 @@ services:
       JM_FARM_MODE: "all"             # all | derivatives | transcript
       JM_FARM_PRODUCER: "linux-farm"
       JM_FARM_DB: "/state/derivatives.db"
+      # JM-16: run the STANDING queue-drain worker (heartbeat + BRPOP the shared
+      # juicefarm: queue on JM_META) so Manager `POST /api/farm/sweep` enqueues are
+      # picked up in near-real-time — what OpenLoupe expects. With this set the
+      # entrypoint exec's `jmfarm -queue` and JM_FARM_INTERVAL below is NOT used.
+      JM_FARM_QUEUE: "1"
+      # Fallback only: if JM_FARM_QUEUE is unset/0 the worker reverts to a periodic
+      # -root sweep every JM_FARM_INTERVAL seconds (the pre-JM-16 behavior).
       JM_FARM_INTERVAL: "900"
       JM_FARM_WORKERS: "4"
     volumes:

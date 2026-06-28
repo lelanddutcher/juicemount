@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/assertions-sidecar.schema.json",
+  "title": "AssertionSidecar",
+  "description": "The portable `<media>.loupe.json` assertion sidecar — the SOURCE OF TRUTH for human metadata about a media file (ratings, person names, a deliberate log-profile pick). ASSERTIONS_SIDECAR.md. It is an ordinary JSON file next to the media (same directory, name = media filename + `.loupe.json`), so the truth travels with the bytes on any cross-volume / SMB / USB copy and is readable by a second client with no JuiceMount in the path. JuiceMount's Tier-B `assertions` table is a REBUILDABLE INDEX over these sidecars, never the silo that owns them. Join key = the portable content-hash `asset_key` (xxh3 of size‖head‖tail, the same source_hash already on the wire), with a path/name fallback until bytes are hashed; the JuiceFS inode is a Tier-B accelerator column ONLY, never written here and never identity. An asset with no assertions has NO sidecar (an empty one is never written).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema", "asset_key", "media_filename", "assertions"],
+  "properties": {
+    "schema": {
+      "const": "loupe.assertions/1",
+      "description": "Versioned shape tag; bumped only on a breaking change. Forward-compat readers ignore unknown namespaces + unknown top-level keys (hence additionalProperties:true)."
+    },
+    "asset_key": {
+      "type": "string",
+      "description": "PRIMARY join key — the portable content hash, `xxh3:<16 hex>` (xxh3 of size‖head‖tail = SampleHash). Survives rename/copy/SMB. MAY be empty (\"\") for a not-yet-hashed asset, in which case the sidecar's location + media_filename is the binding (path/name fallback) until a hash is stamped.",
+      "pattern": "^(xxh3:[0-9a-f]{16}|)$"
+    },
+    "media_filename": {
+      "type": "string",
+      "description": "Basename of the media this sidecar belongs to — the path/name fallback anchor and the human-readable association.",
+      "minLength": 1
+    },
+    "assertions": {
+      "type": "array",
+      "description": "The namespaced (namespace,key,value) triples — verbatim JM-ASSERT wire shape — each carrying its author stamp. LWW-resolved: exactly one triple per (namespace,key); the per-author history (for the deferred author-merge model) lives in the Tier-B index, so merge lands with no sidecar-format migration.",
+      "items": { "$ref": "#/$defs/assertion" }
+    }
+  },
+  "$defs": {
+    "assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "key", "value", "asserted_by", "asserted_at"],
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "description": "Assertion namespace: \"person\" | \"log_profile\" | \"rating\" | \"pick\" | \"tag\" | (future). Unknown namespaces are ignored by forward-compat readers, never an error.",
+          "minLength": 1
+        },
+        "key": {
+          "type": "string",
+          "description": "Namespace-defined key; e.g. \"value\", or a cluster_id for the \"person\" namespace."
+        },
+        "value": {
+          "type": ["string", "number", "boolean", "null"],
+          "description": "The asserted value. null is a RETRACT (the user took their assertion back) and is DISTINCT from a real force-negative value like log_profile \"none\" (the user asserts it is NOT log)."
+        },
+        "asserted_by": {
+          "type": "string",
+          "description": "Author identity (e.g. \"ol:leland@…/MacBook\"). The LWW tiebreak field now and the author-merge unit later; a privacy opt-in toggles per author.",
+          "minLength": 1
+        },
+        "asserted_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC-3339 UTC timestamp — the last-writer-wins ordering field."
+        }
+      }
+    }
+  }
+}

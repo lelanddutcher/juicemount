@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://juicemount.contract/v1/derivatives.schema.json",
   "title": "Derivatives",
-  "description": "GET /derivatives?inode=N — the derivative MANIFEST for one asset: which machine-derived artifacts exist (thumbnail/filmstrip/waveform/proxy/tech/embedding/transcript/ocr/faces), their status, integrity hash, producer, and (for blob kinds) the volume-relative blob path. JM-14, the Tier-B foundation. CLIENT-AGNOSTIC: OpenLoupe (Swift) and the JuiceMount web UI consume this identically. Keyed by the durable JuiceFS inode (from /lookup), never the mount path. Machine-derived data is a rebuildable cache — the media is the truth — so a client that distrusts a derivative (hash mismatch) just regenerates it.",
+  "description": "GET /derivatives?inode=N — the derivative MANIFEST for one asset: which machine-derived artifacts exist (thumbnail/filmstrip/waveform/proxy/tech/embedding/transcript/ocr/faces), their status, integrity hash, producer, and (for blob kinds) the volume-relative blob path. JM-14, the Tier-B foundation. CLIENT-AGNOSTIC: OpenLoupe (Swift) and the JuiceMount web UI consume this identically. Keyed by the durable JuiceFS inode (from /lookup), never the mount path. Machine-derived data is a rebuildable cache — the media is the truth — so a client that distrusts a derivative (hash mismatch) just regenerates it. PROXY-CODEC additive fields (PROXY_CODEC_SPEC §JuiceMount ratification, schema version 2): proxy rows MAY carry `codec` (h264 default/floor | hevc | av1; absent ⇒ h264), `codec_string` (the exact isTypeSupported/canPlayType token), and `blob_size` (actual produced bytes). All additive — OL feature-detects on field presence, so old/new clients interoperate with no contract_version bump.",
   "type": "object",
   "additionalProperties": false,
   "required": ["inode", "exists", "derivatives"],
@@ -37,7 +37,7 @@
           },
           "blob_rel_path": {
             "type": ["string", "null"],
-            "description": "Volume-relative path under /.juicemount/derivatives/<inode>/ for blob kinds (e.g. \"poster.jpg\", \"strip.jpg\", \"proxy.m4s\"). null for DB-only kinds. The Mac client reads it through the mount; the web UI serves the same bytes over HTTP."
+            "description": "Volume-relative path under /.juicemount/derivatives/<inode>/ for blob kinds (e.g. \"poster.jpg\", \"strip.jpg\", \"proxy.mp4\"). null for DB-only kinds. The Mac client reads it through the mount; the web UI serves the same bytes over HTTP (byte-range-capable: Accept-Ranges + 206)."
           },
           "media_type": {
             "type": ["string", "null"],
@@ -48,6 +48,19 @@
           "updated_at": { "type": "integer", "description": "Unix seconds the derivative was last produced." },
           "source_size": { "type": ["integer", "null"], "description": "Source file size (bytes) at generation time — lets a consumer stat-verify the derivative off the manifest (live /lookup size == source_size) without a separate tech row. Omitted on rows that predate this field." },
           "source_mtime": { "type": ["integer", "null"], "description": "Source file mtime (unix seconds) at generation time; the companion stat-guard to source_size." },
+          "codec": {
+            "enum": ["h264", "hevc", "av1"],
+            "description": "PROXY-CODEC (PROXY_CODEC_SPEC §JuiceMount ratification §2). Which video codec THIS proxy blob is. Present only on kind=='proxy'. ABSENT ⇒ assume \"h264\" (back-compat: every pre-existing proxy is the H.264 floor). H.264 is the guaranteed-decodable floor; the farm MUST NOT emit an asset whose only proxy is non-h264. Invariant across all codecs: MP4 container, +faststart, closed-GOP/CFR/BT.709 discipline, byte-range serving."
+          },
+          "codec_string": {
+            "type": ["string", "null"],
+            "description": "PROXY-CODEC. The exact MediaSource.isTypeSupported()/canPlayType() / AVURLAsset probe token for THIS blob (e.g. \"avc1.640028, mp4a.40.2\"). The web UI and OpenLoupe MUST gate on this, not on `codec` alone. Present only on kind=='proxy'."
+          },
+          "blob_size": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "PROXY-CODEC / REMOTE_PROXY (IN-FLIGHT-1). The actual produced size of the blob in bytes (os.Stat of the blob at generation time). Required-intent on kind=='proxy'; permitted (additive) on all blob kinds. OpenLoupe OBSERVES this and owns the downgrade/skip/cap policy (skip the proxy when blob_size >= original.size; quantify the saving). JuiceMount makes NO size-ratio guarantee — only honesty: blob_size reflects the real blob."
+          },
           "filmstrip": {
             "type": "object",
             "additionalProperties": false,
@@ -68,6 +81,10 @@
           {
             "if": { "not": { "properties": { "kind": { "const": "filmstrip" } }, "required": ["kind"] } },
             "then": { "not": { "required": ["filmstrip"] } }
+          },
+          {
+            "if": { "not": { "properties": { "kind": { "const": "proxy" } }, "required": ["kind"] } },
+            "then": { "not": { "required": ["codec"] }, "properties": { "codec_string": { "const": null } } }
           }
         ]
       }

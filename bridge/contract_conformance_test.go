@@ -189,6 +189,8 @@ func seedControlPlane(t *testing.T) func() {
 		"/whoami", "/residency", "/lookup", "/derivatives", "/metadata",
 		"/derivatives/register", // OL-1 → contribute capability
 		"/derivatives/changes",  // since= delta feed → changes capability
+		"/blob",                 // PROXY-CODEC #50 byte-range blob delivery → blob capability
+		"/assertions",           // JM-ASSERT #51 portable human metadata → assertions capability
 		"/reclaim", "/cache-clear", "/verify-pins", "/force-eject", "/stop",
 		"/self-test", "/spool", "/activity", "/spool-recover", "/mount-now",
 		"/debug/pprof/",

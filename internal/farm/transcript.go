@@ -332,5 +332,5 @@ func writeLoupe(blobPath string, doc *LoupeJSON) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(blobPath, b, 0o644)
+	return atomicWriteFile(blobPath, b, 0o644)
 }

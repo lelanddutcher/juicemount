@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/assertions.schema.json",
+  "title": "AssertionWriteResult",
+  "description": "POST /assertions 200 response (JM-ASSERT / ASSERTIONS_SIDECAR.md §3). The consumer (OpenLoupe) POSTs a namespaced human assertion (rating / person name / log-profile pick) targeting an asset by inode, absolute path, or the portable asset_key/content_hash directly; the server resolves it to the content-hash asset_key, writes the `<media>.loupe.json` sidecar (the source of truth — atomic temp+fsync+rename, merge-not-clobber sibling namespaces), and upserts its rebuildable Tier-B index. Last-writer-wins by asserted_at: an incoming assertion with an OLDER (or equal) asserted_at than the stored one for the same (asset_key,namespace,key) is REJECTED — accepted:false, the stored value + sidecar unchanged, winning_asserted_at = the stored winner's. The wire API is unchanged from SEARCH_FEDERATION JM-ASSERT; only the storage internals (portable sidecar, asset_key key) moved.\n\nREQUEST body (application/json): { inode?:int | path?:string | asset_key?:string | content_hash?:string, namespace:string, key:string, value:(string|number|bool|null — null retracts), asserted_by:string, asserted_at:RFC-3339 }.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["accepted", "winning_asserted_at", "asset_key"],
+  "properties": {
+    "accepted": {
+      "type": "boolean",
+      "description": "true when this assertion won LWW (sidecar rewritten + index upserted). false on a reject-stale (older/equal asserted_at) — value + sidecar unchanged."
+    },
+    "winning_asserted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "The asserted_at of whichever writer now holds the (asset_key,namespace,key) slot — the incoming one on accept, the stored winner on a reject-stale."
+    },
+    "asset_key": {
+      "type": "string",
+      "description": "The durable identity the assertion bound to: the portable content hash `xxh3:<16 hex>` when the bytes were hashable, else a `path:<filename>` fallback (§2)."
+    },
+    "inode": {
+      "type": "integer",
+      "description": "Echo of the resolved/queried inode when known (the on-JuiceFS accelerator). Omitted for a pure asset_key write with no inode."
+    }
+  }
+}

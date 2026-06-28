@@ -126,7 +126,7 @@ func Waveform(ffmpegBin, srcPath, outPath string, samplesPerPixel int) (int, err
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return 0, err
 	}
-	if err := os.WriteFile(outPath, payload, 0o644); err != nil {
+	if err := atomicWriteFile(outPath, payload, 0o644); err != nil {
 		return 0, err
 	}
 	return wf.Length, nil

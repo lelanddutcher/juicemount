@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://juicemount.contract/v1/assertions-get.schema.json",
+  "title": "AssertionReadResult",
+  "description": "GET /assertions response (JM-ASSERT / ASSERTIONS_SIDECAR.md §7). Reads the resolved (LWW) assertions for an asset, queried by the portable asset_key (?asset_key= / ?content_hash=) or by inode/path resolved to asset_key (?inode= / ?path=). The Tier-B index answers; the sidecars are the durable truth behind it. assertions is ALWAYS a non-null array (empty when the asset has none). The assertion triple shape mirrors assertions-sidecar.schema.json#/$defs/assertion (inlined here so this schema validates standalone).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["asset_key", "assertions"],
+  "properties": {
+    "asset_key": {
+      "type": "string",
+      "description": "The content-hash identity the assertions are bound to (`xxh3:<16 hex>` or a `path:<filename>` fallback). Empty when an inode/path query resolved to no assertions."
+    },
+    "inode": {
+      "type": "integer",
+      "description": "Echo of the queried/accelerator inode when the query was by inode/path. Omitted for a pure asset_key query."
+    },
+    "assertions": {
+      "type": "array",
+      "description": "The resolved assertion triples, each verbatim JM-ASSERT shape (the accelerator inode is NOT projected — it is not part of a portable assertion).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["namespace", "key", "value", "asserted_by", "asserted_at"],
+        "properties": {
+          "namespace": { "type": "string", "minLength": 1, "description": "\"person\" | \"log_profile\" | \"rating\" | \"pick\" | \"tag\" | (future)." },
+          "key": { "type": "string", "description": "Namespace-defined; e.g. \"value\", or a cluster_id for \"person\"." },
+          "value": { "type": ["string", "number", "boolean", "null"], "description": "null is a retract (distinct from a force-negative value like log_profile \"none\")." },
+          "asserted_by": { "type": "string", "minLength": 1, "description": "Author identity (LWW tiebreak + audit)." },
+          "asserted_at": { "type": "string", "format": "date-time", "description": "RFC-3339 UTC; the LWW ordering field." }
+        }
+      }
+    }
+  }
+}

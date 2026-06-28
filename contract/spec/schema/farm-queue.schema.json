@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/lelanddutcher/juicemount-contract/spec/schema/farm-queue.schema.json",
+  "title": "POST /farm/queue — enqueue server-side generation (request + response)",
+  "description": "OpenLoupe (Phase-2 producer) enqueues farm generation for a folder/file via a thin, capability-gated control-plane route that pushes to the shared Redis queue. `producer` is stamped server-side as \"openloupe\"; the consumer never sends it.",
+  "definitions": {
+    "request": {
+      "type": "object",
+      "required": ["path", "kinds"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Volume-relative path (mount_point stripped — the contract's nas_rel_path). A directory (recursive) or one file. The control plane resolves it under the farm root. MUST be non-empty (no whole-volume sweep)."
+        },
+        "kinds": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "enum": ["derivatives", "proxy", "transcript", "all"] },
+          "description": "derivatives = tech + poster/thumbnail + filmstrip + waveform; proxy = H.264 faststart; transcript = whisper; all = full pipeline."
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional generation knobs; any omitted field ⇒ the worker's container default.",
+          "properties": {
+            "crf": { "type": "integer" },
+            "preset": { "type": "string" },
+            "model": { "type": "string" },
+            "vcodec": { "type": "string" },
+            "workers": { "type": "integer" },
+            "proxy_workers": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "required": ["id", "status"],
+      "properties": {
+        "id": { "type": "string", "description": "The enqueued job id (16-hex)." },
+        "status": { "type": "string", "enum": ["queued"] }
+      }
+    }
+  }
+}

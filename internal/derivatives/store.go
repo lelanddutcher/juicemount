@@ -46,6 +46,18 @@ type DerivRow struct {
 	// kind=="filmstrip". Persisted in the row's kind-specific `extra` JSON
 	// column. omitempty so every other kind omits it on the wire.
 	Filmstrip *FilmstripGeo `json:"filmstrip,omitempty"`
+	// PROXY-CODEC additive fields (#50, derivatives.schema.json v2), present ONLY
+	// for kind=="proxy". Persisted in the same kind-specific `extra` JSON column as
+	// Filmstrip (no SQL migration — `extra` already exists). omitempty so every
+	// other kind, and a proxy row that predates the fields, omits them on the wire
+	// (back-compat: codec absent ⇒ h264; the schema forbids `codec` on non-proxy
+	// rows, which omitempty guarantees).
+	//   Codec       : "h264" (floor) | "hevc" | "av1" — which codec THIS blob is.
+	//   CodecString : exact MediaSource.isTypeSupported/canPlayType token.
+	//   BlobSize    : actual produced bytes (os.Stat of the blob at generation).
+	Codec       *string `json:"codec,omitempty"`
+	CodecString *string `json:"codec_string,omitempty"`
+	BlobSize    *int64  `json:"blob_size,omitempty"`
 }
 
 // FilmstripGeo is the sprite-sheet geometry a scrubber needs to map a time to a
@@ -141,7 +153,13 @@ func Open(dbPath string) (*Store, error) {
 			return nil, fmt.Errorf("derivatives: migrate %s: %w", col, err)
 		}
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	// JM-ASSERT (#51): the assertions accelerator index shares this DB + handle.
+	if err := s.initAssertions(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("derivatives: assertions schema: %w", err)
+	}
+	return s, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -198,13 +216,9 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 			v := srcMtime.Int64
 			d.SourceMtime = &v
 		}
-		// kind-specific `extra`: filmstrip geometry today (JM-16).
-		if d.Kind == "filmstrip" && extra.Valid && extra.String != "" {
-			var fg FilmstripGeo
-			if json.Unmarshal([]byte(extra.String), &fg) == nil {
-				d.Filmstrip = &fg
-			}
-		}
+		// kind-specific `extra`: filmstrip geometry (JM-16) for kind==filmstrip,
+		// proxy-codec fields (#50) for kind==proxy.
+		decodeExtra(&d, extra)
 		out = append(out, d)
 	}
 	return out, rows.Err()
@@ -492,14 +506,66 @@ func int64OrNil(p *int64) any {
 	return *p
 }
 
+// extraEnvelope is the kind-specific sub-object persisted in the derivatives
+// `extra` JSON column. Filmstrip geometry (JM-16) for kind==filmstrip; the
+// proxy-codec triple (#50) for kind==proxy. omitempty so a row with no
+// kind-specific extra serializes to "{}" (treated as nil — see extraJSON).
+type extraEnvelope struct {
+	Filmstrip   *FilmstripGeo `json:"filmstrip,omitempty"`
+	Codec       *string       `json:"codec,omitempty"`
+	CodecString *string       `json:"codec_string,omitempty"`
+	BlobSize    *int64        `json:"blob_size,omitempty"`
+}
+
 // extraJSON serializes a row's kind-specific sub-object into the `extra` column.
-// Filmstrip geometry today (JM-16); nil for every other kind.
+// Filmstrip geometry (JM-16) or the proxy-codec triple (#50); nil (NULL column)
+// when the row carries neither, so older non-filmstrip/non-proxy rows are
+// untouched.
 func extraJSON(d DerivRow) any {
+	env := extraEnvelope{}
+	has := false
 	if d.Filmstrip != nil {
-		b, err := json.Marshal(d.Filmstrip)
-		if err == nil {
-			return string(b)
+		env.Filmstrip = d.Filmstrip
+		has = true
+	}
+	if d.Codec != nil || d.CodecString != nil || d.BlobSize != nil {
+		env.Codec, env.CodecString, env.BlobSize = d.Codec, d.CodecString, d.BlobSize
+		has = true
+	}
+	if !has {
+		return nil
+	}
+	b, err := json.Marshal(env)
+	if err != nil {
+		return nil
+	}
+	return string(b)
+}
+
+// decodeExtra unpacks the `extra` JSON column back onto a row's kind-specific
+// fields. Tolerant of the legacy bare-FilmstripGeo encoding (pre-#50 filmstrip
+// rows stored just the geo object, not the envelope): it tries the envelope
+// first, then falls back to the bare geo for kind==filmstrip.
+func decodeExtra(d *DerivRow, extra sql.NullString) {
+	if !extra.Valid || extra.String == "" {
+		return
+	}
+	var env extraEnvelope
+	if json.Unmarshal([]byte(extra.String), &env) == nil &&
+		(env.Filmstrip != nil || env.Codec != nil || env.CodecString != nil || env.BlobSize != nil) {
+		if d.Kind == "filmstrip" {
+			d.Filmstrip = env.Filmstrip
+		}
+		if d.Kind == "proxy" {
+			d.Codec, d.CodecString, d.BlobSize = env.Codec, env.CodecString, env.BlobSize
+		}
+		return
+	}
+	// Legacy: a pre-envelope filmstrip row stored the bare FilmstripGeo.
+	if d.Kind == "filmstrip" {
+		var fg FilmstripGeo
+		if json.Unmarshal([]byte(extra.String), &fg) == nil && fg.Cols > 0 {
+			d.Filmstrip = &fg
 		}
 	}
-	return nil
 }

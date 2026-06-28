@@ -1,0 +1,12 @@
+{
+  "inode": 1180620,
+  "exists": true,
+  "source_hash": "a1b2c3d4e5f60718",
+  "derivatives": [
+    { "kind": "tech",  "status": "ready", "producer": "linux-farm", "version": 1, "hash": "a1b2c3d4e5f60718", "blob_rel_path": null,             "media_type": null,       "model": null, "dim": null, "updated_at": 1750000000 },
+    { "kind": "proxy", "status": "ready", "producer": "linux-farm", "version": 1, "hash": "a1b2c3d4e5f60718", "blob_rel_path": "proxy.mp4",      "media_type": "video/mp4", "model": null, "dim": null, "updated_at": 1750000000,
+      "codec": "h264", "codec_string": "avc1.640028, mp4a.40.2", "blob_size": 20447232 },
+    { "kind": "proxy", "status": "ready", "producer": "linux-farm", "version": 1, "hash": "a1b2c3d4e5f60718", "blob_rel_path": "proxy.hevc.mp4", "media_type": "video/mp4", "model": null, "dim": null, "updated_at": 1750000000,
+      "codec": "hevc", "codec_string": "hvc1.1.6.L120.90, mp4a.40.2", "blob_size": 13631488 }
+  ]
+}

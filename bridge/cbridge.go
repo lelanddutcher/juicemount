@@ -837,6 +837,19 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"/derivatives":         handleDerivativesHTTP,
 			"/derivatives/changes": handleDerivativesChangesHTTP,
 			"/metadata":            handleMetadataHTTP,
+			// PROXY-CODEC (#50) byte-range blob delivery. GET /blob?inode=N&kind=proxy
+			// streams a derivative blob (proxy.mp4 etc.) with Accept-Ranges: bytes,
+			// answers Range with 206 + Content-Range/Content-Length, serves the
+			// Content-Type from the manifest media_type, and 200 + Content-Length
+			// unranged — what a browser <video> / remote AVPlayer need to seek over
+			// HTTP. Capability token `blob` (route path == token).
+			"/blob": handleBlobHTTP,
+			// JM-ASSERT (#51) portable-human-metadata channel. POST /assertions writes
+			// the <media>.loupe.json sidecar (source of truth — atomic, LWW,
+			// merge-not-clobber) + upserts the asset_key-keyed Tier-B index; GET
+			// reads the resolved set by asset_key (or inode/path → asset_key).
+			// Capability token `assertions` (route path == token).
+			"/assertions": handleAssertionsHTTP,
 			// OL-1 on-device AI contribute-back (write). POST: a consumer that
 			// wrote ai.loupe.json through the mount registers it so the server
 			// indexes it for every client + the web UI. Capability token =
@@ -2712,7 +2725,70 @@ func handleMetadataHTTP(w http.ResponseWriter, r *http.Request) {
 	resp.Version = tm.Version
 	resp.Hash = tm.Hash
 	resp.Tech = tm.Payload
+	// OUT-8 log_profile LWW-over-detection: a human log_profile assertion
+	// (namespace=log_profile) OVERRIDES the ffprobe-DETECTED tech.video.log_format
+	// — the user's deliberate "this is clog3" (or force-negative "none") wins over
+	// a best-effort tag scrape. Privacy opt-in gate: OFF by default (per-author
+	// human assertions don't leak into the shared /metadata view) — enabled with
+	// JM_LOG_PROFILE_OVERLAY=1. Read-only overlay; the stored detection is
+	// untouched, and a retract (value:null) simply leaves the detected value.
+	if kind == "tech" && os.Getenv("JM_LOG_PROFILE_OVERLAY") == "1" {
+		resp.Tech = overlayLogProfile(ds, inode, resp.Tech)
+	}
 	writeContractJSON(w, resp)
+}
+
+// overlayLogProfile applies the OUT-8 log_profile LWW-over-detection overlay: if
+// an accepted (LWW-resolved, non-retracted) log_profile assertion exists for this
+// inode's asset, it replaces tech.video.log_format with the asserted value. A
+// retract (value:null) or absent assertion leaves the detected value verbatim. On
+// any error the original payload is returned unchanged (fail-open to detection).
+func overlayLogProfile(ds *derivatives.Store, inode uint64, tech json.RawMessage) json.RawMessage {
+	if len(tech) == 0 {
+		return tech
+	}
+	assetKey, err := ds.AssetKeyForInode(inode)
+	if err != nil || assetKey == "" {
+		return tech
+	}
+	raws, err := ds.AssertionsByAssetKey(assetKey)
+	if err != nil {
+		return tech
+	}
+	var asserted *string
+	for _, a := range raws {
+		if a.Namespace != "log_profile" || a.Key != "value" {
+			continue
+		}
+		// value_json is raw JSON: "null" = retract (no override); a string = the pick.
+		if a.ValueJSON == "null" {
+			return tech // retracted → defer to detection
+		}
+		var s string
+		if json.Unmarshal([]byte(a.ValueJSON), &s) == nil {
+			asserted = &s
+		}
+		break
+	}
+	if asserted == nil {
+		return tech
+	}
+	// Decode → set tech.video.log_format → re-encode. Tolerant of a null/absent
+	// video object (no overlay target then).
+	var m map[string]any
+	if json.Unmarshal(tech, &m) != nil {
+		return tech
+	}
+	video, ok := m["video"].(map[string]any)
+	if !ok {
+		return tech
+	}
+	video["log_format"] = *asserted
+	out, err := json.Marshal(m)
+	if err != nil {
+		return tech
+	}
+	return out
 }
 
 // registerRequest is the POST /derivatives/register body (OL-1 on-device AI
@@ -2847,6 +2923,339 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	jmlog.Info("OL-1 AI contribute-back registered",
 		"inode", req.Inode, "producer", req.Producer, "model", req.Model, "hash", hash)
 	writeContractJSON(w, registerResponse{Inode: req.Inode, Registered: true, Derivative: row})
+}
+
+// handleBlobHTTP serves GET /blob?inode=N&kind=proxy (PROXY-CODEC #50): the
+// byte-range delivery of a derivative blob (proxy.mp4 etc.). It resolves the
+// blob via the asset's manifest row (blob_rel_path + media_type, fail-closed: a
+// kind that isn't a READY blob row → 404), opens it through the FUSE mount, and
+// hands it to http.ServeContent, which implements the full Range/206/Accept-
+// Ranges contract: a ranged request gets 206 + Content-Range + Content-Length,
+// an unranged GET gets 200 + Content-Length, both with Accept-Ranges: bytes.
+// That is exactly what a browser <video> and a remote AVPlayer need to seek over
+// HTTP, identical for h264/hevc/av1.
+func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
+	inode, ok := parseInodeQuery(w, r)
+	if !ok {
+		return
+	}
+	kind := r.URL.Query().Get("kind")
+	if kind == "" {
+		kind = "proxy" // the only blob kind /blob serves today.
+	}
+	globalMu.Lock()
+	ds := globalDerivStore
+	mount := globalFUSEPath
+	if mount == "" {
+		mount = globalMountPath
+	}
+	globalMu.Unlock()
+	if ds == nil || mount == "" {
+		http.Error(w, "control plane not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	// On a miss, try the JM-15 on-demand reconcile so a farm-derived blob this app
+	// hasn't ingested yet still resolves (same bridge the /derivatives handler uses).
+	if known, _ := ds.Known(inode); !known {
+		if found, ferr := farm.ReconcileOneSidecar(ds, mount, inode); ferr == nil && found {
+			// reconciled — fall through to the manifest read below.
+		}
+	}
+	rows, err := ds.Manifest(inode)
+	if err != nil {
+		http.Error(w, "manifest read failed", http.StatusInternalServerError)
+		return
+	}
+	var blobRel, mediaType string
+	for _, d := range rows {
+		if d.Kind != kind || d.Status != "ready" || d.BlobRelPath == nil || *d.BlobRelPath == "" {
+			continue
+		}
+		blobRel = *d.BlobRelPath
+		if d.MediaType != nil {
+			mediaType = *d.MediaType
+		}
+		break
+	}
+	if blobRel == "" {
+		http.Error(w, "no ready "+kind+" blob for this inode", http.StatusNotFound)
+		return
+	}
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
+	}
+
+	// Resolve the blob under the Tier-A per-inode dir and open it through the FUSE
+	// mount (direct JuiceFS — no NFS self-loop). filepath.Clean on the rel path
+	// keeps it inside the inode dir (the farm only ever writes flat names there).
+	blobPath := filepath.Join(farm.DerivBlobDir(mount, inode), filepath.Clean("/"+blobRel))
+	f, err := os.Open(blobPath)
+	if err != nil {
+		http.Error(w, "blob unreadable", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		http.Error(w, "blob stat failed", http.StatusInternalServerError)
+		return
+	}
+	// http.ServeContent sets Content-Type (we pin it from the manifest media_type),
+	// Accept-Ranges: bytes, and the full 200/206 + Content-Range/Content-Length
+	// Range machinery. modtime drives caching validators; the blob's mtime is fine.
+	w.Header().Set("Content-Type", mediaType)
+	http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
+}
+
+// assertRequest is the POST /assertions body (JM-ASSERT #51). The consumer
+// targets an asset by inode, absolute path, or the portable asset_key/
+// content_hash directly; the server resolves it to the content-hash asset_key,
+// writes the <media>.loupe.json sidecar (source of truth), and upserts the
+// asset_key-keyed Tier-B index. value is json.RawMessage so null (retract) is
+// preserved verbatim and distinct from a missing field.
+type assertRequest struct {
+	Inode       uint64          `json:"inode"`
+	Path        string          `json:"path"`
+	AssetKey    string          `json:"asset_key"`
+	ContentHash string          `json:"content_hash"`
+	Namespace   string          `json:"namespace"`
+	Key         string          `json:"key"`
+	Value       json.RawMessage `json:"value"`
+	AssertedBy  string          `json:"asserted_by"`
+	AssertedAt  string          `json:"asserted_at"`
+}
+
+// assertWriteResponse is the POST /assertions 200 body. Schema:
+// contract/spec/schema/assertions.schema.json. inode is echoed (omitempty) only
+// when the write resolved/queried an accelerator inode.
+type assertWriteResponse struct {
+	Accepted          bool   `json:"accepted"`
+	WinningAssertedAt string `json:"winning_asserted_at"`
+	AssetKey          string `json:"asset_key"`
+	Inode             uint64 `json:"inode,omitempty"`
+}
+
+// assertReadResponse is the GET /assertions 200 body. Schema:
+// contract/spec/schema/assertions-get.schema.json. assertions is ALWAYS a
+// non-null array (empty when none).
+type assertReadResponse struct {
+	AssetKey   string             `json:"asset_key"`
+	Inode      uint64             `json:"inode,omitempty"`
+	Assertions []assertReadTriple `json:"assertions"`
+}
+
+type assertReadTriple struct {
+	Namespace  string          `json:"namespace"`
+	Key        string          `json:"key"`
+	Value      json.RawMessage `json:"value"`
+	AssertedBy string          `json:"asserted_by"`
+	AssertedAt string          `json:"asserted_at"`
+}
+
+// handleAssertionsHTTP serves POST/GET /assertions (JM-ASSERT #51). POST applies
+// one namespaced human assertion under last-writer-wins: it resolves the asset to
+// a content-hash asset_key (hashing the live source when given inode/path,
+// path:<basename> fallback when the bytes aren't hashable), writes the portable
+// <media>.loupe.json sidecar (the source of truth — atomic, merge-not-clobber)
+// AND upserts the asset_key-keyed Tier-B index, then returns whether it won LWW.
+// GET reads the resolved (LWW) set by asset_key, or by inode/path resolved to an
+// asset_key; assertions is a non-null array (empty on a miss — fail-closed).
+func handleAssertionsHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		handleAssertionsGet(w, r)
+	case http.MethodPost:
+		handleAssertionsPost(w, r)
+	default:
+		http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleAssertionsGet(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	assetKey := q.Get("asset_key")
+	if assetKey == "" {
+		assetKey = q.Get("content_hash")
+	}
+	var inode uint64
+	if v := q.Get("inode"); v != "" {
+		inode, _ = strconv.ParseUint(v, 10, 64)
+	}
+
+	globalMu.Lock()
+	ds := globalDerivStore
+	store := globalStore
+	mp := globalMountPath
+	if mp == "" {
+		mp = globalWantMountPoint
+	}
+	globalMu.Unlock()
+
+	resp := assertReadResponse{Assertions: []assertReadTriple{}}
+	if ds == nil {
+		writeContractJSON(w, resp) // fail closed → empty set, empty asset_key
+		return
+	}
+	// Resolve a path query to an accelerator inode (entries are volume-relative).
+	if assetKey == "" && inode == 0 && q.Get("path") != "" && store != nil {
+		if e := store.LookupByPath(metaRelPath(q.Get("path"), mp)); e != nil {
+			inode = e.Inode
+		}
+	}
+	// inode/path → asset_key via the accelerator column.
+	if assetKey == "" && inode != 0 {
+		resp.Inode = inode
+		if k, err := ds.AssetKeyForInode(inode); err == nil {
+			assetKey = k
+		}
+	}
+	if assetKey == "" {
+		writeContractJSON(w, resp) // unknown → empty asset_key + empty assertions[]
+		return
+	}
+	raws, err := ds.AssertionsByAssetKey(assetKey)
+	if err != nil {
+		jmlog.Warn("assertions read failed", "asset_key", assetKey, "error", err.Error())
+		writeContractJSON(w, resp)
+		return
+	}
+	resp.AssetKey = assetKey
+	for _, a := range raws {
+		resp.Assertions = append(resp.Assertions, assertReadTriple{
+			Namespace: a.Namespace, Key: a.Key, Value: json.RawMessage(a.ValueJSON),
+			AssertedBy: a.AssertedBy, AssertedAt: a.AssertedAt,
+		})
+	}
+	writeContractJSON(w, resp)
+}
+
+func handleAssertionsPost(w http.ResponseWriter, r *http.Request) {
+	var req assertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json body", 400)
+		return
+	}
+	if req.Namespace == "" || req.Key == "" {
+		http.Error(w, "missing namespace/key", 400)
+		return
+	}
+	if req.AssertedBy == "" || req.AssertedAt == "" {
+		http.Error(w, "missing asserted_by/asserted_at", 400)
+		return
+	}
+	valueJSON := strings.TrimSpace(string(req.Value))
+	if valueJSON == "" {
+		valueJSON = "null" // an omitted value is a retract (null)
+	}
+
+	globalMu.Lock()
+	ds := globalDerivStore
+	store := globalStore
+	fusePath := globalFUSEPath
+	mp := globalMountPath
+	if mp == "" {
+		mp = globalWantMountPoint
+	}
+	globalMu.Unlock()
+	if ds == nil {
+		http.Error(w, "control plane not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Resolve identity: asset_key (preferred), else inode/path → live source →
+	// content-hash asset_key, with a path:<basename> fallback. mediaPath is the
+	// FUSE-mount path to the source (for hashing + the sidecar location); empty
+	// when only an asset_key was given (a pure asset_key write has no inode/sidecar).
+	assetKey := req.AssetKey
+	if assetKey == "" {
+		assetKey = req.ContentHash
+	}
+	var entry *metadata.Entry
+	if store != nil {
+		if req.Inode != 0 {
+			entry = store.LookupByInode(req.Inode)
+		} else if req.Path != "" {
+			entry = store.LookupByPath(metaRelPath(req.Path, mp))
+		} else if assetKey != "" {
+			// Pure asset_key write: if this key was previously bound to an
+			// accelerator inode (an earlier inode/path write), resolve the media
+			// so we still write the sidecar (the source of truth) — not just the
+			// index. A never-before-seen portable key has no inode → sidecar-less
+			// index write, which the response honestly reflects.
+			if in, err := ds.InodeForAssetKey(assetKey); err == nil && in != 0 {
+				entry = store.LookupByInode(in)
+			}
+		}
+	}
+	var mediaPath, mediaName string
+	resolvedInode := req.Inode
+	if entry != nil {
+		resolvedInode = entry.Inode
+		mediaName = entry.Name
+		if fusePath != "" {
+			mediaPath = filepath.Join(fusePath, entry.Path)
+		}
+	} else if req.Path != "" {
+		mediaName = filepath.Base(req.Path)
+		mediaPath = req.Path
+	}
+	// Hash the live source for the portable asset_key when we have no explicit key.
+	if assetKey == "" && mediaPath != "" {
+		if fi, err := os.Stat(mediaPath); err == nil {
+			if h, herr := farm.SampleHash(mediaPath, fi.Size()); herr == nil {
+				assetKey = "xxh3:" + h
+			}
+		}
+	}
+	if assetKey == "" {
+		if mediaName != "" {
+			assetKey = derivatives.PathAssetKey(mediaName) // path/name fallback (§2)
+		} else {
+			http.Error(w, "could not resolve an asset_key (need asset_key, inode, or path)", 400)
+			return
+		}
+	}
+
+	// 1) Write the sidecar (the SOURCE OF TRUTH) when we know where the media is.
+	//    The sidecar's LWW result is authoritative; the index mirrors it.
+	var value any
+	_ = json.Unmarshal([]byte(valueJSON), &value) // null → nil; preserves type
+	incoming := farm.SidecarAssertion{
+		Namespace: req.Namespace, Key: req.Key, Value: value,
+		AssertedBy: req.AssertedBy, AssertedAt: req.AssertedAt,
+	}
+	var sidecarRes farm.ApplyAssertionResult
+	sidecarWritten := false
+	if mediaPath != "" {
+		if res, err := farm.ApplyAssertion(farm.AssertionSidecarPath(mediaPath), assetKey, mediaName, incoming); err != nil {
+			jmlog.Warn("assertion sidecar write failed", "media", mediaPath, "error", err.Error())
+		} else {
+			sidecarRes = res
+			sidecarWritten = true
+		}
+	}
+
+	// 2) Upsert the rebuildable Tier-B index (the accelerator GET answers from).
+	idxRes, err := ds.AssertLWW(assetKey, req.Namespace, req.Key, valueJSON, req.AssertedBy, req.AssertedAt, resolvedInode)
+	if err != nil {
+		http.Error(w, "assertion index write failed: "+err.Error(), 500)
+		return
+	}
+
+	// The sidecar is authoritative when written; otherwise the index decides.
+	out := assertWriteResponse{AssetKey: assetKey, Inode: resolvedInode}
+	if sidecarWritten {
+		out.Accepted = sidecarRes.Accepted
+		out.WinningAssertedAt = sidecarRes.WinningAssertedAt
+	} else {
+		out.Accepted = idxRes.Accepted
+		out.WinningAssertedAt = idxRes.WinningAssertedAt
+	}
+	jmlog.Info("JM-ASSERT write",
+		"asset_key", assetKey, "namespace", req.Namespace, "key", req.Key,
+		"accepted", out.Accepted, "sidecar", sidecarWritten)
+	writeContractJSON(w, out)
 }
 
 func handleCacheStatusHTTP(w http.ResponseWriter, r *http.Request) {

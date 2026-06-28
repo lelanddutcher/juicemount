@@ -22,11 +22,20 @@ func Thumbnail(ffmpegBin, srcPath, outPath string, maxDim int) error {
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return err
 	}
+	// Encode to a temp sibling, then atomically rename onto outPath so a
+	// concurrent OpenLoupe reader never sees a half-written JPEG. -f image2
+	// forces the muxer because the temp path lacks the .jpg extension ffmpeg
+	// would otherwise infer the format from.
+	tmpPath := atomicTempPath(outPath)
+	defer os.Remove(tmpPath) // no-op once the commit rename consumes it
 	vf := fmt.Sprintf("thumbnail,scale=w=%d:h=%d:force_original_aspect_ratio=decrease", maxDim, maxDim)
 	cmd := exec.Command(ffmpegBin, "-y", "-loglevel", "error",
-		"-i", srcPath, "-vf", vf, "-frames:v", "1", "-q:v", "3", outPath)
+		"-i", srcPath, "-vf", vf, "-frames:v", "1", "-q:v", "3", "-f", "image2", tmpPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg thumbnail %q: %w: %s", srcPath, err, out)
+	}
+	if err := atomicCommitFile(tmpPath, outPath); err != nil {
+		return fmt.Errorf("commit thumbnail %q: %w", outPath, err)
 	}
 	return nil
 }

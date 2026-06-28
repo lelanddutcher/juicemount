@@ -46,6 +46,10 @@ var capabilityVocab = map[string]bool{
 	"pin": true, "unpin": true, "self-test": true, "verify-pins": true,
 	"metrics": true, "derivatives": true, "metadata": true, "contribute": true,
 	"changes": true,
+	// PROXY-CODEC (#50) byte-range blob delivery (GET /blob?inode=N&kind=proxy)
+	// and JM-ASSERT (#51) portable-human-metadata channel (POST/GET /assertions).
+	// Both route paths == their tokens, so no routeCapAlias entry is needed.
+	"blob": true, "assertions": true,
 }
 
 // routeCapAlias maps a served route (no leading slash) to a capability token when

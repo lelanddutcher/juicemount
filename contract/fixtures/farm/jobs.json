@@ -1,0 +1,33 @@
+{
+  "available": true,
+  "workers": [
+    {
+      "id": "farm-1",
+      "started_at": "2026-06-25T20:00:00Z",
+      "last_seen": "2026-06-25T21:45:30Z",
+      "current_job": "a1b2c3d4e5f6a7b8"
+    }
+  ],
+  "queue_depth": 2,
+  "jobs": [
+    {
+      "id": "a1b2c3d4e5f6a7b8",
+      "status": "running",
+      "path": "/jfs/Film Projects/SPARQ",
+      "kinds": "derivatives,proxy,transcript",
+      "producer": "manager",
+      "enqueued_at": "2026-06-25T21:40:00Z",
+      "started_at": "2026-06-25T21:40:05Z",
+      "processed": 37,
+      "failed": 0
+    },
+    {
+      "id": "b2c3d4e5f6a7b8c9",
+      "status": "queued",
+      "path": "/jfs/Film Projects/SPARQ/Extras",
+      "kinds": "all",
+      "producer": "openloupe",
+      "enqueued_at": "2026-06-25T21:42:00Z"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "asset_key": "xxh3:2e9cf3ae98300fda",
+  "assertions": [
+    {
+      "namespace": "log_profile",
+      "key": "value",
+      "value": "clog3",
+      "asserted_by": "ol:leland@lelanddutcher.com/MacBook",
+      "asserted_at": "2026-06-27T18:40:00Z"
+    },
+    {
+      "namespace": "person",
+      "key": "c_3f",
+      "value": "Bob",
+      "asserted_by": "ol:leland@lelanddutcher.com/MacBook",
+      "asserted_at": "2026-06-27T18:41:12Z"
+    }
+  ]
+}

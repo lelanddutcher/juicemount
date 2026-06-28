@@ -67,11 +67,20 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return nil, err
 	}
+	// Encode to a temp sibling, then atomically rename onto outPath so a
+	// concurrent OpenLoupe reader never sees a half-written sprite sheet. -f
+	// image2 forces the muxer because the temp path lacks the .jpg extension
+	// ffmpeg would otherwise infer the format from.
+	tmpPath := atomicTempPath(outPath)
+	defer os.Remove(tmpPath) // no-op once the commit rename consumes it
 	vf := fmt.Sprintf("fps=%.6f,scale=%d:%d,tile=%dx%d", fps, cellW, cellH, cols, rows)
 	cmd := exec.Command(ffmpegBin, "-y", "-loglevel", "error",
-		"-i", srcPath, "-vf", vf, "-frames:v", "1", "-q:v", "4", outPath)
+		"-i", srcPath, "-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", tmpPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("ffmpeg filmstrip %q: %w: %s", srcPath, err, out)
+	}
+	if err := atomicCommitFile(tmpPath, outPath); err != nil {
+		return nil, fmt.Errorf("commit filmstrip %q: %w", outPath, err)
 	}
 
 	return &derivatives.FilmstripGeo{
