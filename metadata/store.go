@@ -64,6 +64,33 @@ PRAGMA busy_timeout = 30000;
 // DefaultMaxCacheSize is the default maximum number of entries in the in-memory caches.
 const DefaultMaxCacheSize = 500_000
 
+// cacheMutationChunk bounds how many entries a bulk cache mutation
+// (BulkInsert's rebuild loop, DeletePaths' removal loop) processes per single
+// s.mu.Lock() acquisition. The lock is RELEASED between chunks so a concurrent
+// serve-path reader (NFS LOOKUP/GETATTR/READDIR -> LookupByPath/LookupByInode/
+// ListChildren, all under s.mu.RLock) can interleave and is never blocked for
+// the full delta.
+//
+// DRAIN-LATENCY tail fix (2026-06-28): the residual ~300ms p99 tail spike on
+// the dir-open / Stat gate (test/qa-battery/11-drain-latency.sh) under a
+// sustained spool-drain was the periodic ~30s reconcile's BulkInsert holding
+// s.mu.Lock across its ENTIRE upsert delta — and DeletePaths across its entire
+// prune delta. During a hot drain, a single 30s cycle can surface a large
+// batch of newly-drained / changed entries (toUpsert) and pruned entries
+// (toDelete). Each per-entry op is pure in-memory map work (no I/O), but
+// iterating thousands of them under one write lock parks every concurrent
+// serve RLock for the full pass — a moving 1-per-reconcile multi-hundred-ms
+// stall, exactly the periodic tail. The map mutation order is identical
+// whether done in one critical section or N chunks (each entry's effect is
+// independent and idempotent), so chunking changes only WHEN the lock is
+// briefly yielded, never WHAT the caches end up containing — no stale serve.
+//
+// 2048 keeps each critical section well under the 5ms target on commodity
+// hardware (a few thousand map ops) while keeping the lock-acquire overhead
+// negligible relative to the work. Var (not const) so a test can shrink it to
+// force multi-chunk behavior deterministically on a small delta.
+var cacheMutationChunk = 2048
+
 // PinChecker is the minimal interface the metadata layer needs from the pin
 // store. QA-30 (2026-05-25): pinned paths must NEVER be pruned from the
 // metadata caches — pinning is an explicit user contract that the file
@@ -772,20 +799,49 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 	// the write lock is held.
 	s.stagePinnedForEviction()
 
-	// Rebuild caches after all batches insert
-	s.mu.Lock()
-	for _, e := range entries {
-		if old, ok := s.pathCache[e.Path]; ok {
-			s.removeFromChildrenIdx(old)
-			// QA-27: see Insert.
-			s.evictPathOrphanLocked(old, e)
+	// Rebuild caches after all batches insert.
+	//
+	// DRAIN-LATENCY tail fix: do NOT hold s.mu.Lock across the WHOLE delta.
+	// Under a sustained drain a single reconcile cycle can carry thousands of
+	// changed entries; a one-shot write-lock over all of them parks every
+	// concurrent serve RLock (LookupByPath / LookupByInode / ListChildren) for
+	// the full pass — the residual ~300ms p99 tail. Chunk the in-memory
+	// mutation so the lock is released between bounded batches, letting serve
+	// reads interleave. Each entry's cache effect is independent and
+	// idempotent, so the final cache state is identical to the one-shot loop;
+	// chunking only yields the lock more often. No stale read: a reader between
+	// chunks sees a prefix of the delta already applied and the rest still
+	// pending, never an inconsistent or rolled-back view.
+	for i := 0; i < len(entries); i += cacheMutationChunk {
+		end := i + cacheMutationChunk
+		if end > len(entries) {
+			end = len(entries)
 		}
-		// QA-25: see Insert.
-		s.evictInodeOrphanLocked(e)
-		s.inodeCache[e.Inode] = e
-		s.pathCache[e.Path] = e
-		s.addToChildrenIdx(e)
+		s.mu.Lock()
+		for _, e := range entries[i:end] {
+			if old, ok := s.pathCache[e.Path]; ok {
+				s.removeFromChildrenIdx(old)
+				// QA-27: see Insert.
+				s.evictPathOrphanLocked(old, e)
+			}
+			// QA-25: see Insert.
+			s.evictInodeOrphanLocked(e)
+			s.inodeCache[e.Inode] = e
+			s.pathCache[e.Path] = e
+			s.addToChildrenIdx(e)
+		}
+		s.mu.Unlock()
 	}
+
+	// Eviction is a separate, final critical section. In production this is a
+	// no-op (pathCache ~200k <= maxCacheSize 500k, early return in evictOldest)
+	// and never rebuilds the maps; keeping it out of the chunk loop means the
+	// staged pinned set (stagePinnedForEviction above) is consumed exactly once
+	// and the chunked inserts above don't repeatedly re-check the eviction
+	// budget. When eviction DOES fire (small test cache), this single short
+	// lock does the trim against the fully-applied delta — same result as
+	// before.
+	s.mu.Lock()
 	s.evictOldest()
 	s.mu.Unlock()
 
@@ -1260,20 +1316,33 @@ func (s *Store) DeletePaths(paths []string) error {
 	}
 	s.writeMu.Unlock()
 
-	s.mu.Lock()
-	for _, p := range paths {
-		if e, ok := s.pathCache[p]; ok {
-			// QA-25: see Delete.
-			if cur, inodeOk := s.inodeCache[e.Inode]; inodeOk && cur == e {
-				delete(s.inodeCache, e.Inode)
-			}
-			s.removeFromChildrenIdx(e)
-			// QA-30 Layer B: shadow for possible recovery (see Delete).
-			s.shadowEvictedLocked(e)
-			delete(s.pathCache, p)
+	// DRAIN-LATENCY tail fix: chunk the in-memory removal the same way as
+	// BulkInsert's rebuild loop. The periodic reconcile's prune (toDelete) can
+	// carry a large delta under a sustained drain; holding s.mu.Lock across the
+	// whole set parks every concurrent serve RLock for the full pass. Releasing
+	// the lock between bounded chunks lets NFS LOOKUP/GETATTR/READDIR interleave.
+	// Each removal is independent; a reader between chunks sees a consistent
+	// prefix removed and the rest still present — never a partial/torn entry.
+	for i := 0; i < len(paths); i += cacheMutationChunk {
+		end := i + cacheMutationChunk
+		if end > len(paths) {
+			end = len(paths)
 		}
+		s.mu.Lock()
+		for _, p := range paths[i:end] {
+			if e, ok := s.pathCache[p]; ok {
+				// QA-25: see Delete.
+				if cur, inodeOk := s.inodeCache[e.Inode]; inodeOk && cur == e {
+					delete(s.inodeCache, e.Inode)
+				}
+				s.removeFromChildrenIdx(e)
+				// QA-30 Layer B: shadow for possible recovery (see Delete).
+				s.shadowEvictedLocked(e)
+				delete(s.pathCache, p)
+			}
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
 
 	return nil
 }
