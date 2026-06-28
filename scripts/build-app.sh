@@ -70,7 +70,15 @@ swift build -c "$SWIFT_CONFIG" \
     -Xlinker "-framework" -Xlinker "AppKit" \
     -Xlinker "-framework" -Xlinker "Quartz" \
     -Xlinker "-framework" -Xlinker "Carbon" \
-    -Xlinker "-framework" -Xlinker "ServiceManagement"
+    -Xlinker "-framework" -Xlinker "ServiceManagement" \
+    -Xlinker "-rpath" -Xlinker "@executable_path/../Frameworks"
+    # ^ rpath for the embedded Sparkle.framework. The binary references
+    #   @rpath/Sparkle.framework/.../Sparkle, and the framework is copied to
+    #   Contents/Frameworks/ in step 3. Without this rpath dyld only searches
+    #   @loader_path (= Contents/MacOS) and the app crashes at launch with
+    #   "Library not loaded: @rpath/Sparkle.framework". This is the standard
+    #   bundled-framework rpath; SwiftPM does NOT add it for binary-artifact
+    #   frameworks the way Xcode's "Embed Frameworks" phase would.
 
 SWIFT_BIN="$SWIFT_PKG/.build/$SWIFT_CONFIG/JuiceMount"
 if [ ! -f "$SWIFT_BIN" ]; then
@@ -189,6 +197,41 @@ if [ -d "$SPM_RES_BUNDLE" ]; then
     cp -R "$SPM_RES_BUNDLE" "$APP_RES_DIR/"
 fi
 
+# --- Sparkle.framework embed ------------------------------------------------
+# The Swift app links against Sparkle (auto-updater). SwiftPM ships it as a
+# binary artifact (an .xcframework) rather than linking it statically, so the
+# runtime framework must be copied into Contents/Frameworks/ or the app
+# crashes at launch with a dyld "Library not loaded: @rpath/Sparkle.framework"
+# error. The executable already carries an LC_RPATH of @executable_path/../
+# Frameworks (SwiftPM adds it because the product depends on a framework
+# artifact), so this is the canonical embed location.
+#
+# We pick the macOS slice out of the resolved .xcframework. The path is under
+# .build/artifacts/sparkle/Sparkle/Sparkle.xcframework — found dynamically so a
+# Sparkle version bump (which changes nothing here) doesn't break the build.
+APP_FW_DIR="$APP_DIR/Contents/Frameworks"
+SPARKLE_EMBEDDED=0
+SPARKLE_XCFW="$(find "$SWIFT_PKG/.build/artifacts" -type d -name 'Sparkle.xcframework' 2>/dev/null | head -1)"
+if [ -n "$SPARKLE_XCFW" ]; then
+    # macOS slice dir name is e.g. macos-arm64_x86_64 — glob it so an arch
+    # change in a future Sparkle build is tolerated.
+    SPARKLE_FW_SRC="$(find "$SPARKLE_XCFW" -type d -name 'Sparkle.framework' -path '*macos*' 2>/dev/null | head -1)"
+fi
+if [ -n "${SPARKLE_FW_SRC:-}" ] && [ -d "$SPARKLE_FW_SRC" ]; then
+    mkdir -p "$APP_FW_DIR"
+    # -R preserves the Versions/Current symlink farm (required for a valid
+    # versioned framework). Remove any prior copy first so a stale signature
+    # never lingers across rebuilds.
+    rm -rf "$APP_FW_DIR/Sparkle.framework"
+    cp -R "$SPARKLE_FW_SRC" "$APP_FW_DIR/Sparkle.framework"
+    SPARKLE_EMBEDDED=1
+    echo "    Embedded: Sparkle.framework -> Contents/Frameworks/ (from $SPARKLE_FW_SRC)"
+else
+    echo "    ${YELLOW}WARNING: Sparkle.framework not found under .build/artifacts — auto-updater will crash at launch.${RESET}"
+    echo "    ${YELLOW}         Run 'swift package resolve' in $SWIFT_PKG and rebuild.${RESET}"
+fi
+# --- end Sparkle.framework embed --------------------------------------------
+
 echo "    Bundle: $APP_DIR"
 
 # 4. Codesign
@@ -252,21 +295,60 @@ else
     echo "    ${YELLOW}WARNING: 'security' command not found; signing ad-hoc (not distributable)${RESET}"
 fi
 
-# Build the codesign argv. The hardened runtime (--options runtime) and
-# --timestamp are for DISTRIBUTABLE (notarizable) builds and only work with a
-# real identity. Ad-hoc dev builds skip both: hardened runtime gives no local
-# benefit, --timestamp is rejected for ad-hoc, and (critically) hardened
-# runtime is part of what makes an unnotarized bundle stall on first launch.
-CS_ARGS=(--force --deep --sign "$SIGN_IDENTITY")
+# Hardened runtime (--options runtime) and --timestamp are for DISTRIBUTABLE
+# (notarizable) builds and only work with a real identity. Ad-hoc dev builds
+# skip both: hardened runtime gives no local benefit, --timestamp is rejected
+# for ad-hoc, and (critically) hardened runtime is part of what makes an
+# unnotarized bundle stall on first launch.
+HARDEN_ARGS=()
 if [ "$SIGN_IDENTITY" != "-" ]; then
-    CS_ARGS+=(--options runtime --timestamp)
+    HARDEN_ARGS=(--options runtime --timestamp)
 fi
+
+# --- Inside-out codesign of the embedded Sparkle.framework ------------------
+# We do NOT rely on `codesign --deep`: Apple deprecated it for signing and it
+# does NOT correctly sign a framework that contains nested XPC services and a
+# helper .app (Sparkle's Downloader.xpc / Installer.xpc / Updater.app /
+# Autoupdate). Each nested code item must be signed FIRST, from the leaves up,
+# THEN the framework, THEN the app. The framework's own bundles carry their own
+# identifiers (org.sparkle-project.*) and embedded entitlements, so we sign
+# them WITHOUT --entitlements (those are JuiceMount's app entitlements; forcing
+# them onto Sparkle's helpers would be wrong and can break notarization).
+# --force replaces Sparkle's shipped ad-hoc signatures with our Dev ID.
+if [ "$SPARKLE_EMBEDDED" = 1 ]; then
+    echo "    Signing embedded Sparkle.framework inside-out ($SIGN_IDENTITY_LABEL)..."
+    FW="$APP_FW_DIR/Sparkle.framework"
+    FW_VER="$FW/Versions/Current"   # symlink -> B (or A); codesign follows it
+    # Leaves first: XPC services, then the Updater.app and its nested helper
+    # executable, then the standalone Autoupdate helper. Order matters — a
+    # parent bundle's seal includes its children's signatures.
+    SPARKLE_NESTED=(
+        "$FW_VER/XPCServices/Downloader.xpc"
+        "$FW_VER/XPCServices/Installer.xpc"
+        "$FW_VER/Updater.app/Contents/MacOS/Autoupdate"
+        "$FW_VER/Updater.app"
+        "$FW_VER/Autoupdate"
+    )
+    for item in "${SPARKLE_NESTED[@]}"; do
+        if [ -e "$item" ]; then
+            codesign --force "${HARDEN_ARGS[@]}" --sign "$SIGN_IDENTITY" "$item"
+        fi
+    done
+    # Finally the framework bundle itself (seals the now-signed nested items).
+    codesign --force "${HARDEN_ARGS[@]}" --sign "$SIGN_IDENTITY" "$FW"
+fi
+# --- end inside-out Sparkle signing -----------------------------------------
+
+# Sign the app LAST (its seal now covers the already-signed framework). No
+# --deep: every nested code item is signed explicitly above, and --deep would
+# re-sign Sparkle's helpers with the wrong (app) entitlements.
+CS_ARGS=(--force "${HARDEN_ARGS[@]}" --sign "$SIGN_IDENTITY")
 if [ -n "$ENT_FILE" ]; then
     CS_ARGS+=(--entitlements "$ENT_FILE")
 fi
 
 codesign "${CS_ARGS[@]}" "$APP_DIR"
-codesign --verify --verbose=2 "$APP_DIR" 2>&1 | head -3 || true
+codesign --verify --deep --strict --verbose=2 "$APP_DIR" 2>&1 | head -5 || true
 
 # Notarization, gated. Skipped on:
 #   - JM_QUICK=1  (dev iteration; notarization is slow, 1-5 minutes)
@@ -304,6 +386,48 @@ else
         echo "                       --apple-id <email> --team-id <team> --password <app-specific-password>"
     fi
 fi
+
+# --- Sparkle appcast generation (release artifact step) ---------------------
+# Produces build/sparkle-release/{JuiceMount.zip, appcast.xml}. These are the
+# two files uploaded to the GitHub Release that SUFeedURL points at:
+#   https://github.com/lelanddutcher/juicemount/releases/latest/download/appcast.xml
+#
+# generate_appcast signs the .zip with the EdDSA PRIVATE key from the login
+# keychain (the same key whose PUBLIC half is in Info.plist) and writes the
+# signature into appcast.xml. It MUST run after notarize+staple so the zipped
+# app carries the stapled ticket (otherwise users updating get an un-notarized
+# build). Gated behind JM_APPCAST=1 because it's a release-only step, and
+# skipped unless the build was actually notarized.
+if [ -n "${JM_APPCAST:-}" ]; then
+    GEN_APPCAST="$(find "$SWIFT_PKG/.build/artifacts" -type f -name 'generate_appcast' 2>/dev/null | head -1)"
+    if [ "$NOTARIZED" != "yes" ]; then
+        echo "    ${YELLOW}WARNING: JM_APPCAST=1 but build was not notarized — refusing to publish an un-notarized update.${RESET}"
+    elif [ -z "$GEN_APPCAST" ]; then
+        echo "    ${YELLOW}WARNING: generate_appcast not found under .build/artifacts — run 'swift package resolve'.${RESET}"
+    else
+        echo ""
+        echo "==> Generating Sparkle appcast"
+        REL_DIR="$BUILD_DIR/sparkle-release"
+        rm -rf "$REL_DIR"
+        mkdir -p "$REL_DIR"
+        # generate_appcast scans a directory of app archives; give it a clean
+        # dir containing only this build's zip (stapled app).
+        ditto -c -k --keepParent "$APP_DIR" "$REL_DIR/JuiceMount.zip"
+        # --download-url-prefix makes the appcast's enclosure URL point at the
+        # GitHub release asset path so clients fetch the zip from the right place.
+        if "$GEN_APPCAST" \
+              --download-url-prefix "https://github.com/lelanddutcher/juicemount/releases/latest/download/" \
+              -o "$REL_DIR/appcast.xml" \
+              "$REL_DIR"; then
+            echo "    Appcast: $REL_DIR/appcast.xml"
+            echo "    Archive: $REL_DIR/JuiceMount.zip"
+            echo "    Upload BOTH to the GitHub Release tagged for this version."
+        else
+            echo "    ${YELLOW}WARNING: generate_appcast failed — see output above.${RESET}"
+        fi
+    fi
+fi
+# --- end appcast generation -------------------------------------------------
 
 # Warn about the hang-prone combo: Developer ID signature + hardened runtime
 # but NOT notarized. macOS stalls the first launch of such a bundle for

@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Combine
+import Sparkle
 
 /// Owns the NSStatusItem and the popover that appears when the user clicks the icon.
 /// Built with AppKit because SwiftUI's MenuBarExtra has limitations around custom layouts
@@ -11,6 +12,14 @@ final class MenuBarController: NSObject {
     private let server: ServerController
     private let statusItem: NSStatusItem
     private let popover: NSPopover
+
+    /// Sparkle auto-updater. `startingUpdater: true` schedules the background
+    /// check loop (SUEnableAutomaticChecks / SUScheduledCheckInterval in
+    /// Info.plist drive the cadence). Feed URL + EdDSA public key also come
+    /// from Info.plist, so no programmatic configuration is needed here.
+    /// Retained for the process lifetime via this controller (which the
+    /// AppDelegate owns) so the scheduled checks keep running.
+    private let updaterController: SPUStandardUpdaterController
 
     private var searchWindow: NSWindow?
     private var preferencesWindow: NSWindow?
@@ -25,6 +34,15 @@ final class MenuBarController: NSObject {
         popover.behavior = .transient
         popover.animates = true
         self.popover = popover
+
+        // Construct the Sparkle updater before super.init so it's a fully
+        // initialized stored property. No custom delegate/driver — Info.plist
+        // carries the feed URL, public key, and check schedule.
+        self.updaterController = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
 
         super.init()
 
@@ -56,10 +74,25 @@ final class MenuBarController: NSObject {
             onSearch: { [weak self] in self?.openSearchWindow() },
             onPreferences: { [weak self] in self?.openPreferencesWindow() },
             onSetupAssistant: { [weak self] in self?.openOnboardingWindow() },
+            onCheckForUpdates: { [weak self] in self?.checkForUpdates() },
             onQuit: { NSApplication.shared.terminate(nil) }
         )
         popover.contentViewController = NSHostingController(rootView: view)
         popover.contentSize = NSSize(width: 320, height: 360)
+    }
+
+    /// User-initiated "Check for Updates…". As an LSUIElement (accessory)
+    /// menu-bar app we have no regular activation, so Sparkle's update
+    /// dialog would otherwise appear behind other apps with no way to
+    /// focus it. Bring the app forward first, dismiss the popover, then
+    /// drive the check so the progress/no-update/update sheets are visible
+    /// and key.
+    func checkForUpdates() {
+        if popover.isShown {
+            popover.performClose(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        updaterController.checkForUpdates(nil)
     }
 
     // MARK: - State observation

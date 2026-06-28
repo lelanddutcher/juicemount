@@ -38,6 +38,24 @@
         <key>JM_METADATA_KEYSPACE_PUSH</key>
         <string>1</string>
     </dict>
+
+    <!-- Sparkle 2 auto-updater configuration.
+         SUFeedURL      — appcast hosted on GitHub Releases ("latest" release).
+         SUPublicEDKey  — EdDSA (ed25519) public key; the matching PRIVATE key
+                          lives ONLY in the login keychain (via Sparkle's
+                          generate_keys), never in the repo — same rule as the
+                          notarytool credentials. Update releases are verified
+                          against this key before they install.
+         SUEnableAutomaticChecks / SUScheduledCheckInterval — check once per day. -->
+    <key>SUFeedURL</key>
+    <string>https://github.com/lelanddutcher/juicemount/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>/YW+9b1o9nmwtEFTaUxMCCTZliWp0wmgMmxTwp0Zg/Y=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
+
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 Leland Dutcher. All rights reserved.</string>
     <key>NSHighResolutionCapable</key>

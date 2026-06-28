@@ -8,6 +8,7 @@ struct MenuPopoverView: View {
     let onSearch: () -> Void
     let onPreferences: () -> Void
     let onSetupAssistant: () -> Void
+    let onCheckForUpdates: () -> Void
     let onQuit: () -> Void
 
     /// Computed mirror of `server.cacheStatus` — kept under the original
@@ -1805,6 +1806,15 @@ struct MenuPopoverView: View {
                 systemImage: "eject.circle",
                 tint: .orange,
                 action: { forceEjectMount() }
+            )
+
+            // Sparkle auto-updater. Manual trigger; background checks run on
+            // their own schedule (SUScheduledCheckInterval). The handler
+            // brings the accessory app forward so the update sheet is visible.
+            ActionButton(
+                title: "Check for Updates…",
+                systemImage: "arrow.down.circle",
+                action: onCheckForUpdates
             )
 
             ActionButton(
