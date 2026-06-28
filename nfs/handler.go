@@ -70,6 +70,17 @@ type JuiceMountHandler struct {
 	prefetched  map[string]time.Time
 	prefetchSem chan struct{} // limits concurrent prefetch goroutines
 
+	// Async phantom-purge dedup (RC drain-latency fix, 2026-06-28). The
+	// Stat hot path no longer FUSE-Lstats inline to confirm a phantom; it
+	// serves the cached FileInfo and confirms in the background. This set
+	// is the singleflight key so a Stat storm on the SAME path (Finder
+	// fires Stat-backed ops constantly during a copy) launches at most ONE
+	// confirmation goroutine + ONE FUSE Lstat per path in flight, instead
+	// of N. Keyed by in-mount filename; entry cleared when the goroutine
+	// finishes. See asyncConfirmPhantomPurge + QA-35 / feedback_perf_hot_path.
+	phantomPurgeMu       sync.Mutex
+	phantomPurgeInFlight map[string]struct{}
+
 	// Verifier cleanup lifecycle
 	verifierStop chan struct{}
 
@@ -127,6 +138,22 @@ type verifierData struct {
 // slot immediately; the gate caps how many goroutines can be parked in a
 // stuck syscall at once (≤24) while healthy cold-cache concurrency flows.
 var nfsLstatGate = make(chan struct{}, 24)
+
+// prefetchGate caps concurrent in-flight FUSE ReadDirs spawned by the
+// BACKGROUND directory prefetcher (prefetchChildren). It is SEPARATE from
+// nfsLstatGate on purpose (RC drain-latency fix, 2026-06-28): the prefetcher
+// used to share nfsLstatGate, so under spool-drain load its FUSE ReadDirs —
+// blocked on the saturated JuiceFS daemon — consumed the same 24 slots that
+// genuine FOREGROUND cache-miss metadata RPCs need, starving them and head-of-
+// line-blocking Finder's single NFS connection (the spinner). Background
+// prefetch is a best-effort nav-latency optimization, never correctness, so it
+// gets its own tiny budget that it can fully saturate without ever touching the
+// foreground gate. Bounded small (2) so prefetch itself can't pile onto the
+// daemon during a drain. The existing prefetchSem (cap 4) still limits prefetch
+// goroutine concurrency; this only stops the FUSE-syscall budget from being
+// shared. See QA-35 / feedback_perf_hot_path: never let background work consume
+// the foreground hot-path FUSE budget.
+var prefetchGate = make(chan struct{}, 2)
 
 // errFUSETimeout is returned by the bounded FUSE helpers when a JuiceFS
 // syscall doesn't complete within its deadline (the mount is wedged/slow).
@@ -196,11 +223,15 @@ func statWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, err error
 }
 
 // readDirWithTimeout is the os.ReadDir sibling. ok=false → FUSE wedged.
-func readDirWithTimeout(p string, timeout time.Duration) (ents []os.DirEntry, err error, ok bool) {
+// gate bounds concurrent in-flight ReadDirs: foreground cold-readdir RPCs pass
+// nfsLstatGate (the shared hot-path budget); the BACKGROUND prefetcher passes
+// prefetchGate so its FUSE ReadDirs can never consume foreground slots during a
+// spool drain (RC drain-latency fix). See prefetchGate's doc.
+func readDirWithTimeout(p string, timeout time.Duration, gate chan struct{}) (ents []os.DirEntry, err error, ok bool) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case nfsLstatGate <- struct{}{}:
+	case gate <- struct{}{}:
 	case <-timer.C:
 		return nil, nil, false
 	}
@@ -212,7 +243,7 @@ func readDirWithTimeout(p string, timeout time.Duration) (ents []os.DirEntry, er
 	go func() {
 		ents, err := os.ReadDir(p)
 		ch <- result{ents: ents, err: err}
-		<-nfsLstatGate
+		<-gate
 	}()
 	select {
 	case r := <-ch:
@@ -355,9 +386,10 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		writeSizes:    make(map[string]int64),
 		activeWriters: make(map[string]int),
 		verifiers:     make(map[string]verifierData),
-		prefetched:    make(map[string]time.Time),
-		prefetchSem:   make(chan struct{}, 4), // max 4 concurrent prefetches
-		verifierStop:  make(chan struct{}),
+		prefetched:           make(map[string]time.Time),
+		prefetchSem:          make(chan struct{}, 4), // max 4 concurrent prefetches
+		phantomPurgeInFlight: make(map[string]struct{}),
+		verifierStop:         make(chan struct{}),
 	}
 	go h.verifierCleanupLoop(60*time.Second, 5*time.Minute)
 	return h
@@ -620,9 +652,12 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 	// Bounded: this background scan must never park its goroutine (and its OS
 	// thread) on a wedged/slow FUSE mount. readDirWithTimeout returns ok=false
 	// past the deadline; we abandon the best-effort prefetch rather than leak
-	// a blocked thread (crash 2026-06-14). The nfsLstatGate (cap 24) shared
-	// with the hot path also caps how many of these can be in flight at once.
-	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout)
+	// a blocked thread (crash 2026-06-14). Uses prefetchGate (cap 2), SEPARATE
+	// from the foreground nfsLstatGate (RC drain-latency fix): under spool-drain
+	// load these background ReadDirs block on the saturated FUSE daemon, and if
+	// they shared nfsLstatGate they'd starve foreground cache-miss metadata RPCs
+	// and head-of-line-block Finder's NFS connection. See prefetchGate's doc.
+	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout, prefetchGate)
 	if !ok {
 		return
 	}
@@ -723,6 +758,66 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 			// all workers busy, skip
 		}
 	}
+}
+
+// asyncConfirmPhantomPurge confirms-and-purges a suspected phantom cache entry
+// OFF the synchronous Stat hot path (RC drain-latency fix, 2026-06-28 —
+// QA-35 / feedback_perf_hot_path). The caller has already served the cached
+// FileInfo; this runs the bounded FUSE Lstat in the background under
+// nfsLstatGate and ONLY purges on a CONFIRMED isNotExist. On timeout/race it
+// does nothing — keep the entry — exactly the prior conservative behavior, just
+// no longer head-of-line-blocking Finder's NFS connection while a spool drain
+// saturates the FUSE daemon.
+//
+// Deduped per-path (singleflight via phantomPurgeInFlight): Finder issues
+// Stat-backed ops on the same path in a tight storm during a copy, so without
+// dedup each Stat would launch its own goroutine + FUSE Lstat. We keep at most
+// ONE confirmation in flight per path; concurrent Stats on a path already being
+// confirmed return immediately. Uses fuseStatTimeout (the WAN-aware hot-path
+// FUSE budget), NOT the old hardcoded 2s.
+func (h *JuiceMountHandler) asyncConfirmPhantomPurge(filename, fusePath string) {
+	h.phantomPurgeMu.Lock()
+	if _, inFlight := h.phantomPurgeInFlight[filename]; inFlight {
+		h.phantomPurgeMu.Unlock()
+		return // a confirmation for this path is already running — coalesce
+	}
+	h.phantomPurgeInFlight[filename] = struct{}{}
+	h.phantomPurgeMu.Unlock()
+
+	go func() {
+		defer func() {
+			h.phantomPurgeMu.Lock()
+			delete(h.phantomPurgeInFlight, filename)
+			h.phantomPurgeMu.Unlock()
+		}()
+
+		// Re-check the guards that can have changed since the Stat served:
+		// a writer may have opened, or the file may have started draining,
+		// between serving the cached entry and this goroutine running. Purging
+		// then would STALE a live handle. Cheap in-memory checks, no FUSE.
+		if h.hasActiveWriter(filename) {
+			return
+		}
+		if h.fdPool != nil && h.fdPool.HasOpenRefs(fusePath) {
+			return
+		}
+		if h.spool != nil && h.spool.HasPending(filename) {
+			return
+		}
+
+		isNotExist, ok := lstatNotExistWithTimeout(fusePath, fuseStatTimeout)
+		if ok && isNotExist {
+			// Confirm the entry is still the same phantom before deleting —
+			// a concurrent recreate/drain could have re-inserted it.
+			if h.store.LookupByPath(filename) == nil {
+				return
+			}
+			jmlog.Warn("purging phantom file (stale cache, confirmed async)", "path", filename)
+			h.store.DeleteFromCache(filename)
+			go h.store.Delete(filename)
+		}
+		// !ok (timeout) or exists → keep the entry; a future Stat reverifies.
+	}()
 }
 
 // publishEvent sends a metadata event via Redis SUBSCRIBE if a client is configured.
@@ -1290,17 +1385,30 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 				// EvictIndex), so this can never perma-pin a stale entry.
 				jmlog.Debug("stat ENOENT but spool-pending — NOT purging (in-flight, queued to drain)", "path", filename)
 			} else {
-				fusePath := jfs.fullPath(filename)
-				isNotExist, ok := lstatNotExistWithTimeout(fusePath, 2*time.Second)
-				if ok && isNotExist {
-					jmlog.Warn("purging phantom file (stale cache)", "path", filename)
-					jfs.handler.store.DeleteFromCache(filename)
-					go jfs.handler.store.Delete(filename)
-					return nil, os.ErrNotExist
-				}
-				// !ok means the Lstat timed out — FUSE is degraded. Treat the
-				// cache entry as authoritative for now; the stale entry (if
-				// any) will be cleaned up on a future stat once FUSE recovers.
+				// RC drain-latency fix (2026-06-28) — QA-35 / feedback_perf_hot_path:
+				// the phantom-purge confirmation must NEVER FUSE-syscall on the
+				// SYNCHRONOUS Stat path. Idle, the os.Lstat below is µs; but under
+				// a spool drain the drainer pushes io.CopyBuffer(1MiB)+dst.Sync()
+				// per file through the SAME JuiceFS/FUSE daemon, so the Lstat
+				// blocks up to its full timeout. Each slow Stat holds an
+				// nfsLstatGate slot AND an rpcSem slot; the reader admits each
+				// non-WRITE RPC on rpcSem BEFORE spawning the handler goroutine
+				// (internal/nfs/conn.go), so once those drain it parks and EVERY
+				// subsequent READDIR on Finder's single TCP connection waits →
+				// the directory-open spinner. Finder fires Stat-backed ops
+				// constantly during a copy (onRead/onRemove/onRename/onCreate/
+				// readlink/link/mknod/symlink all call fs.Stat), so the gate fills
+				// exactly when the drain is hot. A regression of the "never FUSE-
+				// syscall per RPC on the hot path" rule.
+				//
+				// Fix: SERVE THE CACHED FileInfo IMMEDIATELY (like every guard
+				// branch above) and confirm the phantom in the BACKGROUND. Only a
+				// CONFIRMED isNotExist purges; a timeout/race keeps the entry —
+				// exactly the prior conservative behavior, just off the hot path.
+				// No new STALE risk: we serve MORE conservatively (keep the
+				// entry), never less. Deduped per-path (singleflight) so a Stat
+				// storm on one path launches ONE goroutine + ONE FUSE Lstat, not N.
+				jfs.handler.asyncConfirmPhantomPurge(filename, jfs.fullPath(filename))
 			}
 		}
 
@@ -1552,7 +1660,9 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	// wedged JuiceFS can't hang the READDIR RPC and exhaust the server's
 	// concurrency budget (see statWithTimeout rationale).
 	fusePath := jfs.fullPath(dirname)
-	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout)
+	// Foreground cold READDIR — a genuine cache-miss metadata RPC on Finder's
+	// hot path, so it uses the shared nfsLstatGate (NOT prefetchGate).
+	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout, nfsLstatGate)
 	if !ok {
 		return nil, errFUSETimeout
 	}
