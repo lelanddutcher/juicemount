@@ -2099,8 +2099,74 @@ func (jfs *juiceFS) Join(elem ...string) string { return path.Join(elem...) }
 func (jfs *juiceFS) TempFile(dir, prefix string) (billy.File, error) {
 	return nil, fmt.Errorf("not implemented")
 }
-func (jfs *juiceFS) Symlink(target, link string) error    { return fmt.Errorf("not supported") }
-func (jfs *juiceFS) Readlink(link string) (string, error) { return "", fmt.Errorf("not supported") }
+// Symlink creates a symbolic link at `link` pointing at `target`, exposed over
+// NFS via the registered SYMLINK procedure (internal/nfs/nfs_onsymlink.go).
+//
+// WHY THIS EXISTS (the real bug): macOS project bundles/packages — .fcpbundle,
+// Premiere/Resolve project folders, .app, *.framework (Versions/Current), dylib
+// libraries — contain INTERNAL symlinks. Finder copying any such bundle issues
+// a SYMLINK RPC; while this returned "not supported" the WHOLE copy aborted
+// with "you don't have permission to access some of the items" (and `ln -s`
+// gave -5000 / EPERM). Plain-file copies have no symlinks, which is why every
+// synthetic test false-greened. The underlying JuiceFS FUSE mount is a POSIX
+// fs, so os.Symlink/os.Readlink/os.Lstat work directly against it.
+//
+// `target` is stored VERBATIM (it may be relative like "A" or
+// "Versions/Current/Lib", or absolute) — passed straight through to
+// os.Symlink, never resolved. A symlink carries no data, so it does NOT route
+// through the write spool: we create it on FUSE and synchronously mirror it
+// into the metadata cache (the same InsertToCache path Create uses) so the
+// follow-up LOOKUP/GETATTR/READLINK and handle resolution see it immediately.
+func (jfs *juiceFS) Symlink(target, link string) error {
+	link = strings.TrimPrefix(link, "/")
+
+	fusePath := jfs.fullPath(link)
+	if err := os.Symlink(target, fusePath); err != nil {
+		// os.Symlink wraps the syscall errno in *os.LinkError; the onSymlink
+		// wire layer already pre-checks existence and maps to NFSStatusExist,
+		// but map here too so a direct/raced EEXIST is reported faithfully
+		// (onSymlink turns a generic error into NFSStatusAccess otherwise).
+		if os.IsExist(err) {
+			return os.ErrExist
+		}
+		return err
+	}
+
+	// Mirror the new symlink into the metadata cache so it is instantly
+	// visible to LOOKUP/GETATTR/READDIR/handle-resolution — same pattern as
+	// Create's InsertToCache + synthetic inode + async SQLite write. We Lstat
+	// the freshly-created link (NOT Stat — Stat follows the link and a dangling
+	// target would ENOENT) to capture its real size/mtime; the Entry's Mode
+	// carries os.ModeSymlink so a cache-hit Lstat reports type=symlink and NFS
+	// clients then issue READLINK. Lstat failure is non-fatal: the link IS on
+	// FUSE, so fall back to a zero-size/now entry rather than failing the RPC.
+	now := time.Now()
+	var size int64
+	if fi, err := os.Lstat(fusePath); err == nil {
+		size = fi.Size()
+		now = fi.ModTime()
+	}
+	e := metadata.MakeEntry(link, false, size, now, jfs.handler.nextSyntheticInode())
+	e.Mode = (e.Mode &^ os.ModeType) | os.ModeSymlink
+	e.LocalOnly = true
+	jfs.handler.store.InsertToCache(e)
+	go jfs.handler.store.Insert(e)
+
+	jfs.handler.publishEvent(metadata.MetadataEvent{
+		Op: "create", Path: link, Mtime: now.Unix(), Inode: e.Inode,
+	})
+	return nil
+}
+
+// Readlink returns the verbatim target stored in the symlink at `link`,
+// serving the NFS READLINK procedure (internal/nfs/nfs_onreadlink.go). The
+// target is returned exactly as stored — relative or absolute — never
+// resolved. os.Readlink reports ENOENT/EINVAL, which onReadLink maps to the
+// correct NFS status.
+func (jfs *juiceFS) Readlink(link string) (string, error) {
+	link = strings.TrimPrefix(link, "/")
+	return os.Readlink(jfs.fullPath(link))
+}
 func (jfs *juiceFS) Chroot(p string) (billy.Filesystem, error) {
 	return nil, fmt.Errorf("not supported")
 }
