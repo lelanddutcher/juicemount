@@ -121,11 +121,18 @@ var (
 	// Captured at Start because cfg.MountPoint/DBPath/MetricsAddr are otherwise
 	// local to NFSServerStart; the /whoami handler needs them later. Read under
 	// globalMu like every other global in this block.
-	globalDBPath       string   // cfg.DBPath — metadata.db path + instance-id dir
-	globalMetricsAddr  string   // cfg.MetricsAddr — control-plane bind addr
-	globalVolumeName   string   // basename of the mount point
-	globalInstanceID   string   // stable per-install UUID (minted/persisted once)
-	globalCapabilities []string // capabilities DERIVED from this binary's routes
+	globalDBPath      string // cfg.DBPath — metadata.db path + instance-id dir
+	globalMetricsAddr string // cfg.MetricsAddr — control-plane bind addr
+	// globalFUSEMetricsAddr is the host:port the JuiceFS FUSE daemon binds its
+	// Prometheus /metrics to (health.FUSEManager.EffectiveMetricsAddr). The
+	// block-cache scraper (pin.BlockCacheBytes) reads juicefs_blockcache_bytes
+	// from here to report the true cache_used_bytes in /cache-status. Distinct
+	// from globalMetricsAddr (our own control plane) and from the :9567 sync
+	// metrics addr — see the loopback-port-collision note in health/fuse.go.
+	globalFUSEMetricsAddr string
+	globalVolumeName      string   // basename of the mount point
+	globalInstanceID      string   // stable per-install UUID (minted/persisted once)
+	globalCapabilities    []string // capabilities DERIVED from this binary's routes
 )
 
 // offlineEngageDelay is how long the backend must be CONTINUOUSLY unreachable
@@ -316,13 +323,19 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				ps.Close()
 			}
 			fm := health.NewFUSEManager(health.FUSEConfig{
-				RedisURL:       cfg.RedisURL,
-				MountPoint:     cfg.FUSEPath,
-				CacheSize:      cfg.CacheSize,
-				FreeSpaceRatio: "0.01",
-				BucketOverride: cfg.BucketOverride,
-				PinnedBytes:    pinnedBytes,
+				RedisURL:        cfg.RedisURL,
+				MountPoint:      cfg.FUSEPath,
+				CacheSize:       cfg.CacheSize,
+				FreeSpaceRatio:  "0.01",
+				BucketOverride:  cfg.BucketOverride,
+				PinnedBytes:     pinnedBytes,
+				FUSEMetricsAddr: health.DefaultFUSEMetricsAddr,
 			})
+			// Tell the block-cache scraper where the FUSE daemon's prometheus
+			// /metrics endpoint is so /cache-status can report the TRUE on-disk
+			// block-cache size (juicefs_blockcache_bytes) as cache_used_bytes.
+			globalFUSEMetricsAddr = fm.EffectiveMetricsAddr()
+			pin.SetBlockCacheMetricsAddr(globalFUSEMetricsAddr)
 			// Start the watchdog and register globalFUSE UNCONDITIONALLY —
 			// even if the initial mount fails (a transient backend blip at
 			// launch). Pre-2026-05-29 this returned before StartMonitor() on
@@ -2180,6 +2193,15 @@ type CacheStatus struct {
 	// the pinned set can't be kept fully resident; the UI shows a "free disk or
 	// unpin" banner with ShortfallBytes.
 	Capacity pin.CapacityVerdict `json:"capacity"`
+	// CacheUsedBytes (A2) is the TRUE on-disk block-cache size, exposed as an
+	// unambiguous top-level field so the app + OpenLoupe stop reporting the
+	// pinned-only Aggregate.CachedBytes as "cache used" (the long-standing
+	// metric bug: pinned files are a SUBSET of the real LRU block cache).
+	// Sourced from JuiceFS's authoritative juicefs_blockcache_bytes gauge
+	// (scraped from the FUSE daemon's prometheus /metrics), falling back to a
+	// du of the cache dir (Capacity.CacheUsageBytes) when the scrape is
+	// unavailable.
+	CacheUsedBytes int64 `json:"cache_used_bytes"`
 	// Scanning lists pin roots whose subtree is still being enumerated (R-2).
 	// The UI renders a "Scanning <folder>…" row until the real pinned root
 	// appears in Roots.
@@ -2200,6 +2222,16 @@ func NFSServerCacheStatus() *C.char {
 		return jsonStr(CacheStatus{OfflineMode: pin.IsOffline(), Roots: []pin.RootSummary{}, Scanning: []pin.ScanningRoot{}})
 	}
 	cs := CacheStatus{OfflineMode: pin.IsOffline(), Capacity: pin.Capacity(), Scanning: pin.ScanningRoots()}
+	// cache_used_bytes = the TRUE on-disk JuiceFS block-cache size. PREFER the
+	// authoritative juicefs_blockcache_bytes gauge scraped LAZILY (≤ once per
+	// ~2s, never per-RPC — NFS hot-path discipline) from the FUSE daemon's
+	// prometheus endpoint; FALL BACK to the existing cache-dir du
+	// (Capacity.CacheUsageBytes) when the scrape is unavailable (addr unknown,
+	// endpoint not yet up, transient miss). Nil/err-safe and non-blocking.
+	cs.CacheUsedBytes = cs.Capacity.CacheUsageBytes // fallback: cache-dir du
+	if bc, ok := pin.BlockCacheBytes(); ok {
+		cs.CacheUsedBytes = bc // authoritative block-cache gauge
+	}
 	if a, err := pinStore.AggregateStats(); err == nil {
 		cs.Aggregate = a
 	}

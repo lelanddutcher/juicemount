@@ -238,11 +238,19 @@ public enum NFSBridge {
         public var offline_mode: Bool = false
         public var capacity: CapacityVerdict = CapacityVerdict()
         public var scanning: [ScanningRoot] = []
+        /// TRUE on-disk JuiceFS block-cache size in bytes — the honest "cache
+        /// used" number. Sourced from the `juicefs_blockcache_bytes` gauge
+        /// (every block read but not necessarily pinned), NOT the pinned-only
+        /// `aggregate.CachedBytes`. Default 0 = null/absence-safe for an older
+        /// core that omits the field. Pair with `capacity.cache_capacity_bytes`
+        /// for the used-vs-capacity view. See CONSUMER_STATUS.md.
+        public var cache_used_bytes: Int64 = 0
 
         public init() {}
 
         private enum CodingKeys: String, CodingKey {
             case aggregate, roots, live, offline_mode, capacity, scanning
+            case cache_used_bytes
         }
 
         /// Null/absence-tolerant decode. ROOT CAUSE of the long-standing
@@ -268,6 +276,7 @@ public enum NFSBridge {
             self.offline_mode = try c.decodeIfPresent(Bool.self, forKey: .offline_mode) ?? false
             self.capacity = try c.decodeIfPresent(CapacityVerdict.self, forKey: .capacity) ?? CapacityVerdict()
             self.scanning = try c.decodeIfPresent([ScanningRoot].self, forKey: .scanning) ?? []
+            self.cache_used_bytes = try c.decodeIfPresent(Int64.self, forKey: .cache_used_bytes) ?? 0
         }
     }
 

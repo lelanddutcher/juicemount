@@ -25,6 +25,7 @@
     "workers": 4
   },
   "offline_mode": false,
+  "cache_used_bytes": 5200000000,
   "capacity": {
     "over_capacity": false,
     "pinned_bytes": 3400000000,

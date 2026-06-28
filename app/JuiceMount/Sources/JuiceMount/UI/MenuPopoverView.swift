@@ -1252,10 +1252,17 @@ struct MenuPopoverView: View {
     }
 
     private var cacheCounts: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        // This is the PINNED-RESIDENT readiness view: how much of the explicitly
+        // pinned set is downloaded (aggregate.CachedBytes) out of the pinned
+        // total (aggregate.TotalBytes). It is a SUBSET of the on-disk block
+        // cache — the honest total "cache used" is in the glance row above
+        // (cacheStatus.cache_used_bytes). Keep these two distinct so the pinned
+        // offline-readiness progress isn't confused with total cache footprint.
+        return VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text("\(cacheStatus.aggregate.TotalFiles) pinned")
+                Text("\(cacheStatus.aggregate.TotalFiles) pinned resident")
                     .font(.caption.monospaced())
+                    .help("How much of the explicitly pinned set is downloaded and ready offline. This is a subset of the total cache used shown above.")
                 Spacer()
                 // Show the live download rate next to the byte counter
                 // while a pin is draining. Only when PendingFiles > 0
@@ -1475,14 +1482,19 @@ struct MenuPopoverView: View {
         }
     }
 
-    /// (b) "X cached · Y GB free" + a thin proportional bar of cached vs
-    /// free disk. Cached = pinned bytes actually resident (the number the
-    /// cache section details below); free = statfs free on the cache disk.
+    /// (b) "X cached · Y GB free" + a thin proportional bar of cache used vs
+    /// cache capacity. Cached = the TRUE on-disk JuiceFS block cache
+    /// (`cache_used_bytes`, every block read — not just pinned); the bar is
+    /// used-vs-capacity (`capacity.cache_capacity_bytes`, the honest pairing).
+    /// The pinned-resident readiness number lives in the cache section's
+    /// "pinned" line below.
     private var cacheGlanceRow: some View {
-        let cachedBytes = max(0, cacheStatus.aggregate.CachedBytes)
-        let freeBytes = Int64(max(0, diskFreeGB) * 1e9)
-        let total = Double(cachedBytes + freeBytes)
-        let fraction = total > 0 ? Double(cachedBytes) / total : 0
+        // Block-cache used vs the cache's sustainable capacity (the honest
+        // pairing). Fall back to disk free for the "GB free" label when the
+        // capacity verdict hasn't computed yet.
+        let cachedBytes = max(0, cacheStatus.cache_used_bytes)
+        let capacityBytes = max(0, cacheStatus.capacity.cache_capacity_bytes)
+        let fraction = capacityBytes > 0 ? Double(cachedBytes) / Double(capacityBytes) : 0
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
                 Image(systemName: "internaldrive")

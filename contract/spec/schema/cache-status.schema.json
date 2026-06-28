@@ -31,6 +31,12 @@
       "description": "Live prefetcher state (pin.LiveStats). Zero-valued when prefetcher is nil."
     },
     "offline_mode": { "type": "boolean" },
+    "cache_used_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "TRUE total on-disk JuiceFS block-cache size in bytes — the honest 'cache used' number. Sourced from the juicefs_blockcache_bytes gauge (every block read, NOT only pinned), falling back to a du of the cache dir when the gauge is unavailable. This is a SUPERSET of aggregate.cached_bytes (which is pinned-resident only). Consumers should display this as 'cache used' (pair with capacity.cache_capacity_bytes), and treat aggregate.cached_bytes/total_bytes strictly as the pinned-resident readiness fraction. ADDITIVE/optional: an older core omits this field (decode as 0); no contract_version bump.",
+      "$comment": "Optional (not in required) so a pre-fix core that omits it still validates."
+    },
     "capacity": {
       "type": "object",
       "additionalProperties": false,

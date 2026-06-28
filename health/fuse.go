@@ -105,7 +105,31 @@ type FUSEConfig struct {
 	// Passed as the `--bucket` flag on `juicefs mount`, which wins over
 	// the Redis-stored URL.
 	BucketOverride string
+
+	// FUSEMetricsAddr is the host:port the JuiceFS mount daemon binds its
+	// Prometheus /metrics endpoint to, passed explicitly as `--metrics`. The
+	// bridge scrapes `juicefs_blockcache_bytes` from this endpoint to report
+	// the TRUE on-disk block-cache size as `cache_used_bytes` in /cache-status
+	// (replacing the pinned-only aggregate + the racy cache-dir du).
+	//
+	// Why explicit, and why NOT :9567: JuiceFS defaults the mount metrics to
+	// 127.0.0.1:9567, but the `juicefs sync`/manager path (internal/manager/
+	// sync.go) ALSO pins :9567. Relying on the mount's default would collide
+	// with a concurrent sync's metrics listener (the documented loopback-port
+	// collision). We bind the mount to a distinct default of 127.0.0.1:9568.
+	//
+	// Empty = pass nothing; JuiceFS falls back to its own :9567 default. The
+	// bridge only scrapes the addr it knows about, so an empty value just
+	// means cache_used_bytes uses the dir-walk fallback.
+	FUSEMetricsAddr string
 }
+
+// DefaultFUSEMetricsAddr is the loopback host:port the FUSE mount daemon binds
+// its Prometheus metrics to when FUSEConfig.FUSEMetricsAddr is empty. It is
+// deliberately :9568 — distinct from the `juicefs sync` path's :9567 — to avoid
+// the documented loopback-port collision between a running mount and a
+// concurrent sync.
+const DefaultFUSEMetricsAddr = "127.0.0.1:9568"
 
 // FUSEManager manages the JuiceFS FUSE mount lifecycle.
 type FUSEManager struct {
@@ -121,6 +145,17 @@ type FUSEManager struct {
 // the effective value rather than the user's original input.
 func (fm *FUSEManager) EffectiveCacheSize() string {
 	return fm.cfg.CacheSize
+}
+
+// EffectiveMetricsAddr returns the host:port the FUSE daemon's Prometheus
+// metrics endpoint is bound to (the value passed as `--metrics`), filling in
+// DefaultFUSEMetricsAddr when the config left it empty. The bridge uses this to
+// tell the block-cache scraper where to find juicefs_blockcache_bytes.
+func (fm *FUSEManager) EffectiveMetricsAddr() string {
+	if fm.cfg.FUSEMetricsAddr != "" {
+		return fm.cfg.FUSEMetricsAddr
+	}
+	return DefaultFUSEMetricsAddr
 }
 
 // lastNonEmptyLine returns the last non-blank line of s, trimmed. juicefs
@@ -305,6 +340,16 @@ func (fm *FUSEManager) Mount() error {
 		"--prefetch", strconv.Itoa(jfp.Prefetch),
 		"-o", "nobrowse", // hide from Finder (MNT_DONTBROWSE flag)
 	)
+	// Bind the Prometheus metrics endpoint EXPLICITLY so the bridge can scrape
+	// `juicefs_blockcache_bytes` (the true on-disk block-cache size) for the
+	// cache_used_bytes field. We do NOT rely on JuiceFS's :9567 default — that
+	// collides with the `juicefs sync`/manager metrics addr (the documented
+	// loopback-port collision); DefaultFUSEMetricsAddr is :9568. See FUSEConfig.
+	metricsAddr := fm.cfg.FUSEMetricsAddr
+	if metricsAddr == "" {
+		metricsAddr = DefaultFUSEMetricsAddr
+	}
+	args = append(args, "--metrics", metricsAddr)
 	// DATA-LOSS FIX (2026-06-13): --writeback is DISABLED by default.
 	//
 	// With --writeback, a close/fsync on a FUSE file returns once the bytes are
