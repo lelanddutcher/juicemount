@@ -664,6 +664,44 @@ func decodeInodeAttr(attr []byte) (mtime int64, size int64, ok bool) {
 	return mtime, size, true
 }
 
+// JuiceFS directory-entry file-type bytes (the first byte of the 9-byte dir
+// HASH value; see decodeDirChild). These mirror the upstream meta encoding.
+const (
+	jfsTypeFile    byte = 1 // regular file
+	jfsTypeDir     byte = 2 // directory
+	jfsTypeSymlink byte = 3 // symbolic link
+)
+
+// modeForFiletype maps a JuiceFS dir-entry filetype byte to the cache Entry's
+// (fs.FileMode, isDir) pair. This is the SINGLE SOURCE OF TRUTH for the
+// type→mode classification shared by EVERY decode/sync site (the full Lua SCAN
+// in redis.go, this file's live keyspace dir-resync, and the per-key
+// MetadataEvent applyEvent path) so a backend-resident symlink (ft==3) is never
+// silently collapsed to a 0644 regular file.
+//
+// ft==2 (dir)     → 0755 | ModeDir, isDir=true   (the existing precedent)
+// ft==3 (symlink) → 0644-perm + os.ModeSymlink, isDir=false — the type bit is
+//
+//	set the SAME way the Create/Symlink write path does
+//	(mode = (mode &^ os.ModeType) | os.ModeSymlink) so it
+//	survives the uint32(mode) SQLite round-trip (ModeSymlink
+//	is 1<<27) and a cache-hit Lstat reports type=symlink, which
+//	makes NFS clients issue READLINK.
+//
+// any other (incl. ft==1 file) → 0644 regular, isDir=false.
+func modeForFiletype(ft byte) (mode fs.FileMode, isDir bool) {
+	switch ft {
+	case jfsTypeDir:
+		return 0755 | fs.ModeDir, true
+	case jfsTypeSymlink:
+		// Preserve perm bits, set ONLY the symlink type bit — identical to the
+		// write-side juiceFS.Symlink mapping in nfs/handler.go.
+		return (fs.FileMode(0644) &^ os.ModeType) | os.ModeSymlink, false
+	default:
+		return 0644, false
+	}
+}
+
 // ----------------------------------------------------------------------------
 // reconcileDir: single-dir incremental reconcile (NO scan).
 // ----------------------------------------------------------------------------
@@ -728,11 +766,12 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 		}
 		freshNames[name] = struct{}{}
 
-		isDir := ft == 2
-		var mode fs.FileMode = 0644
-		if isDir {
-			mode = 0755 | fs.ModeDir
-		}
+		// Classify via the shared single-source-of-truth mapper so ft==3
+		// (symlink) maps to os.ModeSymlink instead of collapsing to 0644 — a
+		// backend-resident symlink synced through this live dir-resync stays a
+		// symlink (NFS then issues READLINK) rather than degrading to a regular
+		// file. ft==2 still → ModeDir, ft==1/other → regular.
+		mode, isDir := modeForFiletype(ft)
 
 		// Child path: parentPath + "/" + name, mirroring syncMetadata. For the
 		// tree root (parentPath==""), the child path is just the name.

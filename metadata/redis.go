@@ -55,6 +55,16 @@ type MetadataEvent struct {
 	Inode uint64 `json:"inode,omitempty"`
 	IsDir bool   `json:"is_dir,omitempty"`
 
+	// IsSymlink is the per-event symlink discriminator. The live event path
+	// only carried IsDir, so a create/update event for a SYMLINK was re-derived
+	// as a 0644 regular file in applyEvent — downgrading the locally-minted
+	// ModeSymlink cache Entry (juiceFS.Symlink) the moment the self-write
+	// pub/sub (or a peer's event) replayed it. Carrying the type explicitly
+	// keeps applyEvent's Entry as ModeSymlink, mirroring the ft==3 case the
+	// SCAN/dir-resync decoders now handle. Additive + omitempty: older
+	// publishers that never set it decode as false (regular/dir), unchanged.
+	IsSymlink bool `json:"is_symlink,omitempty"`
+
 	// For rename operations
 	OldPath string `json:"old_path,omitempty"`
 }
@@ -697,9 +707,19 @@ func (rc *RedisClient) runSubscribe() {
 // Updates the in-memory cache immediately (never blocked), then writes to
 // SQLite with retry (may be briefly blocked by BulkInsert transactions).
 func (rc *RedisClient) applyEvent(evt MetadataEvent) {
+	// Classify mode from the event's type discriminators. IsSymlink takes
+	// precedence so a create/update/rename of a symlink keeps os.ModeSymlink
+	// (and never downgrades the locally-minted ModeSymlink cache Entry) instead
+	// of collapsing to a 0644 regular file. Mirrors the ft==3 → ModeSymlink
+	// mapping the SCAN/dir-resync decoders use (modeForFiletype).
 	var mode fs.FileMode = 0644
-	if evt.IsDir {
+	switch {
+	case evt.IsDir:
 		mode = 0755 | fs.ModeDir
+	case evt.IsSymlink:
+		// Preserve perm bits, set ONLY the symlink type bit — identical to the
+		// write-side juiceFS.Symlink mapping and modeForFiletype's ft==3 case.
+		mode = (mode &^ os.ModeType) | os.ModeSymlink
 	}
 
 	switch evt.Op {
@@ -1297,16 +1317,17 @@ func (rc *RedisClient) syncMetadata() error {
 		}
 		entryPath := strings.Join(parts, "/")
 
-		isDir := e.ft == 2
 		var mtime time.Time
 		if e.mtime > 0 {
 			mtime = time.Unix(e.mtime, 0)
 		}
 
-		var mode fs.FileMode = 0644
-		if isDir {
-			mode = 0755 | fs.ModeDir
-		}
+		// Classify via the shared single-source-of-truth mapper (keyspace.go)
+		// so the full SCAN decodes ft==3 (symlink) as os.ModeSymlink, not a
+		// 0644 regular file. Without this, a reconcile of a dir containing a
+		// symlink would UPSERT a regular-file Entry over the locally-minted
+		// ModeSymlink cache entry and silently degrade it. ft==2 still → ModeDir.
+		mode, isDir := modeForFiletype(byte(e.ft))
 
 		redisEntries = append(redisEntries, &Entry{
 			Path:       entryPath,

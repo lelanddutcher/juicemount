@@ -1406,6 +1406,31 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 		return e.FileInfo(), nil
 	}
 
+	// Cache miss. Stat (the fall-through below) uses os.Stat, which FOLLOWS a
+	// symlink — so an evicted (or backend-resident-but-uncached) symlink would
+	// mis-report as its target's type, or ENOENT if the target is dangling, and
+	// the client would never issue READLINK. Lstat must NOT follow. Do a single
+	// no-follow probe (lstatWithTimeout → os.Lstat, the same no-follow helper
+	// the phantom-purge gate uses) and, ONLY if the path is a symlink, mint a
+	// ModeSymlink entry. Regular files and dirs — and a wedge/ENOENT — fall
+	// through to Stat unchanged, so the regular-file hot path is untouched.
+	fusePath := jfs.fullPath(filename)
+	if fi, ok := lstatWithTimeout(fusePath, fuseStatTimeout); ok && fi != nil && fi.Mode()&os.ModeSymlink != 0 {
+		var inode uint64
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Ino != 0 {
+			inode = st.Ino
+		} else {
+			inode = jfs.handler.nextSyntheticInode()
+		}
+		entry := metadata.MakeEntry(filename, false, fi.Size(), fi.ModTime(), inode)
+		entry.Mode = (entry.Mode &^ os.ModeType) | os.ModeSymlink
+		// Seed the cache so the next GETATTR is a cache hit (and READLINK
+		// resolves the link the client now knows is a symlink).
+		jfs.handler.store.InsertToCache(entry)
+		go jfs.handler.store.Insert(entry)
+		return entry.FileInfo(), nil
+	}
+
 	return jfs.Stat(filename)
 }
 
@@ -2154,6 +2179,10 @@ func (jfs *juiceFS) Symlink(target, link string) error {
 
 	jfs.handler.publishEvent(metadata.MetadataEvent{
 		Op: "create", Path: link, Mtime: now.Unix(), Inode: e.Inode,
+		// Carry the symlink type so a subscriber (self-write pub/sub or a peer
+		// JuiceMount) re-applies this event as ModeSymlink, not a 0644 regular
+		// file — otherwise applyEvent would downgrade the link we just minted.
+		IsSymlink: true,
 	})
 	return nil
 }
