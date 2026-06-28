@@ -130,6 +130,31 @@ type RedisClient struct {
 	mountPoint string
 	fuseRoot   string
 
+	// spoolPending (QA-30 Layer D, NFSv3 sprint) reports whether a store path
+	// has a LIVE write-spool entry that has not yet drain-succeeded — i.e. the
+	// user just created the file and it is still on local SSD, NOT yet in
+	// Redis/FUSE. scopedPrune (and syncMetadata's full-SCAN prune) use it to
+	// spare such paths: they are absent from the fresh Redis name set (not
+	// drained) AND absent from FUSE (only on the spool), so Layer A (FUSE Lstat)
+	// and Layer C (pin) both MISS them — and pruning would Forget their
+	// path-stable Track-B NFS handle, surfacing ESTALE mid-copy (live build-438
+	// error 100070).
+	//
+	// Injected (not imported) to avoid a metadata→nfs import cycle: the bridge
+	// wires it via SetSpoolGuard to nfs.SpoolStore.HasPending after both the
+	// SpoolStore and this RedisClient exist.
+	//
+	// CONCURRENCY (review FIX 1): production wiring order is rc.Start() (which
+	// launches the reconcile goroutine) BEFORE SetSpoolGuard — the spool is
+	// created much later than Start, so the guard is installed while the
+	// reconcile goroutine may already be reading it. Storing it in a plain field
+	// would be a data race (write in SetSpoolGuard vs. read in
+	// scopedPrune/syncMetadata). It is therefore held in an atomic.Pointer to a
+	// named func type: SetSpoolGuard Stores, and the reconcile path Loads via
+	// loadSpoolGuard. nil pointer = no spool configured = the pre-spool no-op
+	// (default).
+	spoolPending atomic.Pointer[spoolGuardFunc]
+
 	// Test seams for the keyspace-push path. Production leaves these nil and
 	// the real methods run. Tests set them to observe coalescer behavior
 	// (which dirs got reconciled, how many full-SCAN promotions) without a
@@ -166,6 +191,47 @@ func (rc *RedisClient) keyspaceTriggerSync() {
 func (rc *RedisClient) SetPathConfig(mountPoint, fuseRoot string) {
 	rc.mountPoint = strings.TrimRight(mountPoint, "/")
 	rc.fuseRoot = strings.TrimRight(fuseRoot, "/")
+}
+
+// spoolGuardFunc is the type of the QA-30 Layer D write-spool membership probe.
+// Named (rather than an inline func type) so it can be stored in an
+// atomic.Pointer — sync/atomic needs a concrete named type.
+type spoolGuardFunc func(volRelPath string) bool
+
+// SetSpoolGuard wires the write-spool membership probe used by QA-30 Layer D
+// in scopedPrune AND syncMetadata's full-SCAN prune (see the spoolPending
+// field). fn(volRelPath) must return true while volRelPath has a live,
+// not-yet-drained spool entry — production passes nfs.SpoolStore.HasPending.
+// Keyed in the store/JuiceFS-internal path scheme (no leading slash, no mount
+// prefix), which is exactly a prune candidate's Entry.Path, so no conversion is
+// needed at the call site.
+//
+// Injected rather than imported to keep metadata free of an nfs dependency
+// (metadata must NOT import nfs — the cycle). Nil-safe: passing nil restores
+// the pre-spool no-op (the prune spares nothing extra).
+//
+// CONCURRENCY (review FIX 1): stored atomically. Production calls this AFTER
+// rc.Start (the spool is created long after Start), so the reconcile goroutine
+// may already be reading the guard via loadSpoolGuard when this Stores it. The
+// atomic store/load pair makes that race-clean regardless of wiring order.
+func (rc *RedisClient) SetSpoolGuard(fn func(volRelPath string) bool) {
+	if fn == nil {
+		rc.spoolPending.Store(nil)
+		return
+	}
+	gf := spoolGuardFunc(fn)
+	rc.spoolPending.Store(&gf)
+}
+
+// loadSpoolGuard atomically loads the QA-30 Layer D guard installed by
+// SetSpoolGuard. Returns nil when no spool is configured (the pre-spool no-op).
+// This is the race-clean accessor the reconcile goroutine MUST use to read the
+// guard (review FIX 1) — never read rc.spoolPending as a plain field.
+func (rc *RedisClient) loadSpoolGuard() spoolGuardFunc {
+	if p := rc.spoolPending.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // SetReconcileInterval overrides the periodic reconcile cadence (LB-4:
@@ -1348,6 +1414,23 @@ func (rc *RedisClient) syncMetadata() error {
 		}
 	}
 
+	// === QA-30 Layer D (review FIX 2): never prune a spool-pending path ===
+	// The periodic full-SCAN prune is the SAME ESTALE bug class as scopedPrune,
+	// reached via the backstop SCAN instead of a keyspace push. A spool-pending
+	// file is absent from Redis (not yet drained) AND absent from FUSE (only on
+	// the spool), so Layer A (FUSE Lstat) returns isAbsent=true and does NOT
+	// spare it, and Layer C (pin) misses it. A large file draining at ~5 MB/s
+	// can stay absent for >= PruneThreshold (10) SCAN cycles → pruned →
+	// handles.Forget → identical ESTALE/100070 mid-copy. Filter the guard FIRST
+	// (before pin/FUSE) because the index probe is an O(1) in-memory lookup,
+	// cheaper than a FUSE round-trip — symmetric with scopedPrune's filter (same
+	// shared helper). Uses the race-clean accessor (review FIX 1).
+	toDelete, prunedSpoolPending := rc.filterSpoolPending(toDelete)
+	if prunedSpoolPending > 0 {
+		jmlog.Info("metadata sync: spared spool-pending paths (Layer D)",
+			"count", prunedSpoolPending)
+	}
+
 	// QA-30 (2026-05-25): two-layer protection against pruning still-valid
 	// files. Layer C (pin guard) runs first because it's authoritative:
 	// pinning is the user's explicit contract that the file remain offline-
@@ -1457,6 +1540,7 @@ func (rc *RedisClient) syncMetadata() error {
 		"pruned", len(toDelete),
 		"pinned_skipped", prunedPinned, // QA-30 Layer C: pinned paths spared
 		"fuse_present_skipped", prunedFUSEpresent, // QA-30 Layer A: FUSE-confirmed present
+		"spool_pending_skipped", prunedSpoolPending, // QA-30 Layer D: spool-pending paths spared
 		"pending_prune", pendingPrune,
 		"duration_ms", duration.Round(time.Millisecond).Milliseconds(),
 	)

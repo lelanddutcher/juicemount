@@ -830,6 +830,32 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		return
 	}
 
+	// === QA-30 Layer D: never prune a spool-pending path ===
+	// A path with a LIVE write-spool entry was just created by the user and is
+	// still draining from local SSD — it is DEFINITIVELY live-and-local. It is
+	// absent from the fresh Redis name set (not yet drained) and absent from
+	// FUSE (only on the spool), so Layers A and C below both MISS it; pruning it
+	// would Forget its path-stable Track-B NFS handle and surface ESTALE
+	// mid-copy (live build-438 error 100070). Applied FIRST (before the per-path
+	// FUSE Lstat) because the index probe is an O(1) in-memory lookup — far
+	// cheaper than a FUSE round-trip — and spares the candidate before any
+	// expensive verification. Candidate paths are store/JuiceFS-internal
+	// (Entry.Path), the exact scheme the spool keys its index by (Create passes
+	// the same string to store.MakeEntry and OpenWrite), so no conversion is
+	// needed. The final toDelete set is re-filtered below to also spare any
+	// spool-pending DESCENDANT of a (wrongly) candidate directory.
+	{
+		var spared int
+		candidates, spared = rc.filterSpoolPending(candidates)
+		if spared > 0 {
+			jmlog.Info("metadata keyspace push: scoped prune: spared spool-pending",
+				"count", spared, "parent", parentPath)
+		}
+		if len(candidates) == 0 {
+			return
+		}
+	}
+
 	// === QA-30 Layer C: never prune pinned paths ===
 	pinned, perr := rc.store.pinnedSetPublic()
 	if perr != nil {
@@ -898,12 +924,62 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		toDelete = append(toDelete, rc.collectSubtree(p)...)
 	}
 
+	// === QA-30 Layer D (subtree pass): re-filter the FINAL toDelete set ===
+	// collectSubtree expanded each candidate DIRECTORY to its descendants. A
+	// spool-pending FILE can live inside a candidate dir (e.g. the dir's Redis
+	// entry vanished but a child is still draining from the spool), and the
+	// candidate-root filter above only vetted the roots. Filtering the whole
+	// toDelete set here guarantees no spool-pending descendant is deleted /
+	// handle-Forgotten, while still pruning the genuinely-gone siblings around
+	// it (Layer D is targeted, never a blanket prune-disable).
+	{
+		var spared int
+		toDelete, spared = rc.filterSpoolPending(toDelete)
+		if spared > 0 {
+			jmlog.Info("metadata keyspace push: scoped prune: spared spool-pending (subtree)",
+				"count", spared, "parent", parentPath)
+		}
+		if len(toDelete) == 0 {
+			return
+		}
+	}
+
 	if err := rc.store.DeletePaths(toDelete); err != nil {
 		jmlog.Warn("metadata keyspace push: scoped prune delete", "parent", parentPath, "error", err.Error())
 		return
 	}
 	jmlog.Info("metadata keyspace push: scoped prune",
 		"parent", parentPath, "removed_roots", len(candidates), "removed_total", len(toDelete))
+}
+
+// filterSpoolPending applies QA-30 Layer D to a prune candidate set: it removes
+// every path that the injected spool guard reports as live-and-local (a
+// not-yet-drained write-spool entry). Returns the kept paths (in place, reusing
+// the backing array) and the count spared. When no guard is wired (nil) it is a
+// no-op returning paths unchanged. The guard is loaded via the race-clean
+// accessor (review FIX 1), so this is safe to call from the reconcile goroutine
+// while SetSpoolGuard concurrently installs the guard.
+//
+// Shared by BOTH prune paths so the spool-pending spare is symmetric:
+// scopedPrune (keyspace push) and syncMetadata (periodic full-SCAN backstop,
+// review FIX 2). A spool-pending path is absent from Redis (not yet drained)
+// AND absent from FUSE (only on the spool), so Layers A (FUSE Lstat) and C
+// (pin) both MISS it; pruning it would Forget its path-stable Track-B NFS
+// handle and surface ESTALE mid-copy (live build-438 error 100070).
+func (rc *RedisClient) filterSpoolPending(paths []string) (kept []string, spared int) {
+	guard := rc.loadSpoolGuard()
+	if guard == nil || len(paths) == 0 {
+		return paths, 0
+	}
+	kept = paths[:0]
+	for _, p := range paths {
+		if guard(p) {
+			spared++
+			continue
+		}
+		kept = append(kept, p)
+	}
+	return kept, spared
 }
 
 // collectSubtree returns every store path strictly below `root` (its

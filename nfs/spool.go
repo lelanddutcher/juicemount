@@ -486,6 +486,67 @@ func (s *SpoolStore) LookupActive(nfsPath string) (*SpoolEntry, bool) {
 	return s.index.Lookup(nfsPath)
 }
 
+// HasPending reports whether volRelPath has a live spool entry that has not
+// yet drain-succeeded — i.e. the file was just created/written here and is
+// still on local SSD, NOT yet in MinIO/Redis/FUSE. True from juiceFS.Create's
+// OpenWrite (s.index.Insert) until the entry is evicted: drain success
+// (MarkDrainComplete), delete (CancelForDelete), corruption (QuarantineDrain),
+// or rename (Index.Move re-keys it under the new path). Those eviction points
+// are exactly the moments the path stops being "live-and-local", so an O(1)
+// index membership probe is the precise spool-pending signal.
+//
+// QA-30 Layer D (NFSv3 sprint): the metadata reconcile's scopedPrune calls
+// this (via the injected spoolPending guard on RedisClient) to NEVER prune a
+// spool-pending path. Such a path is absent from Redis (not yet drained) and
+// absent from FUSE (only on the spool), so the existing Layer A FUSE-Lstat and
+// Layer C pin guards both MISS it — leaving the wrong prune to Forget the
+// kernel's path-stable (Track B) handle and surface ESTALE mid-copy (live
+// build-438 error 100070, a 4596-burst of "FromHandle STALE").
+//
+// volRelPath MUST be keyed exactly as OpenWrite keys the index: the NFS
+// filename with no leading slash and no mount prefix (the JuiceFS-internal /
+// store path scheme — Create passes the same string to both store.MakeEntry
+// and OpenWrite, so a scopedPrune candidate's store path is already this key).
+//
+// Lock discipline: this takes ONLY the SpoolIndex RWMutex (a quick independent
+// RLock via Index.Lookup) — it never touches s.mu, e.mu, or any path shard, so
+// there is no lock-ordering hazard with the spool's other locks. It is a
+// reconcile-path call (scopedPrune), kept off the NFS GETATTR/LOOKUP and
+// ToHandle/FromHandle hot paths per the QA-35 perf-discipline gate.
+func (s *SpoolStore) HasPending(volRelPath string) bool {
+	if s == nil || s.index == nil {
+		return false
+	}
+	_, ok := s.index.Lookup(volRelPath)
+	return ok
+}
+
+// EvictIndex removes the in-memory index entry for nfsPath, but ONLY if the
+// currently-indexed entry's row id matches `id` (identity-checked, mirroring
+// QuarantineDrain's eviction). A non-matching slot means a newer writer rotated
+// in a fresh entry for the same path; we must not stomp it.
+//
+// Review FIX 3: the drainer's terminal failPermanent path uses this so a
+// permanently-failed drain stops reporting HasPending==true forever. Without
+// it, the dead entry lingers in the index for the process lifetime (the boot
+// scrubber does NOT repopulate the index for failed rows), so QA-30 Layer D
+// would treat that path as perpetually spool-pending — making it un-prunable
+// even after the user deletes it, leaving a stale store entry + NFS handle that
+// can never be cleaned up until restart.
+//
+// Lock discipline matches HasPending: only the SpoolIndex RWMutex is touched
+// (via Lookup + DeleteIfMatches), no s.mu / e.mu / path shard, so there is no
+// lock-ordering hazard. Returns true if an entry was actually evicted.
+func (s *SpoolStore) EvictIndex(nfsPath string, id int64) bool {
+	if s == nil || s.index == nil {
+		return false
+	}
+	if e, ok := s.index.Lookup(nfsPath); ok && e.ID() == id {
+		return s.index.DeleteIfMatches(nfsPath, e)
+	}
+	return false
+}
+
 // Meta returns the underlying SQLite-backed index. Used by the drainer
 // (slice B) which lives below the in-memory index abstraction.
 func (s *SpoolStore) Meta() *metadata.SpoolStore { return s.meta }

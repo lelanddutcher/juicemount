@@ -749,6 +749,15 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					globalSpool = spool
 					globalDrainer = drainer
 					srv.Handler().SetSpool(spool, drainer)
+					// QA-30 Layer D: let the reconcile's scopedPrune spare any
+					// path with a live, not-yet-drained spool entry so a
+					// spool-pending file (absent from Redis AND FUSE) is never
+					// pruned mid-copy — which would Forget its Track-B NFS handle
+					// and surface ESTALE (build-438 error 100070). Must precede
+					// rc.Start's reconcile goroutine, which already launched
+					// above; safe because no prune can fire before the first
+					// keyspace/SCAN reconcile and the spool index is live now.
+					rc.SetSpoolGuard(spool.HasPending)
 					drainer.Start()
 					used, total := spool.Capacity()
 					jmlog.Info("spool ready",

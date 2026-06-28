@@ -667,6 +667,15 @@ func (d *Drainer) failPermanent(row *metadata.SpoolRow, reason string) {
 	if transitioned {
 		d.spool.releaseCapacity(row.Size)
 	}
+	// Review FIX 3: evict the in-memory index entry, identity-checked on the
+	// row id (mirroring QuarantineDrain). A permanently-failed drain is one of
+	// the entry's eviction points — without this, HasPending(nfsPath) would
+	// keep returning true for the process lifetime (the boot scrubber does not
+	// repopulate the index for failed rows), so QA-30 Layer D would treat the
+	// path as perpetually spool-pending and refuse to ever prune it — even
+	// after the user deletes it. The identity check makes a no-op safe if a
+	// newer writer (rename-requeue / re-open) already rotated in a fresh entry.
+	d.spool.EvictIndex(row.NFSPath, row.ID)
 	d.metrics.DrainsFailed.Add(1)
 }
 

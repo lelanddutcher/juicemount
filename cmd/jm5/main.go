@@ -257,6 +257,11 @@ func main() {
 					}
 
 					srv.Handler().SetSpool(ss, dr)
+					// QA-30 Layer D: scopedPrune spares paths with a live,
+					// not-yet-drained spool entry (absent from Redis AND FUSE)
+					// so an in-flight spool file is never pruned mid-copy and its
+					// Track-B NFS handle never Forgotten (build-438 error 100070).
+					rc.SetSpoolGuard(ss.HasPending)
 					dr.Start()
 					spoolStore = ss
 					drainer = dr
