@@ -155,6 +155,17 @@ var nfsLstatGate = make(chan struct{}, 24)
 // the foreground hot-path FUSE budget.
 var prefetchGate = make(chan struct{}, 2)
 
+// fuseFstatGate caps concurrent LiveSize fstats (task #65 read-during-drain
+// fix). SEPARATE from nfsLstatGate for the same reason as prefetchGate: under a
+// drain burst, many NFS reads hit their last (partial) chunk simultaneously and
+// each calls LiveSize -> an fstat of the open FUSE fd. Sharing the 24-slot
+// foreground gate would let those fstats starve genuine cache-miss metadata RPCs
+// (the prefetchGate class of bug). An fstat of an OPEN fd (FGETATTR) returns in
+// microseconds on a healthy daemon, so a small budget (8) is ample throughput
+// while never touching the foreground hot-path FUSE budget. See QA-35 /
+// feedback_perf_hot_path.
+var fuseFstatGate = make(chan struct{}, 8)
+
 // errFUSETimeout is returned by the bounded FUSE helpers when a JuiceFS
 // syscall doesn't complete within its deadline (the mount is wedged/slow).
 // It is the shared nfslib.ErrFUSETimeout sentinel so the RPC boundary
@@ -584,6 +595,11 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		// FUSE yet. Without this, Stat reports the Create-time size 0 until
 		// the next Redis reconcile.
 		drainer.SetOnDrainComplete(h.onSpoolDrained)
+		// task #65: publish the authoritative drained size into the metadata store
+		// BEFORE the spool index entry is evicted (see Drainer.onSizeReady), closing
+		// the eviction-before-publish window that made fresh reads of a just-drained
+		// file clamp to a stale 0/partial size during an offline->online drain burst.
+		drainer.SetOnSizeReady(h.publishDrainedSize)
 		// Post-materialize hook: once a deferred offline symlink is os.Symlink'd
 		// onto FUSE at reconnect, clear its LocalOnly flag — it's now a real
 		// backend entry, so the reconcile prune must treat it like any other
@@ -615,6 +631,21 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 			}
 		}
 		h.spoolSweeperStop = spool.StartSweeper(idle, 0)
+	}
+}
+
+// publishDrainedSize syncs the real drained size into the metadata cache. It
+// runs BEFORE the spool index entry is evicted (task #65) so no fresh read can
+// snapshot a stale 0/partial Entry.Size in the post-eviction window. UpdateSize
+// is MAX-only and idempotent, so the later onSpoolDrained UpdateSize is a no-op
+// on size (kept there for crash-safety if onSizeReady is ever unwired). On a
+// cancelled drain the entry is already deleted, so UpdateSize (pure UPDATE)
+// no-ops — no resurrection.
+func (h *JuiceMountHandler) publishDrainedSize(nfsPath string, size int64) {
+	if size > 0 {
+		if err := h.store.UpdateSize(nfsPath, size, time.Now()); err != nil {
+			jmlog.Warn("publishDrainedSize: UpdateSize failed (will heal on reconcile)", "path", nfsPath, "error", err.Error())
+		}
 	}
 }
 
@@ -2773,6 +2804,48 @@ func (f *cachedFile) CachedInfo() os.FileInfo {
 	return f.cachedInfo
 }
 
+// LiveSize fstats the open FUSE fd for the file's CURRENT size. The backend
+// always holds the complete file once drained, so this is AUTHORITATIVE —
+// unlike the open-time cachedInfo snapshot or the metadata-mirror size, which
+// can lag stale-LOW during an offline->online drain burst (task #65) and
+// truncate reads. Bounded against a FUSE wedge exactly like statWithTimeout
+// (acquire fuseFstatGate or time out; run the fstat on a goroutine that releases
+// the gate only after it returns); ok=false on timeout/error so onRead falls
+// back to fs.Stat. onRead only consults this on the short-snapshot slow path,
+// so the QA-31 syscall-free cached-read fast path is unaffected.
+func (f *cachedFile) LiveSize() (int64, bool) {
+	if f.fuseFD == nil {
+		return 0, false
+	}
+	timer := time.NewTimer(fuseStatTimeout)
+	defer timer.Stop()
+	select {
+	case fuseFstatGate <- struct{}{}:
+	case <-timer.C:
+		return 0, false
+	}
+	type result struct {
+		sz int64
+		ok bool
+	}
+	ch := make(chan result, 1)
+	go func() {
+		fi, err := f.fuseFD.Stat()
+		if err != nil {
+			ch <- result{0, false}
+		} else {
+			ch <- result{fi.Size(), true}
+		}
+		<-fuseFstatGate // release only after Stat actually returns
+	}()
+	select {
+	case r := <-ch:
+		return r.sz, r.ok
+	case <-timer.C:
+		return 0, false
+	}
+}
+
 func (f *cachedFile) Name() string { return f.name }
 
 // cacheReaderServeEnabled gates the Priority-2 direct-SSD-cache serving read.
@@ -3165,6 +3238,42 @@ func (f *billyFile) Read(p []byte) (int, error) {
 		return 0, pin.ErrOfflineNotAvailable
 	}
 	return f.File.Read(p)
+}
+
+// LiveSize fstats the embedded FUSE fd for the authoritative current size (see
+// cachedFile.LiveSize, task #65 — the metadata mirror can lag stale-low during
+// an offline->online drain burst and truncate reads). Bounded against a wedge.
+func (f *billyFile) LiveSize() (int64, bool) {
+	if f.File == nil {
+		return 0, false
+	}
+	timer := time.NewTimer(fuseStatTimeout)
+	defer timer.Stop()
+	select {
+	case fuseFstatGate <- struct{}{}:
+	case <-timer.C:
+		return 0, false
+	}
+	type result struct {
+		sz int64
+		ok bool
+	}
+	ch := make(chan result, 1)
+	go func() {
+		fi, err := f.File.Stat()
+		if err != nil {
+			ch <- result{0, false}
+		} else {
+			ch <- result{fi.Size(), true}
+		}
+		<-fuseFstatGate
+	}()
+	select {
+	case r := <-ch:
+		return r.sz, r.ok
+	case <-timer.C:
+		return 0, false
+	}
 }
 
 // ReadAt is the hot path for NFS READ RPCs (which always carry an offset).

@@ -69,6 +69,15 @@ type Drainer struct {
 	// set-before-Start provides the happens-before (no lock needed).
 	onDrainComplete func(nfsPath string, size int64)
 
+	// onSizeReady, if set, publishes the drained file's authoritative size into
+	// the metadata store BEFORE MarkDrainComplete evicts the spool shadow, so a
+	// fresh read can never observe a post-eviction-but-pre-size (0/partial)
+	// Entry.Size (task #65 read-during-active-drain). Set once via SetOnSizeReady
+	// BEFORE Start (same set-before-Start happens-before as onDrainComplete).
+	// row.Size is authoritative at the call site: the copy is rejected unless
+	// n == row.Size.
+	onSizeReady func(nfsPath string, size int64)
+
 	// onSymlinkMaterialized, if set, is invoked after a deferred offline
 	// symlink is os.Symlink'd onto FUSE at reconnect. Set once via
 	// SetOnSymlinkMaterialized BEFORE Start; the handler uses it to
@@ -240,6 +249,12 @@ func (d *Drainer) Metrics() *DrainerMetrics { return &d.metrics }
 // after the row is marked done. Must be called BEFORE Start.
 func (d *Drainer) SetOnDrainComplete(fn func(nfsPath string, size int64)) {
 	d.onDrainComplete = fn
+}
+
+// SetOnSizeReady registers the pre-eviction size-publish hook (task #65). Call
+// once before Start.
+func (d *Drainer) SetOnSizeReady(fn func(nfsPath string, size int64)) {
+	d.onSizeReady = fn
 }
 
 // SetOnSymlinkMaterialized registers a callback invoked once per deferred
@@ -602,6 +617,18 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 			d.failTransient(row, fmt.Errorf("%s", reason))
 			return
 		}
+	}
+
+	// task #65: publish the real size into the metadata store BEFORE eviction.
+	// The backend file is whole + SHA-verified here and row.Size is authoritative
+	// (n == row.Size enforced above), so this closes the eviction-before-publish
+	// gap: once MarkDrainComplete evicts the spool shadow, fresh reads resolve
+	// Entry.Size — now correct — instead of a stale 0/partial value. Safe during
+	// the brief shadow overlap: for a sequential file ContiguousEnd == row.Size,
+	// so the shadow and the store agree. It is on the drain's critical path (not
+	// a queued callback), so it stays correct under a burst.
+	if d.onSizeReady != nil {
+		d.onSizeReady(row.NFSPath, row.Size)
 	}
 
 	done, err := d.spool.MarkDrainComplete(row.ID, row.NFSPath, row.SpoolFile, row.Size)

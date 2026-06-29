@@ -208,6 +208,15 @@ type CachedInfoProvider interface {
 	CachedInfo() os.FileInfo
 }
 
+// liveSizer, if implemented by a read handle, returns the AUTHORITATIVE current
+// size of the backing file (an fstat of the open FUSE fd). onRead uses it to
+// rescue a read whose open-time snapshot size would truncate it because the
+// metadata mirror lagged stale-low during a drain burst (task #65). ok=false
+// means unavailable (no fd / wedge timeout) -> fall back to fs.Stat.
+type liveSizer interface {
+	LiveSize() (int64, bool)
+}
+
 // tryCachedStat returns a FileAttribute synthesized from a handle's cached
 // info, or nil if the handle didn't supply one. fullPath is used only for
 // the file-id fallback (when Sys() doesn't carry an inode).
