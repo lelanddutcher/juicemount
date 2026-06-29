@@ -222,6 +222,92 @@ func statWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, err error
 	}
 }
 
+// --- bounded MUTATION syscalls (task #70: .app/.framework bundle copy hang) ---
+//
+// The read path (stat/lstat/readdir/open) was hardened with *WithTimeout so an
+// unbounded FUSE syscall can't park on the RPC reader path and stall the whole
+// mount (the 100060 class). The MUTATION syscalls on the SYMLINK/MKDIR/SETATTR
+// paths were left UNbounded — and a .app/.framework is the first workload to
+// drive SYMLINK + a symlink-FOLLOWING SETATTR (os.Chmod follows the link), so
+// under spool-drain load they parked on a loaded JuiceFS, held rpcSem reader
+// slots, and stalled the mount. These three mirror statWithTimeout exactly:
+// acquire nfsLstatGate (or time out), run the syscall on a goroutine that
+// releases the gate only after it returns, and surface ok=false on a wedge so
+// the caller returns errFUSETimeout → NFS3ERR_JUKEBOX (client retries) instead
+// of the mount stalling. A leaked goroutine completes harmlessly (ch is
+// buffered) and releases the gate when the wedged syscall eventually returns.
+
+// symlinkWithTimeout is the bounded os.Symlink sibling. ok=false → FUSE wedged.
+func symlinkWithTimeout(target, p string, timeout time.Duration) (err error, ok bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case nfsLstatGate <- struct{}{}:
+	case <-timer.C:
+		return nil, false
+	}
+	ch := make(chan error, 1)
+	go func() {
+		e := os.Symlink(target, p)
+		ch <- e
+		<-nfsLstatGate // release only after the syscall actually returns
+	}()
+	select {
+	case e := <-ch:
+		return e, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
+// mkdirAllWithTimeout is the bounded os.MkdirAll sibling. ok=false → FUSE wedged.
+func mkdirAllWithTimeout(p string, perm os.FileMode, timeout time.Duration) (err error, ok bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case nfsLstatGate <- struct{}{}:
+	case <-timer.C:
+		return nil, false
+	}
+	ch := make(chan error, 1)
+	go func() {
+		e := os.MkdirAll(p, perm)
+		ch <- e
+		<-nfsLstatGate
+	}()
+	select {
+	case e := <-ch:
+		return e, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
+// chmodWithTimeout is the bounded os.Chmod sibling. os.Chmod FOLLOWS symlinks,
+// so a framework's nested links drive it into the most contended JuiceFS
+// resolution — exactly the path that wedged. ok=false → FUSE wedged.
+func chmodWithTimeout(p string, mode os.FileMode, timeout time.Duration) (err error, ok bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case nfsLstatGate <- struct{}{}:
+	case <-timer.C:
+		return nil, false
+	}
+	ch := make(chan error, 1)
+	go func() {
+		e := os.Chmod(p, mode)
+		ch <- e
+		<-nfsLstatGate
+	}()
+	select {
+	case e := <-ch:
+		return e, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
 // readDirWithTimeout is the os.ReadDir sibling. ok=false → FUSE wedged.
 // gate bounds concurrent in-flight ReadDirs: foreground cold-readdir RPCs pass
 // nfsLstatGate (the shared hot-path budget); the BACKGROUND prefetcher passes
@@ -2311,7 +2397,13 @@ func (jfs *juiceFS) MkdirAll(dirname string, perm os.FileMode) error {
 	// reconnect. So an offline copy spools cleanly and the tree appears for the
 	// user; the backend catches up online.
 	if !pin.IsOffline() {
-		if err := os.MkdirAll(jfs.fullPath(dirname), perm); err != nil {
+		// BOUNDED (task #70): unbounded os.MkdirAll on the MKDIR RPC path parks
+		// on a drain-loaded FUSE and stalls the mount; JUKEBOX-retry instead.
+		err, ok := mkdirAllWithTimeout(jfs.fullPath(dirname), perm, fuseStatTimeout)
+		if !ok {
+			return errFUSETimeout
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -2377,7 +2469,13 @@ func (jfs *juiceFS) Symlink(target, link string) error {
 	// succeeds; the backend catches up online.
 	offline := pin.IsOffline()
 	if !offline {
-		if err := os.Symlink(target, fusePath); err != nil {
+		// BOUNDED (task #70): unbounded os.Symlink on the SYMLINK RPC path parks
+		// on a drain-loaded FUSE and stalls the mount; JUKEBOX-retry instead.
+		err, ok := symlinkWithTimeout(target, fusePath, fuseStatTimeout)
+		if !ok {
+			return errFUSETimeout
+		}
+		if err != nil {
 			// os.Symlink wraps the syscall errno in *os.LinkError; the onSymlink
 			// wire layer already pre-checks existence and maps to NFSStatusExist,
 			// but map here too so a direct/raced EEXIST is reported faithfully
@@ -2505,7 +2603,13 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 	// already-landed file. Skip too if there's no FUSE root (bare-handler tests).
 	if h.fusePath != "" && (h.spool == nil || !h.spool.HasPending(rel)) {
 		fusePath := path.Join(h.fusePath, rel)
-		if err := os.Chmod(fusePath, mode.Perm()); err != nil && !os.IsNotExist(err) {
+		// BOUNDED (task #70): os.Chmod FOLLOWS symlinks → a framework's nested
+		// links drive it into the most contended JuiceFS resolution; unbounded it
+		// parked on a drain-loaded FUSE and stalled the mount. On a wedge degrade
+		// to metadata-only (store.UpdateMode below is the authoritative mode).
+		if err, ok := chmodWithTimeout(fusePath, mode.Perm(), fuseStatTimeout); !ok {
+			jmlog.Debug("Chmod: FUSE chmod timed out (non-fatal, store update is authority)", "path", rel)
+		} else if err != nil && !os.IsNotExist(err) {
 			jmlog.Debug("Chmod: FUSE chmod failed (non-fatal, store update is authority)",
 				"path", rel, "err", err)
 		}
