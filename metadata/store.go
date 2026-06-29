@@ -1030,6 +1030,43 @@ func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error 
 	return nil
 }
 
+// UpdateMode persists a new permission mode for entryPath and updates the
+// in-memory cache. Only the permission bits (os.ModePerm) are stored; the
+// type bits (dir/symlink) are preserved from the existing cached Entry so a
+// SETATTR{mode} can never flip a directory into a regular file.
+//
+// This is the authority for what NFS GETATTR returns for an entry's mode
+// (onGetAttr serves from the cache). The handler's Chmod also best-effort
+// os.Chmod's the FUSE file, but the cached/persisted Mode here is what makes
+// a copied read-only file (0444) actually read back as read-only over NFS —
+// the FUSE chmod alone is lost on a spool-pending file (not yet on FUSE) and
+// can be clobbered by os.Create's 0644 on drain. Mirrors UpdateSize's
+// write-then-cache shape (writeMu for SQLite, mu for the cache map).
+func (s *Store) UpdateMode(entryPath string, mode fs.FileMode) error {
+	perm := uint32(mode & fs.ModePerm)
+
+	s.writeMu.Lock()
+	_, err := s.db.Exec(
+		`UPDATE entries SET mode = (mode & ~511) | ? WHERE path = ?`,
+		perm, entryPath,
+	)
+	s.writeMu.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("update mode %q: %w", entryPath, err)
+	}
+
+	s.mu.Lock()
+	if e, ok := s.pathCache[entryPath]; ok {
+		// Preserve type bits (ModeDir/ModeSymlink), replace perm bits only.
+		e.Mode = (e.Mode &^ fs.ModePerm) | (mode & fs.ModePerm)
+		e.PreSerializedGetAttr = nil // invalidate cached XDR attrs (see UpdateSize)
+	}
+	s.mu.Unlock()
+
+	return nil
+}
+
 // ClearLocalOnly marks an entry as no longer local-only (confirmed in Redis).
 func (s *Store) ClearLocalOnly(entryPath string) error {
 	s.writeMu.Lock()

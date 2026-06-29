@@ -492,7 +492,21 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = enc.Encode(snap)
 }
 
+// handleIndex serves the human-readable route banner at the exact root path
+// and returns 404 for anything else. This handler is registered against the
+// ServeMux subtree pattern "/", so it receives every request that no
+// longer-prefix exact route (/metrics, /health, /whoami, /residency, the
+// /manager and /debug/pprof subtrees, …) already claimed. Without the
+// path guard below, a truly-unknown route such as GET /definitely-not-a-real-
+// route would fall through here and get an HTTP 200 — the "catch-all 200 trap"
+// OpenLoupe flagged: capability probing can't distinguish a served route from
+// an unserved one. Registered routes are unaffected because ServeMux always
+// dispatches the longest matching pattern, so they never reach this function.
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = fmt.Fprint(w, "JuiceMount metrics\n  /metrics\n  /health\n")
 }

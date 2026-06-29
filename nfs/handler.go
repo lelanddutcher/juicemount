@@ -1043,11 +1043,32 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 		// see exactly which inode the kernel is presenting and
 		// correlate against what we have in the cache. Remove after
 		// QA-25 is closed; the cost of this Warn-level log is small.
+		//
+		// Residual-STALE attribution (2026-06-28): by this point both
+		// recovery paths above have already FAILED for this inode —
+		// tryRecoverEvicted (real inodes: shadow + FUSE-Lstat re-confirm)
+		// and SyntheticHandlePath (synthetic inodes). The remaining question
+		// is WHICH source dropped the entry. `had_shadow` distinguishes a
+		// prune/eviction orphan (a Layer-B shadow exists within ShadowTTL, so
+		// scopedPrune/syncMetadata's DeletePaths — or evictOldest — removed an
+		// entry whose handle Finder still holds, and recovery's racy FUSE
+		// Lstat then said "gone") from a genuinely-foreign handle (no shadow).
+		// `path_sidecar` flags a `._`-AppleDouble base name — the reconcile
+		// prune has NO `._`-skip (unlike the Stat/Open phantom-purge), so a
+		// sidecar prune-orphan is the leading residual-STALE hypothesis. This
+		// is observability-only; it changes no prune/recovery behavior.
 		pathSample := "(no entry)"
+		hadShadow := false
+		if shadow, ok := h.store.LookupRecentlyEvicted(inode); ok {
+			hadShadow = true
+			pathSample = shadow.Path
+		}
 		ps, is := h.store.CacheStats()
 		jmlog.Warn("FromHandle STALE",
 			"inode", fmt.Sprintf("%x", inode),
 			"inode_synthetic", inode&(1<<63) != 0,
+			"had_shadow", hadShadow,
+			"path_sidecar", strings.HasPrefix(path.Base(pathSample), "._"),
 			"pathCache_size", ps,
 			"inodeCache_size", is,
 			"sample", pathSample,
@@ -2226,8 +2247,23 @@ func (jfs *juiceFS) Remove(filename string) error {
 		jfs.handler.spool.CancelForDelete(filename)
 	}
 
-	// Delete from SQLite first (immediate visibility)
 	e := jfs.handler.store.LookupByPath(filename)
+
+	// Evict the in-memory cache SYNCHRONOUSLY, BEFORE the durable store.Delete
+	// (2026-06-28 back-to-back same-dest -48 fix). store.Delete also drops the
+	// cache entry, but only AFTER a full SQLite transaction that holds writeMu —
+	// so under reconcile/BulkInsert contention the cache eviction is trapped
+	// behind a blocked commit. During that window a `rm -rf <dir>` immediately
+	// followed by re-copying to the SAME dest name hit onCreate's StatCacheOnly+
+	// IsDir existence check (internal/nfs/nfs_oncreate.go), still saw the ghost
+	// directory entry, and returned NFS3ERR_EXIST → Finder "-48 already an item".
+	// DeleteFromCache removes path+inode+childrenIdx immediately (and shadows the
+	// entry for FromHandle Layer-B recovery, so an in-flight NFS handle does NOT
+	// go STALE — the sync delete is correct, not just faster). store.Delete below
+	// then makes it durable; its own cache-removal is now a no-op (already gone).
+	jfs.handler.store.DeleteFromCache(filename)
+
+	// Delete from SQLite (durable). Safe even though the cache is already evicted.
 	jfs.handler.store.Delete(filename)
 
 	// Delete on FUSE synchronously — returning success before the file is
@@ -2367,7 +2403,54 @@ type juiceChange struct {
 	handler *JuiceMountHandler
 }
 
-func (jc *juiceChange) Chmod(name string, mode os.FileMode) error         { return nil }
+// Chmod applies an NFS SETATTR{mode} so a copied file keeps its source perms
+// (the read-only bit in particular: a `chmod 444` source that Finder copies
+// must read back 0444, not 0644). Previously a no-op, which is why a read-only
+// file became writable after a Finder copy.
+//
+// Two-part apply, both bounded (this is the write/SETATTR path, NOT the hot
+// read path — no per-read FUSE here):
+//
+//  1. Best-effort os.Chmod on the FUSE file. Succeeds for a file already on
+//     FUSE (in-place modify). For a spool-pending file (written+closed, not yet
+//     drained to FUSE) the path doesn't exist yet, so this ENOENTs — tolerated,
+//     not fatal: the cached/persisted Mode below is the authority NFS GETATTR
+//     serves, and that's what the client reads back.
+//  2. Persist the perm bits to the metadata store (cache + SQLite) via
+//     UpdateMode. Type bits are preserved there, so a stray mode on a directory
+//     can never flip it to a regular file. This is the durable fix — it
+//     survives the os.Create(0644) the drainer uses when it lands the spool
+//     file on FUSE, because GETATTR reads the store, not a fresh FUSE stat.
+//
+// Spool/drain untouched: we never open, truncate, or re-create the spool entry;
+// the FUSE chmod is best-effort and the store update is metadata-only.
+func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
+	h := jc.handler
+	rel := strings.TrimPrefix(name, "/")
+
+	// (1) Best-effort FUSE chmod. ENOENT (spool-pending, not yet on FUSE) is
+	// expected and ignored; any other error is non-fatal — the store update is
+	// the authoritative path. Skip entirely if there's no FUSE root configured
+	// (unit tests with a bare handler).
+	if h.fusePath != "" {
+		fusePath := path.Join(h.fusePath, rel)
+		if err := os.Chmod(fusePath, mode.Perm()); err != nil && !os.IsNotExist(err) {
+			jmlog.Debug("Chmod: FUSE chmod failed (non-fatal, store update is authority)",
+				"path", rel, "err", err)
+		}
+	}
+
+	// (2) Authoritative: persist perm bits to the metadata store (cache + DB).
+	// No-op if the path isn't cached (DB UPDATE matches zero rows); a later
+	// LOOKUP/sync re-inserts with the correct mode from FUSE if it landed.
+	if err := h.store.UpdateMode(rel, mode); err != nil {
+		jmlog.Warn("Chmod: store UpdateMode failed", "path", rel, "err", err)
+		// Don't fail the SETATTR: the FUSE chmod (if the file was present) has
+		// already taken effect on disk. Surfacing an error here would make cp
+		// exit non-zero on a transient SQLite hiccup.
+	}
+	return nil
+}
 func (jc *juiceChange) Chown(name string, uid, gid int) error             { return nil }
 func (jc *juiceChange) Lchown(name string, uid, gid int) error            { return nil }
 func (jc *juiceChange) Chtimes(name string, atime, mtime time.Time) error { return nil }
