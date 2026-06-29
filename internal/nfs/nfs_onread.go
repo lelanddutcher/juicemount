@@ -214,10 +214,27 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		}
 	}
 	if ioErr != nil {
-		// [JM6 tier-1.7] Offline fail-fast: distinguish offline-refusal
-		// from genuine I/O error. NFSStatusNXIO preserves the kernel's
-		// file handle cache for post-recovery; NFSStatusIO would not.
+		// [JM6 tier-1.7] Offline-refusal vs genuine I/O error.
 		if pin.IsOfflineNotAvailable(ioErr) {
+			// v0.2.1 offline-transition resilience: an IN-FLIGHT read (the client
+			// is mid-file → Offset>0) caught by an offline transition — a manual
+			// toggle OR a sustained-outage auto-offline — must STALL and resume on
+			// reconnect, not die. Within a bounded grace window since going
+			// offline, answer NFS3ERR_JUKEBOX: the kernel NFS client holds the RPC
+			// and retries; when offline lifts the retry serves the bytes and the
+			// copy resumes seamlessly. A brand-new cold read (Offset==0) still
+			// fails fast with NXIO so deliberate offline browsing of un-cached
+			// media gets an instant "not available offline", not a beach-ball.
+			// Window expiry → NXIO so an in-flight read never hangs forever. (NXIO,
+			// not IO, preserves the kernel's file-handle cache across the gap so
+			// the file reappears without a remount.)
+			if obj.Offset > 0 && pin.WithinOfflineReadStallWindow() {
+				// Count it like conn.go's FUSETimeout→JUKEBOX path so the storm
+				// detector (inflight.go) sees offline-stall retries instead of
+				// going blind during a transition with many in-flight reads.
+				recordJukebox(inflightOpName(w.req))
+				return &NFSStatusError{NFSStatusJukebox, ioErr}
+			}
 			return &NFSStatusError{NFSStatusNXIO, ioErr}
 		}
 		return &NFSStatusError{NFSStatusIO, ioErr}

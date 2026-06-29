@@ -65,6 +65,11 @@ var (
 	autoOfflineMu     sync.RWMutex
 	autoOfflineReason string
 	autoOfflineSince  time.Time
+	// userOfflineSince records when the user-intent toggle last engaged
+	// (zero when not user-offline). Protected by autoOfflineMu alongside the
+	// auto fields. Used by WithinOfflineReadStallWindow to bound how long an
+	// in-flight read is JUKEBOX-stalled after going offline.
+	userOfflineSince time.Time
 )
 
 // SetOffline switches the process to user-intent offline mode (or
@@ -72,9 +77,21 @@ var (
 // only know about manual toggles.
 func SetOffline(on bool) {
 	if on {
+		// Stamp BEFORE the flag store: an in-flight read on another goroutine
+		// must never observe IsOffline()==true while WithinOfflineReadStallWindow()
+		// is still false (it would get a terminal NXIO instead of a retryable
+		// JUKEBOX — the exact abort this feature prevents).
+		autoOfflineMu.Lock()
+		if userOfflineSince.IsZero() {
+			userOfflineSince = time.Now()
+		}
+		autoOfflineMu.Unlock()
 		userOfflineFlag.Store(1)
 	} else {
 		userOfflineFlag.Store(0)
+		autoOfflineMu.Lock()
+		userOfflineSince = time.Time{}
+		autoOfflineMu.Unlock()
 	}
 }
 
@@ -87,13 +104,15 @@ func SetOffline(on bool) {
 // flags and never block each other.
 func SetAutoOffline(on bool, reason string) {
 	if on {
-		autoOfflineFlag.Store(1)
+		// Stamp BEFORE the flag store (see SetOffline) so WithinOfflineReadStallWindow()
+		// is already valid the instant IsOffline() flips true.
 		autoOfflineMu.Lock()
 		autoOfflineReason = reason
 		if autoOfflineSince.IsZero() {
 			autoOfflineSince = time.Now()
 		}
 		autoOfflineMu.Unlock()
+		autoOfflineFlag.Store(1)
 	} else {
 		autoOfflineFlag.Store(0)
 		autoOfflineMu.Lock()
@@ -120,6 +139,39 @@ func IsUserOffline() bool {
 // IsAutoOffline reports whether auto-engage has fired.
 func IsAutoOffline() bool {
 	return autoOfflineFlag.Load() != 0
+}
+
+// OfflineReadStallWindow bounds how long an IN-FLIGHT read (one already in
+// progress when offline engaged — the client is mid-file) is answered with
+// NFS3ERR_JUKEBOX (the kernel NFS client holds + retries the RPC, resuming on
+// reconnect) instead of a terminal NXIO. Measured from when offline engaged by
+// either source. Sized against the macOS soft-mount per-RPC budget so a brief
+// blip or a toggle-offline-then-back rides through and the copy survives, while
+// a genuinely sustained offline still fails the copy cleanly rather than
+// hanging it forever. A var so it can be tuned / env-overridden.
+var OfflineReadStallWindow = 90 * time.Second
+
+// WithinOfflineReadStallWindow reports whether offline (by either source)
+// engaged recently enough that an in-flight read should be JUKEBOX-stalled
+// (stall + resume on reconnect) rather than NXIO-failed. False when fully
+// online, and false once we've been continuously offline longer than
+// OfflineReadStallWindow (give up — don't beach-ball the copy forever).
+func WithinOfflineReadStallWindow() bool {
+	autoOfflineMu.RLock()
+	auto := autoOfflineSince
+	user := userOfflineSince
+	autoOfflineMu.RUnlock()
+	// "Since" = the EARLIEST still-active engage = how long we've been
+	// continuously offline. An in-flight copy is caught at the transition, so
+	// measuring from the first engage is what bounds its stall correctly.
+	since := auto
+	if since.IsZero() || (!user.IsZero() && user.Before(since)) {
+		since = user
+	}
+	if since.IsZero() {
+		return false
+	}
+	return time.Since(since) < OfflineReadStallWindow
 }
 
 // OfflineState is a snapshot of the offline subsystem suitable for

@@ -118,6 +118,13 @@ func TestSpoolBackpressureOfflineStallsThenResumes(t *testing.T) {
 // RED on pre-fix code: without the touch, lastWrite stays frozen at the head
 // write, so sweepOnce escalates and finalizes the entry truncated at 100 bytes
 // while the second write is still parked.
+//
+// Task #71 (offline-transition resilience) added a belt to this suspenders:
+// sweepOnce now no-ops entirely while OFFLINE, so the offline-parked entry is
+// doubly protected (the loop below now also proves the offline short-circuit).
+// The end-to-end writtenEnd==160 assertion remains the real data-loss guard;
+// the touch mechanic itself is now exercised ONLINE by the sibling test
+// TestCapacityStallParkedWriterNotEscalatedOnline.
 func TestCapacityStallParkedWriterNotEscalated(t *testing.T) {
 	old := capacityWaitDeadline
 	capacityWaitDeadline = 50 * time.Millisecond
@@ -166,6 +173,61 @@ func TestCapacityStallParkedWriterNotEscalated(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("parked write did not resume after reconnect")
+	}
+	e.mu.Lock()
+	end := e.writtenEnd
+	e.mu.Unlock()
+	if end != 160 {
+		t.Fatalf("writtenEnd=%d after resume, want 160 (a truncating escalation would leave 100)", end)
+	}
+}
+
+// TestCapacityStallParkedWriterNotEscalatedOnline verifies the touch mechanic
+// DIRECTLY now that sweepOnce no-ops while offline (task #71): the touch is the
+// online-only protection against the leaked-handle escalation force-finalizing a
+// parked writer truncated. ONLINE, the sweep runs, so a frozen lastWrite WOULD
+// escalate; the per-poll touch keeps it fresh so escalation never fires, and on
+// capacity-free the parked write completes with the FULL content.
+func TestCapacityStallParkedWriterNotEscalatedOnline(t *testing.T) {
+	old := capacityWaitDeadline
+	capacityWaitDeadline = 300 * time.Millisecond // long enough to sweep during the online park
+	t.Cleanup(func() { capacityWaitDeadline = old })
+	// Stays ONLINE — no SetOffline — so sweepOnce actually runs against the entry.
+
+	s := newTestSpoolStore(t, 100)
+	s.SetStuckEscalationWindow(30 * time.Millisecond) // a frozen handle would escalate fast
+
+	e, err := s.OpenWrite("/parked_online.bin")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := e.WriteAt(make([]byte, 100), 0); err != nil { // fill the 100-byte cap
+		t.Fatalf("fill: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { _, werr := e.WriteAt(make([]byte, 60), 100); done <- werr }()
+
+	// Sweep repeatedly while the write is parked ONLINE, well past the escalation
+	// window. The parked write's touch keeps lastWrite fresh → escalation must
+	// NEVER fire (sweepOnce returns 0).
+	deadline := time.Now().Add(150 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if n := s.sweepOnce(0); n != 0 {
+			t.Fatalf("ONLINE sweeper escalated a write PARKED in the capacity stall (finalized %d) — touch mechanic broken", n)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// Free capacity (within the 300ms deadline): the parked write resumes FULLY.
+	s.releaseCapacity(60)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("parked write failed after capacity free: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked write did not resume after capacity free")
 	}
 	e.mu.Lock()
 	end := e.writtenEnd

@@ -409,6 +409,22 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 // active long writes are immune: continuous writes keep lastWrite fresh, so
 // the entry is never quiescent for the full window.
 func (s *SpoolStore) sweepOnce(idle time.Duration) int {
+	// v0.2.1 offline-transition resilience: never finalize/escalate while
+	// offline. finalizeIfIdle would CLOSE an in-flight entry whose Finder copy
+	// merely PAUSED across the offline toggle (refcount briefly drops to 0
+	// between WRITE RPCs); the drainer is paused offline (drainer.go), so the
+	// closed entry can't drain, and a resumed WRITE then hits OpenWrite's
+	// reopen-poll → reopenMaxWait → ErrSpoolBusy → the client's copy dies
+	// (Finder mislabels it "name too long/invalid"). Holding entries in
+	// `writing` across the offline window lets a resumed WRITE reuse them via
+	// OpenWrite's !closed branch; on reconnect the next sweep finalizes any
+	// genuinely-idle entry → drains. Durability is safe across an offline
+	// restart: RecoverOnBoot's DrainWriting case hashes the on-disk file (not
+	// the DB Size, which stays 0 until finalize) and resumes a `writing` row
+	// with real bytes to `ready`, so an offline-ingested file is never lost.
+	if pin.IsOffline() {
+		return 0
+	}
 	entries := s.index.Snapshot()
 	n := 0
 	for _, e := range entries {
