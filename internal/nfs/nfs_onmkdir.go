@@ -81,6 +81,12 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	if err := fs.MkdirAll(newFolderPath, attrs.Mode(mkdirDefaultMode)); err != nil {
+		// task #70: jfs.MkdirAll is now bounded (mkdirAllWithTimeout). Surface a
+		// FUSE-wedge ErrFUSETimeout raw so conn.handle maps it to NFS3ERR_JUKEBOX
+		// (client retries; MkdirAll is idempotent) instead of NFSStatusAccess.
+		if errors.Is(err, ErrFUSETimeout) {
+			return err
+		}
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 

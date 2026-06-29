@@ -3,6 +3,7 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 
 	"github.com/go-git/go-billy/v5"
@@ -50,6 +51,21 @@ func onSymlink(ctx context.Context, w *response, userHandle Handler) error {
 
 	err = fs.Symlink(string(target), newFilePath)
 	if err != nil {
+		// task #70: jfs.Symlink is now bounded (symlinkWithTimeout). On a FUSE
+		// wedge it returns ErrFUSETimeout — surface it raw so conn.handle maps it
+		// to NFS3ERR_JUKEBOX (client retries) rather than burying it under
+		// NFSStatusAccess (which only reached JUKEBOX via the Unwrap chain).
+		if errors.Is(err, ErrFUSETimeout) {
+			return err
+		}
+		// A JUKEBOX retry can race the prior attempt's goroutine actually
+		// creating the symlink → EEXIST. That's an idempotent success, NOT
+		// "permission denied": map to NFSStatusExist so Finder treats it as
+		// already-created and the copy continues. (The pre-flight Stat at line 42
+		// catches the common case; this catches the timeout-retry race.)
+		if errors.Is(err, os.ErrExist) {
+			return &NFSStatusError{NFSStatusExist, err}
+		}
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 
