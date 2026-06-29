@@ -1430,6 +1430,17 @@ func (rc *RedisClient) syncMetadata() error {
 	var toDelete []string
 	for p, count := range rc.pruneAbsent {
 		if count >= PruneThreshold {
+			// `._` AppleDouble guard (symmetric with scopedPrune's `._`-skip):
+			// `._` sidecars are scan-filtered / managed Mac-side via the explicit
+			// Remove path, never the reconcile — their absence from Redis is not a
+			// delete signal. Pruning one whose path-stable Track-B handle the
+			// kernel still holds Forgets it → FromHandle STALE (the `._dirN`
+			// had_shadow STALE the release battery caught). Stop tracking it and
+			// never enqueue it for deletion.
+			if strings.HasPrefix(path.Base(p), "._") {
+				delete(rc.pruneAbsent, p)
+				continue
+			}
 			toDelete = append(toDelete, p)
 			delete(rc.pruneAbsent, p)
 		}

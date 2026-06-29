@@ -863,6 +863,20 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		if _, present := freshNames[ch.Name]; present {
 			continue
 		}
+		// === `._` AppleDouble guard (release-battery ._dirN had_shadow STALE) ===
+		// `._` sidecars are scan-filtered from the backend SCAN, so they are
+		// ALWAYS absent from freshNames even when they legitimately exist (Mac-
+		// written + drained) — making "absent from Redis" a FALSE delete signal
+		// for them specifically. They're managed Mac-side via the explicit Remove
+		// path, never the reconcile. Pruning a `._` entry whose path-stable
+		// Track-B handle the kernel still holds Forgets it → FromHandle STALE
+		// (the `._dir8` had_shadow:true / path_sidecar:true STALE the release
+		// battery's 06/08 caught — data stayed intact, but it tripped the strict
+		// zero-Finder-error bar). The Stat/Open phantom-purge already skips `._`
+		// for exactly this reason; the reconcile prune must too.
+		if strings.HasPrefix(ch.Name, "._") {
+			continue
+		}
 		candidates = append(candidates, ch.Path)
 	}
 	if len(candidates) == 0 {
