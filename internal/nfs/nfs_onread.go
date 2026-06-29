@@ -102,13 +102,21 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	// Stat() which contains a 2-second-budgeted FUSE Lstat for the
 	// phantom-purge gate — a fixed per-RPC cost that dominated read
 	// throughput on cached files. Cached size is a snapshot from Open
-	// time; a stale value can only cause a benign short read (NFS clients
-	// reissue), not a correctness issue.
+	// time; a stale HIGH-or-equal value only causes a benign short read
+	// (clients reissue). A stale ZERO is NOT benign — see the size>0 guard.
 	if obj.Count > CheckRead {
 		var size int64
 		var haveSize bool
 		if cp, ok := fh.(CachedInfoProvider); ok {
-			if info := cp.CachedInfo(); info != nil {
+			// v0.2.1 drain-tail truncation fix: require size > 0 to trust the
+			// cached snapshot. A spool-routed file's store Entry is Size=0 until
+			// the drainer's post-drain UpdateSize lands (and a racy keyspace
+			// reconcile can re-zero it); a read OpenFile in that window freezes a
+			// size-0 cachedInfo. Trusting 0 makes the clamp below set Count=0 — a
+			// SILENT truncated read (md5/readers get an empty stream, no error).
+			// Falling through to fs.Stat is drain-correct (it applies the sticky
+			// writeSizes high-water). A real 0-byte file reads 0 bytes anyway.
+			if info := cp.CachedInfo(); info != nil && info.Size() > 0 {
 				size = info.Size()
 				haveSize = true
 			}
