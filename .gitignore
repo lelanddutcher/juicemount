@@ -30,6 +30,7 @@
 /build/*.h
 /build/JuiceMount.app/
 /build/AppIcon.iconset/
+/build/sparkle-release/
 app/JuiceMount/.build/
 
 # SQLite databases (local state, not code)
