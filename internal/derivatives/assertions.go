@@ -35,7 +35,7 @@ type Assertion struct {
 	AssertedAt string `json:"asserted_at"` // RFC-3339 UTC; the LWW ordering field
 }
 
-const assertionsSchema = `
+const assertionsTableDDL = `
 CREATE TABLE IF NOT EXISTS assertions (
     asset_key   TEXT NOT NULL,
     namespace   TEXT NOT NULL,
@@ -45,9 +45,21 @@ CREATE TABLE IF NOT EXISTS assertions (
     asserted_at TEXT NOT NULL,   -- RFC-3339; lexical sort == chronological for UTC Z
     inode       INTEGER,         -- Tier-B accelerator ONLY (nullable, non-identity)
     PRIMARY KEY (asset_key, namespace, key)
-);
-CREATE INDEX IF NOT EXISTS idx_assert_inode ON assertions(inode);
-`
+);`
+
+// assertionsAddedColumns are columns added to the assertions table AFTER its
+// original DDL first shipped. `CREATE TABLE IF NOT EXISTS` is a no-op against a
+// table an OLDER binary already created, so on a deployed (pre-existing) index
+// DB these columns are never added — and every `POST /assertions` then 500s
+// "table assertions has no column named value_json" (the classic green-in-test /
+// red-in-deploy migration drift OpenLoupe hit). SQLite has no
+// `ADD COLUMN IF NOT EXISTS`, so initAssertions PRAGMA-probes the live columns
+// and ALTERs in any that are missing. All are NULLable with no default, which is
+// exactly what SQLite's `ALTER TABLE ... ADD COLUMN` permits.
+var assertionsAddedColumns = []struct{ name, ddl string }{
+	{"value_json", "value_json TEXT"},
+	{"inode", "inode INTEGER"},
+}
 
 // AssertResult is the outcome of an AssertLWW write — the data the POST
 // /assertions response is built from.
@@ -56,11 +68,51 @@ type AssertResult struct {
 	WinningAssertedAt string // asserted_at of whoever now holds the slot
 }
 
-// initAssertions creates the assertions table. Called from Open alongside the
-// derivative schema so one Store owns both.
+// initAssertions creates the assertions table AND migrates any columns missing
+// from a pre-existing (older-binary) table. Called from Open alongside the
+// derivative schema so one Store owns both. Order matters: table first, then
+// ADD COLUMN for drift, then the inode index LAST — an older table may lack the
+// inode column the index references, and creating the index before the column
+// exists would error.
 func (s *Store) initAssertions() error {
-	_, err := s.db.Exec(assertionsSchema)
+	if _, err := s.db.Exec(assertionsTableDDL); err != nil {
+		return err
+	}
+	have, err := s.assertionsColumns()
+	if err != nil {
+		return err
+	}
+	for _, c := range assertionsAddedColumns {
+		if !have[c.name] {
+			if _, err := s.db.Exec(`ALTER TABLE assertions ADD COLUMN ` + c.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_assert_inode ON assertions(inode);`)
 	return err
+}
+
+// assertionsColumns returns the set of column names currently on the assertions
+// table (via PRAGMA table_info), so initAssertions can ADD COLUMN any that an
+// older binary's DDL didn't create.
+func (s *Store) assertionsColumns() (map[string]bool, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(assertions)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		have[name] = true
+	}
+	return have, rows.Err()
 }
 
 // AssertLWW applies one assertion under last-writer-wins by asserted_at. It
