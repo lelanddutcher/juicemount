@@ -1,5 +1,38 @@
 # JuiceMount6 Changelog
 
+## 0.2.0 — 2026-06-29 — Bundles & packages, offline hardening, auto-updates, server-side generation
+
+### Added
+- **Automatic updates (Sparkle).** JuiceMount now checks for and installs signed
+  updates in the background (Developer-ID + notarized builds; EdDSA-signed appcast).
+- **App bundles & packages copy correctly.** `.app`, `.framework`, `.fcpbundle`, and
+  NLE project folders — which contain internal symlinks — now copy without the
+  "you don't have permission to access some of the items" error. NFS SYMLINK /
+  READLINK are implemented.
+- **JuiceFarm (advanced, optional).** Server-side generation of playback proxies,
+  poster frames, filmstrips, audio waveforms, technical metadata, and transcripts, so
+  clients don't transcode on-device. See [`docs/JUICEFARM.md`](docs/JUICEFARM.md).
+- **OpenLoupe integration.** A versioned wire contract for portable derivatives and
+  human assertions (ratings / picks / person names), shared with the OpenLoupe DAM.
+
+### Changed
+- **Faster, less-disruptive metadata sync.** The index updates from live Redis
+  keyspace notifications (push) instead of a constant full re-scan, so a background
+  index refresh no longer stalls Finder; the full scan is demoted to a rare backstop.
+- **Snappier folder opening under load.** Opening a directory while a large copy
+  drains returns instantly from the local index instead of showing a spinner.
+- **Correct cache-size reporting.** "Cache used" reflects the JuiceFS block cache,
+  not just pinned files.
+
+### Fixed
+- **Offline bundle copies.** Copying a package with internal symlinks while offline
+  no longer fails — the symlinks are deferred and materialized on reconnect.
+- **No spurious "connection interrupted" when toggling offline mid-copy.** The health
+  watchdog is now offline-aware and won't remount a busy-but-healthy mount.
+- **AppleDouble (`._`) sidecars** no longer trip a transient stale-handle warning
+  during a metadata sync.
+- Additional data-integrity, concurrency, and offline-ingest hardening.
+
 ## 2026-06-10 — Launch hardening, Phase 4 (OSS publication hygiene)
 
 - **Apache-2.0.** `LICENSE` + `NOTICE` added (JuiceFS and go-nfs/go-nfs-client

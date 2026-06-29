@@ -2,113 +2,96 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-    <key>CFBundleExecutable</key>
-    <string>JuiceMount</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.juicemount.app</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>JuiceMount</string>
-    <key>CFBundleDisplayName</key>
-    <string>JuiceMount</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.utilities</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>LSUIElement</key>
-    <true/>
-    <!-- Enable the Redis keyspace-notification metadata push (demotes the 30s
-         full SCAN to a rare class-gated backstop). Set at process launch so the
-         Go core's os.Getenv sees it before the runtime caches environ. SAFE: the
-         core auto-detects notify-keyspace-events via CONFIG GET and falls back to
-         the classic 30s SCAN if the NAS Redis isn't configured for it. -->
-    <key>LSEnvironment</key>
-    <dict>
-        <key>JM_METADATA_KEYSPACE_PUSH</key>
-        <string>1</string>
-    </dict>
-
-    <!-- Sparkle 2 auto-updater configuration.
-         SUFeedURL      — appcast hosted on GitHub Releases ("latest" release).
-         SUPublicEDKey  — EdDSA (ed25519) public key; the matching PRIVATE key
-                          lives ONLY in the login keychain (via Sparkle's
-                          generate_keys), never in the repo — same rule as the
-                          notarytool credentials. Update releases are verified
-                          against this key before they install.
-         SUEnableAutomaticChecks / SUScheduledCheckInterval — check once per day. -->
-    <key>SUFeedURL</key>
-    <string>https://github.com/lelanddutcher/juicemount/releases/latest/download/appcast.xml</string>
-    <key>SUPublicEDKey</key>
-    <string>/YW+9b1o9nmwtEFTaUxMCCTZliWp0wmgMmxTwp0Zg/Y=</string>
-    <key>SUEnableAutomaticChecks</key>
-    <true/>
-    <key>SUScheduledCheckInterval</key>
-    <integer>86400</integer>
-
-    <key>NSHumanReadableCopyright</key>
-    <string>© 2026 Leland Dutcher. All rights reserved.</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>JuiceMount needs to send Apple events to mount and unmount NFS volumes.</string>
-    <key>NSLocalNetworkUsageDescription</key>
-    <string>JuiceMount connects to your NAS over the local network to access your media files.</string>
-    <key>NSDocumentsFolderUsageDescription</key>
-    <string>JuiceMount needs to read project files for indexing and search.</string>
-    <key>NSDesktopFolderUsageDescription</key>
-    <string>JuiceMount needs to read files on your Desktop for indexing and search.</string>
-    <key>NSDownloadsFolderUsageDescription</key>
-    <string>JuiceMount needs to read files in Downloads for indexing and search.</string>
-    <key>NSRemovableVolumesUsageDescription</key>
-    <string>JuiceMount mounts your media library as a removable volume.</string>
-
-    <!-- Finder right-click services -->
-    <key>NSServices</key>
-    <array>
-        <dict>
-            <key>NSMessage</key>
-            <string>pinForOffline</string>
-            <key>NSPortName</key>
-            <string>JuiceMount</string>
-            <key>NSMenuItem</key>
-            <dict>
-                <key>default</key>
-                <string>JuiceMount: Pin for Offline</string>
-            </dict>
-            <key>NSSendTypes</key>
-            <array>
-                <string>public.file-url</string>
-                <string>NSFilenamesPboardType</string>
-            </array>
-            <key>NSReturnTypes</key>
-            <array/>
-        </dict>
-        <dict>
-            <key>NSMessage</key>
-            <string>toggleOfflineMode</string>
-            <key>NSPortName</key>
-            <string>JuiceMount</string>
-            <key>NSMenuItem</key>
-            <dict>
-                <key>default</key>
-                <string>JuiceMount: Toggle Offline Mode</string>
-            </dict>
-            <key>NSSendTypes</key>
-            <array/>
-            <key>NSReturnTypes</key>
-            <array/>
-        </dict>
-    </array>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>JuiceMount</string>
+	<key>CFBundleExecutable</key>
+	<string>JuiceMount</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.juicemount.app</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>JuiceMount</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.0</string>
+	<key>CFBundleVersion</key>
+	<string>2</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSEnvironment</key>
+	<dict>
+		<key>JM_METADATA_KEYSPACE_PUSH</key>
+		<string>1</string>
+	</dict>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>JuiceMount needs to send Apple events to mount and unmount NFS volumes.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>JuiceMount needs to read files on your Desktop for indexing and search.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>JuiceMount needs to read project files for indexing and search.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>JuiceMount needs to read files in Downloads for indexing and search.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Leland Dutcher. All rights reserved.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>JuiceMount connects to your NAS over the local network to access your media files.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>JuiceMount mounts your media library as a removable volume.</string>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>JuiceMount: Pin for Offline</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>pinForOffline</string>
+			<key>NSPortName</key>
+			<string>JuiceMount</string>
+			<key>NSReturnTypes</key>
+			<array/>
+			<key>NSSendTypes</key>
+			<array>
+				<string>public.file-url</string>
+				<string>NSFilenamesPboardType</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>JuiceMount: Toggle Offline Mode</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>toggleOfflineMode</string>
+			<key>NSPortName</key>
+			<string>JuiceMount</string>
+			<key>NSReturnTypes</key>
+			<array/>
+			<key>NSSendTypes</key>
+			<array/>
+		</dict>
+	</array>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/lelanddutcher/juicemount/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>/YW+9b1o9nmwtEFTaUxMCCTZliWp0wmgMmxTwp0Zg/Y=</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 </dict>
 </plist>
