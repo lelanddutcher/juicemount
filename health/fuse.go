@@ -990,6 +990,18 @@ var fuseWatchdogLinkAware = os.Getenv("JM_FUSE_WATCHDOG_LINKAWARE") != "0"
 // behavior for debugging (cellular-revert-safety doctrine).
 var fuseOfflineNoEscalate = os.Getenv("JM_FUSE_OFFLINE_ESCALATE") != "1"
 
+// fuseSkipEscalateWhileOffline reports whether a stale-but-juicefs-alive FUSE
+// tick must be deferred (the escalation counter frozen, NEVER accumulating
+// toward the escalate-to-remount threshold) because the user is OFFLINE.
+// Offline, a "stale" probe is the juicefs daemon saturated by in-flight spool
+// drains (busy, not wedged); escalating would diskutil-unmount-force a HEALTHY
+// daemon and drop the NFS mount → Finder "connection interrupted". Gated by the
+// JM_FUSE_OFFLINE_ESCALATE=1 kill-switch. Extracted from monitorLoop so the
+// release-critical guard is unit-testable (see TestFUSEOfflineGuard*).
+func fuseSkipEscalateWhileOffline() bool {
+	return fuseOfflineNoEscalate && pin.IsOffline()
+}
+
 // fuseColdStartGrace is how long after the watchdog starts (≈ app start / first
 // mount) the escalation to a destructive SIGKILL+remount is SUPPRESSED. During
 // cold start the JuiceFS mount is legitimately busy warming caches and serving
@@ -1157,7 +1169,7 @@ func (fm *FUSEManager) monitorLoop() {
 				// defer; the mount recovers when the drain settles / on reconnect.
 				// Kill-switch JM_FUSE_OFFLINE_ESCALATE=1 restores the pre-fix
 				// behavior (cellular-revert-safety doctrine).
-				if fuseOfflineNoEscalate && pin.IsOffline() {
+				if fuseSkipEscalateWhileOffline() {
 					staleWhileAliveTicks = 0
 					consecutiveFailures = 0
 					offlineDeferTicks++
