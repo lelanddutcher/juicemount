@@ -2495,11 +2495,15 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 	h := jc.handler
 	rel := strings.TrimPrefix(name, "/")
 
-	// (1) Best-effort FUSE chmod. ENOENT (spool-pending, not yet on FUSE) is
-	// expected and ignored; any other error is non-fatal — the store update is
-	// the authoritative path. Skip entirely if there's no FUSE root configured
-	// (unit tests with a bare handler).
-	if h.fusePath != "" {
+	// (1) Best-effort FUSE chmod — ONLY for a file actually on FUSE, i.e. NOT
+	// spool-pending. A just-created, still-spooling file is not on the backend
+	// yet, so os.Chmod would ENOENT — and that per-SETATTR FUSE LOOKUP is pure
+	// cost: 50 small-file creates each paying an ENOENT chmod made write_50x1k
+	// 1.78x slower (TestBenchmarkSuite regression). The drainer lands spool files
+	// via os.Create regardless, and store.UpdateMode below is the authoritative
+	// NFS-served mode; the FUSE chmod only matters for an IN-PLACE chmod of an
+	// already-landed file. Skip too if there's no FUSE root (bare-handler tests).
+	if h.fusePath != "" && (h.spool == nil || !h.spool.HasPending(rel)) {
 		fusePath := path.Join(h.fusePath, rel)
 		if err := os.Chmod(fusePath, mode.Perm()); err != nil && !os.IsNotExist(err) {
 			jmlog.Debug("Chmod: FUSE chmod failed (non-fatal, store update is authority)",
