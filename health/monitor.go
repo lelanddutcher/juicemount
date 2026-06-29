@@ -15,6 +15,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
@@ -601,6 +602,17 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 		}
 		return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 	case <-time.After(5 * time.Second):
+		// Offline-aware (release fix): a root readdir that times out while the
+		// user is OFFLINE is the juicefs daemon being SATURATED by in-flight
+		// spool drains (writes with nowhere to go offline) — BUSY, not wedged.
+		// Reporting unhealthy here feeds the watchdog's escalate-to-remount,
+		// which SIGTERMs a healthy daemon and drops the NFS mount → Finder
+		// "connection interrupted". Offline, treat a readdir timeout as a
+		// transient busy state, not a stale-mount fault.
+		if pin.IsOffline() {
+			jmlog.Debug("fuse readdir slow but offline (busy draining) — not flagging stale", "path", m.cfg.FUSEPath)
+			return ComponentStatus{Healthy: true, LastCheck: now, Message: "offline (busy/draining)"}
+		}
 		jmlog.Warn("fuse mount unresponsive (stale)", "path", m.cfg.FUSEPath)
 		go m.logWedgeDiagnostics("readdir_unresponsive")
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "unresponsive (stale mount)"}

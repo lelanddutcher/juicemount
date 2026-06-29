@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
@@ -981,6 +982,14 @@ var FUSEStaleEscalateTicks = 9
 // thresholds. See docs/TUNING/REVERT_LOG.md (R1).
 var fuseWatchdogLinkAware = os.Getenv("JM_FUSE_WATCHDOG_LINKAWARE") != "0"
 
+// fuseOfflineNoEscalate (default ON): when offline, NEVER escalate a stale-but-
+// alive mount to an app-side remount. Offline, "stale" is the juicefs daemon
+// saturated by in-flight spool drains (busy, not wedged); a remount SIGTERMs a
+// healthy daemon and drops the NFS mount (Finder "connection interrupted").
+// Set JM_FUSE_OFFLINE_ESCALATE=1 to restore the pre-fix escalate-when-offline
+// behavior for debugging (cellular-revert-safety doctrine).
+var fuseOfflineNoEscalate = os.Getenv("JM_FUSE_OFFLINE_ESCALATE") != "1"
+
 // fuseColdStartGrace is how long after the watchdog starts (≈ app start / first
 // mount) the escalation to a destructive SIGKILL+remount is SUPPRESSED. During
 // cold start the JuiceFS mount is legitimately busy warming caches and serving
@@ -1112,6 +1121,7 @@ func (fm *FUSEManager) monitorLoop() {
 	watchdogStart := time.Now() // for the cold-start escalation grace window
 	consecutiveFailures := 0    // ticks where the mount is stale AND juicefs is gone
 	staleWhileAliveTicks := 0   // ticks where the mount is stale but juicefs is alive
+	offlineDeferTicks := 0      // ticks deferred because offline (busy draining, not wedged)
 	for {
 		select {
 		case <-fm.stopCh:
@@ -1135,6 +1145,29 @@ func (fm *FUSEManager) monitorLoop() {
 			// The mount is unhealthy. Decide WHY before acting — killing a
 			// live-but-slow juicefs is what drove the macFUSE remount thrash.
 			if isJuiceFSProcessAliveFn() {
+				// OFFLINE GUARD (release fix — Finder "connection interrupted"):
+				// when the user is OFFLINE, a "stale" probe is overwhelmingly the
+				// juicefs daemon being SATURATED by in-flight spool drains (writes
+				// with nowhere to go offline) — BUSY, not wedged. Escalating to a
+				// remount unmounts (diskutil unmount force → SIGTERM) a HEALTHY
+				// daemon and rips the FUSE mountpoint out from under the kernel NFS
+				// export → Finder "connection interrupted" mid-offline-workflow.
+				// juicefs is alive and the user chose offline, so a remount is
+				// both unnecessary and harmful. Freeze the escalation counter and
+				// defer; the mount recovers when the drain settles / on reconnect.
+				// Kill-switch JM_FUSE_OFFLINE_ESCALATE=1 restores the pre-fix
+				// behavior (cellular-revert-safety doctrine).
+				if fuseOfflineNoEscalate && pin.IsOffline() {
+					staleWhileAliveTicks = 0
+					consecutiveFailures = 0
+					offlineDeferTicks++
+					if offlineDeferTicks == 1 || offlineDeferTicks%6 == 0 {
+						jmlog.Warn("fuse stale but OFFLINE + juicefs alive — NOT escalating (busy draining, not wedged); an app-side remount here would drop the NFS mount → Finder 'connection interrupted'",
+							"offline_defer_ticks", offlineDeferTicks)
+					}
+					continue
+				}
+				offlineDeferTicks = 0
 				// juicefs (and its own supervisor) is alive — the mount is
 				// stale, usually a flapping/blipping backend link. Default to
 				// deferring (no kill, no macFUSE thrash). BUT juicefs's own
