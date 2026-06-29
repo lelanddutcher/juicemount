@@ -498,6 +498,12 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		// FUSE yet. Without this, Stat reports the Create-time size 0 until
 		// the next Redis reconcile.
 		drainer.SetOnDrainComplete(h.onSpoolDrained)
+		// Post-materialize hook: once a deferred offline symlink is os.Symlink'd
+		// onto FUSE at reconnect, clear its LocalOnly flag — it's now a real
+		// backend entry, so the reconcile prune must treat it like any other
+		// (no longer the "local-only, don't prune" exemption). The drainer can't
+		// reach the entries store directly, so it calls back here.
+		drainer.SetOnSymlinkMaterialized(h.onSymlinkMaterialized)
 	}
 	if spool != nil {
 		// NFS closes the file after every WRITE RPC, so finalize is driven
@@ -553,6 +559,19 @@ func (h *JuiceMountHandler) onSpoolDrained(nfsPath string, size int64) {
 	h.publishEvent(metadata.MetadataEvent{
 		Op: "create", Path: nfsPath, Size: size, Mtime: now.Unix(), Inode: inode,
 	})
+}
+
+// onSymlinkMaterialized runs after the drainer os.Symlinks a deferred offline
+// symlink onto FUSE at reconnect. The link's cache entry was inserted LocalOnly
+// at offline-create time (juiceFS.Symlink); now that it's on the backend, clear
+// that flag so the reconcile prune treats it as a normal entry. Best-effort: a
+// ClearLocalOnly failure just leaves the entry flagged local-only (browsable,
+// merely prune-exempt) until the next reconcile — never a copy failure.
+func (h *JuiceMountHandler) onSymlinkMaterialized(linkPath string) {
+	if err := h.store.ClearLocalOnly(linkPath); err != nil {
+		jmlog.Warn("onSymlinkMaterialized: clear local_only failed",
+			"path", linkPath, "error", err.Error())
+	}
 }
 
 // SetRedisClient attaches a Redis client for publishing metadata events.
@@ -2343,30 +2362,61 @@ func (jfs *juiceFS) Symlink(target, link string) error {
 	link = strings.TrimPrefix(link, "/")
 
 	fusePath := jfs.fullPath(link)
-	if err := os.Symlink(target, fusePath); err != nil {
-		// os.Symlink wraps the syscall errno in *os.LinkError; the onSymlink
-		// wire layer already pre-checks existence and maps to NFSStatusExist,
-		// but map here too so a direct/raced EEXIST is reported faithfully
-		// (onSymlink turns a generic error into NFSStatusAccess otherwise).
-		if os.IsExist(err) {
-			return os.ErrExist
+
+	// Create on FUSE — but NOT when offline. A FUSE symlink needs JuiceFS→Redis/
+	// backend, which is unreachable offline; the call fails and the onSymlink
+	// wire layer maps the error to NFSStatusAccess → Finder aborts the WHOLE
+	// bundle copy with "you don't have permission to access some of the items".
+	// That breaks copying ANY package with internal symlinks (.app, .framework,
+	// .fcpbundle, Premiere/Resolve projects) while offline — a real offline-
+	// ingest workflow. So offline we mirror MkdirAll's lazy-creation pattern:
+	// DON'T os.Symlink; record the link in the metadata cache below (LocalOnly,
+	// for instant NFS visibility AND reconcile-prune protection) and PERSIST
+	// (link, target) so it survives an app restart AND the drainer materializes
+	// it on FUSE at reconnect (see Drainer.materializePendingSymlinks). The copy
+	// succeeds; the backend catches up online.
+	offline := pin.IsOffline()
+	if !offline {
+		if err := os.Symlink(target, fusePath); err != nil {
+			// os.Symlink wraps the syscall errno in *os.LinkError; the onSymlink
+			// wire layer already pre-checks existence and maps to NFSStatusExist,
+			// but map here too so a direct/raced EEXIST is reported faithfully
+			// (onSymlink turns a generic error into NFSStatusAccess otherwise).
+			if os.IsExist(err) {
+				return os.ErrExist
+			}
+			return err
 		}
-		return err
+	} else if jfs.handler.spool != nil {
+		// PERSIST the deferred link BEFORE inserting into the cache, so a crash
+		// in the (instant) window between the two leaves a durable record rather
+		// than a cache-only link that vanishes on restart with nothing to
+		// materialize. UPSERT keyed on link_path: a re-created link just updates
+		// the target. A nil spool means spool/offline-defer is disabled, so we
+		// fall through to the in-memory mirror only (best-effort, non-durable) —
+		// the same posture MkdirAll has with no spool wired.
+		if err := jfs.handler.spool.Meta().PutPendingSymlink(link, target); err != nil {
+			return err
+		}
 	}
 
 	// Mirror the new symlink into the metadata cache so it is instantly
 	// visible to LOOKUP/GETATTR/READDIR/handle-resolution — same pattern as
-	// Create's InsertToCache + synthetic inode + async SQLite write. We Lstat
-	// the freshly-created link (NOT Stat — Stat follows the link and a dangling
-	// target would ENOENT) to capture its real size/mtime; the Entry's Mode
-	// carries os.ModeSymlink so a cache-hit Lstat reports type=symlink and NFS
-	// clients then issue READLINK. Lstat failure is non-fatal: the link IS on
-	// FUSE, so fall back to a zero-size/now entry rather than failing the RPC.
+	// Create's InsertToCache + synthetic inode + async SQLite write. Online we
+	// Lstat the freshly-created link (NOT Stat — Stat follows the link and a
+	// dangling target would ENOENT) to capture its real size/mtime; the Entry's
+	// Mode carries os.ModeSymlink so a cache-hit Lstat reports type=symlink and
+	// NFS clients then issue READLINK. Lstat failure is non-fatal: the link IS
+	// on FUSE, so fall back to a zero-size/now entry. Offline there is no on-FUSE
+	// link to Lstat, so we use a zero-size/now entry directly (the link byte size
+	// is cosmetic for NFS type classification — READLINK serves the real target).
 	now := time.Now()
 	var size int64
-	if fi, err := os.Lstat(fusePath); err == nil {
-		size = fi.Size()
-		now = fi.ModTime()
+	if !offline {
+		if fi, err := os.Lstat(fusePath); err == nil {
+			size = fi.Size()
+			now = fi.ModTime()
+		}
 	}
 	e := metadata.MakeEntry(link, false, size, now, jfs.handler.nextSyntheticInode())
 	e.Mode = (e.Mode &^ os.ModeType) | os.ModeSymlink
@@ -2391,7 +2441,24 @@ func (jfs *juiceFS) Symlink(target, link string) error {
 // correct NFS status.
 func (jfs *juiceFS) Readlink(link string) (string, error) {
 	link = strings.TrimPrefix(link, "/")
-	return os.Readlink(jfs.fullPath(link))
+	target, err := os.Readlink(jfs.fullPath(link))
+	if err == nil {
+		return target, nil
+	}
+	// Offline-defer fallback: a symlink created while offline was NOT written to
+	// FUSE (juiceFS.Symlink defers it), so os.Readlink ENOENTs until the drainer
+	// materializes it on reconnect. Serve the verbatim target from the pending-
+	// symlink store so READLINK succeeds during an offline bundle copy (the
+	// client issues READLINK right after the SYMLINK it just made). Only consult
+	// the store on a not-exist error and only when a spool is wired — a genuine
+	// EINVAL (not a symlink) or other error must still propagate so onReadLink
+	// maps it faithfully.
+	if os.IsNotExist(err) && jfs.handler.spool != nil {
+		if t, gerr := jfs.handler.spool.Meta().GetPendingSymlink(link); gerr == nil {
+			return t, nil
+		}
+	}
+	return target, err
 }
 func (jfs *juiceFS) Chroot(p string) (billy.Filesystem, error) {
 	return nil, fmt.Errorf("not supported")

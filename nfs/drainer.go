@@ -53,6 +53,11 @@ type Drainer struct {
 	stop   chan struct{}
 	done   chan struct{}
 
+	// started gates Stop's wait on d.done: set true by Start (which launches
+	// the dispatcher that closes d.done). Without it, Stop on a never-started
+	// drainer would block forever on <-d.done.
+	started atomic.Bool
+
 	inFlight sync.WaitGroup
 
 	metrics DrainerMetrics
@@ -63,6 +68,14 @@ type Drainer struct {
 	// the metadata cache. Worker goroutines read it after Start, so
 	// set-before-Start provides the happens-before (no lock needed).
 	onDrainComplete func(nfsPath string, size int64)
+
+	// onSymlinkMaterialized, if set, is invoked after a deferred offline
+	// symlink is os.Symlink'd onto FUSE at reconnect. Set once via
+	// SetOnSymlinkMaterialized BEFORE Start; the handler uses it to
+	// ClearLocalOnly on the link's cache entry (the link is now on the
+	// backend, no longer local-only). The dispatcher goroutine reads it on
+	// the reconnect edge, so set-before-Start provides the happens-before.
+	onSymlinkMaterialized func(linkPath string)
 
 	// atRestVerify gates the post-copy at-rest SHA re-read (re-opening the
 	// just-written file through JuiceFS and re-hashing it). Default OFF: with
@@ -171,6 +184,7 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 // Drainer.Start) are picked up immediately rather than waiting for
 // the first pollFallback tick.
 func (d *Drainer) Start() {
+	d.started.Store(true)
 	d.spool.SetDrainerWake(d.wakeNonBlocking)
 	d.wakeNonBlocking()
 	go d.dispatchLoop()
@@ -183,6 +197,19 @@ func (d *Drainer) Start() {
 //
 // Idempotent — second call returns immediately with true.
 func (d *Drainer) Stop(deadline time.Duration) bool {
+	// Never started: there's no dispatcher to wait on (d.done is never closed
+	// without Start), so closing d.stop and blocking on <-d.done would deadlock.
+	// A constructed-but-unstarted drainer has nothing in flight — return clean.
+	// (SetSpool wires a drainer that the binary always Starts; this guards the
+	// degenerate path and keeps Stop safe for tests/short-lived instances.)
+	if !d.started.Load() {
+		select {
+		case <-d.stop:
+		default:
+			close(d.stop)
+		}
+		return true
+	}
 	select {
 	case <-d.stop:
 		return true
@@ -213,6 +240,13 @@ func (d *Drainer) Metrics() *DrainerMetrics { return &d.metrics }
 // after the row is marked done. Must be called BEFORE Start.
 func (d *Drainer) SetOnDrainComplete(fn func(nfsPath string, size int64)) {
 	d.onDrainComplete = fn
+}
+
+// SetOnSymlinkMaterialized registers a callback invoked once per deferred
+// offline symlink after it is materialized on FUSE at reconnect. Must be
+// called BEFORE Start (read by the dispatcher on the reconnect edge).
+func (d *Drainer) SetOnSymlinkMaterialized(fn func(linkPath string)) {
+	d.onSymlinkMaterialized = fn
 }
 
 // wakeNonBlocking is the callback handed to SpoolStore.SetDrainerWake.
@@ -271,6 +305,11 @@ func (d *Drainer) dispatchLoop() {
 			} else if n > 0 {
 				log.Printf("drainer: reconnect requeued %d failed spool row(s)", n)
 			}
+			// Symlinks created offline were deferred (juiceFS.Symlink does NOT
+			// os.Symlink while offline); materialize them on FUSE now that the
+			// backend is reachable. This is the symlink analogue of the file
+			// drain — same reconnect path, same offline→online recovery.
+			d.materializePendingSymlinks()
 		}
 
 		// Drain all currently-ready rows before going back to sleep.
@@ -304,6 +343,66 @@ func (d *Drainer) dispatchLoop() {
 				}
 			}
 		}
+	}
+}
+
+// materializePendingSymlinks creates, on the FUSE mount, every symlink that was
+// deferred while offline (juiceFS.Symlink persists (link, target) instead of
+// os.Symlink'ing when the backend is unreachable). Called on the reconnect edge,
+// alongside RetryFailed — the symlink half of offline→online recovery.
+//
+// For each persisted link: os.Symlink(target, fuseRoot/link), then clear the
+// link's LocalOnly flag (via onSymlinkMaterialized → store.ClearLocalOnly) and
+// drop the pending row. Idempotent and crash-safe:
+//   - An os.IsExist link (already materialized, or a concurrent online create
+//     beat us) is treated as success — we still clear LocalOnly and delete the
+//     row so the persisted intent doesn't linger.
+//   - A missing parent dir (ENOENT) means the link's directory hasn't been
+//     materialized yet; MkdirAll the parent and retry once. The drainer's file
+//     drain os.MkdirAlls parents too, but a symlink may have no sibling files to
+//     trigger that, so we do it here.
+//   - The row is deleted ONLY after a successful (or already-exists) os.Symlink,
+//     so a crash mid-loop re-materializes the rest next reconnect; a genuine
+//     error leaves the row for the next attempt and is logged, never fatal
+//     (one bad link must not strand the others or the file drain).
+func (d *Drainer) materializePendingSymlinks() {
+	pend, err := d.spool.Meta().ListPendingSymlinks()
+	if err != nil {
+		log.Printf("drainer: reconnect list pending symlinks: %v", err)
+		return
+	}
+	if len(pend) == 0 {
+		return
+	}
+	materialized := 0
+	for _, p := range pend {
+		fusePath := filepath.Join(d.fuseRoot, p.LinkPath)
+		serr := os.Symlink(p.Target, fusePath)
+		if serr != nil && os.IsNotExist(serr) {
+			// Parent dir not present yet — create it and retry once.
+			if mErr := os.MkdirAll(filepath.Dir(fusePath), 0o755); mErr == nil {
+				serr = os.Symlink(p.Target, fusePath)
+			}
+		}
+		if serr != nil && !os.IsExist(serr) {
+			// Transient (e.g. backend flapped back offline mid-materialize):
+			// leave the row for the next reconnect, log, keep going.
+			log.Printf("drainer: materialize symlink %q -> %q: %v", p.LinkPath, p.Target, serr)
+			continue
+		}
+		// On-FUSE now (created, or already existed). Clear LocalOnly so the
+		// reconcile prune treats it as a normal backend entry, then drop the
+		// persisted intent.
+		if d.onSymlinkMaterialized != nil {
+			d.onSymlinkMaterialized(p.LinkPath)
+		}
+		if dErr := d.spool.Meta().DeletePendingSymlink(p.LinkPath); dErr != nil {
+			log.Printf("drainer: delete pending symlink %q: %v", p.LinkPath, dErr)
+		}
+		materialized++
+	}
+	if materialized > 0 {
+		log.Printf("drainer: reconnect materialized %d deferred symlink(s)", materialized)
 	}
 }
 

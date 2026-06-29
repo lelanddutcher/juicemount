@@ -560,6 +560,91 @@ func (s *SpoolStore) DeleteDone(cutoff time.Time) (int64, error) {
 	return n, nil
 }
 
+// PendingSymlink is one persisted offline-created symlink awaiting
+// materialization on the FUSE mount at reconnect. Maps 1:1 to a
+// pending_symlinks row.
+type PendingSymlink struct {
+	ID        int64
+	LinkPath  string // in-mount path of the link (UNIQUE key)
+	Target    string // verbatim target string (relative or absolute)
+	CreatedAt time.Time
+}
+
+// PutPendingSymlink records (linkPath, target) so an offline-created symlink
+// survives an app restart and gets materialized on the FUSE mount when the
+// backend is reachable again. It is an UPSERT keyed on link_path: if the same
+// link is re-created (e.g. a copy re-issued after a cancel), the latest target
+// wins and no duplicate row accumulates — matching os.Symlink's "one link per
+// path" semantics. created_at is refreshed on conflict so the audit ordering
+// reflects the most recent intent.
+func (s *SpoolStore) PutPendingSymlink(linkPath, target string) error {
+	now := time.Now().Unix()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.db.Exec(
+		`INSERT INTO pending_symlinks (link_path, target, created_at)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(link_path) DO UPDATE SET target=excluded.target, created_at=excluded.created_at`,
+		linkPath, target, now,
+	); err != nil {
+		return fmt.Errorf("put pending symlink %q: %w", linkPath, err)
+	}
+	return nil
+}
+
+// GetPendingSymlink returns the persisted target for linkPath, or sql.ErrNoRows
+// if none is pending. The offline Readlink path uses this to serve the target
+// for a not-yet-materialized symlink (os.Readlink on FUSE would ENOENT offline).
+func (s *SpoolStore) GetPendingSymlink(linkPath string) (string, error) {
+	var target string
+	err := s.db.QueryRow(
+		`SELECT target FROM pending_symlinks WHERE link_path=?`, linkPath,
+	).Scan(&target)
+	if err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+// ListPendingSymlinks returns every pending symlink, oldest first, so the
+// drainer's reconnect hook materializes them in creation order. Unfiltered:
+// the table only ever holds links not yet materialized (each is deleted on
+// success), so its size is bounded by the offline working set.
+func (s *SpoolStore) ListPendingSymlinks() ([]PendingSymlink, error) {
+	rows, err := s.db.Query(
+		`SELECT id, link_path, target, created_at FROM pending_symlinks ORDER BY created_at ASC, id ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list pending symlinks: %w", err)
+	}
+	defer rows.Close()
+	var out []PendingSymlink
+	for rows.Next() {
+		var p PendingSymlink
+		var createdAt int64
+		if err := rows.Scan(&p.ID, &p.LinkPath, &p.Target, &createdAt); err != nil {
+			return nil, err
+		}
+		p.CreatedAt = time.Unix(createdAt, 0)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// DeletePendingSymlink removes the row for linkPath once it has been
+// materialized on FUSE (or is otherwise no longer pending — e.g. the link's
+// path was deleted before reconnect). Idempotent: deleting an absent row is a
+// no-op, so a crash between os.Symlink and this delete just re-materializes
+// harmlessly on the next reconnect.
+func (s *SpoolStore) DeletePendingSymlink(linkPath string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.db.Exec(`DELETE FROM pending_symlinks WHERE link_path=?`, linkPath); err != nil {
+		return fmt.Errorf("delete pending symlink %q: %w", linkPath, err)
+	}
+	return nil
+}
+
 // scanSpoolRow is the Scan callback adapter used by Get/ListReady/etc.
 func scanSpoolRow(scan func(...any) error) (*SpoolRow, error) {
 	var r SpoolRow
