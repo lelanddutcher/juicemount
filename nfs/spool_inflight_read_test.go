@@ -120,3 +120,57 @@ func TestSpoolSequentialReadTracksContiguous(t *testing.T) {
 		t.Fatalf("full read: n=%d err=%v, want %d", n, err, 8*65536)
 	}
 }
+
+// TestSpoolFinalizeAdvancesContiguousEnd is the regression test for task #65's
+// CORE bug: under parallel / out-of-order NFS WRITEs, the in-flight contiguousEnd
+// tracker advances only on in-order writes and LAGS far behind writtenEnd (a 1GiB
+// cp was observed stuck at 6MiB). The Stat read-shadow reports contiguousEnd as
+// the file SIZE, so a lagged value made the NFS client cap reads and silently
+// TRUNCATE the tail of a file read while it drained (the client never even issued
+// a tail READ). On finalize the writer has closed and every byte 0..writtenEnd is
+// on disk, so contiguousEnd must advance to writtenEnd → the full file readable.
+func TestSpoolFinalizeAdvancesContiguousEnd(t *testing.T) {
+	s := newTestSpoolStore(t, 0)
+	e, err := s.OpenWrite("/oof.bin")
+	if err != nil {
+		t.Fatalf("OpenWrite: %v", err)
+	}
+
+	// Out-of-order writes that leave contiguousEnd LAGGING: [0,4K), then [8K,12K)
+	// (a hole at [4K,8K) → contiguousEnd stays 4K), then fill [4K,8K). The advance
+	// only bumps contiguousEnd to the filling write's end (8K), NOT past the
+	// already-written [8K,12K), so contiguousEnd lags at 8K while writtenEnd=12K.
+	blk := bytes.Repeat([]byte{0xCD}, 4096)
+	for _, off := range []int64{0, 8192, 4096} {
+		if _, err := e.WriteAt(blk, off); err != nil {
+			t.Fatalf("WriteAt %d: %v", off, err)
+		}
+	}
+	if got := e.WrittenEnd(); got != 12288 {
+		t.Fatalf("WrittenEnd = %d, want 12288", got)
+	}
+	if got := e.ContiguousEnd(); got >= e.WrittenEnd() {
+		t.Fatalf("ContiguousEnd = %d — expected it to LAG behind writtenEnd %d pre-finalize (the bug)", got, e.WrittenEnd())
+	}
+
+	// Finalize (writer closed). Every byte is on disk now → contiguousEnd must
+	// advance to writtenEnd.
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close/finalize: %v", err)
+	}
+	if got := e.ContiguousEnd(); got != 12288 {
+		t.Fatalf("ContiguousEnd after finalize = %d, want 12288 (= writtenEnd); otherwise the Stat shadow reports short and the NFS client truncates the tail", got)
+	}
+
+	// The read shadow now serves the tail that was previously past contiguousEnd.
+	rf := &spoolReadFile{name: "/oof.bin", entry: e}
+	defer rf.Close()
+	tail := make([]byte, 4096)
+	n, err := rf.ReadAt(tail, 8192)
+	if err != nil && err != io.EOF {
+		t.Fatalf("tail ReadAt: %v", err)
+	}
+	if n != 4096 || !bytes.Equal(tail[:n], blk) {
+		t.Fatalf("tail read after finalize: n=%d match=%v, want 4096 + correct bytes (no truncation)", n, bytes.Equal(tail[:n], blk))
+	}
+}

@@ -1981,6 +1981,19 @@ func (e *SpoolEntry) finalizeLocked() error {
 		e.sha256 = e.hasher.Sum(nil)
 	}
 	finalSize := e.writtenEnd
+	// task #65: the writer has CLOSED — every byte it intended to write has landed
+	// on the spool file, so 0..writtenEnd is the complete file (any genuine sparse
+	// gap reads back as zeros, which IS the file's content). The in-flight
+	// contiguousEnd tracker (WriteAt) only advances on in-order writes and LAGS far
+	// behind writtenEnd under parallel / out-of-order NFS WRITEs — a 1GiB cp was
+	// observed stuck at 6MiB. The Stat read-shadow reports contiguousEnd as the
+	// file SIZE, so a lagged value made the NFS client cap reads and silently
+	// TRUNCATE the tail of a file read while it drained (the core #65 bug: the
+	// client never even issued a tail READ). A finalized file has no more writes
+	// coming, so its readable prefix IS its full written extent — advance it.
+	if e.contiguousEnd < e.writtenEnd {
+		e.contiguousEnd = e.writtenEnd
+	}
 	finalSha := e.sha256 // nil if streaming hash was invalidated (out-of-order)
 	finalSpoolFile := e.spoolFile
 	finalID := e.id // capture under mu: rename migration can re-bind id
