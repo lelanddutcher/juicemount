@@ -758,8 +758,22 @@ func (fm *FUSEManager) isMountedLocked() bool {
 		return false
 	}
 
-	// Check 2: actually responsive — try listing the directory.
-	// A stale FUSE mount (dead process) will hang on any fs operation.
+	// Check 2: actually responsive — try listing the directory. A stale FUSE
+	// mount (dead daemon) hangs on any fs op. Kept as a root readdir (NOT the
+	// .config probe) because this same check gates LAUNCH readiness via
+	// waitForMount: right after `juicefs mount -d` the dir is listable before the
+	// .config control file is served, so a .config probe here false-fails the
+	// launch verification. Pure-read, no side-effect umount (QA-34 Slice 2): the
+	// monitorLoop owns the remount decision with its failure tolerance.
+	//
+	// task #72: this 5s readdir DOES flip to "stale" under backend slowness /
+	// cold-start warm, but the DESTRUCTIVE remount is gated by the escalation-
+	// confirm probe (mountResponsiveWithin), which reads the in-memory .config and
+	// so never trips on data-path slowness — a slow-but-alive mount is NEVER
+	// SIGKILLed even though this 5s readdir over-reports "stale" under load. (The
+	// residual cosmetic false "degraded" during heavy load is acceptable; the
+	// watchdog defers to the .config confirm, never destroys on this 5s probe. See
+	// mountResponsiveWithin for why .config beat a generous readdir here.)
 	done := make(chan bool, 1)
 	go func() {
 		_, err := os.ReadDir(fm.cfg.MountPoint)
@@ -769,25 +783,6 @@ func (fm *FUSEManager) isMountedLocked() bool {
 	case ok := <-done:
 		return ok
 	case <-time.After(5 * time.Second):
-		// QA-34 Slice 2 (2026-05-25): no longer fires a side-effect
-		// `umount -f` from inside this health probe.
-		//
-		// History of the bug: isMountedLocked is the leaf "is the mount
-		// healthy right now" check, called by the monitorLoop AND by
-		// any other code path that wants a snapshot. Pre-fix, a 5-second
-		// ReadDir timeout would trigger a fire-and-forget `umount -f`
-		// as a hidden side effect — which bypassed QA-33's 30-second
-		// consecutive-failure tolerance entirely. Under sustained
-		// writes, juicefs does fsync flushes that can take 15-30 s
-		// (observed: 16.86 s in production), during which ReadDir
-		// against the mount point hangs. The hidden umount then races
-		// the in-flight fsync, fails-or-succeeds depending on timing,
-		// and either way kills the daemon mid-write.
-		//
-		// New rule: this function is pure-read. It returns false on
-		// timeout and lets monitorLoop (which honors the consecutive-
-		// failure tolerance) decide whether to actually remount. The
-		// 5-second probe timeout stays so callers don't block forever.
 		log.Printf("[fuse] mount at %s is unresponsive (stale); reporting unhealthy. Remount decision deferred to monitorLoop.", fm.cfg.MountPoint)
 		return false
 	}
@@ -804,15 +799,46 @@ func (fm *FUSEManager) isMountedLocked() bool {
 // answers within 25s; a genuinely wedged one never does.
 const fuseConfirmProbeTimeout = 25 * time.Second
 
-// mountResponsiveWithin returns true if an os.ReadDir of the mount point
-// completes without error inside timeout. Same probe as isMountedLocked's
-// Check 2 but with a caller-chosen budget; used to CONFIRM wedged-ness before
-// an escalation remount. Safe to call without fm.mu (touches no fm state).
+// mountResponsiveWithin returns true (responsive → DEFER the destructive remount)
+// if juicefs answers a bounded .config read inside timeout. Safe to call without
+// fm.mu (touches no fm state).
+//
+// DELIBERATELY a .config (LIVENESS) probe, NOT a data-path readdir — empirically
+// grounded (2026-06-29). Three iterations were tried as the escalation-confirm:
+//
+//  1. root readdir (original) — false-SIGKILLs a slow-but-alive mount whenever a
+//     readdir exceeds the confirm window under transient load.
+//  2. root readdir gated by the GENEROUS 25s/45s/90s class window (the "obvious"
+//     fix an adversarial review recommended) — STILL false-escalated: during the
+//     cold-start metadata-sync burst the root readdir momentarily exceeded even
+//     25s, so the watchdog SIGKILLed a PERFECTLY HEALTHY juicefs (verified
+//     seconds later with escalation suppressed: readdir 130ms, reads 13ms, full
+//     bytes) and the follow-up remount then failed ("mount not ready after 15s")
+//     → a stuck no-mount loop. Destroying healthy mounts is the exact regression
+//     tasks #13/#72 exist to PREVENT, so this is strictly worse than (3).
+//  3. .config (this) — juicefs serves it from memory with NO backend round-trip,
+//     so it answers whenever the process + FUSE session are alive and hangs only
+//     on a TOTAL session death. It never false-trips on data-path slowness, so it
+//     never SIGKILLs a healthy mount; in the common case .config-healthy tracks
+//     data-path-healthy (verified: readdir 130ms / reads 13ms while .config OK).
+//
+// KNOWN LIMITATION (tracked as a #72 follow-up): a .config probe cannot see the
+// RARE "juicefs alive but backend CONNECTION wedged" shape (.config answers while
+// readdir hangs — the 2026-06-01 event). There this defers and the mount does not
+// auto-recover; manual app restart is the recovery. Accepted for now because
+// (a) it is rare, (b) the escalation's remount is itself currently broken ("mount
+// not ready after 15s"), so detecting the wedge would not recover it anyway, and
+// (c) the alternative (readdir-confirm) destroys HEALTHY mounts in the COMMON
+// case. The proper fix is a SEPARATE sustained-data-path-stall counter (escalate
+// only after readdir hangs for MINUTES while .config stays live) PLUS a fix for
+// the broken remount — both deferred to the follow-up, not rushed into a release.
 func (fm *FUSEManager) mountResponsiveWithin(timeout time.Duration) bool {
 	done := make(chan bool, 1)
 	go func() {
-		_, err := os.ReadDir(fm.cfg.MountPoint)
-		done <- (err == nil)
+		// Content OR a prompt error both mean juicefs ANSWERED (alive); only a
+		// genuine session death hangs this read, and then the select times out.
+		_, _ = os.ReadFile(fm.cfg.MountPoint + "/.config")
+		done <- true
 	}()
 	select {
 	case ok := <-done:
