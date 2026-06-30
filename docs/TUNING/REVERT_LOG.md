@@ -79,3 +79,31 @@ testing-feedback discipline).
   remove the LSEnvironment key (or set notify-keyspace-events empty on the NAS → auto-fallback
   to the classic 30s SCAN). The core auto-detects via CONFIG GET, so the flag is dormant unless
   the NAS Redis has notify-keyspace-events sufficient (K && (A || (g && h))).
+
+---
+
+## 2026-06-30 — Demoted-SCAN backstop lengthened to ~15-30m (keyspace-push reliance)
+
+**What:** With keyspace-push proven engaged on the live NAS (subscribed + per-dir
+reconcile observed live), lengthen the DEMOTED periodic full-SCAN backstop from
+10/15/5m (LAN/WiFi/tunnel) to 15/20/15m. Field testing (remote/WAN) showed the
+~5m WAN SCAN "rebuilding the index every ~5 min" was too eager and churned the
+438MB mirror (177MB WAL) into user-visible periodic sluggishness. The push
+(real-time per-dir d-key reconcile) is the live path; the SCAN is only a
+missed-event safety net.
+
+**Safety (unchanged):** when push DROPS, `keyspaceLoop` calls
+`setEngagement(keyspaceDegraded)` which resets the cadence to
+`DefaultReconcileInterval` (30s) until push re-engages, so the long backstop only
+ever applies WHILE PUSH IS HEALTHY + REACHABLE. tunnel stays <= lan/wifi.
+
+**Kill switch (env, no rebuild):**
+
+| `JM_RECONCILE_BACKSTOP_SEC` | Effect |
+|---|---|
+| unset / `0` (default) | class-gated 15/20/15m (LAN/WiFi/tunnel) |
+| positive integer N | force N-second backstop for ALL classes (`300` restores the prior 5m tunnel cap; `900` = 15m everywhere; `1800` = 30m) |
+
+**Full revert:** `JM_METADATA_KEYSPACE_PUSH=0` (disables push → 30s SCAN,
+byte-identical to pre-keyspace-push) OR `JM_RECONCILE_BACKSTOP_SEC=300`. Baseline:
+keyspace.go backstopForClass 10/15/5m.

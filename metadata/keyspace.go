@@ -180,14 +180,47 @@ func reachableNow() bool {
 // still a 6x+ reduction from the old 30s cadence (the link-saturation fix holds),
 // while bounding attr drift to <=5 min and a missed-delete ghost to
 // PruneThreshold x 5 min instead of x 45 min. See QA residual risks / REVERT_LOG.
+// reconcileBackstopOverride forces the demoted periodic-SCAN backstop to a
+// caller-chosen interval for ALL link classes when JM_RECONCILE_BACKSTOP_SEC is a
+// positive integer. Field-tuning kill switch per the cellular-revert-safety
+// doctrine (env-overridable + logged; record changes in docs/TUNING/REVERT_LOG.md).
+// 0 / unset keeps the class-gated defaults below.
+func reconcileBackstopOverride() (time.Duration, bool) {
+	if v := os.Getenv("JM_RECONCILE_BACKSTOP_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second, true
+		}
+	}
+	return 0, false
+}
+
+// backstopForClass returns the DEMOTED periodic full-SCAN cadence used while
+// keyspace-push is engaged. The push (real-time per-dir d-key reconcile) is the
+// live path; this SCAN is only a missed-event safety net, so it is a long
+// interval. SAFETY: if push DROPS, keyspaceLoop calls setEngagement(degraded)
+// which resets the cadence to DefaultReconcileInterval (30s) until push
+// re-engages — so a long value here only ever applies WHILE PUSH IS HEALTHY,
+// and a real outage still converges fast on reconnect.
+//
+// Lengthened 2026-06-30 (from 10/15/5 min) after field testing: the SCAN
+// "rebuilding the index every ~5 min" over WAN was too eager and churned the
+// 438MB mirror (177MB WAL) — visible to the user as periodic sluggishness. With
+// push proven engaged on the live NAS (subscribed + per-dir reconcile), the SCAN
+// can safely be rare. Tunable live via JM_RECONCILE_BACKSTOP_SEC.
 func backstopForClass(c linkClass) time.Duration {
+	if d, ok := reconcileBackstopOverride(); ok {
+		return d
+	}
 	switch c {
 	case classLAN:
-		return 10 * time.Minute
-	case classWiFi:
 		return 15 * time.Minute
-	default: // tunnel / cellular / WAN — capped low to bound staleness windows
-		return 5 * time.Minute
+	case classWiFi:
+		return 20 * time.Minute
+	default: // tunnel / cellular / WAN — the SCAN is MOST expensive here (377k
+		// rows over the tunnel), so a long backstop helps most; a missed push
+		// event for a dir is re-covered by that dir's next d-key event, and a true
+		// push drop snaps the cadence back to 30s (setEngagement above).
+		return 15 * time.Minute
 	}
 }
 

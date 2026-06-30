@@ -221,28 +221,39 @@ func TestCurrentLinkClassBands(t *testing.T) {
 }
 
 func TestBackstopAndTuningOrdering(t *testing.T) {
-	// Tunnel/cellular MUST get the longest backstop and loosest coalescing —
-	// that is the motivation (rare cellular SCAN) — but the cellular SCAN is
-	// CAPPED LOW, not maximally rare, to bound staleness.
-	// Every class demotes the SCAN well below the 30s DISABLED cadence:
+	// With keyspace-push engaged, the periodic full SCAN is only a missed-event
+	// backstop, so every class demotes it to a LONG interval in the intended
+	// 15-30m range (lengthened 2026-06-30 from 10/15/5m after field testing showed
+	// the ~5m WAN SCAN "rebuilding every 5 min" was too eager + churned the mirror).
+	// All stay well above the 30s DISABLED/DEGRADED cadence; staleness from a
+	// missed push event is bounded by that dir's next d-key event, and a real push
+	// DROP snaps the cadence back to 30s (the unreachable/DEGRADED cases below).
 	for _, c := range []linkClass{classLAN, classWiFi, classTunnel} {
-		if backstopForClass(c) <= DefaultReconcileInterval {
-			t.Errorf("class %v backstop %v must exceed the 30s DISABLED cadence", c, backstopForClass(c))
+		b := backstopForClass(c)
+		if b <= DefaultReconcileInterval {
+			t.Errorf("class %v backstop %v must exceed the 30s DISABLED cadence", c, b)
+		}
+		if b < 10*time.Minute || b > 30*time.Minute {
+			t.Errorf("class %v backstop %v out of the intended ~15-30m demoted-SCAN range", c, b)
 		}
 	}
-	// Tunnel/cellular is CAPPED LOW (<= lan/wifi), NOT the longest. The cap bounds
-	// the backstop-only staleness windows (foreign in-place attr edits + a delete
-	// missed during a reconnect gap) on the flap-prone metered link to minutes,
-	// not hours, while still making the expensive cellular SCAN rare vs the old
-	// constant 30s cadence.
+	// Tunnel/cellular stays <= lan/wifi (never the LONGEST): its SCAN is the most
+	// expensive (377k rows over the tunnel) AND push is flappiest there, so a
+	// missed in-place attr edit / reconnect-gap delete is caught soonest on the
+	// link most likely to miss one.
 	if backstopForClass(classTunnel) > backstopForClass(classLAN) ||
 		backstopForClass(classTunnel) > backstopForClass(classWiFi) {
-		t.Errorf("tunnel backstop must be capped <= lan/wifi: lan=%v wifi=%v tunnel=%v",
+		t.Errorf("tunnel backstop must be <= lan/wifi: lan=%v wifi=%v tunnel=%v",
 			backstopForClass(classLAN), backstopForClass(classWiFi), backstopForClass(classTunnel))
 	}
-	if backstopForClass(classTunnel) != 5*time.Minute {
-		t.Errorf("tunnel/cellular backstop must be the 5m staleness cap, got %v", backstopForClass(classTunnel))
+	// JM_RECONCILE_BACKSTOP_SEC overrides every class (field-tuning kill switch).
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "1800")
+	for _, c := range []linkClass{classLAN, classWiFi, classTunnel} {
+		if got := backstopForClass(c); got != 30*time.Minute {
+			t.Errorf("env override: class %v backstop = %v, want 30m", c, got)
+		}
 	}
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "")
 	// Coalescing is still LOOSER on the metered link (fewer, larger batches).
 	if !(tuningForClass(classLAN).debounce < tuningForClass(classTunnel).debounce) {
 		t.Error("tunnel debounce should be looser than LAN")
