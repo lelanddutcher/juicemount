@@ -1600,6 +1600,22 @@ func (e *SpoolEntry) ContiguousEnd() int64 {
 	return n
 }
 
+// ReadableBounds returns the contiguous-written prefix end (cend — the readable
+// boundary) and the high-water written end (wend — the highest offset any WRITE
+// has reached) in a SINGLE RLock, so a read past cend is classified against a
+// CONSISTENT snapshot: cend<=off<wend is a still-fillable in-flight hole (an
+// out-of-order / preallocated writer hasn't filled it yet) → JUKEBOX-hold; off>=
+// wend is a genuine past-end (the file may still grow) → EOF. Taking both fields
+// under one lock avoids a transient cend>wend mis-read that two separate getters
+// could expose to the read classifier (task #65). No I/O under the lock.
+func (e *SpoolEntry) ReadableBounds() (cend, wend int64) {
+	e.mu.RLock()
+	cend = e.contiguousEnd
+	wend = e.writtenEnd
+	e.mu.RUnlock()
+	return
+}
+
 // Sync fsyncs the spool file to stable storage WITHOUT finalizing the entry —
 // the writer may continue. This is the NFS COMMIT / FILE_SYNC durability
 // barrier: it makes the data written so far survive a power loss (a plain

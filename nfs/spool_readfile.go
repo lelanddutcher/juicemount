@@ -6,6 +6,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 )
 
 // spoolReadFile is the billy.File returned by juiceFS.OpenFile when a
@@ -85,17 +87,36 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.ensureFDLocked(); err != nil {
+		// GAP A (task #65) — the drain-evict race: the spool file was unlinked
+		// after our LookupActive hit but before this first read opened its fd. The
+		// bytes are already in FUSE at the PUBLISHED size (the drainer publishes
+		// the real size BEFORE it evicts+unlinks), so signal the protocol layer to
+		// make the client REOPEN onto the drained copy (NFS3ERR_NOENT) rather than
+		// fail the read — a terminal NFSStatusIO here would abort the copy (100060).
+		if os.IsNotExist(err) {
+			return 0, pin.ErrSpoolDrained
+		}
 		return 0, err
 	}
 	// Never serve bytes from an unwritten region of an in-flight file. A
 	// preallocated (ftruncate) or out-of-order write leaves a hole that a raw
 	// pread returns as ZEROS with err=nil — indistinguishable from real data,
 	// so an NLE reading a still-copying clip renders black frames / corrupt
-	// RAW. Clamp every read to the contiguous-written prefix; anything beyond
-	// it is not on disk yet, so report EOF at that boundary (the file appears
-	// to grow, the client re-stats and reissues) rather than fabricate zeros.
-	cend := f.entry.ContiguousEnd()
+	// RAW. Clamp every read to the contiguous-written prefix and classify a
+	// past-prefix offset against a CONSISTENT (cend,wend) snapshot.
+	cend, wend := f.entry.ReadableBounds()
 	if off >= cend {
+		// GAP B (task #65): at/past the readable prefix. If there are still-
+		// expected bytes below the high-water (a not-yet-filled in-flight hole)
+		// and the writer is still active, HOLD (JUKEBOX via the sentinel) — a
+		// short/EOF read here would let the client treat a partially-arrived file
+		// as COMPLETE (silent truncation). A genuine past-end (off>=wend, the file
+		// merely appears to grow) — or a writer gone silent past the stall window
+		// (wedged/abandoned, the partial is the best available) — reports io.EOF
+		// as before, so the client re-stats and reissues / accepts the partial.
+		if off < wend && time.Since(f.entry.LastWrite()) < pin.SpoolIncompleteStallWindow {
+			return 0, pin.ErrSpoolIncomplete
+		}
 		return 0, io.EOF
 	}
 	if int64(len(p)) > cend-off {
@@ -107,6 +128,22 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 	// contiguousEnd) keeps the client coherent, so a true past-end read above
 	// returns io.EOF and a clamped read returns the available bytes.
 	return n, err
+}
+
+// IncompleteAt implements the internal/nfs incompleteReader gate. It reports
+// whether a read at off would land in a not-yet-written hole of a STILL-ARRIVING
+// file: at/past the readable contiguous prefix (off>=cend) but below the
+// high-water of expected bytes (off<wend), with the writer still active. onRead
+// calls this on its SIZE-CLAMP path — where Count is zeroed for off>=size and
+// ReadAt is therefore never reached for reads above CheckRead — so the JUKEBOX
+// hold must be decided here too. Mirrors ReadAt's boundary classification exactly
+// (task #65). Cheap: one RLock via ReadableBounds + an atomic LastWrite load.
+func (f *spoolReadFile) IncompleteAt(off int64) bool {
+	cend, wend := f.entry.ReadableBounds()
+	if off < cend || off >= wend {
+		return false
+	}
+	return time.Since(f.entry.LastWrite()) < pin.SpoolIncompleteStallWindow
 }
 
 // Seek updates the logical position.

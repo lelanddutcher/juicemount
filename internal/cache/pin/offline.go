@@ -174,6 +174,39 @@ func WithinOfflineReadStallWindow() bool {
 	return time.Since(since) < OfflineReadStallWindow
 }
 
+// ErrSpoolIncomplete signals an NFS read landed at/past the contiguous-written
+// prefix of a file STILL ARRIVING in the write spool, with not-yet-written bytes
+// still expected below the high-water mark (off in [contiguousEnd, writtenEnd)).
+// The NFS read path (internal/nfs/nfs_on read) maps it to NFS3ERR_JUKEBOX so the
+// kernel client HOLDS and retries until the bytes land / the file drains — never
+// EOF, which would let a client treat a partially-arrived file as COMPLETE
+// (silent truncation, task #65). Cross-package sentinel (the nfs-side spool read
+// handle returns it; internal/nfs recognizes it) — same pattern as
+// ErrOfflineNotAvailable, avoiding an internal/nfs <- nfs import cycle.
+var ErrSpoolIncomplete = errors.New("spool: read offset not yet written (in-flight)")
+
+// IsSpoolIncomplete reports whether err is (or wraps) ErrSpoolIncomplete.
+func IsSpoolIncomplete(err error) bool { return errors.Is(err, ErrSpoolIncomplete) }
+
+// ErrSpoolDrained signals the spool file was evicted + unlinked (drain
+// completed) between a read's LookupActive hit and its first fd open — the
+// drain-evict race. The bytes are now in FUSE at the published size (the drainer
+// publishes BEFORE it evicts), so the NFS read path maps this to NFS3ERR_NOENT
+// so the client reissues OPEN and lands on the drained backend copy, rather than
+// a terminal NFSStatusIO that would abort the copy ("error 100060").
+var ErrSpoolDrained = errors.New("spool: file drained+evicted before read (reopen)")
+
+// IsSpoolDrained reports whether err is (or wraps) ErrSpoolDrained.
+func IsSpoolDrained(err error) bool { return errors.Is(err, ErrSpoolDrained) }
+
+// SpoolIncompleteStallWindow bounds how long a read of a not-yet-written spool
+// hole is held with JUKEBOX before giving up (EOF/terminal). Keyed off the
+// entry's LAST WRITE (applied where the entry is available, in the nfs-side read
+// handle): an actively-arriving file holds-and-resumes, but a wedged/abandoned
+// writer (silent past this window) stops beach-balling the client. A var so it
+// can be tuned / env-overridden; mirrors OfflineReadStallWindow's sizing.
+var SpoolIncompleteStallWindow = 90 * time.Second
+
 // OfflineState is a snapshot of the offline subsystem suitable for
 // surfacing to the UI or HTTP metrics endpoint.
 type OfflineState struct {

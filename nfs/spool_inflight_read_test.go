@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"testing"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 )
 
 // TestSpoolInFlightReadNeverServesHoleAsZeros is the regression test for the
@@ -53,11 +55,21 @@ func TestSpoolInFlightReadNeverServesHoleAsZeros(t *testing.T) {
 		t.Fatalf("ReadAt(0): n=%d want %d, bytes match=%v", n, written, bytes.Equal(buf[:n], data))
 	}
 
-	// (2) Read ENTIRELY inside the hole: must be EOF/0 bytes, NEVER zeros.
+	// (2) Read ENTIRELY inside the hole (off in [contiguousEnd, writtenEnd), the
+	// writer still active): 0 bytes — NEVER zeros — and now a JUKEBOX hold
+	// (ErrSpoolIncomplete) rather than EOF (task #65). EOF here would let the
+	// client treat the partially-arrived file as COMPLETE — a silent truncation;
+	// the sentinel makes onRead hold + retry until the bytes land.
 	hole := make([]byte, 16)
 	n, err = rf.ReadAt(hole, allocated/2)
-	if n != 0 || err != io.EOF {
-		t.Fatalf("hole read: got n=%d err=%v, want n=0 err=EOF (must not fabricate zeros)", n, err)
+	if n != 0 || !pin.IsSpoolIncomplete(err) {
+		t.Fatalf("hole read: got n=%d err=%v, want n=0 err=ErrSpoolIncomplete (no zeros, hold-not-EOF)", n, err)
+	}
+	if !rf.IncompleteAt(allocated / 2) {
+		t.Fatalf("IncompleteAt(hole) = false, want true (in-flight hole must JUKEBOX)")
+	}
+	if rf.IncompleteAt(0) {
+		t.Fatalf("IncompleteAt(in-prefix) = true, want false")
 	}
 
 	// (3) Read SPANNING the contiguous boundary: only the written part returns.
@@ -71,6 +83,18 @@ func TestSpoolInFlightReadNeverServesHoleAsZeros(t *testing.T) {
 	}
 	if !bytes.Equal(span[:n], data[written-2048:]) {
 		t.Fatalf("span read returned wrong bytes")
+	}
+
+	// (4) Read at/past the WRITTEN high-water (off >= writtenEnd): a genuine
+	// past-end — the file merely appears to grow — so io.EOF (NOT JUKEBOX), and
+	// IncompleteAt is false there (nothing more is expected below the offset).
+	end := make([]byte, 16)
+	n, err = rf.ReadAt(end, allocated+4096)
+	if n != 0 || err != io.EOF {
+		t.Fatalf("past-end read: got n=%d err=%v, want n=0 err=EOF", n, err)
+	}
+	if rf.IncompleteAt(allocated + 4096) {
+		t.Fatalf("IncompleteAt(past-end) = true, want false")
 	}
 }
 

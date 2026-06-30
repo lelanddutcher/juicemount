@@ -183,6 +183,19 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		// §3.3.6: server should return zero-length result when reading
 		// at or past EOF.
 		if int64(obj.Offset) >= size {
+			// EOF-at-or-past-end — UNLESS this handle is a still-arriving spool
+			// file with a not-yet-written hole at this offset (off in [cend,wend)
+			// with the writer active). Reporting EOF there (Count=0) would let the
+			// client treat a partially-arrived file as COMPLETE — a SILENT
+			// truncation (task #65). The size shadow clamps `size` to the spool's
+			// contiguous prefix and this size-clamp zeroes Count for off>=size, so
+			// the handle's ReadAt is NEVER reached for reads above CheckRead — the
+			// JUKEBOX hold must be decided here. The client holds + retries until
+			// the bytes land / the file drains.
+			if ir, ok := fh.(incompleteReader); ok && ir.IncompleteAt(int64(obj.Offset)) {
+				recordJukebox(inflightOpName(w.req))
+				return &NFSStatusError{NFSStatusJukebox, pin.ErrSpoolIncomplete}
+			}
 			obj.Count = 0
 		} else if size-int64(obj.Offset) < int64(obj.Count) {
 			obj.Count = uint32(size - int64(obj.Offset))
@@ -266,6 +279,19 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		// (see offlineReadRefusal — task #71.)
 		if pin.IsOfflineNotAvailable(ioErr) {
 			return offlineReadRefusal(obj.Offset, w, ioErr)
+		}
+		// task #65 spool-read sentinels — small reads (≤ CheckRead) reach ReadAt
+		// directly, bypassing the size-clamp gate above:
+		//   - incomplete in-flight hole → JUKEBOX hold (client retries until the
+		//     bytes land), same outcome as the size-clamp path.
+		//   - drained+evicted mid-read → NOENT so the client reopens onto the
+		//     now-drained FUSE copy (GAP A), NOT a copy-aborting NFSStatusIO.
+		if pin.IsSpoolIncomplete(ioErr) {
+			recordJukebox(inflightOpName(w.req))
+			return &NFSStatusError{NFSStatusJukebox, ioErr}
+		}
+		if pin.IsSpoolDrained(ioErr) {
+			return &NFSStatusError{NFSStatusNoEnt, ioErr}
 		}
 		return &NFSStatusError{NFSStatusIO, ioErr}
 	}

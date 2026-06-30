@@ -217,6 +217,19 @@ type liveSizer interface {
 	LiveSize() (int64, bool)
 }
 
+// incompleteReader, if implemented by a read handle, reports whether a read at
+// `off` would land in a not-yet-written region of a file that is STILL ARRIVING
+// (the write spool): off is at/past the readable contiguous prefix but below the
+// high-water of expected bytes, and the writer is still active. When true, onRead
+// must JUKEBOX-hold the read (the client retries until the bytes land / the file
+// drains) instead of reporting EOF — reporting EOF at an in-flight hole lets a
+// client treat a partially-arrived file as COMPLETE (silent truncation, task
+// #65). The size-clamp zeroes Count for off >= size and never reaches the handle's
+// ReadAt for large reads, so this gate lives in onRead's size-clamp itself.
+type incompleteReader interface {
+	IncompleteAt(off int64) bool
+}
+
 // tryCachedStat returns a FileAttribute synthesized from a handle's cached
 // info, or nil if the handle didn't supply one. fullPath is used only for
 // the file-id fallback (when Sys() doesn't carry an inode).
