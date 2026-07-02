@@ -237,3 +237,13 @@ cycle with fewer than 2048 candidates finishing under 3s (the normal case).
 incl. -race on the prune tests). **Pending:** live cellular-relay validation
 that a threshold-crossing cycle stays <5s and "Rebuilding index…" clears
 (unit tests give false positives on this codebase per testing discipline).
+
+## 2026-07-02 — U1 serve-first boot (V2.3)
+
+| `JM_BOOT_SYNC_FIRST` | Effect |
+|---|---|
+| unset (default) | NFS + control plane start immediately; initial full-tree SyncOnce runs in the background (syncMu single-flighted). Blocking retained automatically when the mirror is EMPTY (fresh install). |
+| `1` | Restores the pre-U1 blocking order (SyncOnce completes before the NFS server starts). |
+
+**Why:** field "5+ min to first items" — measured 136s of a 141s cellular cold start was the blocking SyncOnce; mirror was already RAM-hydrated. jm5's initial-sync Fatalf also demoted to Warn (K4).
+**Revert:** `JM_BOOT_SYNC_FIRST=1`, or revert the commit.

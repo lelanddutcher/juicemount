@@ -150,7 +150,12 @@ func main() {
 	jmlog.Info("initial metadata sync starting")
 	start := time.Now()
 	if err := rc.SyncOnce(); err != nil {
-		log.Fatalf("Initial sync: %v", err)
+		// V2.3 U1/K4: a transient sync failure (slow WAN, backend hiccup)
+		// must not abort the CLI server — the GUI core only Warns here, the
+		// mirror serves what it has, and rc.Start()'s reconcile loop retries
+		// until the backend answers.
+		jmlog.Warn("initial sync failed — serving existing mirror; reconcile loop retries",
+			"error", err.Error())
 	}
 	count, _ := store.Count()
 	jmlog.Info("initial metadata sync complete",

@@ -591,9 +591,42 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// the dead backend. rc.Start() still launches the reconcile loop, which flips
 	// connected=true and catches up the mirror on its first success once the
 	// backend returns.
+	//
+	// V2.3 U1 (serve-first boot, field report "5+ min to first items"): the
+	// full-tree SyncOnce used to BLOCK here, ahead of the NFS server and the
+	// control plane — 136s of empty Finder over a cellular relay (measured
+	// 2026-07-02: mount up in 5s, everything else waiting on this call). The
+	// mirror is already RAM-hydrated from disk (metadata.Open→rebuildCaches),
+	// so serving it immediately is exactly what offline mode already does;
+	// the sync runs in the background (syncMu single-flights it against the
+	// reconcile loop) and IsSyncing drives the "Rebuilding index…" indicator.
+	// Blocking is kept for: (a) an EMPTY mirror (fresh install / wiped DB) —
+	// there is nothing to serve and an empty Finder tree is worse than a
+	// short wait; (b) JM_BOOT_SYNC_FIRST=1 (kill switch, restores the old
+	// ordering; REVERT_LOG 2026-07-02).
 	if !startedOffline {
-		if err := rc.SyncOnce(); err != nil {
-			jmlog.Warn("initial sync failed", "error", err.Error())
+		bootSyncBlocking := os.Getenv("JM_BOOT_SYNC_FIRST") == "1"
+		if !bootSyncBlocking {
+			if n, cErr := store.Count(); cErr != nil || n == 0 {
+				bootSyncBlocking = true
+			}
+		}
+		if bootSyncBlocking {
+			if err := rc.SyncOnce(); err != nil {
+				jmlog.Warn("initial sync failed", "error", err.Error())
+			}
+		} else {
+			go func() {
+				t0 := time.Now()
+				jmlog.Info("initial metadata sync running in background (serve-first boot)")
+				if err := rc.SyncOnce(); err != nil {
+					jmlog.Warn("background initial sync failed — reconcile loop retries",
+						"error", err.Error())
+					return
+				}
+				jmlog.Info("background initial sync complete",
+					"duration_ms", time.Since(t0).Round(time.Millisecond).Milliseconds())
+			}()
 		}
 	}
 	rc.Start()
