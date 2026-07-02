@@ -379,7 +379,24 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// juicefs invocation entirely. FUSEManager.Mount() also handles this
 	// internally, but we want to avoid even creating a second monitor
 	// goroutine for the same mount.
-	if cfg.FUSEPath != "" {
+	//
+	// S1 (2026-07-02): this block, metadata.Open(), and connectRedisWithRetry
+	// are mutually independent (the mount needs only cfg + backendUp; connect
+	// needs only the opened store), so they are run CONCURRENTLY and JOINED
+	// before srv.Start(). No semantic change — identical work, identical
+	// causal order (store→connect stays serial; the mount overlaps both),
+	// only the ~1.4-7s fm.Mount() and the ~6s Open+~2s connect now overlap
+	// instead of stacking (the ~16s serial boot → ~max(mount, open+connect)).
+	// Extracted into a closure so the parallel and serial (JM_BOOT_PARALLEL=0
+	// kill switch) paths share ONE copy of the mount logic verbatim. Runs
+	// under the already-held globalMu; the only global it writes (globalFUSE /
+	// globalFUSEPath / globalFUSEMetricsAddr) is disjoint from the store lane's
+	// globalStore, and the parent blocks on the join before any other code
+	// reads them, so there is no added race.
+	mountFUSE := func() {
+		if cfg.FUSEPath == "" {
+			return
+		}
 		// Make sure the mount-point directory exists
 		_ = os.MkdirAll(cfg.FUSEPath, 0o755)
 		globalFUSEPath = cfg.FUSEPath
@@ -391,122 +408,119 @@ func NFSServerStart(configJSON *C.char) *C.char {
 
 		if globalFUSE != nil && fuseLooksHealthy(cfg.FUSEPath) {
 			jmlog.Info("juicefs FUSE already mounted, reusing", "path", cfg.FUSEPath)
+			return
+		}
+		// Forward the user's configured cache size to JuiceFS. Without this,
+		// JuiceFS uses an unspecified default and (worse) the user's
+		// preferred cap is silently ignored — see the regression in the
+		// CLI→GUI port where the menu-bar app was passing cache_size in
+		// the JSON config but cbridge never forwarded it.
+		//
+		// FreeSpaceRatio = 0.01 (1%) instead of JuiceFS's default 0.1.
+		// Video editors fill their disks; the default makes the cache
+		// silently disable below 10% free, sending every read straight
+		// to S3 with no warning. 1% is the sweet spot for our use case
+		// — the disk is the cache.
+		// QA-7 followup: if we're entering this branch with a still-
+		// live globalFUSE (e.g. fuseLooksHealthy misfired after
+		// NFSServerStopMount which intentionally preserved it), stop
+		// the old manager FIRST so we don't leak its monitor
+		// goroutine. The old FUSEManager's monitor would otherwise
+		// keep ticking against the now-replaced mount and could
+		// race with the new one. Idempotent — Stop on an already-
+		// stopped manager is a no-op.
+		if globalFUSE != nil {
+			jmlog.Warn("Start: replacing existing globalFUSE that fuseLooksHealthy rejected — stopping the old one first to prevent monitor leak",
+				"path", cfg.FUSEPath)
+			oldFM := globalFUSE
+			globalFUSE = nil
+			oldFM.Stop()
+		}
+		// Pre-read total pinned bytes so the cache-size policy can grow the
+		// cache just enough to keep the pinned set resident. The pin store
+		// proper is opened post-mount (~L413); this brief read-only open is
+		// best-effort — 0 on any error just means "respect the configured
+		// cache size."
+		var pinnedBytes int64
+		if ps, perr := pin.Open(pinStorePath(cfg.DBPath)); perr == nil {
+			if agg, aerr := ps.AggregateStats(); aerr == nil {
+				pinnedBytes = agg.TotalBytes
+			}
+			ps.Close()
+		}
+		fm := health.NewFUSEManager(health.FUSEConfig{
+			RedisURL:        cfg.RedisURL,
+			MountPoint:      cfg.FUSEPath,
+			CacheSize:       cfg.CacheSize,
+			FreeSpaceRatio:  "0.01",
+			BucketOverride:  cfg.BucketOverride,
+			PinnedBytes:     pinnedBytes,
+			FUSEMetricsAddr: health.DefaultFUSEMetricsAddr,
+		})
+		// Tell the block-cache scraper where the FUSE daemon's prometheus
+		// /metrics endpoint is so /cache-status can report the TRUE on-disk
+		// block-cache size (juicefs_blockcache_bytes) as cache_used_bytes.
+		globalFUSEMetricsAddr = fm.EffectiveMetricsAddr()
+		pin.SetBlockCacheMetricsAddr(globalFUSEMetricsAddr)
+		// Start the watchdog and register globalFUSE UNCONDITIONALLY —
+		// even if the initial mount fails (a transient backend blip at
+		// launch). Pre-2026-05-29 this returned before StartMonitor() on
+		// failure, so a launch-time error — especially on a restart that
+		// had just Stopped the previous watchdog (see line ~208) — left the
+		// app with NO FUSE self-heal at all. The watchdog retries once the
+		// backend is reachable; registering globalFUSE keeps a later retry
+		// from leaking a second monitor goroutine.
+		// R-4: skip the SYNCHRONOUS boot-time mount when the backend is
+		// unreachable. juicefs mount needs Redis as its metadata engine, so
+		// fm.Mount() would block up to ~30s before failing — the dominant
+		// offline-boot stall. We still StartMonitor + register globalFUSE so
+		// the watchdog mounts it the moment the backend returns (the same
+		// self-heal path a failed mount already relies on).
+		var mountErr error
+		if backendUp {
+			mountErr = fm.Mount()
+		}
+		fm.StartMonitor()
+		globalFUSE = fm
+		if !backendUp {
+			jmlog.Warn("deferred FUSE mount — backend unreachable at startup; the watchdog will mount it once the backend returns",
+				"path", cfg.FUSEPath)
+		} else if mountErr != nil {
+			// Launch-time mount failed — almost always a transient backend
+			// blip during startup. Do NOT abort startup: the watchdog
+			// (started above) brings FUSE up once the backend is reachable.
+			// Returning here used to leave the app HALF-STARTED — juicefs
+			// recovering in the background but NFS, the metrics/control
+			// server, and the spool never started, so /Volumes/zpool never
+			// mounted and the app looked dead (observed 2026-06-01 under a
+			// blippy link). Continue instead: the app comes up fully,
+			// un-pinned reads fail-fast until FUSE is ready, and the mount
+			// self-heals.
+			jmlog.Error("juicefs FUSE mount failed at launch — continuing startup; watchdog will mount it once the backend is reachable",
+				"error", mountErr.Error())
 		} else {
-			// Forward the user's configured cache size to JuiceFS. Without this,
-			// JuiceFS uses an unspecified default and (worse) the user's
-			// preferred cap is silently ignored — see the regression in the
-			// CLI→GUI port where the menu-bar app was passing cache_size in
-			// the JSON config but cbridge never forwarded it.
-			//
-			// FreeSpaceRatio = 0.01 (1%) instead of JuiceFS's default 0.1.
-			// Video editors fill their disks; the default makes the cache
-			// silently disable below 10% free, sending every read straight
-			// to S3 with no warning. 1% is the sweet spot for our use case
-			// — the disk is the cache.
-			// QA-7 followup: if we're entering this branch with a still-
-			// live globalFUSE (e.g. fuseLooksHealthy misfired after
-			// NFSServerStopMount which intentionally preserved it), stop
-			// the old manager FIRST so we don't leak its monitor
-			// goroutine. The old FUSEManager's monitor would otherwise
-			// keep ticking against the now-replaced mount and could
-			// race with the new one. Idempotent — Stop on an already-
-			// stopped manager is a no-op.
-			if globalFUSE != nil {
-				jmlog.Warn("Start: replacing existing globalFUSE that fuseLooksHealthy rejected — stopping the old one first to prevent monitor leak",
-					"path", cfg.FUSEPath)
-				oldFM := globalFUSE
-				globalFUSE = nil
-				oldFM.Stop()
-			}
-			// Pre-read total pinned bytes so the cache-size policy can grow the
-			// cache just enough to keep the pinned set resident. The pin store
-			// proper is opened post-mount (~L413); this brief read-only open is
-			// best-effort — 0 on any error just means "respect the configured
-			// cache size."
-			var pinnedBytes int64
-			if ps, perr := pin.Open(pinStorePath(cfg.DBPath)); perr == nil {
-				if agg, aerr := ps.AggregateStats(); aerr == nil {
-					pinnedBytes = agg.TotalBytes
-				}
-				ps.Close()
-			}
-			fm := health.NewFUSEManager(health.FUSEConfig{
-				RedisURL:        cfg.RedisURL,
-				MountPoint:      cfg.FUSEPath,
-				CacheSize:       cfg.CacheSize,
-				FreeSpaceRatio:  "0.01",
-				BucketOverride:  cfg.BucketOverride,
-				PinnedBytes:     pinnedBytes,
-				FUSEMetricsAddr: health.DefaultFUSEMetricsAddr,
-			})
-			// Tell the block-cache scraper where the FUSE daemon's prometheus
-			// /metrics endpoint is so /cache-status can report the TRUE on-disk
-			// block-cache size (juicefs_blockcache_bytes) as cache_used_bytes.
-			globalFUSEMetricsAddr = fm.EffectiveMetricsAddr()
-			pin.SetBlockCacheMetricsAddr(globalFUSEMetricsAddr)
-			// Start the watchdog and register globalFUSE UNCONDITIONALLY —
-			// even if the initial mount fails (a transient backend blip at
-			// launch). Pre-2026-05-29 this returned before StartMonitor() on
-			// failure, so a launch-time error — especially on a restart that
-			// had just Stopped the previous watchdog (see line ~208) — left the
-			// app with NO FUSE self-heal at all. The watchdog retries once the
-			// backend is reachable; registering globalFUSE keeps a later retry
-			// from leaking a second monitor goroutine.
-			// R-4: skip the SYNCHRONOUS boot-time mount when the backend is
-			// unreachable. juicefs mount needs Redis as its metadata engine, so
-			// fm.Mount() would block up to ~30s before failing — the dominant
-			// offline-boot stall. We still StartMonitor + register globalFUSE so
-			// the watchdog mounts it the moment the backend returns (the same
-			// self-heal path a failed mount already relies on).
-			var mountErr error
-			if backendUp {
-				mountErr = fm.Mount()
-			}
-			fm.StartMonitor()
-			globalFUSE = fm
-			if !backendUp {
-				jmlog.Warn("deferred FUSE mount — backend unreachable at startup; the watchdog will mount it once the backend returns",
-					"path", cfg.FUSEPath)
-			} else if mountErr != nil {
-				// Launch-time mount failed — almost always a transient backend
-				// blip during startup. Do NOT abort startup: the watchdog
-				// (started above) brings FUSE up once the backend is reachable.
-				// Returning here used to leave the app HALF-STARTED — juicefs
-				// recovering in the background but NFS, the metrics/control
-				// server, and the spool never started, so /Volumes/zpool never
-				// mounted and the app looked dead (observed 2026-06-01 under a
-				// blippy link). Continue instead: the app comes up fully,
-				// un-pinned reads fail-fast until FUSE is ready, and the mount
-				// self-heals.
-				jmlog.Error("juicefs FUSE mount failed at launch — continuing startup; watchdog will mount it once the backend is reachable",
-					"error", mountErr.Error())
-			} else {
-				// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
-				// the *effective* config from the mount, not the user input —
-				// otherwise the user reads "100 GiB" and is confused why the
-				// daemon was actually launched with 800 GiB.
-				jmlog.Info("juicefs FUSE mounted",
-					"path", cfg.FUSEPath,
-					"effective_cache_size_mb", fm.EffectiveCacheSize(),
-					"free_space_ratio", "0.01")
-			}
+			// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
+			// the *effective* config from the mount, not the user input —
+			// otherwise the user reads "100 GiB" and is confused why the
+			// daemon was actually launched with 800 GiB.
+			jmlog.Info("juicefs FUSE mounted",
+				"path", cfg.FUSEPath,
+				"effective_cache_size_mb", fm.EffectiveCacheSize(),
+				"free_space_ratio", "0.01")
 		}
 	}
 
-	// Open metadata store. If this fails, leave FUSE mounted — the next
-	// Start can pick it up. Tearing FUSE down here would force an admin
-	// password prompt on the next attempt, which is hostile.
-	store, err := metadata.Open(cfg.DBPath)
-	if err != nil {
-		return C.CString(fmt.Sprintf("error: open store: %v", err))
+	// openStore opens the metadata store. Fatal on error (as before): a caller
+	// with no store cannot serve nav. The connect lane runs AFTER this (it
+	// needs the opened store), so store→connect stays serial; only the mount
+	// overlaps them.
+	openStore := func() (*metadata.Store, error) {
+		// Open metadata store. If this fails, leave FUSE mounted — the next
+		// Start can pick it up. Tearing FUSE down here would force an admin
+		// password prompt on the next attempt, which is hostile.
+		return metadata.Open(cfg.DBPath)
 	}
-	globalStore = store
 
-	// Connect to Redis with bounded retry. Network can be flaky — wifi/cell
-	// handoffs, sleeping NAS, brief router restart. Without this, a 1s blip
-	// at launch leaves the user staring at "redis: connect: no route to host"
-	// even though the NAS comes back 3 seconds later.
-	//
 	// Retry schedule: 1s, 2s, 4s, 8s, 16s = 5 attempts, ~31s total worst case.
 	// R-4: when the up-front probe already found the backend down, don't burn
 	// those ~31s — one quick attempt, then take the offline-start path.
@@ -514,6 +528,60 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if !backendUp {
 		connectAttempts = 1
 	}
+
+	// S1: run mount ‖ (open → connect). The mount lane never returns from the
+	// function (mount failure is non-fatal, handled inline in mountFUSE); the
+	// store/connect lane can early-return (fatal open error / malformed URL),
+	// so it stays in the main flow where the C-string returns are clean. The
+	// only concurrency is the backgrounded mount; we JOIN it before any code
+	// below reads globalFUSE or reaches srv.Start(). Kill switch
+	// JM_BOOT_PARALLEL=0 runs the original strictly-serial order (mount, then
+	// open, then connect) for a bisect if the orchestration is ever suspected.
+	var store *metadata.Store
+	var rc *metadata.RedisClient
+	var connectErr error
+	if os.Getenv("JM_BOOT_PARALLEL") == "0" {
+		mountFUSE()
+		var openErr error
+		store, openErr = openStore()
+		if openErr != nil {
+			return C.CString(fmt.Sprintf("error: open store: %v", openErr))
+		}
+		globalStore = store
+		// Connect to Redis with bounded retry. Network can be flaky — wifi/cell
+		// handoffs, sleeping NAS, brief router restart. Without this, a 1s blip
+		// at launch leaves the user staring at "redis: connect: no route to host"
+		// even though the NAS comes back 3 seconds later.
+		rc, connectErr = connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
+	} else {
+		var mountWG sync.WaitGroup
+		mountWG.Add(1)
+		go func() {
+			defer mountWG.Done()
+			mountFUSE()
+		}()
+		// Main flow: open the store, then (if it opened) connect — serial
+		// because connect needs the store — while the mount runs concurrently.
+		var openErr error
+		store, openErr = openStore()
+		if openErr != nil {
+			// The mount goroutine writes only its own globals and never returns
+			// from the function; join it so we don't abandon an in-flight mount
+			// goroutine writing globalFUSE after we've released globalMu.
+			mountWG.Wait()
+			return C.CString(fmt.Sprintf("error: open store: %v", openErr))
+		}
+		globalStore = store
+		// Connect to Redis with bounded retry (see the schedule note above).
+		rc, connectErr = connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
+		// JOIN the mount before srv.Start() (preserves pinned-files-instant —
+		// NFS must not serve before the mount lane has registered globalFUSE +
+		// armed the identity gate). Done here, before we touch rc/globalFUSE
+		// below, so every downstream invariant sees the same post-join state as
+		// the serial path.
+		mountWG.Wait()
+	}
+
 	startedOffline := false
 	// Batch-3 adversarial review #8: carry a per-cause reason for the
 	// "started_offline:" status instead of always reusing the R-4 constant —
@@ -522,8 +590,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// slow-backend defer claimed "unreachable" while its own SetAutoOffline
 	// reason said "responding slowly".
 	startOfflineReason := offlineStartReason
-	rc, err := connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
-	if err != nil {
+	if err := connectErr; err != nil {
 		// R-4: do NOT abort. Start offline. A DEFERRED Redis client
 		// (connected=false) keeps every downstream rc.* call site working
 		// unchanged and self-heals via the reconcile loop (which flips

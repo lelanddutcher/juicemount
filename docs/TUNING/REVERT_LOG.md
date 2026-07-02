@@ -49,6 +49,56 @@ and shows no "Rebuilding index…") is the real proof — pending.
 
 ---
 
+## 2026-07-02 — Boot fast-path S1 (parallelize mount ‖ store-open ‖ connect)
+
+Env-revertable without a rebuild. Motivation: `NFSServerStart` booted strictly
+serial — `fm.Mount()` (~1.4-7s) → `metadata.Open()`+hydrate (~6s) →
+`connectRedisWithRetry` (~1-2s) → `srv.Start()` — ~16s before Finder showed
+anything.
+
+**S1 — run the independent boot steps concurrently.** `fm.Mount()`,
+`metadata.Open()`, and `connectRedisWithRetry` are mutually independent (the
+mount needs only `cfg`+`backendUp`; connect needs only the opened store).
+The mount is extracted into a `mountFUSE` closure and run in a goroutine; the
+main flow opens the store then connects (serial — connect needs the store) so
+the mount overlaps both. **No semantic change** — identical work, identical
+causal order (store→connect unchanged), only the mount now overlaps instead of
+stacking. Collapses ~16s serial → ~max(mount, open+connect).
+
+**Ordering / invariants preserved:**
+- The mount is JOINED (`WaitGroup.Wait`) **before** `srv.Start()` — NFS never
+  serves before the mount lane registered `globalFUSE` + armed G0
+  `pin.SetFUSEIdentityPath` (preserves pinned-files-instant; backgrounding the
+  mount past NFS-serve is the separate, out-of-scope **S9**).
+- `srv.Start()` still needs the store OPEN+hydrated; it does NOT need Redis
+  connected (`SetRedisClient` is post-Start already). Connect is joined in the
+  main flow before its result feeds `rc.SetPathConfig`/`SetReconcileInterval`/
+  `rc.Start()`.
+- A fatal `metadata.Open` error still returns (after joining the mount
+  goroutine so we don't abandon an in-flight global write); a mount failure
+  still `StartMonitor`+registers `globalFUSE` UNCONDITIONALLY inside `mountFUSE`
+  (QA-7 monitor-leak guard intact); a malformed-URL connect still takes the
+  deferred-client path. `bootSyncWired`, the R-4 offline path
+  (`backendUp==false` skips `fm.Mount`), `globalMu` discipline, and the
+  reachability liveness hook (reads `globalDrainerAtomic`, never `globalMu`)
+  are untouched. The mount lane and the store lane write disjoint globals
+  (`globalFUSE*` vs `globalStore`) and the parent blocks on the join before any
+  other code reads them, so no new race (`-race` clean).
+
+- **`JM_BOOT_PARALLEL=0`** — kill switch. Runs the three steps strictly serially
+  in the original order (`mountFUSE()` → `openStore()` → `connect`),
+  byte-identical to the pre-S1 flow. Baseline for a bisect if the goroutine
+  orchestration is ever suspected.
+
+**Validated:** the orchestration is not unit-testable in isolation (needs a
+live FUSE mount + Redis); both the parallel and serial paths reuse the SAME
+`mountFUSE`/`openStore`/`connect` calls, covered by the bridge suite. `gofmt`
+clean; `go build ./...` green; `go test -race ./metadata/ ./bridge/ -count=1`
+green. Live boot-timing (the ~16s-to-first-items shrinking to ~max serial over
+a cellular relay) is the real proof — pending.
+
+---
+
 ## 2026-06-28 — Slow-link false-flap fix (drain-liveness probe override + degrade-gated prunes)
 
 *(Salvaged onto feat/v2.3 on 2026-07-01 — the original landed on the rolled-back
