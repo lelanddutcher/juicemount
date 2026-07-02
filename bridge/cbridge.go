@@ -269,7 +269,20 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// reconcile loop recover everything automatically when the backend returns.
 	// A reachable backend — the overwhelmingly common case — takes the unchanged
 	// online path.
-	backendUp, bootRTT := backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+	// V2.3 U3: persisted user-offline intent — the user toggled offline in a
+	// previous session and never toggled back, so this session STARTS
+	// offline (field report: "clicking the offline toggle doesn't just start
+	// it in offline mode"). Checked BEFORE the reachability probe so an
+	// offline start touches no network at all. One menu click returns online
+	// (SetOffline clears the marker).
+	pin.SetOfflinePersistPath(filepath.Join(os.Getenv("HOME"), ".juicemount", "offline-intent"))
+	bootUserOffline := pin.PersistedOfflineIntent()
+	backendUp, bootRTT := false, time.Duration(0)
+	if bootUserOffline {
+		jmlog.Info("persisted user-offline intent found — starting offline, skipping the reachability probe (U3)")
+	} else {
+		backendUp, bootRTT = backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+	}
 	// V2.3 U2/K2: a link can be reachable-but-useless — the TCP handshake
 	// completes inside 1.5s but the RTT is so high that the synchronous
 	// online boot (juicefs mount + first syncs) would churn for minutes.
@@ -494,6 +507,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if bootRTTDeferred && !startedOffline {
 		startedOffline = true
 		pin.SetAutoOffline(true, "backend responding slowly — started offline; recovering in background")
+	}
+	// V2.3 U3: persisted USER intent — engage the user flag (not auto), so
+	// U4's watchdog stand-down holds and only an explicit toggle clears it.
+	if bootUserOffline {
+		startedOffline = true
+		pin.SetOffline(true)
 	}
 	globalRC = rc
 	// QA-30 (2026-05-25): give the reconcile loop the path config it needs

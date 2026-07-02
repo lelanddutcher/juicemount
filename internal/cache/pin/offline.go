@@ -2,6 +2,7 @@ package pin
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,6 +73,54 @@ var (
 	userOfflineSince time.Time
 )
 
+// V2.3 U3 (field report: "clicking the offline toggle doesn't just start it
+// in offline mode"): user-intent offline PERSISTS across launches via a
+// marker file. Armed at boot (SetOfflinePersistPath); SetOffline writes/
+// removes the marker best-effort, and the boot path consults
+// PersistedOfflineIntent() to start offline without touching the network.
+// Unconfigured (tests, tools) → fully inert.
+var (
+	offlinePersistMu   sync.Mutex
+	offlinePersistPath string
+)
+
+// SetOfflinePersistPath arms user-offline persistence at the given marker
+// path. "" disarms.
+func SetOfflinePersistPath(path string) {
+	offlinePersistMu.Lock()
+	offlinePersistPath = path
+	offlinePersistMu.Unlock()
+}
+
+// PersistedOfflineIntent reports whether a previous session left user-intent
+// offline engaged. False when persistence is unconfigured.
+func PersistedOfflineIntent() bool {
+	offlinePersistMu.Lock()
+	p := offlinePersistPath
+	offlinePersistMu.Unlock()
+	if p == "" {
+		return false
+	}
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// persistOfflineIntent mirrors the user flag to disk, best-effort — a
+// failed write must never block or fail the toggle itself.
+func persistOfflineIntent(on bool) {
+	offlinePersistMu.Lock()
+	p := offlinePersistPath
+	offlinePersistMu.Unlock()
+	if p == "" {
+		return
+	}
+	if on {
+		_ = os.WriteFile(p, []byte("user-offline\n"), 0o644)
+	} else {
+		_ = os.Remove(p)
+	}
+}
+
 // SetOffline switches the process to user-intent offline mode (or
 // back online). This is the existing API; preserved for callers that
 // only know about manual toggles.
@@ -93,6 +142,7 @@ func SetOffline(on bool) {
 		userOfflineSince = time.Time{}
 		autoOfflineMu.Unlock()
 	}
+	persistOfflineIntent(on)
 }
 
 // SetAutoOffline is called by the reachability monitor when the
