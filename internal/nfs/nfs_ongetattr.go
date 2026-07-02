@@ -69,10 +69,15 @@ func onGetAttr(ctx context.Context, w *response, userHandle Handler) error {
 	copy(bodyBytes, writer.Bytes())
 	putResponseBuffer(writer)
 
-	// Cache the pre-serialized bytes on the Entry for next time.
-	if fi, ok := info.(*metadata.FileInfo); ok {
-		if entry := fi.Entry(); entry != nil {
-			entry.PreSerializedGetAttr = bodyBytes
+	// Cache the pre-serialized bytes on the Entry for next time. Skip under
+	// SQLite serve (review fix, LOW): each serve accessor returns a FRESH
+	// throwaway Entry, so caching on it is marshaled-then-discarded work with
+	// no next-time hit. No new lock, no correctness change.
+	if !metadata.ServeFromSQLite() {
+		if fi, ok := info.(*metadata.FileInfo); ok {
+			if entry := fi.Entry(); entry != nil {
+				entry.PreSerializedGetAttr = bodyBytes
+			}
 		}
 	}
 

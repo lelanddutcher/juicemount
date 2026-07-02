@@ -175,6 +175,17 @@ func (rc *RedisClient) ReconcileSubtree(rootInode uint64, maxDirs int) error {
 	truncated := false
 
 	for len(queue) > 0 {
+		// Review fix (MED): re-check the offline/kill-switch gate per dir. A
+		// mid-walk link degradation would otherwise make every remaining
+		// reconcileDir burn a ~30s Redis timeout (keyspace.go), hanging the
+		// background pass across up to maxDirs dirs. Mirrors the between-roots
+		// re-check in warmPinnedRootsAtBoot. The remainder is left to the
+		// authoritative full SCAN (same as the maxDirs truncation).
+		if pin.IsOffline() || !PinWarmMetadataEnabled() {
+			jmlog.Info("pin warm: ReconcileSubtree stopping mid-walk (offline or disabled)",
+				"root_inode", rootInode, "dirs_reconciled", dirsDone, "queue_remaining", len(queue))
+			return nil
+		}
 		if dirsDone >= maxDirs {
 			truncated = true
 			break

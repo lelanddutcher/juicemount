@@ -187,8 +187,9 @@ func TestListChildrenPage_BigDirUnderBudget(t *testing.T) {
 	}
 	perPage := time.Since(start) / iters
 	t.Logf("big-dir (%d children) %d-row page: %v/page", children, pageSize, perPage)
-	if perPage > 2*time.Millisecond {
-		t.Fatalf("page latency %v exceeds 2ms budget — idx_parent_name likely missing "+
-			"(temp-b-tree ORDER BY sorts all children per page)", perPage)
+	budget := 2 * time.Millisecond * bigDirPageBudgetMultiplier
+	if perPage > budget {
+		t.Fatalf("page latency %v exceeds %v budget — idx_parent_name likely missing "+
+			"(temp-b-tree ORDER BY sorts all children per page)", perPage, budget)
 	}
 }

@@ -38,6 +38,12 @@ func serveFromSQLite() bool {
 	return serveFromSQLiteVal
 }
 
+// ServeFromSQLite exports the serve-substrate predicate for peer packages
+// (the NFS protocol layer) that need to skip RAM-shadow-only fast paths — e.g.
+// the GETATTR pre-serialization cache, which is a no-op when serving throwaway
+// Entries from SQLite (review fix, LOW).
+func ServeFromSQLite() bool { return serveFromSQLite() }
+
 // logServeSubstrate logs the chosen serve substrate ONCE per boot (not per RPC)
 // so an A/B run is attributable in the logs. Called from OpenWithMaxCacheSize
 // after the store is wired.
@@ -66,8 +72,18 @@ func (s *Store) lookupByPathSQLite(entryPath string) *Entry {
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			log.Printf("metadata: LookupByPath SQLite query %q: %v", entryPath, err)
+			return nil
 		}
-		return nil
+		// sql.ErrNoRows: SQLite may not have the row YET. Create/rename seed
+		// the RAM map synchronously (InsertToCache) but commit to SQLite via
+		// `go Insert` async, so during a BulkInsert flood the committed WAL
+		// snapshot can miss a just-created path that RAM already has. RAM is
+		// ALWAYS same-or-ahead of SQLite (never staler — SQLite is only ever
+		// written after/with RAM), so back-stop the miss with the RAM map.
+		// This closes the rename-drop (review MED) and the async cold-stat
+		// window; the RLock is paid ONLY on a miss (the common HIT path stays
+		// lock-free, preserving the write-preferring-RWMutex contention win).
+		return s.lookupByPathRAM(entryPath)
 	}
 	return e
 }
@@ -85,8 +101,12 @@ func (s *Store) lookupByInodeSQLite(inode uint64) *Entry {
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			log.Printf("metadata: LookupByInode SQLite query %d: %v", inode, err)
+			return nil
 		}
-		return nil
+		// sql.ErrNoRows: back-stop the async-commit window with the RAM map
+		// (same rationale as lookupByPathSQLite — RAM is never staler than
+		// SQLite; RLock only on the miss path).
+		return s.lookupByInodeRAM(inode)
 	}
 	return e
 }
