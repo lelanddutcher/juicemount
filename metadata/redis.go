@@ -57,6 +57,18 @@ const (
 	// Kill switch: JM_LAYERA_BUDGET=0 restores the unbounded pre-G6 behavior.
 	layerAProbeCap    = 2048            // max ladder candidates Lstat-probed per cycle
 	layerAProbeBudget = 3 * time.Second // max wall time probing ladder candidates
+
+	// C1 (2026-07-02): store_meta key under which the wall-clock time of the
+	// last SUCCESSFUL full SCAN is persisted (unix seconds, as a decimal
+	// string). Read at boot by ShouldSkipBootSync to decide whether the mirror
+	// is fresh enough to skip the redundant boot SCAN.
+	metaKeyLastSyncTime = "last_sync_time"
+
+	// defaultBootSyncMaxAge is the freshness window ShouldSkipBootSync uses when
+	// JM_BOOT_SYNC_MAX_AGE_SEC is unset. A persisted last-sync newer than this
+	// (AND keyspace push engaged) is considered fresh — the PSUBSCRIBE gap-fill
+	// and periodic backstop carry any deltas since, so the boot SCAN is skipped.
+	defaultBootSyncMaxAge = 24 * time.Hour
 )
 
 // MetadataEvent represents a real-time metadata change published via Redis SUBSCRIBE.
@@ -824,6 +836,70 @@ func (rc *RedisClient) SyncProgress() (scanned, estTotal int64) {
 // SyncOnce performs a single batch reconciliation (Lua tree pull → SQLite).
 func (rc *RedisClient) SyncOnce() error {
 	return rc.syncMetadata()
+}
+
+// ShouldSkipBootSync reports whether the boot-time full SCAN can be safely
+// skipped because the persisted mirror is FRESH and the keyspace-notification
+// push is engaged (C1, 2026-07-02).
+//
+// Rationale: with JM_METADATA_KEYSPACE_PUSH=1 the PSUBSCRIBE gap-fill plus the
+// periodic backstop SCAN already guarantee convergence, so re-running a full
+// boot SCAN over a recently-synced mirror is pure redundant work (the 174s
+// "Rebuilding index…" spinner on a cellular relay). We skip it ONLY when both
+// hold:
+//
+//   - keyspacePushEnabled() — without push there is no gap-fill/backstop that
+//     would carry the deltas we'd miss, so the SCAN is still authoritative and
+//     must run;
+//   - a persisted last_sync_time exists AND is within the freshness window
+//     (default 24h; JM_BOOT_SYNC_MAX_AGE_SEC overrides, 0 = never skip).
+//
+// A first-run / wiped mirror has NO persisted last_sync_time (the store_meta
+// table lives in the same DB the reset wipes) → returns false → today's
+// blocking/background boot SCAN runs. A future or malformed timestamp is
+// treated conservatively as "not fresh" → false. The rc.Start() reconcile +
+// keyspace loops launch regardless of this decision; only the one-shot boot
+// SyncOnce is elided.
+//
+// Kill switch: JM_BOOT_SYNC_SKIP=0 forces the current always-sync behavior
+// (returns false unconditionally). REVERT_LOG 2026-07-02.
+func (rc *RedisClient) ShouldSkipBootSync() bool {
+	if os.Getenv("JM_BOOT_SYNC_SKIP") == "0" {
+		return false // kill switch: never skip
+	}
+	if !rc.keyspacePushEnabled() {
+		return false // no push → the SCAN is the only authoritative sync
+	}
+	if rc.store == nil {
+		return false
+	}
+
+	maxAge := defaultBootSyncMaxAge
+	if v := os.Getenv("JM_BOOT_SYNC_MAX_AGE_SEC"); v != "" {
+		n, perr := strconv.ParseInt(v, 10, 64)
+		if perr != nil {
+			return false // malformed override → conservative: don't skip
+		}
+		if n <= 0 {
+			return false // 0 (or negative) = never skip
+		}
+		maxAge = time.Duration(n) * time.Second
+	}
+
+	raw, ok, err := rc.store.GetMeta(metaKeyLastSyncTime)
+	if err != nil || !ok {
+		return false // no persisted sync (first run / wiped mirror) or read error
+	}
+	unix, perr := strconv.ParseInt(raw, 10, 64)
+	if perr != nil {
+		return false // corrupt value → don't skip
+	}
+	last := time.Unix(unix, 0)
+	age := time.Since(last)
+	if age < 0 {
+		return false // clock skew / future timestamp → conservative
+	}
+	return age <= maxAge
 }
 
 // Start begins the SUBSCRIBE listener, periodic batch reconciliation, and —
@@ -1957,12 +2033,24 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	}
 
 	duration := time.Since(start)
+	syncedAt := time.Now()
 	rc.mu.Lock()
 	rc.lastSyncDuration = duration
-	rc.lastSyncTime = time.Now()
+	rc.lastSyncTime = syncedAt
 	rc.lastSyncEntries = len(redisEntries)
 	pendingPrune := len(rc.pruneAbsent)
 	rc.mu.Unlock()
+
+	// C1 (2026-07-02): persist the successful-sync wall clock durably so the
+	// NEXT boot can decide (via ShouldSkipBootSync) whether the mirror is fresh
+	// enough to skip the redundant boot SCAN when keyspace push is engaged.
+	// Best-effort: a write error here must not fail the sync (it only costs the
+	// next boot a SCAN it could have skipped), so it is logged and swallowed.
+	if rc.store != nil {
+		if err := rc.store.SetMeta(metaKeyLastSyncTime, strconv.FormatInt(syncedAt.Unix(), 10)); err != nil {
+			jmlog.Warn("failed to persist last_sync_time (next boot may re-SCAN)", "error", err.Error())
+		}
+	}
 
 	jmlog.Info("metadata sync complete",
 		"entries", len(redisEntries),

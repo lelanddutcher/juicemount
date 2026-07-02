@@ -7,6 +7,48 @@ a rebuild**.
 
 ---
 
+## 2026-07-02 — Boot fast-path C1 (skip the boot SCAN when mirror fresh + push engaged)
+
+Env-revertable without a rebuild. Motivation: a deployed build over a cellular
+relay ran a 174s background "Rebuilding index…" boot SCAN that is redundant
+when keyspace push is engaged (the PSUBSCRIBE gap-fill + periodic backstop
+already guarantee convergence).
+
+**C1 — skip the boot SCAN when the mirror is fresh + push engaged.**
+`RedisClient.ShouldSkipBootSync()` returns true only when BOTH
+`JM_METADATA_KEYSPACE_PUSH=1` AND a durably-persisted `last_sync_time` (new
+`store_meta` key/value table in `metadata.db`, written on every successful
+`syncMetadata`) is within a freshness window. When true, `cbridge`'s boot-sync
+block skips the one-shot `SyncOnce` entirely — the PSUBSCRIBE gap-fill + the
+periodic backstop SCAN carry any deltas since. `rc.Start()` (reconcile loop +
+keyspace loop) launches unchanged. `IsSyncing()` stays false for a skipped boot
+(no `lastSyncStartedAt` stamp), so G7's `/activity` never shows "Rebuilding
+index…".
+
+- **`JM_BOOT_SYNC_SKIP=0`** — kill switch. Forces the current always-sync
+  behavior (`ShouldSkipBootSync` returns false unconditionally). Baseline =
+  every boot runs the SCAN as before.
+- **`JM_BOOT_SYNC_MAX_AGE_SEC=<n>`** — freshness window in seconds (default
+  86400 = 24h). `0` (or negative) = **never skip**. A malformed value fails
+  safe (no skip). Reverting to the always-SCAN behavior needs only
+  `JM_BOOT_SYNC_SKIP=0` (or push off).
+
+**Fail-safe cases (all fall through to today's blocking/background boot SCAN):**
+push disabled/unset; no persisted `last_sync_time` (first run OR the app's
+"Reset local metadata cache" — `store_meta` lives in the same DB the reset
+wipes, so a wiped mirror is never treated as fresh); stale timestamp;
+corrupt/future timestamp (clock skew); read error. The empty-mirror blocking
+`SyncOnce` (U1) and `JM_BOOT_SYNC_FIRST=1` are unreachable behind a skip because
+`ShouldSkipBootSync` returns false for an empty/first-run mirror.
+
+**Validated:** unit — `TestStoreMetaRoundTrip`, `TestShouldSkipBootSync` (full
+truth table incl. env overrides + kill switch + corrupt/future timestamps).
+`gofmt` clean; `go build ./...` green; `go test ./metadata/ ./bridge/ -count=1`
+green. Live boot-timing (a fresh restart over a cellular relay skips the SCAN
+and shows no "Rebuilding index…") is the real proof — pending.
+
+---
+
 ## 2026-06-28 — Slow-link false-flap fix (drain-liveness probe override + degrade-gated prunes)
 
 *(Salvaged onto feat/v2.3 on 2026-07-01 — the original landed on the rolled-back

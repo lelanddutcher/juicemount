@@ -759,29 +759,45 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	bootSyncWired := make(chan struct{})
 	defer close(bootSyncWired)
 	if !startedOffline {
-		bootSyncBlocking := os.Getenv("JM_BOOT_SYNC_FIRST") == "1"
-		if !bootSyncBlocking {
-			if n, cErr := store.Count(); cErr != nil || n == 0 {
-				bootSyncBlocking = true
-			}
-		}
-		if bootSyncBlocking {
-			if err := rc.SyncOnce(); err != nil {
-				jmlog.Warn("initial sync failed", "error", err.Error())
-			}
+		// C1 (2026-07-02): skip the boot SCAN entirely when the mirror is fresh
+		// AND keyspace push is engaged. In that config the PSUBSCRIBE gap-fill +
+		// the periodic backstop already guarantee convergence, so a full boot
+		// SCAN over a recently-synced mirror is redundant work (the 174s
+		// "Rebuilding index…" spinner over a cellular relay). ShouldSkipBootSync
+		// fails safe on a first-run/wiped mirror (no persisted last_sync_time),
+		// on push-off, on a stale timestamp, and under the JM_BOOT_SYNC_SKIP=0
+		// kill switch — every one of those falls through to today's behavior
+		// below. We deliberately do NOT stamp lastSyncStartedAt here, so
+		// IsSyncing() stays false and G7's /activity never shows "Rebuilding
+		// index…" for a skipped boot. rc.Start() below still launches the
+		// reconcile + keyspace loops as normal.
+		if rc.ShouldSkipBootSync() {
+			jmlog.Info("boot SCAN skipped — mirror fresh + push engaged; PSUBSCRIBE + backstop carry deltas")
 		} else {
-			go func() {
-				<-bootSyncWired
-				t0 := time.Now()
-				jmlog.Info("initial metadata sync running in background (serve-first boot)")
-				if err := rc.SyncOnce(); err != nil {
-					jmlog.Warn("background initial sync failed — reconcile loop retries",
-						"error", err.Error())
-					return
+			bootSyncBlocking := os.Getenv("JM_BOOT_SYNC_FIRST") == "1"
+			if !bootSyncBlocking {
+				if n, cErr := store.Count(); cErr != nil || n == 0 {
+					bootSyncBlocking = true
 				}
-				jmlog.Info("background initial sync complete",
-					"duration_ms", time.Since(t0).Round(time.Millisecond).Milliseconds())
-			}()
+			}
+			if bootSyncBlocking {
+				if err := rc.SyncOnce(); err != nil {
+					jmlog.Warn("initial sync failed", "error", err.Error())
+				}
+			} else {
+				go func() {
+					<-bootSyncWired
+					t0 := time.Now()
+					jmlog.Info("initial metadata sync running in background (serve-first boot)")
+					if err := rc.SyncOnce(); err != nil {
+						jmlog.Warn("background initial sync failed — reconcile loop retries",
+							"error", err.Error())
+						return
+					}
+					jmlog.Info("background initial sync complete",
+						"duration_ms", time.Since(t0).Round(time.Millisecond).Milliseconds())
+				}()
+			}
 		}
 	}
 	rc.Start()

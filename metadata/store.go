@@ -33,6 +33,21 @@ CREATE INDEX IF NOT EXISTS idx_inode ON entries(inode);
 CREATE INDEX IF NOT EXISTS idx_name ON entries(name COLLATE NOCASE);
 `
 
+// metaSchema is a tiny durable key/value side-table for small pieces of
+// store-scoped state that must survive across process restarts but don't
+// belong in the entries mirror. C1 (2026-07-02) uses it to persist the
+// wall-clock time of the last successful metadata SCAN (key "last_sync_time",
+// unix seconds), so a fresh restart under keyspace-push can skip the redundant
+// boot SCAN. Deliberately separate from the entries table so a mirror wipe
+// (the app's "Reset local metadata cache") also drops this state — a wiped
+// mirror is stale by definition and must NOT be treated as fresh.
+const metaSchema = `
+CREATE TABLE IF NOT EXISTS store_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+`
+
 // ftsSchema creates a full-text search virtual table for instant filename search.
 // Uses FTS5 with a trigram tokenizer so partial matches work (e.g. "explosion" matches
 // "Big_Explosion_4K.mov"). NO triggers — FTS is rebuilt manually after bulk operations
@@ -462,6 +477,11 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
+	}
+
+	if _, err := db.Exec(metaSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create meta schema: %w", err)
 	}
 
 	if _, err := db.Exec(ftsSchema); err != nil {
@@ -1430,6 +1450,38 @@ func (s *Store) Count() (int, error) {
 	var count int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM entries`).Scan(&count)
 	return count, err
+}
+
+// GetMeta reads a value from the durable store_meta key/value table (C1).
+// ok is false when the key is absent (not an error); a real query error is
+// returned in err. Callers treat (…, false, nil) as "no value persisted".
+func (s *Store) GetMeta(key string) (value string, ok bool, err error) {
+	row := s.db.QueryRow(`SELECT value FROM store_meta WHERE key = ?`, key)
+	switch scanErr := row.Scan(&value); scanErr {
+	case nil:
+		return value, true, nil
+	case sql.ErrNoRows:
+		return "", false, nil
+	default:
+		return "", false, scanErr
+	}
+}
+
+// SetMeta upserts a value into the durable store_meta key/value table (C1).
+// Serialized through writeMu like every other SQLite write in this store so it
+// never races an entries write on a second pooled connection.
+func (s *Store) SetMeta(key, value string) error {
+	s.writeMu.Lock()
+	_, err := s.db.Exec(
+		`INSERT INTO store_meta (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		key, value,
+	)
+	s.writeMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("set meta %q: %w", key, err)
+	}
+	return nil
 }
 
 // AllPaths returns every path in the store (used for reconciliation diffing).
