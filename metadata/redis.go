@@ -1589,22 +1589,36 @@ func (rc *RedisClient) syncMetadata() error {
 	// cycle instead of restarting the 10-cycle climb.
 	var toDelete []string
 	ladderCounts := make(map[string]int)
-	for p, count := range rc.pruneAbsent {
-		if count >= PruneThreshold {
-			// `._` AppleDouble guard (symmetric with scopedPrune's `._`-skip):
-			// `._` sidecars are scan-filtered / managed Mac-side via the explicit
-			// Remove path, never the reconcile — their absence from Redis is not a
-			// delete signal. Pruning one whose path-stable Track-B handle the
-			// kernel still holds Forgets it → FromHandle STALE (the `._dirN`
-			// had_shadow STALE the release battery caught). Stop tracking it and
-			// never enqueue it for deletion.
-			if strings.HasPrefix(path.Base(p), "._") {
+	// Review fix (G6/U1 adversarial review, HIGH): qualification is gated on
+	// !skipIncrement. Pre-G6 this gate was implicit — no counter could
+	// survive a cycle boundary at >= PruneThreshold (the loop drained every
+	// qualifier; increments are skipped while RecentlyDegraded), so a
+	// degraded/recovery cycle was structurally incapable of prune progress
+	// (the invariant documented above; same rule gates the G5 fast-path).
+	// G6's deferral re-inserts candidates AT >= threshold, so without this
+	// gate a backend flap right after a deferring cycle would pull them into
+	// toDelete during the recovery window — where a rehydrating JuiceFS can
+	// return false ENOENT to Layer A → live entries pruned → ESTALE (QA-30
+	// class). Deferred candidates wait out the window at their preserved
+	// count and re-qualify on the next stable cycle.
+	if !skipIncrement {
+		for p, count := range rc.pruneAbsent {
+			if count >= PruneThreshold {
+				// `._` AppleDouble guard (symmetric with scopedPrune's `._`-skip):
+				// `._` sidecars are scan-filtered / managed Mac-side via the explicit
+				// Remove path, never the reconcile — their absence from Redis is not a
+				// delete signal. Pruning one whose path-stable Track-B handle the
+				// kernel still holds Forgets it → FromHandle STALE (the `._dirN`
+				// had_shadow STALE the release battery caught). Stop tracking it and
+				// never enqueue it for deletion.
+				if strings.HasPrefix(path.Base(p), "._") {
+					delete(rc.pruneAbsent, p)
+					continue
+				}
+				toDelete = append(toDelete, p)
+				ladderCounts[p] = count
 				delete(rc.pruneAbsent, p)
-				continue
 			}
-			toDelete = append(toDelete, p)
-			ladderCounts[p] = count
-			delete(rc.pruneAbsent, p)
 		}
 	}
 
@@ -1852,7 +1866,16 @@ func (rc *RedisClient) verifyPruneCandidates(toDelete []string, fastConfirmed ma
 		isAbsent, ok := lstatNotExistWithTimeout(fusePath, time.Second)
 		if !ok {
 			lstatTimeouts++
-			continue // timed out — don't prune, retry next cycle
+			// Review fix: a timed-out candidate keeps its ladder position
+			// (same re-insertion as the defer branch) instead of restarting
+			// the 10-cycle climb — timeout is FUSE slowness, not evidence
+			// about the path.
+			count, ok2 := ladderCounts[p]
+			if !ok2 {
+				count = PruneThreshold
+			}
+			rc.pruneAbsent[p] = count
+			continue
 		}
 		if isAbsent {
 			verified = append(verified, p)
@@ -1874,17 +1897,28 @@ func (rc *RedisClient) verifyPruneCandidates(toDelete []string, fastConfirmed ma
 			"elapsed_ms", time.Since(probeStart).Round(time.Millisecond).Milliseconds(),
 		)
 	}
-	// QA-30 code review HIGH-3: absolute floor of 4 timeouts before
-	// bailing the whole cycle. Without this, a small batch
-	// (N<=3) trips the bail on a single transient timeout —
-	// effectively a 100%/50%/33% threshold instead of the
-	// intended 25%. Small batches handle individual timeouts
-	// fine via the `continue` above (paths simply stay
-	// unpruned this cycle, retried next time).
-	if lstatTimeouts >= 4 && lstatTimeouts*4 > len(toDelete) {
+	// QA-30 code review HIGH-3: absolute floor of timeouts before bailing
+	// the whole cycle. Without this, a small batch (N<=3) trips the bail on
+	// a single transient timeout — effectively a 100%/50%/33% threshold
+	// instead of the intended 25%. Small batches handle individual timeouts
+	// fine via the `continue` above (paths simply stay unpruned this cycle,
+	// retried next time).
+	//
+	// Review fixes (G6/U1 adversarial review): the ratio denominator is
+	// `probed`, not len(toDelete) — the budget caps probes at 2048 and the
+	// list also contains deferred + fastConfirmed entries, so the old
+	// denominator made the bail unreachable on exactly the large backlogs it
+	// protects against. And under the 3s budget at most 3 serial 1s
+	// timeouts can occur before deferral kicks in, so the floor is 3 when
+	// budgeted (4 unbounded, preserving QA-30's original constant there).
+	bailFloor := 4
+	if !unbounded {
+		bailFloor = 3
+	}
+	if lstatTimeouts >= bailFloor && lstatTimeouts*4 > probed {
 		jmlog.Warn("metadata sync: FUSE degraded (>25% Lstat timeouts), skipping prune this cycle",
 			"timeouts", lstatTimeouts,
-			"total_probes", len(toDelete),
+			"total_probes", probed,
 		)
 		return nil, fusePresent
 	}

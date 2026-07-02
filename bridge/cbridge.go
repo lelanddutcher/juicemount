@@ -604,6 +604,15 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// there is nothing to serve and an empty Finder tree is worse than a
 	// short wait; (b) JM_BOOT_SYNC_FIRST=1 (kill switch, restores the old
 	// ordering; REVERT_LOG 2026-07-02).
+	// Review fix (G6/U1 adversarial review): the background sync must not
+	// reach its prune pass before the prune guards are wired — SetPinChecker
+	// (Layer C) and SetSpoolGuard (Layer D) are installed further down in
+	// this function. bootSyncWired is closed by the deferred call on EVERY
+	// exit path (success = all wiring done; error = rc is being torn down
+	// and the goroutine's SyncOnce fails harmlessly), so the goroutine can
+	// never run a guard-less prune and never leaks.
+	bootSyncWired := make(chan struct{})
+	defer close(bootSyncWired)
 	if !startedOffline {
 		bootSyncBlocking := os.Getenv("JM_BOOT_SYNC_FIRST") == "1"
 		if !bootSyncBlocking {
@@ -617,6 +626,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			}
 		} else {
 			go func() {
+				<-bootSyncWired
 				t0 := time.Now()
 				jmlog.Info("initial metadata sync running in background (serve-first boot)")
 				if err := rc.SyncOnce(); err != nil {
