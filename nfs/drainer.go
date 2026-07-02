@@ -448,6 +448,15 @@ func (d *Drainer) materializePendingSymlinks() {
 	}
 	materialized := 0
 	for _, p := range pend {
+		// Review fix: re-check the gate PER LINK — an unmount mid-loop would
+		// otherwise land the remaining links on the plain dir. Cached (2s
+		// TTL) so the per-link cost is a mutex read. Bail without deleting
+		// rows: they retry next reconnect (os.IsExist path is idempotent).
+		if ok, reason := pin.FUSEIdentityState(); !ok {
+			log.Printf("drainer: symlink materialization aborted — FUSE identity gate failed (%s); %d row(s) retry next reconnect",
+				reason, len(pend)-materialized)
+			return
+		}
 		fusePath := filepath.Join(d.fuseRoot, p.LinkPath)
 		serr := os.Symlink(p.Target, fusePath)
 		if serr != nil && os.IsNotExist(serr) {
@@ -461,6 +470,14 @@ func (d *Drainer) materializePendingSymlinks() {
 			// leave the row for the next reconnect, log, keep going.
 			log.Printf("drainer: materialize symlink %q -> %q: %v", p.LinkPath, p.Target, serr)
 			continue
+		}
+		// Review fix: close the write-then-delete gap — if the mount vanished
+		// between the Symlink and here, the link landed on the plain dir and
+		// the row must NOT be deleted. Bail; the retry is idempotent.
+		if ok, reason := pin.FUSEIdentityState(); !ok {
+			log.Printf("drainer: symlink materialization aborted post-create — FUSE identity gate failed (%s); row %q retries next reconnect",
+				reason, p.LinkPath)
+			return
 		}
 		// On-FUSE now (created, or already existed). Clear LocalOnly so the
 		// reconcile prune treats it as a normal backend entry, then drop the
@@ -596,6 +613,27 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		d.failTransient(row, fmt.Errorf("create dest: %w", err))
 		return
 	}
+	// Review fix (phase-1 adversarial review, HIGH — the TOCTOU that would
+	// have reopened the 174GB incident): the path-based identity gate above
+	// reads a ≤2s-stale cache, so a mount torn down moments before Create
+	// can still pass it and the file lands on the plain dir — where every
+	// downstream safeguard (copy, fsync, SHA, at-rest re-read) verifies the
+	// same local bytes and "succeeds". The fd's filesystem binding is
+	// immutable, so checking the OPEN fd is race-free regardless of what
+	// mounts or unmounts afterwards.
+	if err := pin.FUSEIdentityCheckFD(dst.Fd()); err != nil {
+		dst.Close()
+		_ = os.Remove(dest)
+		d.failTransient(row, err)
+		return
+	}
+	// Capture where dest actually lives for the pre-completion device check.
+	destDev := int32(-1)
+	if fi, err := dst.Stat(); err == nil {
+		if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
+			destDev = sys.Dev
+		}
+	}
 
 	h := sha256.New()
 	mw := io.MultiWriter(dst, h)
@@ -683,6 +721,26 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 			_ = os.Remove(dest)
 			d.failTransient(row, fmt.Errorf("%s", reason))
 			return
+		}
+	}
+
+	// Review fix (phase-1 adversarial review, belt-and-suspenders half of the
+	// TOCTOU close): before declaring the drain complete — which deletes the
+	// spool copy, the only other copy of these bytes — confirm dest still
+	// lives on the SAME device as the CURRENT mountpoint. If a remount landed
+	// mid-copy, the bytes went to a dead mount instance (or the plain dir,
+	// though the fd check at Create already catches that) and the current
+	// mount does not have them: requeue instead of completing. os.Stat on a
+	// healthy mount is cheap; on a wedged one it can block — same hazard
+	// class as the at-rest re-read above (drainer worker, not the hot path).
+	if destDev != -1 {
+		if fi, statErr := os.Stat(d.fuseRoot); statErr == nil {
+			if sys, ok := fi.Sys().(*syscall.Stat_t); ok && sys.Dev != destDev {
+				_ = os.Remove(dest)
+				d.failTransient(row, fmt.Errorf("dest device %d != current mount device %d (remount raced the copy): %w",
+					destDev, sys.Dev, pin.ErrFUSEIdentityGate))
+				return
+			}
 		}
 	}
 

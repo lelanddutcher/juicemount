@@ -2,6 +2,7 @@ package pin
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -107,29 +108,34 @@ func FUSEIdentityState() (bool, string) {
 	return ok, reason
 }
 
-// checkFUSEIdentity runs the bounded statfs fsid comparison. On timeout the
-// straggler goroutine's result is discarded — the next TTL expiry re-checks.
+// fuseIdentityProbeGate single-flights the statfs prober (review fix, phase-1
+// adversarial review): syscall.Statfs against a WEDGED macFUSE mount blocks
+// in the kernel and pins an OS thread; without a gate every TTL expiry (the
+// parked drainer alone re-consults every 3s) spawns another, accumulating
+// hundreds of pinned threads per hour toward Go's 10000-thread abort —
+// turning a safely-parked degraded state into a process crash. The slot is
+// released only when the statfs actually RETURNS (never by a timed-out
+// waiter), capping the leak at one thread per wedge episode; a gate-full
+// consult reports NOT-OK immediately, which is both fail-safe and faster
+// than waiting out the timeout against a probe that is already stuck.
+var fuseIdentityProbeGate = make(chan struct{}, 1)
+
+// checkFUSEIdentity runs the bounded, single-flighted statfs fsid comparison.
 func checkFUSEIdentity(path string) (bool, string) {
+	select {
+	case fuseIdentityProbeGate <- struct{}{}:
+	default:
+		return false, "identity probe already in flight (previous statfs still blocked — mount wedged)"
+	}
 	type res struct {
 		ok     bool
 		reason string
 	}
 	ch := make(chan res, 1)
 	go func() {
-		var st, pst syscall.Statfs_t
-		if err := syscall.Statfs(path, &st); err != nil {
-			ch <- res{false, "statfs mountpoint: " + err.Error()}
-			return
-		}
-		if err := syscall.Statfs(filepath.Dir(path), &pst); err != nil {
-			ch <- res{false, "statfs parent: " + err.Error()}
-			return
-		}
-		if st.Fsid == pst.Fsid {
-			ch <- res{false, "mountpoint is a plain directory — no filesystem mounted (macFUSE kext not loaded, or mount absent)"}
-			return
-		}
-		ch <- res{true, "ok"}
+		defer func() { <-fuseIdentityProbeGate }()
+		ok, reason := statfsIdentityOK(path)
+		ch <- res{ok: ok, reason: reason}
 	}()
 	select {
 	case r := <-ch:
@@ -137,4 +143,80 @@ func checkFUSEIdentity(path string) (bool, string) {
 	case <-time.After(fuseIdentityStatfsTimeout):
 		return false, "statfs timed out — mount wedged"
 	}
+}
+
+// statfsIdentityOK is the raw comparison: a mounted filesystem has its own
+// fsid; a plain directory shares its parent's.
+func statfsIdentityOK(path string) (bool, string) {
+	var st, pst syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return false, "statfs mountpoint: " + err.Error()
+	}
+	if err := syscall.Statfs(filepath.Dir(path), &pst); err != nil {
+		return false, "statfs parent: " + err.Error()
+	}
+	if st.Fsid == pst.Fsid {
+		return false, "mountpoint is a plain directory — no filesystem mounted (macFUSE kext not loaded, or mount absent)"
+	}
+	return true, "ok"
+}
+
+// FUSEIdentityFresh is FUSEIdentityState with the TTL cache BYPASSED for the
+// read (the result still re-stamps the cache, so ladder-path consumers in the
+// same cycle see the fresh verdict). Use at decision points where ≤TTL-stale
+// evidence is not acceptable — e.g. after G5's Lstat probes and before
+// pruneAbsent mutation: ENOENT evidence is only trustworthy if the mount is
+// verified real AFTER the last probe. Same kill-switch/unconfigured
+// semantics; same single-flight bound (a wedge returns NOT-OK immediately).
+func FUSEIdentityFresh() (bool, string) {
+	if os.Getenv("JM_FUSE_IDENTITY_GATE") == "0" {
+		return true, "gate disabled (JM_FUSE_IDENTITY_GATE=0)"
+	}
+	fuseIdentityMu.Lock()
+	path := fuseIdentityPathV
+	fuseIdentityMu.Unlock()
+	if path == "" {
+		return true, "gate unconfigured"
+	}
+	ok, reason := checkFUSEIdentity(path)
+	fuseIdentityMu.Lock()
+	fuseIdentityCache = fuseIdentityResult{ok: ok, reason: reason, at: time.Now()}
+	fuseIdentityMu.Unlock()
+	return ok, reason
+}
+
+// FUSEIdentityCheckFD verifies that an OPEN file descriptor lives on a real
+// mounted filesystem rather than the gate path's parent volume (= plain-dir
+// mountpoint). This is the race-free half of the drain gate (phase-1
+// adversarial review, HIGH): the path-based check is cached and a mount can
+// be torn down inside the TTL window, but an fd's filesystem binding is
+// immutable — created on the plain dir it fails this check no matter what
+// mounts later; created on the real FUSE fs, a subsequent unmount makes
+// writes/fsync on it fail instead. fstatfs on a live fd does not consult the
+// path namespace, so no timeout bound is needed for the plain-dir case; on a
+// wedged FUSE fd it can block, which is the same pre-existing hazard class as
+// the copy that follows it (drainer worker only — never the NFS hot path).
+// Returns nil when the gate is unconfigured or disabled.
+func FUSEIdentityCheckFD(fd uintptr) error {
+	if os.Getenv("JM_FUSE_IDENTITY_GATE") == "0" {
+		return nil
+	}
+	fuseIdentityMu.Lock()
+	path := fuseIdentityPathV
+	fuseIdentityMu.Unlock()
+	if path == "" {
+		return nil
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Fstatfs(int(fd), &st); err != nil {
+		return fmt.Errorf("fstatfs dest: %v: %w", err, ErrFUSEIdentityGate)
+	}
+	var pst syscall.Statfs_t
+	if err := syscall.Statfs(filepath.Dir(path), &pst); err != nil {
+		return fmt.Errorf("statfs parent: %v: %w", err, ErrFUSEIdentityGate)
+	}
+	if st.Fsid == pst.Fsid {
+		return fmt.Errorf("dest fd is on the mountpoint's parent volume — plain-dir mountpoint: %w", ErrFUSEIdentityGate)
+	}
+	return nil
 }

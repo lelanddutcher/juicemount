@@ -132,6 +132,14 @@ type RedisClient struct {
 	// are actually deleted from SQLite. Guarded by mu.
 	pruneAbsent map[string]int
 
+	// pruneFollowUp marks the next syncNowCh wake as a G5 fast-path
+	// CONTINUATION (a capped mass-delete with confirmed survivors) — it must
+	// bypass the keyspace-push deferral and the flap debounce in
+	// reconcileLoop, which exist to suppress network-flap triggers, not
+	// self-scheduled prune convergence. Set in syncMetadata; consumed
+	// (Swap(false)) by reconcileLoop.
+	pruneFollowUp atomic.Bool
+
 	// QA-30 (2026-05-25): path conversion config so syncMetadata can
 	// correctly cross-reference the pin store (mountpoint-prefixed paths)
 	// against metadata.Store entries (JuiceFS-internal paths, no prefix)
@@ -623,9 +631,22 @@ func (rc *RedisClient) collectFastPathPrunes(skipIncrement bool) (fastConfirmed 
 		fastPathDeleteCap = 25000           // max rows fast-pruned per cycle (one DeletePaths tx)
 	)
 	absent := rc.pruneAbsent
+	// Review fix: exclude spool-pending paths at COLLECTION time (roots
+	// before their probe, descendants before the sweep), not only in the
+	// downstream Layer D filter. This restores the ladder's ordering
+	// invariant against a drain completing mid-cycle: the drainer
+	// materializes the FUSE dest BEFORE MarkDrainComplete evicts the spool
+	// shadow, so a path whose guard reads not-pending and whose root then
+	// Lstats ENOENT is genuinely deleted — every interleaving is caught by
+	// the guard (still pending) or the probe (already on FUSE). The
+	// downstream filterSpoolPending stays as a backstop.
+	guard := rc.loadSpoolGuard()
 	var roots []string
 	for p := range absent {
 		if strings.HasPrefix(path.Base(p), "._") {
+			continue
+		}
+		if guard != nil && guard(p) {
 			continue
 		}
 		if _, parentAbsent := absent[path.Dir(p)]; !parentAbsent {
@@ -653,9 +674,23 @@ func (rc *RedisClient) collectFastPathPrunes(skipIncrement bool) (fastConfirmed 
 				capped = true
 				break
 			}
-			if strings.HasPrefix(p, prefix) && !strings.HasPrefix(path.Base(p), "._") {
+			if strings.HasPrefix(p, prefix) && !strings.HasPrefix(path.Base(p), "._") &&
+				(guard == nil || !guard(p)) {
 				fastConfirmed[p] = struct{}{}
 			}
+		}
+	}
+	// Review fix: ENOENT evidence is only trustworthy if the mount is
+	// verified REAL after the last probe — a mount dying to a plain dir
+	// mid-cycle turns every Lstat into a false "deleted". Cache-bypassing
+	// re-check before any pruneAbsent mutation; a discard leaves the ladder
+	// counters intact, and the re-stamped cache means the ladder-path
+	// identity gate in the prune pass sees the same fresh verdict.
+	if len(fastConfirmed) > 0 {
+		if identOK, identReason := pin.FUSEIdentityFresh(); !identOK {
+			jmlog.Warn("metadata sync: fast-path prune DISCARDED — FUSE identity failed post-probe",
+				"reason", identReason, "would_have_pruned", len(fastConfirmed))
+			return make(map[string]struct{}), false
 		}
 	}
 	for p := range fastConfirmed {
@@ -927,6 +962,18 @@ func (rc *RedisClient) reconcileLoop() {
 		case <-ticker.C:
 			rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
 		case <-rc.syncNowCh:
+			// G5 fast-path continuation (review fix): a capped mass-delete
+			// cycle with confirmed survivors schedules its own follow-up.
+			// It is authoritative prune convergence, not a network-flap
+			// trigger — run it immediately, bypassing the push deferral and
+			// flap debounce below (each continuation is still internally
+			// gated by RecentlyDegraded + the G0 identity checks inside
+			// collectFastPathPrunes, and stops the moment nothing survives).
+			if rc.pruneFollowUp.Swap(false) {
+				jmlog.Info("fast-path prune continuation — running immediate reconcile")
+				rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
+				continue
+			}
 			// Keyspace-push deferral (2026-06-27): when the push is actively
 			// ENABLED the backstop is long (setEngagement stores a >30s interval
 			// ONLY for ENABLED+reachable). In that state a network-change/reconnect
@@ -1570,11 +1617,10 @@ func (rc *RedisClient) syncMetadata() error {
 	for p := range fastConfirmed {
 		toDelete = append(toDelete, p)
 	}
-	if fastCapped {
-		// More confirmed work remains — run the next cycle now instead of
-		// waiting out the backstop.
-		rc.TriggerSync()
-	}
+	// (Review fix: the capped follow-up is scheduled AFTER DeletePaths below,
+	// and only when fast-confirmed paths actually survived the filters —
+	// otherwise a fully-spared >cap backlog (all pinned/spool-pending) or a
+	// zero-progress timeout cycle would chain back-to-back full SCANs.)
 
 	// === QA-30 Layer D (review FIX 2): never prune a spool-pending path ===
 	// The periodic full-SCAN prune is the SAME ESTALE bug class as scopedPrune,
@@ -1709,6 +1755,29 @@ func (rc *RedisClient) syncMetadata() error {
 	if len(toDelete) > 0 {
 		if err := rc.store.DeletePaths(toDelete); err != nil {
 			return fmt.Errorf("delete pruned: %w", err)
+		}
+	}
+
+	// Review fix: schedule the fast-path continuation only when capped AND
+	// fast-confirmed paths actually survived the filters into the executed
+	// delete — a fully-spared backlog (all pinned/spool-pending) or a
+	// zero-progress probe cycle must fall back to the periodic backstop, not
+	// chain back-to-back full SCANs. pruneFollowUp makes the follow-up bypass
+	// the keyspace-push deferral and flap debounce in reconcileLoop: it is a
+	// self-scheduled continuation of an already-authoritative SCAN, not a
+	// network-flap trigger (without it the accelerator is inert in the
+	// deployed push-enabled config).
+	if fastCapped && len(fastConfirmed) > 0 {
+		survived := false
+		for _, p := range toDelete {
+			if _, ok := fastConfirmed[p]; ok {
+				survived = true
+				break
+			}
+		}
+		if survived {
+			rc.pruneFollowUp.Store(true)
+			rc.TriggerSync()
 		}
 	}
 

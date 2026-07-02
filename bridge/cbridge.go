@@ -118,6 +118,13 @@ var (
 	globalSpool   *jmnfs.SpoolStore
 	globalDrainer *jmnfs.Drainer
 
+	// globalDrainerAtomic mirrors globalDrainer for lock-free readers that
+	// must never contend on globalMu (review fix: the reachability liveness
+	// hook runs on the prober goroutine while NFSServerStart can hold
+	// globalMu for its entire body — a mutex read there freezes offline
+	// detection during start). Stored wherever globalDrainer is assigned.
+	globalDrainerAtomic atomic.Pointer[jmnfs.Drainer]
+
 	// Control-plane / contract identity (JM-1 /whoami, JM-6 version-of-record).
 	// Captured at Start because cfg.MountPoint/DBPath/MetricsAddr are otherwise
 	// local to NFSServerStart; the /whoami handler needs them later. Read under
@@ -477,14 +484,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// offline-engage deferral and (pre-fix) let a reconcile prune real
 			// files mid-copy. This hook reports the age of the last proven
 			// drain; the monitor suppresses a probe FAILURE while that age is
-			// within ~2*baseInterval. globalDrainer is set later (under
-			// globalMu, same Start goroutine) — read it under globalMu and
-			// nil-safe: no drainer (spool disabled) → MaxInt64 sentinel → the
-			// override never fires → behavior identical to today.
+			// within ~2*baseInterval. Review fix (phase-1 adversarial review):
+			// the hook runs on the reachability prober's goroutine — taking
+			// globalMu here would block the ENTIRE offline-detection loop for
+			// as long as NFSServerStart holds globalMu (its whole body, which
+			// includes this very Reachability.Start), freezing offline
+			// detection exactly during start-while-offline. Read the drainer
+			// through a dedicated atomic instead (LastDrainSuccess is
+			// internally synchronized). Nil (spool disabled / server stopped)
+			// → MaxInt64 sentinel → the override never fires.
 			health.WithLivenessHook(func() time.Duration {
-				globalMu.Lock()
-				d := globalDrainer
-				globalMu.Unlock()
+				d := globalDrainerAtomic.Load()
 				if d == nil {
 					return time.Duration(math.MaxInt64)
 				}
@@ -557,21 +567,25 @@ func NFSServerStart(configJSON *C.char) *C.char {
 
 	// [metadata keyspace push] Wire the class-gating signals BEFORE rc.Start so
 	// the keyspace loop (started inside Start when JM_METADATA_KEYSPACE_PUSH=1)
-	// can class-gate its rare-backstop cadence + coalescer from launch. We always
-	// pass globalReach.Reachable for online/offline; the active-interface NAME
-	// signal needs a NetWatcher, which we only spin up when the push feature is
-	// enabled (avoids an extra 1s-poll goroutine in the default-off case). When
-	// the NetWatcher is absent, class-gating falls back to JM_WAN_MODE + a WiFi
-	// default — safe and link-sparing.
+	// can class-gate its rare-backstop cadence + coalescer from launch.
+	// Review fix (phase-1 adversarial review): the reachability signal is
+	// wired UNCONDITIONALLY — RecentlyDegraded's reachableNow() gate (the G2
+	// b.1 false-flap prune protection) must be live in every config, not
+	// only when the push is enabled. Only the NetWatcher (active-interface
+	// NAME signal, an extra 1s-poll goroutine) stays push-gated; with a nil
+	// interface fn, class-gating falls back to JM_WAN_MODE + a WiFi default
+	// — safe and link-sparing, byte-identical to before for push-off.
+	var reachFn func() bool
+	if globalReach != nil {
+		reachFn = globalReach.Reachable
+	}
+	var ifaceFn func() string
 	if os.Getenv("JM_METADATA_KEYSPACE_PUSH") == "1" {
 		globalKeyspaceNetWatcher = health.NewNetWatcher(1 * time.Second)
 		globalKeyspaceNetWatcher.Start()
-		var reachFn func() bool
-		if globalReach != nil {
-			reachFn = globalReach.Reachable
-		}
-		metadata.SetClassSignals(globalKeyspaceNetWatcher.ActiveInterface, reachFn)
+		ifaceFn = globalKeyspaceNetWatcher.ActiveInterface
 	}
+	metadata.SetClassSignals(ifaceFn, reachFn)
 
 	// Initial sync. R-4: skip when started offline — it would only fail against
 	// the dead backend. rc.Start() still launches the reconcile loop, which flips
@@ -793,6 +807,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 
 					globalSpool = spool
 					globalDrainer = drainer
+					globalDrainerAtomic.Store(drainer)
 					srv.Handler().SetSpool(spool, drainer)
 					// QA-30 Layer D: let the reconcile's scopedPrune spare any
 					// path with a live, not-yet-drained spool entry so a
@@ -1135,6 +1150,7 @@ func stopServerLocked() {
 	keyspaceNW := globalKeyspaceNetWatcher
 	spool := globalSpool
 	drainer := globalDrainer
+	globalDrainerAtomic.Store(nil)
 	derivStore := globalDerivStore
 	globalMetrics = nil
 	globalMonitor = nil

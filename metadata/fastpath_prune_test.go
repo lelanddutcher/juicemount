@@ -61,6 +61,30 @@ func TestFastPathPruneConvergesDeletedSubtree(t *testing.T) {
 	}
 }
 
+// Review fix: spool-pending paths must be excluded at COLLECTION time — a
+// file mid-drain is absent from Redis AND absent from FUSE (spool-only), so
+// without the guard the fast-path would confirm-and-prune it, Forgetting its
+// live NFS handle (ESTALE mid-copy).
+func TestFastPathPruneSparesSpoolPending(t *testing.T) {
+	rc := fastPathHarness(t, map[string]int{
+		"Assets/Gone":         1,
+		"Assets/Gone/a.wav":   1,
+		"Assets/draining.mov": 1, // spool-pending root — must not be probed/pruned
+	})
+	rc.SetSpoolGuard(func(p string) bool { return p == "Assets/draining.mov" })
+
+	confirmed, _ := rc.collectFastPathPrunes(false)
+	if _, ok := confirmed["Assets/draining.mov"]; ok {
+		t.Fatal("spool-pending path fast-pruned — ESTALE/100070 mid-copy bug class")
+	}
+	if _, still := rc.pruneAbsent["Assets/draining.mov"]; !still {
+		t.Fatal("spool-pending path must remain tracked for later cycles")
+	}
+	if _, ok := confirmed["Assets/Gone"]; !ok {
+		t.Fatal("guard must not over-spare: genuinely deleted subtree still prunes")
+	}
+}
+
 func TestFastPathPruneInertOnDegradedCycle(t *testing.T) {
 	rc := fastPathHarness(t, map[string]int{"Assets/Gone": 1})
 	confirmed, capped := rc.collectFastPathPrunes(true /* skipIncrement: RecentlyDegraded */)
