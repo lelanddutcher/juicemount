@@ -1843,7 +1843,14 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 		dirname = strings.TrimPrefix(dirname, "/")
 	}
 
-	children, err := jfs.handler.store.ListChildren(dirname)
+	// Item 1 (serving-layer-decision.md): under JM_READDIR_PAGINATED (or the
+	// SQLite serve substrate), build the whole listing by streaming idx_parent
+	// in bounded pages with pooled scratch instead of one giant whole-dir map
+	// copy — kills the big-dir veto (the 10,774-child DCIM dir was 12.7ms /
+	// 6.26MB / 215k allocs as a single scan+copy). Default off = RAM whole-dir
+	// copy, unchanged. The returned SET is identical either way; the protocol
+	// layer still hashes+caches+paginates the full listing by index.
+	children, err := jfs.handler.store.ListChildrenForReadDir(dirname)
 	if err != nil {
 		return nil, err
 	}

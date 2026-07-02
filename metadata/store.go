@@ -31,6 +31,20 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS idx_parent ON entries(parent_path);
 CREATE INDEX IF NOT EXISTS idx_inode ON entries(inode);
 CREATE INDEX IF NOT EXISTS idx_name ON entries(name COLLATE NOCASE);
+-- idx_parent_name is load-bearing for the paginated READDIR seek-cursor query
+-- (serving-layer-decision.md §Item 1, ListChildrenPage): WHERE parent_path=?
+-- AND name>? ORDER BY name LIMIT ?. Without it the planner uses idx_parent for
+-- the WHERE but then builds a "USE TEMP B-TREE FOR ORDER BY" that sorts the
+-- ENTIRE child set by name on EVERY page — making each page O(all-children),
+-- ~2.2ms on the 10,774-child DCIM dir regardless of LIMIT (measured). A
+-- composite (parent_path, name) index satisfies both the equality seek AND the
+-- name ordering from the index itself (no temp b-tree), turning each page into a
+-- true O(limit) index seek: ~160µs for a 128-row page (14x faster; the
+-- veto-mitigation proof). BINARY collation (default) — matches the plain
+-- 'ORDER BY name' / 'name > ?' in ListChildrenPage; idx_name's NOCASE variant
+-- does NOT satisfy a BINARY ordering, which is why this is a distinct index.
+-- Additive (CREATE IF NOT EXISTS) so it lands on existing mirror DBs at open.
+CREATE INDEX IF NOT EXISTS idx_parent_name ON entries(parent_path, name);
 `
 
 // metaSchema is a tiny durable key/value side-table for small pieces of
@@ -199,6 +213,14 @@ type Store struct {
 	// needs recovery, so evicting the oldest is safe). Guarded by mu.
 	syntheticHandles map[uint64]string
 	syntheticOrder   []uint64
+
+	// serve holds the lazily-prepared SQLite serve statements used by the
+	// SQLite-direct serve path (JM_SERVE_FROM_SQLITE / JM_READDIR_PAGINATED,
+	// serving-layer-decision.md §Item 1/2). Prepared against the *sql.DB pool
+	// on first serve query; see serve_sqlite.go for the concurrency model.
+	// Non-nil for the process lifetime; the statements inside are nil until the
+	// first flag-on serve query prepares them (default-off = never prepared).
+	serve *serveStmts
 }
 
 // maxSyntheticHandles bounds syntheticHandles. Generous — far above any real
@@ -528,6 +550,7 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		childrenIdx:      make(map[string]map[string]*Entry),
 		maxCacheSize:     maxCacheSize,
 		syntheticHandles: make(map[uint64]string),
+		serve:            &serveStmts{},
 	}
 
 	if err := s.rebuildCaches(); err != nil {
@@ -810,7 +833,15 @@ func (s *Store) evictPathOrphanLocked(old, new *Entry) {
 }
 
 // LookupByInode returns the entry with the given inode, or nil.
+//
+// The RAM read is factored into lookupByInodeRAM so the SQLite-direct serve
+// path (serving-layer-decision.md §Item 2) can add a per-call substrate switch
+// here without touching call sites. Item 1 leaves this reading RAM.
 func (s *Store) LookupByInode(inode uint64) *Entry {
+	return s.lookupByInodeRAM(inode)
+}
+
+func (s *Store) lookupByInodeRAM(inode uint64) *Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.inodeCache[inode]
@@ -818,6 +849,10 @@ func (s *Store) LookupByInode(inode uint64) *Entry {
 
 // LookupByPath returns the entry at the given path, or nil.
 func (s *Store) LookupByPath(entryPath string) *Entry {
+	return s.lookupByPathRAM(entryPath)
+}
+
+func (s *Store) lookupByPathRAM(entryPath string) *Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.pathCache[entryPath]
@@ -825,7 +860,12 @@ func (s *Store) LookupByPath(entryPath string) *Entry {
 
 // ListChildren returns all entries whose parent_path matches the given path.
 // Uses the children index for O(children) lookup instead of O(total entries).
+// (Item 2 adds a per-call SQLite substrate switch here; Item 1 leaves it RAM.)
 func (s *Store) ListChildren(parentPath string) ([]*Entry, error) {
+	return s.listChildrenRAM(parentPath)
+}
+
+func (s *Store) listChildrenRAM(parentPath string) ([]*Entry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

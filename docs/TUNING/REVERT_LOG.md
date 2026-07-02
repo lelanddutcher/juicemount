@@ -683,3 +683,61 @@ green; health green except the known environmental failures
 (`TestRedisHealthCheck`/`TestMinIOHealthCheck`/`TestStatusReturnsCorrectState`
 need a live local Redis/MinIO). **Pending:** live hotspot+Tailscale re-test
 that `currentLinkClass()` now reports tunnel and the G7 300s budget engages.
+
+---
+
+## 2026-07-02 — Item 1: paginated READDIR via ListChildrenPage (big-dir veto mitigation)
+
+Env-revertable without a rebuild. Motivation: the serving-layer decision
+(VISION/serving-layer-decision.md §Item 1) moves NFS nav toward serving from
+SQLite-WAL, but a naive whole-dir `SELECT` on the 10,774-child DCIM dir was the
+one number that vetoed the port: 12.7ms p99 / 6.26MB / 215,517 allocs as a
+single full scan+copy. READDIR must be PAGINATED first.
+
+**Item 1 — `Store.ListChildrenPage(parentPath, cursor, limit)`** runs a prepared
+seek-cursor query on the mirror — `WHERE parent_path=? AND name > ? ORDER BY
+name LIMIT ?` — returning one READDIR page + a next-cursor (the last name). A
+`sync.Pool` recycles the scalar scan scratch to cut per-row allocs. The NFS
+`ReadDir` path (nfs/handler.go) builds its whole-dir listing by iterating
+`ListChildrenPage` in bounded pages instead of one giant `ListChildren` map
+copy. (The NFS PROTOCOL layer — nfs_onreaddir.go — still hashes+caches the full
+listing and paginates by index into it; Item 1 changes only how that listing is
+BUILT, not the protocol contract. See "uncertainty" below.)
+
+**Load-bearing schema addition — `idx_parent_name ON entries(parent_path,
+name)`:** without a composite (parent_path, name) index the planner uses
+`idx_parent` for the equality but then builds a `USE TEMP B-TREE FOR ORDER BY`
+that sorts the ENTIRE child set by name on EVERY page — making each page
+O(all-children), ~2.2ms on the DCIM dir REGARDLESS of LIMIT (measured, and it is
+the same floor at page size 64 or 512). The composite index satisfies both the
+equality seek AND the name ordering from the index (no temp b-tree), turning
+each page into a true O(limit) seek: a realistic 256-row page drops to ~0.30ms
+(first page ~0.30ms, middle page ~0.33ms) — a ~7x win and well under the
+sub-1ms/page RPC budget. The index is additive (`CREATE INDEX IF NOT EXISTS`),
+BINARY collation (matches the plain `ORDER BY name`; idx_name's NOCASE variant
+does NOT satisfy a BINARY ordering), and lands on existing mirror DBs at open.
+It costs one extra b-tree on writes — negligible vs the READDIR win.
+
+- **`JM_READDIR_PAGINATED=1`** — enables the paginated whole-dir build in NFS
+  ReadDir. **Default OFF (unset / != "1")** = today's behavior: the RAM
+  `childrenIdx` whole-dir map copy, byte-identical. Checked in
+  `readdirPaginatedEnabled()` (metadata/serve_sqlite.go), consulted only inside
+  `Store.ListChildrenForReadDir`; no handler.go call-site behavior changes when
+  off. `JM_SERVE_FROM_SQLITE=1` (Item 2) implies the paged build too.
+
+**Revert:** unset `JM_READDIR_PAGINATED` → instant return to the RAM whole-dir
+copy, no restart-of-the-world. The idx_parent_name index remains (inert when
+unused; harmless extra index). `ListChildren` (the RAM whole-dir accessor) is
+untouched and still used when the flag is off.
+
+**Validated:** unit — `TestListChildrenPage_MultiPage` (25 items/10-limit → 3
+pages, strict name order, no dupes/gaps), `_ExactMultiple` (20/10 → empty tail
+page terminates), `_EmptyDir`, `_OverLimit` (100/7, no dupes),
+`TestListChildrenPage_BigDirUnderBudget` (10,774-child, 256-row page < 2ms gate
+— catches idx_parent_name loss). Benchmarks (Apple M2 Pro, on-disk WAL + shared
+`:memory:` both):
+`BenchmarkListChildrenPage_BigDir` (256-row middle page) = ~333µs / 3,867
+allocs; `_FirstPage` = ~302µs; `_FullPage` (1000-row) = ~1.17ms. `go vet` clean;
+metadata suite green. **Pending:** real Finder open of the DCIM dir (no
+beachball) — unit benches are the veto-mitigation proof, not the field test.
+
