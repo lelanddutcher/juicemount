@@ -480,3 +480,65 @@ cellular-relay validation that a 200-300s SCAN now completes within the 300s
 budget (or defers quietly), the link stays usable between backstop ticks,
 and /activity shows the deferred line instead of "Rebuilding index…" (unit
 tests give false positives on this codebase per testing discipline).
+
+## 2026-07-02 — G8: classify link by BACKEND route, not default route (task #81)
+
+**Proven live (2026-07-02 11:05, iPhone-hotspot + Tailscale):** the NAS route
+was `utun6` but `currentLinkClass()` said WIFI, because the interface signal
+(`health.NetWatcher.ActiveInterface`, wired via `metadata.SetClassSignals` in
+`bridge/cbridge.go`) reported the DEFAULT-ROUTE interface (`en0`). Measured
+consequences: G7's `scanContextTimeout()` used the 120s WiFi budget instead of
+the 300s cellular budget → the SCAN could never complete → keyspace-push
+gap-fill never finished → engagement never ENABLED → G7's deferral never armed
+→ a 60s/backoff retry loop burned the metered link. The same wrong class also
+mis-gated G6's tunnel deferral, the 15m-vs-20m backstop, and the coalescer.
+
+**Change (health/netwatch.go, bridge/cbridge.go):** the keyspace-push
+NetWatcher is now constructed `WithBackendTarget(redisAddr)` (host:port from
+`metadata.ParseRedisURL(cfg.RedisURL)`), which switches it from default-route
+detection to backend-route detection: resolve *the interface the kernel routes
+to the backend*.
+
+**Resolver chosen — connected-UDP trick (no exec, no probe traffic):**
+`net.Dial("udp", backend)` performs `connect(2)` on a datagram socket, which
+sends NO packet — the kernel only does the routing-table lookup and binds the
+local source IP of the chosen route; that IP is mapped back to its owning
+interface via `net.Interfaces`. LAN backend (10.x over en21) → binds en21's
+address → `en21`; Tailscale backend (100.64/10 or subnet-router route) → binds
+the Mac's OWN utunN address (the utun has its own local IP) → `utunN`
+(live-validated on the hotspot+Tailscale rig). Resolution is cached ~10s
+(success AND failure) — the 1s poll is too hot for a possibly-DNS-involving
+dial; route changes are rare, ≤10s detection lag is fine.
+
+**Failure modes (all degrade to the pre-G8 default-route behavior, never
+worse):** DNS-named backend with DNS down → bounded 2s dial timeout, failure
+cached; fully offline (no route) → connect fails → fallback; loopback backend
+(dev localhost Redis) → resolves `lo0` → unknown-name conservative WiFi band;
+link-local IPv6 zone mismatch → no interface match → fallback. The connected
+socket proves ROUTING only, not reachability (liveness stays with
+`health.Reachability`).
+
+**Override precedence untouched:** `JM_WAN_MODE=1` is still consulted FIRST in
+`metadata.currentLinkClass` (forces tunnel regardless of any interface
+signal); `JM_NET_FORCE_CLASS`/`JM_NET_ADAPTIVE` (netprofile) are a separate
+classifier and unchanged. jm5 does not wire `SetClassSignals` — left as is.
+
+**Revert:** no new env switch — the backend-route mode only engages under
+`JM_METADATA_KEYSPACE_PUSH=1` (same gate as the NetWatcher itself), and
+`JM_WAN_MODE=1` already pins the tunnel band without a rebuild if the resolver
+ever misclassifies. Full revert = revert the commit (the `WithBackendTarget`
+option is additive; dropping it restores default-route detection
+byte-identically).
+
+**Validated:** unit — `TestCurrentLinkClassBands` (+`utun6` case, via the
+injected `SetClassSignals` signal), `TestInterfaceForIPRoundTrip` (real
+`net.Interfaces` data: lo0/en0/...; utun can't be fabricated in CI —
+live-validated), `TestInterfaceForIPUnownedIP`,
+`TestResolveRouteInterfaceLoopback` (full connected-UDP path over the loopback
+route), `TestResolveRouteInterfaceBadTarget`,
+`TestNetWatcherBackendRouteSuccess/Cached/FallbackOnError/Recovery`,
+`TestNetWatcherNoTargetUnchanged`. `go vet` clean; metadata + bridge suites
+green; health green except the known environmental failures
+(`TestRedisHealthCheck`/`TestMinIOHealthCheck`/`TestStatusReturnsCorrectState`
+need a live local Redis/MinIO). **Pending:** live hotspot+Tailscale re-test
+that `currentLinkClass()` now reports tunnel and the G7 300s budget engages.

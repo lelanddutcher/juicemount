@@ -197,6 +197,7 @@ func TestCurrentLinkClassBands(t *testing.T) {
 		{"eth0", classLAN},
 		{"en0", classWiFi},
 		{"utun4", classTunnel},
+		{"utun6", classTunnel}, // G8 (task #81): the live hotspot+Tailscale backend route
 		{"tailscale0", classTunnel},
 		{"weird9", classWiFi}, // unknown -> conservative WiFi
 	}

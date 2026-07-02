@@ -710,7 +710,23 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	}
 	var ifaceFn func() string
 	if os.Getenv("JM_METADATA_KEYSPACE_PUSH") == "1" {
-		globalKeyspaceNetWatcher = health.NewNetWatcher(1 * time.Second)
+		// G8 (task #81): classify by the route to the BACKEND, not the default
+		// route. Proven live 2026-07-02 (hotspot + Tailscale): the NAS route was
+		// utun6 but the default-route heuristic reported en0, so currentLinkClass
+		// said WiFi on a metered tunnel — G7's SCAN budget used 120s instead of
+		// 300s, the SCAN never finished, engagement never ENABLED, and the 60s
+		// retry loop burned the metered link (also mis-gated G6's deferral, the
+		// backstop cadence, and the coalescer). WithBackendTarget makes the
+		// watcher resolve the interface the kernel routes to the Redis host
+		// (connected-UDP trick, no probe traffic; resolver failure falls back to
+		// the old default-route behavior — see health/netwatch.go). JM_WAN_MODE /
+		// JM_NET_FORCE_CLASS override precedence is untouched: those are consulted
+		// in metadata.currentLinkClass / netprofile BEFORE this signal.
+		var opts []health.NetWatcherOption
+		if backendAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL); backendAddr != "" {
+			opts = append(opts, health.WithBackendTarget(backendAddr))
+		}
+		globalKeyspaceNetWatcher = health.NewNetWatcher(1*time.Second, opts...)
 		globalKeyspaceNetWatcher.Start()
 		ifaceFn = globalKeyspaceNetWatcher.ActiveInterface
 	}
