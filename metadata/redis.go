@@ -1659,6 +1659,19 @@ func (rc *RedisClient) syncMetadata() (err error) {
 		}
 		entryPath := strings.Join(parts, "/")
 
+		// #78 follow-up (proven live 2026-07-02): `.juicemount/` IS
+		// SCAN-visible (unlike `.trash/`, which the root-walk excludes
+		// structurally), so without this gate the SCAN's upsert path
+		// resurrects ~17k internal-namespace rows every cycle and the
+		// open-time GC deletes them again next launch — a permanent churn
+		// loop. Filter here, at construction: the entry stays out of BOTH
+		// redisEntries (no upsert) and redisPaths (so the absent-tracking
+		// exclusion in trackAbsentPaths stays consistent — filtered paths
+		// are absent from both sides and tracked nowhere).
+		if scanFilteredPath(entryPath) {
+			continue
+		}
+
 		var mtime time.Time
 		if e.mtime > 0 {
 			mtime = time.Unix(e.mtime, 0)
