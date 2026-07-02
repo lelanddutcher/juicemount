@@ -110,6 +110,32 @@ type Drainer struct {
 	// buffer). Opt back in with JM_DRAIN_ATREST_VERIFY=1 only on a fast/idle
 	// backend where the extra read pass is affordable.
 	atRestVerify bool
+
+	// batchInsert gates the drain metadata write-coalescer (Lever 1,
+	// JM_DRAIN_BATCH_INSERT). Default OFF: behavior is byte-identical to the
+	// per-file (onSizeReady → MarkDrainComplete) path. When ON, a
+	// successfully-copied+verified drain is enqueued into the coalescer instead
+	// of committing its (UpdateSize + MarkDone) pair inline; the coalescer
+	// flushes N ops or T ms — whichever first — in ONE cross-table SQLite
+	// transaction (metadata.Store.BatchDrainComplete), collapsing N fsync/
+	// syscall cascades into 1 under a many-file write storm. Task #65's
+	// size-publish-before-eviction ordering is preserved by construction: the
+	// per-file UpdateSize and MarkDone land in the same committed tx, and the
+	// batch's post-commit eviction cleanup runs only after that commit. See
+	// drainer_batch.go.
+	batchInsert bool
+
+	// batch is the write-coalescer; non-nil only when batchInsert is true. Set
+	// in NewDrainer. See drainBatcher.
+	batch *drainBatcher
+
+	// onBatchDrainComplete commits a batch of drained-file metadata writes in
+	// one transaction and returns per-item done results. Wired (before Start)
+	// to metadata.Store.BatchDrainComplete via SetOnBatchDrainComplete. Read
+	// by the coalescer flusher goroutine; set-before-Start provides the
+	// happens-before. nil ⇒ the batcher falls back to per-file completion
+	// (defensive; production always wires it when the flag is on).
+	onBatchDrainComplete func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)
 }
 
 // DrainerConfig controls drainer behavior. Zero values fall back to
@@ -183,7 +209,7 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 	if cfg.PollFallback <= 0 {
 		cfg.PollFallback = 30 * time.Second
 	}
-	return &Drainer{
+	d := &Drainer{
 		spool:        spool,
 		fuseRoot:     cfg.FuseRoot,
 		workers:      cfg.Workers,
@@ -191,11 +217,16 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		backoffBase:  cfg.BackoffBase,
 		pollFallback: cfg.PollFallback,
 		atRestVerify: os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
+		batchInsert:  os.Getenv("JM_DRAIN_BATCH_INSERT") == "1",
 		sem:          make(chan struct{}, cfg.Workers),
 		notify:       make(chan struct{}, 1),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
-	}, nil
+	}
+	if d.batchInsert {
+		d.batch = newDrainBatcher(d, drainBatchMaxOps, drainBatchMaxDelay)
+	}
+	return d, nil
 }
 
 // Start launches the dispatcher goroutine and registers the wake
@@ -245,6 +276,11 @@ func (d *Drainer) Stop(deadline time.Duration) bool {
 	doneCh := make(chan struct{})
 	go func() {
 		d.inFlight.Wait()
+		// Lever 1: once every worker has finished enqueueing, flush the final
+		// partial batch so no drained file's metadata commit is stranded at
+		// shutdown. Runs inside the wait goroutine so it completes within the
+		// same deadline the caller granted for in-flight work.
+		d.flushBatch()
 		close(doneCh)
 	}()
 	select {
@@ -286,11 +322,32 @@ func (d *Drainer) SetOnSizeReady(fn func(nfsPath string, size int64)) {
 	d.onSizeReady = fn
 }
 
+// SetOnBatchDrainComplete registers the batched metadata-commit hook used when
+// JM_DRAIN_BATCH_INSERT is on (Lever 1). It must commit every item's size
+// publish + spool mark-done in ONE transaction, size-before-done per item, and
+// return per-item done results aligned by index (see
+// metadata.Store.BatchDrainComplete). Call once BEFORE Start; the coalescer
+// flusher reads it after Start (set-before-Start happens-before). A no-op when
+// the flag is off.
+func (d *Drainer) SetOnBatchDrainComplete(fn func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)) {
+	d.onBatchDrainComplete = fn
+}
+
 // SetOnSymlinkMaterialized registers a callback invoked once per deferred
 // offline symlink after it is materialized on FUSE at reconnect. Must be
 // called BEFORE Start (read by the dispatcher on the reconnect edge).
 func (d *Drainer) SetOnSymlinkMaterialized(fn func(linkPath string)) {
 	d.onSymlinkMaterialized = fn
+}
+
+// flushBatch flushes any pending coalesced drains (Lever 1). No-op when the
+// batcher is disabled. Called on the drain-idle edge (ListReady empty), before
+// the dispatcher parks (offline / FUSE-identity loss), and on Stop — so a
+// partial batch is never stranded and never spans the offline boundary.
+func (d *Drainer) flushBatch() {
+	if d.batch != nil {
+		d.batch.flush()
+	}
 }
 
 // wakeNonBlocking is the callback handed to SpoolStore.SetDrainerWake.
@@ -336,6 +393,11 @@ func (d *Drainer) dispatchLoop() {
 		// backend is reachable again; ingest keeps filling the spool meanwhile
 		// (offline-ingest sprint) and we drain it on reconnect.
 		if pin.IsOffline() {
+			// Lever 1: flush any coalesced drains from the just-ended online
+			// window before parking, so a partial batch is committed while the
+			// backend is still reachable and never spans the offline boundary.
+			// (In-flight stragglers are still backstopped by the batch timer.)
+			d.flushBatch()
 			wasOffline = true
 			continue
 		}
@@ -347,6 +409,8 @@ func (d *Drainer) dispatchLoop() {
 		// offline: the spool is the durable safe place; drains resume (with
 		// the reconnect requeue below) the moment the mount is real again.
 		if ok, reason := pin.FUSEIdentityState(); !ok {
+			// Lever 1: flush before parking (see the offline branch).
+			d.flushBatch()
 			if !identityParked {
 				log.Printf("drainer: PARKED — FUSE identity gate failed (%s); writes stay in the spool until the mount is real", reason)
 				identityParked = true
@@ -408,6 +472,12 @@ func (d *Drainer) dispatchLoop() {
 				}
 			}
 		}
+		// Lever 1: the ready queue is drained (or we bailed to re-evaluate).
+		// Flush whatever workers have enqueued so far rather than making it wait
+		// for the batch timer before its size-publish + shadow eviction land.
+		// Workers still finishing the last dispatch cycle enqueue after this and
+		// are caught by the batch timer (or the next iteration's flush).
+		d.flushBatch()
 	}
 }
 
@@ -744,6 +814,19 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		}
 	}
 
+	// Lever 1 (JM_DRAIN_BATCH_INSERT): hand the fully-copied+verified drain to
+	// the write-coalescer instead of committing its (UpdateSize + MarkDone) pair
+	// inline. The coalescer batches many files' metadata writes into one SQLite
+	// transaction, cutting fsync/syscall volume under a write storm. Correctness
+	// is unchanged: BatchDrainComplete commits the size publish BEFORE the
+	// mark-done per file (task #65), and the post-commit eviction cleanup runs
+	// only after that tx commits — so this file's size is durable before its
+	// spool shadow is evicted, exactly as the per-file path guarantees below.
+	if d.batch != nil {
+		d.batch.enqueue(pendingDrain{row: row, dest: dest, n: n})
+		return
+	}
+
 	// task #65: publish the real size into the metadata store BEFORE eviction.
 	// The backend file is whole + SHA-verified here and row.Size is authoritative
 	// (n == row.Size enforced above), so this closes the eviction-before-publish
@@ -979,5 +1062,10 @@ func (d *Drainer) DrainOnceForTest(ctx context.Context) int {
 	case <-ctx.Done():
 		panic("DrainOnceForTest: ctx expired before in-flight drains completed; pass a longer context or check for a stalled FUSE call")
 	}
+	// Lever 1: workers enqueue into the coalescer instead of committing inline,
+	// so a single test scan leaves a partial batch. Flush it synchronously here
+	// so the same post-conditions the per-file path asserts (row done, spool
+	// file gone, size published, capacity released) hold when this returns.
+	d.flushBatch()
 	return count
 }

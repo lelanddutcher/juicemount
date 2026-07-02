@@ -680,6 +680,12 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		// the eviction-before-publish window that made fresh reads of a just-drained
 		// file clamp to a stale 0/partial size during an offline->online drain burst.
 		drainer.SetOnSizeReady(h.publishDrainedSize)
+		// Lever 1 (JM_DRAIN_BATCH_INSERT): batched form of the size-publish +
+		// mark-done pair. When the flag is on, the drainer coalesces many files'
+		// metadata writes and commits them via this hook in ONE cross-table
+		// SQLite transaction (size published BEFORE mark-done per file, task
+		// #65). A no-op cost when the flag is off (the drainer never calls it).
+		drainer.SetOnBatchDrainComplete(h.store.BatchDrainComplete)
 		// Post-materialize hook: once a deferred offline symlink is os.Symlink'd
 		// onto FUSE at reconnect, clear its LocalOnly flag — it's now a real
 		// backend entry, so the reconcile prune must treat it like any other

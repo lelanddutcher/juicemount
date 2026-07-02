@@ -882,6 +882,22 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 		// drainer to undo the FUSE write it just made.
 		return false, nil
 	}
+	s.completeDrainCleanup(id, nfsPath, spoolFile, size)
+	return true, nil
+}
+
+// completeDrainCleanup runs the post-MarkDone side of a successful drain: evict
+// the in-memory index entry, release the capacity reservation, note drain
+// progress (keep-awake), remove the spool file, and append the audit manifest
+// record. Factored out of MarkDrainComplete so the batched drain path
+// (JM_DRAIN_BATCH_INSERT — SpoolStore.BatchCompleteDrainCleanup) runs the EXACT
+// same cleanup after its single-transaction mark-done commit; the per-file and
+// batched paths stay behavior-identical from here on.
+//
+// MUST be called ONLY after the row's SQL mark-done has durably committed (task
+// #65: the spool shadow's eviction — index delete + file removal here — happens
+// strictly after the size publish + mark-done are on disk).
+func (s *SpoolStore) completeDrainCleanup(id int64, nfsPath, spoolFile string, size int64) {
 	// Finding 3 fix: evict the in-memory index entry BEFORE removing the
 	// spool file. New reads then miss the index and fall through to FUSE
 	// (where the drained bytes now live) instead of resolving to the spool
@@ -925,7 +941,17 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 				id, nfsPath, appendErr)
 		}
 	}
-	return true, nil
+}
+
+// BatchCompleteDrainCleanup runs completeDrainCleanup for one already-committed
+// batched drain (JM_DRAIN_BATCH_INSERT). The size publish + mark-done for this
+// id were committed in metadata.Store.BatchDrainComplete's single transaction;
+// this performs the identical post-commit cleanup the per-file
+// MarkDrainComplete does after its own MarkDone. Exported so the drainer's
+// batch flusher (a different package method surface than MarkDrainComplete) can
+// reuse it verbatim.
+func (s *SpoolStore) BatchCompleteDrainCleanup(id int64, nfsPath, spoolFile string, size int64) {
+	s.completeDrainCleanup(id, nfsPath, spoolFile, size)
 }
 
 // CancelForDelete cancels any in-flight spool entry for nfsPath so a pending

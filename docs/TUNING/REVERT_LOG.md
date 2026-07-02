@@ -7,6 +7,63 @@ a rebuild**.
 
 ---
 
+## 2026-07-02 — Perf Lever 1: batch drain metadata SQLite writes (`JM_DRAIN_BATCH_INSERT`)
+
+Env-revertable without a rebuild. Motivation: a CPU profile under a concurrent
+write storm showed the app SYSCALL + SCHEDULER-bound (47% raw syscalls, 22%
+netpoll, 16% thread park/wake), NOT lock-bound. A reducible contributor is the
+volume of BACKGROUND drain metadata SQLite writes: the drainer commits a
+SEPARATE transaction PER drained file — the size publish (`onSizeReady` →
+`Store.UpdateSize`) and the mark-done (`MarkDrainComplete` → `SpoolStore.MarkDone`)
+are two transactions, each its own WAL append + fsync. Under an N-file copy
+storm that is ~2N transactions = ~2N fsync/syscall cascades competing with the
+foreground NFS handlers on the same DB.
+
+**Lever 1 — coalesce the drainer's per-file metadata writes into BATCHED
+transactions.** When ON, a copied+SHA-verified drain is enqueued into a bounded
+write-coalescer instead of committing inline; the coalescer flushes on the FIRST
+of two thresholds — **256 ops** or **50 ms** since the batch opened — committing
+every pending file's (size publish + mark-done) in ONE cross-table SQLite
+transaction (`metadata.Store.BatchDrainComplete`). N drains → 1 transaction → 1
+fsync cascade. The per-file post-commit cleanup (index evict, capacity release,
+spool-file removal, manifest, metrics, `onDrainComplete`) runs unchanged, only
+after the batch commits.
+
+- **`JM_DRAIN_BATCH_INSERT`** — the A/B flag. **Default OFF** (unset / any value
+  other than `1`): the drainer takes the per-file `onSizeReady →
+  MarkDrainComplete` path exactly as today — byte-identical, the coalescer is
+  never constructed (`drainer.batch == nil`). Set `JM_DRAIN_BATCH_INSERT=1` to
+  enable the coalescer. Read once in `NewDrainer`, so a revert is: unset the env
+  and restart (no rebuild).
+
+**Correctness — task #65 (size-publish-before-eviction) preserved by
+construction, NOT by timing.** For every file, `BatchDrainComplete` runs
+`UPDATE entries SET size=MAX(...)` BEFORE `UPDATE spool_entries SET
+drain_state=done` and both commit atomically in the one transaction; the
+eviction side-effects (index evict, spool-file removal) run ONLY after that
+`tx.Commit()`. So a file's authoritative size is durable no later than its
+mark-done, and its spool shadow is not evicted until after the commit — a fresh
+read can never resolve a post-eviction-but-pre-size 0/partial size. This is the
+same guarantee the per-file path gives, with fewer fsyncs. entries.size stays
+MAX-only (idempotent, matching `UpdateSize`), and the QA-37 cancel contract
+holds via `_txlock=immediate` (the tx takes SQLite's write lock at Begin, so a
+concurrent `DeleteActiveByPath` either committed its DELETE first → mark-done
+affects 0 rows → `Done=false` → caller undoes the FUSE write, or blocks until
+after commit → its DELETE skips the now-done row).
+
+**No stranded writes / no offline-boundary spanning:** the batch flushes on
+drain-idle (ready queue empty), before the dispatcher parks (offline / FUSE
+identity loss), and on `Stop` (after in-flight workers drain). On any commit
+error the whole tx rolls back and every file in the batch is retried transiently
+(`failTransient`) with its FUSE write removed — no partial commit.
+
+**Baseline to revert to = `JM_DRAIN_BATCH_INSERT` unset/`0`** (no rebuild). Not
+link-class gated (it's a background-drain fsync optimization, link-independent),
+but logged here per discipline because it changes durable write batching on the
+metadata store that the offline promise depends on.
+
+---
+
 ## 2026-07-02 — Item 0: pinned-subtree metadata warming (pinned dirs list offline)
 
 Env-revertable without a rebuild. Motivation: pinning a directory cached its
