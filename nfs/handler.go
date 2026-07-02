@@ -940,6 +940,13 @@ func (h *JuiceMountHandler) asyncConfirmPhantomPurge(filename, fusePath string) 
 		if h.spool != nil && h.spool.HasPending(filename) {
 			return
 		}
+		// V2.3 G0: a plain-dir mountpoint (kext not loaded / mount absent)
+		// makes Lstat-ENOENT meaningless — every backend file "confirms" as
+		// a phantom. Keep the entry; a future Stat reverifies once the mount
+		// is real.
+		if !pin.FUSEIdentityOK() {
+			return
+		}
 
 		isNotExist, ok := lstatNotExistWithTimeout(fusePath, fuseStatTimeout)
 		if ok && isNotExist {
@@ -2029,6 +2036,15 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 					// are transient; keep the entry, just return ENOENT. See the Stat gate.
 					jmlog.Debug("open ENOENT on ._ sidecar - NOT purging (scan-filtered, transient)",
 						"path", filename)
+					return nil, err
+				}
+				// V2.3 G0: with the mountpoint a plain directory (macFUSE kext
+				// not loaded / mount absent), FUSE Lstat-ENOENT is true for
+				// EVERY backend file not locally present — purging on it would
+				// erode the mirror wholesale. Identity first, then Lstat.
+				if identOK, identReason := pin.FUSEIdentityState(); !identOK {
+					jmlog.Debug("open ENOENT but FUSE identity gate failed — NOT purging",
+						"path", filename, "reason", identReason)
 					return nil, err
 				}
 				isNotExist, ok := lstatNotExistWithTimeout(fusePath, 2*time.Second)

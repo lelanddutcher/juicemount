@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
@@ -913,6 +914,19 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		candidates = append(candidates, ch.Path)
 	}
 	if len(candidates) == 0 {
+		return
+	}
+
+	// === V2.3 G0: FUSE identity gate — skip this scoped prune when the
+	// mountpoint has no real filesystem mounted (kext not loaded / mount
+	// absent / wedged). The per-path FUSE Lstat spare below reads ENOENT for
+	// everything against a plain directory, disabling its protection exactly
+	// when it's needed most. The backstop SCAN re-derives these candidates
+	// once the mount is real.
+	if identOK, identReason := pin.FUSEIdentityState(); !identOK {
+		jmlog.Warn("scoped prune: FUSE identity gate failed — skipping",
+			"parent", parentPath, "reason", identReason,
+			"would_have_pruned", len(candidates))
 		return
 	}
 

@@ -585,6 +585,12 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 	}
 	if !strings.Contains(string(out), m.cfg.FUSEPath) {
 		jmlog.Debug("fuse mount not in mount table", "path", m.cfg.FUSEPath)
+		// V2.3 G0d: when the miss is the kext-approval loss, say so with the
+		// remediation — "no FUSE" alone reads like a transient.
+		if KextApprovalBlocked() {
+			return ComponentStatus{Healthy: false, LastCheck: now,
+				Message: "macFUSE not approved — System Settings → Privacy & Security → Allow, then reboot (writes buffered in spool)"}
+		}
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted (directory exists but no FUSE)"}
 	}
 

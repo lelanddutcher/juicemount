@@ -281,13 +281,14 @@ func (d *Drainer) wakeNonBlocking() {
 func (d *Drainer) dispatchLoop() {
 	defer close(d.done)
 	wasOffline := false
+	identityParked := false
 	for {
 		// When offline, poll at a tighter cadence than pollFallback so we
 		// notice reconnection (manual toggle or auto-recovery) within a few
 		// seconds and resume draining promptly. Online, the wake signal drives
 		// us and pollFallback is just a missed-signal backstop.
 		wait := d.pollFallback
-		if pin.IsOffline() {
+		if pin.IsOffline() || !pin.FUSEIdentityOK() {
 			wait = drainOfflineRecheck
 		}
 		select {
@@ -308,6 +309,25 @@ func (d *Drainer) dispatchLoop() {
 		if pin.IsOffline() {
 			wasOffline = true
 			continue
+		}
+		// PAUSE while the FUSE identity gate fails (V2.3 G0). When the
+		// mountpoint is a plain directory (macFUSE kext not loaded / mount
+		// absent) or wedged, os.Create against it SUCCEEDS onto the local
+		// boot disk and the "drained" bytes never reach the backend — the
+		// 2026-07-01 174GB stranded-writes incident. Park exactly like
+		// offline: the spool is the durable safe place; drains resume (with
+		// the reconnect requeue below) the moment the mount is real again.
+		if ok, reason := pin.FUSEIdentityState(); !ok {
+			if !identityParked {
+				log.Printf("drainer: PARKED — FUSE identity gate failed (%s); writes stay in the spool until the mount is real", reason)
+				identityParked = true
+			}
+			wasOffline = true
+			continue
+		}
+		if identityParked {
+			log.Printf("drainer: FUSE identity restored — resuming drains")
+			identityParked = false
 		}
 		// RECONNECT edge: any rows that exhausted their retry budget before or
 		// during the offline window are stuck in `failed`. Requeue them now
@@ -334,11 +354,12 @@ func (d *Drainer) dispatchLoop() {
 				return
 			default:
 			}
-			// Bail out of the batch if the network dropped mid-drain; the outer
-			// loop re-evaluates and parks. In-flight workers finish or
-			// fail-transient (treated as an offline pause, not a per-file
+			// Bail out of the batch if the network dropped mid-drain — or the
+			// FUSE identity gate failed (mount unmounted/wedged mid-batch);
+			// the outer loop re-evaluates and parks. In-flight workers finish
+			// or fail-transient (treated as an offline pause, not a per-file
 			// failure — see failTransient).
-			if pin.IsOffline() {
+			if pin.IsOffline() || !pin.FUSEIdentityOK() {
 				break
 			}
 			rows, err := d.spool.Meta().ListReady(d.workers * 2)
@@ -350,7 +371,7 @@ func (d *Drainer) dispatchLoop() {
 				break
 			}
 			for _, row := range rows {
-				if pin.IsOffline() {
+				if pin.IsOffline() || !pin.FUSEIdentityOK() {
 					break
 				}
 				if !d.dispatchRow(row) {
@@ -381,6 +402,13 @@ func (d *Drainer) dispatchLoop() {
 //     error leaves the row for the next attempt and is logged, never fatal
 //     (one bad link must not strand the others or the file drain).
 func (d *Drainer) materializePendingSymlinks() {
+	// V2.3 G0: os.Symlink into a plain-dir mountpoint would strand the links
+	// on the local disk exactly like a misdirected file drain. Rows persist,
+	// so skipping here just defers to the next reconnect edge.
+	if ok, reason := pin.FUSEIdentityState(); !ok {
+		log.Printf("drainer: skipping symlink materialization — FUSE identity gate failed (%s)", reason)
+		return
+	}
 	pend, err := d.spool.Meta().ListPendingSymlinks()
 	if err != nil {
 		log.Printf("drainer: reconnect list pending symlinks: %v", err)
@@ -502,6 +530,16 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	if row.DrainAttempts >= d.maxAttempts {
 		// Exhausted before we even started this attempt.
 		d.failPermanent(row, fmt.Sprintf("retry budget exhausted (%d attempts)", row.DrainAttempts))
+		return
+	}
+
+	// V2.3 G0: last-line identity guard for a worker that raced the
+	// dispatcher's park (mount unmounted between dispatch and here). Writing
+	// into a plain-dir mountpoint "succeeds" onto the local disk and strands
+	// the bytes — refuse and pause instead (ErrFUSEIdentityGate routes to
+	// failTransient's infra-pause branch: requeue, no budget burn).
+	if ok, reason := pin.FUSEIdentityState(); !ok {
+		d.failTransient(row, fmt.Errorf("%s: %w", reason, pin.ErrFUSEIdentityGate))
 		return
 	}
 
@@ -694,7 +732,7 @@ func (d *Drainer) failTransient(row *metadata.SpoolRow, err error) {
 	// don't spend this photo's per-file budget on a network outage. The
 	// dispatcher is already parked offline, so this just resets the in-flight
 	// row to `ready`; it drains on reconnect.
-	if isInfraUnavailable(err) || pin.IsOffline() {
+	if isInfraUnavailable(err) || pin.IsOffline() || errors.Is(err, pin.ErrFUSEIdentityGate) {
 		if rErr := d.spool.Meta().ResetToReady(row.ID); rErr != nil {
 			log.Printf("drainer: infra-pause reset %d: %v", row.ID, rErr)
 		}

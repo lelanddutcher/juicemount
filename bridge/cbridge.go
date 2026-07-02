@@ -280,6 +280,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// Make sure the mount-point directory exists
 		_ = os.MkdirAll(cfg.FUSEPath, 0o755)
 		globalFUSEPath = cfg.FUSEPath
+		// V2.3 G0: arm the FUSE identity gate. Drains, phantom purges, and
+		// reconcile prunes all refuse to act while this path has no real
+		// filesystem mounted on it (kext-approval loss / mount absent /
+		// wedge) instead of silently operating against a plain local dir.
+		pin.SetFUSEIdentityPath(cfg.FUSEPath)
 
 		if globalFUSE != nil && fuseLooksHealthy(cfg.FUSEPath) {
 			jmlog.Info("juicefs FUSE already mounted, reusing", "path", cfg.FUSEPath)

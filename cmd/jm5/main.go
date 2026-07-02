@@ -21,6 +21,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/health"
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/cplane"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/manager"
@@ -176,6 +177,10 @@ func main() {
 	}
 
 	// 4. Start NFS server
+	// V2.3 G0: arm the FUSE identity gate before the server (and its
+	// drainer) starts — drains/purges/prunes refuse to act while the
+	// mountpoint has no real filesystem mounted on it.
+	pin.SetFUSEIdentityPath(*fusePath)
 	srv := jmnfs.NewServer(jmnfs.Config{
 		ListenAddr: *listenAddr,
 		FUSEPath:   *fusePath,

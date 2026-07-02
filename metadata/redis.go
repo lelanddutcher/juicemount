@@ -21,6 +21,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
@@ -1477,6 +1478,22 @@ func (rc *RedisClient) syncMetadata() error {
 	// we're closing.
 	prunedPinned := 0
 	prunedFUSEpresent := 0
+	// === V2.3 G0: FUSE identity gate — skip the whole prune pass when the
+	// mountpoint has no real filesystem on it (macFUSE kext not loaded /
+	// mount absent / wedged). In that state Layer A's FUSE Lstat returns
+	// ENOENT for EVERY backend path, so its spare-if-present protection is
+	// silently disabled and the prune runs unprotected. Same fail-safe shape
+	// as the pin-checker error path below: a delayed prune costs one cycle
+	// of stale entries; an unprotected prune is the ESTALE bug class.
+	if len(toDelete) > 0 {
+		if identOK, identReason := pin.FUSEIdentityState(); !identOK {
+			jmlog.Warn("metadata sync: FUSE identity gate failed — skipping prune pass this cycle",
+				"reason", identReason,
+				"would_have_pruned", len(toDelete),
+			)
+			toDelete = nil
+		}
+	}
 	if len(toDelete) > 0 {
 		// === Layer C: filter out pinned paths ===
 		pinned, perr := rc.store.pinnedSetPublic()

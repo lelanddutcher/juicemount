@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -170,6 +171,55 @@ func lastNonEmptyLine(s string) string {
 		}
 	}
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// macFUSE kext-approval classification (V2.3 G0d, 2026-07-01).
+//
+// A macOS update silently revokes the macFUSE system-extension approval
+// (kernelmanagerd: "Extension io.macfuse.filesystems.macfuse.N not approved
+// to load"). From then on EVERY juicefs mount hangs at "Mounting volume…"
+// and dies with "mount point is not ready in 10 seconds" — an error
+// indistinguishable from a slow backend unless the kext state is checked.
+// No amount of retrying can succeed; only the user can fix it (System
+// Settings approval). Classify once per failure so the log carries the exact
+// remediation and /health can surface it instead of a generic "no FUSE".
+
+// kextBlockedFlag latches "mount failed AND the macFUSE kext is not loaded".
+// Cleared on any successful mount. Read by the health monitor's FUSE check.
+var kextBlockedFlag atomic.Bool
+
+// KextApprovalBlocked reports whether the last mount failure was classified
+// as the macFUSE kext being unloaded (approval loss). Cheap; any goroutine.
+func KextApprovalBlocked() bool { return kextBlockedFlag.Load() }
+
+// noteMountFailure classifies a mount failure. Only latches the blocked flag
+// on high confidence (kmutil ran and macfuse is absent); on kmutil error or
+// timeout it stays quiet — the FUSE identity gate is the safety mechanism,
+// this is diagnosis for the human.
+func noteMountFailure() {
+	if kextLoaded() {
+		kextBlockedFlag.Store(false)
+		return
+	}
+	if kextBlockedFlag.CompareAndSwap(false, true) {
+		jmlog.Error("macFUSE kext is NOT loaded — juicefs mount cannot succeed until it is approved. " +
+			"Likely cause: a macOS update reset the system-extension approval. " +
+			"USER ACTION: System Settings → Privacy & Security → Allow \"Benjamin Fleischer\" (macFUSE), then reboot if prompted. " +
+			"Until then the FUSE identity gate parks drains and prunes; writes stay safely in the spool.")
+	}
+}
+
+// kextLoaded reports whether any macFUSE kext is currently loaded, bounded.
+// Returns true (= "can't claim blocked") when kmutil fails or times out.
+func kextLoaded() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "kmutil", "showloaded").Output()
+	if err != nil {
+		return true
+	}
+	return strings.Contains(strings.ToLower(string(out)), "macfuse")
 }
 
 // NewFUSEManager creates a FUSE mount manager.
@@ -482,6 +532,7 @@ func (fm *FUSEManager) Mount() error {
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
 
 	if err := cmd.Run(); err != nil {
+		noteMountFailure()
 		if launchCtx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("juicefs mount: timed out after 30s (backend unreachable?)")
 		}
@@ -493,8 +544,10 @@ func (fm *FUSEManager) Mount() error {
 
 	// Wait for the mount to become live (juicefs mount -d returns before FUSE is ready)
 	if err := fm.waitForMount(15 * time.Second); err != nil {
+		noteMountFailure()
 		return fmt.Errorf("mount verification: %w", err)
 	}
+	kextBlockedFlag.Store(false)
 
 	log.Printf("[fuse] JuiceFS mounted at %s", fm.cfg.MountPoint)
 
