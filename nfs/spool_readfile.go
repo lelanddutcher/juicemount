@@ -124,20 +124,26 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 	}
 	n, err := f.fd.ReadAt(p, off)
 	// A short read because we clamped at the contiguous boundary is NOT a real
-	// EOF if the file is still growing; the FileInfo.Size (also clamped to
-	// contiguousEnd) keeps the client coherent, so a true past-end read above
-	// returns io.EOF and a clamped read returns the available bytes.
+	// EOF if the file is still growing. Post-#85 FileInfo.Size reports writtenEnd
+	// (the full high-water), DECOUPLED from this contiguous prefix — so a read CAN
+	// be directed into [contiguousEnd, writtenEnd), a genuine in-flight hole. The
+	// cend clamp + JUKEBOX hold above is therefore the SOLE authoritative guard
+	// against serving zeros from a hole; do NOT remove it on the assumption that
+	// the reported size already keeps reads within the readable prefix — it no
+	// longer does.
 	return n, err
 }
 
 // IncompleteAt implements the internal/nfs incompleteReader gate. It reports
 // whether a read at off would land in a not-yet-written hole of a STILL-ARRIVING
 // file: at/past the readable contiguous prefix (off>=cend) but below the
-// high-water of expected bytes (off<wend), with the writer still active. onRead
-// calls this on its SIZE-CLAMP path — where Count is zeroed for off>=size and
-// ReadAt is therefore never reached for reads above CheckRead — so the JUKEBOX
-// hold must be decided here too. Mirrors ReadAt's boundary classification exactly
-// (task #65). Cheap: one RLock via ReadableBounds + an atomic LastWrite load.
+// high-water of expected bytes (off<wend), with the writer still active. Post-#85
+// the reported size is writtenEnd, so onRead's size-clamp EOF branch no longer
+// zeroes Count for spool holes (off<size there) and spoolReadFile.ReadAt now
+// decides the hole JUKEBOX; onRead retains its IncompleteAt call only as a
+// defensive backstop for the off>=size path. Mirrors ReadAt's boundary
+// classification exactly (task #65). Cheap: one RLock via ReadableBounds + an
+// atomic LastWrite load.
 func (f *spoolReadFile) IncompleteAt(off int64) bool {
 	cend, wend := f.entry.ReadableBounds()
 	if off < cend || off >= wend {

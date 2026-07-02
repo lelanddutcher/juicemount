@@ -183,15 +183,16 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		// §3.3.6: server should return zero-length result when reading
 		// at or past EOF.
 		if int64(obj.Offset) >= size {
-			// EOF-at-or-past-end — UNLESS this handle is a still-arriving spool
-			// file with a not-yet-written hole at this offset (off in [cend,wend)
-			// with the writer active). Reporting EOF there (Count=0) would let the
-			// client treat a partially-arrived file as COMPLETE — a SILENT
-			// truncation (task #65). The size shadow clamps `size` to the spool's
-			// contiguous prefix and this size-clamp zeroes Count for off>=size, so
-			// the handle's ReadAt is NEVER reached for reads above CheckRead — the
-			// JUKEBOX hold must be decided here. The client holds + retries until
-			// the bytes land / the file drains.
+			// EOF-at-or-past-end. Post-#85 `size` is the spool's WRITTEN high-water
+			// (writtenEnd), DECOUPLED from the contiguous readable prefix. So a
+			// not-yet-filled in-flight hole (off in [cend,wend), writer active) has
+			// off < size and does NOT enter this branch — its JUKEBOX hold is now
+			// enforced authoritatively in spoolReadFile.ReadAt (ErrSpoolIncomplete
+			// → JUKEBOX at the ioErr conversion below). This IncompleteAt gate is
+			// retained only as a defensive backstop for the off>=size path; for a
+			// still-arriving file IncompleteAt returns false there (off>=wend), so
+			// it no longer fires for spool holes — kept lest a future size source
+			// regress `size` back to the contiguous prefix (task #65).
 			if ir, ok := fh.(incompleteReader); ok && ir.IncompleteAt(int64(obj.Offset)) {
 				recordJukebox(inflightOpName(w.req))
 				return &NFSStatusError{NFSStatusJukebox, pin.ErrSpoolIncomplete}
