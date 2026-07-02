@@ -201,12 +201,25 @@ func (i *spoolFileInfo) Sys() any           { return nil }
 func spoolFileInfoForEntry(base string, e *SpoolEntry) *spoolFileInfo {
 	return &spoolFileInfo{
 		name: base,
-		// Report the contiguous-written size, NOT the preallocated high-water:
-		// onRead clamps reads to this, so a read can never be directed into an
-		// unwritten hole (which pread would return as zeros). The file appears
-		// to grow as data lands; once drained, reads come from FUSE at full
-		// size. Keeps the read clamp and the no-zeros guarantee consistent.
-		size:  e.ContiguousEnd(),
+		// Report the WRITTEN HIGH-WATER (writtenEnd), NOT the contiguous prefix
+		// (#85/#65/#38). Under macOS out-of-order async WRITE dispatch, contiguousEnd
+		// pins at a block boundary (~4 MiB) while the true high-water races to full,
+		// so reporting contiguousEnd made GETATTR/Stat/Lstat return a truncated size
+		// after a large write until the macOS attr cache refreshed — and that stale
+		// size also rode out in WRITE/COMMIT reply post-op attrs (onWrite/onCommit →
+		// tryStat → Lstat → here), seeding the client's attr cache wrong.
+		//
+		// This is SAFE to decouple from the readable prefix: the read path
+		// (spoolReadFile.ReadAt/ReadableBounds/IncompleteAt) independently clamps to
+		// contiguousEnd and JUKEBOX-holds an in-flight hole rather than serving zeros,
+		// so a read directed at [contiguousEnd,writtenEnd) never fabricates data even
+		// though the reported size now covers it. writtenEnd is monotonic on WriteAt
+		// and an authoritative SETATTR{size}/Truncate shrink lowers it (spool.go
+		// Truncate sets writtenEnd=size), so a client-commanded shrink is still
+		// honored — never masked by a stale high-water. A preallocate-then-fill writer
+		// (fio ftruncate up-front) over-reports here, which is acceptable: reads into
+		// the unfilled region hold/JUKEBOX or read zeros correctly, no truncation.
+		size:  e.WrittenEnd(),
 		mtime: e.LastWrite(),
 		inode: e.Inode(),
 	}

@@ -955,3 +955,56 @@ gate):** live 10GbE A/B under a background edit storm (`=1` vs `=0`) — SQLite-
 p99 must beat RAM-on p99; and the torn-read re-run of the v0.2.0 HOLD repro on
 the SQLite path (zero silent truncation). Do NOT flip default-on or proceed to
 Item 3 (shadow removal) until those pass.
+
+---
+
+## 2026-07-02 — Data-integrity fix: GETATTR reports full written size, not contiguous prefix (#85/#65/#38)
+
+**Not a tuning lever — no env kill switch, no link-class gate.** This is a
+correctness fix logged here for revert traceability. It has no A/B flag because
+the pre-fix behavior is a bug (a truncated stat after a large write), not a
+tunable trade-off.
+
+**What changed.** `nfs/spool_readfile.go` `spoolFileInfoForEntry` now reports the
+spool entry's **`WrittenEnd()`** (the written high-water) as the FileInfo
+`Size()`, instead of `ContiguousEnd()` (the contiguously-written prefix from
+offset 0). This is the single site that synthesizes a spool-shadow size for
+GETATTR/Stat/Lstat (routed from `handler.go` Stat/Lstat short-circuits, and from
+the WRITE/COMMIT reply post-op attrs via `tryStat → Lstat`).
+
+**Why.** Under macOS out-of-order async WRITE dispatch, `contiguousEnd` pins at a
+JuiceFS block boundary (~4 MiB) while the true high-water races to full, so
+GETATTR returned a truncated size after a large write until the macOS attr cache
+refreshed — and the stale size also seeded the client attr cache via WRITE/COMMIT
+post-op attrs. Decoupling "reported size" from "readable prefix" is safe: the
+read path (`spoolReadFile.ReadAt`/`ReadableBounds`/`IncompleteAt`) independently
+clamps to `contiguousEnd` and JUKEBOX-holds an in-flight hole rather than serving
+zeros, so a read into `[contiguousEnd, writtenEnd)` never fabricates data even
+though the reported size now covers it.
+
+**Shrink safety.** An authoritative NFS SETATTR{size}/Truncate shrink lowers
+`writtenEnd` (`nfs/spool.go` `Truncate` sets `writtenEnd = size` on both grow and
+shrink), so a client-commanded shrink is honored, never masked by a stale
+high-water. Invariant preserved: task #65 size-publish-before-eviction is
+untouched (finalize/drain still publish the finalize-time full size).
+
+**Residual (accepted):** a preallocate-then-fill writer (fio ftruncate up-front)
+over-reports `writtenEnd` vs bytes actually filled. Acceptable: reads into the
+unfilled region hold/JUKEBOX or read zeros correctly — no truncation. The
+dominant cp/Finder/OpenLoupe pattern is write-then-ftruncate where
+`writtenEnd == real bytes`.
+
+**Revert:** one line — restore `size: e.ContiguousEnd()` in
+`spoolFileInfoForEntry`. Requires a rebuild (this is compiled behavior, not an
+env flag). Reverting reintroduces the truncated-stat-after-write bug.
+
+**Validated:** `nfs` — rescoped `TestSpoolInFlightReadNeverServesHoleAsZeros`
+(now asserts `Size()==writtenEnd` AND that a hole read still returns
+`ErrSpoolIncomplete` despite the larger size), new `TestSpoolShadowReportsFullSizeImmediately`,
+`TestSpoolShadowSizeMonotonicOutOfOrder` (the discriminator — red pre-fix),
+`TestSpoolShadowTruncateShrinkHonored`; `internal/nfs` —
+`TestGetAttrFullSizeDuringInflightWrite` (onWrite RPCs then onGetAttr →
+`Filesize==totalWritten`, plus WRITE and COMMIT reply post-op attrs carry the
+full high-water). `gofmt`/`go vet` clean; `nfs`/`internal/nfs`/`metadata` green
+under `-race` (only the known-environmental `TestMemBuf*` async-load failures,
+unrelated).
