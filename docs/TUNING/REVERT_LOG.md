@@ -741,3 +741,89 @@ allocs; `_FirstPage` = ~302µs; `_FullPage` (1000-row) = ~1.17ms. `go vet` clean
 metadata suite green. **Pending:** real Finder open of the DCIM dir (no
 beachball) — unit benches are the veto-mitigation proof, not the field test.
 
+---
+
+## 2026-07-02 — Item 2: SQLite-direct serve accessors behind JM_SERVE_FROM_SQLITE (live A/B)
+
+Env-revertable without a rebuild. Motivation: felt problem (c) — 10GbE nav
+sluggish under a concurrent writer — is a reader stall, not idle latency. Every
+serve accessor (`LookupByPath`/`LookupByInode`/`ListChildren`) takes only
+`s.mu.RLock` and Go's RWMutex is write-preferring, so a queued writer's 2048-row
+`Lock` chunks block new readers mid-burst. Benchmark-proven: under a contending
+writer, small-dir nav p99 = SQLite-WAL 206µs vs RAM RWMutex 0.93-1.6ms. WAL
+readers snapshot around the writer and remove `s.mu` from the read path.
+
+**Item 2 — SQLite-backed serve accessors with IDENTICAL signatures/semantics**
+to the RAM accessors, gated INSIDE each accessor (metadata/store.go):
+`if serveFromSQLite() { <sqlite> } else { <existing RAM map read> }`. Both paths
+are compiled in; the flag picks per call, so NO handler.go call site changes and
+rollback is one env var. The substrate is logged ONCE per boot
+(`metadata: serve substrate = …`) so an A/B run is attributable.
+
+**Concurrency model (the crux):** every SQLite serve query runs against a
+lazily-prepared `*sql.Stmt` owned by the Store and prepared against the
+`*sql.DB` POOL (not a single conn). modernc.org/sqlite's `*sql.DB` is
+concurrency-safe and pools connections (`SetMaxOpenConns(8)`); a `*sql.Stmt`
+from `db.Prepare` is safe for concurrent use by many goroutines —
+`database/sql` re-prepares it per pooled connection on demand and caches that
+per-conn, so N concurrent NFS goroutines each take a pooled conn and run the
+point/page query with NO shared Go-level lock in the hot path and NO per-RPC
+Prepare. The only sync is a one-time `sync.Once` for lazy stmt init. Point
+lookups use `QueryRow` on the PRIMARY-KEY (path) / `idx_inode`; ReadDir uses the
+Item 1 paged `idx_parent_name` seek. This satisfies `feedback_perf_hot_path`: a
+warm prepared point/index query against the WAL page cache is not a cold
+FUSE/Redis syscall-per-RPC. WAL + `synchronous=NORMAL` already set in `pragmas`.
+
+- **`JM_SERVE_FROM_SQLITE=1`** — serve `LookupByPath`/`LookupByInode`/
+  `ListChildren` from SQLite-WAL. **Default OFF (unset / != "1")** = RAM maps,
+  byte-identical to prior behavior (the A/B baseline and the rollback). Read
+  once and cached in `serveFromSQLite()` (metadata/serve_sqlite.go).
+
+**LEFT UNCHANGED (correctness gates, not perf):** the offline-empty branch
+(handler.go ~1922) and the online FUSE-fallback branch (handler.go ~1924+).
+They call `ListChildren`, which may now be SQLite-backed — fine: a SQLite
+`ListChildren` returning 0 for a genuinely-empty/unmirrored dir behaves
+identically to the RAM map returning 0. **NOT deleted (Item 3, a later commit
+gated on QA-battery-green):** `rebuildCaches`, the 3 maps, and all writer-side
+cache maintenance — both paths coexist behind the flag.
+
+**Parity guarantees (verified):** the SQLite scan column list matches
+`scanEntry` exactly (9 cols incl. `local_only`) with the SAME semantics — high-bit
+inode reinterpret (`uint64(int64)`), `time.Unix(mtime,0)`, `fs.FileMode(mode) |
+ModeDir` — so a row here equals the RAM map's Entry for the same row.
+
+**Known, bounded divergences (flagged, not papered over):**
+1. `InsertToCache` (symlink seed, handler.go ~1831) writes the RAM maps
+   synchronously then `go Insert` commits SQLite async. In that brief window a
+   SQLite LOOKUP misses where RAM would hit; it self-heals when the async Insert
+   commits (and the FromHandle/Stat fallback re-seeds). Bounded to the
+   symlink-mint path; correctness gates are untouched.
+2. `PreSerializedGetAttr` (a lazy per-entry XDR cache on the RAM `*Entry`) is
+   nil on SQLite-served entries, so GETATTR recomputes the 88-byte fattr3 each
+   call — a small perf regression, not a correctness one. (Item 3 / a future
+   pass can add a serve-side XDR cache if it shows up.)
+3. RAM `ListChildren` returns children in map-iteration (nondeterministic)
+   order; the SQLite path returns them NAME-SORTED. Every serve caller that
+   cares already sorts (ReadDir, getDirListingWithVerifier), so this is a
+   strict superset of the RAM contract — same SET, a defined order — never a
+   divergence in the child set. Verified: RAM vs SQLite child SETS are
+   identical across 1,234-child, unicode, `._` sidecar, dot-file, case, and
+   root-parent cases.
+
+**Revert ladder:** Item 2 misbehaves → `JM_SERVE_FROM_SQLITE=0` (instant, no
+restart; the shadow is still maintained so it's warm). Item 1 misbehaves →
+`JM_READDIR_PAGINATED=0`. Both default off, so a stock build is unchanged.
+
+**Validated:** unit — `TestServeParity_LookupByPathAndInode` (500 rows + high-bit
+inode + local_only + a dir; RAM path == SQLite path for a sample of path/inode
+lookups incl. a not-found → nil on both), `TestServeParity_ListChildren` (1,234
+children: identical set, SQLite name-sorted), `TestServeParity_EmptyDir` (both
+return nil, not empty slice), `TestServeFlagOff_UsesRAM` (flag off → public
+accessor returns the RAM cache entry). Benchmarks: `BenchmarkLookupByPath_RAM`
+~16ns vs `_SQLite` ~3.1-5µs (matches the design's 85ns→~7µs idle claim — both
+sub-RPC-budget). `go vet` clean; metadata suite green (nfs suite: only the
+known-environmental `TestMemBuf*` failures, unrelated). **Pending (the real
+gate):** live 10GbE A/B under a background edit storm (`=1` vs `=0`) — SQLite-on
+p99 must beat RAM-on p99; and the torn-read re-run of the v0.2.0 HOLD repro on
+the SQLite path (zero silent truncation). Do NOT flip default-on or proceed to
+Item 3 (shadow removal) until those pass.

@@ -553,6 +553,11 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		serve:            &serveStmts{},
 	}
 
+	// Item 2: log the serve substrate ONCE per boot (RAM shadow vs SQLite-WAL)
+	// so a live A/B run (JM_SERVE_FROM_SQLITE=0 vs =1 on the same binary) is
+	// attributable in the logs. Not per-RPC.
+	logServeSubstrate()
+
 	if err := s.rebuildCaches(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("rebuild caches: %w", err)
@@ -834,10 +839,17 @@ func (s *Store) evictPathOrphanLocked(old, new *Entry) {
 
 // LookupByInode returns the entry with the given inode, or nil.
 //
-// The RAM read is factored into lookupByInodeRAM so the SQLite-direct serve
-// path (serving-layer-decision.md §Item 2) can add a per-call substrate switch
-// here without touching call sites. Item 1 leaves this reading RAM.
+// SUBSTRATE SWITCH (serving-layer-decision.md §Item 2): when
+// JM_SERVE_FROM_SQLITE=1 this queries SQLite-WAL directly via a prepared point
+// lookup on idx_inode (no s.mu, WAL reader snapshots around a contending
+// writer); otherwise it reads the in-RAM inodeCache exactly as before. The
+// switch lives HERE so both paths are compiled in and no handler.go call site
+// changes — the flag picks per call. Default OFF = RAM path, byte-identical to
+// prior behavior.
 func (s *Store) LookupByInode(inode uint64) *Entry {
+	if serveFromSQLite() {
+		return s.lookupByInodeSQLite(inode)
+	}
 	return s.lookupByInodeRAM(inode)
 }
 
@@ -848,7 +860,13 @@ func (s *Store) lookupByInodeRAM(inode uint64) *Entry {
 }
 
 // LookupByPath returns the entry at the given path, or nil.
+//
+// SUBSTRATE SWITCH: see LookupByInode. SQLite path is a prepared PRIMARY-KEY
+// point lookup on entries(path).
 func (s *Store) LookupByPath(entryPath string) *Entry {
+	if serveFromSQLite() {
+		return s.lookupByPathSQLite(entryPath)
+	}
 	return s.lookupByPathRAM(entryPath)
 }
 
@@ -859,9 +877,19 @@ func (s *Store) lookupByPathRAM(entryPath string) *Entry {
 }
 
 // ListChildren returns all entries whose parent_path matches the given path.
-// Uses the children index for O(children) lookup instead of O(total entries).
-// (Item 2 adds a per-call SQLite substrate switch here; Item 1 leaves it RAM.)
+//
+// SUBSTRATE SWITCH: see LookupByInode. When JM_SERVE_FROM_SQLITE=1 the child
+// set comes from SQLite-WAL via internally-paged ListChildrenPage on
+// idx_parent_name (bounded scan, pooled scratch — never a single unbounded
+// whole-dir scan); otherwise it reads the in-RAM childrenIdx (O(children))
+// exactly as before. Both return (nil, nil) for an empty/unmirrored dir. The
+// offline-empty branch (handler.go) and the online FUSE-fallback branch
+// downstream are unchanged correctness gates: a SQLite ListChildren returning 0
+// for a genuinely-empty dir behaves identically to the RAM map returning 0.
 func (s *Store) ListChildren(parentPath string) ([]*Entry, error) {
+	if serveFromSQLite() {
+		return s.listChildrenSQLite(parentPath)
+	}
 	return s.listChildrenRAM(parentPath)
 }
 

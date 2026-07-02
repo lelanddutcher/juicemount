@@ -241,10 +241,15 @@ func (s *Store) listChildrenSQLite(parentPath string) ([]*Entry, error) {
 // hashes+caches the full listing and paginates by index (nfs_onreaddir.go), so
 // this returns the whole dir — Item 1 changes the BUILD cost, not the contract.
 func (s *Store) ListChildrenForReadDir(parentPath string) ([]*Entry, error) {
+	if serveFromSQLite() {
+		// Item 2: SQLite serve substrate — listChildrenSQLite already pages
+		// internally off idx_parent_name.
+		return s.listChildrenSQLite(parentPath)
+	}
 	if readdirPaginatedEnabled() {
-		// Paged idx_parent_name scan with pooled scratch — kills the big-dir
-		// single-scan alloc/latency spike. (Item 2 adds a serveFromSQLite branch
-		// here; it also routes to the paged build.)
+		// Item 1: paged idx_parent_name scan with pooled scratch — kills the
+		// big-dir single-scan alloc/latency spike while RAM stays the point-
+		// lookup substrate.
 		return s.listChildrenSQLite(parentPath)
 	}
 	return s.listChildrenRAM(parentPath)
