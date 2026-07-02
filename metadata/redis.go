@@ -523,6 +523,22 @@ func (rc *RedisClient) LastReconnect() time.Time {
 // consider the client degraded. Tuned for the typical metadata-sync
 // cycle (~30s) plus a safety margin.
 func (rc *RedisClient) RecentlyDegraded(cooldown time.Duration) bool {
+	// Reachability-aware (NFSv3 sprint slow-link false-flap, fix b.1 — task #66
+	// salvage). The rc.connected flag below is written ONLY by doReconcile /
+	// Reconnect / the keyspace sub — NEVER by the reachability monitor. During a
+	// slow-link probe flap the drain + SCAN keep SUCCEEDING (the backend is
+	// provably reachable; only the cold probe SYN false-fails), so rc.connected
+	// stays true and this returned false — leaving BOTH prune paths un-gated
+	// while the app was about to engage offline. Consult the injected
+	// reachability signal too (wired via metadata.SetClassSignals from bridge):
+	// an unreachable verdict means the offline-engage path is arming, so any
+	// prune in flight must DEFER (the authoritative delete replays next cycle /
+	// heals via the backstop SCAN — it is never dropped). Checked BEFORE taking
+	// rc.mu.RLock so reachableNow()'s separate keyspaceSignalMu never nests
+	// under rc.mu (no lock-order inversion).
+	if !reachableNow() {
+		return true
+	}
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 	if !rc.connected {

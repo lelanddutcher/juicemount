@@ -471,6 +471,7 @@ func TestScopedPruneRootKey(t *testing.T) {
 	}
 
 	rc := &RedisClient{store: store} // no fuseRoot, no pin checker
+	markPruneHealthy(rc)             // backend non-degraded → scopedPrune runs (NFSv3-sprint gate)
 
 	// Sanity: the root children live under "." not "".
 	if c, _ := store.ListChildren("."); len(c) != 2 {

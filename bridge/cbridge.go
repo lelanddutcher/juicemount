@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -466,7 +467,33 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// adaptive readahead can bootstrap link class (fast LAN vs slow WAN)
 		// before any throughput sample arrives (internal/netprofile).
 		globalReach = health.NewReachability(reachAddr,
-			health.WithRTTObserver(netprofile.Default().ObserveRTT))
+			health.WithRTTObserver(netprofile.Default().ObserveRTT),
+			// Drain-liveness false-flap override (task #66 salvage, NFSv3
+			// sprint): a completed drain (a MinIO PUT that landed) is positive
+			// proof the backend is reachable over the SAME link the probe
+			// dials. When the drainer saturates the uplink, a cold probe SYN
+			// can queue behind its bulk PUT traffic and exceed the dial
+			// timeout — a FALSE "unreachable" that would arm the 18s
+			// offline-engage deferral and (pre-fix) let a reconcile prune real
+			// files mid-copy. This hook reports the age of the last proven
+			// drain; the monitor suppresses a probe FAILURE while that age is
+			// within ~2*baseInterval. globalDrainer is set later (under
+			// globalMu, same Start goroutine) — read it under globalMu and
+			// nil-safe: no drainer (spool disabled) → MaxInt64 sentinel → the
+			// override never fires → behavior identical to today.
+			health.WithLivenessHook(func() time.Duration {
+				globalMu.Lock()
+				d := globalDrainer
+				globalMu.Unlock()
+				if d == nil {
+					return time.Duration(math.MaxInt64)
+				}
+				last := d.LastDrainSuccess()
+				if last.IsZero() {
+					return time.Duration(math.MaxInt64)
+				}
+				return time.Since(last)
+			}))
 		globalReach.OnChange(func(reachable bool, reason string) {
 			offlineEngageMu.Lock()
 			defer offlineEngageMu.Unlock()

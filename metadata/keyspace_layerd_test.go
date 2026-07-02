@@ -8,6 +8,21 @@ import (
 	"time"
 )
 
+// markPruneHealthy sets the precondition required for scopedPrune to actually
+// prune: a non-degraded backend. The NFSv3-sprint slow-link false-flap fix
+// (task #66 salvage) gates scopedPrune on RecentlyDegraded(), which is true
+// when rc.connected is false (the bare &RedisClient{} test default) OR the
+// injected reachability signal reports unreachable. These QA-30 guard tests
+// exercise the Layer A/C/D logic downstream of that gate, so they must first
+// establish "backend healthy" — set connected=true and ensure no stale
+// reachable=false signal leaks in from a sibling test (reachableNow() defaults
+// to true when the hook wired by SetClassSignals is nil).
+func markPruneHealthy(rc *RedisClient) {
+	rc.mu.Lock()
+	rc.connected = true
+	rc.mu.Unlock()
+}
+
 // TestScopedPruneLayerDSparesSpoolPending is the QA-30 Layer D gate (NFSv3
 // sprint). It reproduces the live build-438 bug: a Finder copy routes a new
 // file to the write spool; while it is spool-pending (NOT in Redis, NOT in
@@ -75,6 +90,7 @@ func TestScopedPruneLayerDSparesSpoolPending(t *testing.T) {
 		store := seed(t)
 
 		rc := &RedisClient{store: store} // no fuseRoot, no pin checker
+		markPruneHealthy(rc)             // backend non-degraded → scopedPrune runs
 		// Layer D guard: only "dir/pending.mov" is spool-pending.
 		rc.SetSpoolGuard(func(volRelPath string) bool {
 			return volRelPath == "dir/pending.mov"
@@ -100,6 +116,7 @@ func TestScopedPruneLayerDSparesSpoolPending(t *testing.T) {
 		store := seed(t)
 
 		rc := &RedisClient{store: store} // spoolPending == nil → pre-fix path
+		markPruneHealthy(rc)             // backend non-degraded → scopedPrune runs
 		rc.scopedPrune("dir", freshNames)
 
 		if store.LookupByPath("dir/pending.mov") != nil {
@@ -138,6 +155,7 @@ func TestScopedPruneLayerDSparesSpoolPendingDescendant(t *testing.T) {
 		}
 	}
 	rc := &RedisClient{store: store}
+	markPruneHealthy(rc) // backend non-degraded → scopedPrune runs
 	rc.SetSpoolGuard(func(volRelPath string) bool {
 		return volRelPath == "proj/shoot/clip.mov"
 	})
@@ -187,6 +205,7 @@ func TestSpoolGuardConcurrentSetAndRead(t *testing.T) {
 	}
 
 	rc := &RedisClient{store: store}
+	markPruneHealthy(rc) // backend non-degraded → scopedPrune's prune body runs (full race coverage)
 
 	var (
 		wg   sync.WaitGroup
@@ -293,4 +312,114 @@ func TestSyncMetadataPruneSparesSpoolPending(t *testing.T) {
 			t.Fatalf("control: kept = %d, want 2 (nothing spared without the guard)", len(kept))
 		}
 	})
+}
+
+// seedPruneTree builds a store with one parent dir holding a single child that
+// is ABSENT from the fresh Redis name set (an authoritative push-delete signal),
+// with no pin/FUSE/spool guard sparing it. Such a child is pruned by scopedPrune
+// UNLESS the new degrade gate defers.
+//
+// NOTE (rc-keyspace base): the original sprint version also minted and asserted
+// the child's Track-B path-stable handle (ToHandleID / HandlePathByID). Track B
+// is NOT in this base, so the load-bearing guarantee asserted here is the
+// store-prune spare (LookupByPath) — the same adaptation the Layer D tests
+// above already carry.
+func seedPruneTree(t *testing.T) *Store {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	mt := time.Unix(1700000000, 0)
+	for _, e := range []*Entry{
+		MakeEntry("dir", true, 0, mt, 10),
+		MakeEntry("dir/gone.mov", false, 5678, mt, 11),
+	} {
+		store.InsertToCache(e)
+		if err := store.Insert(e); err != nil {
+			t.Fatalf("Insert %q: %v", e.Path, err)
+		}
+	}
+	return store
+}
+
+// TestScopedPruneDeferredWhileDegraded is the fix-(b.2) gate for the NFSv3-sprint
+// slow-link false-flap (task #66 salvage). scopedPrune must DEFER all pruning
+// while the backend is degraded/unreachable — a single push 'hdel' observation
+// during a slow-link probe flap must NOT remove a real file mid-copy (the
+// 257-removal → 210-STALE → copy-error damage). It asserts BOTH directions
+// against the SAME tree so the gate is shown to be load-bearing, not vacuous:
+//   - reachable signal == FALSE → the candidate is SPARED (deferred);
+//   - reachable signal == TRUE  → the same candidate is PRUNED.
+//
+// A deferred delete is never dropped: the next keyspace event replays it and the
+// backstop SCAN heals a missed delete — so sparing here is correct, not a leak.
+func TestScopedPruneDeferredWhileDegraded(t *testing.T) {
+	freshNames := map[string]struct{}{} // child is absent → prune candidate
+
+	t.Run("degraded_defers_prune", func(t *testing.T) {
+		store := seedPruneTree(t)
+		rc := &RedisClient{store: store}
+		// Backend is "connected" at the Redis level (drain + SCAN succeeding),
+		// but the reachability signal reports UNREACHABLE — exactly the slow-link
+		// flap state where the OLD code would have pruned. fix b.1 makes
+		// RecentlyDegraded honor this signal; fix b.2 gates scopedPrune on it.
+		markPruneHealthy(rc) // rc.connected = true (proves the gate fires on REACHABILITY, not connected)
+		SetClassSignals(nil, func() bool { return false })
+		t.Cleanup(func() { SetClassSignals(nil, nil) })
+
+		rc.scopedPrune("dir", freshNames)
+
+		if store.LookupByPath("dir/gone.mov") == nil {
+			t.Error("fix b.2: scopedPrune pruned a candidate while the backend was UNREACHABLE — must defer")
+		}
+	})
+
+	t.Run("reachable_prunes_normally", func(t *testing.T) {
+		store := seedPruneTree(t)
+		rc := &RedisClient{store: store}
+		markPruneHealthy(rc)
+		SetClassSignals(nil, func() bool { return true }) // backend healthy
+		t.Cleanup(func() { SetClassSignals(nil, nil) })
+
+		rc.scopedPrune("dir", freshNames)
+
+		if store.LookupByPath("dir/gone.mov") != nil {
+			t.Error("fix b.2 over-gated: scopedPrune did NOT prune a genuine candidate while the backend was REACHABLE")
+		}
+	})
+}
+
+// TestRecentlyDegradedReachabilityAware is the fix-(b.1) gate. RecentlyDegraded
+// must return true when the injected reachability signal reports unreachable —
+// EVEN WHEN rc.connected is true (the slow-link flap state: drain + SCAN keep
+// succeeding so connected stays true, while the cold probe SYN false-fails and
+// the app arms offline). Without this, both prune gates read false during the
+// flap and real files get pruned. Asserts all three states over the same client.
+func TestRecentlyDegradedReachabilityAware(t *testing.T) {
+	rc := &RedisClient{}
+	markPruneHealthy(rc) // connected = true → degrade can ONLY come from reachability
+
+	// reachable == true → not degraded (connected and reachable).
+	SetClassSignals(nil, func() bool { return true })
+	if rc.RecentlyDegraded(60 * time.Second) {
+		t.Error("RecentlyDegraded=true with connected && reachable — want false")
+	}
+
+	// reachable == false → degraded, despite connected==true. THIS is the bug
+	// the fix closes: the reachability flap must mark the client degraded so the
+	// prunes pause.
+	SetClassSignals(nil, func() bool { return false })
+	if !rc.RecentlyDegraded(60 * time.Second) {
+		t.Error("RecentlyDegraded=false with connected but UNREACHABLE — want true (b.1 must honor the reachability signal)")
+	}
+
+	// nil signal → reachableNow() optimistically returns true, so degrade is
+	// governed purely by rc.connected as before (no behavior change when the
+	// signal isn't wired). connected==true → not degraded.
+	SetClassSignals(nil, nil)
+	if rc.RecentlyDegraded(60 * time.Second) {
+		t.Error("RecentlyDegraded=true with connected && no reachability hook — want false (nil-signal must not over-gate)")
+	}
 }

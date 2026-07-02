@@ -106,6 +106,45 @@ func TestDrainerHappyPath(t *testing.T) {
 	}
 }
 
+// TestDrainerLastDrainSuccessStamp is the fix-(a) producer-side gate (task #66
+// salvage): the drainer must stamp LastDrainSuccess ONLY on a COMPLETED drain
+// (a real MinIO PUT landed and the row was marked done) — never before. The
+// reachability monitor reads this to suppress a probe-dial false-failure during
+// uplink saturation; stamping on anything but a genuine success would make the
+// override mask a REAL outage, so the "zero before any success" half of this
+// test is as load-bearing as the "fresh after success" half.
+func TestDrainerLastDrainSuccessStamp(t *testing.T) {
+	spool, d := newTestDrainer(t, DrainerConfig{})
+
+	// Before any drain: zero (the override hook must treat this as "never").
+	if !d.LastDrainSuccess().IsZero() {
+		t.Fatalf("LastDrainSuccess must be zero before any drain, got %v", d.LastDrainSuccess())
+	}
+
+	writeSpoolEntry(t, spool, "/Films/clip.mov", []byte("a sample file's worth of bytes"))
+
+	before := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if n := d.DrainOnceForTest(ctx); n != 1 {
+		t.Fatalf("expected 1 row processed, got %d", n)
+	}
+	after := time.Now()
+
+	if d.Metrics().DrainsSucceeded.Load() != 1 {
+		t.Fatalf("precondition: succeeded=%d, want 1", d.Metrics().DrainsSucceeded.Load())
+	}
+	last := d.LastDrainSuccess()
+	if last.IsZero() {
+		t.Fatal("LastDrainSuccess still zero after a completed drain — stamp missing")
+	}
+	// The stamp must fall within the drain window (proves it was set at the
+	// success site, not at construction or some unrelated time).
+	if last.Before(before.Add(-time.Second)) || last.After(after.Add(time.Second)) {
+		t.Errorf("LastDrainSuccess=%v outside the drain window [%v, %v]", last, before, after)
+	}
+}
+
 func TestDrainerWorkerPoolBounded(t *testing.T) {
 	spool, d := newTestDrainer(t, DrainerConfig{Workers: 2})
 

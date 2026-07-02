@@ -69,6 +69,20 @@ type Drainer struct {
 	// set-before-Start provides the happens-before (no lock needed).
 	onDrainComplete func(nfsPath string, size int64)
 
+	// lastDrainSuccessNanos is the wall-clock UnixNano of the most recent
+	// COMPLETED drain — a real MinIO PUT that landed and was marked done (the
+	// DrainsSucceeded.Add(1) site). It is positive proof the backend is
+	// reachable over whatever link this Mac is on RIGHT NOW. The reachability
+	// monitor's drain-liveness override (health.WithLivenessHook) reads it via
+	// LastDrainSuccess() to suppress a probe-dial FALSE-failure when a cold SYN
+	// merely queued behind the drainer's own bulk PUT traffic on a saturated
+	// uplink (slow-link false-flap, NFSv3 sprint / task #66 salvage). Stamped
+	// ONLY on a genuine success — never on an attempted/in-flight drain — so a
+	// real outage (drains stop landing) lets the override lapse within seconds
+	// and the normal 2-failure flip proceeds. Atomic: written by worker
+	// goroutines, read by the probe-loop goroutine.
+	lastDrainSuccessNanos atomic.Int64
+
 	// onSizeReady, if set, publishes the drained file's authoritative size into
 	// the metadata store BEFORE MarkDrainComplete evicts the spool shadow, so a
 	// fresh read can never observe a post-eviction-but-pre-size (0/partial)
@@ -244,6 +258,21 @@ func (d *Drainer) Stop(deadline time.Duration) bool {
 // Metrics returns the live counter struct. Caller may read fields
 // concurrently with worker activity.
 func (d *Drainer) Metrics() *DrainerMetrics { return &d.metrics }
+
+// LastDrainSuccess returns the wall-clock time of the most recent COMPLETED
+// drain (a MinIO PUT that landed and was marked done). Returns the zero Time
+// if no drain has succeeded yet. Used by the reachability monitor's
+// drain-liveness override: a recent success is positive proof the backend is
+// reachable over the current link, so a probe-dial timeout that merely queued
+// behind the drainer's bulk PUT traffic is suppressed rather than counted as a
+// failure. Concurrent-safe (atomic load).
+func (d *Drainer) LastDrainSuccess() time.Time {
+	ns := d.lastDrainSuccessNanos.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
 
 // SetOnDrainComplete registers a callback invoked once per successful drain,
 // after the row is marked done. Must be called BEFORE Start.
@@ -697,6 +726,12 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 	d.metrics.DrainsSucceeded.Add(1)
 	d.metrics.BytesDrained.Add(n)
+	// Stamp drain liveness: a real MinIO PUT just landed, so the backend is
+	// provably reachable over the current (possibly congested) link. The
+	// reachability monitor consults this via LastDrainSuccess() to suppress a
+	// probe-dial false-failure caused by the drainer's own uplink saturation.
+	// Done ONLY here, on a COMPLETED success — never on an attempt/in-flight.
+	d.lastDrainSuccessNanos.Store(time.Now().UnixNano())
 	if d.onDrainComplete != nil {
 		d.onDrainComplete(row.NFSPath, row.Size)
 	}

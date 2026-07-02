@@ -892,6 +892,28 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		return
 	}
 
+	// === Degrade gate (NFSv3 sprint slow-link false-flap, fix b.2 — task #66 salvage) ===
+	// Defer ALL pruning while the backend is degraded/unreachable. The periodic
+	// full-SCAN prune already gates on RecentlyDegraded (redis.go skipIncrement);
+	// the keyspace-push prune had NO such gate, so during a slow-link probe flap
+	// (drain + SCAN still succeeding, but the app arming offline) a single push
+	// 'hdel' observation could remove real files mid-copy → STALE → Finder copy
+	// error. fix b.1 makes RecentlyDegraded reachability-aware, so this gate is
+	// actually TRUE during the flap. This DEFERS the authoritative push-delete
+	// one cycle — it is NEVER dropped: the next keyspace event replays it, and
+	// the backstop SCAN heals any missed delete (a removed file lingers at most
+	// one degraded window). Placed AFTER the ListChildren early-out (cheap
+	// no-children skip first) and BEFORE any candidate computation; the gate
+	// covers the subtree-delete path too since the whole function returns.
+	// Upserts are UNGATED (handled in reconcileDir before this call), so
+	// navigation/convergence keeps working while pruning is paused. scopedPrune
+	// holds no rc.mu, so RecentlyDegraded's rc.mu.RLock cannot deadlock here.
+	if rc.RecentlyDegraded(60 * time.Second) {
+		jmlog.Info("metadata keyspace push: scoped prune deferred (backend degraded)",
+			"parent", parentPath, "candidates_unevaluated", len(children))
+		return
+	}
+
 	var candidates []string // internal paths to delete
 	for _, ch := range children {
 		if _, present := freshNames[ch.Name]; present {

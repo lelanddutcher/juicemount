@@ -7,6 +7,91 @@ a rebuild**.
 
 ---
 
+## 2026-06-28 — Slow-link false-flap fix (drain-liveness probe override + degrade-gated prunes)
+
+*(Salvaged onto feat/v2.3 on 2026-07-01 — the original landed on the rolled-back
+NFSv3-perfection sprint branch as task #66 and was lost in the rollback.)*
+
+**What:** A Finder copy over saturated WiFi (network proven fine: 30/30 Redis
+dials, 0% ping loss, 3 ms; the drain KEEPS SUCCEEDING during the flap) was
+erroring because of two compounding defects:
+
+1. **Probe false-flap (`health/reachability.go`).** The reachability monitor
+   probes only the Redis host:port with a cold TCP dial. On healthy WiFi RTT
+   ~3 ms keeps the adaptive `effectiveDialTimeout` clamped to the 1 s floor (it
+   folds RTT only from *successful* dials). When the drainer saturates the
+   uplink, a cold SYN queues behind the bulk PUT traffic and exceeds 1 s → 2
+   failures → a FALSE "unreachable" that arms the 18 s offline-engage deferral.
+   The adaptive timeout cannot grow from the very congestion causing the failure.
+2. **Prune-during-degrade (`metadata/keyspace.go` + `metadata/redis.go`).** The
+   keyspace-push `scopedPrune` had NO degrade gate (only the periodic full-SCAN
+   prune did), and `RecentlyDegraded()` was FALSE during the flap anyway —
+   `rc.connected` is written only by doReconcile / Reconnect / the keyspace sub
+   (which keep succeeding), never by the reachability monitor. A single push
+   `hdel` observation then removed real files mid-copy (257 scoped-prune removals
+   → 210 STALE → copy error).
+
+**Fix (a) — drain-liveness probe override (load-bearing).** A completed drain
+(a MinIO PUT that landed) is positive proof the backend is reachable over the
+SAME congested link. The drainer stamps `LastDrainSuccess` (an `atomic.Int64`
+UnixNano) ONLY at the `DrainsSucceeded.Add(1)` success site —
+never on an attempted/in-flight drain. `health.WithLivenessHook` injects
+"time-since-last-proven-backend-IO" into the monitor; on a probe FAILURE, if a
+drain succeeded within the liveness window (`~2*baseInterval`, ~4 s), the failure
+is suppressed — the fail streak is neither advanced nor reset, no transition
+fires. A genuine outage stops drains within seconds → the window lapses → the
+normal 2-failure flip proceeds. Wired in `bridge/cbridge.go` capturing
+`globalDrainer` (read under `globalMu`); nil drainer → MaxInt64 sentinel → the
+override never fires → behavior identical to today.
+
+**Fix (b) — degrade-gate both prune paths.** `RecentlyDegraded()` is now
+reachability-aware: it also returns true when the injected reachability signal
+(`reachableNow()`, wired via `metadata.SetClassSignals` under
+`JM_METADATA_KEYSPACE_PUSH=1`) reports unreachable — checked before taking
+`rc.mu.RLock` so the separate `keyspaceSignalMu` never nests under `rc.mu`.
+`scopedPrune` gains a top gate (`if rc.RecentlyDegraded(60s) { return }`, after
+the `ListChildren` early-out), symmetric to the SCAN path's existing gate,
+covering the subtree-delete path too. This DEFERS the authoritative push-delete
+one cycle (replayed on the next keyspace event / healed by the backstop SCAN) —
+**never drops it**; a removed file lingers at most one degraded window.
+**Upserts stay ungated**, so navigation/convergence keeps working while pruning
+is paused.
+
+**Kill switch (env, no rebuild):**
+
+| `JM_REACH_DRAIN_LIVENESS` | Effect |
+|---|---|
+| unset / non-`0` (default) | **ENABLED** — drain-liveness override active. |
+| `0` | **DISABLED** — the liveness hook is never consulted; a probe failure flips after the normal 2-failure threshold regardless of recent drains. **Byte-identical to the pre-fix monitor.** |
+
+Fix (b) has no separate env switch: it is correctness, not a tuning band, and it
+only ever DEFERS a delete (never drops one). It is implicitly neutralized
+wherever reachability is — a nil `reachableFn` makes `reachableNow()` return
+true, so `RecentlyDegraded()` reverts to its pure `rc.connected`/cooldown logic
+and `scopedPrune` gates exactly as the pre-fix SCAN path already did. (On this
+base the reachability signal is only wired when `JM_METADATA_KEYSPACE_PUSH=1` —
+the same env gate the original fix had.)
+
+**Baseline to revert to:** `JM_REACH_DRAIN_LIVENESS=0` restores the exact
+pre-fix probe behavior (no liveness consultation). Fix (b)'s gate matches the
+periodic SCAN prune's long-standing `RecentlyDegraded` gate, so on a healthy LAN
+(reachable + connected) `RecentlyDegraded()` is false and pruning runs exactly as
+before — **10GbE behavior is byte-identical**.
+
+**Validated:** Go tests only (false-positive-prone per testing discipline) —
+`TestReachability_DrainLivenessSuppressesFalseFlap` (recent drain → no flip;
+stale drain → flips; absent hook → flips) +
+`TestReachability_DrainLivenessKillSwitchByteIdentical` (`=0` → hook never called,
+normal flip); `TestDrainerLastDrainSuccessStamp` (zero before any drain, stamped
+inside the drain window after success); `TestScopedPruneDeferredWhileDegraded`
+(unreachable → defer, candidate spared; reachable → pruned) and
+`TestRecentlyDegradedReachabilityAware` (true when reachable==false despite
+connected==true; false when nil-signal). **Pending:** REAL-app live gate — re-run
+the saturating Finder copy and expect ~0 flap-induced prunes / STALE; the
+orchestrator owns that verdict.
+
+---
+
 ## 2026-06-27 — Metadata Redis keyspace-notification push
 
 **What:** Demote the full-tree Lua metadata SCAN from a fixed 30s cadence to a
