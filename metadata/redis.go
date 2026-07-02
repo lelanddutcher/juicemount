@@ -152,6 +152,14 @@ type RedisClient struct {
 	// (Swap(false)) by reconcileLoop.
 	pruneFollowUp atomic.Bool
 
+	// V2.3 U6 (task #37): live progress of the in-flight full SCAN, so the
+	// UI can render "Rebuilding index… N / ~M" instead of a bare spinner
+	// (field report: an opaque multi-minute rebuild feels broken). scanned
+	// counts raw child entries as SCAN batches land; the denominator is the
+	// PREVIOUS sync's entry count — an estimate (labelled ~), but accurate
+	// for a warm mirror and free (no extra Redis round-trip).
+	syncScanned atomic.Int64
+
 	// QA-30 (2026-05-25): path conversion config so syncMetadata can
 	// correctly cross-reference the pin store (mountpoint-prefixed paths)
 	// against metadata.Store entries (JuiceFS-internal paths, no prefix)
@@ -758,6 +766,17 @@ func (rc *RedisClient) IsSyncing() bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 	return !rc.lastSyncStartedAt.IsZero() && rc.lastSyncStartedAt.After(rc.lastSyncTime)
+}
+
+// SyncProgress reports the in-flight rebuild's scanned-entry count and an
+// ESTIMATED total (the previous sync's entry count; 0 on a first-ever sync).
+// Progress covers the SCAN phase, which dominates rebuild time on slow links;
+// the diff/upsert tail after it is seconds. V2.3 U6 (task #37).
+func (rc *RedisClient) SyncProgress() (scanned, estTotal int64) {
+	rc.mu.RLock()
+	est := int64(rc.lastSyncEntries)
+	rc.mu.RUnlock()
+	return rc.syncScanned.Load(), est
 }
 
 // SyncOnce performs a single batch reconciliation (Lua tree pull → SQLite).
@@ -1409,6 +1428,7 @@ func (rc *RedisClient) syncMetadata() error {
 	// no single batch (incl. a big dir's HGETALL + per-child attr GETs) keeps
 	// Redis BUSY long enough to starve a concurrent copy.
 	const scanCount = "500"
+	rc.syncScanned.Store(0) // U6: fresh progress for this rebuild
 	type rawEntry struct {
 		ft          int
 		mtime, size int64
@@ -1428,6 +1448,7 @@ func (rc *RedisClient) syncMetadata() error {
 			break
 		}
 		cursor = res[0]
+		rc.syncScanned.Add(int64(len(res) - 1)) // U6 progress
 		for _, raw := range res[1:] {
 			// "fileType:mtime:fileSize:inode:parentInode:name"
 			parts := strings.SplitN(raw, ":", 6)

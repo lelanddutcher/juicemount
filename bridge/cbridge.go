@@ -3427,7 +3427,23 @@ func handleActivityHTTP(w http.ResponseWriter, r *http.Request) {
 	if rc != nil {
 		op := activityOperation{Kind: "reconcile", Active: rc.IsSyncing()}
 		if op.Active {
-			op.Detail = "Rebuilding index…"
+			// V2.3 U6 (task #37): show real progress — an opaque
+			// multi-minute rebuild reads as "stuck" (field report). The
+			// total is the previous sync's entry count, hence the ~.
+			scanned, estTotal := rc.SyncProgress()
+			switch {
+			case estTotal > 0 && scanned > 0:
+				pct := scanned * 100 / estTotal
+				if pct > 99 {
+					pct = 99 // estimate — never claim done before completion
+				}
+				op.Detail = fmt.Sprintf("Rebuilding index… %d / ~%d (%d%%)", scanned, estTotal, pct)
+			case scanned > 0:
+				op.Detail = fmt.Sprintf("Rebuilding index… %d entries scanned", scanned)
+			default:
+				op.Detail = "Rebuilding index…"
+			}
+			op.Files = int(scanned)
 			working = append(working, "rebuilding index")
 		} else {
 			last := rc.LastSyncTime()
