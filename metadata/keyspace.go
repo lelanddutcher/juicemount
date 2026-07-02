@@ -961,13 +961,21 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		if strings.HasPrefix(ch.Name, "._") {
 			continue
 		}
-		// Task #78: internal-namespace rows (.trash/, .juicemount/) are
-		// managed by the one-time open-GC + push-insert filter, never by
-		// push-prune. Post-GC none should exist; if one does (seeded by an
-		// older build mid-session), a prune attempt here would just churn
-		// through Layer A every root reconcile (FUSE shows .trash /
-		// .juicemount present → spared → re-candidate next cycle).
-		if scanFilteredPath(ch.Path) {
+		// Task #78: internal-namespace DESCENDANT rows (.trash/…,
+		// .juicemount/…) are managed by the one-time open-GC + push-insert
+		// filter, never by push-prune. Post-GC none should exist; if one does
+		// (seeded by an older build mid-session), a prune attempt here would
+		// just churn through Layer A every root reconcile (FUSE shows the
+		// path present → spared → re-candidate next cycle).
+		//
+		// Batch-3 adversarial review #5: scanFilteredDescendant, NOT
+		// scanFilteredPath — the BARE ".trash"/".juicemount" dir rows stay
+		// eligible as candidates so the QA-30 per-path FUSE Lstat below can
+		// prune them if the backend namespace is ever genuinely removed.
+		// While the namespace exists, FUSE shows it present and the spare
+		// keeps the row (bounded: 2 extra Lstats worst case per root
+		// reconcile that reaches this loop).
+		if scanFilteredDescendant(ch.Path) {
 			continue
 		}
 		candidates = append(candidates, ch.Path)

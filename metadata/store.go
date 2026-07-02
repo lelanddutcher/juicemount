@@ -533,12 +533,26 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 // number of rows removed.
 func gcInternalNamespaces(db *sql.DB) (int64, error) {
 	// Namespaces MUST mirror scanFilteredPath (the single source of truth).
-	// Children only ('ns/%'): the bare ".trash"/".juicemount" dir rows are
+	// Children only ('ns/*'): the bare ".trash"/".juicemount" dir rows are
 	// left alone — they are cheap, FUSE-visible directories, and the
-	// pruneAbsent exclusion keeps them off the ladder.
+	// scanFilteredDescendant split keeps their descendants off the ladder
+	// while the bare rows stay prunable via the normal FUSE-verified paths.
+	//
+	// GLOB, not LIKE (batch-3 adversarial review #3): SQLite LIKE is
+	// ASCII-case-INSENSITIVE by default (no case_sensitive_like pragma is
+	// set), so LIKE '.trash/%' also matched a root-level USER directory named
+	// '.Trash' (e.g. a macOS home-dir backup copied to the volume root) — a
+	// real, SCAN-visible namespace that scanFilteredPath does NOT filter —
+	// and deleted its mirror rows at EVERY open (delete-at-boot /
+	// re-add-at-first-SCAN cycle; invisible offline until the next online
+	// SCAN). GLOB is ASCII-case-sensitive and treats '.'/'/' literally, so it
+	// matches the predicate's exact byte semantics. PRAGMA case_sensitive_like
+	// was rejected: db.Exec pragmas bind to a single pooled connection (see
+	// the pragmas note above) and it would silently change the other LIKE
+	// query in this file.
 	const batch = `DELETE FROM entries WHERE rowid IN (
 		SELECT rowid FROM entries
-		WHERE path LIKE '.trash/%' OR path LIKE '.juicemount/%'
+		WHERE path GLOB '.trash/*' OR path GLOB '.juicemount/*'
 		LIMIT 5000)`
 	var total int64
 	for {
@@ -1037,6 +1051,194 @@ func (s *Store) bulkInsertBatch(batch []*Entry, incremental bool) error {
 		}
 	}
 
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// BulkInsertAbsent is the insert-if-absent sibling of BulkInsert, for ASYNC
+// FUSE-sourced mirror warmers (U7 refreshUnmirroredDir, prefetchChildren).
+//
+// Batch-3 adversarial review #1 (TOCTOU): those warmers snapshot FUSE, filter
+// via LookupByPath==nil OUTSIDE any store lock, then batch-insert. A fresher
+// row landing in the window between the filter and the batch commit (a
+// keyspace-push event completing a remote write, a CREATE, the reconcile) was
+// REPLACEd by the older FUSE snapshot — no later push event corrects it, so
+// GETATTR served a stale (short) size until the SCAN backstop (the
+// silent-truncation class), or a remotely-deleted child was resurrected as a
+// phantom row. Here the presence check happens INSIDE the same critical
+// section as each apply:
+//
+//   - SQLite: INSERT OR IGNORE, never REPLACE; on the incremental-FTS path an
+//     existing row is skipped entirely (no REPLACE, no FTS delete/insert) —
+//     see ftsExternalInsertAbsent.
+//   - Caches: an entry already present in pathCache is skipped under the SAME
+//     s.mu hold that would have inserted it; an entry whose inode is already
+//     owned by another live cached path is also skipped (a rename raced the
+//     snapshot — the push-event row for the new path is fresher, and
+//     inserting the stale old-path entry would evict it: the QA-25
+//     stale-handle class).
+//
+// All interleavings converge to fresh-wins: if the fresh row lands first, the
+// warmer skips it in both stores; if the warmer's stale row lands first, the
+// fresh writer's replace-semantics path (Insert / applyEvent / reconcile
+// BulkInsert) overwrites it. Foreground writers keep BulkInsert unchanged.
+// Callers' LookupByPath pre-filters remain as cheap batch-size reducers but
+// are no longer load-bearing.
+func (s *Store) BulkInsertAbsent(entries []*Entry, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+
+	// Same incremental-vs-bulk FTS decision as BulkInsert (QA-40 rationale).
+	incremental := len(entries) > 0 && (s.ftsInitialized.Load() || len(entries) < FTSFullRebuildThreshold)
+
+	for i := 0; i < len(entries); i += batchSize {
+		end := i + batchSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+		if err := s.bulkInsertAbsentBatch(entries[i:end], incremental); err != nil {
+			return err
+		}
+	}
+
+	// See BulkInsert for the QA-30 Layer B HIGH-2 + chunked-mutation
+	// (drain-latency tail) rationale — same structure, absent semantics.
+	s.stagePinnedForEviction()
+
+	for i := 0; i < len(entries); i += cacheMutationChunk {
+		end := i + cacheMutationChunk
+		if end > len(entries) {
+			end = len(entries)
+		}
+		s.mu.Lock()
+		for _, e := range entries[i:end] {
+			// The whole point of the absent variant: presence is checked
+			// under THIS lock hold, not in the caller's earlier filter pass.
+			if _, exists := s.pathCache[e.Path]; exists {
+				continue // fresher row won the race — never overwrite it
+			}
+			if _, taken := s.inodeCache[e.Inode]; taken {
+				// Inode already owned by a live cached path (a rename raced
+				// the FUSE snapshot). Inserting our stale path would evict
+				// the fresher owner (QA-25 class) — skip; the reconcile
+				// converges the mirror.
+				continue
+			}
+			s.inodeCache[e.Inode] = e
+			s.pathCache[e.Path] = e
+			s.addToChildrenIdx(e)
+		}
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	s.evictOldest()
+	s.mu.Unlock()
+
+	if !incremental {
+		if err := s.RebuildFTS(); err != nil {
+			log.Printf("[metadata] BulkInsertAbsent: RebuildFTS failed: %v", err)
+		}
+	}
+	if len(entries) > 0 {
+		s.ftsInitialized.Store(true)
+	}
+	return nil
+}
+
+// ftsExternalInsertAbsent is the insert-if-absent sibling of
+// ftsExternalUpsert (caller holds writeMu). An existing row is left entirely
+// untouched — no REPLACE, no FTS delete/insert — so a fresher concurrent
+// writer's row (and its FTS tokens) survive an async warmer's stale snapshot
+// (batch-3 adversarial review #1).
+func ftsExternalInsertAbsent(tx *sql.Tx, e *Entry) error {
+	var one int
+	switch err := tx.QueryRow(`SELECT 1 FROM entries WHERE path = ?`, e.Path).Scan(&one); err {
+	case nil:
+		return nil // row exists — the present (fresher) row wins; skip entirely
+	case sql.ErrNoRows:
+		// genuinely absent — insert below
+	default:
+		return fmt.Errorf("insert-absent read %q: %w", e.Path, err)
+	}
+	res, err := tx.Exec(
+		`INSERT OR IGNORE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.Path, e.Name, e.ParentPath,
+		boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
+		int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
+	)
+	if err != nil {
+		return fmt.Errorf("insert-absent %q: %w", e.Path, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("insert-absent rows %q: %w", e.Path, err)
+	}
+	if n == 0 {
+		return nil // belt-and-braces: IGNOREd — present row wins, no FTS write
+	}
+	newRowid, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("insert-absent lastid %q: %w", e.Path, err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO entries_fts(rowid, name, path) VALUES(?, ?, ?)`,
+		newRowid, e.Name, e.Path); err != nil {
+		return fmt.Errorf("insert-absent fts %q: %w", e.Path, err)
+	}
+	return nil
+}
+
+// bulkInsertAbsentBatch is bulkInsertBatch with INSERT OR IGNORE semantics
+// (one transaction, writeMu held only for its own duration).
+func (s *Store) bulkInsertAbsentBatch(batch []*Entry, incremental bool) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+
+	if incremental {
+		for _, e := range batch {
+			if err := ftsExternalInsertAbsent(tx, e); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit: %w", err)
+		}
+		return nil
+	}
+
+	// Non-incremental (startup/large load): skip per-row FTS here; the caller
+	// does one bulk RebuildFTS, which re-derives FTS from `entries` and is
+	// therefore consistent with IGNOREd rows too.
+	stmt, err := tx.Prepare(
+		`INSERT OR IGNORE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("prepare: %w", err)
+	}
+	for _, e := range batch {
+		if _, err := stmt.Exec(
+			e.Path, e.Name, e.ParentPath,
+			boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
+			int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
+		); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			return fmt.Errorf("exec %q: %w", e.Path, err)
+		}
+	}
 	stmt.Close()
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)

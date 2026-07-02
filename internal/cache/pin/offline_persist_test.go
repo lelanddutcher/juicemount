@@ -47,3 +47,64 @@ func TestOfflineIntentUnconfiguredInert(t *testing.T) {
 		t.Fatal("unconfigured persistence must never report intent")
 	}
 }
+
+// Batch-3 adversarial review #10: a marker that outlives the metadata mirror
+// DB (an app-data reset deletes Application Support but not ~/.juicemount)
+// must be treated as stale — cleared, so the boot proceeds online and takes
+// the empty-mirror blocking sync — instead of serving an empty volume.
+func TestDropStaleOfflineIntent(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "offline-intent")
+	SetOfflinePersistPath(marker)
+	t.Cleanup(func() {
+		SetOffline(false)
+		SetOfflinePersistPath("")
+	})
+	dbPath := filepath.Join(dir, "metadata.db")
+
+	// Servable DB → marker honored, nothing dropped.
+	SetOffline(true)
+	if err := os.WriteFile(dbPath, []byte("sqlite"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if DropStaleOfflineIntent(dbPath) {
+		t.Fatal("marker dropped despite a servable mirror DB")
+	}
+	if !PersistedOfflineIntent() {
+		t.Fatal("marker must survive a servable-DB check")
+	}
+
+	// Zero-length DB → stale: cleared and reported.
+	if err := os.WriteFile(dbPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !DropStaleOfflineIntent(dbPath) {
+		t.Fatal("zero-length mirror DB must mark the intent stale")
+	}
+	if PersistedOfflineIntent() {
+		t.Fatal("stale marker must be removed (empty-DB case)")
+	}
+
+	// Missing DB → stale.
+	SetOffline(true)
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if !DropStaleOfflineIntent(dbPath) {
+		t.Fatal("missing mirror DB must mark the intent stale")
+	}
+	if PersistedOfflineIntent() {
+		t.Fatal("stale marker must be removed (missing-DB case)")
+	}
+
+	// No marker present → no-op false.
+	if DropStaleOfflineIntent(dbPath) {
+		t.Fatal("no marker: DropStaleOfflineIntent must be a no-op")
+	}
+
+	// Unconfigured persistence → fully inert.
+	SetOfflinePersistPath("")
+	if DropStaleOfflineIntent(dbPath) {
+		t.Fatal("unconfigured persistence must be inert")
+	}
+}

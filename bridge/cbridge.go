@@ -270,19 +270,60 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// A reachable backend — the overwhelmingly common case — takes the unchanged
 	// online path.
 	// V2.3 U3: persisted user-offline intent — the user toggled offline in a
-	// previous session and never toggled back, so this session STARTS
-	// offline (field report: "clicking the offline toggle doesn't just start
-	// it in offline mode"). Checked BEFORE the reachability probe so an
-	// offline start touches no network at all. One menu click returns online
-	// (SetOffline clears the marker).
-	pin.SetOfflinePersistPath(filepath.Join(os.Getenv("HOME"), ".juicemount", "offline-intent"))
-	bootUserOffline := pin.PersistedOfflineIntent()
-	backendUp, bootRTT := false, time.Duration(0)
-	if bootUserOffline {
-		jmlog.Info("persisted user-offline intent found — starting offline, skipping the reachability probe (U3)")
+	// previous session and never toggled back, so this session STARTS with
+	// the user-offline gates engaged (field report: "clicking the offline
+	// toggle doesn't just start it in offline mode"). One menu click returns
+	// online (SetOffline clears the marker).
+	//
+	// Batch-3 adversarial review (HIGH): a persisted-offline boot still
+	// PROBES the backend and — when reachable — MOUNTS FUSE. Offline pinned
+	// reads REQUIRE the mount: OpenFile's read path opens the FUSE fd and the
+	// JuiceFS LRU serves pinned bytes from local SSD, so the original
+	// skip-the-probe/skip-the-mount behavior made EVERY pinned-and-ready file
+	// unreadable (ENOENT against a plain empty dir) for the entire relaunched
+	// offline session — and the U4 watchdog stand-down (correctly) never
+	// remounts while the USER flag is held, so nothing recovered it. The
+	// original "touches no network at all" goal was WRONG for the same
+	// reason: juicefs needs its Redis metadata engine to mount, so a
+	// user-offline session was never a zero-network session (this also
+	// subsumes/rejects the companion suggestion to skip the boot Redis
+	// connect while user-offline). The split that actually holds:
+	//   - FUSE mount + Redis connect budget key on backendUp (TRUE probed
+	//     reachability, exactly like every other boot);
+	//   - boot sync/SCAN suppression, the offline read/readdir gates, and
+	//     the started_offline banner key on startedOffline (forced below).
+	// On a metered link the only added traffic is the 1.5s TCP probe + the
+	// juicefs mount metadata handshake — no data reads (the offline gates
+	// refuse un-pinned opens from the first RPC). On a dead link the probe
+	// fails fast and boot degenerates to the existing R-4 path.
+	//
+	// Batch-3 review #7: resolve the marker path via os.UserHomeDir with
+	// warn-and-disable — os.Getenv("HOME") made the marker path cwd-relative
+	// when HOME was unset (arbitrary in a launchd/daemon context), silently
+	// losing the user's offline choice. Unconfigured persistence is the pin
+	// package's designed inert mode: degrade loudly and safely.
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" {
+		pin.SetOfflinePersistPath(filepath.Join(home, ".juicemount", "offline-intent"))
 	} else {
-		backendUp, bootRTT = backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+		jmlog.Warn("cannot resolve home directory — offline-intent persistence disabled (the offline toggle will not stick across launches)",
+			"error", fmt.Sprintf("%v", homeErr))
 	}
+	bootUserOffline := pin.PersistedOfflineIntent()
+	// Batch-3 review #10: a marker that outlived the metadata mirror DB (an
+	// app-data reset — including the app's own "Reset local metadata cache" —
+	// deletes Application Support but not ~/.juicemount) would make this boot
+	// skip the U1 empty-mirror blocking sync and serve a completely EMPTY
+	// volume that looks like data loss. Treat the marker as stale when there
+	// is nothing to serve: clear it and take the normal online boot.
+	if bootUserOffline && pin.DropStaleOfflineIntent(cfg.DBPath) {
+		jmlog.Warn("persisted offline intent but the metadata mirror DB is missing/empty (app data reset?) — ignoring the stale marker and booting online",
+			"db_path", cfg.DBPath)
+		bootUserOffline = false
+	}
+	if bootUserOffline {
+		jmlog.Info("persisted user-offline intent found — starting offline (U3); still probing + mounting FUSE so pinned files stay readable")
+	}
+	backendUp, bootRTT := backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
 	// V2.3 U2/K2: a link can be reachable-but-useless — the TCP handshake
 	// completes inside 1.5s but the RTT is so high that the synchronous
 	// online boot (juicefs mount + first syncs) would churn for minutes.
@@ -292,8 +333,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// default (tonight's 42ms DERP-relay cellular booted fine in 19s —
 	// deferral is for genuinely broken links); JM_BOOT_DEFER_RTT_MS tunes,
 	// 0 disables (REVERT_LOG 2026-07-02).
+	// Batch-3 adversarial review (HIGH follow-through): the U2 RTT defer is
+	// SKIPPED on a persisted-offline (U3) boot. The defer works by fabricating
+	// backendUp=false, which skips the boot fm.Mount() — but a U3 session
+	// holds the USER offline flag, so the watchdog's gone-branch remount
+	// stands down (fuseSkipRemountWhileUserOffline) and FUSE would NEVER
+	// mount: the same pinned-files-unreadable failure on a slow-but-alive
+	// link. A U3 boot already has everything the defer buys (startedOffline
+	// is forced below: no boot sync, offline gates live, banner) EXCEPT the
+	// mount skip — which is exactly the part that must not happen.
 	bootRTTDeferred := false
-	if backendUp && bootRTT > 0 {
+	if backendUp && bootRTT > 0 && !bootUserOffline {
 		deferMS := int64(500)
 		if v := os.Getenv("JM_BOOT_DEFER_RTT_MS"); v != "" {
 			if n, pErr := strconv.ParseInt(v, 10, 64); pErr == nil {
@@ -465,6 +515,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		connectAttempts = 1
 	}
 	startedOffline := false
+	// Batch-3 adversarial review #8: carry a per-cause reason for the
+	// "started_offline:" status instead of always reusing the R-4 constant —
+	// a deliberate user-offline relaunch was reported to Swift (and os_log'd)
+	// as "backend unreachable at launch", a false causal story, and the U2
+	// slow-backend defer claimed "unreachable" while its own SetAutoOffline
+	// reason said "responding slowly".
+	startOfflineReason := offlineStartReason
 	rc, err := connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
 	if err != nil {
 		// R-4: do NOT abort. Start offline. A DEFERRED Redis client
@@ -506,12 +563,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// without waiting for a reconnect).
 	if bootRTTDeferred && !startedOffline {
 		startedOffline = true
-		pin.SetAutoOffline(true, "backend responding slowly — started offline; recovering in background")
+		startOfflineReason = "backend responding slowly — started offline; recovering in background"
+		pin.SetAutoOffline(true, startOfflineReason)
 	}
 	// V2.3 U3: persisted USER intent — engage the user flag (not auto), so
 	// U4's watchdog stand-down holds and only an explicit toggle clears it.
+	// Batch-3 review (HIGH): when the backend was reachable, FUSE is ALREADY
+	// mounted above (the mount keys on backendUp, never on user intent) —
+	// this block only engages the gates/banner and suppresses the boot sync,
+	// so pinned files stay readable through the whole offline session.
 	if bootUserOffline {
 		startedOffline = true
+		startOfflineReason = "offline mode is on (your setting from last session)"
 		pin.SetOffline(true)
 	}
 	globalRC = rc
@@ -1188,7 +1251,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// listen addr remains available via the stats path. Recovery is automatic
 	// (watchdog remounts FUSE; reachability OnChange lifts auto-offline).
 	if startedOffline {
-		return C.CString("started_offline: " + offlineStartReason)
+		// Batch-3 review #8: per-cause reason (R-4 unreachable / U2 slow
+		// backend / U3 persisted user intent), not the R-4 constant for all.
+		return C.CString("started_offline: " + startOfflineReason)
 	}
 	return C.CString(srv.Addr())
 }
@@ -4079,7 +4144,9 @@ func handleOfflineHTTP(w http.ResponseWriter, r *http.Request) {
 // offlineStartReason is the human-readable reason surfaced (via pin.SetAutoOffline
 // → pin.State().Reason and the "started_offline:" start result) when the app
 // boots with the metadata backend unreachable (R-4). The UI shows it in the
-// "Started offline — showing cached state" banner.
+// "Started offline — showing cached state" banner. Batch-3 review #8: this is
+// now only the R-4 DEFAULT for startOfflineReason — the U2 (slow backend) and
+// U3 (persisted user intent) offline starts carry their own per-cause reason.
 const offlineStartReason = "Started offline — backend unreachable at launch"
 
 // backendReachableQuick does a single cheap TCP dial to the metadata host so

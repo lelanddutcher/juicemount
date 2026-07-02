@@ -346,3 +346,69 @@ app restart suffices), or revert the commit.
 tests; only the known environmental TestMemBuf* failures remain). **Pending:**
 live slow-link validation that an unmirrored dir populates on Finder's own
 refresh cadence.
+
+## 2026-07-02 — Batch-3 adversarial-review fixes: U3 mounts FUSE when persisted-offline (HIGH), U7 bounded stats + insert-if-absent, #78 filter unification (V2.3)
+
+**What changed (behavior notes for the three entries above):**
+
+- **U3 (HIGH):** a persisted-offline boot now PROBES the backend and — when
+  reachable — MOUNTS FUSE, exactly like every other boot. Offline pinned reads
+  REQUIRE the mount (OpenFile reads pinned bytes through the FUSE fd from the
+  JuiceFS local block cache); the old skip-probe/skip-mount start made every
+  pinned-and-ready file unreadable for the whole relaunched offline session,
+  with the U4 watchdog stand-down (correctly) refusing to recover it. The
+  split that holds now: FUSE mount + Redis connect budget key on `backendUp`
+  (true probed reachability); boot-sync suppression, offline gates, and the
+  started_offline banner key on `startedOffline`. The U2 RTT-defer is skipped
+  on a U3 boot (it works by fabricating `backendUp=false`, which would
+  re-open the same hole on a slow-but-alive link). The "touches no network"
+  U3 claim was wrong and is retired: juicefs needs Redis to mount, so the
+  boot Redis connect stays (the review suggestion to skip it was
+  rejected/subsumed for the same reason). Added traffic on a metered link:
+  the 1.5s TCP probe + mount metadata handshake — no data reads.
+  Also: marker path now via `os.UserHomeDir()` (warn-and-disable on failure);
+  per-cause `started_offline:` reasons (R-4 unreachable / U2 slow / U3 "your
+  setting from last session"); a marker that outlives a missing/empty
+  metadata mirror DB (app-data reset) is treated as stale — cleared, normal
+  online boot with the U1 empty-mirror blocking sync
+  (`pin.DropStaleOfflineIntent`).
+- **U7:** the per-child `de.Info()` lstats in `coldDirListing` are now
+  bounded (`infoWithTimeout`, gate-parameterized: foreground fallback →
+  `nfsLstatGate`, async worker → `prefetchGate`) and a timeout ABANDONS the
+  listing pass, so a wedged FUSE can no longer park refresh workers forever
+  and silently exhaust `dirRefreshSem`. The async warmers
+  (`refreshUnmirroredDir`, `prefetchChildren`) insert via the new
+  `Store.BulkInsertAbsent` (INSERT OR IGNORE + skip-if-present cache mutation
+  inside the store's critical sections), closing the TOCTOU where a fresher
+  push-event row landing mid-warm was clobbered by the stale FUSE snapshot
+  (stale-GETATTR-size / phantom-re-insert class). Foreground writers keep
+  replace semantics.
+- **#78:** `metadata.ScanFilteredPath` is now exported and applied on ALL
+  FUSE-sourced mirror-insert paths — ReadDir short-circuits scan-filtered
+  namespaces (empty answer, no FUSE readdir, no insert), `coldDirListing`
+  lists-but-never-mirrors filtered children, `prefetchChildren` skips them
+  and never fans out into them — so `.trash`/`.juicemount` can no longer be
+  re-mirrored mid-session, closing the GC-delete/re-add cycle. The open-GC
+  predicate is now case-sensitive GLOB (`.trash/*`, `.juicemount/*`): SQLite
+  LIKE was ASCII-case-insensitive and deleted case-variant USER trees
+  (`.Trash/…` from a home-dir backup) at every open. The prune-tracking
+  exclusion narrowed to a new `scanFilteredDescendant` (descendants only):
+  the bare `.trash`/`.juicemount` dir rows re-enter the FUSE-verified prune
+  paths, so they are spared while real (2 bounded Layer-A Lstats worst case
+  per cycle) but prunable if the backend namespace is ever genuinely removed
+  (no more permanent ghost dir).
+
+**Switches:** unchanged — `JM_MIRROR_NS_GC=0`, `JM_ASYNC_DIR_REFRESH=0`,
+`JM_FUSE_OFFLINE_REMOUNT=1`, `JM_BOOT_DEFER_RTT_MS` all still apply; no new
+env vars. Full revert = revert the commit.
+
+**Validated:** unit — `TestInfoWithTimeoutWedgedStat`/`Completes`,
+`TestColdDirListingBreaksOnWedgedStat`, `TestReadDirScanFilteredShortCircuit`,
+`TestColdListingListsButNeverMirrorsFiltered`,
+`TestPrefetchChildrenSkipsFilteredNamespace`,
+`TestBulkInsertAbsentNeverOverwritesFresherRow`/`RespectsInodeOwner`/
+`InsertsNewRows`, `TestScanFilteredDescendantTruthTable`,
+`TestMirrorNamespaceGC` (case-variant rows), `TestDropStaleOfflineIntent` +
+full metadata/nfs/pin/bridge suites (only the known environmental TestMemBuf*
+failures with the live app). **Pending:** live persisted-offline relaunch
+proving pinned files open (the HIGH's headline flow).

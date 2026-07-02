@@ -334,3 +334,214 @@ func TestAsyncDirRefreshNeverOverwrites(t *testing.T) {
 		t.Fatal("new child d/b.txt not inserted by async refresh")
 	}
 }
+
+// ============================================================================
+// Batch-3 adversarial-review coverage: bounded per-child stats (#0), the
+// atomic insert-if-absent race (#1), and the scan-filtered-namespace
+// unification (#2/#4).
+// ============================================================================
+
+// blockingDirEntry fakes a DirEntry whose Info() — a LAZY lstat(2) on darwin
+// — wedges until released: the macFUSE watchdog-thrash mode review #0
+// targets.
+type blockingDirEntry struct {
+	name    string
+	release chan struct{}
+}
+
+func (b *blockingDirEntry) Name() string      { return b.name }
+func (b *blockingDirEntry) IsDir() bool       { return false }
+func (b *blockingDirEntry) Type() os.FileMode { return 0 }
+func (b *blockingDirEntry) Info() (os.FileInfo, error) {
+	<-b.release
+	return nil, os.ErrNotExist
+}
+
+// TestInfoWithTimeoutWedgedStat: a wedged Info() must return ok=false within
+// the budget, keep holding its gate slot while parked (bounded leak), and
+// release the slot once the underlying stat finally returns.
+func TestInfoWithTimeoutWedgedStat(t *testing.T) {
+	gate := make(chan struct{}, 1)
+	de := &blockingDirEntry{name: "wedged.mov", release: make(chan struct{})}
+
+	_, _, ok := infoWithTimeout(de, 50*time.Millisecond, gate)
+	if ok {
+		t.Fatal("wedged Info() must report ok=false")
+	}
+	// The parked worker holds the gate slot until the stat returns…
+	select {
+	case gate <- struct{}{}:
+		<-gate
+		t.Fatal("gate slot free while the wedged Info() is still parked — the slot must be held (bounded leak)")
+	default:
+	}
+	// …and releases it once the wedge clears.
+	close(de.release)
+	if !pollUntil(t, 2*time.Second, func() bool {
+		select {
+		case gate <- struct{}{}:
+			<-gate
+			return true
+		default:
+			return false
+		}
+	}) {
+		t.Fatal("gate slot never released after the wedged Info() returned")
+	}
+}
+
+// TestInfoWithTimeoutCompletes: the healthy path returns the FileInfo.
+func TestInfoWithTimeoutCompletes(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil || len(ents) != 1 {
+		t.Fatalf("ReadDir: %v (%d entries)", err, len(ents))
+	}
+	gate := make(chan struct{}, 1)
+	fi, ierr, ok := infoWithTimeout(ents[0], 2*time.Second, gate)
+	if !ok || ierr != nil || fi == nil || fi.Name() != "a.txt" {
+		t.Fatalf("infoWithTimeout = (%v, %v, ok=%v), want a.txt info", fi, ierr, ok)
+	}
+}
+
+// TestColdDirListingBreaksOnWedgedStat: one wedged child must ABANDON the
+// listing pass (break, not continue) — entries behind the wedge are never
+// stat'd — so a U7 worker always returns promptly and its deferred
+// dirRefreshSem/singleflight release runs. The partial toInsert is kept
+// (insert-only; the next readdir re-fires the refresh).
+func TestColdDirListingBreaksOnWedgedStat(t *testing.T) {
+	jfs, _, fuseRoot := newDirRefreshHarness(t)
+
+	oldTimeout := fuseStatTimeout
+	fuseStatTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { fuseStatTimeout = oldTimeout })
+
+	// Two REAL healthy entries with a wedged fake between them; the entry
+	// after the wedge must never be reached.
+	mkFUSEDir(t, fuseRoot, "d", "a.txt", "c.txt")
+	real, err := os.ReadDir(filepath.Join(fuseRoot, "d"))
+	if err != nil || len(real) != 2 {
+		t.Fatalf("ReadDir: %v (%d entries)", err, len(real))
+	}
+	wedged := &blockingDirEntry{name: "b-wedged.mov", release: make(chan struct{})}
+	t.Cleanup(func() { close(wedged.release) })
+	entries := []os.DirEntry{real[0], wedged, real[1]}
+
+	gate := make(chan struct{}, 4)
+	infos, toInsert := jfs.coldDirListing("d", entries, gate)
+	if len(infos) != 1 || infos[0].Name() != "a.txt" {
+		t.Fatalf("infos = %d entries, want only a.txt (break on wedge — no stats issued past it)", len(infos))
+	}
+	if len(toInsert) != 1 || toInsert[0].Path != "d/a.txt" {
+		t.Fatalf("toInsert = %d entries, want only d/a.txt (partial insert is safe)", len(toInsert))
+	}
+}
+
+// TestReadDirScanFilteredShortCircuit (#2/#4): a zero-row ONLINE readdir of
+// a scan-filtered namespace must return empty immediately — no async
+// dispatch, no foreground FUSE readdir, no mirror inserts. Otherwise every
+// walker entering .trash/.juicemount (ls -a, rsync, Spotlight, OpenLoupe)
+// re-mirrors what the #78 open-GC removed, every session.
+func TestReadDirScanFilteredShortCircuit(t *testing.T) {
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	mkFUSEDir(t, fuseRoot, ".juicemount/derivatives", "p.mp4")
+	mkFUSEDir(t, fuseRoot, ".trash/2026-07-02-08", "1-2-x.mov")
+
+	for _, dir := range []string{".juicemount", ".juicemount/derivatives", ".trash", ".trash/2026-07-02-08"} {
+		infos, err := jfs.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("ReadDir(%s): %v", dir, err)
+		}
+		if len(infos) != 0 {
+			t.Fatalf("ReadDir(%s) = %d entries, want 0 (short-circuit)", dir, len(infos))
+		}
+	}
+	if !inFlightEmpty(h)() {
+		t.Fatal("scan-filtered readdir dispatched an async refresh")
+	}
+	time.Sleep(200 * time.Millisecond)
+	for _, p := range []string{
+		".juicemount/derivatives", ".juicemount/derivatives/p.mp4",
+		".trash/2026-07-02-08", ".trash/2026-07-02-08/1-2-x.mov",
+	} {
+		if store.LookupByPath(p) != nil {
+			t.Fatalf("mirror row %q re-created for a scan-filtered namespace", p)
+		}
+	}
+
+	// The JM_ASYNC_DIR_REFRESH=0 foreground fallback short-circuits
+	// identically (the guard sits above BOTH paths).
+	t.Setenv("JM_ASYNC_DIR_REFRESH", "0")
+	infos, err := jfs.ReadDir(".juicemount")
+	if err != nil || len(infos) != 0 {
+		t.Fatalf("foreground ReadDir(.juicemount) = (%d entries, %v), want (0, nil)", len(infos), err)
+	}
+	if kids, _ := store.ListChildren(".juicemount"); len(kids) != 0 {
+		t.Fatalf("foreground fallback mirrored %d filtered children", len(kids))
+	}
+}
+
+// TestColdListingListsButNeverMirrorsFiltered (#2): the cold listing keeps
+// scan-filtered children in the RETURNED listing (client-visible behavior
+// unchanged — the bare dirs still appear at the volume root) but never
+// mirrors them.
+func TestColdListingListsButNeverMirrorsFiltered(t *testing.T) {
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	t.Setenv("JM_ASYNC_DIR_REFRESH", "0") // foreground path → synchronous asserts
+	mkFUSEDir(t, fuseRoot, ".juicemount", "d.jpg")
+	mkFUSEDir(t, fuseRoot, "movies", "clip.mov")
+
+	infos, err := jfs.ReadDir(".")
+	if err != nil {
+		t.Fatalf("ReadDir(.): %v", err)
+	}
+	names := map[string]bool{}
+	for _, fi := range infos {
+		names[fi.Name()] = true
+	}
+	if !names[".juicemount"] || !names["movies"] {
+		t.Fatalf("root listing = %v, want .juicemount AND movies visible", names)
+	}
+	if store.LookupByPath("movies") == nil {
+		t.Fatal("regular child not mirrored by the cold listing")
+	}
+	if store.LookupByPath(".juicemount") != nil {
+		t.Fatal("bare .juicemount mirrored by a FUSE-sourced listing — the #78 filter must apply")
+	}
+}
+
+// TestPrefetchChildrenSkipsFilteredNamespace (#2): the prefetcher must never
+// warm a filtered namespace — neither when asked directly (a walker
+// descended into it) nor via the fast-link root fan-out (which was
+// re-mirroring the .juicemount derivative tree one level per navigation).
+func TestPrefetchChildrenSkipsFilteredNamespace(t *testing.T) {
+	jfs, store, fuseRoot := newDirRefreshHarness(t)
+	h := jfs.handler
+	mkFUSEDir(t, fuseRoot, ".juicemount/derivatives", "p.mp4")
+	mkFUSEDir(t, fuseRoot, "movies", "clip.mov")
+
+	// Direct.
+	h.prefetchChildren(".juicemount")
+	if kids, _ := store.ListChildren(".juicemount"); len(kids) != 0 {
+		t.Fatalf("prefetchChildren(.juicemount) mirrored %d children", len(kids))
+	}
+
+	// Root fan-out (tmpfs readdir is instant → fast-link path): movies is
+	// warmed; .juicemount is skipped from toInsert AND from the subdir
+	// fan-out.
+	h.prefetchChildren(".")
+	if !pollUntil(t, 3*time.Second, mirrorHasChildren(store, "movies")) {
+		t.Fatal("fan-out never warmed the regular sibling (test inconclusive)")
+	}
+	time.Sleep(200 * time.Millisecond) // let any stray fan-out land
+	if store.LookupByPath(".juicemount") != nil {
+		t.Fatal("root prefetch mirrored the bare .juicemount row")
+	}
+	if kids, _ := store.ListChildren(".juicemount"); len(kids) != 0 {
+		t.Fatalf("root fan-out descended into .juicemount (%d children mirrored)", len(kids))
+	}
+}

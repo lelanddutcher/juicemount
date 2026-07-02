@@ -8,9 +8,11 @@ import (
 
 // Task #78: the keyspace-push insert paths must mirror the full SCAN's
 // namespace exclusions (scanFilteredPath is the single source of truth), the
-// pruneAbsent ladder must never track scan-filtered paths, and the one-time
-// open-GC must remove pre-fix .trash/.juicemount mirror rows while sparing
-// `._` sidecars and regular rows.
+// pruneAbsent ladder must never track scan-filtered DESCENDANTS (batch-3
+// review #5: the bare namespace dir rows DO track so they stay prunable),
+// and the one-time open-GC must remove pre-fix .trash/.juicemount mirror
+// rows while sparing `._` sidecars, case-variant user trees, and regular
+// rows.
 
 func TestScanFilteredPathTruthTable(t *testing.T) {
 	cases := []struct {
@@ -46,6 +48,46 @@ func TestScanFilteredPathTruthTable(t *testing.T) {
 	for _, tc := range cases {
 		if got := scanFilteredPath(tc.p); got != tc.want {
 			t.Errorf("scanFilteredPath(%q) = %v, want %v", tc.p, got, tc.want)
+		}
+		// The exported wrapper (nfs FUSE-sourced insert paths, batch-3
+		// review #2/#4) must stay in lockstep with the internal predicate.
+		if got := ScanFilteredPath(tc.p); got != tc.want {
+			t.Errorf("ScanFilteredPath(%q) = %v, want %v", tc.p, got, tc.want)
+		}
+	}
+}
+
+// Batch-3 adversarial review #5 (bare-name/descendant split): the prune
+// TRACKING paths use the descendants-only predicate so the bare namespace
+// dir rows stay ladder/scopedPrune-eligible — otherwise they are permanently
+// unprunable ghosts if the backend namespace is ever genuinely removed.
+func TestScanFilteredDescendantTruthTable(t *testing.T) {
+	cases := []struct {
+		p    string
+		want bool
+	}{
+		// Bare namespace dir rows: filtered by scanFilteredPath, NOT by
+		// scanFilteredDescendant.
+		{".trash", false},
+		{".juicemount", false},
+		// Descendants: never tracked ("absent from the SCAN" carries zero
+		// delete signal for them).
+		{".trash/2026-07-01-12", true},
+		{".trash/2026-07-01-12/1-2-clip.mov", true},
+		{".juicemount/derivatives", true},
+		{".juicemount/derivatives/12345/proxy.mp4", true},
+		// Exact-namespace discipline unchanged from scanFilteredPath.
+		{".trashcan/clip.mov", false},
+		{".trash2", false},
+		{".juicemountain", false},
+		{"movies/.trash/clip.mov", false},
+		{"a/.juicemount/x", false},
+		{"", false},
+		{".", false},
+	}
+	for _, tc := range cases {
+		if got := scanFilteredDescendant(tc.p); got != tc.want {
+			t.Errorf("scanFilteredDescendant(%q) = %v, want %v", tc.p, got, tc.want)
 		}
 	}
 }
@@ -142,6 +184,7 @@ func TestTrackAbsentPathsNeverTracksFilteredNamespaces(t *testing.T) {
 		".trash/stale-counter": 7,
 	}}
 	existing := set(
+		".trash", ".juicemount", // bare namespace dir rows (GC-spared)
 		".trash/x", ".trash/stale-counter",
 		".juicemount/derivatives/1/proxy.mp4",
 		"movies/gone.mov", "movies/here.mov",
@@ -154,6 +197,15 @@ func TestTrackAbsentPathsNeverTracksFilteredNamespaces(t *testing.T) {
 	for _, p := range []string{".trash/x", ".juicemount/derivatives/1/proxy.mp4", ".trash/stale-counter"} {
 		if _, ok := rc.pruneAbsent[p]; ok {
 			t.Errorf("filtered-namespace path %q tracked in pruneAbsent — permanent pending_prune floor (task #78)", p)
+		}
+	}
+	// Batch-3 review #5: the BARE dir rows DO track (scanFilteredDescendant,
+	// not scanFilteredPath) — while the namespace exists on FUSE the Layer-A
+	// probe spares them every cycle, and once it is genuinely gone this is
+	// the only path that can prune the ghost.
+	for _, p := range []string{".trash", ".juicemount"} {
+		if rc.pruneAbsent[p] != 1 {
+			t.Errorf("bare namespace dir row %q not tracked: count = %d, want 1 (permanently unprunable ghost otherwise)", p, rc.pruneAbsent[p])
 		}
 	}
 	if rc.pruneAbsent["movies/gone.mov"] != 1 {
@@ -196,6 +248,12 @@ func seedGCFixture(t *testing.T) string {
 		106: {"._rootsidecar", false},                    // root-level ._ row — MUST survive
 		107: {"movies/clip.mov", false},                  // regular row — MUST survive
 		108: {"movies/.trash-lookalike/keep.mov", false}, // nested lookalike — MUST survive
+		// Batch-3 review #3: case variants are USER namespaces (a macOS
+		// home-dir backup copied to the volume root carries a '.Trash') —
+		// scanFilteredPath is byte-exact, so the GC must be case-sensitive
+		// too (GLOB, not ASCII-case-insensitive LIKE). MUST survive.
+		109: {".Trash/doc.txt", false},
+		110: {".JuiceMount/deriv.jpg", false},
 	} {
 		if err := s.Insert(MakeEntry(row.path, row.isDir, 1, now, inode)); err != nil {
 			t.Fatalf("seed insert %q: %v", row.path, err)
@@ -231,6 +289,12 @@ func TestMirrorNamespaceGC(t *testing.T) {
 		"._rootsidecar",
 		"movies/clip.mov",
 		"movies/.trash-lookalike/keep.mov",
+		// Batch-3 review #3: case-variant USER trees must survive — SQLite
+		// LIKE matched them case-insensitively and deleted them at EVERY
+		// open (delete-at-boot / re-add-at-first-SCAN cycle; invisible in
+		// offline nav until the next online SCAN).
+		".Trash/doc.txt",
+		".JuiceMount/deriv.jpg",
 	} {
 		if s.LookupByPath(kept) == nil {
 			t.Errorf("GC removed row %q it must spare", kept)
@@ -240,8 +304,8 @@ func TestMirrorNamespaceGC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 6 {
-		t.Errorf("post-GC Count = %d, want 6", count)
+	if count != 8 {
+		t.Errorf("post-GC Count = %d, want 8", count)
 	}
 }
 

@@ -69,6 +69,43 @@ func scanFilteredPath(p string) bool {
 	return false
 }
 
+// ScanFilteredPath exposes scanFilteredPath to peer packages. The nfs
+// FUSE-sourced mirror-insert paths (cold readdir listing, U7 async dir
+// refresh, the prefetcher) must apply the SAME exclusions as the push paths:
+// without them, any readdir descending into .trash/.juicemount re-mirrored
+// the children the open-GC had just removed, every session (batch-3
+// adversarial review #2/#4). Single source of truth stays in this file —
+// see the lockstep comment above.
+func ScanFilteredPath(p string) bool { return scanFilteredPath(p) }
+
+// scanFilteredDescendant reports whether p lies STRICTLY UNDER a scan-
+// filtered namespace — the bare ".trash"/".juicemount" dir rows themselves
+// do NOT match (they do match scanFilteredPath).
+//
+// Batch-3 adversarial review #5: the bare dir rows are deliberately kept in
+// the mirror (they match real FUSE dirs and are cheap), but excluding them
+// from BOTH the pruneAbsent ladder and the scopedPrune candidates made them
+// permanently unprunable — a ghost dir in root listings forever if the
+// backend namespace is ever genuinely removed (juicefarm uninstalled and
+// .juicemount rmdir'd server-side, trash disabled/compacted away). The prune
+// TRACKING paths (trackAbsentPaths, scopedPrune candidate skip) therefore
+// use THIS predicate: descendants stay untracked ("absent from the SCAN"
+// carries zero delete signal for them), while the bare rows re-enter the
+// normal FUSE-Lstat-verified prune paths — while the namespace exists on
+// FUSE the Layer-A probe spares them (worst case 2 bounded Lstats per
+// full-SCAN cycle — the pre-#78 status quo for 2 rows instead of ~112k);
+// once FUSE genuinely reports ENOENT, the ladder/scopedPrune remove the
+// ghost. Insert-skip paths and the open-GC keep using scanFilteredPath
+// (root-or-descendant).
+func scanFilteredDescendant(p string) bool {
+	for _, ns := range scanInternalNamespaces {
+		if len(p) > len(ns) && p[:len(ns)] == ns && p[len(ns)] == '/' {
+			return true
+		}
+	}
+	return false
+}
+
 // scanFilterSkipLogWindow bounds Debug logging of push-driven skips to one
 // line per burst window: a keyspace burst (mass delete-to-trash, farm
 // derivative fan-out) can carry thousands of events, and one line per event

@@ -1835,19 +1835,27 @@ func (rc *RedisClient) syncMetadata() error {
 // cycle's view (extracted from syncMetadata for task #78 so the tracking
 // policy is unit-testable).
 //
-// Task #78: paths in scan-filtered namespaces (.trash/, .juicemount/ — see
-// scanFilteredPath) are NEVER tracked. The SCAN structurally cannot return
-// them, so "absent from the SCAN" carries zero delete signal for them;
-// tracking them created a permanent ~112k pending_prune floor (live-probed
-// 2026-07-02), inflated every diff iteration, and fueled the pre-G6 Layer-A
-// probe storms. The cleanup loop also actively drops any filtered-namespace
-// counter (belt-and-braces — pruneAbsent is in-memory, so restart already
-// clears pre-fix counters). The `._` AppleDouble guard stays where it was: at
-// qualification time in syncMetadata (sidecars ARE tracked but never pruned).
+// Task #78: paths STRICTLY UNDER scan-filtered namespaces (.trash/…,
+// .juicemount/… — see scanFilteredDescendant) are NEVER tracked. The SCAN
+// structurally cannot return them, so "absent from the SCAN" carries zero
+// delete signal for them; tracking them created a permanent ~112k
+// pending_prune floor (live-probed 2026-07-02), inflated every diff
+// iteration, and fueled the pre-G6 Layer-A probe storms. The cleanup loop
+// also actively drops any filtered-namespace counter (belt-and-braces —
+// pruneAbsent is in-memory, so restart already clears pre-fix counters).
+//
+// Batch-3 adversarial review #5: the BARE ".trash"/".juicemount" dir rows
+// (spared by the open-GC) ARE tracked — scanFilteredDescendant, not
+// scanFilteredPath. While the namespace exists on FUSE, the Layer-A Lstat
+// probe spares them every cycle (2 bounded probes, negligible); if the
+// backend namespace is ever genuinely removed, this is the ONLY path that
+// can prune the ghost dir row. The `._` AppleDouble guard stays where it
+// was: at qualification time in syncMetadata (sidecars ARE tracked but
+// never pruned).
 func (rc *RedisClient) trackAbsentPaths(existingPaths, redisPaths map[string]struct{}, skipIncrement bool) {
 	for p := range existingPaths {
 		if _, inRedis := redisPaths[p]; !inRedis {
-			if !skipIncrement && !scanFilteredPath(p) {
+			if !skipIncrement && !scanFilteredDescendant(p) {
 				rc.pruneAbsent[p]++
 			}
 		} else {
@@ -1855,9 +1863,9 @@ func (rc *RedisClient) trackAbsentPaths(existingPaths, redisPaths map[string]str
 		}
 	}
 	// Remove stale entries from pruneAbsent: paths already deleted from
-	// SQLite, and (task #78) scan-filtered-namespace counters.
+	// SQLite, and (task #78) scan-filtered-namespace-descendant counters.
 	for p := range rc.pruneAbsent {
-		if _, exists := existingPaths[p]; !exists || scanFilteredPath(p) {
+		if _, exists := existingPaths[p]; !exists || scanFilteredDescendant(p) {
 			delete(rc.pruneAbsent, p)
 		}
 	}

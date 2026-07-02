@@ -23,8 +23,8 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
-	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
+	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/metadata"
@@ -383,6 +383,51 @@ func readDirWithTimeout(p string, timeout time.Duration, gate chan struct{}) (en
 	}
 }
 
+// infoWithTimeout is the os.DirEntry.Info sibling. On darwin a DirEntry from
+// a FUSE-backed os.ReadDir carries its type (macFUSE supplies d_type) but NOT
+// its FileInfo, so Info() is a LAZY lstat(2) against FUSE — the same
+// wedge-able syscall every other *WithTimeout helper here bounds. Batch-3
+// adversarial review #0: the U7 refresh worker's per-child Info() loop was
+// untimed and ungated, so a wedged/slow juicefs parked the worker goroutine
+// indefinitely while it held its dirRefreshSem slot AND the directory's
+// singleflight key — four such parks and async dir refresh was silently dead
+// for the rest of the session (unmirrored dirs listed empty forever, no log,
+// no fallback).
+//
+// ok=false → the lstat didn't complete inside the budget; callers must treat
+// the WHOLE listing pass as abandoned (break, not continue) so worker cleanup
+// (sem/key release) runs promptly. Gate-parameterized like readDirWithTimeout
+// (QA-35 discipline): the foreground cold-readdir fallback passes
+// nfsLstatGate (the shared hot-path budget); background workers (U7 async
+// refresh) pass prefetchGate so they can never consume foreground slots. On
+// timeout the spawned goroutine still holds its gate slot until the lstat
+// actually returns — the same bounded leak every sibling accepts.
+func infoWithTimeout(de os.DirEntry, timeout time.Duration, gate chan struct{}) (fi os.FileInfo, err error, ok bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case gate <- struct{}{}:
+	case <-timer.C:
+		return nil, nil, false
+	}
+	type result struct {
+		fi  os.FileInfo
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		fi, err := de.Info()
+		ch <- result{fi: fi, err: err}
+		<-gate // release slot only after Info actually returns
+	}()
+	select {
+	case r := <-ch:
+		return r.fi, r.err, true
+	case <-timer.C:
+		return nil, nil, false
+	}
+}
+
 // openFileWithTimeout is the os.OpenFile sibling. ok=false → FUSE wedged.
 // On timeout the leaked goroutine's *os.File (if the open eventually
 // succeeds) is closed so we don't leak an fd.
@@ -512,10 +557,10 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		fdPool:    fdPool,
 		readahead: NewReadaheadManager(fusePath, fdPool, netprofile.Default()),
 		// NewMemoryBuffer maps <= 0 to the package defaults.
-		memBuf:        NewMemoryBuffer(ho.memBufThreshold, ho.memBufBudget),
-		writeSizes:    make(map[string]int64),
-		activeWriters: make(map[string]int),
-		verifiers:     make(map[string]verifierData),
+		memBuf:               NewMemoryBuffer(ho.memBufThreshold, ho.memBufBudget),
+		writeSizes:           make(map[string]int64),
+		activeWriters:        make(map[string]int),
+		verifiers:            make(map[string]verifierData),
 		prefetched:           make(map[string]time.Time),
 		prefetchSem:          make(chan struct{}, 4), // max 4 concurrent prefetches
 		phantomPurgeInFlight: make(map[string]struct{}),
@@ -806,6 +851,13 @@ func (h *JuiceMountHandler) clampWriteSize(path string, size int64) {
 // Also spawns bounded sub-prefetches for immediate subdirectories (one level)
 // for Finder's "expanding disclosure triangle" pattern.
 func (h *JuiceMountHandler) prefetchChildren(dirname string) {
+	// Batch-3 adversarial review #2: never warm a scan-filtered namespace
+	// (.trash/, .juicemount/) — the #78 open-GC removed their rows and the
+	// push/prune paths ignore them by design, so a prefetch here re-mirrored
+	// the derivative tree (the ~112k-row source) every session.
+	if metadata.ScanFilteredPath(dirname) {
+		return
+	}
 	h.prefetchMu.Lock()
 	if t, ok := h.prefetched[dirname]; ok && time.Since(t) < 30*time.Second {
 		h.prefetchMu.Unlock()
@@ -872,7 +924,16 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 			childPath = info.Name()
 		}
 
-		// Only insert if not already cached
+		// Batch-3 adversarial review #2: skip scan-filtered children entirely
+		// — never mirrored, and never added to subdirs (the fast-link fan-out
+		// below was descending from a root READDIR into .juicemount and
+		// re-mirroring the derivative tree one level per navigation).
+		if metadata.ScanFilteredPath(childPath) {
+			continue
+		}
+
+		// Only insert if not already cached (cheap pre-filter; the atomic
+		// presence check lives in BulkInsertAbsent — see below)
 		if h.store.LookupByPath(childPath) == nil {
 			entry := metadata.MakeEntry(childPath, info.IsDir(), info.Size(), info.ModTime(), inode)
 			toInsert = append(toInsert, entry)
@@ -885,7 +946,12 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 	}
 
 	if len(toInsert) > 0 {
-		h.store.BulkInsert(toInsert, 500)
+		// Batch-3 adversarial review #1: insert-if-absent, checked inside the
+		// store's own critical sections — a fresher row (push event/CREATE/
+		// reconcile) landing between the LookupByPath filter above and this
+		// batch must never be overwritten by our older FUSE snapshot. Same
+		// TOCTOU (and fix) as refreshUnmirroredDir.
+		h.store.BulkInsertAbsent(toInsert, 500)
 	}
 
 	// Gate the recursive subdir fan-out (remote folder-nav perf fix). The
@@ -1857,6 +1923,21 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 
 	// The mirror has ZERO rows for this directory and we're ONLINE — a
 	// genuinely unmirrored (or genuinely empty) directory.
+
+	// Batch-3 adversarial review #2/#4: scan-filtered namespaces (.trash/,
+	// .juicemount/ — metadata.ScanFilteredPath) are deliberately GC'd from
+	// the mirror at open and deliberately never re-mirrored by the push
+	// paths (#78: the SCAN can never confirm them, so mirrored rows cycled
+	// in the prune ladder forever). Zero mirror rows here is therefore the
+	// DESIGNED state for them, not a cache miss: return empty immediately —
+	// no FUSE readdir (async OR foreground), no mirror insert. Without this,
+	// any walker entering .trash/.juicemount (ls -a, rsync, Spotlight,
+	// OpenLoupe) re-mirrored the whole filtered tree every session, undoing
+	// the GC. Cheap in-memory string check — QA-35 hot-path safe.
+	if metadata.ScanFilteredPath(dirname) {
+		return []os.FileInfo{}, nil
+	}
+
 	fusePath := jfs.fullPath(dirname)
 
 	// U7 (V2.3): NEVER block the READDIR RPC on FUSE. The old foreground
@@ -1887,7 +1968,9 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	infos, toInsert := jfs.coldDirListing(dirname, dirEntries)
+	// Foreground RPC path → per-child stats draw from the shared hot-path
+	// budget (nfsLstatGate), same as the readDirWithTimeout above.
+	infos, toInsert := jfs.coldDirListing(dirname, dirEntries, nfsLstatGate)
 
 	// Bulk-insert into SQLite synchronously so subsequent Stat() calls
 	// from Finder (which follow immediately after READDIR) hit the cache
@@ -1903,11 +1986,27 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 // (b) the mirror entries to insert. Extracted from the foreground cold-
 // readdir fallback so the U7 async refresh builds entries via the SAME code
 // path — one entry-construction path, two callers.
-func (jfs *juiceFS) coldDirListing(dirname string, dirEntries []os.DirEntry) ([]os.FileInfo, []*metadata.Entry) {
+//
+// gate bounds the per-child de.Info() lstats (batch-3 adversarial review #0
+// — see infoWithTimeout): the foreground fallback passes nfsLstatGate, the
+// U7 async worker passes prefetchGate. On a timeout the listing pass is
+// ABANDONED (break) so the async worker always returns promptly and releases
+// its dirRefreshSem slot + singleflight key; the partial toInsert is safe
+// (inserts are insert-only and the next readdir re-fires the refresh).
+func (jfs *juiceFS) coldDirListing(dirname string, dirEntries []os.DirEntry, gate chan struct{}) ([]os.FileInfo, []*metadata.Entry) {
 	infos := make([]os.FileInfo, 0, len(dirEntries))
 	toInsert := make([]*metadata.Entry, 0, len(dirEntries))
 	for _, de := range dirEntries {
-		info, err := de.Info()
+		info, err, ok := infoWithTimeout(de, fuseStatTimeout, gate)
+		if !ok {
+			// FUSE wedged/slow mid-listing. Do NOT keep issuing per-child
+			// lstats against a mount that just proved unresponsive — bail with
+			// whatever was collected. Warn (not Debug): shedding a listing
+			// pass is the signal that FUSE is degrading.
+			jmlog.Warn("readdir: per-child stat timed out — abandoning cold listing",
+				"dir", dirname, "name", de.Name(), "collected", len(infos), "total", len(dirEntries))
+			break
+		}
 		if err != nil {
 			// Log rather than silently dropping. A stat failure here (e.g. a
 			// transient hiccup on a high-latency link) omits the entry from the
@@ -1930,6 +2029,15 @@ func (jfs *juiceFS) coldDirListing(dirname string, dirEntries []os.DirEntry) ([]
 		childPath := path.Join(dirname, info.Name())
 		if dirname == "." {
 			childPath = info.Name()
+		}
+		// Batch-3 adversarial review #2/#4: never MIRROR a scan-filtered
+		// namespace from a FUSE-sourced listing (#78 invariant: the mirror
+		// never holds .trash/.juicemount rows — the SCAN can't confirm them,
+		// so mirrored rows resurface in listings/FTS until the next boot's
+		// GC). The entry stays in the RETURNED listing (foreground behavior
+		// unchanged); it just never lands in the mirror.
+		if metadata.ScanFilteredPath(childPath) {
+			continue
 		}
 		entry := metadata.MakeEntry(childPath, info.IsDir(), info.Size(), info.ModTime(), inode)
 		toInsert = append(toInsert, entry)
@@ -1987,8 +2095,9 @@ func (jfs *juiceFS) maybeAsyncRefreshDir(dirname, fusePath string) {
 //   - Re-checks offline + the G0 FUSE-identity gate here (both can flip
 //     between dispatch and run; and against a plain-dir mountpoint the
 //     readdir would "succeed" on the boot SSD and mirror garbage).
-//   - INSERT-only: children already present in the mirror are skipped
-//     (BulkInsert is replace-on-conflict), so an async result can never
+//   - INSERT-only: children already present in the mirror are skipped, and
+//     the skip is enforced ATOMICALLY by BulkInsertAbsent (INSERT OR IGNORE +
+//     in-lock cache check — batch-3 review #1), so an async result can never
 //     overwrite a fresher row — pruning stays the reconcile's job.
 //   - A genuinely empty directory inserts nothing and records nothing; the
 //     next readdir re-fires the singleflight, which is acceptable.
@@ -2010,6 +2119,12 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) {
 	if !pin.FUSEIdentityOK() {
 		return
 	}
+	// Batch-3 adversarial review #2 (defense in depth): never scan or mirror
+	// a scan-filtered namespace even if a future caller dispatches one —
+	// ReadDir short-circuits these before dispatch today.
+	if metadata.ScanFilteredPath(dirname) {
+		return
+	}
 
 	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout, prefetchGate)
 	if !ok {
@@ -2019,12 +2134,21 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) {
 		return
 	}
 
-	_, discovered := jfs.coldDirListing(dirname, dirEntries)
+	// Background worker → per-child stats draw from prefetchGate (never the
+	// foreground budget); a wedged stat BREAKS the listing pass so this
+	// worker always returns and its deferred sem/key release runs (batch-3
+	// adversarial review #0).
+	_, discovered := jfs.coldDirListing(dirname, dirEntries, prefetchGate)
 
-	// INSERT-only: never overwrite an existing mirror row from an async
-	// result (same discipline as prefetchChildren). The row that appeared
-	// since dispatch (a CREATE, the reconcile, a push event) is fresher than
-	// our snapshot.
+	// INSERT-only, enforced ATOMICALLY by the store (batch-3 adversarial
+	// review #1): the LookupByPath pre-filter below is only a cheap
+	// batch-size reducer. A row that lands BETWEEN this filter and the batch
+	// commit (a push event completing a remote write, a CREATE, the
+	// reconcile) is fresher than our FUSE snapshot and must win —
+	// BulkInsertAbsent re-checks presence inside the store's own critical
+	// sections (INSERT OR IGNORE + skip-if-present cache mutation), so the
+	// stale snapshot can never clobber it (stale GETATTR size / phantom
+	// re-insert class).
 	toInsert := make([]*metadata.Entry, 0, len(discovered))
 	for _, e := range discovered {
 		if h.store.LookupByPath(e.Path) == nil {
@@ -2032,7 +2156,7 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) {
 		}
 	}
 	if len(toInsert) > 0 {
-		h.store.BulkInsert(toInsert, 500)
+		h.store.BulkInsertAbsent(toInsert, 500)
 		jmlog.Debug("async dir refresh: mirrored unmirrored directory",
 			"dir", dirname, "children", len(toInsert))
 	}
@@ -2644,6 +2768,7 @@ func (jfs *juiceFS) Join(elem ...string) string { return path.Join(elem...) }
 func (jfs *juiceFS) TempFile(dir, prefix string) (billy.File, error) {
 	return nil, fmt.Errorf("not implemented")
 }
+
 // Symlink creates a symbolic link at `link` pointing at `target`, exposed over
 // NFS via the registered SYMLINK procedure (internal/nfs/nfs_onsymlink.go).
 //

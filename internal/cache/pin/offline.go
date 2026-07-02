@@ -77,8 +77,13 @@ var (
 // in offline mode"): user-intent offline PERSISTS across launches via a
 // marker file. Armed at boot (SetOfflinePersistPath); SetOffline writes/
 // removes the marker best-effort, and the boot path consults
-// PersistedOfflineIntent() to start offline without touching the network.
-// Unconfigured (tests, tools) → fully inert.
+// PersistedOfflineIntent() to start with the user-offline gates engaged.
+// NOTE (batch-3 adversarial review, HIGH): a persisted-offline start is NOT
+// a zero-network start — the boot still probes the backend and mounts FUSE
+// when reachable, because pinned reads require the mount (juicefs needs its
+// Redis metadata engine either way); the gates only refuse un-pinned opens.
+// See the boot block in bridge/cbridge.go. Unconfigured (tests, tools) →
+// fully inert.
 var (
 	offlinePersistMu   sync.Mutex
 	offlinePersistPath string
@@ -119,6 +124,27 @@ func persistOfflineIntent(on bool) {
 	} else {
 		_ = os.Remove(p)
 	}
+}
+
+// DropStaleOfflineIntent clears a persisted offline marker that has outlived
+// the data it gates (batch-3 adversarial review #10). companionDBPath is the
+// metadata mirror DB: when the marker is present but that DB is missing or
+// zero-length (an app-data reset wiped Application Support but not
+// ~/.juicemount), a persisted-offline boot would skip the empty-mirror
+// blocking sync and serve a completely empty volume that looks like data
+// loss. Returns true when a stale marker was found and removed; false when
+// there is no marker, persistence is unconfigured, or the companion DB looks
+// servable. Never touches the in-memory flags — call it at boot BEFORE the
+// user flag is engaged.
+func DropStaleOfflineIntent(companionDBPath string) bool {
+	if !PersistedOfflineIntent() {
+		return false
+	}
+	if fi, err := os.Stat(companionDBPath); err == nil && fi.Size() > 0 {
+		return false // mirror looks servable — honor the marker
+	}
+	persistOfflineIntent(false)
+	return true
 }
 
 // SetOffline switches the process to user-intent offline mode (or
