@@ -412,3 +412,71 @@ env vars. Full revert = revert the commit.
 full metadata/nfs/pin/bridge suites (only the known environmental TestMemBuf*
 failures with the live app). **Pending:** live persisted-offline relaunch
 proving pinned files open (the HIGH's headline flow).
+
+## 2026-07-02 — G7: class-gated SCAN budget + deferred-not-failed slow-link syncs (task #80)
+
+**What:** `syncMetadata`'s full-SCAN batch loop ran under a FIXED
+`context.WithTimeout(…, 120s)`. On a degraded cellular relay the full SCAN
+needs ~200-300s, so EVERY attempt died with "redis SCAN batch: context
+deadline exceeded" (live 2026-07-01: **31 consecutive failures over 3h**).
+Worse, `doReconcile`'s failure backoff retries FASTER than the class backstop
+(deliberate for outage recovery, wrong here) — each retry saturated the
+metered link for the full 120s and then died — and `IsSyncing()` keyed only on
+`lastSyncStartedAt > lastSyncTime`, so /activity rendered an eternal
+"Rebuilding index…". The keyspace push was ENGAGED and healthy the whole time
+(deltas flowing): the failing backstop SCAN was redundant convergence work.
+Three changes (metadata/redis.go, metadata/keyspace.go, bridge/cbridge.go):
+
+1. **Class-gated SCAN budget** — `scanContextTimeout()` (keyspace.go, same
+   `currentLinkClass()` accessor as the backstop/coalescer/G6 gating):
+   LAN/WiFi → 120s (byte-identical), tunnel/cellular (`utun*`/`tailscale0`/
+   `JM_WAN_MODE=1`) → 300s so the observed slow-link SCAN can finish.
+2. **Deferred-not-failed classification** — a sync error that wraps
+   `context.DeadlineExceeded` (syncMetadata now guarantees the sentinel
+   whenever its OWN budget context expired, however go-redis dressed it)
+   WHILE the push is engaged (`currentBackstop() > DefaultReconcileInterval`,
+   the established push-carrying test) is DEFERRED: no `consecutiveFailures`
+   bump / fast-retry backoff (next attempt waits for the normal backstop
+   tick; a prior failure-streak's short ticker is reset to the backstop), no
+   `connected=false` flip (push-healthy means the backend IS reachable —
+   flipping would poison the `RecentlyDegraded` prune/phantom-purge gates),
+   Warn logged ONCE per streak. If the push drops, `setEngagement` snaps the
+   backstop to 30s and every deadline error is a genuine failure again —
+   real outages keep the classic fail-fast backoff.
+3. **/activity truthfulness** — new `lastSyncEndedAt` stamped on EVERY
+   syncMetadata exit; `IsSyncing()` additionally requires
+   `lastSyncStartedAt.After(lastSyncEndedAt)`, so a failed/deferred attempt
+   stops reporting "syncing" immediately. `lastSyncStartedAt` is NEVER
+   zeroed (the reconcileLoop flap debounce reads it and must keep
+   suppressing flap-triggered SCANs right after the link was saturated).
+   `SyncDeferredReason()` drives a truthful /activity line: "Index sync
+   deferred — link too slow for a full rebuild; live updates continue via
+   push" (Active: false). The U6 N/~M progress rendering is unchanged for
+   genuinely-active syncs.
+
+**Switches (env, no rebuild, read per call):**
+
+| Switch | Effect |
+|---|---|
+| `JM_SCAN_TIMEOUT_SEC=<n>` (positive) | forces the SCAN budget to n seconds for ALL classes; `0`/unset = class logic |
+| `JM_SYNC_DEFERRAL=0` | disables the deferred classification entirely — every sync error drives the pre-G7 failure backoff |
+
+**Revert:** `JM_SYNC_DEFERRAL=0` + `JM_SCAN_TIMEOUT_SEC=120` restores the
+pre-G7 timing/backoff behavior without a rebuild (the only residual is the
+truthful-IsSyncing bookkeeping, which is presentation-only); full revert =
+revert the commit. LAN/WiFi baseline is byte-identical: 120s budget, and the
+deferral can only engage when the push holds a long backstop AND the budget
+expires — never in the deployed 10GbE steady state where SCANs take 2-10s.
+
+**Validated:** unit — `TestScanContextTimeoutClassTable`,
+`TestScanContextTimeoutEnvOverride`, `TestIsDeferredSyncErrClassification`,
+`TestDoReconcileDeferredSkipsBackoff` (real doReconcile→syncMetadata against
+a hung local listener: counter stays 0, connected stays true, IsSyncing
+false, reason set), `TestDoReconcileFailurePathUnchanged` (push not engaged →
+byte-identical failure backoff), `TestIsSyncingFalseAfterDeferredOrFailed`,
+`TestDeferredStreakCounterResetsOnSuccess`; full metadata+bridge suites
+green, `go vet` clean, new tests race-clean. **Pending:** live
+cellular-relay validation that a 200-300s SCAN now completes within the 300s
+budget (or defers quietly), the link stays usable between backstop ticks,
+and /activity shows the deferred line instead of "Rebuilding index…" (unit
+tests give false positives on this codebase per testing discipline).

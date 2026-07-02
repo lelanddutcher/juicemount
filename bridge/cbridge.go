@@ -3579,9 +3579,17 @@ func handleActivityHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			last := rc.LastSyncTime()
 			op.Files = rc.LastSyncEntries()
-			if last.IsZero() {
+			switch {
+			case rc.SyncDeferredReason() != "":
+				// G7 (task #80): the slow-link full rebuild was DEFERRED, not
+				// failed — IsSyncing() now reports false for a dead attempt,
+				// so say what actually happened instead of the eternal
+				// "Rebuilding index…" (live 2026-07-01: 3h of it while the
+				// push was engaged and healthy the whole time).
+				op.Detail = "Index sync deferred — link too slow for a full rebuild; live updates continue via push"
+			case last.IsZero():
 				op.Detail = "Index not yet built"
-			} else {
+			default:
 				op.Detail = fmt.Sprintf("Index up to date — %d entries, synced %s ago",
 					op.Files, time.Since(last).Round(time.Second))
 			}

@@ -119,10 +119,22 @@ type RedisClient struct {
 	lastSyncDuration  time.Duration
 	lastSyncTime      time.Time
 	lastSyncStartedAt time.Time // when the most recent sync BEGAN (for flap debounce)
-	lastSyncEntries   int
-	connected         bool
-	lastDisconnect    time.Time
-	lastReconnect     time.Time
+	// G7 (task #80): truthful IsSyncing across failed/deferred syncs.
+	// lastSyncEndedAt records when the most recent sync attempt ENDED —
+	// success, failure, OR deferral (set by noteSyncOutcome on every
+	// syncMetadata exit). Before G7, IsSyncing keyed only on
+	// lastSyncStartedAt > lastSyncTime, so a FAILING sync left /activity
+	// rendering "Rebuilding index…" forever (live 2026-07-01: 3h of it).
+	// lastSyncStartedAt itself is NEVER zeroed — the reconcileLoop flap
+	// debounce reads it and must keep suppressing flap-triggered SCANs
+	// right after a failed/deferred attempt (the link was just saturated).
+	lastSyncEndedAt    time.Time
+	syncDeferredReason string // non-empty while the most recent attempt was DEFERRED (G7)
+	syncDeferredStreak int    // consecutive DEFERRED attempts; Warn logs once per streak (G7)
+	lastSyncEntries    int
+	connected          bool
+	lastDisconnect     time.Time
+	lastReconnect      time.Time
 
 	// backstopNanos is the CURRENT desired interval (in nanoseconds) for the
 	// periodic full-SCAN reconcile loop, read every loop turn so a running
@@ -762,10 +774,30 @@ func (rc *RedisClient) LastSyncEntries() int {
 // right now — i.e. the most recent sync STARTED after the most recent sync
 // COMPLETED. Used by /activity to surface "Rebuilding index…" while a full
 // SCAN is in flight (the period when Finder can feel sluggish on cold paths).
+//
+// G7 (task #80): a sync attempt that FAILED or was DEFERRED is not "syncing".
+// lastSyncEndedAt is stamped on EVERY syncMetadata exit (noteSyncOutcome), so
+// the started-after-ended clause turns this false the moment an attempt dies —
+// previously only lastSyncTime (success-only) cleared it, and a failure streak
+// pinned /activity on an eternal "Rebuilding index…".
 func (rc *RedisClient) IsSyncing() bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
-	return !rc.lastSyncStartedAt.IsZero() && rc.lastSyncStartedAt.After(rc.lastSyncTime)
+	return !rc.lastSyncStartedAt.IsZero() &&
+		rc.lastSyncStartedAt.After(rc.lastSyncTime) &&
+		rc.lastSyncStartedAt.After(rc.lastSyncEndedAt)
+}
+
+// SyncDeferredReason returns a non-empty reason string while the most recent
+// sync attempt was classified DEFERRED (G7: SCAN budget exceeded on a slow
+// link while the keyspace push is engaged and carrying deltas). Cleared by
+// the next successful — or genuinely-failed — attempt. /activity renders a
+// plain-language "sync deferred, live updates continue via push" line off it
+// instead of the eternal "Rebuilding index…".
+func (rc *RedisClient) SyncDeferredReason() string {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	return rc.syncDeferredReason
 }
 
 // SyncProgress reports the in-flight rebuild's scanned-entry count and an
@@ -1101,6 +1133,29 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 	// applies once we're connected+ENABLED and reset cleanly (below).
 	baseInterval := DefaultReconcileInterval
 	if err := rc.syncMetadata(); err != nil {
+		// G7 (task #80): DEFERRED, not failed. A SCAN that exceeded its
+		// class-gated budget WHILE the keyspace push is engaged (backstop >
+		// DefaultReconcileInterval — the established push-carrying test, see
+		// the reconcileLoop deferral above) is redundant convergence work:
+		// deltas are flowing via push the whole time. The failure backoff is
+		// deliberately FASTER than the backstop (outage recovery), which is
+		// exactly wrong here — live 2026-07-01, each fast retry saturated a
+		// metered cellular relay for the full budget and then died, 31
+		// consecutive times over 3h. Instead: no failure bookkeeping (no
+		// consecutiveFailures bump, no connected=false flip — push healthy
+		// means the backend IS reachable, and flipping it would poison
+		// RecentlyDegraded's prune/phantom-purge gates), and the next attempt
+		// waits for the normal backstop tick. Resetting the counter/ticker
+		// here also ends any PRIOR failure streak's fast cadence — otherwise
+		// a short backoff ticker would keep re-burning the link with deferred
+		// attempts. Warn is logged once per streak by noteSyncOutcome.
+		// Kill switch: JM_SYNC_DEFERRAL=0 (see isDeferredSyncErr).
+		if rc.isDeferredSyncErr(err) {
+			*consecutiveFailures = 0
+			*backoff = rc.currentBackstop()
+			ticker.Reset(*backoff)
+			return
+		}
 		*consecutiveFailures++
 		*backoff = baseInterval * time.Duration(1<<min(*consecutiveFailures, 6))
 		if *backoff > maxBackoff {
@@ -1179,6 +1234,66 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 			*backoff = next
 			ticker.Reset(*backoff)
 		}
+	}
+}
+
+// isDeferredSyncErr reports whether a syncMetadata error should be classified
+// DEFERRED rather than FAILED (G7, task #80): the error wraps
+// context.DeadlineExceeded (the SCAN exceeded its class-gated wall budget —
+// syncMetadata guarantees the sentinel is present whenever its own context
+// expired) AND the keyspace push is engaged and carrying deltas
+// (currentBackstop() > DefaultReconcileInterval — the same push-carrying test
+// reconcileLoop's network-change deferral uses; setEngagement stores a long
+// backstop ONLY for ENABLED+reachable). In that state the backstop SCAN is
+// redundant convergence work and must not drive the fast failure backoff.
+//
+// If the push drops, setEngagement(degraded/disabled) snaps the backstop back
+// to 30s and this returns false — a real outage still gets the classic
+// fail-fast backoff and recovery. Kill switch: JM_SYNC_DEFERRAL=0 restores
+// the pre-G7 behavior exactly (every error is a failure). Read per call.
+func (rc *RedisClient) isDeferredSyncErr(err error) bool {
+	if err == nil || os.Getenv("JM_SYNC_DEFERRAL") == "0" {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) &&
+		rc.currentBackstop() > DefaultReconcileInterval
+}
+
+// noteSyncOutcome records the end of a sync attempt (G7, task #80). Called on
+// EVERY syncMetadata exit — success, failure, or deferral — so IsSyncing()
+// stops reporting an attempt that already died, and /activity can render the
+// deferred state truthfully instead of an eternal "Rebuilding index…".
+// lastSyncStartedAt is deliberately NOT touched: the reconcileLoop flap
+// debounce keys on it and must keep suppressing flap-triggered SCANs right
+// after a failed/deferred attempt (the link was just saturated for the full
+// budget). The deferral Warn logs ONCE per streak, not per attempt — on a
+// cellular relay the streak can run for hours at the backstop cadence.
+func (rc *RedisClient) noteSyncOutcome(err error) {
+	deferred := rc.isDeferredSyncErr(err)
+	now := time.Now()
+	rc.mu.Lock()
+	rc.lastSyncEndedAt = now
+	prevStreak := rc.syncDeferredStreak
+	if deferred {
+		rc.syncDeferredStreak++
+		rc.syncDeferredReason = "SCAN budget exceeded on slow link; keyspace push engaged"
+	} else {
+		rc.syncDeferredStreak = 0
+		rc.syncDeferredReason = ""
+	}
+	rc.mu.Unlock()
+
+	if deferred && prevStreak == 0 {
+		jmlog.Warn("metadata sync DEFERRED — full-SCAN budget exceeded while keyspace push is engaged; "+
+			"skipping failure backoff, next attempt at the backstop tick (logged once per streak)",
+			"budget_sec", int(scanContextTimeout().Seconds()),
+			"backstop_sec", int(rc.currentBackstop().Seconds()),
+			"class", currentLinkClass().String(),
+			"error", err.Error(),
+		)
+	} else if err == nil && prevStreak > 0 {
+		jmlog.Info("metadata sync recovered after deferred streak",
+			"deferred_attempts", prevStreak)
 	}
 }
 
@@ -1438,7 +1553,7 @@ return out
 // gap-fill can both reach here, but never concurrently — preserving the
 // pruneAbsent single-writer invariant and preventing two overlapping full
 // SCANs from racing each other's diff.
-func (rc *RedisClient) syncMetadata() error {
+func (rc *RedisClient) syncMetadata() (err error) {
 	rc.syncMu.Lock()
 	defer rc.syncMu.Unlock()
 
@@ -1453,7 +1568,16 @@ func (rc *RedisClient) syncMetadata() error {
 	rc.syncScanned.Store(0)
 	rc.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// G7 (task #80): record the attempt's outcome on EVERY exit — success,
+	// failure, or deferral — so IsSyncing() turns false the moment this
+	// attempt ends (named return; runs before the syncMu unlock above).
+	defer func() { rc.noteSyncOutcome(err) }()
+
+	// G7 (task #80): class-gated SCAN budget (was a fixed 120s; LAN/WiFi are
+	// byte-identical, tunnel/cellular gets 300s so a ~200-300s slow-link SCAN
+	// can actually finish). Env override JM_SCAN_TIMEOUT_SEC.
+	scanBudget := scanContextTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), scanBudget)
 	defer cancel()
 
 	// Drive the SCAN cursor loop from Go so Redis only blocks for one small
@@ -1476,6 +1600,15 @@ func (rc *RedisClient) syncMetadata() error {
 	for {
 		res, err := rc.redisDB().Eval(ctx, luaScanBatch, nil, cursor, scanCount).StringSlice()
 		if err != nil {
+			// G7 (task #80): when OUR scan budget expired, make the returned
+			// error uniformly match errors.Is(_, context.DeadlineExceeded)
+			// regardless of how go-redis dressed the expiry (ctx sentinel vs
+			// a net "i/o timeout" from the ctx-derived read deadline) — the
+			// deferred-not-failed classification keys on that sentinel.
+			if ctx.Err() == context.DeadlineExceeded {
+				return fmt.Errorf("redis SCAN batch: %w (SCAN budget %v exceeded): %w",
+					err, scanBudget, context.DeadlineExceeded)
+			}
 			return fmt.Errorf("redis SCAN batch: %w", err)
 		}
 		if len(res) == 0 {

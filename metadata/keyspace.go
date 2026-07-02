@@ -225,6 +225,35 @@ func backstopForClass(c linkClass) time.Duration {
 	}
 }
 
+// scanContextTimeout returns the wall-clock budget for ONE full-SCAN reconcile
+// attempt (syncMetadata's context deadline around the SCAN batch loop).
+//
+// G7 (task #80): the budget was a fixed 120s. On a degraded cellular relay the
+// full SCAN needs ~200-300s, so EVERY attempt died with "redis SCAN batch:
+// context deadline exceeded" (live 2026-07-01: 31 consecutive failures over
+// 3h), each one saturating the metered link for the full 120s first. Class
+// gate, same accessor as the backstop/coalescer/G6 gating:
+//
+//   - LAN / WiFi        → 120s (byte-identical to the historical fixed budget)
+//   - tunnel / cellular → 300s (utun*/tailscale0/JM_WAN_MODE=1 — enough for the
+//     observed ~200-300s slow-link SCAN to actually finish)
+//
+// Env override JM_SCAN_TIMEOUT_SEC: a positive integer forces that budget (in
+// seconds) for ALL classes — field-tuning kill switch per the cellular-revert
+// doctrine (docs/TUNING/REVERT_LOG.md). 0 / unset / garbage keeps the class
+// logic. Read per call so it can be flipped live.
+func scanContextTimeout() time.Duration {
+	if v := os.Getenv("JM_SCAN_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	if currentLinkClass() == classTunnel {
+		return 300 * time.Second
+	}
+	return 120 * time.Second
+}
+
 // coalescerTuning bundles the class-gated debounce/burst parameters.
 type coalescerTuning struct {
 	debounce     time.Duration // quiet-period before flushing a batch
