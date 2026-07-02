@@ -579,6 +579,84 @@ func (rc *RedisClient) Reconnect() error {
 	return nil
 }
 
+// collectFastPathPrunes implements the V2.3 G5 mass-delete fast-path (task
+// #73). It walks rc.pruneAbsent (single-writer: only syncMetadata's
+// goroutine), finds subtree ROOTS (absent paths whose parent is not absent),
+// FUSE-Lstat-confirms each root, and returns every absent path under a
+// confirmed-deleted root — removing them from pruneAbsent. `._` AppleDouble
+// sidecars are never included (scan-filtered from Redis; absence there is not
+// a delete signal — symmetric with the ladder's and scopedPrune's guard).
+//
+// Bounded three ways (root count, wall time, rows per cycle); `capped=true`
+// means work remains and the caller should schedule an immediate follow-up
+// cycle. Inert when: the cycle is RecentlyDegraded (a partial Redis view must
+// never confirm a deletion — same rule as the ladder), the G0 FUSE-identity
+// gate fails, fuseRoot is unset, or JM_PRUNE_FASTPATH=0 (kill switch).
+func (rc *RedisClient) collectFastPathPrunes(skipIncrement bool) (fastConfirmed map[string]struct{}, capped bool) {
+	fastConfirmed = make(map[string]struct{})
+	if len(rc.pruneAbsent) == 0 || skipIncrement || rc.fuseRoot == "" ||
+		os.Getenv("JM_PRUNE_FASTPATH") == "0" {
+		return fastConfirmed, false
+	}
+	if identOK, _ := pin.FUSEIdentityState(); !identOK {
+		return fastConfirmed, false
+	}
+	const (
+		fastPathRootCap   = 2048            // max subtree roots probed per cycle
+		fastPathBudget    = 3 * time.Second // max wall time probing roots
+		fastPathDeleteCap = 25000           // max rows fast-pruned per cycle (one DeletePaths tx)
+	)
+	absent := rc.pruneAbsent
+	var roots []string
+	for p := range absent {
+		if strings.HasPrefix(path.Base(p), "._") {
+			continue
+		}
+		if _, parentAbsent := absent[path.Dir(p)]; !parentAbsent {
+			roots = append(roots, p)
+		}
+	}
+	probeStart := time.Now()
+	probed, confirmedRoots := 0, 0
+	for _, root := range roots {
+		if probed >= fastPathRootCap || time.Since(probeStart) > fastPathBudget ||
+			len(fastConfirmed) >= fastPathDeleteCap {
+			capped = true
+			break
+		}
+		probed++
+		isAbsent, ok := lstatNotExistWithTimeout(rc.fusePathFor(root), time.Second)
+		if !ok || !isAbsent {
+			continue // timeout or FUSE-present — leave to the ladder
+		}
+		confirmedRoots++
+		prefix := root + "/"
+		fastConfirmed[root] = struct{}{}
+		for p := range absent {
+			if len(fastConfirmed) >= fastPathDeleteCap {
+				capped = true
+				break
+			}
+			if strings.HasPrefix(p, prefix) && !strings.HasPrefix(path.Base(p), "._") {
+				fastConfirmed[p] = struct{}{}
+			}
+		}
+	}
+	for p := range fastConfirmed {
+		delete(rc.pruneAbsent, p)
+	}
+	if len(fastConfirmed) > 0 {
+		jmlog.Info("metadata sync: fast-path pruning confirmed-deleted subtrees",
+			"roots_probed", probed,
+			"roots_confirmed", confirmedRoots,
+			"paths", len(fastConfirmed),
+			"probe_ms", time.Since(probeStart).Round(time.Millisecond).Milliseconds(),
+			"capped", capped,
+		)
+	}
+	return fastConfirmed, capped
+}
+
 // TriggerSync signals the reconcile loop to run an immediate sync cycle.
 // Non-blocking: if a signal is already pending it does nothing.
 func (rc *RedisClient) TriggerSync() {
@@ -1447,6 +1525,41 @@ func (rc *RedisClient) syncMetadata() error {
 		}
 	}
 
+	// === V2.3 G5: mass-delete convergence fast-path (task #73) ===
+	// The counter ladder alone cannot converge a mass deletion:
+	// PruneThreshold(10) consecutive cycles × the 15m LAN backstop ≥ 2.5h,
+	// and pruneAbsent is in-memory — every app restart (and every
+	// RecentlyDegraded window) resets ALL counters, so a reorganized library
+	// lingers as a ghost tree indefinitely (live 2026-07-01: 125k pending,
+	// an entire deleted SFX tree still served, files erroring on open).
+	//
+	// A deletion is safe to confirm WITHOUT the ladder when two independent
+	// authorities agree on the SAME cycle: the path is absent from this
+	// cycle's Redis SCAN (authoritative metadata) AND its subtree ROOT is
+	// Lstat-ENOENT on an identity-verified FUSE mount (authoritative
+	// filesystem). Confirmation happens at the subtree-root level — a path
+	// whose parent is also absent needs no probe of its own — so a
+	// 120k-entry deleted tree costs a handful of Lstats, not 120k.
+	//
+	// Fast-pathed paths still pass Layer D (spool-pending) and Layer C
+	// (pinned) below; they skip only Layer A's per-path Lstat, which their
+	// root probe already answered. Bounded three ways (root count, wall
+	// time, rows per cycle); when the row cap truncates, TriggerSync
+	// schedules the next cycle immediately so full convergence takes
+	// minutes, not backstop-hours. Kill switch: JM_PRUNE_FASTPATH=0.
+	// Same stability rule as the ladder: skipped entirely on
+	// RecentlyDegraded cycles (a partial Redis view must never confirm a
+	// deletion), and the G0 FUSE-identity gate must pass.
+	fastConfirmed, fastCapped := rc.collectFastPathPrunes(skipIncrement)
+	for p := range fastConfirmed {
+		toDelete = append(toDelete, p)
+	}
+	if fastCapped {
+		// More confirmed work remains — run the next cycle now instead of
+		// waiting out the backstop.
+		rc.TriggerSync()
+	}
+
 	// === QA-30 Layer D (review FIX 2): never prune a spool-pending path ===
 	// The periodic full-SCAN prune is the SAME ESTALE bug class as scopedPrune,
 	// reached via the backstop SCAN instead of a keyspace push. A spool-pending
@@ -1534,6 +1647,14 @@ func (rc *RedisClient) syncMetadata() error {
 			verified := toDelete[:0]
 			lstatTimeouts := 0
 			for _, p := range toDelete {
+				// V2.3 G5: fast-path entries were already FUSE-confirmed at
+				// their subtree root this same cycle — re-Lstat'ing 120k
+				// descendants individually is exactly what root-level
+				// confirmation exists to avoid.
+				if _, ok := fastConfirmed[p]; ok {
+					verified = append(verified, p)
+					continue
+				}
 				fusePath := rc.fusePathFor(p)
 				if fusePath == "" {
 					verified = append(verified, p)
