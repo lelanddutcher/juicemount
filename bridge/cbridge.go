@@ -956,6 +956,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// the absolute paths the pin store keys on.
 		srv.Handler().SetPinStore(ps, cfg.MountPoint)
 		jmlog.Info("pin store ready", "path", pinDBPath, "workers", 4)
+
+		// Item 0: heal dirs pinned in a PRIOR session. On boot the pin store
+		// remembers the pinned roots but the metadata mirror may not have their
+		// subtree rows (older build, or the warm never completed) — so those
+		// dirs would list empty offline. Enumerate PinRoots() and warm each
+		// root's ancestor chain + subtree. Runs in the background so it never
+		// blocks boot; self-gates on JM_PIN_WARM_METADATA and pin.IsOffline()
+		// (offline reconcileDir burns a 30s Redis timeout per dir — the metadata
+		// warm resumes when online; blocks are already cached).
+		warmMount := cfg.MountPoint
+		go warmPinnedRootsAtBoot(ps, rc, warmMount)
 	} else {
 		jmlog.Warn("pin store open failed (offline-pin disabled)", "error", err.Error())
 	}
@@ -2450,6 +2461,7 @@ func NFSServerPin(rootPath *C.char) *C.char {
 	mountPath := globalMountPath
 	fusePath := globalFUSEPath
 	prefetcher := globalPrefetcher
+	rc := globalRC
 	globalMu.Unlock()
 
 	if pinStore == nil {
@@ -2457,6 +2469,15 @@ func NFSServerPin(rootPath *C.char) *C.char {
 	}
 	root := C.GoString(rootPath)
 	walkPath := translateMountToFUSE(root, mountPath, fusePath)
+
+	// Item 0 GUARD: a pin root inside a scan-filtered internal namespace
+	// (.trash/.juicemount) can never be metadata-warmed — reconcileDir #78-
+	// filters it — so pinning it is nonsensical. Reject with a clear error
+	// rather than warming blocks for a dir that will never list offline.
+	if rel := metaRelPath(root, mountPath); metadata.ScanFilteredPath(rel) {
+		jmlog.Warn("pin rejected: cannot pin internal namespace", "root", root, "rel", rel)
+		return jsonStr(PinResult{Error: "cannot pin internal namespace (.trash/.juicemount)"})
+	}
 
 	// Surface the spinner before the (slow) walk starts; return immediately.
 	pin.MarkScanning(root)
@@ -2493,6 +2514,15 @@ func NFSServerPin(rootPath *C.char) *C.char {
 		if prefetcher != nil {
 			prefetcher.Wake()
 		}
+
+		// Item 0: warm the pinned SUBTREE's metadata into the mirror so the dir
+		// (and its whole tree) LIST OFFLINE. PinMany above cached the file
+		// BLOCKS but wrote no subtree rows; without this, an offline ListChildren
+		// of the pinned dir returns empty. Reuses reconcileDir (durable SQLite
+		// `entries` write). Gated on !pin.IsOffline() and JM_PIN_WARM_METADATA
+		// inside the metadata calls. Best-effort; a failure leaves today's
+		// behavior (blocks cached, metadata warmed by the next full SCAN).
+		warmPinnedMetadata(rc, root, mountPath)
 	}()
 
 	// FilesPinned/BytesTotal are filled in via /cache-status as the walk lands.
@@ -2698,6 +2728,100 @@ func writeContractJSON(w http.ResponseWriter, v any) {
 // path — do NOT translate pin lookups.)
 func metaRelPath(path, mountPoint string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(path, mountPoint), "/")
+}
+
+// warmPinnedMetadata reconciles a pinned root's ancestor chain and (if it is a
+// directory) its whole subtree into the metadata mirror so the pinned dir lists
+// OFFLINE (Item 0). The pin store keys on the full user-facing path (e.g.
+// "/Volumes/zpool/movies/reel"); the metadata store is keyed volume-relative,
+// so we translate once via metaRelPath and resolve the inode via LookupByPath.
+//
+// Everything here is best-effort and self-gating: the metadata calls no-op when
+// JM_PIN_WARM_METADATA=0 or pin.IsOffline(), and a nil RedisClient (pin issued
+// before the metadata layer wired, or a CLI build) simply skips warming. A
+// failure never breaks pinning — the blocks are already cached and the next
+// full SCAN eventually mirrors the subtree.
+func warmPinnedMetadata(rc *metadata.RedisClient, root, mountPath string) {
+	if rc == nil {
+		return
+	}
+	if !metadata.PinWarmMetadataEnabled() {
+		return
+	}
+	if pin.IsOffline() {
+		jmlog.Info("pin warm: skipped (offline)", "root", root)
+		return
+	}
+	rel := metaRelPath(root, mountPath)
+	if metadata.ScanFilteredPath(rel) {
+		// Already rejected at NFSServerPin entry; defensive double-check.
+		jmlog.Warn("pin warm: refusing scan-filtered namespace", "root", root, "rel", rel)
+		return
+	}
+
+	// Warm the ancestor chain first so the pinned dir is reachable from root,
+	// then warm the subtree. ReconcileAncestors also reconciles root inode 1.
+	if err := rc.ReconcileAncestors(rel); err != nil {
+		jmlog.Warn("pin warm: ReconcileAncestors failed", "root", root, "rel", rel, "error", err.Error())
+	}
+
+	ent := rc.Store().LookupByPath(rel)
+	if ent == nil {
+		jmlog.Warn("pin warm: pinned path not yet in mirror after ancestor warm — subtree left to SCAN",
+			"root", root, "rel", rel)
+		return
+	}
+	if ent.IsDir {
+		if err := rc.ReconcileSubtree(ent.Inode, 0); err != nil {
+			jmlog.Warn("pin warm: ReconcileSubtree failed", "root", root, "inode", ent.Inode, "error", err.Error())
+		}
+	}
+}
+
+// warmPinnedRootsAtBoot re-warms the metadata mirror for every pin root that
+// survived from a prior session (Item 0). Runs on a background goroutine at
+// boot. Self-gates: no-op when warming is disabled or offline; a nil
+// RedisClient (e.g. metadata layer not wired yet) skips silently. Each root is
+// warmed via the same warmPinnedMetadata path used at pin time.
+func warmPinnedRootsAtBoot(ps *pin.Store, rc *metadata.RedisClient, mountPath string) {
+	defer func() {
+		if r := recover(); r != nil {
+			jmlog.Warn("pin warm (boot) panicked (recovered)", "panic", fmt.Sprint(r))
+		}
+	}()
+	if ps == nil || rc == nil {
+		return
+	}
+	if !metadata.PinWarmMetadataEnabled() {
+		return
+	}
+	if pin.IsOffline() {
+		jmlog.Info("pin warm (boot): skipped (offline) — resumes when online")
+		return
+	}
+	roots, err := ps.PinRoots()
+	if err != nil {
+		jmlog.Warn("pin warm (boot): PinRoots failed", "error", err.Error())
+		return
+	}
+	if len(roots) == 0 {
+		return
+	}
+	jmlog.Info("pin warm (boot): warming pinned roots from prior session", "roots", len(roots))
+	for _, r := range roots {
+		if r.Root == "" {
+			continue
+		}
+		// Re-check offline between roots: the user may toggle offline mid-pass;
+		// each warmPinnedMetadata also self-gates, but bailing early avoids a
+		// stack of 30s-timeout dir reconciles.
+		if pin.IsOffline() {
+			jmlog.Info("pin warm (boot): offline mid-pass — stopping", "remaining_hint", r.Root)
+			return
+		}
+		warmPinnedMetadata(rc, r.Root, mountPath)
+	}
+	jmlog.Info("pin warm (boot): pinned-root warm pass complete", "roots", len(roots))
 }
 
 // handleWhoamiHTTP serves GET /whoami (contract JM-1): JuiceMount identity,

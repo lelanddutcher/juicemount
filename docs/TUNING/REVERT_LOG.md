@@ -7,6 +7,55 @@ a rebuild**.
 
 ---
 
+## 2026-07-02 — Item 0: pinned-subtree metadata warming (pinned dirs list offline)
+
+Env-revertable without a rebuild. Motivation: pinning a directory cached its
+file BLOCKS but never wrote the directory's METADATA subtree into the mirror.
+Online a not-yet-mirrored pinned dir fell through to the FUSE fallback and
+listed; OFFLINE the handler correctly refuses FUSE and returned EMPTY — so a
+pinned dir listed empty offline, breaking the core offline promise. Root cause:
+`pin.CountFilesUnder` returns FILES ONLY, so `NFSServerPin`/`PinMany` warmed
+blocks but never reconciled subtree rows into the metadata Store.
+
+**Item 0 — warm the pinned subtree's metadata into the mirror at pin time and
+at boot.** New exported `metadata.RedisClient.ReconcileSubtree(rootInode, maxDirs)`
+and `ReconcileAncestors(internalPath)` LOOP the existing `reconcileDir`, which
+durably writes SQLite `entries` (via `Insert` → `ftsExternalUpsert`'s
+`INSERT OR REPLACE INTO entries`) AND the `childrenIdx` — so the rows survive a
+reboot (the load-bearing property). `NFSServerPin`'s existing detached goroutine
+calls both after `PinMany`; a boot-time background pass enumerates
+`pinStore.PinRoots()` and warms each root, healing dirs pinned in a prior
+session. No parallel Redis fetcher — reuses `reconcileDir` verbatim.
+
+- **`JM_PIN_WARM_METADATA=0`** — kill switch. Restores today's behavior
+  (blocks cached, metadata NOT warmed at pin time — a pinned dir stays empty
+  offline until a full SCAN happens to cover it). Default (unset / any non-`0`
+  value) = warming ON. Checked inside `PinWarmMetadataEnabled()`, gating both
+  `ReconcileSubtree` and `ReconcileAncestors` and both bridge call sites.
+
+**Gates / guards (all fail toward today's behavior, never toward data loss):**
+- **Offline gate:** the whole warm pass is skipped when `pin.IsOffline()` — an
+  offline `reconcileDir` burns a full 30s Redis timeout per dir. The pin BLOCKS
+  are already cached; metadata warming resumes on the next pin / next boot when
+  online. Checked at the top of both functions AND at both bridge call sites
+  (and re-checked between roots in the boot pass).
+- **ScanFilteredPath guard:** a pin root matching `metadata.ScanFilteredPath`
+  (`.trash` / `.juicemount`) is REJECTED with a clear "cannot pin internal
+  namespace" — `reconcileDir`'s #78 filter would silently no-op it, so warming
+  is impossible. `NFSServerPin` rejects at entry; the metadata functions
+  self-reject with `errPinInternalNamespace` as defense-in-depth. The filter is
+  NOT weakened.
+- **Bounded walk:** `ReconcileSubtree` BFS is capped at `maxDirs` (default
+  50,000); on truncation it logs and stops, leaving the remainder to the
+  authoritative full SCAN.
+
+**Substrate note:** this is independent of the SQLite-direct serving decision
+(serving-layer-decision.md §Item 0) — the metadata must be warmed at pin time
+regardless of whether nav serves from the RAM shadow or SQLite-WAL. Baseline to
+revert to = `JM_PIN_WARM_METADATA=0` (no rebuild).
+
+---
+
 ## 2026-07-02 — Boot fast-path C1 (skip the boot SCAN when mirror fresh + push engaged)
 
 Env-revertable without a rebuild. Motivation: a deployed build over a cellular

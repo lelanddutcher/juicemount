@@ -224,6 +224,10 @@ type RedisClient struct {
 	// live Redis. See keyspaceReconcileDir / keyspaceTriggerSync below.
 	testReconcileDir func(uint64) error
 	testTriggerSync  func()
+	// testChildDirInodes overrides the d{inode} child-dir discovery that drives
+	// ReconcileSubtree's walk, so the bounding/dedup/cap logic is testable
+	// without a live Redis. Production leaves it nil (real HGETALL runs).
+	testChildDirInodes func(uint64) ([]uint64, error)
 }
 
 // keyspaceReconcileDir dispatches to the test seam when set, else the real
