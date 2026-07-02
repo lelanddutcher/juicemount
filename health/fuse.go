@@ -543,7 +543,7 @@ func (fm *FUSEManager) Mount() error {
 	}
 
 	// Wait for the mount to become live (juicefs mount -d returns before FUSE is ready)
-	if err := fm.waitForMount(15 * time.Second); err != nil {
+	if err := fm.waitForMount(fm.mountVerifyTimeout()); err != nil {
 		noteMountFailure()
 		return fmt.Errorf("mount verification: %w", err)
 	}
@@ -1160,6 +1160,29 @@ func (fm *FUSEManager) confirmProbeTimeout() time.Duration {
 		return 45 * time.Second
 	default:
 		return fuseConfirmProbeTimeout // 25s — unchanged on LAN/medium/fast
+	}
+}
+
+// mountVerifyTimeout is the launch-time mount-establish budget (V2.3 U5/K1,
+// field "mount not ready after 15s" churn on slow links). Same class gating
+// and kill switch as confirmProbeTimeout: byte-identical 15s on LAN/medium/
+// fast and whenever JM_FUSE_WATCHDOG_LINKAWARE is off; wider only where a
+// juicefs cold-start legitimately needs longer to answer its first readdir
+// (metadata warm-up over a slow/metered backend link). Note the kext-cant-
+// load shape fails FAST regardless (juicefs's own 10s "mount point is not
+// ready" fatal fires before any of these budgets — see noteMountFailure).
+func (fm *FUSEManager) mountVerifyTimeout() time.Duration {
+	const base = 15 * time.Second
+	if !fuseWatchdogLinkAware {
+		return base
+	}
+	switch netprofile.Default().Class() {
+	case netprofile.ClassMetered:
+		return 90 * time.Second
+	case netprofile.ClassSlow:
+		return 45 * time.Second
+	default:
+		return base
 	}
 }
 

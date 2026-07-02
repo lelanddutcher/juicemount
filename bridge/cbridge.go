@@ -269,7 +269,29 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// reconcile loop recover everything automatically when the backend returns.
 	// A reachable backend — the overwhelmingly common case — takes the unchanged
 	// online path.
-	backendUp := backendReachableQuick(cfg.RedisURL, 1500*time.Millisecond)
+	backendUp, bootRTT := backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+	// V2.3 U2/K2: a link can be reachable-but-useless — the TCP handshake
+	// completes inside 1.5s but the RTT is so high that the synchronous
+	// online boot (juicefs mount + first syncs) would churn for minutes.
+	// Above the threshold, take the SAME start-while-offline path as a dead
+	// backend: nav serves from the mirror instantly and the watchdog +
+	// reconcile loop bring everything online in the background. Conservative
+	// default (tonight's 42ms DERP-relay cellular booted fine in 19s —
+	// deferral is for genuinely broken links); JM_BOOT_DEFER_RTT_MS tunes,
+	// 0 disables (REVERT_LOG 2026-07-02).
+	if backendUp && bootRTT > 0 {
+		deferMS := int64(500)
+		if v := os.Getenv("JM_BOOT_DEFER_RTT_MS"); v != "" {
+			if n, pErr := strconv.ParseInt(v, 10, 64); pErr == nil {
+				deferMS = n
+			}
+		}
+		if deferMS > 0 && bootRTT.Milliseconds() > deferMS {
+			backendUp = false
+			jmlog.Warn("backend reachable but RTT above boot-defer threshold — taking the start-while-offline path (U2)",
+				"rtt_ms", bootRTT.Milliseconds(), "threshold_ms", deferMS)
+		}
+	}
 	if !backendUp {
 		jmlog.Warn("metadata backend unreachable at startup — taking the start-while-offline path (serving cached navigation; reads resume when the backend returns)",
 			"redis_url", cfg.RedisURL)
@@ -4023,16 +4045,29 @@ const offlineStartReason = "Started offline — backend unreachable at launch"
 // when the URL can't be parsed, so a parse quirk never forces a spurious
 // offline start.
 func backendReachableQuick(redisURL string, timeout time.Duration) bool {
+	up, _ := backendReachableRTT(redisURL, timeout)
+	return up
+}
+
+// backendReachableRTT is backendReachableQuick plus the dial RTT it was
+// previously performing-and-discarding (V2.3 U2/K2). The RTT seeds
+// netprofile (so class-gated behavior is correct from the first moment) and
+// lets the boot path treat a reachable-but-terrible link as effectively
+// down. rtt is 0 when the address can't be parsed (optimistic-up).
+func backendReachableRTT(redisURL string, timeout time.Duration) (up bool, rtt time.Duration) {
 	addr, _, err := metadata.ParseRedisURL(redisURL)
 	if err != nil || addr == "" {
-		return true
+		return true, 0
 	}
+	t0 := time.Now()
 	conn, derr := net.DialTimeout("tcp", addr, timeout)
 	if derr != nil {
-		return false
+		return false, 0
 	}
+	rtt = time.Since(t0)
 	_ = conn.Close()
-	return true
+	netprofile.Default().ObserveRTT(rtt)
+	return true, rtt
 }
 
 // connectRedisWithRetry wraps metadata.NewRedisClient with exponential

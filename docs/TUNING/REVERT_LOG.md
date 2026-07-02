@@ -247,3 +247,12 @@ that a threshold-crossing cycle stays <5s and "Rebuilding index…" clears
 
 **Why:** field "5+ min to first items" — measured 136s of a 141s cellular cold start was the blocking SyncOnce; mirror was already RAM-hydrated. jm5's initial-sync Fatalf also demoted to Warn (K4).
 **Revert:** `JM_BOOT_SYNC_FIRST=1`, or revert the commit.
+
+## 2026-07-02 — U5 mountVerifyTimeout + U2 boot-defer RTT (V2.3)
+
+| Switch | Effect |
+|---|---|
+| `JM_FUSE_WATCHDOG_LINKAWARE` off | U5 inert: launch mount verify stays fixed 15s (as before). On: 45s slow / 90s metered, 15s LAN unchanged. |
+| `JM_BOOT_DEFER_RTT_MS` (default 500) | Boot dial RTT above this → start-while-offline path instead of synchronous online boot. `0` disables U2 entirely. |
+
+**Revert:** flip the switches; both paths byte-identical to pre-V2.3 when disabled.
