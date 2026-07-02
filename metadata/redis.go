@@ -776,6 +776,16 @@ func (rc *RedisClient) SyncProgress() (scanned, estTotal int64) {
 	rc.mu.RLock()
 	est := int64(rc.lastSyncEntries)
 	rc.mu.RUnlock()
+	// Review fix (MED): the first in-process sync — exactly the multi-minute
+	// boot rebuild the field report was about, now backgrounded by U1 — has
+	// lastSyncEntries==0. Fall back to the persisted mirror's row count so a
+	// warm 264k-entry mirror still gets a denominator. Cheap (indexed
+	// COUNT(*)), and only paid while est==0 during that first sync.
+	if est == 0 && rc.store != nil {
+		if n, err := rc.store.Count(); err == nil {
+			est = int64(n)
+		}
+	}
 	return rc.syncScanned.Load(), est
 }
 
@@ -1416,6 +1426,10 @@ func (rc *RedisClient) syncMetadata() error {
 	// in-flight or just-ran and suppress redundant network-change triggers.
 	rc.mu.Lock()
 	rc.lastSyncStartedAt = start
+	// U6 review fix: reset progress in the same critical section that flips
+	// IsSyncing()=true, so a concurrent /activity poll can never see the
+	// previous sync's final count against an active rebuild ("99%" flash).
+	rc.syncScanned.Store(0)
 	rc.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -1428,7 +1442,6 @@ func (rc *RedisClient) syncMetadata() error {
 	// no single batch (incl. a big dir's HGETALL + per-child attr GETs) keeps
 	// Redis BUSY long enough to starve a concurrent copy.
 	const scanCount = "500"
-	rc.syncScanned.Store(0) // U6: fresh progress for this rebuild
 	type rawEntry struct {
 		ft          int
 		mtime, size int64

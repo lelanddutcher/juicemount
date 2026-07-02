@@ -927,7 +927,14 @@ func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
 		if fm.isMountedLocked() {
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		// U5 review fix: with class-widened budgets (45s/90s) a failing
+		// verify would otherwise pin fm.mu through Mount() and park the
+		// user's Stop/quit for the whole window — abort promptly on Stop.
+		select {
+		case <-fm.stopCh:
+			return fmt.Errorf("mount verification aborted: manager stopping")
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("mount not ready after %v", timeout)
 }

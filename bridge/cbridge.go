@@ -279,6 +279,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// default (tonight's 42ms DERP-relay cellular booted fine in 19s —
 	// deferral is for genuinely broken links); JM_BOOT_DEFER_RTT_MS tunes,
 	// 0 disables (REVERT_LOG 2026-07-02).
+	bootRTTDeferred := false
 	if backendUp && bootRTT > 0 {
 		deferMS := int64(500)
 		if v := os.Getenv("JM_BOOT_DEFER_RTT_MS"); v != "" {
@@ -287,8 +288,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			}
 		}
 		if deferMS > 0 && bootRTT.Milliseconds() > deferMS {
+			// Review fix (HIGH): do NOT just flip backendUp — a
+			// reachable-but-slow backend ANSWERS the single connect attempt,
+			// which would leave startedOffline=false and produce the worst
+			// of both worlds (no offline gating, NFS serving over an
+			// unmounted FUSE, and a fresh-install boot blocking on a
+			// synchronous SCAN over the terrible link). Carry the decision
+			// and force the FULL offline-start semantics after the connect
+			// block below.
 			backendUp = false
-			jmlog.Warn("backend reachable but RTT above boot-defer threshold — taking the start-while-offline path (U2)",
+			bootRTTDeferred = true
+			jmlog.Warn("backend reachable but RTT above boot-defer threshold — forcing the start-while-offline path (U2)",
 				"rtt_ms", bootRTT.Milliseconds(), "threshold_ms", deferMS)
 		}
 	}
@@ -469,6 +479,21 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// true, which suppresses the phantom-purge so the offline session can't
 		// delete real entries from the mirror.
 		pin.SetAutoOffline(true, offlineStartReason)
+	}
+	// V2.3 U2 review fix (HIGH): the RTT defer must yield the SAME offline-
+	// start semantics as a dead backend even when the connect above
+	// SUCCEEDED (a reachable-but-slow backend usually answers within the
+	// 10s dial). With startedOffline forced true: the boot skips the
+	// synchronous fm.Mount() and the U1 blocking-sync branch (no full SCAN
+	// over the terrible link, fresh installs included), the offline
+	// read/readdir gates are live from the first RPC, and Swift gets the
+	// started_offline banner. Recovery is the standard R-4 machinery — the
+	// reachability monitor + watchdog bring the mount and sync up in the
+	// background (with a LIVE rc here, the first reconcile tick syncs
+	// without waiting for a reconnect).
+	if bootRTTDeferred && !startedOffline {
+		startedOffline = true
+		pin.SetAutoOffline(true, "backend responding slowly — started offline; recovering in background")
 	}
 	globalRC = rc
 	// QA-30 (2026-05-25): give the reconcile loop the path config it needs
@@ -4044,23 +4069,29 @@ const offlineStartReason = "Started offline — backend unreachable at launch"
 // latency. Returns true (assume reachable, fall through to the normal connect)
 // when the URL can't be parsed, so a parse quirk never forces a spurious
 // offline start.
-func backendReachableQuick(redisURL string, timeout time.Duration) bool {
-	up, _ := backendReachableRTT(redisURL, timeout)
-	return up
-}
-
-// backendReachableRTT is backendReachableQuick plus the dial RTT it was
-// previously performing-and-discarding (V2.3 U2/K2). The RTT seeds
+// backendReachableRTT is the boot reachability probe plus the dial RTT it
+// was previously performing-and-discarding (V2.3 U2/K2). The RTT seeds
 // netprofile (so class-gated behavior is correct from the first moment) and
 // lets the boot path treat a reachable-but-terrible link as effectively
 // down. rtt is 0 when the address can't be parsed (optimistic-up).
+//
+// Review fix (MED): DNS resolution happens OUTSIDE the timed window — a cold
+// resolver / MagicDNS lookup at wake could otherwise push a healthy link
+// past the defer threshold and seed netprofile with an inflated first
+// sample. Only the TCP connect against the resolved address is timed.
 func backendReachableRTT(redisURL string, timeout time.Duration) (up bool, rtt time.Duration) {
 	addr, _, err := metadata.ParseRedisURL(redisURL)
 	if err != nil || addr == "" {
 		return true, 0
 	}
+	resolved, rerr := net.ResolveTCPAddr("tcp", addr)
+	if rerr != nil {
+		// Resolution failure = unreachable for boot purposes (same signal a
+		// dial would return, just without burning the timeout on it).
+		return false, 0
+	}
 	t0 := time.Now()
-	conn, derr := net.DialTimeout("tcp", addr, timeout)
+	conn, derr := net.DialTimeout("tcp", resolved.String(), timeout)
 	if derr != nil {
 		return false, 0
 	}
