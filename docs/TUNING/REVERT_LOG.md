@@ -299,3 +299,50 @@ listings simply stop showing the internal trees).
 `TestMirrorNamespaceGCKillSwitch` + full metadata suite). **Pending:** live
 validation that pending_prune drops from the ~112k floor to ~0 after one
 restart + first SCAN cycle.
+
+## 2026-07-02 — U7 async unmirrored-dir refresh: never block READDIR on FUSE (V2.3)
+
+**What:** a directory with ZERO rows in the SQLite mirror used to fall through
+to a FOREGROUND bounded FUSE readdir while online (`nfs/handler.go` ReadDir
+fallback). Over a slow link — or any FUSE slowness; root readdir was measured
+hanging >25s over a cellular relay — Finder sat on "loading" for up to a
+minute on such directories. Now the online zero-row readdir returns the
+mirror's answer (empty) IMMEDIATELY and dispatches an ASYNC bounded FUSE
+readdir (`refreshUnmirroredDir`) that INSERT-only upserts the discovered
+children into the mirror (SQLite + cache), so the next readdir (Finder
+retries/refreshes on its own) serves them from the mirror hot path.
+
+**Bounds:** singleflight per directory (`dirRefreshInFlight`, the
+phantomPurgeInFlight pattern) so a Finder storm on one dir spawns ONE
+goroutine; `dirRefreshSem` (4) caps concurrently-refreshing dirs, excess is
+shed and re-fired by the next readdir; the FUSE readdir itself uses
+`readDirWithTimeout` with `fuseStatTimeout` (the WAN-aware budget the old
+foreground fallback used) and draws from `prefetchGate` (the background
+readdir budget), never `nfsLstatGate` (QA-35: background work must not
+consume the foreground hot-path FUSE budget). Worker re-checks
+`pin.IsOffline()` and the G0 `pin.FUSEIdentityOK()` gate before touching
+FUSE; a plain-dir mountpoint is never scanned or mirrored. Offline readdir
+semantics untouched (empty-fast path returns before the dispatch). Entries
+are built by `coldDirListing`, the SAME extracted code path the foreground
+fallback uses.
+
+| `JM_ASYNC_DIR_REFRESH` | Effect |
+|---|---|
+| unset / `1` (default) | Online zero-row readdir returns empty immediately + async mirror refresh; next readdir serves the children. |
+| `0` | Restores the prior FOREGROUND bounded-FUSE fallback byte-identically (old code path kept intact behind the switch). |
+
+**Known trade (by design):** the first listing of an unmirrored dir shows
+empty until Finder re-lists (macOS may cache the empty answer up to
+acdirmax); the refresh typically lands within one `fuseStatTimeout`.
+
+**Revert:** `JM_ASYNC_DIR_REFRESH=0` (read per call — a launchctl setenv +
+app restart suffices), or revert the commit.
+
+**Validated:** unit (`TestAsyncDirRefreshPopulatesStore`,
+`TestAsyncDirRefreshSingleFlight`, `TestAsyncDirRefreshShedWhenSaturated`,
+`TestAsyncDirRefreshKillSwitch`, `TestAsyncDirRefreshOfflineUntouched`,
+`TestAsyncDirRefreshIdentityGateRefusal`,
+`TestAsyncDirRefreshNeverOverwrites` + full nfs suite incl. -race on the new
+tests; only the known environmental TestMemBuf* failures remain). **Pending:**
+live slow-link validation that an unmirrored dir populates on Finder's own
+refresh cadence.

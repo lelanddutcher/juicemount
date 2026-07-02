@@ -81,6 +81,21 @@ type JuiceMountHandler struct {
 	phantomPurgeMu       sync.Mutex
 	phantomPurgeInFlight map[string]struct{}
 
+	// U7 async unmirrored-dir refresh (V2.3). When an ONLINE readdir finds
+	// ZERO mirror rows for a directory, the RPC returns the mirror's answer
+	// (empty) immediately and a background goroutine does the bounded FUSE
+	// readdir + mirror insert so the NEXT readdir sees the children — the
+	// READDIR RPC itself never blocks on FUSE (root readdir was measured
+	// hanging >25s over a cellular relay on the old foreground fallback).
+	// dirRefreshInFlight is the per-directory singleflight key set (same
+	// pattern as phantomPurgeInFlight): a Finder storm on one directory
+	// coalesces to ONE refresh goroutine. dirRefreshSem caps concurrently-
+	// refreshing directories (non-blocking acquire at dispatch — excess is
+	// shed, and the next readdir on that directory re-fires the refresh).
+	dirRefreshMu       sync.Mutex
+	dirRefreshInFlight map[string]struct{}
+	dirRefreshSem      chan struct{}
+
 	// Verifier cleanup lifecycle
 	verifierStop chan struct{}
 
@@ -153,6 +168,12 @@ var nfsLstatGate = make(chan struct{}, 24)
 // goroutine concurrency; this only stops the FUSE-syscall budget from being
 // shared. See QA-35 / feedback_perf_hot_path: never let background work consume
 // the foreground hot-path FUSE budget.
+//
+// Also drawn on by the U7 async unmirrored-dir refresh (refreshUnmirroredDir)
+// — the same class of work (a background mirror-warming FUSE ReadDir), so it
+// shares this background budget rather than growing total background readdir
+// pressure on the daemon. Its goroutine count is separately capped by
+// dirRefreshSem (4).
 var prefetchGate = make(chan struct{}, 2)
 
 // fuseFstatGate caps concurrent LiveSize fstats (task #65 read-during-drain
@@ -204,6 +225,18 @@ var fuseStatTimeout = func() time.Duration {
 	}
 	return 800 * time.Millisecond
 }()
+
+// asyncDirRefreshEnabled gates the U7 async unmirrored-dir refresh. Default
+// ON: an online readdir of a directory with zero mirror rows returns the
+// mirror's (empty) answer immediately and refreshes the mirror from FUSE in
+// the background. JM_ASYNC_DIR_REFRESH=0 restores the prior FOREGROUND
+// bounded-FUSE fallback byte-identically (the old code path is kept intact
+// behind this switch). Read per call — this only executes on the zero-row
+// cold path, never on the serve-from-mirror hot path — so tests (and a live
+// launchctl setenv) can flip it without a rebuild.
+func asyncDirRefreshEnabled() bool {
+	return os.Getenv("JM_ASYNC_DIR_REFRESH") != "0"
+}
 
 // statWithTimeout is the os.Stat sibling of lstatWithTimeout. ok=false means
 // the underlying Stat didn't complete within the timeout (FUSE wedged).
@@ -486,6 +519,8 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		prefetched:           make(map[string]time.Time),
 		prefetchSem:          make(chan struct{}, 4), // max 4 concurrent prefetches
 		phantomPurgeInFlight: make(map[string]struct{}),
+		dirRefreshInFlight:   make(map[string]struct{}),
+		dirRefreshSem:        make(chan struct{}, 4), // max 4 concurrently-refreshing dirs (U7)
 		verifierStop:         make(chan struct{}),
 	}
 	go h.verifierCleanupLoop(60*time.Second, 5*time.Minute)
@@ -1820,10 +1855,29 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 		return []os.FileInfo{}, nil
 	}
 
-	// Fallback: read directly from FUSE and cache into SQLite. BOUNDED so a
-	// wedged JuiceFS can't hang the READDIR RPC and exhaust the server's
-	// concurrency budget (see statWithTimeout rationale).
+	// The mirror has ZERO rows for this directory and we're ONLINE — a
+	// genuinely unmirrored (or genuinely empty) directory.
 	fusePath := jfs.fullPath(dirname)
+
+	// U7 (V2.3): NEVER block the READDIR RPC on FUSE. The old foreground
+	// fallback below bounds the FUSE readdir with fuseStatTimeout, but over a
+	// slow link (or ANY FUSE slowness — root readdir was measured hanging
+	// >25s over a cellular relay) Finder sits on "loading" for up to a minute
+	// on such directories. Instead: return the mirror's answer (empty)
+	// IMMEDIATELY and kick an ASYNC bounded FUSE readdir that upserts the
+	// discovered children into the mirror, so the NEXT readdir (Finder
+	// retries/refreshes on its own) serves them from the mirror hot path.
+	// QA-35 hot-path discipline: this RPC path does only in-memory checks —
+	// the FUSE readdir happens strictly on the background goroutine.
+	if asyncDirRefreshEnabled() {
+		jfs.maybeAsyncRefreshDir(dirname, fusePath)
+		return []os.FileInfo{}, nil
+	}
+
+	// JM_ASYNC_DIR_REFRESH=0 kill switch: the prior FOREGROUND fallback —
+	// read directly from FUSE and cache into SQLite. BOUNDED so a wedged
+	// JuiceFS can't hang the READDIR RPC and exhaust the server's
+	// concurrency budget (see statWithTimeout rationale).
 	// Foreground cold READDIR — a genuine cache-miss metadata RPC on Finder's
 	// hot path, so it uses the shared nfsLstatGate (NOT prefetchGate).
 	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout, nfsLstatGate)
@@ -1833,6 +1887,23 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	infos, toInsert := jfs.coldDirListing(dirname, dirEntries)
+
+	// Bulk-insert into SQLite synchronously so subsequent Stat() calls
+	// from Finder (which follow immediately after READDIR) hit the cache
+	if len(toInsert) > 0 {
+		jfs.handler.store.BulkInsert(toInsert, 500)
+	}
+
+	return infos, nil
+}
+
+// coldDirListing converts the result of a bounded FUSE ReadDir on dirname
+// into (a) the FileInfos a foreground READDIR returns to the client and
+// (b) the mirror entries to insert. Extracted from the foreground cold-
+// readdir fallback so the U7 async refresh builds entries via the SAME code
+// path — one entry-construction path, two callers.
+func (jfs *juiceFS) coldDirListing(dirname string, dirEntries []os.DirEntry) ([]os.FileInfo, []*metadata.Entry) {
 	infos := make([]os.FileInfo, 0, len(dirEntries))
 	toInsert := make([]*metadata.Entry, 0, len(dirEntries))
 	for _, de := range dirEntries {
@@ -1863,14 +1934,108 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 		entry := metadata.MakeEntry(childPath, info.IsDir(), info.Size(), info.ModTime(), inode)
 		toInsert = append(toInsert, entry)
 	}
+	return infos, toInsert
+}
 
-	// Bulk-insert into SQLite synchronously so subsequent Stat() calls
-	// from Finder (which follow immediately after READDIR) hit the cache
-	if len(toInsert) > 0 {
-		jfs.handler.store.BulkInsert(toInsert, 500)
+// maybeAsyncRefreshDir dispatches the U7 background refresh for a directory
+// the mirror has no rows for. Called from the ReadDir RPC path, so it does
+// ONLY in-memory work (QA-35): a singleflight check + a non-blocking
+// semaphore acquire. Deduped per directory via dirRefreshInFlight (the
+// phantomPurgeInFlight pattern) — a Finder storm on one directory launches
+// at most ONE refresh goroutine. dirRefreshSem (cap 4) bounds concurrently-
+// refreshing directories; when saturated the refresh is SHED (key cleared)
+// and the next readdir on that directory simply re-fires it — refresh is a
+// mirror-warming optimization, never correctness.
+func (jfs *juiceFS) maybeAsyncRefreshDir(dirname, fusePath string) {
+	h := jfs.handler
+	h.dirRefreshMu.Lock()
+	if _, inFlight := h.dirRefreshInFlight[dirname]; inFlight {
+		h.dirRefreshMu.Unlock()
+		return // a refresh for this directory is already running — coalesce
+	}
+	h.dirRefreshInFlight[dirname] = struct{}{}
+	h.dirRefreshMu.Unlock()
+
+	clear := func() {
+		h.dirRefreshMu.Lock()
+		delete(h.dirRefreshInFlight, dirname)
+		h.dirRefreshMu.Unlock()
 	}
 
-	return infos, nil
+	select {
+	case h.dirRefreshSem <- struct{}{}:
+		go func() {
+			defer func() {
+				<-h.dirRefreshSem
+				clear()
+			}()
+			jfs.refreshUnmirroredDir(dirname, fusePath)
+		}()
+	default:
+		// All refresh workers busy — shed. Clear the singleflight key now so
+		// the NEXT readdir on this directory can re-dispatch.
+		clear()
+	}
+}
+
+// refreshUnmirroredDir is the U7 background worker: a bounded FUSE readdir
+// of a directory the mirror had zero rows for, INSERTING the discovered
+// children into the mirror (SQLite + in-memory cache via BulkInsert) so the
+// next readdir serves them from the mirror. Runs strictly OFF the RPC path.
+//
+// Correctness bounds:
+//   - Re-checks offline + the G0 FUSE-identity gate here (both can flip
+//     between dispatch and run; and against a plain-dir mountpoint the
+//     readdir would "succeed" on the boot SSD and mirror garbage).
+//   - INSERT-only: children already present in the mirror are skipped
+//     (BulkInsert is replace-on-conflict), so an async result can never
+//     overwrite a fresher row — pruning stays the reconcile's job.
+//   - A genuinely empty directory inserts nothing and records nothing; the
+//     next readdir re-fires the singleflight, which is acceptable.
+//
+// The FUSE readdir draws from prefetchGate (the BACKGROUND readdir budget),
+// never nfsLstatGate — background work must not consume the foreground
+// hot-path FUSE budget (QA-35 / RC drain-latency fix). Timeout is
+// fuseStatTimeout, the same WAN-aware budget the foreground fallback uses.
+func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) {
+	h := jfs.handler
+
+	// Offline engaged since dispatch: the offline readdir path has its own
+	// empty-fast semantics — generate no backend traffic.
+	if pin.IsOffline() {
+		return
+	}
+	// V2.3 G0: a plain-dir mountpoint (kext not loaded / mount absent) makes
+	// the readdir answer meaningless — do not scan it, do not insert from it.
+	if !pin.FUSEIdentityOK() {
+		return
+	}
+
+	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout, prefetchGate)
+	if !ok {
+		return // FUSE wedged/slow — give up; next readdir re-fires
+	}
+	if err != nil {
+		return
+	}
+
+	_, discovered := jfs.coldDirListing(dirname, dirEntries)
+
+	// INSERT-only: never overwrite an existing mirror row from an async
+	// result (same discipline as prefetchChildren). The row that appeared
+	// since dispatch (a CREATE, the reconcile, a push event) is fresher than
+	// our snapshot.
+	toInsert := make([]*metadata.Entry, 0, len(discovered))
+	for _, e := range discovered {
+		if h.store.LookupByPath(e.Path) == nil {
+			toInsert = append(toInsert, e)
+		}
+	}
+	if len(toInsert) > 0 {
+		h.store.BulkInsert(toInsert, 500)
+		jmlog.Debug("async dir refresh: mirrored unmirrored directory",
+			"dir", dirname, "children", len(toInsert))
+	}
 }
 
 // StatCacheOnly returns the FileInfo for filename if the metadata cache knows
