@@ -779,6 +779,18 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 		storeParent = ent.Path // non-root: path.Dir(parent+"/"+name) == parent
 	}
 
+	// Task #78: never reconcile a directory inside a scan-filtered namespace
+	// (.trash/, .juicemount/ — see scanFilteredPath). The full SCAN can never
+	// return these paths, so push-mirrored rows under them are permanently
+	// absent from every SCAN diff and cycle in the pruneAbsent ladder forever.
+	// Checked BEFORE any Redis round-trip: a trash/derivative burst (mass
+	// delete-to-trash, farm fan-out) otherwise costs one HGETALL + N attr GETs
+	// per event for rows we'd refuse to mirror anyway.
+	if parentPath != "" && scanFilteredPath(parentPath) {
+		noteScanFilteredSkip("reconcileDir", parentPath, 1)
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -792,6 +804,7 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 	// Build the fresh child set and the entries to upsert.
 	freshNames := make(map[string]struct{}, len(raw))
 	var toUpsert []*Entry
+	skippedFiltered := 0 // task #78: scan-filtered children not mirrored
 	for name, valStr := range raw {
 		val := []byte(valStr)
 		childInode, ft, ok := decodeDirChild(val)
@@ -814,6 +827,17 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 			childPath = name
 		} else {
 			childPath = parentPath + "/" + name
+		}
+
+		// Task #78: never mirror a child row in a scan-filtered namespace
+		// (reachable here only on a ROOT reconcile, where ".trash"/".juicemount"
+		// appear as bare child names — deeper dirs are skipped wholesale above).
+		// The name stays in freshNames (set above) so scopedPrune keeps seeing
+		// it as Redis-fresh; we just refuse to MIRROR it. Skipping before the
+		// attr GET also saves the per-child Redis round-trip.
+		if scanFilteredPath(childPath) {
+			skippedFiltered++
+			continue
 		}
 
 		// Fetch attrs for mtime/size (single GET, no scan). A missing/short
@@ -849,6 +873,10 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 			existing.Inode != e.Inode {
 			toUpsert = append(toUpsert, e)
 		}
+	}
+
+	if skippedFiltered > 0 {
+		noteScanFilteredSkip("reconcileDir children", parentPath, skippedFiltered)
 	}
 
 	// Apply upserts (cache-first, then SQLite) via the applyEvent fast path
@@ -931,6 +959,15 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		// zero-Finder-error bar). The Stat/Open phantom-purge already skips `._`
 		// for exactly this reason; the reconcile prune must too.
 		if strings.HasPrefix(ch.Name, "._") {
+			continue
+		}
+		// Task #78: internal-namespace rows (.trash/, .juicemount/) are
+		// managed by the one-time open-GC + push-insert filter, never by
+		// push-prune. Post-GC none should exist; if one does (seeded by an
+		// older build mid-session), a prune attempt here would just churn
+		// through Layer A every root reconcile (FUSE shows .trash /
+		// .juicemount present → spared → re-candidate next cycle).
+		if scanFilteredPath(ch.Path) {
 			continue
 		}
 		candidates = append(candidates, ch.Path)

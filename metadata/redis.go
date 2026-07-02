@@ -895,6 +895,16 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 
 	switch evt.Op {
 	case "create", "update":
+		// Task #78: never mirror push events for scan-filtered namespaces
+		// (.trash/, .juicemount/ — see scanFilteredPath). The full SCAN can
+		// never return these paths, so a push-inserted row would be
+		// permanently absent from every SCAN diff and cycle in the
+		// pruneAbsent ladder forever. `._` sidecars are deliberately NOT
+		// filtered here (they are SCAN-visible once drained).
+		if scanFilteredPath(evt.Path) {
+			noteScanFilteredSkip("applyEvent", evt.Path, 1)
+			return
+		}
 		e := &Entry{
 			Path:       evt.Path,
 			Name:       path.Base(evt.Path),
@@ -913,15 +923,26 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		}
 
 	case "delete":
+		// Deletes are NOT namespace-filtered: removing an internal-namespace
+		// row (if one was seeded by an older build) is convergent.
 		rc.store.DeleteFromCache(evt.Path)
 		if err := rc.store.Delete(evt.Path); err != nil {
 			log.Printf("subscribe apply delete: %v", err)
 		}
 
 	case "rename":
+		// The OldPath removal is UNGATED: a rename INTO .trash is JuiceFS's
+		// delete-to-trash, and the source row must still be dropped.
 		if evt.OldPath != "" {
 			rc.store.DeleteFromCache(evt.OldPath)
 			rc.store.Delete(evt.OldPath)
+		}
+		// Task #78: skip mirroring the DESTINATION when it lands in a
+		// scan-filtered namespace (delete-to-trash). A rename OUT of .trash
+		// (restore) has a non-filtered destination and is mirrored normally.
+		if scanFilteredPath(evt.Path) {
+			noteScanFilteredSkip("applyEvent", evt.Path, 1)
+			return
 		}
 		e := &Entry{
 			Path:       evt.Path,
@@ -1599,21 +1620,7 @@ func (rc *RedisClient) syncMetadata() error {
 	// (commit bbc6bff) to give recovery a full pruneThreshold-cycle
 	// window before any destructive cache mutation can fire.
 	skipIncrement := rc.RecentlyDegraded(60 * time.Second)
-	for p := range existingPaths {
-		if _, inRedis := redisPaths[p]; !inRedis {
-			if !skipIncrement {
-				rc.pruneAbsent[p]++
-			}
-		} else {
-			delete(rc.pruneAbsent, p)
-		}
-	}
-	// Remove stale entries from pruneAbsent (paths already deleted from SQLite).
-	for p := range rc.pruneAbsent {
-		if _, exists := existingPaths[p]; !exists {
-			delete(rc.pruneAbsent, p)
-		}
-	}
+	rc.trackAbsentPaths(existingPaths, redisPaths, skipIncrement)
 	// Collect paths that have been absent long enough to prune.
 	//
 	// V2.3 G6: ladderCounts snapshots each candidate's counter BEFORE the
@@ -1822,6 +1829,38 @@ func (rc *RedisClient) syncMetadata() error {
 		"duration_ms", duration.Round(time.Millisecond).Milliseconds(),
 	)
 	return nil
+}
+
+// trackAbsentPaths advances the pruneAbsent counter ladder from one full-SCAN
+// cycle's view (extracted from syncMetadata for task #78 so the tracking
+// policy is unit-testable).
+//
+// Task #78: paths in scan-filtered namespaces (.trash/, .juicemount/ — see
+// scanFilteredPath) are NEVER tracked. The SCAN structurally cannot return
+// them, so "absent from the SCAN" carries zero delete signal for them;
+// tracking them created a permanent ~112k pending_prune floor (live-probed
+// 2026-07-02), inflated every diff iteration, and fueled the pre-G6 Layer-A
+// probe storms. The cleanup loop also actively drops any filtered-namespace
+// counter (belt-and-braces — pruneAbsent is in-memory, so restart already
+// clears pre-fix counters). The `._` AppleDouble guard stays where it was: at
+// qualification time in syncMetadata (sidecars ARE tracked but never pruned).
+func (rc *RedisClient) trackAbsentPaths(existingPaths, redisPaths map[string]struct{}, skipIncrement bool) {
+	for p := range existingPaths {
+		if _, inRedis := redisPaths[p]; !inRedis {
+			if !skipIncrement && !scanFilteredPath(p) {
+				rc.pruneAbsent[p]++
+			}
+		} else {
+			delete(rc.pruneAbsent, p)
+		}
+	}
+	// Remove stale entries from pruneAbsent: paths already deleted from
+	// SQLite, and (task #78) scan-filtered-namespace counters.
+	for p := range rc.pruneAbsent {
+		if _, exists := existingPaths[p]; !exists || scanFilteredPath(p) {
+			delete(rc.pruneAbsent, p)
+		}
+	}
 }
 
 // verifyPruneCandidates is the prune ladder's Layer A: per-path FUSE Lstat

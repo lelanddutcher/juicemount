@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -474,6 +475,28 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		return nil, fmt.Errorf("drop FTS triggers: %w", err)
 	}
 
+	// Task #78 one-time mirror GC: drop internal-namespace rows (.trash/,
+	// .juicemount/) that pre-fix keyspace-push builds mirrored into SQLite.
+	// The full SCAN can never return these paths (see scanFilteredPath), so
+	// they were permanently absent from every SCAN diff and cycled in the
+	// pruneAbsent ladder forever (~112k pending_prune floor). Runs HERE —
+	// after the schema, BEFORE rebuildCaches and RebuildFTS — so neither the
+	// in-memory caches nor the FTS index ever see the removed rows (RebuildFTS
+	// below re-derives FTS from `entries`, which is why bare DELETEs without
+	// per-row FTS 'delete' ops are safe at this site and only this site).
+	// `._` rows are deliberately NOT touched. Kill switch: JM_MIRROR_NS_GC=0
+	// (see docs/TUNING/REVERT_LOG.md).
+	if os.Getenv("JM_MIRROR_NS_GC") != "0" {
+		if n, gcErr := gcInternalNamespaces(db); gcErr != nil {
+			// Fail-open: a GC error must not block boot/mount. The rows it
+			// would have removed are inert now that the push filter and the
+			// pruneAbsent exclusion are in place.
+			log.Printf("metadata: internal-namespace GC failed (continuing): %v", gcErr)
+		} else if n > 0 {
+			log.Printf("metadata: internal-namespace GC removed %d mirror rows (.trash/ + .juicemount/)", n)
+		}
+	}
+
 	if maxCacheSize <= 0 {
 		maxCacheSize = DefaultMaxCacheSize
 	}
@@ -500,6 +523,38 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	}
 
 	return s, nil
+}
+
+// gcInternalNamespaces is the task-#78 one-time mirror GC (see the call site
+// in OpenWithMaxCacheSize for the full rationale and the safety argument for
+// bare DELETEs here). Batched via a rowid subquery — DELETE ... LIMIT needs a
+// non-default SQLite compile flag — so a ~112k-row backlog is removed in
+// bounded transactions instead of one giant journal spike. Returns the total
+// number of rows removed.
+func gcInternalNamespaces(db *sql.DB) (int64, error) {
+	// Namespaces MUST mirror scanFilteredPath (the single source of truth).
+	// Children only ('ns/%'): the bare ".trash"/".juicemount" dir rows are
+	// left alone — they are cheap, FUSE-visible directories, and the
+	// pruneAbsent exclusion keeps them off the ladder.
+	const batch = `DELETE FROM entries WHERE rowid IN (
+		SELECT rowid FROM entries
+		WHERE path LIKE '.trash/%' OR path LIKE '.juicemount/%'
+		LIMIT 5000)`
+	var total int64
+	for {
+		res, err := db.Exec(batch)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n == 0 {
+			return total, nil
+		}
+	}
 }
 
 // Close closes the database connection.

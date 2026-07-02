@@ -256,3 +256,46 @@ that a threshold-crossing cycle stays <5s and "Rebuilding index…" clears
 | `JM_BOOT_DEFER_RTT_MS` (default 500) | Boot dial RTT above this → start-while-offline path instead of synchronous online boot. `0` disables U2 entirely. |
 
 **Revert:** flip the switches; both paths byte-identical to pre-V2.3 when disabled.
+
+## 2026-07-02 — #78 push-path namespace filter + one-time internal-namespace mirror GC (V2.3)
+
+**What:** the SQLite mirror held ~112k rows under backend-internal namespaces
+(`.trash/…` JuiceFS built-in trash, `.juicemount/…` server-side derivatives)
+plus un-drained `._` sidecars. The full SCAN can never return the internal
+namespaces (the trash tree is structurally unreachable from root inode 1 in
+syncMetadata's path reconstruction; `.juicemount` live-proven SCAN-absent), but
+the keyspace-push insert paths (`applyEvent`, `reconcileDir`) had no matching
+filter — so pushed rows were mirrored, then cycled forever in the `pruneAbsent`
+ladder (permanent pending_prune floor, inflated diffs, pre-G6 Layer-A storms).
+
+**Fix:** `metadata/scanfilter.go: scanFilteredPath` is the single source of
+truth mirroring the SCAN's effective exclusions (`.trash/`, `.juicemount/` —
+root-level only; `._` deliberately NOT included: it is SCAN-visible once
+drained and served Mac-side). Applied in `applyEvent` (create/update + rename
+destination; deletes and rename-source removal stay ungated), `reconcileDir`
+(dir-level skip before any Redis round-trip + root-child skip; `freshNames`
+stays faithful to Redis), `scopedPrune` candidates, and the `pruneAbsent`
+tracking loop (`trackAbsentPaths` — filtered paths never tracked, stale
+counters dropped). One-time GC at Store open (before cache/FTS rebuild)
+deletes `path LIKE '.trash/%' OR '.juicemount/%'` in 5k-row batches — bare
+namespace dir rows and ALL `._` rows are spared.
+
+| `JM_MIRROR_NS_GC` | Effect |
+|---|---|
+| unset (default) | one-time GC runs at every Store open (idempotent; ~112k rows first run, then 0) |
+| `0` | GC disabled — pre-fix mirror rows are left in place (they are inert: push-filtered + never ladder-tracked) |
+
+**Revert:** `JM_MIRROR_NS_GC=0` stops the GC without a rebuild (the push
+filter itself has no switch — it only skips writes the SCAN would never
+confirm; full revert = revert the commit). Deleted rows are NOT restored by
+the revert, but Finder/NFS never depended on them (the NFS handler serves
+`._` via its own write path, and `.trash`/`.juicemount` are server-internal;
+listings simply stop showing the internal trees).
+
+**Validated:** unit (`TestScanFilteredPathTruthTable`,
+`TestApplyEventSkipsScanFilteredNamespaces`,
+`TestReconcileDirSkipsFilteredNamespaceDirs`,
+`TestTrackAbsentPathsNeverTracksFilteredNamespaces`, `TestMirrorNamespaceGC`,
+`TestMirrorNamespaceGCKillSwitch` + full metadata suite). **Pending:** live
+validation that pending_prune drops from the ~112k floor to ~0 after one
+restart + first SCAN cycle.
