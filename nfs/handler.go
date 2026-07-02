@@ -685,6 +685,7 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		// metadata writes and commits them via this hook in ONE cross-table
 		// SQLite transaction (size published BEFORE mark-done per file, task
 		// #65). A no-op cost when the flag is off (the drainer never calls it).
+		//
 		drainer.SetOnBatchDrainComplete(h.store.BatchDrainComplete)
 		// Post-materialize hook: once a deferred offline symlink is os.Symlink'd
 		// onto FUSE at reconnect, clear its LocalOnly flag — it's now a real
@@ -694,6 +695,16 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		drainer.SetOnSymlinkMaterialized(h.onSymlinkMaterialized)
 	}
 	if spool != nil {
+		// QA-37: wire the sibling metadata.SpoolStore (same DB, spool.Meta())
+		// into the entries Store so BatchDrainComplete can mark spool_entries
+		// done under SpoolStore.writeMu — serializing the batched mark-done
+		// against DeleteActiveByPath / MarkDone (the cancel↔drain race).
+		// Independent of the drainer: BatchDrainComplete fails closed if the
+		// batch-insert lever ever flushes without this wired. Done here so it is
+		// set whenever a spool is attached, even when SetSpool is called with a
+		// nil drainer (the drainer's hooks are wired separately by the caller).
+		h.store.SetSpoolStore(spool.Meta())
+
 		// NFS closes the file after every WRITE RPC, so finalize is driven
 		// by quiescence (idle sweeper), not by Close. Stopped in StopHandler.
 		//

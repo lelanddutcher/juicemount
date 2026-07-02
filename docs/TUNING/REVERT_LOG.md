@@ -45,11 +45,20 @@ eviction side-effects (index evict, spool-file removal) run ONLY after that
 mark-done, and its spool shadow is not evicted until after the commit — a fresh
 read can never resolve a post-eviction-but-pre-size 0/partial size. This is the
 same guarantee the per-file path gives, with fewer fsyncs. entries.size stays
-MAX-only (idempotent, matching `UpdateSize`), and the QA-37 cancel contract
-holds via `_txlock=immediate` (the tx takes SQLite's write lock at Begin, so a
-concurrent `DeleteActiveByPath` either committed its DELETE first → mark-done
-affects 0 rows → `Done=false` → caller undoes the FUSE write, or blocks until
-after commit → its DELETE skips the now-done row).
+MAX-only (idempotent, matching `UpdateSize`).
+
+> ⚠️ **SUPERSEDED (see the 2026-07-02 QA-37 addendum below).** The original
+> claim here — that "the QA-37 cancel contract holds via `_txlock=immediate`"
+> because the batch tx takes SQLite's write lock at `Begin` — was **WRONG**. In
+> WAL mode a concurrent `DeleteActiveByPath` runs its decision-making SELECT as
+> a *snapshot reader* that holds **no** write lock, so it could observe a
+> still-`draining` row and collect it for deletion while the batch committed
+> `drain_state=done` first (`Done=true`); the cancel's later DELETE then matched
+> 0 rows and the user-deleted file was **resurrected** as a committed
+> backend/Redis entry. The batch marked `spool_entries` done under
+> `Store.writeMu`, a **different** mutex than the `SpoolStore.writeMu` the cancel
+> serializes on, so `_txlock=immediate` alone could not order them. Fixed by the
+> addendum: the batched mark-done now runs under `SpoolStore.writeMu`.
 
 **No stranded writes / no offline-boundary spanning:** the batch flushes on
 drain-idle (ready queue empty), before the dispatcher parks (offline / FUSE
@@ -61,6 +70,68 @@ error the whole tx rolls back and every file in the batch is retried transiently
 link-class gated (it's a background-drain fsync optimization, link-independent),
 but logged here per discipline because it changes durable write batching on the
 metadata store that the offline promise depends on.
+
+---
+
+## 2026-07-02 — QA-37 fix: batched mark-done must serialize on `SpoolStore.writeMu` (cancel↔drain race)
+
+Correctness fix to Perf Lever 1 above (`JM_DRAIN_BATCH_INSERT`). **Not
+env-revertable within the lever** — the fix is required whenever the lever is
+ON, so the only revert is turning the lever OFF (`JM_DRAIN_BATCH_INSERT` unset).
+The per-file path was never affected and stays byte-identical.
+
+**The defect (confirmed, adversarial review).** `metadata.Store.BatchDrainComplete`
+marked `spool_entries` done under `Store.writeMu`, while the NFS delete path's
+`metadata.SpoolStore.DeleteActiveByPath` (SELECT-then-DELETE) and per-file
+`MarkDone` serialize on `SpoolStore.writeMu` — a **different** mutex. So a
+mid-coalescer file in `draining` could be deleted by the user (NFS Remove →
+`CancelForDelete` → `DeleteActiveByPath`) and BOTH sides "win": the cancel's
+SELECT (a WAL snapshot reader, no write lock) sees the row `draining` and
+collects it; the batch commits `drain_state=done` (`Done=true`); the cancel's
+DELETE (filtered to writing/ready/draining) then matches 0 rows. `Done=true`
+drove `BatchCompleteDrainCleanup` + `onDrainComplete` → the user-deleted file was
+**resurrected** as a committed backend/Redis create + `entries.size`.
+`_txlock=immediate` did **not** save it (the cancel's decision-SELECT holds no
+write lock). The per-file path is immune because `MarkDone` and
+`DeleteActiveByPath` share `SpoolStore.writeMu`.
+
+**The fix (approach A — restores the exact per-file invariant).** The batched
+mark-done moved into `SpoolStore.batchMarkDoneTx(tx, items)`, which
+`BatchDrainComplete` calls **while holding `SpoolStore.writeMu`**, passing its
+own `*sql.Tx` so the `entries.size` publish and the `spool_entries` mark-done
+stay in ONE atomic transaction (task #65 preserved). `BatchDrainComplete` now
+holds BOTH `Store.writeMu` and `SpoolStore.writeMu`. A cancel and a batch
+mark-done can no longer interleave — one runs entirely before the other, exactly
+as `MarkDone` vs `DeleteActiveByPath` do. `Store` gets the sibling `SpoolStore`
+via `SetSpoolStore`, wired in `handler.SetSpool` (independent of the drainer);
+`BatchDrainComplete` **fails closed** (errors, whole batch retried transiently)
+if flushed unwired, rather than run the mark-done unserialized.
+
+**Deadlock audit.** Global lock order established: **`Store.writeMu` →
+`SpoolStore.writeMu` → SQLite-write-lock (`tx.Begin`, `_txlock=immediate`)**.
+Audited every acquisition site of both mutexes across `metadata/` + `nfs/`:
+`Store` holds no reference to `SpoolStore` and no `SpoolStore` method calls back
+into any `Store` method, so before this change the two lock domains were
+disjoint and `BatchDrainComplete` is the ONLY site that ever holds both — no
+inversion possible. Critically, `SpoolStore.writeMu` is acquired **before**
+`tx.Begin`, so no `SpoolStore` writer can hold `SpoolStore.writeMu` while blocked
+on the WAL write lock this tx holds (the reverse pairing would 30s-stall on
+`busy_timeout`, not hang, but is avoided outright).
+
+**Regression test (the one that was missing).**
+`TestBatchDrainCompleteConcurrentCancelDoesNotResurrect` (`metadata/`, runs under
+`-race`) drives the real concurrent interleaving via a test-only sync hook fired
+inside `DeleteActiveByPath` between its SELECT and DELETE: the cancel parks there
+holding `SpoolStore.writeMu`, the batch flush is launched and asserted to BLOCK
+(not complete) until the cancel releases, then the cancel's DELETE wins the row
+and the batch's mark-done sees 0 rows → `Done=false` → no resurrection; a
+sibling keep-row still commits `Done=true`. Verified to FAIL on the pre-fix code
+(batch completed unserialized while the cancel was parked) and PASS after.
+`TestBatchDrainCompleteCancelledRowReportsNotDone` (the delete-before-batch case)
+is retained.
+
+**Baseline to revert to = `JM_DRAIN_BATCH_INSERT` unset/`0`** (no rebuild); the
+per-file drain path is unchanged and carries no resurrection risk.
 
 ---
 

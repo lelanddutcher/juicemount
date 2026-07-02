@@ -155,6 +155,16 @@ type Store struct {
 	maxCacheSize int
 	pinChecker   PinChecker // optional (QA-30); see PinChecker docstring
 
+	// spoolStore is the sibling SpoolStore over the SAME *sql.DB (both created
+	// from store.DB(); see the shared-DB note on Open). Wired via
+	// SetSpoolStore. Used ONLY by BatchDrainComplete, which must hold
+	// SpoolStore.writeMu while it marks spool_entries done so the batched
+	// mark-done serializes against DeleteActiveByPath / MarkDone exactly like
+	// the per-file path does (QA-37 cancel↔drain race). Nil until wired and
+	// when the batch-insert lever is off — BatchDrainComplete errors rather
+	// than run the mark-done unserialized. Read-only after SetSpoolStore.
+	spoolStore *SpoolStore
+
 	// ftsInitialized is set once the external-content FTS has been built (the
 	// first BulkInsert / initial sync). After that EVERY BulkInsert maintains
 	// FTS incrementally — even a large delta — so it never holds writeMu
@@ -402,6 +412,16 @@ func (s *Store) SetPinChecker(pc PinChecker) {
 	s.mu.Lock()
 	s.pinChecker = pc
 	s.mu.Unlock()
+}
+
+// SetSpoolStore wires the sibling SpoolStore (over the SAME *sql.DB) that
+// BatchDrainComplete uses to serialize its batched spool_entries mark-done on
+// SpoolStore.writeMu (QA-37). Call once, on the start path, BEFORE the drainer
+// can flush a batch — the bridge wires it in nfs.JuiceMountHandler.SetSpool
+// alongside SetOnBatchDrainComplete. Idempotent; read-only afterwards, so no
+// lock is needed (matches the one-shot SetOnBatchDrainComplete wiring).
+func (s *Store) SetSpoolStore(ss *SpoolStore) {
+	s.spoolStore = ss
 }
 
 // pinnedSetLocked returns the current pinned-path set under s.mu (caller

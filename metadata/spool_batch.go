@@ -53,12 +53,26 @@ type DrainCommitResult struct {
 // reconcile or a re-drain can't shrink a size; spool_entries mark-done is by id
 // with a rows-affected check so a row CANCELLED mid-drain (deleted by
 // DeleteActiveByPath, whose DELETE filters drain_state IN writing/ready/draining
-// and thus can't touch a just-done row) reports Done=false. The QA-37 cancel
-// contract holds without sharing SpoolStore.writeMu: _txlock=immediate makes
-// this tx take SQLite's write lock at Begin, so a concurrent cancel either
-// committed its DELETE first (this UPDATE affects 0 rows → Done=false → caller
-// undoes the FUSE write) or blocks until after this commit (and then its DELETE
-// skips the now-done row). Either resolution matches the single-write path.
+// and thus can't touch a just-done row) reports Done=false.
+//
+// QA-37 CANCEL CONTRACT — held by SHARING SpoolStore.writeMu, not by tx timing.
+// The mark-done (SpoolStore.batchMarkDoneTx) runs UNDER SpoolStore.writeMu, the
+// SAME mutex DeleteActiveByPath / MarkDone serialize on, so a concurrent cancel
+// and this mark-done cannot interleave — one runs entirely before the other,
+// exactly as MarkDone vs DeleteActiveByPath do in the per-file path. (The
+// earlier "_txlock=immediate is enough" reasoning was WRONG: in WAL mode the
+// cancel's SELECT is a snapshot reader holding NO write lock, so it could
+// observe a still-'draining' row and collect it for deletion while this batch
+// committed the mark-done first — resurrecting a user-deleted file. Sharing the
+// mutex closes that window.)
+//
+// LOCK ORDER — global, uninverted: Store.writeMu → SpoolStore.writeMu →
+// SQLite-write-lock (tx.Begin, _txlock=immediate). SpoolStore.writeMu is taken
+// BEFORE tx.Begin so no SpoolStore writer can be mid-DB-write (holding
+// SpoolStore.writeMu, blocked on the WAL write lock this tx holds) while this
+// path waits on SpoolStore.writeMu — that reversed pairing would 30s-stall on
+// busy_timeout. Because this is the ONLY site that holds both Go mutexes and no
+// SpoolStore method ever calls back into a Store method, the order has no cycle.
 //
 // On ANY SQL error the whole tx rolls back and NO item is marked done, so the
 // caller retries every file transiently (no partial commit, no half-evicted
@@ -70,11 +84,23 @@ func (s *Store) BatchDrainComplete(items []DrainCommitItem) ([]DrainCommitResult
 	if len(items) == 0 {
 		return nil, nil
 	}
+	if s.spoolStore == nil {
+		// Wiring invariant: the batch-insert lever must call SetSpoolStore before
+		// the drainer can flush. Fail closed rather than run the mark-done
+		// unserialized and reopen the QA-37 race.
+		return nil, fmt.Errorf("batch drain complete: spool store not wired (SetSpoolStore)")
+	}
 
+	// LOCK ORDER: Store.writeMu, then SpoolStore.writeMu, then tx (see docstring).
+	// SpoolStore.writeMu is held across the whole tx so the batched mark-done
+	// serializes against DeleteActiveByPath / MarkDone (QA-37).
 	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.spoolStore.writeMu.Lock()
+	defer s.spoolStore.writeMu.Unlock()
+
 	tx, err := s.db.Begin()
 	if err != nil {
-		s.writeMu.Unlock()
 		return nil, fmt.Errorf("batch drain complete begin: %w", err)
 	}
 	// Rollback is a no-op after a successful Commit.
@@ -83,13 +109,11 @@ func (s *Store) BatchDrainComplete(items []DrainCommitItem) ([]DrainCommitResult
 		if !committed {
 			_ = tx.Rollback()
 		}
-		s.writeMu.Unlock()
 	}()
 
-	results := make([]DrainCommitResult, len(items))
-	for i, it := range items {
-		// (1) size publish onto entries — MAX-only + mtime, identical to
-		//     UpdateSize's SQL. Runs BEFORE the mark-done below (task #65).
+	// (1) size publish onto entries — MAX-only + mtime, identical to UpdateSize's
+	//     SQL. Runs BEFORE every mark-done below (task #65).
+	for _, it := range items {
 		if it.Size > 0 {
 			if _, err := tx.Exec(
 				`UPDATE entries SET size = MAX(size, ?), mtime = ? WHERE path = ?`,
@@ -98,18 +122,16 @@ func (s *Store) BatchDrainComplete(items []DrainCommitItem) ([]DrainCommitResult
 				return nil, fmt.Errorf("batch drain complete update size %q: %w", it.NFSPath, err)
 			}
 		}
-		// (2) mark the spool row done — the eviction trigger. WHERE id only,
-		//     mirroring SpoolStore.MarkDone; rows-affected==0 ⇒ row cancelled
-		//     mid-drain ⇒ Done=false (caller undoes the FUSE write).
-		res, err := tx.Exec(
-			`UPDATE spool_entries SET drain_state=?, updated_at=? WHERE id=?`,
-			DrainDone, it.Mtime.Unix(), it.SpoolID,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("batch drain complete mark done %d: %w", it.SpoolID, err)
-		}
-		n, _ := res.RowsAffected()
-		results[i] = DrainCommitResult{SpoolID: it.SpoolID, Done: n > 0}
+	}
+
+	// (2) mark every spool row done — the eviction trigger — under
+	//     SpoolStore.writeMu (already held), inside this same tx. rows-affected==0
+	//     ⇒ row cancelled mid-drain ⇒ Done=false (caller undoes the FUSE write).
+	//     Kept BELOW the size publishes so entries.size is durable no later than
+	//     the mark-done in the single atomic commit (task #65).
+	results, err := s.spoolStore.batchMarkDoneTx(tx, items)
+	if err != nil {
+		return nil, fmt.Errorf("batch drain complete: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
