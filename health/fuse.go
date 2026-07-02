@@ -1081,6 +1081,21 @@ func fuseSkipEscalateWhileOffline() bool {
 	return fuseOfflineNoEscalate && pin.IsOffline()
 }
 
+// V2.3 U4 (task #74/K3, field report "clicking offline doesn't help"): while
+// the USER has explicitly engaged offline mode, the gone-branch's app-side
+// remount of a dead juicefs is pure churn — a fresh juicefs mount needs the
+// backend anyway, and the user has asked us to stand down. Navigation keeps
+// serving from the SQLite mirror the whole time. AUTO-offline deliberately
+// does NOT gate this (blips must self-heal without user action); the
+// backend-reachability check next to the call site covers that shape.
+// Set JM_FUSE_OFFLINE_REMOUNT=1 to restore the pre-fix always-retry behavior
+// (cellular-revert-safety doctrine).
+var fuseOfflineNoRemount = os.Getenv("JM_FUSE_OFFLINE_REMOUNT") != "1"
+
+func fuseSkipRemountWhileUserOffline() bool {
+	return fuseOfflineNoRemount && pin.IsUserOffline()
+}
+
 // fuseColdStartGrace is how long after the watchdog starts (≈ app start / first
 // mount) the escalation to a destructive SIGKILL+remount is SUPPRESSED. During
 // cold start the JuiceFS mount is legitimately busy warming caches and serving
@@ -1212,6 +1227,7 @@ func (fm *FUSEManager) monitorLoop() {
 	watchdogStart := time.Now() // for the cold-start escalation grace window
 	consecutiveFailures := 0    // ticks where the mount is stale AND juicefs is gone
 	staleWhileAliveTicks := 0   // ticks where the mount is stale but juicefs is alive
+	remountDeferTicks := 0      // gone-branch ticks deferred (user-offline / backend down) — V2.3 U4
 	offlineDeferTicks := 0      // ticks deferred because offline (busy draining, not wedged)
 	for {
 		select {
@@ -1329,6 +1345,31 @@ func (fm *FUSEManager) monitorLoop() {
 			// juicefs is genuinely GONE — its own supervisor exhausted its
 			// retries and exited. App-side recovery is now the only option.
 			staleWhileAliveTicks = 0
+
+			// V2.3 U4: suppress the retry loop when it cannot or should not
+			// succeed. (a) The user engaged offline — stand down until they
+			// come back online (the mirror keeps serving nav). (b) The
+			// backend is unreachable — a fresh juicefs mount needs Redis, so
+			// each attempt just burns a 30s launch timeout and churns macFUSE
+			// state. The next 10s tick re-evaluates both, so recovery is
+			// automatic the moment conditions clear. Rate-limited logging.
+			if fuseSkipRemountWhileUserOffline() {
+				remountDeferTicks++
+				if remountDeferTicks == 1 || remountDeferTicks%30 == 0 {
+					jmlog.Info("juicefs gone but user is OFFLINE — not remounting (mirror serves nav; remount resumes when back online)",
+						"defer_ticks", remountDeferTicks)
+				}
+				continue
+			}
+			if !fm.backendReachable() {
+				remountDeferTicks++
+				if remountDeferTicks == 1 || remountDeferTicks%30 == 0 {
+					jmlog.Info("juicefs gone but backend unreachable — not remounting (a mount cannot succeed; retrying on recovery)",
+						"defer_ticks", remountDeferTicks)
+				}
+				continue
+			}
+			remountDeferTicks = 0
 			consecutiveFailures++
 			jmlog.Warn("juicefs process tree gone — app-side remount",
 				"attempt", consecutiveFailures)
