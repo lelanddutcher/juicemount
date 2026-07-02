@@ -45,6 +45,18 @@ const (
 	// regardless of threshold) and the per-path FUSE Lstat verification
 	// added separately to syncMetadata.
 	PruneThreshold = 10
+
+	// V2.3 G6 (task #79): bounds on the prune ladder's Layer-A per-path FUSE
+	// Lstat verification, mirroring collectFastPathPrunes' probe cap + wall
+	// budget. Proven live 2026-07-02: with ~112k permanent ladder candidates
+	// (SCAN-coverage bug) the UNBOUNDED Layer-A loop ran 86s on LAN and ~90
+	// minutes over a cellular relay (~50ms/Lstat), saturating the link and
+	// pinning "Rebuilding index…" forever. Candidates deferred by these bounds
+	// keep their ladder position (re-inserted into pruneAbsent at their prior
+	// count) so they re-qualify next cycle — deferral, never data loss.
+	// Kill switch: JM_LAYERA_BUDGET=0 restores the unbounded pre-G6 behavior.
+	layerAProbeCap    = 2048            // max ladder candidates Lstat-probed per cycle
+	layerAProbeBudget = 3 * time.Second // max wall time probing ladder candidates
 )
 
 // MetadataEvent represents a real-time metadata change published via Redis SUBSCRIBE.
@@ -1569,7 +1581,14 @@ func (rc *RedisClient) syncMetadata() error {
 		}
 	}
 	// Collect paths that have been absent long enough to prune.
+	//
+	// V2.3 G6: ladderCounts snapshots each candidate's counter BEFORE the
+	// delete below erases it, so Layer A can re-insert budget-deferred
+	// candidates at their prior count (>= PruneThreshold) — preserving ladder
+	// position exactly: a deferred candidate re-qualifies on the very next
+	// cycle instead of restarting the 10-cycle climb.
 	var toDelete []string
+	ladderCounts := make(map[string]int)
 	for p, count := range rc.pruneAbsent {
 		if count >= PruneThreshold {
 			// `._` AppleDouble guard (symmetric with scopedPrune's `._`-skip):
@@ -1584,6 +1603,7 @@ func (rc *RedisClient) syncMetadata() error {
 				continue
 			}
 			toDelete = append(toDelete, p)
+			ladderCounts[p] = count
 			delete(rc.pruneAbsent, p)
 		}
 	}
@@ -1698,57 +1718,11 @@ func (rc *RedisClient) syncMetadata() error {
 		}
 
 		// === Layer A: per-path FUSE Lstat verification ===
-		// Even non-pinned paths shouldn't be pruned if FUSE still shows
-		// them present — that means JuiceFS still has them, Redis SCAN
-		// just happened to miss them this cycle. Each Lstat capped at 1s
-		// so a FUSE wedge can't pin the reconcile goroutine. If more than
-		// 25% of probes time out, treat FUSE as degraded and skip the
-		// whole prune (defensive — degraded FUSE plus blind prune was
-		// what surfaced the bug in production).
+		// Extracted to verifyPruneCandidates (V2.3 G6, task #79) so the
+		// probe-cap / wall-budget / class-gate bounding is unit-testable
+		// without a full syncMetadata run. See the method's doc comment.
 		if len(toDelete) > 0 && rc.fuseRoot != "" {
-			verified := toDelete[:0]
-			lstatTimeouts := 0
-			for _, p := range toDelete {
-				// V2.3 G5: fast-path entries were already FUSE-confirmed at
-				// their subtree root this same cycle — re-Lstat'ing 120k
-				// descendants individually is exactly what root-level
-				// confirmation exists to avoid.
-				if _, ok := fastConfirmed[p]; ok {
-					verified = append(verified, p)
-					continue
-				}
-				fusePath := rc.fusePathFor(p)
-				if fusePath == "" {
-					verified = append(verified, p)
-					continue
-				}
-				isAbsent, ok := lstatNotExistWithTimeout(fusePath, time.Second)
-				if !ok {
-					lstatTimeouts++
-					continue // timed out — don't prune, retry next cycle
-				}
-				if isAbsent {
-					verified = append(verified, p)
-				} else {
-					prunedFUSEpresent++ // FUSE says it's there — keep it
-				}
-			}
-			// QA-30 code review HIGH-3: absolute floor of 4 timeouts before
-			// bailing the whole cycle. Without this, a small batch
-			// (N<=3) trips the bail on a single transient timeout —
-			// effectively a 100%/50%/33% threshold instead of the
-			// intended 25%. Small batches handle individual timeouts
-			// fine via the `continue` above (paths simply stay
-			// unpruned this cycle, retried next time).
-			if lstatTimeouts >= 4 && lstatTimeouts*4 > len(toDelete) {
-				jmlog.Warn("metadata sync: FUSE degraded (>25% Lstat timeouts), skipping prune this cycle",
-					"timeouts", lstatTimeouts,
-					"total_probes", len(toDelete),
-				)
-				toDelete = nil
-			} else {
-				toDelete = verified
-			}
+			toDelete, prunedFUSEpresent = rc.verifyPruneCandidates(toDelete, fastConfirmed, ladderCounts)
 		}
 	}
 
@@ -1800,4 +1774,119 @@ func (rc *RedisClient) syncMetadata() error {
 		"duration_ms", duration.Round(time.Millisecond).Milliseconds(),
 	)
 	return nil
+}
+
+// verifyPruneCandidates is the prune ladder's Layer A: per-path FUSE Lstat
+// verification (QA-30), extracted from syncMetadata by V2.3 G6 (task #79) so
+// its bounding is unit-testable. Even non-pinned paths shouldn't be pruned if
+// FUSE still shows them present — that means JuiceFS still has them, Redis
+// SCAN just happened to miss them this cycle. Each Lstat capped at 1s so a
+// FUSE wedge can't pin the reconcile goroutine. If more than 25% of probes
+// time out, treat FUSE as degraded and skip the whole prune (defensive —
+// degraded FUSE plus blind prune was what surfaced the bug in production).
+//
+// V2.3 G6 bounding (task #79, proven live 2026-07-02): the loop is bounded
+// the same way as collectFastPathPrunes — layerAProbeCap probes / a
+// layerAProbeBudget wall clock. Without bounds, a large permanent candidate
+// backlog (~112k from a SCAN-coverage bug) ran 86s on LAN and ~90 min over a
+// cellular relay, saturating the link. Once EITHER bound trips, every
+// remaining unprobed LADDER candidate is deferred: NOT pruned this cycle and
+// re-inserted into rc.pruneAbsent at its prior counter (from ladderCounts, or
+// PruneThreshold if unknown), so it keeps its ladder position and re-qualifies
+// on the very next cycle. fastConfirmed entries are exempt from all gates —
+// their subtree root was FUSE-confirmed this same cycle (G5), so re-Lstat'ing
+// 120k descendants individually is exactly what root-level confirmation
+// exists to avoid.
+//
+// Class gate: on the metered/tunnel band (currentLinkClass() == classTunnel:
+// utun*/tailscale0/JM_WAN_MODE=1 — same accessor as the keyspace backstop and
+// coalescer gating) ladder candidates are NEVER probed — each Lstat costs an
+// NFS/FUSE round-trip over the metered link (~50ms each observed on the
+// cellular relay). All ladder candidates are deferred; deferral is the
+// fail-safe direction (a delayed prune costs a cycle of stale entries, an
+// unverified prune is the ESTALE bug class). fastConfirmed entries still
+// prune: they were root-verified already.
+//
+// Kill switch: JM_LAYERA_BUDGET=0 (read per call, like JM_PRUNE_FASTPATH)
+// restores the pre-G6 unbounded, un-gated behavior exactly.
+//
+// Caller contract: single-writer — runs on syncMetadata's goroutine only
+// (rc.pruneAbsent mutation). rc.fuseRoot must be non-empty. Returns the
+// verified (prunable) subset — nil when the FUSE-degraded bail trips — plus
+// the count of FUSE-present spared paths.
+func (rc *RedisClient) verifyPruneCandidates(toDelete []string, fastConfirmed map[string]struct{}, ladderCounts map[string]int) (prunable []string, fusePresent int) {
+	unbounded := os.Getenv("JM_LAYERA_BUDGET") == "0"
+	deferClass := !unbounded && currentLinkClass() == classTunnel
+	if rc.pruneAbsent == nil {
+		rc.pruneAbsent = make(map[string]int)
+	}
+	verified := toDelete[:0]
+	lstatTimeouts, probed, deferred := 0, 0, 0
+	probeStart := time.Now()
+	for _, p := range toDelete {
+		// V2.3 G5: fast-path entries were already FUSE-confirmed at
+		// their subtree root this same cycle.
+		if _, ok := fastConfirmed[p]; ok {
+			verified = append(verified, p)
+			continue
+		}
+		// V2.3 G6: defer the remaining ladder candidates once the class gate
+		// or either budget bound trips. Re-insert at the prior counter so the
+		// ladder position survives (see doc comment).
+		if deferClass || (!unbounded &&
+			(probed >= layerAProbeCap || time.Since(probeStart) > layerAProbeBudget)) {
+			deferred++
+			count, ok := ladderCounts[p]
+			if !ok {
+				count = PruneThreshold
+			}
+			rc.pruneAbsent[p] = count
+			continue
+		}
+		fusePath := rc.fusePathFor(p)
+		if fusePath == "" {
+			verified = append(verified, p)
+			continue
+		}
+		probed++
+		isAbsent, ok := lstatNotExistWithTimeout(fusePath, time.Second)
+		if !ok {
+			lstatTimeouts++
+			continue // timed out — don't prune, retry next cycle
+		}
+		if isAbsent {
+			verified = append(verified, p)
+		} else {
+			fusePresent++ // FUSE says it's there — keep it
+		}
+	}
+	if deferred > 0 {
+		reason := "budget"
+		if deferClass {
+			reason = "class_gate"
+		}
+		jmlog.Info("metadata sync: Layer-A prune verification bounded — deferring unprobed candidates (G6)",
+			"reason", reason,
+			"class", currentLinkClass().String(),
+			"probed", probed,
+			"verified", len(verified),
+			"deferred", deferred,
+			"elapsed_ms", time.Since(probeStart).Round(time.Millisecond).Milliseconds(),
+		)
+	}
+	// QA-30 code review HIGH-3: absolute floor of 4 timeouts before
+	// bailing the whole cycle. Without this, a small batch
+	// (N<=3) trips the bail on a single transient timeout —
+	// effectively a 100%/50%/33% threshold instead of the
+	// intended 25%. Small batches handle individual timeouts
+	// fine via the `continue` above (paths simply stay
+	// unpruned this cycle, retried next time).
+	if lstatTimeouts >= 4 && lstatTimeouts*4 > len(toDelete) {
+		jmlog.Warn("metadata sync: FUSE degraded (>25% Lstat timeouts), skipping prune this cycle",
+			"timeouts", lstatTimeouts,
+			"total_probes", len(toDelete),
+		)
+		return nil, fusePresent
+	}
+	return verified, fusePresent
 }

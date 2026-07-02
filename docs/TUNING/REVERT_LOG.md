@@ -192,3 +192,48 @@ ever applies WHILE PUSH IS HEALTHY + REACHABLE. tunnel stays <= lan/wifi.
 **Full revert:** `JM_METADATA_KEYSPACE_PUSH=0` (disables push → 30s SCAN,
 byte-identical to pre-keyspace-push) OR `JM_RECONCILE_BACKSTOP_SEC=300`. Baseline:
 keyspace.go backstopForClass 10/15/5m.
+
+---
+
+## 2026-07-02 — G6: Layer-A prune verification budgeted + class-gated (task #79)
+
+**What:** `syncMetadata`'s prune-ladder "Layer A: per-path FUSE Lstat
+verification" (metadata/redis.go, extracted to `verifyPruneCandidates`) was
+UNBOUNDED — every ladder candidate got a 1s-capped Lstat with no total budget.
+Proven live 2026-07-02: a SCAN-coverage bug left ~112k permanent candidates,
+so a threshold-crossing cycle ran **86s on LAN** and **~90 min over a cellular
+relay** (~50ms/Lstat), saturating the link and pinning "Rebuilding index…"
+forever. Two changes, both fail-safe (deferral, never an unverified prune):
+
+1. **Budget** — same bounding pattern as `collectFastPathPrunes`:
+   `layerAProbeCap = 2048` probes / `layerAProbeBudget = 3s` wall per cycle.
+   Once either trips, remaining unprobed ladder candidates are deferred and
+   re-inserted into `pruneAbsent` at their PRIOR counter (captured before the
+   ladder collection erases it), so they keep their ladder position and
+   re-qualify on the very next cycle — no 10-cycle restart, no unverified
+   prune. One log line per bounded cycle: probed/verified/deferred + elapsed.
+2. **Class gate** — on the tunnel/cellular band (`currentLinkClass() ==
+   classTunnel`: `utun*`/`tailscale0`/`JM_WAN_MODE=1` — same accessor as the
+   backstop + coalescer gating) ladder candidates are never probed at all
+   (each Lstat is a metered round-trip); ALL are deferred at prior count.
+   G5 `fastConfirmed` entries are exempt from both gates — root-verified this
+   same cycle, they still prune (a deleted tree costs a handful of root
+   Lstats, which is exactly the cheap path the gate preserves).
+
+**Kill switch (env, no rebuild, read per cycle like `JM_PRUNE_FASTPATH`):**
+
+| `JM_LAYERA_BUDGET` | Effect |
+|---|---|
+| unset / anything else (default) | cap 2048 / 3s budget + tunnel-class deferral |
+| `0` | restores the pre-G6 behavior EXACTLY: unbounded per-candidate probing, no class gate |
+
+**Revert:** `JM_LAYERA_BUDGET=0`, or restore the inline Layer-A loop from the
+parent of this commit. Baseline behavior on 10GbE/LAN is unchanged for any
+cycle with fewer than 2048 candidates finishing under 3s (the normal case).
+
+**Validated:** unit (`TestLayerABudgetDefersUnprobedCandidates`,
+`TestLayerAKillSwitchRestoresUnbounded`,
+`TestLayerAMeteredClassDefersLadderButNotFastPath`, + full metadata suite
+incl. -race on the prune tests). **Pending:** live cellular-relay validation
+that a threshold-crossing cycle stays <5s and "Rebuilding index…" clears
+(unit tests give false positives on this codebase per testing discipline).
