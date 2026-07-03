@@ -47,6 +47,11 @@ func TestBulkInsertStaysIncrementalAfterInit(t *testing.T) {
 	if err := s.BulkInsert(big, 500); err != nil {
 		t.Fatal(err)
 	}
+	// Drain any deferred FTS backlog so the searchability assertions below hold
+	// under JM_FTS_DEFER=1 (no-op when the flag is off — fts_pending is empty).
+	if _, err := s.drainFTSPendingForTest(); err != nil {
+		t.Fatal(err)
+	}
 
 	// THE decisive check: the large post-init delta must NOT have run a full
 	// RebuildFTS (the writeMu-long-hold QA-40 stall). On the pre-fix code

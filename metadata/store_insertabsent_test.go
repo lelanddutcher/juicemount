@@ -37,6 +37,11 @@ func TestBulkInsertAbsentNeverOverwritesFresherRow(t *testing.T) {
 	if err := s.BulkInsertAbsent(batch, 500); err != nil {
 		t.Fatalf("BulkInsertAbsent: %v", err)
 	}
+	// Drain any deferred FTS backlog so the FTS-hit assertion below holds under
+	// JM_FTS_DEFER=1 (no-op when the flag is off — fts_pending is empty).
+	if _, err := s.drainFTSPendingForTest(); err != nil {
+		t.Fatalf("drainFTSPendingForTest: %v", err)
+	}
 
 	// Fresh size survives in the serving cache…
 	got := s.LookupByPath("d/a.mov")
