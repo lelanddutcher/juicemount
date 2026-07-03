@@ -7,6 +7,64 @@ a rebuild**.
 
 ---
 
+## 2026-07-03 — Perf lever: defer FTS5 trigram indexing off the write path (`JM_FTS_DEFER`)
+
+Env-revertable without a rebuild. Motivation: under write storms (a large Finder
+copy / SD-card offload / reconcile delta) the synchronous FTS5 **trigram** merge
+was ~30% of metadata-write CPU. The `entries_fts` external-content index
+(trigram tokenizer over name+path) is maintained synchronously in Go — every
+`Insert` / incremental `BulkInsert` row does the expensive `_fts5*` trigram
+INSERT inside the write transaction, on the hot path that also serves NFS
+CREATEs. `#86/#88` moves that trigram INSERT OFF the write path.
+
+**Lever — defer the NEW-rowid trigram INSERT to a background compactor.** When
+ON (`JM_FTS_DEFER=1`), the write path keeps the cheap work synchronous and
+records the new rowid in a durable `fts_pending(rowid)` marker table instead of
+doing the trigram merge. A background goroutine (`ftsCompactorLoop`, started in
+`Open` only when the flag is on, stopped in `Close`) drains `fts_pending` in
+**bounded, coalesced batches** (`ftsCompactBatch`≈256 rows per `writeMu`-held tx,
+`ftsCompactIdleSleep`≈2ms yield between batches, `ftsCompactTick`≈200ms idle
+ticker + an explicit wake after each deferred write), so it never holds `writeMu`
+long enough to starve foreground NFS serving or reconcile. Search stays
+eventually-consistent: a just-created file is not searchable until the compactor
+indexes it (sub-second), which is acceptable and expected.
+
+- **`JM_FTS_DEFER`** — the A/B flag. **Default OFF** (unset / any value other
+  than `1`): the write path is **byte-identical** to today's synchronous FTS —
+  `ftsExternalUpsert` does the trigram INSERT inline, `fts_pending` stays empty,
+  no compactor goroutine is started, and search is immediately correct. Set
+  `JM_FTS_DEFER=1` to defer. Read once at `Open` (`ftsDeferEnabled()` →
+  `s.ftsDefer`), so a revert is: unset the env and restart (no rebuild).
+
+**INTEGRITY — the rowid-lifecycle landmine (preserved).** External-content FTS5
+has NO triggers, so the OLD rowid's tokens must be removed synchronously before
+that rowid can be freed and reused by a later `INSERT OR REPLACE`; otherwise a
+stale token resolves to an unrelated file (a WRONG search hit) and violates FTS5
+integrity. This removal stays SYNCHRONOUS in the write path via the new
+`ftsDeleteOldRowid` helper, which handles BOTH index states the old row can be
+in: if the old row was already INDEXED it issues the external-content
+`entries_fts('delete', rowid, name, path)`; if the old row was STILL PENDING
+(deferred, never indexed) it must NOT issue that `'delete'` (subtracting
+never-inserted tokens corrupts the index — "database disk image is malformed")
+and instead only clears the pending marker. Only the NEW-rowid trigram INSERT is
+ever deferred. `Delete` / `DeletePaths` route through the same helper.
+
+**Crash safety.** `fts_pending` is durable (same WAL DB as `entries`, written in
+the SAME tx as the entries row). After a crash+restart, `Open`'s existing
+`RebuildFTS` re-derives the FULL index from `entries` (the external-content
+backstop — always rebuildable) and clears `fts_pending`; any surviving markers
+are also drained by the compactor. No FTS data is ever lost, only deferred. The
+spool `RecoverOnBoot` path is untouched.
+
+**Revert.** Unset `JM_FTS_DEFER` (or set `≠1`) and restart. Flag-off is the
+pre-lever synchronous behavior; `fts_pending` simply stays empty (the table is
+created unconditionally — additive `CREATE IF NOT EXISTS` — so toggling the flag
+never needs a schema migration). No rebuild required. Tuning knobs
+(`ftsCompactBatch`, `ftsCompactIdleSleep`, `ftsCompactTick`) are package vars,
+adjustable only via a rebuild, but the on/off switch is env-only.
+
+---
+
 ## 2026-07-02 — Perf Lever 0: DSN-pin `synchronous=NORMAL` across all pooled connections (`JM_SQLITE_SYNC_NORMAL_ALL`)
 
 Env-revertable without a rebuild. Motivation: the same CPU profile that
