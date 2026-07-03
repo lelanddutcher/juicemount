@@ -1270,6 +1270,28 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		FUSEPath:      cfg.FUSEPath,
 		NFSMountPoint: cfg.MountPoint,
 	})
+	// #89 online busy-suppression: give the health monitor a lock-free view of
+	// the drainer's live ingest state so a stat/readdir TIMEOUT during a
+	// legitimate high-concurrency ingest is reported as "busy (heavy ingest)"
+	// rather than the false "mount losing communication" degraded state. Mirrors
+	// the reachability WithLivenessHook idiom EXACTLY (read the drainer via the
+	// dedicated atomic, never globalMu — the probe runs on the health-check
+	// goroutine and must not block on NFSServerStart holding globalMu). Nil
+	// drainer (spool disabled / server stopped) → inFlight 0 + MaxInt64 age
+	// sentinel → busyIngesting() is false → no suppression (byte-identical to
+	// the pre-drainer behavior).
+	globalMonitor.SetDrainProbe(func() (int64, time.Duration) {
+		d := globalDrainerAtomic.Load()
+		if d == nil {
+			return 0, time.Duration(math.MaxInt64)
+		}
+		inFlight := d.Metrics().InFlight.Load()
+		since := time.Duration(math.MaxInt64)
+		if last := d.LastDrainSuccess(); !last.IsZero() {
+			since = time.Since(last)
+		}
+		return inFlight, since
+	})
 	// LB-2: auto-remount for a stale/unmounted NFS volume — the same hook
 	// the jm5 CLI has always wired. STRICTLY the non-interactive tier
 	// (passwordless sudo): an unattended health tick must never pop an

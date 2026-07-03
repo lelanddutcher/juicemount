@@ -7,6 +7,53 @@ a rebuild**.
 
 ---
 
+## 2026-07-03 — #89 fix: suppress false "degraded" during a legitimate heavy ingest (online drain-InFlight busy analogue)
+
+**What.** `health/monitor.go` + `bridge/cbridge.go`. The health watchdog's 5 s
+FUSE/NFS stat probe flipped to "component degraded" whenever a FOREGROUND stat
+timed out — which happens under a LEGITIMATE high-concurrency ingest (the drain's
+synchronous MinIO PUTs saturate the FUSE request queue). A busy-suppression
+existed ONLY for `pin.IsOffline()` (the `checkFUSE` readdir timeout), so a heavy
+ingest ONLINE surfaced as the Finder "mount losing communication" report even
+though the mount was fine. This is purely the REPORTING layer — the destructive
+remount path already defers safely (never SIGKILLs).
+
+**Fix.** Added an ONLINE analogue of the offline busy-suppression. A new
+`HealthMonitor.drainProbe` hook (wired from bridge via `globalDrainerAtomic`,
+mirroring the reachability `WithLivenessHook` idiom so `health` keeps NO `nfs`
+import) reports the drainer's live `InFlight` count and time-since-last-completed
+drain. The predicate `busyIngesting()` is true when `InFlight > 0` OR the last
+drain completed within `DrainBusyRecentWindow` (15 s). It is consulted at the
+THREE stat/readdir TIMEOUT sites — `checkFUSE` stat-timeout (Check 1),
+`checkFUSE` readdir-timeout (Check 3, next to the existing offline branch), and
+`checkNFS` stat-timeout — and, when true, reports `Healthy:true` / "busy (heavy
+ingest)" instead of degraded. Logged at INFO on every suppression.
+
+**TIMEOUT-only invariant.** Suppression is wired ONLY into the
+`<-time.After(...)` branches. A genuine error / ENOTCONN resolves via the
+`done`/`statDone` channel and STILL degrades — verified by
+`TestCheckNFSResolvedErrorAlwaysDegrades`. The `mountResponsiveWithin` /
+`fuse.go` destructive remount decision is UNTOUCHED (already safe).
+
+**Kill switch / revert.** No env kill switch (reporting-only, fail-safe: a nil
+drain probe → `busyIngesting()` always false → byte-identical pre-fix behavior).
+`DrainBusyRecentWindow` is a package var overridable in tests. To revert: drop
+the `busyIngesting()` guards at the three timeout sites, the `drainProbe` field +
+`SetDrainProbe`/`busyIngesting` in `health/monitor.go`, and the
+`globalMonitor.SetDrainProbe(...)` wiring in `bridge/cbridge.go`. Requires a
+rebuild. Reverting reintroduces the false "mount losing communication" report
+under heavy ingest.
+
+**Build.** Go-only change; `go build ./...` + `go vet ./health/ ./nfs/ ./bridge/`
+clean; `go test ./health/ -race` green for the new tests
+(`TestBusyIngestingPredicate`, `TestCheckNFSResolvedErrorAlwaysDegrades`,
+`TestCheckNFSNotConfiguredIsHealthy`). Three pre-existing tests
+(`TestRedisHealthCheck`, `TestMinIOHealthCheck`, `TestStatusReturnsCorrectState`)
+require a live Redis/MinIO and fail environmentally in CI regardless of this
+change (confirmed on the clean parent tree).
+
+---
+
 ## 2026-07-03 — #90 fix: class-gated push backstop must win over the 300s config seed (cellular full-SCAN churn)
 
 **What.** `metadata/redis.go` + `metadata/keyspace.go`. The keyspace-push
