@@ -1008,3 +1008,51 @@ env flag). Reverting reintroduces the truncated-stat-after-write bug.
 full high-water). `gofmt`/`go vet` clean; `nfs`/`internal/nfs`/`metadata` green
 under `-race` (only the known-environmental `TestMemBuf*` async-load failures,
 unrelated).
+
+---
+
+## 2026-07-02 — #87: un-gate Go-core start from the network preflight (first-launch hang)
+
+Compiled behavior (Swift), NOT an env flag — reverting requires a rebuild.
+
+**What.** On the ALREADY-ONBOARDED launch path
+(`app/JuiceMount/Sources/JuiceMount/App.swift`, the `else` branch of
+`applicationDidFinishLaunching`), `server.start()` is now called IMMEDIATELY and
+synchronously — no `await` on the Redis TCP dial. The `OnboardingPreflight` now
+runs only as a NON-BLOCKING diagnostic in a `Task.detached` that can never hold
+back start(): it re-opens the setup assistant ONLY for LOCAL hard-stops
+(`report.juicefsPath == nil || !report.macFUSEInstalled`), never merely for an
+unreachable backend (the Go core boots offline via R-4 and self-recovers). The
+genuinely-first-run onboarding `if` branch is UNCHANGED — a brand-new user still
+onboards before the core starts.
+
+**Why.** First launch after install/update hung ~150 s because `server.start()`
+was gated on `report.criticalOK`, which requires `backendReachable` — a cold
+`tcpReachable` NWConnection dial to Redis. On a cold first-connect that dial
+stalls, and its 3 s watchdog was scheduled on the SAME serial queue as the
+connection so it could not fire. The Go core needs nothing from the preflight
+(`start()` reads only `preferences.toServerConfig()`) and already supports
+start-while-offline, so gating the mount on the dial was pure, removable latency.
+
+**Two supporting changes (same commit):**
+- `app/JuiceMount/Sources/JuiceMount/UI/MenuBarController.swift`:
+  `SPUStandardUpdaterController(startingUpdater: false, …)` + a deferred
+  `updaterController.startUpdater()` fired `DispatchQueue.main.asyncAfter(+12 s)`
+  — no Sparkle feed fetch in the launch window. (Sparkle 2.9.3; `startUpdater()`
+  is the documented public API for the `startingUpdater:false` path.)
+- `app/JuiceMount/Sources/JuiceMount/UI/OnboardingWindowView.swift`
+  `tcpReachable`: the 3 s watchdog `asyncAfter` now runs on an INDEPENDENT
+  `com.juicemount.preflight.timeout` queue (not the connection's
+  `com.juicemount.preflight.dial` queue), so a wedged NWConnection setup can no
+  longer starve its own timeout. `finish()` is guarded by an `NSLock` so the
+  continuation still resumes exactly once regardless of which queue fires first.
+
+**Revert:** restore the `else`-branch body to `Task { … if report.criticalOK {
+server.start() } else { openOnboardingWindow() } }`, set Sparkle back to
+`startingUpdater: true` (drop the deferred `startUpdater()` call), and move the
+`tcpReachable` timeout back onto the dial `queue` (dropping the lock). Requires a
+rebuild. Reverting reintroduces the ~150 s first-launch hang.
+
+**Build:** `swift build -c release` of `app/JuiceMount` (with the build script's
+`-L build -lnfsd` + framework link flags) compiles clean — Swift-only change;
+no Go/c-archive change.

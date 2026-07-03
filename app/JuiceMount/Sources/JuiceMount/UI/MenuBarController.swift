@@ -13,12 +13,16 @@ final class MenuBarController: NSObject {
     private let statusItem: NSStatusItem
     private let popover: NSPopover
 
-    /// Sparkle auto-updater. `startingUpdater: true` schedules the background
-    /// check loop (SUEnableAutomaticChecks / SUScheduledCheckInterval in
-    /// Info.plist drive the cadence). Feed URL + EdDSA public key also come
-    /// from Info.plist, so no programmatic configuration is needed here.
-    /// Retained for the process lifetime via this controller (which the
-    /// AppDelegate owns) so the scheduled checks keep running.
+    /// Sparkle auto-updater. #87: constructed with `startingUpdater: false`
+    /// so nothing touches the network during the launch critical path — a
+    /// cold Sparkle feed fetch at launch competed with the core start and
+    /// worsened the first-launch hang. `startUpdater()` is called ~12 s after
+    /// launch (once the core is up) to kick off the background check loop
+    /// (SUEnableAutomaticChecks / SUScheduledCheckInterval in Info.plist drive
+    /// the cadence). Feed URL + EdDSA public key also come from Info.plist, so
+    /// no programmatic configuration is needed here. Retained for the process
+    /// lifetime via this controller (which the AppDelegate owns) so the
+    /// scheduled checks keep running.
     private let updaterController: SPUStandardUpdaterController
 
     private var searchWindow: NSWindow?
@@ -38,8 +42,10 @@ final class MenuBarController: NSObject {
         // Construct the Sparkle updater before super.init so it's a fully
         // initialized stored property. No custom delegate/driver — Info.plist
         // carries the feed URL, public key, and check schedule.
+        // #87: startingUpdater:false keeps Sparkle off the launch critical
+        // path; startUpdater() is invoked below, deferred past the core start.
         self.updaterController = SPUStandardUpdaterController(
-            startingUpdater: true,
+            startingUpdater: false,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
@@ -51,6 +57,14 @@ final class MenuBarController: NSObject {
 
         // Re-render the icon whenever server state changes
         startStateObservation()
+
+        // #87: kick off Sparkle's background update loop only AFTER the core
+        // is up (~12 s), so no Sparkle feed fetch happens in the launch window.
+        // startUpdater() invokes -[SPUUpdater startUpdater:]; the scheduled
+        // checks then run on the Info.plist cadence.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+            self?.updaterController.startUpdater()
+        }
     }
 
     deinit {
