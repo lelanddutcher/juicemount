@@ -91,6 +91,15 @@ PRAGMA cache_size = -8000;
 PRAGMA busy_timeout = 30000;
 `
 
+// syncNormalAllEnabled reports whether Lever 0 is on: pin synchronous=NORMAL
+// across ALL pooled connections via a DSN _pragma (see OpenWithMaxCacheSize).
+// Read once at Open. Default OFF: flag-off is byte-identical to today's
+// behavior (NORMAL on the single connection that runs db.Exec(pragmas), FULL
+// on the other SetMaxOpenConns(8)-1 connections).
+func syncNormalAllEnabled() bool {
+	return os.Getenv("JM_SQLITE_SYNC_NORMAL_ALL") == "1"
+}
+
 // DefaultMaxCacheSize is the default maximum number of entries in the in-memory caches.
 const DefaultMaxCacheSize = 500_000
 
@@ -490,6 +499,27 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		sep = "&"
 	}
 	dsn += sep + "_pragma=busy_timeout(30000)"
+
+	// Lever 0 (JM_SQLITE_SYNC_NORMAL_ALL): pin synchronous=NORMAL across EVERY
+	// pooled connection via a DSN _pragma, for the SAME per-connection reason as
+	// busy_timeout above. `synchronous` is a per-CONNECTION setting, so the
+	// `PRAGMA synchronous = NORMAL` inside `pragmas` (run via db.Exec below)
+	// only takes on the ONE pooled connection that happened to execute it; with
+	// SetMaxOpenConns(8) the other 7 fall back to SQLite's default synchronous=
+	// FULL. Under write load, commits fan out across all 8 connections, so most
+	// commits pay FULL-mode's extra fsync + directory sync — a large slice of
+	// the profiled 22% (*Tx).Commit cost. Appending &_pragma=synchronous(1)
+	// (1 == NORMAL) makes modernc apply NORMAL to every connection it opens, so
+	// all 8 match the app's ALREADY-INTENDED durability level (NORMAL under WAL,
+	// declared in `pragmas`) instead of 7 silently running STRICTER FULL. This
+	// does NOT weaken durability below intent, and journal_mode (a DB-header
+	// setting, correctly Exec-once) is untouched. Default OFF for a clean A/B:
+	// flag-off == today's behavior (NORMAL on 1 conn, FULL on 7); flag-on ==
+	// NORMAL on all 8. The db.Exec(pragmas) below is kept as-is (harmless).
+	if syncNormalAllEnabled() {
+		dsn += "&_pragma=synchronous(1)"
+	}
+
 	// _txlock=immediate: every transaction takes SQLite's write lock at
 	// Begin() instead of upgrading at the first write statement. A DEFERRED
 	// tx that SELECTs and then UPDATEs can hit SQLITE_BUSY *immediately* on

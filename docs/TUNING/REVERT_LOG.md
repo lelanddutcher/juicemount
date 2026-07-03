@@ -7,6 +7,53 @@ a rebuild**.
 
 ---
 
+## 2026-07-02 — Perf Lever 0: DSN-pin `synchronous=NORMAL` across all pooled connections (`JM_SQLITE_SYNC_NORMAL_ALL`)
+
+Env-revertable without a rebuild. Motivation: the same CPU profile that
+motivated Lever 1 showed ~22% in `database/sql.(*Tx).Commit`. A reducible
+contributor is a per-connection pragma footgun in `metadata/store.go`. The
+metadata DB sets `PRAGMA synchronous = NORMAL` inside the `pragmas` string and
+applies it via `db.Exec(pragmas)` — but `synchronous` is a **per-connection**
+setting, so `db.Exec` only takes on the ONE pooled connection that ran it. With
+`db.SetMaxOpenConns(8)` the other 7 connections fall back to SQLite's default
+`synchronous = FULL` (an extra fsync + directory sync per commit). Under write
+load, commits fan out across all 8 connections, so most commits pay FULL-mode's
+double-fsync — a large slice of the profiled 22% Commit cost. (This is the SAME
+class of bug already fixed for `busy_timeout`, which is correctly set as a DSN
+`_pragma` so modernc applies it to every connection. `journal_mode = WAL` is a
+DB-header setting, so `Exec`-once is fine — only `synchronous` is
+per-connection.)
+
+**Lever 0 — pin `synchronous=NORMAL` on EVERY pooled connection via a DSN
+`_pragma`.** When ON, `OpenWithMaxCacheSize` appends `&_pragma=synchronous(1)`
+(1 == NORMAL) to the DSN, right after the `busy_timeout(30000)` DSN pragma, so
+modernc applies NORMAL to all 8 connections. The existing `db.Exec(pragmas)` is
+kept as-is (harmless; the DSN pragma is what makes NORMAL apply everywhere).
+
+- **`JM_SQLITE_SYNC_NORMAL_ALL`** — the A/B flag. **Default OFF** (unset / any
+  value other than `1`): behavior is byte-identical to today — NORMAL on the one
+  connection that runs `db.Exec(pragmas)`, FULL on the other 7. Set
+  `JM_SQLITE_SYNC_NORMAL_ALL=1` to pin NORMAL on all 8. Read once at `Open`
+  (`syncNormalAllEnabled()`), so a revert is: unset the env and restart (no
+  rebuild).
+
+**Correctness — does NOT weaken durability below intent.** `synchronous=NORMAL`
+under WAL is ALREADY the app's declared durability level (it is in `pragmas`);
+this change only makes the other 7 connections MATCH that intent instead of
+silently running STRICTER `FULL`. `journal_mode` is untouched (stays WAL). Under
+WAL, NORMAL is crash-safe (a checkpoint fsyncs the WAL); a power loss can lose
+only the last un-checkpointed transactions, which is the durability envelope the
+app already accepted on connection #1. Verified: `TestSQLiteSyncNormalAllPins
+EveryConnection` forces 16 concurrent pinned connections (2× the pool) and
+asserts every one reports `synchronous == 1`; `TestSQLiteSyncNormalAllCrash
+Recovery` round-trips a committed row across a Close/reopen with the flag on and
+asserts `journal_mode` stays `wal`.
+
+**Baseline it reverts to:** `JM_SQLITE_SYNC_NORMAL_ALL` unset → the
+NORMAL-on-1 / FULL-on-7 behavior that shipped before this change.
+
+---
+
 ## 2026-07-02 — Perf Lever 1: batch drain metadata SQLite writes (`JM_DRAIN_BATCH_INSERT`)
 
 Env-revertable without a rebuild. Motivation: a CPU profile under a concurrent
