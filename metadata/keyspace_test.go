@@ -285,6 +285,96 @@ func TestBackstopAndTuningOrdering(t *testing.T) {
 	SetClassSignals(nil, nil) // reset global hooks for other tests
 }
 
+// TestReconcileBackstopPrecedence locks the #90 fix: the class-gated push
+// backstop must WIN over the 300s config seed. Before the fix, the config seed
+// (SetReconcileInterval, default 300s) wrote STRAIGHT into backstopNanos,
+// clobbering the 900s+ class value so a full ~247k-key SCAN fired every 300s on
+// every link class forever (the push backstop never engaged). The fix splits the
+// config into its own field and resolves precedence via resolveBackstop:
+//
+//   - push ENABLED + reachable + config=300s + tunnel class  -> class value (>=900s), NOT 300s
+//   - config can LENGTHEN the push backstop but never SHORTEN it below the floor
+//   - JM_RECONCILE_BACKSTOP_SEC still wins over both
+//   - push DISABLED -> the config cadence still applies (non-push fallback)
+func TestReconcileBackstopPrecedence(t *testing.T) {
+	t.Setenv("JM_WAN_MODE", "")
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "")
+
+	// --- push ENABLED + tunnel + config=300s: class value must win, NOT 300s ---
+	// JM_WAN_MODE=1 forces the tunnel/cellular class regardless of interface.
+	t.Setenv("JM_WAN_MODE", "1")
+	SetClassSignals(func() string { return "en21" }, func() bool { return true })
+	rc := &RedisClient{}
+	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+
+	// Seed the config to 300s (the exact value cfg.reconcileInterval() supplies).
+	rc.SetReconcileInterval(300 * time.Second)
+	// With push DISABLED (default engaged state), the config cadence applies —
+	// this is the non-push fallback path, so 300s is the honored value.
+	if got := rc.currentBackstop(); got != 300*time.Second {
+		t.Fatalf("push DISABLED + config=300s: backstop = %v, want 300s (config cadence)", got)
+	}
+
+	// Now engage push. The class-gated floor (tunnel = 15m here) must WIN over
+	// the 300s config seed — this is the crux of #90.
+	rc.setEngagement(keyspaceEnabled)
+	classFloor := backstopForClass(classTunnel)
+	if classFloor < 900*time.Second {
+		t.Fatalf("test premise broken: tunnel class floor %v < 900s", classFloor)
+	}
+	if got := rc.currentBackstop(); got != classFloor {
+		t.Fatalf("push ENABLED + tunnel + config=300s: backstop = %v, want class floor %v (NOT 300s)", got, classFloor)
+	}
+	if got := rc.currentBackstop(); got == 300*time.Second {
+		t.Fatalf("REGRESSION #90: config 300s clobbered the class backstop")
+	}
+
+	// --- config can LENGTHEN but never SHORTEN below the class floor ---
+	// A config LONGER than the class floor takes effect (max wins).
+	longer := classFloor + 30*time.Minute
+	rc.SetReconcileInterval(longer)
+	if got := rc.currentBackstop(); got != longer {
+		t.Fatalf("push ENABLED + config LONGER than floor: backstop = %v, want %v (config lengthens)", got, longer)
+	}
+	// A config SHORTER than the class floor is floored to the class value.
+	rc.SetReconcileInterval(60 * time.Second)
+	if got := rc.currentBackstop(); got != classFloor {
+		t.Fatalf("push ENABLED + config SHORTER than floor: backstop = %v, want class floor %v (never shorten)", got, classFloor)
+	}
+
+	// --- JM_RECONCILE_BACKSTOP_SEC override wins over both class and config ---
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "1800") // 30m
+	rc.setEngagement(keyspaceEnabled)             // re-resolve with the override live
+	if got := rc.currentBackstop(); got != 30*time.Minute {
+		t.Fatalf("env override + push ENABLED: backstop = %v, want 30m (override wins)", got)
+	}
+	// The override also wins on the non-push path.
+	rc.setEngagement(keyspaceDisabled)
+	if got := rc.currentBackstop(); got != 30*time.Minute {
+		t.Fatalf("env override + push DISABLED: backstop = %v, want 30m (override wins)", got)
+	}
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "")
+
+	// --- push DISABLED: the config cadence still applies (non-push fallback) ---
+	// The last SetReconcileInterval above set the config seed to 60s; with push
+	// DISABLED and no env override, that config cadence drives the SCAN directly
+	// (NOT floored to the class value — the floor only applies on the push path).
+	rc.setEngagement(keyspaceDisabled)
+	if got := rc.currentBackstop(); got != 60*time.Second {
+		t.Fatalf("push DISABLED after override cleared: backstop = %v, want 60s (config cadence, last set)", got)
+	}
+	// A fresh client with a 300s config and push disabled must serve 300s, not 30s.
+	rc2 := &RedisClient{}
+	rc2.backstopNanos.Store(int64(DefaultReconcileInterval))
+	rc2.SetReconcileInterval(300 * time.Second)
+	if got := rc2.currentBackstop(); got != 300*time.Second {
+		t.Fatalf("fresh client + config=300s + push DISABLED: backstop = %v, want 300s", got)
+	}
+
+	t.Setenv("JM_WAN_MODE", "")
+	SetClassSignals(nil, nil)
+}
+
 // TestNetworkChangeDeferralPredicate locks the exact gate the reconcileLoop
 // syncNowCh handler uses to DEFER a network-change full SCAN to the keyspace
 // push: currentBackstop() > DefaultReconcileInterval. That is true IFF the push

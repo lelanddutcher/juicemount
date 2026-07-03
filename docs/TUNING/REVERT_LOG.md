@@ -7,6 +7,49 @@ a rebuild**.
 
 ---
 
+## 2026-07-03 — #90 fix: class-gated push backstop must win over the 300s config seed (cellular full-SCAN churn)
+
+**What.** `metadata/redis.go` + `metadata/keyspace.go`. The keyspace-push
+architecture demotes the periodic full Redis SCAN to a class-gated backstop
+(15 min LAN / 20 min WiFi / 15 min tunnel) via `setEngagement` →
+`backstopForClass`. But the CONFIG SEED `SetReconcileInterval` (300 s from
+`cfg.reconcileInterval()`, wired at `bridge/cbridge.go:658`) wrote that 300 s
+STRAIGHT into the same `backstopNanos` atomic, CLOBBERING the class-gated value.
+Result: a full ~247k-key SCAN fired every 300 s on EVERY link class forever (the
+push backstop never engaged) — ~40 s full-tree re-pull over cellular/tunnel,
+12×/hour. Confirmed in the log: reconcile `next_interval` maxed at exactly 300;
+the 900 s value never appeared.
+
+**Fix.** Split the config seed into its own atomic field
+(`RedisClient.configReconcileNanos`) and route ALL backstop writes through a
+single precedence resolver `resolveBackstop(reason)`:
+- push ENABLED + reachable → `max(backstopForClass(class), configReconcileNanos)`
+  — the config can only LENGTHEN the push-mode backstop, never shorten it below
+  the class-gated floor.
+- push DISABLED / DEGRADED / unreachable → the config cadence drives the SCAN
+  directly (the non-push authoritative fallback; LB-4 preference still honored).
+- `JM_RECONCILE_BACKSTOP_SEC` env override stays highest precedence (folded into
+  `backstopForClass` on the push path, honored explicitly on the non-push path).
+`setEngagement` now records the engagement state (`RedisClient.engaged`) and
+delegates to `resolveBackstop`; `SetReconcileInterval` sets `configReconcileNanos`
+and re-derives via `resolveBackstop` (no longer touches `backstopNanos`).
+Every ACTUAL `backstopNanos` change now logs at INFO (`metadata reconcile
+backstop changed`, old→new + reason + engaged + class + config), so a future
+900→300 collapse can never hide.
+
+**Kill switch / revert.** `JM_RECONCILE_BACKSTOP_SEC=<sec>` still forces the
+backstop for all classes without a rebuild (unchanged, highest precedence). To
+revert the fix itself: restore `SetReconcileInterval` to
+`rc.backstopNanos.Store(int64(d))` and revert `setEngagement` to write
+`backstopForClass(currentLinkClass())` / `DefaultReconcileInterval` directly
+(dropping `configReconcileNanos`, `engaged`, and `resolveBackstop`). Requires a
+rebuild. Reverting reintroduces the 300 s full-SCAN cellular churn.
+
+**Build.** Go-only change; `go build ./...` + `go vet ./metadata/` clean;
+`go test ./metadata/ -race` green (`TestReconcileBackstopPrecedence`).
+
+---
+
 ## 2026-07-03 — Perf lever: defer FTS5 trigram indexing off the write path (`JM_FTS_DEFER`)
 
 Env-revertable without a rebuild. Motivation: under write storms (a large Finder

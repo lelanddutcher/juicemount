@@ -281,15 +281,74 @@ func tuningForClass(c linkClass) coalescerTuning {
 
 // setEngagement records the engagement state and adjusts the backstop cadence.
 // ENABLED + backend reachable -> long class-gated interval; anything else ->
-// DefaultReconcileInterval (30s) so the periodic SCAN resumes as the
-// authoritative fallback. We never go long while the backend is known
-// unreachable: an unreachable backend means push delivery has stopped, so the
-// SCAN must stay frequent enough to converge fast on reconnect.
+// the config cadence / DefaultReconcileInterval (30s) so the periodic SCAN
+// resumes as the authoritative fallback. We never go long while the backend is
+// known unreachable: an unreachable backend means push delivery has stopped, so
+// the SCAN must stay frequent enough to converge fast on reconnect.
+//
+// The actual backstop value is computed by resolveBackstop, the SINGLE
+// precedence resolver shared with SetReconcileInterval (#90). setEngagement's
+// only extra job is to RECORD the new engagement state (rc.engaged) so a later
+// config change can re-derive with the same precedence.
 func (rc *RedisClient) setEngagement(e keyspaceEngagement) {
+	rc.engaged.Store(int32(e))
+	rc.resolveBackstop("engagement=" + e.String())
+}
+
+// resolveBackstop computes the live periodic-SCAN backstop with the #90
+// precedence and stores it into backstopNanos, logging every ACTUAL change
+// (old->new + reason) so a future 900->300 collapse can never hide.
+//
+// Precedence (highest first):
+//  1. JM_RECONCILE_BACKSTOP_SEC env override — folded INTO backstopForClass via
+//     reconcileBackstopOverride, so it wins for every class in the ENABLED path.
+//     (In the non-ENABLED path we also honor it explicitly, so the field-tuning
+//     kill switch wins regardless of engagement.)
+//  2. push ENABLED + backend reachable -> max(classBackstop, configReconcile):
+//     the config seed can only LENGTHEN the push-mode backstop, never shorten it
+//     below the class-gated floor. This is the crux of #90 — the 300s config seed
+//     used to clobber the 900s class value straight into backstopNanos.
+//  3. otherwise (DISABLED / DEGRADED / ENABLED-but-unreachable) -> the config
+//     cadence drives the SCAN directly (config, else DefaultReconcileInterval).
+//     This is the non-push authoritative fallback, so the LB-4 preference still
+//     applies when push isn't carrying deltas.
+//
+// reason is a short tag (e.g. "config", "engagement=ENABLED") threaded into the
+// change log so the driver of each transition is auditable.
+func (rc *RedisClient) resolveBackstop(reason string) {
+	e := keyspaceEngagement(rc.engaged.Load())
+	cfg := time.Duration(rc.configReconcileNanos.Load())
+
+	var next time.Duration
 	if e == keyspaceEnabled && reachableNow() {
-		rc.backstopNanos.Store(int64(backstopForClass(currentLinkClass())))
+		// Precedence 1+2. backstopForClass already short-circuits to the
+		// JM_RECONCILE_BACKSTOP_SEC override when set, so that override wins here.
+		classBackstop := backstopForClass(currentLinkClass())
+		next = classBackstop
+		if cfg > next {
+			// The config seed can only LENGTHEN the push-mode backstop.
+			next = cfg
+		}
 	} else {
-		rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+		// Precedence 1+3. The env override (highest precedence) still wins even
+		// off the push path; otherwise the config cadence drives the SCAN, else
+		// the 30s default.
+		if d, ok := reconcileBackstopOverride(); ok {
+			next = d
+		} else if cfg > 0 {
+			next = cfg
+		} else {
+			next = DefaultReconcileInterval
+		}
+	}
+
+	old := time.Duration(rc.backstopNanos.Swap(int64(next)))
+	if old != next {
+		jmlog.Info("metadata reconcile backstop changed",
+			"old_sec", old.Seconds(), "new_sec", next.Seconds(),
+			"reason", reason, "engaged", e.String(),
+			"class", currentLinkClass().String(),
+			"config_sec", cfg.Seconds())
 	}
 }
 

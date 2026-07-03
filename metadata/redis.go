@@ -163,6 +163,36 @@ type RedisClient struct {
 	// 1; zero is treated as DefaultReconcileInterval by reconcileLoop.
 	backstopNanos atomic.Int64
 
+	// configReconcileNanos holds the CONFIG-SEED reconcile cadence (in
+	// nanoseconds) supplied by SetReconcileInterval — the LB-4 "Reconcile
+	// interval" preference (default 300s from cfg.reconcileInterval()). It is
+	// STORED SEPARATELY from backstopNanos so the config seed can never CLOBBER
+	// the live class-gated push backstop that setEngagement owns (#90: the old
+	// code wrote the 300s config value STRAIGHT into backstopNanos, collapsing
+	// the 900s+ push backstop back to a full ~247k-key SCAN every 300s on every
+	// link class — the push backstop never engaged).
+	//
+	// Precedence, resolved in setEngagement:
+	//   - JM_RECONCILE_BACKSTOP_SEC env override wins over everything (via
+	//     backstopForClass's reconcileBackstopOverride short-circuit).
+	//   - push ENABLED + reachable: live backstop = max(classBackstop,
+	//     configReconcileNanos) — the config can only LENGTHEN the push-mode
+	//     backstop, never SHORTEN it below the class-gated floor.
+	//   - push DISABLED / DEGRADED / unreachable: the config cadence drives the
+	//     periodic SCAN directly (the non-push authoritative fallback), so the
+	//     LB-4 preference is still honored when push isn't carrying deltas.
+	// Zero means "no config seed" (max() then yields the class value alone).
+	configReconcileNanos atomic.Int64
+
+	// engaged records the LAST keyspace engagement state passed to
+	// setEngagement (stored as the int32 keyspaceEngagement enum). It lets the
+	// live backstop be RE-DERIVED with correct precedence when the config seed
+	// changes (SetReconcileInterval) without a new engagement transition — so a
+	// config change at launch (before push engages) and a config change while
+	// push is ENABLED both flow through the same resolveBackstop precedence
+	// resolver. Defaults to keyspaceDisabled (0), the pre-push classic state.
+	engaged atomic.Int32
+
 	// pruneAbsent tracks how many consecutive reconciliation cycles each path
 	// has been absent from Redis. Only paths absent for PruneThreshold+ cycles
 	// are actually deleted from SQLite. Guarded by mu.
@@ -312,13 +342,24 @@ func (rc *RedisClient) SetReconcileInterval(d time.Duration) {
 		return
 	}
 	rc.reconcileInterval = d
-	// Seed the live backstop so the configured cadence actually takes effect:
-	// reconcileLoop reads backstopNanos (via currentBackstop), not
-	// reconcileInterval, on every turn. setEngagement (the keyspace loop) may
-	// override this live once push is engaged — but until then this is the
-	// authoritative periodic-SCAN interval, so the LB-4 preference is honored
-	// from launch rather than staying a placebo behind DefaultReconcileInterval.
-	rc.backstopNanos.Store(int64(d))
+	// #90: store the config seed in its OWN field, NEVER straight into
+	// backstopNanos. The old code did `rc.backstopNanos.Store(int64(d))`, which
+	// CLOBBERED the live class-gated push backstop that setEngagement owns —
+	// collapsing a 900s+ push backstop back to the 300s config value on every
+	// link class, so the demoted periodic full SCAN fired ~247k keys every 300s
+	// forever and the push backstop never engaged (the cellular full-SCAN churn).
+	rc.configReconcileNanos.Store(int64(d))
+	// Re-derive the live backstop through the SINGLE precedence resolver so the
+	// config change takes effect with the correct precedence:
+	//   - push ENABLED + reachable -> max(classBackstop, config): config can only
+	//     LENGTHEN, never shorten below the class floor.
+	//   - otherwise (DISABLED/DEGRADED/unreachable) -> the config cadence drives
+	//     the periodic SCAN directly (this is the non-push authoritative path,
+	//     so the LB-4 preference is honored from launch).
+	// resolveBackstop reads the current engagement (rc.engaged) and the class
+	// signals, so calling it here holds precedence regardless of whether push is
+	// up yet at config time.
+	rc.resolveBackstop("config")
 }
 
 // lstatFunc is the type of the package-level Lstat hook. Aliased so we can
