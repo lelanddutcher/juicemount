@@ -1412,6 +1412,29 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 		return nil
 	}
 
+	// Task #92: a spool-resident (not-yet-drained) write logically EXISTS even
+	// though it is invisible to a FUSE Lstat — its bytes are on the spool, not
+	// yet in JuiceFS. This is the dominant case for `._` AppleDouble sidecars
+	// during a Finder copy: hundreds are created in a burst; one gets evicted
+	// into the shadow map under cache churn while still spooling; Finder
+	// re-references its (real, path-stable) handle; the FUSE Lstat below returns
+	// ENOENT; recovery "fails"; a 5s negative is cached (recoveryNegative); and
+	// then EVERY retry of that handle short-circuits to STALE for 5s → the copy
+	// stalls / "connection interrupted." The scopedPrune spoolPending guard and
+	// the Stat/Open phantom-purge already spare such paths (spool.go:515); this
+	// recovery path was the one place that still Lstat'd FUSE without consulting
+	// the spool. Recover straight from the spool shadow and skip the doomed
+	// (2s-timeout) Lstat entirely — HasPending keys by the same no-leading-slash
+	// store path scheme used to build the FUSE path below.
+	if h.spool != nil && h.spool.HasPending(strings.TrimLeft(shadow.Path, "/")) {
+		recovered := h.store.RecoverShadow(shadow, inode)
+		jmlog.Info("FromHandle recovered spool-pending evicted entry",
+			"inode", fmt.Sprintf("%x", inode),
+			"path", shadow.Path,
+		)
+		return recovered
+	}
+
 	// Verify the path actually exists in FUSE before recovering.
 	fusePath := h.fusePath + "/" + strings.TrimLeft(shadow.Path, "/")
 	fi, fok := lstatWithTimeout(fusePath, 2*time.Second)
