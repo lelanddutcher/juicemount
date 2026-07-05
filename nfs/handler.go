@@ -1721,7 +1721,19 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 		if hasWriteSize && writeSize > e.Size {
 			clone := *e
 			clone.Size = writeSize
-			clone.Mtime = time.Now()
+			// #100: KEEP the cached mtime — do NOT re-sample time.Now() here.
+			// This branch fires in the post-drain "sticky writeSizes" window
+			// (spool LookupActive has cleared but writeSizes still holds the
+			// high-water size and writeSize > e.Size). A fresh time.Now() makes
+			// the mtime JITTER on every stat, so every WRITE/COMMIT post-op
+			// mtime (wcc) and every GETATTR returns a different value. The macOS
+			// NFS client treats the file as "impossibly changing" and stalls its
+			// next getxattr on the vnode lock until timeout (~73 s) — the real
+			// cause of the "copies take forever" fsetxattr hang writing a ._
+			// AppleDouble sidecar. e.Mtime is stable across stats and the real
+			// mtime lands when the cache entry refreshes post-drain. Same bug
+			// class as the #99 root-dir mtime jitter (a stable-but-slightly-
+			// stale mtime is fine for wcc; a jittering one is catastrophic).
 			return clone.FileInfo(), nil
 		}
 		return e.FileInfo(), nil
@@ -1842,7 +1854,19 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 		if hasWriteSize && writeSize > e.Size {
 			clone := *e
 			clone.Size = writeSize
-			clone.Mtime = time.Now()
+			// #100: KEEP the cached mtime — do NOT re-sample time.Now() here.
+			// This branch fires in the post-drain "sticky writeSizes" window
+			// (spool LookupActive has cleared but writeSizes still holds the
+			// high-water size and writeSize > e.Size). A fresh time.Now() makes
+			// the mtime JITTER on every stat, so every WRITE/COMMIT post-op
+			// mtime (wcc) and every GETATTR returns a different value. The macOS
+			// NFS client treats the file as "impossibly changing" and stalls its
+			// next getxattr on the vnode lock until timeout (~73 s) — the real
+			// cause of the "copies take forever" fsetxattr hang writing a ._
+			// AppleDouble sidecar. e.Mtime is stable across stats and the real
+			// mtime lands when the cache entry refreshes post-drain. Same bug
+			// class as the #99 root-dir mtime jitter (a stable-but-slightly-
+			// stale mtime is fine for wcc; a jittering one is catastrophic).
 			return clone.FileInfo(), nil
 		}
 		return e.FileInfo(), nil
@@ -2259,6 +2283,10 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			return &spoolReadFile{
 				name:  filename,
 				entry: sentry,
+				// #100: a ._ AppleDouble sidecar read must never JUKEBOX-hold an
+				// in-flight sparse hole (the Quarantine getxattr-during-fsetxattr
+				// self-read → ~73s hang). Detect it once here.
+				isAppleDouble: strings.HasPrefix(path.Base(filename), "._"),
 			}, nil
 		}
 	}
@@ -3661,7 +3689,20 @@ type rootDirInfo struct{}
 func (r *rootDirInfo) Name() string       { return "" }
 func (r *rootDirInfo) Size() int64        { return 0 }
 func (r *rootDirInfo) Mode() fs.FileMode  { return fs.ModeDir | 0755 }
-func (r *rootDirInfo) ModTime() time.Time { return time.Now() }
+// rootMtime is a STABLE modification time for the synthetic mount root, set once
+// at process start. Previously rootDirInfo.ModTime() returned time.Now() on EVERY
+// stat, so the root's mtime jittered on every LOOKUP/GETATTR — macOS Tahoe's Finder
+// saw the mount root as perpetually modified and re-validated its pre-flight LOOKUPs
+// in an infinite loop (~400 LOOKUPs, zero writes), stalling any copy INTO the mount
+// root with "connection interrupted" (task #99). A copy into a real subfolder worked
+// because a subfolder carries a stable stored mtime (metadata FileInfo.ModTime =
+// entry.Mtime). A stable value ends the loop; root-listing freshness is covered by
+// the attr-cache TTL + Finder re-reading on navigation + reconcile-driven refresh.
+// TODO(#99): bump this when a child is created/removed at the root so clients notice
+// root-level changes before the attr-cache TTL, without reintroducing per-stat jitter.
+var rootMtime = time.Now()
+
+func (r *rootDirInfo) ModTime() time.Time { return rootMtime }
 func (r *rootDirInfo) IsDir() bool        { return true }
 func (r *rootDirInfo) Sys() any {
 	return &syscall.Stat_t{

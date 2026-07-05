@@ -27,6 +27,9 @@ import (
 type spoolReadFile struct {
 	name  string
 	entry *SpoolEntry
+	// isAppleDouble marks a ._ AppleDouble sidecar. Such a read NEVER
+	// JUKEBOX-holds an in-flight hole (see ReadAt / IncompleteAt, #100).
+	isAppleDouble bool
 
 	mu  sync.Mutex
 	fd  *os.File // lazily opened on first Read/ReadAt
@@ -105,7 +108,28 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 	// RAW. Clamp every read to the contiguous-written prefix and classify a
 	// past-prefix offset against a CONSISTENT (cend,wend) snapshot.
 	cend, wend := f.entry.ReadableBounds()
-	if off >= cend {
+	// #100 — ._ AppleDouble sidecars must NEVER JUKEBOX-hold an in-flight hole.
+	// A large xattr (e.g. a camera's com.blackmagicdesign.thumbnail, ~20KB) makes
+	// copyfile write the ._ sidecar with SEEKS — header at 0, FinderInfo at 0x20,
+	// the resource fork far later — so the spool file has a sparse hole BELOW
+	// writtenEnd. During that same fsetxattr the macOS Quarantine kext reads
+	// com.apple.quarantine from the very ._ being written (qtn_track_vnode_if_
+	// needed → mac_vnop_getxattr). If that read lands in the hole we return
+	// ErrSpoolIncomplete → NFS3ERR_JUKEBOX → the client retries to its ~40s
+	// soft-mount timeout → the notorious ~73s-per-file "copies take forever"
+	// hang (a plain-disk NFS server has no such window and copies the identical
+	// file in ~1s). ._ sidecars are tiny SAME-CLIENT metadata — never the NLE
+	// torn-read / black-frame concern #65's JUKEBOX guards — so serve them exactly
+	// like a plain server: straight from the (sparse) spool file up to writtenEnd,
+	// real bytes where written and zeros in holes, with NO hold. The concurrent
+	// xattr WRITES still land fully in the spool and drain intact, so the final ._
+	// content is unaffected; only the racing quarantine READ sees a transient
+	// zero-hole, which is harmless (it just reads quarantine as absent).
+	readEnd := cend
+	if f.isAppleDouble {
+		readEnd = wend
+	}
+	if off >= readEnd {
 		// GAP B (task #65): at/past the readable prefix. If there are still-
 		// expected bytes below the high-water (a not-yet-filled in-flight hole)
 		// and the writer is still active, HOLD (JUKEBOX via the sentinel) — a
@@ -114,13 +138,15 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 		// merely appears to grow) — or a writer gone silent past the stall window
 		// (wedged/abandoned, the partial is the best available) — reports io.EOF
 		// as before, so the client re-stats and reissues / accepts the partial.
-		if off < wend && time.Since(f.entry.LastWrite()) < pin.SpoolIncompleteStallWindow {
+		// ._ sidecars skip the hold entirely (readEnd==wend already, so off>=wend
+		// here → plain EOF, matching a durable local server).
+		if !f.isAppleDouble && off < wend && time.Since(f.entry.LastWrite()) < pin.SpoolIncompleteStallWindow {
 			return 0, pin.ErrSpoolIncomplete
 		}
 		return 0, io.EOF
 	}
-	if int64(len(p)) > cend-off {
-		p = p[:cend-off]
+	if int64(len(p)) > readEnd-off {
+		p = p[:readEnd-off]
 	}
 	n, err := f.fd.ReadAt(p, off)
 	// A short read because we clamped at the contiguous boundary is NOT a real
@@ -145,6 +171,10 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 // classification exactly (task #65). Cheap: one RLock via ReadableBounds + an
 // atomic LastWrite load.
 func (f *spoolReadFile) IncompleteAt(off int64) bool {
+	// #100: ._ AppleDouble sidecars never hold — mirror ReadAt's readEnd==wend.
+	if f.isAppleDouble {
+		return false
+	}
 	cend, wend := f.entry.ReadableBounds()
 	if off < cend || off >= wend {
 		return false

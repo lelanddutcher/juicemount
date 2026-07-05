@@ -3,14 +3,25 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
+
+// lookupTraceEnabled gates a per-LOOKUP diagnostic (name + handle inode + attr
+// fileid + size + mtime, for both the child and its dir) used to root-cause the
+// Tahoe colliding-destination stall (task #99): if a colliding item's fileid or
+// mtime jitters across identical LOOKUPs, Tahoe's Finder re-validates in a loop
+// (the observed 396-LOOKUP / zero-write pre-flight hang). Read ONCE at init (no
+// Getenv on the hot path). Enable: `launchctl setenv JM_LOOKUP_TRACE 1` + relaunch.
+var lookupTraceEnabled = os.Getenv("JM_LOOKUP_TRACE") != ""
 
 func lookupSuccessResponse(handle []byte, entPath, dirPath []string, fs billy.Filesystem) ([]byte, error) {
 	writer := bytes.NewBuffer([]byte{})
@@ -112,6 +123,9 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 	// cache-miss → NXIO via the handle-preservation branch below).
 	if cs, ok := fs.(cacheStater); ok {
 		if _, found := cs.StatCacheOnly(fs.Join(reqPath...)); !found {
+			if lookupTraceEnabled {
+				jmlog.Info("LOOKUP-TRACE", "result", "noent", "name", string(obj.Filename), "dir", fs.Join(p...))
+			}
 			return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}
 		}
 	} else if _, err = fs.Lstat(fs.Join(reqPath...)); err != nil {
@@ -122,6 +136,18 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	newHandle := userHandle.ToHandle(fs, reqPath)
+	if lookupTraceEnabled {
+		inode := binary.BigEndian.Uint64(newHandle)
+		f := []any{"result", "found", "name", string(obj.Filename), "dir", fs.Join(p...),
+			"handle_inode", fmt.Sprintf("%x", inode), "synthetic", inode&(1<<63) != 0}
+		if ea := tryStat(fs, reqPath); ea != nil {
+			f = append(f, "ent_fileid", ea.Fileid, "ent_size", ea.Filesize, "ent_mtime", ea.Mtime.Seconds, "ent_mtime_ns", ea.Mtime.Nseconds)
+		}
+		if da := tryStat(fs, p); da != nil {
+			f = append(f, "dir_fileid", da.Fileid, "dir_mtime", da.Mtime.Seconds, "dir_mtime_ns", da.Mtime.Nseconds)
+		}
+		jmlog.Info("LOOKUP-TRACE", f...)
+	}
 	resp, err := lookupSuccessResponse(newHandle, reqPath, p, fs)
 	if err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
