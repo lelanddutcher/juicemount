@@ -678,6 +678,18 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 	defer src.Close()
 
+	// #103: capture the spool file's on-disk mtime — the client's last-write
+	// time, which is exactly what the in-flight spool served as ModTime while
+	// this file was pending. os.Create below would otherwise stamp the backend
+	// (JuiceFS) inode with the DRAIN time; once reconcileDir later refreshes
+	// this entry from the backend, the served mtime jumps forward and trips
+	// "modified since last save" in Premiere (and misleads any mtime-sensitive
+	// tool: backups, sync). We restore this mtime after the copy+verify below.
+	var spoolMtime time.Time
+	if si, statErr := src.Stat(); statErr == nil {
+		spoolMtime = si.ModTime()
+	}
+
 	dst, err := os.Create(dest)
 	if err != nil {
 		d.failTransient(row, fmt.Errorf("create dest: %w", err))
@@ -811,6 +823,20 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 					destDev, sys.Dev, pin.ErrFUSEIdentityGate))
 				return
 			}
+		}
+	}
+
+	// #103: preserve the client's mtime on the backend inode. os.Create stamped
+	// it with the drain time; restore the spool file's mtime (what the client
+	// wrote / what the in-flight spool served) so the served mtime stays STABLE
+	// across the spool→backend→reconcile lifecycle instead of jumping forward at
+	// the next reconcileDir refresh. Best-effort: the bytes are already SHA-
+	// verified at rest here, so a Chtimes failure leaves the (wrong) drain-time
+	// mtime but never loses data. Placed before BOTH the batch and inline
+	// completion paths so every drained file is covered.
+	if !spoolMtime.IsZero() {
+		if err := os.Chtimes(dest, spoolMtime, spoolMtime); err != nil {
+			log.Printf("drain: preserve client mtime failed (non-fatal) path=%s: %v", row.NFSPath, err)
 		}
 	}
 
