@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -12,11 +13,16 @@ func TestMemBufBasic(t *testing.T) {
 	mb := NewMemoryBuffer(10*1024*1024, 100*1024*1024) // 10MB threshold, 100MB budget
 	defer mb.Stop()
 
-	// Create a small test file on FUSE
-	testPath := filepath.Join(testFUSEPath, "__membuf_test.txt")
+	// Create a small test file in a hermetic temp dir. membuf.loadFile opens
+	// fusePath directly, so a real temp file exercises the true load path. The
+	// old hardcoded testFUSEPath ("/Users/USER/.juicemount/fuse-internal") never
+	// exists on any machine, so os.WriteFile failed (error ignored), os.Open in
+	// loadFile then failed, and every Get/ReadAt missed → these 4 tests failed.
+	testPath := filepath.Join(t.TempDir(), "__membuf_test.txt")
 	testData := []byte("hello memory buffer test data - this is a small file for testing")
-	os.WriteFile(testPath, testData, 0644)
-	defer os.Remove(testPath)
+	if err := os.WriteFile(testPath, testData, 0644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
 
 	// First Get triggers async load, returns nil
 	data := mb.Get("__membuf_test.txt", int64(len(testData)), testPath)
@@ -48,13 +54,14 @@ func TestMemBufReadAt(t *testing.T) {
 	mb := NewMemoryBuffer(10*1024*1024, 100*1024*1024)
 	defer mb.Stop()
 
-	testPath := filepath.Join(testFUSEPath, "__membuf_readat.txt")
+	testPath := filepath.Join(t.TempDir(), "__membuf_readat.txt")
 	testData := make([]byte, 1024)
 	for i := range testData {
 		testData[i] = byte(i % 256)
 	}
-	os.WriteFile(testPath, testData, 0644)
-	defer os.Remove(testPath)
+	if err := os.WriteFile(testPath, testData, 0644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
 
 	// Trigger load
 	mb.Get("__membuf_readat.txt", int64(len(testData)), testPath)
@@ -98,9 +105,10 @@ func TestMemBufInvalidate(t *testing.T) {
 	mb := NewMemoryBuffer(10*1024*1024, 100*1024*1024)
 	defer mb.Stop()
 
-	testPath := filepath.Join(testFUSEPath, "__membuf_invalidate.txt")
-	os.WriteFile(testPath, []byte("original"), 0644)
-	defer os.Remove(testPath)
+	testPath := filepath.Join(t.TempDir(), "__membuf_invalidate.txt")
+	if err := os.WriteFile(testPath, []byte("original"), 0644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
 
 	mb.Get("__membuf_invalidate.txt", 8, testPath)
 	time.Sleep(500 * time.Millisecond)
@@ -125,17 +133,17 @@ func TestMemBufBudget(t *testing.T) {
 	mb := NewMemoryBuffer(1024*1024, 2*1024*1024) // 1MB threshold, 2MB budget
 	defer mb.Stop()
 
-	testPath1 := filepath.Join(testFUSEPath, "__membuf_budget1.bin")
-	testPath2 := filepath.Join(testFUSEPath, "__membuf_budget2.bin")
-	testPath3 := filepath.Join(testFUSEPath, "__membuf_budget3.bin")
+	dir := t.TempDir()
+	testPath1 := filepath.Join(dir, "__membuf_budget1.bin")
+	testPath2 := filepath.Join(dir, "__membuf_budget2.bin")
+	testPath3 := filepath.Join(dir, "__membuf_budget3.bin")
 
 	data := make([]byte, 900*1024) // 900KB each
-	os.WriteFile(testPath1, data, 0644)
-	os.WriteFile(testPath2, data, 0644)
-	os.WriteFile(testPath3, data, 0644)
-	defer os.Remove(testPath1)
-	defer os.Remove(testPath2)
-	defer os.Remove(testPath3)
+	for _, p := range []string{testPath1, testPath2, testPath3} {
+		if err := os.WriteFile(p, data, 0644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
 
 	// Load first two (1.8MB total, under 2MB budget)
 	mb.Get("__membuf_budget1.bin", 900*1024, testPath1)
@@ -153,6 +161,65 @@ func TestMemBufBudget(t *testing.T) {
 
 	if buffered != 2 {
 		t.Fatalf("expected 2 buffered files, got %d", buffered)
+	}
+}
+
+// TestMemBufStaleLoadDoesNotClobberReplacement guards the identity bug in
+// loadFile's cleanup paths: a load stuck in os.Open on a wedged FUSE mount can
+// be Invalidate'd (every write/rename/delete invalidates) and REPLACED by a
+// fresh Get for the same path; the stale loader's later cleanup must NOT delete
+// the good replacement entry or subtract its bytes from totalSize (a monotonic
+// budget leak that eventually disables all buffering until restart).
+func TestMemBufStaleLoadDoesNotClobberReplacement(t *testing.T) {
+	mb := NewMemoryBuffer(10*1024*1024, 100*1024*1024)
+	defer mb.Stop()
+	dir := t.TempDir()
+
+	// A FIFO makes loadFile's os.Open BLOCK until we open the write end —
+	// deterministically simulating a load wedged on a slow/hung FUSE mount.
+	fifo := filepath.Join(dir, "slow.bin")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	// 1. First Get launches loadFile(entry1); it blocks in os.Open(fifo).
+	mb.Get("x", 1024, fifo)
+	time.Sleep(150 * time.Millisecond) // let the goroutine reach os.Open
+
+	// 2. Invalidate drops entry1; a fresh Get inserts entry2 from a REAL file
+	//    of a DIFFERENT size, which loads successfully.
+	mb.Invalidate("x")
+	real := filepath.Join(dir, "real.bin")
+	realData := make([]byte, 4096)
+	for i := range realData {
+		realData[i] = byte(i)
+	}
+	if err := os.WriteFile(real, realData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mb.Get("x", 4096, real)
+	time.Sleep(300 * time.Millisecond) // let entry2 load
+	if got := mb.Get("x", 4096, real); got == nil {
+		t.Fatal("precondition failed: replacement entry should be buffered")
+	}
+
+	// 3. Unblock entry1's os.Open: open+close the FIFO write end with no data
+	//    → entry1's read sees EOF → totalRead(0) < 1024 → short-load cleanup.
+	w, err := os.OpenFile(fifo, os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open fifo write end: %v", err)
+	}
+	w.Close()
+	time.Sleep(300 * time.Millisecond) // let entry1's stale cleanup run
+
+	// 4. The replacement must survive — a hit, not a re-triggered async miss.
+	if got := mb.Get("x", 4096, real); got == nil {
+		t.Fatal("stale loadFile clobbered the good replacement entry (identity bug)")
+	}
+	for i := 0; i < 4096; i++ {
+		if got := mb.Get("x", 4096, real); got != nil && got[i] != realData[i] {
+			t.Fatalf("replacement data corrupted at %d", i)
+		}
 	}
 }
 
