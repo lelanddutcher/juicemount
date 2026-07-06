@@ -25,7 +25,7 @@ You already know the trade you've been making.
 
 **A NAS over plain SMB** is fast on the LAN and it's yours. But Finder grinds for a full minute opening a big project, there's no offline, and there's no good story the moment you leave the building.
 
-**Sync tools** (Dropbox, Nextcloud, Seafile) own your bytes but move whole files. Open one shot to check focus on a 100 GB take and you wait for all 100 GB.
+**Sync tools** (Dropbox, Nextcloud, Seafile) have offline workflows but move whole files and are much slower than SMB. Open one shot to check focus on a 100 GB take and you wait for all 100 GB.
 
 JuiceMount is the combination that didn't exist: **a real mounted volume that streams only the blocks you touch, caches to your local SSD, keeps working offline, and runs on storage you already own.** Point it at a TrueNAS, a Synology, a QNAP, or any box that runs Docker. Your editors mount `/Volumes/<name>` and cut. No per-seat bill, no storage contract, nobody else holding your footage.
 
