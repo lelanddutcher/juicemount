@@ -14,7 +14,50 @@ func resetOfflineState() {
 	autoOfflineMu.Lock()
 	autoOfflineReason = ""
 	autoOfflineSince = time.Time{}
+	userOfflineSince = time.Time{}
 	autoOfflineMu.Unlock()
+}
+
+func TestWithinOfflineReadStallWindow(t *testing.T) {
+	t.Cleanup(resetOfflineState)
+
+	// (a) fully online → false
+	resetOfflineState()
+	if WithinOfflineReadStallWindow() {
+		t.Errorf("online: WithinOfflineReadStallWindow() = true; want false")
+	}
+	// (b) just after user-offline → true
+	SetOffline(true)
+	if !WithinOfflineReadStallWindow() {
+		t.Errorf("just after user offline: want true")
+	}
+	SetOffline(false)
+	if WithinOfflineReadStallWindow() {
+		t.Errorf("after clearing user offline: want false")
+	}
+	// (c) just after auto-offline → true
+	SetAutoOffline(true, "blip")
+	if !WithinOfflineReadStallWindow() {
+		t.Errorf("just after auto offline: want true")
+	}
+	SetAutoOffline(false, "")
+	// (d) both engaged recently → true
+	resetOfflineState()
+	SetOffline(true)
+	SetAutoOffline(true, "later")
+	if !WithinOfflineReadStallWindow() {
+		t.Errorf("both engaged recently: want true")
+	}
+	// (e) window expired → false
+	resetOfflineState()
+	saved := OfflineReadStallWindow
+	OfflineReadStallWindow = 1 * time.Millisecond
+	defer func() { OfflineReadStallWindow = saved }()
+	SetOffline(true)
+	time.Sleep(5 * time.Millisecond)
+	if WithinOfflineReadStallWindow() {
+		t.Errorf("after window expiry: want false")
+	}
 }
 
 func TestOffline_UserOnly(t *testing.T) {

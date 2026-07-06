@@ -69,6 +69,29 @@ type Drainer struct {
 	// set-before-Start provides the happens-before (no lock needed).
 	onDrainComplete func(nfsPath string, size int64)
 
+	// lastDrainSuccessNanos is the wall-clock UnixNano of the most recent
+	// COMPLETED drain — a real MinIO PUT that landed and was marked done (the
+	// DrainsSucceeded.Add(1) site). It is positive proof the backend is
+	// reachable over whatever link this Mac is on RIGHT NOW. The reachability
+	// monitor's drain-liveness override (health.WithLivenessHook) reads it via
+	// LastDrainSuccess() to suppress a probe-dial FALSE-failure when a cold SYN
+	// merely queued behind the drainer's own bulk PUT traffic on a saturated
+	// uplink (slow-link false-flap, NFSv3 sprint / task #66 salvage). Stamped
+	// ONLY on a genuine success — never on an attempted/in-flight drain — so a
+	// real outage (drains stop landing) lets the override lapse within seconds
+	// and the normal 2-failure flip proceeds. Atomic: written by worker
+	// goroutines, read by the probe-loop goroutine.
+	lastDrainSuccessNanos atomic.Int64
+
+	// onSizeReady, if set, publishes the drained file's authoritative size into
+	// the metadata store BEFORE MarkDrainComplete evicts the spool shadow, so a
+	// fresh read can never observe a post-eviction-but-pre-size (0/partial)
+	// Entry.Size (task #65 read-during-active-drain). Set once via SetOnSizeReady
+	// BEFORE Start (same set-before-Start happens-before as onDrainComplete).
+	// row.Size is authoritative at the call site: the copy is rejected unless
+	// n == row.Size.
+	onSizeReady func(nfsPath string, size int64)
+
 	// onSymlinkMaterialized, if set, is invoked after a deferred offline
 	// symlink is os.Symlink'd onto FUSE at reconnect. Set once via
 	// SetOnSymlinkMaterialized BEFORE Start; the handler uses it to
@@ -87,6 +110,32 @@ type Drainer struct {
 	// buffer). Opt back in with JM_DRAIN_ATREST_VERIFY=1 only on a fast/idle
 	// backend where the extra read pass is affordable.
 	atRestVerify bool
+
+	// batchInsert gates the drain metadata write-coalescer (Lever 1,
+	// JM_DRAIN_BATCH_INSERT). Default OFF: behavior is byte-identical to the
+	// per-file (onSizeReady → MarkDrainComplete) path. When ON, a
+	// successfully-copied+verified drain is enqueued into the coalescer instead
+	// of committing its (UpdateSize + MarkDone) pair inline; the coalescer
+	// flushes N ops or T ms — whichever first — in ONE cross-table SQLite
+	// transaction (metadata.Store.BatchDrainComplete), collapsing N fsync/
+	// syscall cascades into 1 under a many-file write storm. Task #65's
+	// size-publish-before-eviction ordering is preserved by construction: the
+	// per-file UpdateSize and MarkDone land in the same committed tx, and the
+	// batch's post-commit eviction cleanup runs only after that commit. See
+	// drainer_batch.go.
+	batchInsert bool
+
+	// batch is the write-coalescer; non-nil only when batchInsert is true. Set
+	// in NewDrainer. See drainBatcher.
+	batch *drainBatcher
+
+	// onBatchDrainComplete commits a batch of drained-file metadata writes in
+	// one transaction and returns per-item done results. Wired (before Start)
+	// to metadata.Store.BatchDrainComplete via SetOnBatchDrainComplete. Read
+	// by the coalescer flusher goroutine; set-before-Start provides the
+	// happens-before. nil ⇒ the batcher falls back to per-file completion
+	// (defensive; production always wires it when the flag is on).
+	onBatchDrainComplete func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)
 }
 
 // DrainerConfig controls drainer behavior. Zero values fall back to
@@ -160,7 +209,7 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 	if cfg.PollFallback <= 0 {
 		cfg.PollFallback = 30 * time.Second
 	}
-	return &Drainer{
+	d := &Drainer{
 		spool:        spool,
 		fuseRoot:     cfg.FuseRoot,
 		workers:      cfg.Workers,
@@ -168,11 +217,16 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		backoffBase:  cfg.BackoffBase,
 		pollFallback: cfg.PollFallback,
 		atRestVerify: os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
+		batchInsert:  os.Getenv("JM_DRAIN_BATCH_INSERT") == "1",
 		sem:          make(chan struct{}, cfg.Workers),
 		notify:       make(chan struct{}, 1),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
-	}, nil
+	}
+	if d.batchInsert {
+		d.batch = newDrainBatcher(d, drainBatchMaxOps, drainBatchMaxDelay)
+	}
+	return d, nil
 }
 
 // Start launches the dispatcher goroutine and registers the wake
@@ -222,6 +276,11 @@ func (d *Drainer) Stop(deadline time.Duration) bool {
 	doneCh := make(chan struct{})
 	go func() {
 		d.inFlight.Wait()
+		// Lever 1: once every worker has finished enqueueing, flush the final
+		// partial batch so no drained file's metadata commit is stranded at
+		// shutdown. Runs inside the wait goroutine so it completes within the
+		// same deadline the caller granted for in-flight work.
+		d.flushBatch()
 		close(doneCh)
 	}()
 	select {
@@ -236,10 +295,42 @@ func (d *Drainer) Stop(deadline time.Duration) bool {
 // concurrently with worker activity.
 func (d *Drainer) Metrics() *DrainerMetrics { return &d.metrics }
 
+// LastDrainSuccess returns the wall-clock time of the most recent COMPLETED
+// drain (a MinIO PUT that landed and was marked done). Returns the zero Time
+// if no drain has succeeded yet. Used by the reachability monitor's
+// drain-liveness override: a recent success is positive proof the backend is
+// reachable over the current link, so a probe-dial timeout that merely queued
+// behind the drainer's bulk PUT traffic is suppressed rather than counted as a
+// failure. Concurrent-safe (atomic load).
+func (d *Drainer) LastDrainSuccess() time.Time {
+	ns := d.lastDrainSuccessNanos.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
 // SetOnDrainComplete registers a callback invoked once per successful drain,
 // after the row is marked done. Must be called BEFORE Start.
 func (d *Drainer) SetOnDrainComplete(fn func(nfsPath string, size int64)) {
 	d.onDrainComplete = fn
+}
+
+// SetOnSizeReady registers the pre-eviction size-publish hook (task #65). Call
+// once before Start.
+func (d *Drainer) SetOnSizeReady(fn func(nfsPath string, size int64)) {
+	d.onSizeReady = fn
+}
+
+// SetOnBatchDrainComplete registers the batched metadata-commit hook used when
+// JM_DRAIN_BATCH_INSERT is on (Lever 1). It must commit every item's size
+// publish + spool mark-done in ONE transaction, size-before-done per item, and
+// return per-item done results aligned by index (see
+// metadata.Store.BatchDrainComplete). Call once BEFORE Start; the coalescer
+// flusher reads it after Start (set-before-Start happens-before). A no-op when
+// the flag is off.
+func (d *Drainer) SetOnBatchDrainComplete(fn func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)) {
+	d.onBatchDrainComplete = fn
 }
 
 // SetOnSymlinkMaterialized registers a callback invoked once per deferred
@@ -247,6 +338,16 @@ func (d *Drainer) SetOnDrainComplete(fn func(nfsPath string, size int64)) {
 // called BEFORE Start (read by the dispatcher on the reconnect edge).
 func (d *Drainer) SetOnSymlinkMaterialized(fn func(linkPath string)) {
 	d.onSymlinkMaterialized = fn
+}
+
+// flushBatch flushes any pending coalesced drains (Lever 1). No-op when the
+// batcher is disabled. Called on the drain-idle edge (ListReady empty), before
+// the dispatcher parks (offline / FUSE-identity loss), and on Stop — so a
+// partial batch is never stranded and never spans the offline boundary.
+func (d *Drainer) flushBatch() {
+	if d.batch != nil {
+		d.batch.flush()
+	}
 }
 
 // wakeNonBlocking is the callback handed to SpoolStore.SetDrainerWake.
@@ -266,13 +367,14 @@ func (d *Drainer) wakeNonBlocking() {
 func (d *Drainer) dispatchLoop() {
 	defer close(d.done)
 	wasOffline := false
+	identityParked := false
 	for {
 		// When offline, poll at a tighter cadence than pollFallback so we
 		// notice reconnection (manual toggle or auto-recovery) within a few
 		// seconds and resume draining promptly. Online, the wake signal drives
 		// us and pollFallback is just a missed-signal backstop.
 		wait := d.pollFallback
-		if pin.IsOffline() {
+		if pin.IsOffline() || !pin.FUSEIdentityOK() {
 			wait = drainOfflineRecheck
 		}
 		select {
@@ -291,8 +393,34 @@ func (d *Drainer) dispatchLoop() {
 		// backend is reachable again; ingest keeps filling the spool meanwhile
 		// (offline-ingest sprint) and we drain it on reconnect.
 		if pin.IsOffline() {
+			// Lever 1: flush any coalesced drains from the just-ended online
+			// window before parking, so a partial batch is committed while the
+			// backend is still reachable and never spans the offline boundary.
+			// (In-flight stragglers are still backstopped by the batch timer.)
+			d.flushBatch()
 			wasOffline = true
 			continue
+		}
+		// PAUSE while the FUSE identity gate fails (V2.3 G0). When the
+		// mountpoint is a plain directory (macFUSE kext not loaded / mount
+		// absent) or wedged, os.Create against it SUCCEEDS onto the local
+		// boot disk and the "drained" bytes never reach the backend — the
+		// 2026-07-01 174GB stranded-writes incident. Park exactly like
+		// offline: the spool is the durable safe place; drains resume (with
+		// the reconnect requeue below) the moment the mount is real again.
+		if ok, reason := pin.FUSEIdentityState(); !ok {
+			// Lever 1: flush before parking (see the offline branch).
+			d.flushBatch()
+			if !identityParked {
+				log.Printf("drainer: PARKED — FUSE identity gate failed (%s); writes stay in the spool until the mount is real", reason)
+				identityParked = true
+			}
+			wasOffline = true
+			continue
+		}
+		if identityParked {
+			log.Printf("drainer: FUSE identity restored — resuming drains")
+			identityParked = false
 		}
 		// RECONNECT edge: any rows that exhausted their retry budget before or
 		// during the offline window are stuck in `failed`. Requeue them now
@@ -319,11 +447,12 @@ func (d *Drainer) dispatchLoop() {
 				return
 			default:
 			}
-			// Bail out of the batch if the network dropped mid-drain; the outer
-			// loop re-evaluates and parks. In-flight workers finish or
-			// fail-transient (treated as an offline pause, not a per-file
+			// Bail out of the batch if the network dropped mid-drain — or the
+			// FUSE identity gate failed (mount unmounted/wedged mid-batch);
+			// the outer loop re-evaluates and parks. In-flight workers finish
+			// or fail-transient (treated as an offline pause, not a per-file
 			// failure — see failTransient).
-			if pin.IsOffline() {
+			if pin.IsOffline() || !pin.FUSEIdentityOK() {
 				break
 			}
 			rows, err := d.spool.Meta().ListReady(d.workers * 2)
@@ -335,7 +464,7 @@ func (d *Drainer) dispatchLoop() {
 				break
 			}
 			for _, row := range rows {
-				if pin.IsOffline() {
+				if pin.IsOffline() || !pin.FUSEIdentityOK() {
 					break
 				}
 				if !d.dispatchRow(row) {
@@ -343,6 +472,12 @@ func (d *Drainer) dispatchLoop() {
 				}
 			}
 		}
+		// Lever 1: the ready queue is drained (or we bailed to re-evaluate).
+		// Flush whatever workers have enqueued so far rather than making it wait
+		// for the batch timer before its size-publish + shadow eviction land.
+		// Workers still finishing the last dispatch cycle enqueue after this and
+		// are caught by the batch timer (or the next iteration's flush).
+		d.flushBatch()
 	}
 }
 
@@ -366,6 +501,13 @@ func (d *Drainer) dispatchLoop() {
 //     error leaves the row for the next attempt and is logged, never fatal
 //     (one bad link must not strand the others or the file drain).
 func (d *Drainer) materializePendingSymlinks() {
+	// V2.3 G0: os.Symlink into a plain-dir mountpoint would strand the links
+	// on the local disk exactly like a misdirected file drain. Rows persist,
+	// so skipping here just defers to the next reconnect edge.
+	if ok, reason := pin.FUSEIdentityState(); !ok {
+		log.Printf("drainer: skipping symlink materialization — FUSE identity gate failed (%s)", reason)
+		return
+	}
 	pend, err := d.spool.Meta().ListPendingSymlinks()
 	if err != nil {
 		log.Printf("drainer: reconnect list pending symlinks: %v", err)
@@ -376,6 +518,15 @@ func (d *Drainer) materializePendingSymlinks() {
 	}
 	materialized := 0
 	for _, p := range pend {
+		// Review fix: re-check the gate PER LINK — an unmount mid-loop would
+		// otherwise land the remaining links on the plain dir. Cached (2s
+		// TTL) so the per-link cost is a mutex read. Bail without deleting
+		// rows: they retry next reconnect (os.IsExist path is idempotent).
+		if ok, reason := pin.FUSEIdentityState(); !ok {
+			log.Printf("drainer: symlink materialization aborted — FUSE identity gate failed (%s); %d row(s) retry next reconnect",
+				reason, len(pend)-materialized)
+			return
+		}
 		fusePath := filepath.Join(d.fuseRoot, p.LinkPath)
 		serr := os.Symlink(p.Target, fusePath)
 		if serr != nil && os.IsNotExist(serr) {
@@ -389,6 +540,14 @@ func (d *Drainer) materializePendingSymlinks() {
 			// leave the row for the next reconnect, log, keep going.
 			log.Printf("drainer: materialize symlink %q -> %q: %v", p.LinkPath, p.Target, serr)
 			continue
+		}
+		// Review fix: close the write-then-delete gap — if the mount vanished
+		// between the Symlink and here, the link landed on the plain dir and
+		// the row must NOT be deleted. Bail; the retry is idempotent.
+		if ok, reason := pin.FUSEIdentityState(); !ok {
+			log.Printf("drainer: symlink materialization aborted post-create — FUSE identity gate failed (%s); row %q retries next reconnect",
+				reason, p.LinkPath)
+			return
 		}
 		// On-FUSE now (created, or already existed). Clear LocalOnly so the
 		// reconcile prune treats it as a normal backend entry, then drop the
@@ -490,6 +649,16 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		return
 	}
 
+	// V2.3 G0: last-line identity guard for a worker that raced the
+	// dispatcher's park (mount unmounted between dispatch and here). Writing
+	// into a plain-dir mountpoint "succeeds" onto the local disk and strands
+	// the bytes — refuse and pause instead (ErrFUSEIdentityGate routes to
+	// failTransient's infra-pause branch: requeue, no budget burn).
+	if ok, reason := pin.FUSEIdentityState(); !ok {
+		d.failTransient(row, fmt.Errorf("%s: %w", reason, pin.ErrFUSEIdentityGate))
+		return
+	}
+
 	dest := filepath.Join(d.fuseRoot, row.NFSPath)
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		d.failTransient(row, fmt.Errorf("mkdir parent: %w", err))
@@ -509,10 +678,43 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 	defer src.Close()
 
+	// #103: capture the spool file's on-disk mtime — the client's last-write
+	// time, which is exactly what the in-flight spool served as ModTime while
+	// this file was pending. os.Create below would otherwise stamp the backend
+	// (JuiceFS) inode with the DRAIN time; once reconcileDir later refreshes
+	// this entry from the backend, the served mtime jumps forward and trips
+	// "modified since last save" in Premiere (and misleads any mtime-sensitive
+	// tool: backups, sync). We restore this mtime after the copy+verify below.
+	var spoolMtime time.Time
+	if si, statErr := src.Stat(); statErr == nil {
+		spoolMtime = si.ModTime()
+	}
+
 	dst, err := os.Create(dest)
 	if err != nil {
 		d.failTransient(row, fmt.Errorf("create dest: %w", err))
 		return
+	}
+	// Review fix (phase-1 adversarial review, HIGH — the TOCTOU that would
+	// have reopened the 174GB incident): the path-based identity gate above
+	// reads a ≤2s-stale cache, so a mount torn down moments before Create
+	// can still pass it and the file lands on the plain dir — where every
+	// downstream safeguard (copy, fsync, SHA, at-rest re-read) verifies the
+	// same local bytes and "succeeds". The fd's filesystem binding is
+	// immutable, so checking the OPEN fd is race-free regardless of what
+	// mounts or unmounts afterwards.
+	if err := pin.FUSEIdentityCheckFD(dst.Fd()); err != nil {
+		dst.Close()
+		_ = os.Remove(dest)
+		d.failTransient(row, err)
+		return
+	}
+	// Capture where dest actually lives for the pre-completion device check.
+	destDev := int32(-1)
+	if fi, err := dst.Stat(); err == nil {
+		if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
+			destDev = sys.Dev
+		}
 	}
 
 	h := sha256.New()
@@ -604,6 +806,65 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		}
 	}
 
+	// Review fix (phase-1 adversarial review, belt-and-suspenders half of the
+	// TOCTOU close): before declaring the drain complete — which deletes the
+	// spool copy, the only other copy of these bytes — confirm dest still
+	// lives on the SAME device as the CURRENT mountpoint. If a remount landed
+	// mid-copy, the bytes went to a dead mount instance (or the plain dir,
+	// though the fd check at Create already catches that) and the current
+	// mount does not have them: requeue instead of completing. os.Stat on a
+	// healthy mount is cheap; on a wedged one it can block — same hazard
+	// class as the at-rest re-read above (drainer worker, not the hot path).
+	if destDev != -1 {
+		if fi, statErr := os.Stat(d.fuseRoot); statErr == nil {
+			if sys, ok := fi.Sys().(*syscall.Stat_t); ok && sys.Dev != destDev {
+				_ = os.Remove(dest)
+				d.failTransient(row, fmt.Errorf("dest device %d != current mount device %d (remount raced the copy): %w",
+					destDev, sys.Dev, pin.ErrFUSEIdentityGate))
+				return
+			}
+		}
+	}
+
+	// #103: preserve the client's mtime on the backend inode. os.Create stamped
+	// it with the drain time; restore the spool file's mtime (what the client
+	// wrote / what the in-flight spool served) so the served mtime stays STABLE
+	// across the spool→backend→reconcile lifecycle instead of jumping forward at
+	// the next reconcileDir refresh. Best-effort: the bytes are already SHA-
+	// verified at rest here, so a Chtimes failure leaves the (wrong) drain-time
+	// mtime but never loses data. Placed before BOTH the batch and inline
+	// completion paths so every drained file is covered.
+	if !spoolMtime.IsZero() {
+		if err := os.Chtimes(dest, spoolMtime, spoolMtime); err != nil {
+			log.Printf("drain: preserve client mtime failed (non-fatal) path=%s: %v", row.NFSPath, err)
+		}
+	}
+
+	// Lever 1 (JM_DRAIN_BATCH_INSERT): hand the fully-copied+verified drain to
+	// the write-coalescer instead of committing its (UpdateSize + MarkDone) pair
+	// inline. The coalescer batches many files' metadata writes into one SQLite
+	// transaction, cutting fsync/syscall volume under a write storm. Correctness
+	// is unchanged: BatchDrainComplete commits the size publish BEFORE the
+	// mark-done per file (task #65), and the post-commit eviction cleanup runs
+	// only after that tx commits — so this file's size is durable before its
+	// spool shadow is evicted, exactly as the per-file path guarantees below.
+	if d.batch != nil {
+		d.batch.enqueue(pendingDrain{row: row, dest: dest, n: n})
+		return
+	}
+
+	// task #65: publish the real size into the metadata store BEFORE eviction.
+	// The backend file is whole + SHA-verified here and row.Size is authoritative
+	// (n == row.Size enforced above), so this closes the eviction-before-publish
+	// gap: once MarkDrainComplete evicts the spool shadow, fresh reads resolve
+	// Entry.Size — now correct — instead of a stale 0/partial value. Safe during
+	// the brief shadow overlap: for a sequential file ContiguousEnd == row.Size,
+	// so the shadow and the store agree. It is on the drain's critical path (not
+	// a queued callback), so it stays correct under a burst.
+	if d.onSizeReady != nil {
+		d.onSizeReady(row.NFSPath, row.Size)
+	}
+
 	done, err := d.spool.MarkDrainComplete(row.ID, row.NFSPath, row.SpoolFile, row.Size)
 	if err != nil {
 		// Reviewer fix (slice B follow-on): MarkDrainComplete promises
@@ -632,6 +893,12 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 	d.metrics.DrainsSucceeded.Add(1)
 	d.metrics.BytesDrained.Add(n)
+	// Stamp drain liveness: a real MinIO PUT just landed, so the backend is
+	// provably reachable over the current (possibly congested) link. The
+	// reachability monitor consults this via LastDrainSuccess() to suppress a
+	// probe-dial false-failure caused by the drainer's own uplink saturation.
+	// Done ONLY here, on a COMPLETED success — never on an attempt/in-flight.
+	d.lastDrainSuccessNanos.Store(time.Now().UnixNano())
 	if d.onDrainComplete != nil {
 		d.onDrainComplete(row.NFSPath, row.Size)
 	}
@@ -667,7 +934,7 @@ func (d *Drainer) failTransient(row *metadata.SpoolRow, err error) {
 	// don't spend this photo's per-file budget on a network outage. The
 	// dispatcher is already parked offline, so this just resets the in-flight
 	// row to `ready`; it drains on reconnect.
-	if isInfraUnavailable(err) || pin.IsOffline() {
+	if isInfraUnavailable(err) || pin.IsOffline() || errors.Is(err, pin.ErrFUSEIdentityGate) {
 		if rErr := d.spool.Meta().ResetToReady(row.ID); rErr != nil {
 			log.Printf("drainer: infra-pause reset %d: %v", row.ID, rErr)
 		}
@@ -821,5 +1088,10 @@ func (d *Drainer) DrainOnceForTest(ctx context.Context) int {
 	case <-ctx.Done():
 		panic("DrainOnceForTest: ctx expired before in-flight drains completed; pass a longer context or check for a stalled FUSE call")
 	}
+	// Lever 1: workers enqueue into the coalescer instead of committing inline,
+	// so a single test scan leaves a partial batch. Flush it synchronously here
+	// so the same post-conditions the per-file path asserts (row done, spool
+	// file gone, size published, capacity released) hold when this returns.
+	d.flushBatch()
 	return count
 }

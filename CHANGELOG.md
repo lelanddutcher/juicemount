@@ -1,5 +1,36 @@
 # JuiceMount6 Changelog
 
+## 0.3.0 — 2026-07-06 — Reliability: no more "connection interrupted", instant saves & exports
+
+### Fixed
+- **"The server connection was interrupted" is gone.** Finder no longer flashes a
+  spurious connection-interrupted error during copies, at the moment a Premiere
+  export finishes, or when working with unicode / emoji filenames. Root cause: the
+  server could briefly report a just-written file as unavailable while it was still
+  settling — it now stays consistently visible.
+- **Saving and exporting feel instant.** Closing a file — a Premiere project save,
+  a video export — now finalizes in a few seconds instead of up to ~30, and no
+  longer stalls on "the last 1%". Large exports finalize as soon as the app signals
+  it's done, not after a fixed wait.
+- **No more black frames for images in Premiere.** A stale in-memory copy could
+  serve a truncated image (fixed only by restarting the app); images now read from
+  the always-fresh path and stay correct.
+- **Copies no longer stall ~a minute per file.** A Finder copy of files carrying
+  Finder tags or a quarantine flag no longer hangs ~73 s per file.
+- **No data-integrity issues under heavy concurrent copies.** Hardened the write
+  spool so a continuation write during a drain can never truncate an already-written
+  file, and out-of-order writes are tracked correctly.
+
+### Changed (app)
+- **Clear Cache updates the number immediately.** The menu-bar "X cached" figure now
+  drops as soon as the cache is cleared.
+- **Clearer Cache & Storage settings.** Numeric fields use the standard bordered
+  input styling so it's obvious where to type.
+- **More complete diagnostics export.** The exported bundle now includes the full
+  rotated logs (write-spool + NFS activity) and a live spool snapshot.
+- **Removed the obsolete "Reconcile interval" setting.** Metadata now syncs in real
+  time via change notifications; there's no interval to configure.
+
 ## 0.2.0 — 2026-06-29 — Bundles & packages, offline hardening, auto-updates, server-side generation
 
 ### Added

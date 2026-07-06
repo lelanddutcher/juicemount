@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -30,6 +31,35 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS idx_parent ON entries(parent_path);
 CREATE INDEX IF NOT EXISTS idx_inode ON entries(inode);
 CREATE INDEX IF NOT EXISTS idx_name ON entries(name COLLATE NOCASE);
+-- idx_parent_name is load-bearing for the paginated READDIR seek-cursor query
+-- (serving-layer-decision.md §Item 1, ListChildrenPage): WHERE parent_path=?
+-- AND name>? ORDER BY name LIMIT ?. Without it the planner uses idx_parent for
+-- the WHERE but then builds a "USE TEMP B-TREE FOR ORDER BY" that sorts the
+-- ENTIRE child set by name on EVERY page — making each page O(all-children),
+-- ~2.2ms on the 10,774-child DCIM dir regardless of LIMIT (measured). A
+-- composite (parent_path, name) index satisfies both the equality seek AND the
+-- name ordering from the index itself (no temp b-tree), turning each page into a
+-- true O(limit) index seek: ~160µs for a 128-row page (14x faster; the
+-- veto-mitigation proof). BINARY collation (default) — matches the plain
+-- 'ORDER BY name' / 'name > ?' in ListChildrenPage; idx_name's NOCASE variant
+-- does NOT satisfy a BINARY ordering, which is why this is a distinct index.
+-- Additive (CREATE IF NOT EXISTS) so it lands on existing mirror DBs at open.
+CREATE INDEX IF NOT EXISTS idx_parent_name ON entries(parent_path, name);
+`
+
+// metaSchema is a tiny durable key/value side-table for small pieces of
+// store-scoped state that must survive across process restarts but don't
+// belong in the entries mirror. C1 (2026-07-02) uses it to persist the
+// wall-clock time of the last successful metadata SCAN (key "last_sync_time",
+// unix seconds), so a fresh restart under keyspace-push can skip the redundant
+// boot SCAN. Deliberately separate from the entries table so a mirror wipe
+// (the app's "Reset local metadata cache") also drops this state — a wiped
+// mirror is stale by definition and must NOT be treated as fresh.
+const metaSchema = `
+CREATE TABLE IF NOT EXISTS store_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 `
 
 // ftsSchema creates a full-text search virtual table for instant filename search.
@@ -54,12 +84,78 @@ DROP TRIGGER IF EXISTS entries_ad;
 DROP TRIGGER IF EXISTS entries_au;
 `
 
+// ftsPendingSchema creates the durable pending-marker table for the FTS-deferral
+// perf lever (JM_FTS_DEFER, #86/#88). When the flag is on, the entries write hot
+// path skips the expensive trigram INSERT of the NEW rowid and instead records
+// that rowid here (INSERT OR IGNORE, cheap — no _fts5 merge). A background
+// compactor (ftsCompactorLoop) drains this table asynchronously, doing the
+// trigram INSERT off the write path. The table is a plain rowid set:
+// fts_pending.rowid == entries.rowid awaiting indexing.
+//
+// DURABILITY: this table lives in the SAME SQLite DB (WAL, synchronous=NORMAL)
+// as entries and is written in the SAME tx as the entries INSERT OR REPLACE, so
+// a pending marker is as durable as the entries row it points at. After a
+// crash+restart the compactor resumes from whatever pending rows survived — and
+// because entries_fts is external-content, the index is always fully rebuildable
+// from `entries` regardless (RebuildFTS at Open re-derives everything). No FTS
+// data can be lost, only deferred.
+//
+// INTEGRITY (the landmine): a pending marker is ONLY ever the NEW rowid of a
+// still-present entries row. The OLD-rowid entries_fts('delete', ...) stays
+// SYNCHRONOUS in the write path (see ftsExternalUpsertDeferred). Any delete /
+// replace of a rowid ALSO deletes that rowid's pending marker synchronously, so
+// we never (a) index a rowid whose row is gone, nor (b) leak a marker for a
+// freed rowid. See the rowid-lifecycle argument on ftsExternalUpsertDeferred.
+const ftsPendingSchema = `
+CREATE TABLE IF NOT EXISTS fts_pending (
+    rowid INTEGER PRIMARY KEY
+);
+`
+
 const pragmas = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA cache_size = -8000;
 PRAGMA busy_timeout = 30000;
 `
+
+// syncNormalAllEnabled reports whether Lever 0 is on: pin synchronous=NORMAL
+// across ALL pooled connections via a DSN _pragma (see OpenWithMaxCacheSize).
+// Read once at Open. Default OFF: flag-off is byte-identical to today's
+// behavior (NORMAL on the single connection that runs db.Exec(pragmas), FULL
+// on the other SetMaxOpenConns(8)-1 connections).
+func syncNormalAllEnabled() bool {
+	return os.Getenv("JM_SQLITE_SYNC_NORMAL_ALL") == "1"
+}
+
+// ftsDeferEnabled reports whether the FTS-deferral perf lever (#86/#88) is on:
+// the synchronous FTS5 trigram INSERT of the new rowid is removed from the
+// entries write hot path (~30% CPU under write storms) and caught up
+// asynchronously by ftsCompactorLoop. Read once at Open (s.ftsDefer). Default
+// OFF: flag-off is BYTE-IDENTICAL to today's synchronous FTS behavior — the
+// write path calls ftsExternalUpsert exactly as before and fts_pending stays
+// empty. See docs/TUNING/REVERT_LOG.md.
+func ftsDeferEnabled() bool {
+	return os.Getenv("JM_FTS_DEFER") == "1"
+}
+
+// ftsCompactBatch bounds how many pending rowids the compactor indexes per
+// writeMu acquisition (ONE tx). Small so the compactor never holds writeMu long
+// enough to starve foreground NFS serving / reconcile — it does at most this
+// many trigram INSERTs, commits, releases writeMu, then sleeps
+// (ftsCompactIdleSleep) before the next batch. Var (not const) so a test can
+// shrink it to force multi-batch behavior deterministically.
+var ftsCompactBatch = 256
+
+// ftsCompactIdleSleep is the pause the compactor takes between batches while
+// draining a backlog. It is the yield window: writeMu is fully released during
+// the sleep, so foreground writers (NFS CREATE, reconcile BulkInsert) run
+// unblocked between the compactor's bounded bursts. Var so a test can zero it.
+var ftsCompactIdleSleep = 2 * time.Millisecond
+
+// ftsCompactTick is the ticker period on which the compactor wakes to look for
+// pending rows when idle (no backlog). Var so a test can drive it faster.
+var ftsCompactTick = 200 * time.Millisecond
 
 // DefaultMaxCacheSize is the default maximum number of entries in the in-memory caches.
 const DefaultMaxCacheSize = 500_000
@@ -125,6 +221,16 @@ type Store struct {
 	maxCacheSize int
 	pinChecker   PinChecker // optional (QA-30); see PinChecker docstring
 
+	// spoolStore is the sibling SpoolStore over the SAME *sql.DB (both created
+	// from store.DB(); see the shared-DB note on Open). Wired via
+	// SetSpoolStore. Used ONLY by BatchDrainComplete, which must hold
+	// SpoolStore.writeMu while it marks spool_entries done so the batched
+	// mark-done serializes against DeleteActiveByPath / MarkDone exactly like
+	// the per-file path does (QA-37 cancel↔drain race). Nil until wired and
+	// when the batch-insert lever is off — BatchDrainComplete errors rather
+	// than run the mark-done unserialized. Read-only after SetSpoolStore.
+	spoolStore *SpoolStore
+
 	// ftsInitialized is set once the external-content FTS has been built (the
 	// first BulkInsert / initial sync). After that EVERY BulkInsert maintains
 	// FTS incrementally — even a large delta — so it never holds writeMu
@@ -139,6 +245,31 @@ type Store struct {
 	// also leaves every row searchable), which made the prior QA-40 test a
 	// false positive that passed on the broken code.
 	ftsFullRebuilds atomic.Uint64
+
+	// ftsDefer is the once-at-Open snapshot of JM_FTS_DEFER (#86/#88). When
+	// true, the entries write hot path (Insert / BulkInsert incremental /
+	// applyEvent) records the new rowid in fts_pending instead of doing the
+	// expensive synchronous trigram INSERT, and ftsCompactorLoop catches up
+	// asynchronously. The OLD-rowid entries_fts('delete', ...) stays synchronous
+	// regardless (integrity). Read-only after Open. Default false == today's
+	// fully-synchronous FTS.
+	ftsDefer bool
+
+	// ftsStop stops the background compactor goroutine; closed exactly once by
+	// Close (guarded by ftsStopOnce). Nil when ftsDefer is off (no compactor).
+	ftsStop     chan struct{}
+	ftsStopOnce sync.Once
+	// ftsCompactorDone is closed by the compactor goroutine when it exits, so
+	// Close (and tests) can wait for a clean shutdown. Nil when ftsDefer is off.
+	ftsCompactorDone chan struct{}
+	// ftsWake nudges the compactor to drain immediately (buffered, size 1) —
+	// signalled by the write path after it records a pending marker so a
+	// just-created file becomes searchable within a compact batch rather than
+	// waiting up to a full ftsCompactTick. Coalesced: a full buffer is a no-op.
+	ftsWake chan struct{}
+	// ftsCompactedBatches counts compactor batches that indexed >=1 row — a
+	// test-observable proxy for "the compactor ran and made progress".
+	ftsCompactedBatches atomic.Uint64
 
 	// QA-30 Layer B (2026-05-25): recently-evicted shadow map. When an entry
 	// is removed from pathCache+inodeCache via Delete/DeleteFromCache/
@@ -183,6 +314,14 @@ type Store struct {
 	// needs recovery, so evicting the oldest is safe). Guarded by mu.
 	syntheticHandles map[uint64]string
 	syntheticOrder   []uint64
+
+	// serve holds the lazily-prepared SQLite serve statements used by the
+	// SQLite-direct serve path (JM_SERVE_FROM_SQLITE / JM_READDIR_PAGINATED,
+	// serving-layer-decision.md §Item 1/2). Prepared against the *sql.DB pool
+	// on first serve query; see serve_sqlite.go for the concurrency model.
+	// Non-nil for the process lifetime; the statements inside are nil until the
+	// first flag-on serve query prepares them (default-off = never prepared).
+	serve *serveStmts
 }
 
 // maxSyntheticHandles bounds syntheticHandles. Generous — far above any real
@@ -366,6 +505,16 @@ func (s *Store) SetPinChecker(pc PinChecker) {
 	s.mu.Unlock()
 }
 
+// SetSpoolStore wires the sibling SpoolStore (over the SAME *sql.DB) that
+// BatchDrainComplete uses to serialize its batched spool_entries mark-done on
+// SpoolStore.writeMu (QA-37). Call once, on the start path, BEFORE the drainer
+// can flush a batch — the bridge wires it in nfs.JuiceMountHandler.SetSpool
+// alongside SetOnBatchDrainComplete. Idempotent; read-only afterwards, so no
+// lock is needed (matches the one-shot SetOnBatchDrainComplete wiring).
+func (s *Store) SetSpoolStore(ss *SpoolStore) {
+	s.spoolStore = ss
+}
+
 // pinnedSetLocked returns the current pinned-path set under s.mu (caller
 // already holds the lock, e.g. evictOldest). Returns nil + error to caller
 // on DB failure; the caller MUST fail-safe (skip eviction this cycle).
@@ -432,6 +581,27 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		sep = "&"
 	}
 	dsn += sep + "_pragma=busy_timeout(30000)"
+
+	// Lever 0 (JM_SQLITE_SYNC_NORMAL_ALL): pin synchronous=NORMAL across EVERY
+	// pooled connection via a DSN _pragma, for the SAME per-connection reason as
+	// busy_timeout above. `synchronous` is a per-CONNECTION setting, so the
+	// `PRAGMA synchronous = NORMAL` inside `pragmas` (run via db.Exec below)
+	// only takes on the ONE pooled connection that happened to execute it; with
+	// SetMaxOpenConns(8) the other 7 fall back to SQLite's default synchronous=
+	// FULL. Under write load, commits fan out across all 8 connections, so most
+	// commits pay FULL-mode's extra fsync + directory sync — a large slice of
+	// the profiled 22% (*Tx).Commit cost. Appending &_pragma=synchronous(1)
+	// (1 == NORMAL) makes modernc apply NORMAL to every connection it opens, so
+	// all 8 match the app's ALREADY-INTENDED durability level (NORMAL under WAL,
+	// declared in `pragmas`) instead of 7 silently running STRICTER FULL. This
+	// does NOT weaken durability below intent, and journal_mode (a DB-header
+	// setting, correctly Exec-once) is untouched. Default OFF for a clean A/B:
+	// flag-off == today's behavior (NORMAL on 1 conn, FULL on 7); flag-on ==
+	// NORMAL on all 8. The db.Exec(pragmas) below is kept as-is (harmless).
+	if syncNormalAllEnabled() {
+		dsn += "&_pragma=synchronous(1)"
+	}
+
 	// _txlock=immediate: every transaction takes SQLite's write lock at
 	// Begin() instead of upgrading at the first write statement. A DEFERRED
 	// tx that SELECTs and then UPDATEs can hit SQLITE_BUSY *immediately* on
@@ -463,15 +633,51 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
+	if _, err := db.Exec(metaSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create meta schema: %w", err)
+	}
+
 	if _, err := db.Exec(ftsSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create FTS schema: %w", err)
+	}
+
+	// fts_pending is additive (CREATE IF NOT EXISTS) so it lands on existing
+	// mirror DBs at open. Always created (harmless when the deferral flag is
+	// off — it just stays empty) so toggling JM_FTS_DEFER never needs a schema
+	// migration and a crash under the flag leaves a table the next boot can read.
+	if _, err := db.Exec(ftsPendingSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create FTS pending schema: %w", err)
 	}
 
 	// Drop legacy triggers (FTS is maintained manually for performance)
 	if _, err := db.Exec(dropFTSTriggers); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("drop FTS triggers: %w", err)
+	}
+
+	// Task #78 one-time mirror GC: drop internal-namespace rows (.trash/,
+	// .juicemount/) that pre-fix keyspace-push builds mirrored into SQLite.
+	// The full SCAN can never return these paths (see scanFilteredPath), so
+	// they were permanently absent from every SCAN diff and cycled in the
+	// pruneAbsent ladder forever (~112k pending_prune floor). Runs HERE —
+	// after the schema, BEFORE rebuildCaches and RebuildFTS — so neither the
+	// in-memory caches nor the FTS index ever see the removed rows (RebuildFTS
+	// below re-derives FTS from `entries`, which is why bare DELETEs without
+	// per-row FTS 'delete' ops are safe at this site and only this site).
+	// `._` rows are deliberately NOT touched. Kill switch: JM_MIRROR_NS_GC=0
+	// (see docs/TUNING/REVERT_LOG.md).
+	if os.Getenv("JM_MIRROR_NS_GC") != "0" {
+		if n, gcErr := gcInternalNamespaces(db); gcErr != nil {
+			// Fail-open: a GC error must not block boot/mount. The rows it
+			// would have removed are inert now that the push filter and the
+			// pruneAbsent exclusion are in place.
+			log.Printf("metadata: internal-namespace GC failed (continuing): %v", gcErr)
+		} else if n > 0 {
+			log.Printf("metadata: internal-namespace GC removed %d mirror rows (.trash/ + .juicemount/)", n)
+		}
 	}
 
 	if maxCacheSize <= 0 {
@@ -485,7 +691,14 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		childrenIdx:      make(map[string]map[string]*Entry),
 		maxCacheSize:     maxCacheSize,
 		syntheticHandles: make(map[uint64]string),
+		serve:            &serveStmts{},
+		ftsDefer:         ftsDeferEnabled(),
 	}
+
+	// Item 2: log the serve substrate ONCE per boot (RAM shadow vs SQLite-WAL)
+	// so a live A/B run (JM_SERVE_FROM_SQLITE=0 vs =1 on the same binary) is
+	// attributable in the logs. Not per-RPC.
+	logServeSubstrate()
 
 	if err := s.rebuildCaches(); err != nil {
 		db.Close()
@@ -494,16 +707,88 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 
 	// Rebuild FTS index on startup to ensure consistency with the entries table.
 	// This is fast (<1s for 131K entries) and only runs once.
+	//
+	// This full rebuild re-derives entries_fts from `entries` and is exactly the
+	// FTS-deferral crash-safety backstop: it makes the index consistent with
+	// EVERY entries row regardless of what was pending when the process last
+	// exited. So after a crash under the flag the index is already correct at
+	// boot; the fts_pending markers that survived are then indexed again
+	// (idempotent INSERT OR REPLACE into an external-content FTS) by the
+	// compactor and cleared. The rebuild also does NOT touch fts_pending, so a
+	// pending marker for a row that still exists survives into the compactor.
 	if err := s.RebuildFTS(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("rebuild FTS: %w", err)
 	}
 
+	// Start the background FTS compactor only when the deferral flag is on. It
+	// drains fts_pending off the write path. Flag-off: no goroutine, fts_pending
+	// stays empty, behavior is byte-identical to today's synchronous FTS.
+	if s.ftsDefer {
+		s.ftsStop = make(chan struct{})
+		s.ftsCompactorDone = make(chan struct{})
+		s.ftsWake = make(chan struct{}, 1)
+		go s.ftsCompactorLoop()
+	}
+
 	return s, nil
+}
+
+// gcInternalNamespaces is the task-#78 one-time mirror GC (see the call site
+// in OpenWithMaxCacheSize for the full rationale and the safety argument for
+// bare DELETEs here). Batched via a rowid subquery — DELETE ... LIMIT needs a
+// non-default SQLite compile flag — so a ~112k-row backlog is removed in
+// bounded transactions instead of one giant journal spike. Returns the total
+// number of rows removed.
+func gcInternalNamespaces(db *sql.DB) (int64, error) {
+	// Namespaces MUST mirror scanFilteredPath (the single source of truth).
+	// Children only ('ns/*'): the bare ".trash"/".juicemount" dir rows are
+	// left alone — they are cheap, FUSE-visible directories, and the
+	// scanFilteredDescendant split keeps their descendants off the ladder
+	// while the bare rows stay prunable via the normal FUSE-verified paths.
+	//
+	// GLOB, not LIKE (batch-3 adversarial review #3): SQLite LIKE is
+	// ASCII-case-INSENSITIVE by default (no case_sensitive_like pragma is
+	// set), so LIKE '.trash/%' also matched a root-level USER directory named
+	// '.Trash' (e.g. a macOS home-dir backup copied to the volume root) — a
+	// real, SCAN-visible namespace that scanFilteredPath does NOT filter —
+	// and deleted its mirror rows at EVERY open (delete-at-boot /
+	// re-add-at-first-SCAN cycle; invisible offline until the next online
+	// SCAN). GLOB is ASCII-case-sensitive and treats '.'/'/' literally, so it
+	// matches the predicate's exact byte semantics. PRAGMA case_sensitive_like
+	// was rejected: db.Exec pragmas bind to a single pooled connection (see
+	// the pragmas note above) and it would silently change the other LIKE
+	// query in this file.
+	const batch = `DELETE FROM entries WHERE rowid IN (
+		SELECT rowid FROM entries
+		WHERE path GLOB '.trash/*' OR path GLOB '.juicemount/*'
+		LIMIT 5000)`
+	var total int64
+	for {
+		res, err := db.Exec(batch)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n == 0 {
+			return total, nil
+		}
+	}
 }
 
 // Close closes the database connection.
 func (s *Store) Close() error {
+	// Stop the FTS compactor (if running) and wait for it to exit BEFORE
+	// closing the DB, so it can never touch a closed *sql.DB. Idempotent via
+	// ftsStopOnce so a double Close (or Close after a flag-off Open) is safe.
+	if s.ftsStop != nil {
+		s.ftsStopOnce.Do(func() { close(s.ftsStop) })
+		<-s.ftsCompactorDone
+	}
 	return s.db.Close()
 }
 
@@ -527,7 +812,7 @@ func (s *Store) Insert(e *Entry) error {
 		s.writeMu.Unlock()
 		return fmt.Errorf("insert begin %q: %w", e.Path, err)
 	}
-	if err := ftsExternalUpsert(tx, e); err != nil {
+	if err := ftsExternalUpsert(tx, e, s.ftsDefer); err != nil {
 		tx.Rollback()
 		s.writeMu.Unlock()
 		return fmt.Errorf("insert %q: %w", e.Path, err)
@@ -537,6 +822,10 @@ func (s *Store) Insert(e *Entry) error {
 		return fmt.Errorf("insert commit %q: %w", e.Path, err)
 	}
 	s.writeMu.Unlock()
+	// Nudge the compactor so a just-created file becomes searchable promptly
+	// (within a compact batch) rather than only on the next ticker. No-op when
+	// the flag is off (ftsWake is nil). Non-blocking / coalesced.
+	s.wakeFTSCompactor()
 
 	s.mu.Lock()
 	// Remove old entry from children index if path existed with different parent
@@ -594,9 +883,11 @@ func (s *Store) Delete(entryPath string) error {
 		return fmt.Errorf("delete %q: %w", entryPath, err)
 	}
 	if hadOld {
-		if _, err := tx.Exec(
-			`INSERT INTO entries_fts(entries_fts, rowid, name, path) VALUES('delete', ?, ?, ?)`,
-			oldRowid, oldName, oldPath); err != nil {
+		// Remove the old rowid's FTS state: the external-content 'delete' if it
+		// was indexed, or just its pending marker if it was still deferred (a
+		// bare 'delete' of never-inserted tokens would corrupt the FTS5 index).
+		// Flag-off reduces to the original unconditional 'delete'.
+		if err := ftsDeleteOldRowid(tx, oldRowid, oldName, oldPath, s.ftsDefer); err != nil {
 			tx.Rollback()
 			s.writeMu.Unlock()
 			return fmt.Errorf("delete fts %q: %w", entryPath, err)
@@ -721,22 +1012,62 @@ func (s *Store) evictPathOrphanLocked(old, new *Entry) {
 }
 
 // LookupByInode returns the entry with the given inode, or nil.
+//
+// SUBSTRATE SWITCH (serving-layer-decision.md §Item 2): when
+// JM_SERVE_FROM_SQLITE=1 this queries SQLite-WAL directly via a prepared point
+// lookup on idx_inode (no s.mu, WAL reader snapshots around a contending
+// writer); otherwise it reads the in-RAM inodeCache exactly as before. The
+// switch lives HERE so both paths are compiled in and no handler.go call site
+// changes — the flag picks per call. Default OFF = RAM path, byte-identical to
+// prior behavior.
 func (s *Store) LookupByInode(inode uint64) *Entry {
+	if serveFromSQLite() {
+		return s.lookupByInodeSQLite(inode)
+	}
+	return s.lookupByInodeRAM(inode)
+}
+
+func (s *Store) lookupByInodeRAM(inode uint64) *Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.inodeCache[inode]
 }
 
 // LookupByPath returns the entry at the given path, or nil.
+//
+// SUBSTRATE SWITCH: see LookupByInode. SQLite path is a prepared PRIMARY-KEY
+// point lookup on entries(path).
 func (s *Store) LookupByPath(entryPath string) *Entry {
+	if serveFromSQLite() {
+		return s.lookupByPathSQLite(entryPath)
+	}
+	return s.lookupByPathRAM(entryPath)
+}
+
+func (s *Store) lookupByPathRAM(entryPath string) *Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.pathCache[entryPath]
 }
 
 // ListChildren returns all entries whose parent_path matches the given path.
-// Uses the children index for O(children) lookup instead of O(total entries).
+//
+// SUBSTRATE SWITCH: see LookupByInode. When JM_SERVE_FROM_SQLITE=1 the child
+// set comes from SQLite-WAL via internally-paged ListChildrenPage on
+// idx_parent_name (bounded scan, pooled scratch — never a single unbounded
+// whole-dir scan); otherwise it reads the in-RAM childrenIdx (O(children))
+// exactly as before. Both return (nil, nil) for an empty/unmirrored dir. The
+// offline-empty branch (handler.go) and the online FUSE-fallback branch
+// downstream are unchanged correctness gates: a SQLite ListChildren returning 0
+// for a genuinely-empty dir behaves identically to the RAM map returning 0.
 func (s *Store) ListChildren(parentPath string) ([]*Entry, error) {
+	if serveFromSQLite() {
+		return s.listChildrenSQLite(parentPath)
+	}
+	return s.listChildrenRAM(parentPath)
+}
+
+func (s *Store) listChildrenRAM(parentPath string) ([]*Entry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -884,6 +1215,60 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 // on writeMu. Var so tests can lower it.
 var FTSFullRebuildThreshold = 5000
 
+// ftsDeleteOldRowid removes an OLD rowid's FTS state before its rowid can be
+// freed+reused, inside the given tx (caller holds writeMu). This is THE
+// integrity operation of the FTS-deferral lever, and it MUST handle both index
+// states the old row could be in:
+//
+//   - Old row was ALREADY INDEXED (trigrams present in entries_fts): issue the
+//     external-content 'delete' with the exact (rowid, name, path) the tokens
+//     were inserted under, so FTS5 can subtract them. Skipping this is the
+//     landmine — a later rowid reuse would make a stale token resolve to an
+//     unrelated file (wrong hit) and violate FTS5 integrity.
+//   - Old row was STILL PENDING (deferred; its trigrams were never inserted):
+//     issuing 'delete' here would tell FTS5 to subtract tokens that were never
+//     added, corrupting the external-content index ("database disk image is
+//     malformed"). So we MUST NOT issue the 'delete'; we only clear the pending
+//     marker. There are no stale tokens to worry about precisely because none
+//     were ever indexed.
+//
+// The two cases are disjoint and exhaustive: under deferral a rowid is either in
+// fts_pending (never indexed) or not (indexed by the compactor / a boot
+// rebuild). We probe fts_pending to disambiguate. When deferFTS is off,
+// fts_pending is always empty, so this reduces to the original unconditional
+// 'delete' — byte-identical to pre-lever behavior.
+func ftsDeleteOldRowid(tx *sql.Tx, oldRowid int64, oldName, oldPath string, deferFTS bool) error {
+	if deferFTS {
+		var pendingRowid int64
+		switch err := tx.QueryRow(`SELECT rowid FROM fts_pending WHERE rowid = ?`, oldRowid).Scan(&pendingRowid); err {
+		case nil:
+			// Old row was still pending → never indexed → no trigrams to delete.
+			// Just drop the marker (skip the 'delete' that would corrupt FTS5).
+			if _, err := tx.Exec(`DELETE FROM fts_pending WHERE rowid = ?`, oldRowid); err != nil {
+				return fmt.Errorf("clear pending old rowid %d: %w", oldRowid, err)
+			}
+			return nil
+		case sql.ErrNoRows:
+			// Not pending → already indexed → fall through to the 'delete'.
+		default:
+			return fmt.Errorf("probe pending old rowid %d: %w", oldRowid, err)
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO entries_fts(entries_fts, rowid, name, path) VALUES('delete', ?, ?, ?)`,
+		oldRowid, oldName, oldPath); err != nil {
+		return fmt.Errorf("fts delete old rowid %d: %w", oldRowid, err)
+	}
+	// Belt-and-braces: an indexed row should never also carry a pending marker,
+	// but clear it if one somehow exists so we never leak (no-op normally).
+	if deferFTS {
+		if _, err := tx.Exec(`DELETE FROM fts_pending WHERE rowid = ?`, oldRowid); err != nil {
+			return fmt.Errorf("clear stray pending old rowid %d: %w", oldRowid, err)
+		}
+	}
+	return nil
+}
+
 // ftsExternalUpsert maintains the external-content entries_fts index for an
 // INSERT OR REPLACE of e, inside the given tx (caller holds writeMu). Because
 // the entries PK is the TEXT path (not the rowid), INSERT OR REPLACE on a
@@ -891,7 +1276,27 @@ var FTSFullRebuildThreshold = 5000
 // so we must read the OLD row's rowid+name+path BEFORE the replace to issue
 // the FTS5 'delete' for its stale tokens, then index the new rowid. Keeps the
 // external-content index consistent without a full rebuild.
-func ftsExternalUpsert(tx *sql.Tx, e *Entry) error {
+//
+// deferFTS (JM_FTS_DEFER, #86/#88): when true the EXPENSIVE new-rowid trigram
+// INSERT is deferred to the background compactor. The rowid-lifecycle integrity
+// invariant is preserved exactly:
+//
+//   - Removing the OLD rowid's FTS state stays SYNCHRONOUS, via ftsDeleteOldRowid
+//     (which issues the external-content 'delete' ONLY if the old row was already
+//     indexed, else just clears its pending marker). This is the landmine:
+//     external-content FTS5 has no triggers, so if an INDEXED old row's trigrams
+//     outlived the INSERT OR REPLACE that frees+reuses its rowid, a later reuse
+//     would make a stale token resolve to an unrelated file (a WRONG search hit)
+//     and violate FTS5 integrity. Deferring the removal is never safe; only the
+//     NEW-rowid insert is.
+//   - Instead of the new-rowid trigram INSERT we record the new rowid in
+//     fts_pending (INSERT OR IGNORE — cheap, no _fts5 merge) in the SAME tx.
+//   - ftsDeleteOldRowid runs BEFORE the new-rowid pending insert below. SQLite
+//     may hand the freed old rowid straight back as newRowid on the reinsert, so
+//     order matters: clear the old rowid's state first, then mark the new (=
+//     reused) rowid pending — so a rowid that is freed and immediately reused
+//     ends up correctly PENDING under its new name/path, not deleted.
+func ftsExternalUpsert(tx *sql.Tx, e *Entry, deferFTS bool) error {
 	var oldRowid int64
 	var oldName, oldPath string
 	hadOld := false
@@ -917,12 +1322,22 @@ func ftsExternalUpsert(tx *sql.Tx, e *Entry) error {
 	if err != nil {
 		return fmt.Errorf("fts upsert lastid %q: %w", e.Path, err)
 	}
+	// Remove the OLD rowid's FTS state (integrity — see docstring). Done BEFORE
+	// the new-rowid pending insert so a reused rowid (newRowid == oldRowid)
+	// survives as pending under its new name/path, not deleted.
 	if hadOld {
-		if _, err := tx.Exec(
-			`INSERT INTO entries_fts(entries_fts, rowid, name, path) VALUES('delete', ?, ?, ?)`,
-			oldRowid, oldName, oldPath); err != nil {
+		if err := ftsDeleteOldRowid(tx, oldRowid, oldName, oldPath, deferFTS); err != nil {
 			return fmt.Errorf("fts upsert delete-old %q: %w", e.Path, err)
 		}
+	}
+	if deferFTS {
+		// Defer the expensive trigram INSERT: record the new rowid as pending.
+		// INSERT OR IGNORE so a repeated upsert of the same still-pending rowid
+		// is idempotent (no duplicate markers).
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO fts_pending(rowid) VALUES(?)`, newRowid); err != nil {
+			return fmt.Errorf("fts upsert pending %q: %w", e.Path, err)
+		}
+		return nil
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO entries_fts(rowid, name, path) VALUES(?, ?, ?)`,
@@ -947,10 +1362,13 @@ func (s *Store) bulkInsertBatch(batch []*Entry, incremental bool) error {
 	}
 
 	// Steady-state reconcile delta: maintain the external-content FTS per row
-	// so we never wipe+reindex the whole table under writeMu (QA-40).
+	// so we never wipe+reindex the whole table under writeMu (QA-40). Under
+	// JM_FTS_DEFER the per-row trigram INSERT is deferred to fts_pending (the
+	// old-rowid delete stays synchronous) — this is the hot reconcile path under
+	// write storms, so deferring it here is the main CPU win.
 	if incremental {
 		for _, e := range batch {
-			if err := ftsExternalUpsert(tx, e); err != nil {
+			if err := ftsExternalUpsert(tx, e, s.ftsDefer); err != nil {
 				tx.Rollback()
 				return err
 			}
@@ -958,6 +1376,7 @@ func (s *Store) bulkInsertBatch(batch []*Entry, incremental bool) error {
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit: %w", err)
 		}
+		s.wakeFTSCompactor()
 		return nil
 	}
 
@@ -982,6 +1401,207 @@ func (s *Store) bulkInsertBatch(batch []*Entry, incremental bool) error {
 		}
 	}
 
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// BulkInsertAbsent is the insert-if-absent sibling of BulkInsert, for ASYNC
+// FUSE-sourced mirror warmers (U7 refreshUnmirroredDir, prefetchChildren).
+//
+// Batch-3 adversarial review #1 (TOCTOU): those warmers snapshot FUSE, filter
+// via LookupByPath==nil OUTSIDE any store lock, then batch-insert. A fresher
+// row landing in the window between the filter and the batch commit (a
+// keyspace-push event completing a remote write, a CREATE, the reconcile) was
+// REPLACEd by the older FUSE snapshot — no later push event corrects it, so
+// GETATTR served a stale (short) size until the SCAN backstop (the
+// silent-truncation class), or a remotely-deleted child was resurrected as a
+// phantom row. Here the presence check happens INSIDE the same critical
+// section as each apply:
+//
+//   - SQLite: INSERT OR IGNORE, never REPLACE; on the incremental-FTS path an
+//     existing row is skipped entirely (no REPLACE, no FTS delete/insert) —
+//     see ftsExternalInsertAbsent.
+//   - Caches: an entry already present in pathCache is skipped under the SAME
+//     s.mu hold that would have inserted it; an entry whose inode is already
+//     owned by another live cached path is also skipped (a rename raced the
+//     snapshot — the push-event row for the new path is fresher, and
+//     inserting the stale old-path entry would evict it: the QA-25
+//     stale-handle class).
+//
+// All interleavings converge to fresh-wins: if the fresh row lands first, the
+// warmer skips it in both stores; if the warmer's stale row lands first, the
+// fresh writer's replace-semantics path (Insert / applyEvent / reconcile
+// BulkInsert) overwrites it. Foreground writers keep BulkInsert unchanged.
+// Callers' LookupByPath pre-filters remain as cheap batch-size reducers but
+// are no longer load-bearing.
+func (s *Store) BulkInsertAbsent(entries []*Entry, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+
+	// Same incremental-vs-bulk FTS decision as BulkInsert (QA-40 rationale).
+	incremental := len(entries) > 0 && (s.ftsInitialized.Load() || len(entries) < FTSFullRebuildThreshold)
+
+	for i := 0; i < len(entries); i += batchSize {
+		end := i + batchSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+		if err := s.bulkInsertAbsentBatch(entries[i:end], incremental); err != nil {
+			return err
+		}
+	}
+
+	// See BulkInsert for the QA-30 Layer B HIGH-2 + chunked-mutation
+	// (drain-latency tail) rationale — same structure, absent semantics.
+	s.stagePinnedForEviction()
+
+	for i := 0; i < len(entries); i += cacheMutationChunk {
+		end := i + cacheMutationChunk
+		if end > len(entries) {
+			end = len(entries)
+		}
+		s.mu.Lock()
+		for _, e := range entries[i:end] {
+			// The whole point of the absent variant: presence is checked
+			// under THIS lock hold, not in the caller's earlier filter pass.
+			if _, exists := s.pathCache[e.Path]; exists {
+				continue // fresher row won the race — never overwrite it
+			}
+			if _, taken := s.inodeCache[e.Inode]; taken {
+				// Inode already owned by a live cached path (a rename raced
+				// the FUSE snapshot). Inserting our stale path would evict
+				// the fresher owner (QA-25 class) — skip; the reconcile
+				// converges the mirror.
+				continue
+			}
+			s.inodeCache[e.Inode] = e
+			s.pathCache[e.Path] = e
+			s.addToChildrenIdx(e)
+		}
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	s.evictOldest()
+	s.mu.Unlock()
+
+	if !incremental {
+		if err := s.RebuildFTS(); err != nil {
+			log.Printf("[metadata] BulkInsertAbsent: RebuildFTS failed: %v", err)
+		}
+	}
+	if len(entries) > 0 {
+		s.ftsInitialized.Store(true)
+	}
+	return nil
+}
+
+// ftsExternalInsertAbsent is the insert-if-absent sibling of
+// ftsExternalUpsert (caller holds writeMu). An existing row is left entirely
+// untouched — no REPLACE, no FTS delete/insert — so a fresher concurrent
+// writer's row (and its FTS tokens) survive an async warmer's stale snapshot
+// (batch-3 adversarial review #1).
+//
+// deferFTS: this path only ever inserts a GENUINELY-NEW rowid (no REPLACE, no
+// old row, no old trigrams) so the rowid-reuse integrity landmine does not
+// apply here — there is no synchronous old-rowid delete to preserve. Under the
+// flag the new-rowid trigram INSERT is simply recorded in fts_pending for the
+// compactor, same as the upsert path.
+func ftsExternalInsertAbsent(tx *sql.Tx, e *Entry, deferFTS bool) error {
+	var one int
+	switch err := tx.QueryRow(`SELECT 1 FROM entries WHERE path = ?`, e.Path).Scan(&one); err {
+	case nil:
+		return nil // row exists — the present (fresher) row wins; skip entirely
+	case sql.ErrNoRows:
+		// genuinely absent — insert below
+	default:
+		return fmt.Errorf("insert-absent read %q: %w", e.Path, err)
+	}
+	res, err := tx.Exec(
+		`INSERT OR IGNORE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.Path, e.Name, e.ParentPath,
+		boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
+		int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
+	)
+	if err != nil {
+		return fmt.Errorf("insert-absent %q: %w", e.Path, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("insert-absent rows %q: %w", e.Path, err)
+	}
+	if n == 0 {
+		return nil // belt-and-braces: IGNOREd — present row wins, no FTS write
+	}
+	newRowid, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("insert-absent lastid %q: %w", e.Path, err)
+	}
+	if deferFTS {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO fts_pending(rowid) VALUES(?)`, newRowid); err != nil {
+			return fmt.Errorf("insert-absent pending %q: %w", e.Path, err)
+		}
+		return nil
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO entries_fts(rowid, name, path) VALUES(?, ?, ?)`,
+		newRowid, e.Name, e.Path); err != nil {
+		return fmt.Errorf("insert-absent fts %q: %w", e.Path, err)
+	}
+	return nil
+}
+
+// bulkInsertAbsentBatch is bulkInsertBatch with INSERT OR IGNORE semantics
+// (one transaction, writeMu held only for its own duration).
+func (s *Store) bulkInsertAbsentBatch(batch []*Entry, incremental bool) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+
+	if incremental {
+		for _, e := range batch {
+			if err := ftsExternalInsertAbsent(tx, e, s.ftsDefer); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit: %w", err)
+		}
+		s.wakeFTSCompactor()
+		return nil
+	}
+
+	// Non-incremental (startup/large load): skip per-row FTS here; the caller
+	// does one bulk RebuildFTS, which re-derives FTS from `entries` and is
+	// therefore consistent with IGNOREd rows too.
+	stmt, err := tx.Prepare(
+		`INSERT OR IGNORE INTO entries (path, name, parent_path, is_dir, size, mtime, inode, mode, local_only)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("prepare: %w", err)
+	}
+	for _, e := range batch {
+		if _, err := stmt.Exec(
+			e.Path, e.Name, e.ParentPath,
+			boolToInt(e.IsDir), e.Size, e.Mtime.Unix(),
+			int64(e.Inode), uint32(e.Mode), boolToInt(e.LocalOnly),
+		); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			return fmt.Errorf("exec %q: %w", e.Path, err)
+		}
+	}
 	stmt.Close()
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
@@ -1175,6 +1795,38 @@ func (s *Store) Count() (int, error) {
 	return count, err
 }
 
+// GetMeta reads a value from the durable store_meta key/value table (C1).
+// ok is false when the key is absent (not an error); a real query error is
+// returned in err. Callers treat (…, false, nil) as "no value persisted".
+func (s *Store) GetMeta(key string) (value string, ok bool, err error) {
+	row := s.db.QueryRow(`SELECT value FROM store_meta WHERE key = ?`, key)
+	switch scanErr := row.Scan(&value); scanErr {
+	case nil:
+		return value, true, nil
+	case sql.ErrNoRows:
+		return "", false, nil
+	default:
+		return "", false, scanErr
+	}
+}
+
+// SetMeta upserts a value into the durable store_meta key/value table (C1).
+// Serialized through writeMu like every other SQLite write in this store so it
+// never races an entries write on a second pooled connection.
+func (s *Store) SetMeta(key, value string) error {
+	s.writeMu.Lock()
+	_, err := s.db.Exec(
+		`INSERT INTO store_meta (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		key, value,
+	)
+	s.writeMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("set meta %q: %w", key, err)
+	}
+	return nil
+}
+
 // AllPaths returns every path in the store (used for reconciliation diffing).
 func (s *Store) AllPaths() (map[string]struct{}, error) {
 	rows, err := s.db.Query(`SELECT path FROM entries WHERE local_only = 0`)
@@ -1295,7 +1947,207 @@ func (s *Store) RebuildFTS() error {
 	if _, err := s.db.Exec(`INSERT INTO entries_fts(rowid, name, path) SELECT rowid, name, path FROM entries`); err != nil {
 		return fmt.Errorf("fts rebuild: %w", err)
 	}
+	// A full rebuild indexes EVERY entries row, so nothing is un-indexed
+	// afterward — clear the deferral backlog so the pending count is honest (0)
+	// and the compactor does no redundant re-index work. Safe: the FTS now
+	// covers every row these markers pointed at. No-op when the table is empty
+	// (flag-off). This runs under writeMu so it is atomic w.r.t. the write path.
+	if _, err := s.db.Exec(`DELETE FROM fts_pending`); err != nil {
+		return fmt.Errorf("fts clear pending: %w", err)
+	}
 	return nil
+}
+
+// CountPendingFTS returns how many entries rows are awaiting deferred FTS
+// indexing (the JM_FTS_DEFER backlog). The bridge/UI can surface this as
+// "indexing N…" so a user sees that a just-created file is not yet searchable.
+// Always 0 when the deferral flag is off (fts_pending stays empty). Cheap: a
+// COUNT over a small PK-only table. Does NOT take writeMu — it is a read.
+func (s *Store) CountPendingFTS() (int, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM fts_pending`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count pending fts: %w", err)
+	}
+	return n, nil
+}
+
+// wakeFTSCompactor nudges the background compactor to drain fts_pending now
+// rather than on its next ticker, so a just-created file becomes searchable
+// within a compact batch. No-op when the deferral flag is off (ftsWake is nil).
+// Non-blocking and coalesced: a already-buffered wake is left as-is.
+func (s *Store) wakeFTSCompactor() {
+	if s.ftsWake == nil {
+		return
+	}
+	select {
+	case s.ftsWake <- struct{}{}:
+	default:
+	}
+}
+
+// ftsCompactorLoop is the background goroutine (started in Open only when
+// JM_FTS_DEFER is on) that catches up the deferred FTS index off the write
+// path. It drains fts_pending in COALESCED, BOUNDED batches so it never starves
+// foreground NFS serving or reconcile:
+//
+//   - Each batch holds writeMu for ONE tx that indexes at most ftsCompactBatch
+//     (~256) rows, then releases it. Between batches it sleeps
+//     ftsCompactIdleSleep so foreground writers run unblocked in the gap — the
+//     yield window. A large backlog drains as many short bursts, never one long
+//     writeMu hold (contrast RebuildFTS's whole-catalog reindex, the QA-40
+//     stall this lever specifically avoids on the write path).
+//   - When the backlog is empty it blocks on a ticker (ftsCompactTick) or an
+//     explicit wake (ftsWake) from the write path, so it consumes ~nothing when
+//     idle yet reacts within a batch to a fresh write.
+//   - It exits promptly when ftsStop is closed (Close), signalling via
+//     ftsCompactorDone.
+func (s *Store) ftsCompactorLoop() {
+	defer close(s.ftsCompactorDone)
+
+	ticker := time.NewTicker(ftsCompactTick)
+	defer ticker.Stop()
+
+	for {
+		// Drain the current backlog in bounded bursts, yielding writeMu between
+		// each so foreground writers are never blocked for more than one batch.
+		for {
+			select {
+			case <-s.ftsStop:
+				return
+			default:
+			}
+			n, err := s.compactFTSBatch(ftsCompactBatch)
+			if err != nil {
+				// Fail-open: a compactor error must never wedge the store or the
+				// mount. The markers remain durable; the next tick retries, and
+				// a boot RebuildFTS is the ultimate backstop. Back off a tick so
+				// we don't hot-loop on a persistent error.
+				log.Printf("[metadata] fts compactor batch error (will retry): %v", err)
+				break
+			}
+			if n == 0 {
+				break // backlog drained
+			}
+			// Yield: release the CPU and let foreground writers take writeMu
+			// before the next burst. writeMu is NOT held here.
+			if ftsCompactIdleSleep > 0 {
+				select {
+				case <-s.ftsStop:
+					return
+				case <-time.After(ftsCompactIdleSleep):
+				}
+			}
+			if n < ftsCompactBatch {
+				break // partial batch → backlog is (near) empty; wait for a signal
+			}
+		}
+
+		// Backlog empty: wait for the next tick, an explicit wake, or stop.
+		select {
+		case <-s.ftsStop:
+			return
+		case <-ticker.C:
+		case <-s.ftsWake:
+		}
+	}
+}
+
+// compactFTSBatch indexes up to limit pending rows in ONE writeMu-held tx and
+// returns how many pending markers it consumed (indexed OR skipped-and-cleared).
+// A pending rowid whose entries row has since vanished is skipped and its marker
+// deleted (no-op index). Bounded so it never holds writeMu for unbounded time.
+func (s *Store) compactFTSBatch(limit int) (int, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// Snapshot a bounded slice of pending rowids. LIMIT keeps the tx small.
+	rows, err := s.db.Query(`SELECT rowid FROM fts_pending ORDER BY rowid LIMIT ?`, limit)
+	if err != nil {
+		return 0, fmt.Errorf("compact select pending: %w", err)
+	}
+	var pending []int64
+	for rows.Next() {
+		var rid int64
+		if err := rows.Scan(&rid); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("compact scan pending: %w", err)
+		}
+		pending = append(pending, rid)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("compact iterate pending: %w", err)
+	}
+	rows.Close()
+	if len(pending) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("compact begin: %w", err)
+	}
+
+	for _, rid := range pending {
+		// Look up the row's current name+path. If the row vanished (deleted
+		// meanwhile — though a synchronous DELETE FROM fts_pending on delete
+		// should have removed the marker already), skip the trigram insert; the
+		// marker is deleted below regardless, so a stale marker self-heals.
+		var name, p string
+		switch scanErr := tx.QueryRow(`SELECT name, path FROM entries WHERE rowid = ?`, rid).Scan(&name, &p); scanErr {
+		case nil:
+			// External-content INSERT is idempotent enough for our needs: the
+			// row was NOT indexed on the write path (only marked pending), and
+			// any old-rowid trigrams were deleted synchronously there, so this
+			// is a first index of this rowid's current name+path. If a boot
+			// RebuildFTS already indexed it, we re-insert — an external-content
+			// duplicate the integrity-check tolerates, and RebuildFTS would
+			// also have cleared the marker, so this path is not normally hit.
+			if _, err := tx.Exec(
+				`INSERT INTO entries_fts(rowid, name, path) VALUES(?, ?, ?)`,
+				rid, name, p); err != nil {
+				tx.Rollback()
+				return 0, fmt.Errorf("compact index rowid %d: %w", rid, err)
+			}
+		case sql.ErrNoRows:
+			// Row gone; nothing to index. Marker cleared below (self-heal).
+		default:
+			tx.Rollback()
+			return 0, fmt.Errorf("compact read rowid %d: %w", rid, scanErr)
+		}
+		if _, err := tx.Exec(`DELETE FROM fts_pending WHERE rowid = ?`, rid); err != nil {
+			tx.Rollback()
+			return 0, fmt.Errorf("compact clear marker %d: %w", rid, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("compact commit: %w", err)
+	}
+	s.ftsCompactedBatches.Add(1)
+	return len(pending), nil
+}
+
+// drainFTSPendingForTest synchronously compacts the ENTIRE pending backlog and
+// returns the total number of markers consumed. Test-only helper so a test can
+// deterministically await full catch-up without racing the ticker. Not used in
+// production (the background loop handles catch-up there).
+func (s *Store) drainFTSPendingForTest() (int, error) {
+	total := 0
+	for {
+		n, err := s.compactFTSBatch(ftsCompactBatch)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n == 0 {
+			return total, nil
+		}
+	}
 }
 
 // DeletePaths removes multiple entries by path in a single transaction.
@@ -1337,9 +2189,9 @@ func (s *Store) DeletePaths(paths []string) error {
 			return err
 		}
 		if hadOld {
-			if _, err := tx.Exec(
-				`INSERT INTO entries_fts(entries_fts, rowid, name, path) VALUES('delete', ?, ?, ?)`,
-				oldRowid, oldName, oldPath); err != nil {
+			// Same rowid-state-aware removal as Delete(): 'delete' if indexed,
+			// else clear the pending marker (never 'delete' un-inserted tokens).
+			if err := ftsDeleteOldRowid(tx, oldRowid, oldName, oldPath, s.ftsDefer); err != nil {
 				tx.Rollback()
 				s.writeMu.Unlock()
 				return err

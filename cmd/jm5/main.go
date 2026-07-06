@@ -21,6 +21,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/health"
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/cplane"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/manager"
@@ -149,7 +150,12 @@ func main() {
 	jmlog.Info("initial metadata sync starting")
 	start := time.Now()
 	if err := rc.SyncOnce(); err != nil {
-		log.Fatalf("Initial sync: %v", err)
+		// V2.3 U1/K4: a transient sync failure (slow WAN, backend hiccup)
+		// must not abort the CLI server — the GUI core only Warns here, the
+		// mirror serves what it has, and rc.Start()'s reconcile loop retries
+		// until the backend answers.
+		jmlog.Warn("initial sync failed — serving existing mirror; reconcile loop retries",
+			"error", err.Error())
 	}
 	count, _ := store.Count()
 	jmlog.Info("initial metadata sync complete",
@@ -176,6 +182,10 @@ func main() {
 	}
 
 	// 4. Start NFS server
+	// V2.3 G0: arm the FUSE identity gate before the server (and its
+	// drainer) starts — drains/purges/prunes refuse to act while the
+	// mountpoint has no real filesystem mounted on it.
+	pin.SetFUSEIdentityPath(*fusePath)
 	srv := jmnfs.NewServer(jmnfs.Config{
 		ListenAddr: *listenAddr,
 		FUSEPath:   *fusePath,

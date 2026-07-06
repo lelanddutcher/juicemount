@@ -51,6 +51,13 @@ func NewSpoolStore(db *sql.DB) *SpoolStore {
 	return &SpoolStore{db: db}
 }
 
+// deleteActiveByPathSelectHook, when non-nil, is called by DeleteActiveByPath
+// after its SELECT has collected rows to delete but BEFORE its DELETE runs —
+// the precise "decision made, not yet executed" point the QA-37 cancel↔drain
+// race turns on. Test-only (set by the concurrent-interleaving regression
+// test); nil in production, so the hot path pays only a nil check.
+var deleteActiveByPathSelectHook func(nfsPath string)
+
 // Insert creates a new spool_entries row in `writing` state and returns
 // the assigned id. Caller is expected to track id alongside the local
 // file-handle state.
@@ -136,6 +143,47 @@ func (s *SpoolStore) MarkDone(id int64) (bool, error) {
 	return n > 0, nil
 }
 
+// batchMarkDoneTx marks each spool id done inside the caller's transaction and
+// reports, per id (aligned by index), whether a row was actually updated —
+// the batched analogue of MarkDone. It is the QA-37 fix for the batch-insert
+// lever: the mark-done SQL that used to live inline in Store.BatchDrainComplete
+// (running under Store.writeMu, a DIFFERENT mutex than the one MarkDone /
+// DeleteActiveByPath serialize on) is moved here so it executes UNDER
+// SpoolStore.writeMu, restoring the exact mutual exclusion the per-file path
+// relies on.
+//
+// LOCK CONTRACT: the caller MUST already hold s.writeMu (this method does NOT
+// take it) and MUST have opened tx AFTER acquiring s.writeMu. This is what
+// closes the race: DeleteActiveByPath's SELECT+DELETE also runs under
+// s.writeMu, so a cancel and this mark-done can no longer interleave — one runs
+// entirely before the other. If the cancel's DELETE committed first, the
+// UPDATE below affects 0 rows → Done=false → the drainer undoes its FUSE write
+// (no resurrection). If this mark-done ran first, the cancel's DELETE (filtered
+// to writing/ready/draining) skips the now-done row and the drainer completes
+// it normally. Passing the caller's *sql.Tx keeps the entries.size publish and
+// this mark-done in ONE transaction (task #65 atomicity).
+//
+// The UPDATE is by id only (mirroring MarkDone): any row still present is
+// marked done; a row already DELETEd by a cancel yields RowsAffected==0 →
+// Done=false. items[i] carries the id and the per-row updated_at (unix), and
+// results[i] corresponds to items[i] — byte-for-byte the same UPDATE the inline
+// code ran, only relocated under s.writeMu.
+func (s *SpoolStore) batchMarkDoneTx(tx *sql.Tx, items []DrainCommitItem) ([]DrainCommitResult, error) {
+	results := make([]DrainCommitResult, len(items))
+	for i, it := range items {
+		res, err := tx.Exec(
+			`UPDATE spool_entries SET drain_state=?, updated_at=? WHERE id=?`,
+			DrainDone, it.Mtime.Unix(), it.SpoolID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("batch mark done %d: %w", it.SpoolID, err)
+		}
+		n, _ := res.RowsAffected()
+		results[i] = DrainCommitResult{SpoolID: it.SpoolID, Done: n > 0}
+	}
+	return results, nil
+}
+
 // DeleteActiveByPath removes every non-terminal (writing/ready/draining) row
 // for nfsPath and returns the rows it removed, so the caller can clean up the
 // associated spool files + capacity reservations. Terminal rows (done/failed)
@@ -146,7 +194,9 @@ func (s *SpoolStore) MarkDone(id int64) (bool, error) {
 // the SELECT+DELETE makes the cancel atomic with respect to an in-flight
 // drain: a concurrent MarkDraining/MarkDone either committed before this call
 // (and is observed by the SELECT) or blocks until after the DELETE (and then
-// finds 0 rows). No row can be half-claimed across the cancel.
+// finds 0 rows). No row can be half-claimed across the cancel. The batched
+// mark-done (Store.BatchDrainComplete → batchMarkDoneTx) also runs under this
+// same writeMu, so it is likewise serialized against this cancel.
 func (s *SpoolStore) DeleteActiveByPath(nfsPath string) ([]*SpoolRow, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -174,6 +224,13 @@ func (s *SpoolStore) DeleteActiveByPath(nfsPath string) ([]*SpoolRow, error) {
 	}
 	if len(out) == 0 {
 		return nil, nil
+	}
+	// Test-only sync point between the SELECT (decision-to-delete) and the
+	// DELETE, used by the QA-37 concurrent-interleaving regression test to force
+	// the exact bug window. nil in production (zero cost). Fires only when the
+	// SELECT actually collected rows — i.e. the cancel has decided to delete.
+	if hook := deleteActiveByPathSelectHook; hook != nil {
+		hook(nfsPath)
 	}
 	if _, err := s.db.Exec(
 		`DELETE FROM spool_entries WHERE nfs_path=? AND drain_state IN ('writing','ready','draining')`,

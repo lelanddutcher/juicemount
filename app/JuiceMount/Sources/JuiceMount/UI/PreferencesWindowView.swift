@@ -290,12 +290,9 @@ struct PreferencesWindowView: View {
             }
 
             Section {
-                numericRow("Reconcile interval", value: $preferences.reconcileSeconds,
-                           unit: "seconds", range: 5...3600, fallback: 30)
+                footnote("Metadata syncs in real time via Redis change notifications — there is no interval to configure. A rare background reconcile, automatically paced by link speed, guarantees convergence as a backstop.")
             } header: {
                 Text("Metadata sync")
-            } footer: {
-                footnote("How often the local metadata cache reconciles with Redis (real-time events arrive separately). Applies on the next start — Restart Server is enough.")
             }
         }
         .formStyle(.grouped)
@@ -420,6 +417,7 @@ struct PreferencesWindowView: View {
         LabeledContent(label) {
             HStack(spacing: 5) {
                 TextField("\(fallback)", value: clamped(value, range), format: .number)
+                    .textFieldStyle(.roundedBorder) // R-9 field style — was missed on the shared numericRow (Cache & Storage pane)
                     .frame(width: 70)
                     .multilineTextAlignment(.trailing)
                 Text(unit)

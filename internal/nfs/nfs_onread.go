@@ -74,6 +74,28 @@ var readDataPool = sync.Pool{
 	},
 }
 
+// offlineReadRefusal maps an offline-refused READ to the right NFS status for
+// offline-transition resilience (task #71). A cold/un-pinned read can be refused
+// with pin.ErrOfflineNotAvailable at ANY of three points in onRead — the per-RPC
+// fs.Open, the size-clamp fs.Stat, or fh.ReadAt — and all three must behave the
+// same. An IN-FLIGHT read (the client is mid-file → Offset>0) caught by an
+// offline transition (a manual toggle OR a sustained-outage auto-offline) returns
+// NFS3ERR_JUKEBOX within a bounded grace window: the hard-mounted client holds
+// the RPC and retries, so when offline lifts the read resumes seamlessly and the
+// copy survives. A brand-new cold read (Offset==0), or one past the window,
+// returns terminal NXIO so deliberate offline browsing of un-cached media fails
+// fast ("not available offline") and an in-flight read never hangs forever. NXIO
+// (not Access/IO) preserves the kernel's file-handle cache across the gap so the
+// file reappears without a remount. JUKEBOX is counted so the storm detector
+// (inflight.go) isn't blinded during a transition with many in-flight reads.
+func offlineReadRefusal(offset uint64, w *response, err error) *NFSStatusError {
+	if offset > 0 && pin.WithinOfflineReadStallWindow() {
+		recordJukebox(inflightOpName(w.req))
+		return &NFSStatusError{NFSStatusJukebox, err}
+	}
+	return &NFSStatusError{NFSStatusNXIO, err}
+}
+
 func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = opAttrErrorFormatter
 	var obj nfsReadArgs
@@ -91,6 +113,13 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
 		}
+		// Offline-refused open of an un-pinned file (the DOMINANT cold-read
+		// refusal point — onRead re-opens per RPC): stall an in-flight read,
+		// fail-fast a fresh cold read. Was NFSStatusAccess (EACCES) → "you don't
+		// have permission to access some of the items", which aborted the copy.
+		if pin.IsOfflineNotAvailable(err) {
+			return offlineReadRefusal(obj.Offset, w, err)
+		}
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 	defer fh.Close()
@@ -102,20 +131,47 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	// Stat() which contains a 2-second-budgeted FUSE Lstat for the
 	// phantom-purge gate — a fixed per-RPC cost that dominated read
 	// throughput on cached files. Cached size is a snapshot from Open
-	// time; a stale value can only cause a benign short read (NFS clients
-	// reissue), not a correctness issue.
+	// time; a stale HIGH-or-equal value only causes a benign short read
+	// (clients reissue). A stale ZERO is NOT benign — see the size>0 guard.
 	if obj.Count > CheckRead {
 		var size int64
 		var haveSize bool
+		reqEnd := int64(obj.Offset) + int64(obj.Count)
 		if cp, ok := fh.(CachedInfoProvider); ok {
+			// Trust the open-time snapshot ONLY when it fully satisfies this
+			// request (cs >= end-of-request) — then it cannot truncate, and the
+			// QA-31 syscall-free fast path holds. A snapshot SHORT of the request
+			// is NOT trusted: that is either the size-0 drain-tail window or a
+			// stale-LOW metadata-mirror size during an offline->online drain burst
+			// (task #65), where the mirror lags the backend; trusting it would
+			// SILENTLY truncate the read. A stale-HIGH snapshot is fine — a benign
+			// short read, the client reissues.
 			if info := cp.CachedInfo(); info != nil {
-				size = info.Size()
-				haveSize = true
+				if cs := info.Size(); cs > 0 && cs >= reqEnd {
+					size = cs
+					haveSize = true
+				}
+			}
+		}
+		if !haveSize {
+			// task #65: the snapshot would truncate. Get the AUTHORITATIVE size by
+			// fstat'ing the open FUSE fd — the backend always holds the complete
+			// file once drained, even when the metadata mirror is stale-LOW. Only
+			// reached on the short-snapshot slow path, so steady-state cached reads
+			// keep the QA-31 fast path. Bounded against a FUSE wedge inside LiveSize.
+			if ls, ok := fh.(liveSizer); ok {
+				if lv, ok2 := ls.LiveSize(); ok2 && lv > 0 {
+					size = lv
+					haveSize = true
+				}
 			}
 		}
 		if !haveSize {
 			info, err := fs.Stat(fs.Join(path...))
 			if err != nil {
+				if pin.IsOfflineNotAvailable(err) {
+					return offlineReadRefusal(obj.Offset, w, err)
+				}
 				return &NFSStatusError{NFSStatusAccess, err}
 			}
 			size = info.Size()
@@ -127,6 +183,20 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		// §3.3.6: server should return zero-length result when reading
 		// at or past EOF.
 		if int64(obj.Offset) >= size {
+			// EOF-at-or-past-end. Post-#85 `size` is the spool's WRITTEN high-water
+			// (writtenEnd), DECOUPLED from the contiguous readable prefix. So a
+			// not-yet-filled in-flight hole (off in [cend,wend), writer active) has
+			// off < size and does NOT enter this branch — its JUKEBOX hold is now
+			// enforced authoritatively in spoolReadFile.ReadAt (ErrSpoolIncomplete
+			// → JUKEBOX at the ioErr conversion below). This IncompleteAt gate is
+			// retained only as a defensive backstop for the off>=size path; for a
+			// still-arriving file IncompleteAt returns false there (off>=wend), so
+			// it no longer fires for spool holes — kept lest a future size source
+			// regress `size` back to the contiguous prefix (task #65).
+			if ir, ok := fh.(incompleteReader); ok && ir.IncompleteAt(int64(obj.Offset)) {
+				recordJukebox(inflightOpName(w.req))
+				return &NFSStatusError{NFSStatusJukebox, pin.ErrSpoolIncomplete}
+			}
 			obj.Count = 0
 		} else if size-int64(obj.Offset) < int64(obj.Count) {
 			obj.Count = uint32(size - int64(obj.Offset))
@@ -206,11 +276,23 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		}
 	}
 	if ioErr != nil {
-		// [JM6 tier-1.7] Offline fail-fast: distinguish offline-refusal
-		// from genuine I/O error. NFSStatusNXIO preserves the kernel's
-		// file handle cache for post-recovery; NFSStatusIO would not.
+		// Offline-refused in-flight read → stall+resume; else genuine I/O error.
+		// (see offlineReadRefusal — task #71.)
 		if pin.IsOfflineNotAvailable(ioErr) {
-			return &NFSStatusError{NFSStatusNXIO, ioErr}
+			return offlineReadRefusal(obj.Offset, w, ioErr)
+		}
+		// task #65 spool-read sentinels — small reads (≤ CheckRead) reach ReadAt
+		// directly, bypassing the size-clamp gate above:
+		//   - incomplete in-flight hole → JUKEBOX hold (client retries until the
+		//     bytes land), same outcome as the size-clamp path.
+		//   - drained+evicted mid-read → NOENT so the client reopens onto the
+		//     now-drained FUSE copy (GAP A), NOT a copy-aborting NFSStatusIO.
+		if pin.IsSpoolIncomplete(ioErr) {
+			recordJukebox(inflightOpName(w.req))
+			return &NFSStatusError{NFSStatusJukebox, ioErr}
+		}
+		if pin.IsSpoolDrained(ioErr) {
+			return &NFSStatusError{NFSStatusNoEnt, ioErr}
 		}
 		return &NFSStatusError{NFSStatusIO, ioErr}
 	}

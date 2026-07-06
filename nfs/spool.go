@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"hash"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -38,9 +38,13 @@ var ErrSpoolFull = fmt.Errorf("spool: capacity full: %w", syscall.ENOSPC)
 
 // ErrSpoolBusy is returned by OpenWrite when a previous entry for the same
 // path was finalized but is still draining and did not clear within the
-// bounded wait. The handler maps this to a retryable NFS status so the
-// client retries (by which point the drain has almost always completed).
-var ErrSpoolBusy = errors.New("spool: path busy (prior entry still draining)")
+// bounded wait. It WRAPS pin.ErrSpoolBusy so the internal/nfs write handler —
+// which cannot import this package — recognizes it via pin.IsSpoolBusy and maps
+// it to the retryable NFS3ERR_JUKEBOX, so the client retries (by which point
+// the drain has almost always evicted the shadow) instead of aborting the copy
+// on a hard EACCES. errors.Is(err, ErrSpoolBusy) still works by identity for
+// in-package callers/tests.
+var ErrSpoolBusy = fmt.Errorf("spool: path busy (prior entry still draining): %w", pin.ErrSpoolBusy)
 
 // DefaultStuckEscalationWindow is how long an entry may sit QUIESCENT (no
 // writes) with refcount>0 before the sweeper treats the handles as leaked
@@ -290,6 +294,12 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	const reopenPoll = 10 * time.Millisecond
 	const reopenMaxWait = 30 * time.Second
 	var waited time.Duration
+	// sawClosed records that we encountered a FINALIZED (closed) entry for this
+	// path — i.e. this is a reopen of a file that is draining, not a brand-new
+	// create. If that entry then drains+evicts, we must NOT create a fresh spool
+	// entry (its drain would os.Create-truncate the just-drained backend file and
+	// clobber it); the write is bounced to the in-place fdPool path instead.
+	var sawClosed bool
 
 	// Same path always maps to the same shard, so the check-then-create
 	// dedup below is serialized exactly as the old global openMu did; opens
@@ -318,14 +328,41 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 			// Finalized-but-not-yet-drained entry holds this path. Don't
 			// reuse (writes would fail) and don't create a competing entry
 			// (dup drain). Wait for the drainer to evict it.
+			sawClosed = true
+			busyID := existing.id
 			existing.mu.Unlock()
 			shard.Unlock()
+			if waited == 0 {
+				// First park for this OpenWrite: a WRITE (classically a
+				// faststart moov seek-back at end-of-export) arrived for a path
+				// whose prior entry finalized mid-copy and is still draining.
+				jmlog.Info("spool: OpenWrite waiting for finalized-not-drained entry to evict",
+					"path", nfsPath, "entry_id", busyID)
+			}
 			if waited >= reopenMaxWait {
+				jmlog.Warn("spool: OpenWrite gave up waiting for drain-evict — returning ErrSpoolBusy (client retries via JUKEBOX)",
+					"path", nfsPath, "entry_id", busyID,
+					"waited_ms", waited.Milliseconds(), "reopen_max_ms", reopenMaxWait.Milliseconds())
 				return nil, ErrSpoolBusy
 			}
 			time.Sleep(reopenPoll)
 			waited += reopenPoll
 			continue
+		}
+
+		// A reopen whose prior (finalized) entry has now drained+evicted: do NOT
+		// create a fresh spool entry. That fresh entry's drain would
+		// os.Create-truncate the just-drained backend file and clobber it (probe:
+		// TestReopenAfterDrainSpoolLevelCorruptionProbe). The file is durably in
+		// FUSE now, so bounce the write with ErrSpoolBusy → NFS3ERR_JUKEBOX; the
+		// client retries, LookupActive is then false, and the handler routes it
+		// to the in-place fdPool path (no truncate). Only a genuinely NEW path
+		// (never saw a closed entry) falls through to create a fresh entry.
+		if sawClosed {
+			shard.Unlock()
+			jmlog.Info("spool: OpenWrite reopen after drain-evict — deferring to in-place FUSE path (no destructive fresh entry)",
+				"path", nfsPath, "waited_ms", waited.Milliseconds())
+			return nil, ErrSpoolBusy
 		}
 
 		// No entry for this path — create a fresh one under the path shard.
@@ -409,6 +446,22 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 // active long writes are immune: continuous writes keep lastWrite fresh, so
 // the entry is never quiescent for the full window.
 func (s *SpoolStore) sweepOnce(idle time.Duration) int {
+	// v0.2.1 offline-transition resilience: never finalize/escalate while
+	// offline. finalizeIfIdle would CLOSE an in-flight entry whose Finder copy
+	// merely PAUSED across the offline toggle (refcount briefly drops to 0
+	// between WRITE RPCs); the drainer is paused offline (drainer.go), so the
+	// closed entry can't drain, and a resumed WRITE then hits OpenWrite's
+	// reopen-poll → reopenMaxWait → ErrSpoolBusy → the client's copy dies
+	// (Finder mislabels it "name too long/invalid"). Holding entries in
+	// `writing` across the offline window lets a resumed WRITE reuse them via
+	// OpenWrite's !closed branch; on reconnect the next sweep finalizes any
+	// genuinely-idle entry → drains. Durability is safe across an offline
+	// restart: RecoverOnBoot's DrainWriting case hashes the on-disk file (not
+	// the DB Size, which stays 0 until finalize) and resumes a `writing` row
+	// with real bytes to `ready`, so an offline-ingested file is never lost.
+	if pin.IsOffline() {
+		return 0
+	}
 	entries := s.index.Snapshot()
 	n := 0
 	for _, e := range entries {
@@ -866,6 +919,22 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 		// drainer to undo the FUSE write it just made.
 		return false, nil
 	}
+	s.completeDrainCleanup(id, nfsPath, spoolFile, size)
+	return true, nil
+}
+
+// completeDrainCleanup runs the post-MarkDone side of a successful drain: evict
+// the in-memory index entry, release the capacity reservation, note drain
+// progress (keep-awake), remove the spool file, and append the audit manifest
+// record. Factored out of MarkDrainComplete so the batched drain path
+// (JM_DRAIN_BATCH_INSERT — SpoolStore.BatchCompleteDrainCleanup) runs the EXACT
+// same cleanup after its single-transaction mark-done commit; the per-file and
+// batched paths stay behavior-identical from here on.
+//
+// MUST be called ONLY after the row's SQL mark-done has durably committed (task
+// #65: the spool shadow's eviction — index delete + file removal here — happens
+// strictly after the size publish + mark-done are on disk).
+func (s *SpoolStore) completeDrainCleanup(id int64, nfsPath, spoolFile string, size int64) {
 	// Finding 3 fix: evict the in-memory index entry BEFORE removing the
 	// spool file. New reads then miss the index and fall through to FUSE
 	// (where the drained bytes now live) instead of resolving to the spool
@@ -909,7 +978,17 @@ func (s *SpoolStore) MarkDrainComplete(id int64, nfsPath, spoolFile string, size
 				id, nfsPath, appendErr)
 		}
 	}
-	return true, nil
+}
+
+// BatchCompleteDrainCleanup runs completeDrainCleanup for one already-committed
+// batched drain (JM_DRAIN_BATCH_INSERT). The size publish + mark-done for this
+// id were committed in metadata.Store.BatchDrainComplete's single transaction;
+// this performs the identical post-commit cleanup the per-file
+// MarkDrainComplete does after its own MarkDone. Exported so the drainer's
+// batch flusher (a different package method surface than MarkDrainComplete) can
+// reuse it verbatim.
+func (s *SpoolStore) BatchCompleteDrainCleanup(id int64, nfsPath, spoolFile string, size int64) {
+	s.completeDrainCleanup(id, nfsPath, spoolFile, size)
 }
 
 // CancelForDelete cancels any in-flight spool entry for nfsPath so a pending
@@ -1493,6 +1572,12 @@ type SpoolEntry struct {
 	// each writing-extending WriteAt.
 	lastWrite atomic.Int64
 
+	// lastJukeboxLogNs throttles the in-flight-hole JUKEBOX diagnostic log
+	// (spoolReadFile.ReadAt) to ~1 line per entry per 2s, so a genuine hold
+	// with a retrying client can't flood the log (the JM_LOOKUP_TRACE lesson).
+	// Atomic — read/written from the read path without holding mu.
+	lastJukeboxLogNs atomic.Int64
+
 	mu         sync.RWMutex
 	file       *os.File // nil after Close
 	writtenEnd int64
@@ -1505,8 +1590,22 @@ type SpoolEntry struct {
 	// NLE reading a still-copying clip would get black frames / corrupt RAW),
 	// so the read shadow clamps to contiguousEnd. Monotonic; guarded by mu.
 	contiguousEnd int64
-	hasher        hash.Hash
-	sha256        []byte // populated on Close iff streaming hash is trustworthy
+	// writtenExtents tracks already-written regions that lie ABOVE
+	// contiguousEnd — the out-of-order writes macOS's parallel WRITE dispatch
+	// produces (each WRITE RPC runs on its own goroutine over one TCP conn, so
+	// they land out of order). When a later write fills the gap below such a
+	// region, advanceContiguousLocked coalesces it in so contiguousEnd jumps
+	// past ALL now-contiguous bytes — instead of the old single-chunk advance
+	// that left contiguousEnd stuck far below writtenEnd (a 1GiB cp was observed
+	// stuck at 6MiB) until finalize, JUKEBOX-holding end-of-export re-reads of
+	// already-written bytes past the client's soft-mount timeout. Coalesced,
+	// sorted by start, every entry strictly above contiguousEnd. Guarded by mu.
+	// Bounded small in practice (reorder window is shallow; entries collapse as
+	// gaps fill). NEVER holds an unwritten range — an extent is recorded only
+	// AFTER a successful pwrite, preserving the never-serve-a-hole invariant.
+	writtenExtents []spoolExtent
+	hasher         hash.Hash
+	sha256         []byte // populated on Close iff streaming hash is trustworthy
 	// hashValid tracks whether the streaming hasher reflects the on-disk
 	// contents. False once we observe any out-of-order WriteAt (off <
 	// current writtenEnd) — sparse / out-of-order writes make the streaming
@@ -1515,6 +1614,13 @@ type SpoolEntry struct {
 	// streaming SHA is a usable optimization or just noise.
 	hashValid bool
 	closed    bool
+	// committed records that the client issued an NFS COMMIT for this path — an
+	// explicit durability request. It lets the sweeper finalize the entry on the
+	// SHORT idle even when large (#105), so a Premiere save/export finalizes ~a
+	// few seconds after its close-COMMIT instead of waiting the full window.
+	// Safe because a continuation write during the resulting drain defers to the
+	// in-place fdPool path (OpenWrite sawClosed) rather than corrupting.
+	committed bool
 
 	// refcount is the number of live write handles for this entry (one per
 	// in-flight spoolWriteFile). Guarded by mu. OpenWrite increments on
@@ -1582,6 +1688,22 @@ func (e *SpoolEntry) ContiguousEnd() int64 {
 	n := e.contiguousEnd
 	e.mu.RUnlock()
 	return n
+}
+
+// ReadableBounds returns the contiguous-written prefix end (cend — the readable
+// boundary) and the high-water written end (wend — the highest offset any WRITE
+// has reached) in a SINGLE RLock, so a read past cend is classified against a
+// CONSISTENT snapshot: cend<=off<wend is a still-fillable in-flight hole (an
+// out-of-order / preallocated writer hasn't filled it yet) → JUKEBOX-hold; off>=
+// wend is a genuine past-end (the file may still grow) → EOF. Taking both fields
+// under one lock avoids a transient cend>wend mis-read that two separate getters
+// could expose to the read classifier (task #65). No I/O under the lock.
+func (e *SpoolEntry) ReadableBounds() (cend, wend int64) {
+	e.mu.RLock()
+	cend = e.contiguousEnd
+	wend = e.writtenEnd
+	e.mu.RUnlock()
+	return
 }
 
 // Sync fsyncs the spool file to stable storage WITHOUT finalizing the entry —
@@ -1671,6 +1793,103 @@ func (e *SpoolEntry) StreamingHashValid() bool {
 // Out-of-order detection: if off < the current writtenEnd, the streaming
 // hash diverges from the file's at-rest hash. We mark hashValid=false so
 // the drainer knows to re-hash from disk rather than trust SHA256().
+// spoolExtent is a half-open written byte range [start,end) recorded above
+// contiguousEnd while an out-of-order writer leaves a gap below it.
+type spoolExtent struct{ start, end int64 }
+
+// advanceContiguousLocked records the just-written range [off,end) and advances
+// e.contiguousEnd past every already-written region it makes contiguous. MUST
+// be called with e.mu held, AFTER the bytes are durably pwritten. It preserves
+// the never-serve-a-hole invariant: contiguousEnd only ever moves across ranges
+// that were actually written (this range, or a previously-recorded extent),
+// never across a still-unwritten gap.
+func (e *SpoolEntry) advanceContiguousLocked(off, end int64) {
+	if end <= e.contiguousEnd {
+		// Entirely within the readable prefix — an in-place overwrite of
+		// already-contiguous bytes. Nothing to advance.
+		return
+	}
+	if off <= e.contiguousEnd {
+		// Touches/extends the prefix. Absorb it, then pull in every recorded
+		// extent now contiguous with the grown prefix.
+		e.contiguousEnd = end
+		for len(e.writtenExtents) > 0 && e.writtenExtents[0].start <= e.contiguousEnd {
+			if e.writtenExtents[0].end > e.contiguousEnd {
+				e.contiguousEnd = e.writtenExtents[0].end
+			}
+			e.writtenExtents = e.writtenExtents[1:]
+		}
+		if len(e.writtenExtents) == 0 {
+			e.writtenExtents = nil // reclaim the backing array
+		}
+		return
+	}
+	// Starts strictly above the prefix: an out-of-order write leaving a hole
+	// below it. Remember it (coalesced); it advances contiguousEnd once the gap
+	// below fills.
+	e.writtenExtents = insertExtent(e.writtenExtents, off, end)
+}
+
+// insertExtent inserts [s,e) into a start-sorted, coalesced extent slice,
+// merging any overlapping OR directly-adjacent ranges. The slice is tiny in
+// practice (the client's reorder window is shallow), so a sort+sweep per insert
+// is cheaper than the bookkeeping to avoid it.
+func insertExtent(exts []spoolExtent, s, e int64) []spoolExtent {
+	exts = append(exts, spoolExtent{s, e})
+	sort.Slice(exts, func(i, j int) bool { return exts[i].start < exts[j].start })
+	out := exts[:0]
+	for _, x := range exts {
+		if len(out) > 0 && x.start <= out[len(out)-1].end {
+			if x.end > out[len(out)-1].end {
+				out[len(out)-1].end = x.end
+			}
+			continue
+		}
+		out = append(out, x)
+	}
+	return out
+}
+
+// clipExtents drops (or trims) any recorded extent at/above size — used when a
+// SETATTR/Truncate shrink discards bytes the extents referenced, so a later
+// gap-fill can't advance contiguousEnd past bytes that no longer exist.
+func clipExtents(exts []spoolExtent, size int64) []spoolExtent {
+	out := exts[:0]
+	for _, x := range exts {
+		if x.start >= size {
+			continue
+		}
+		if x.end > size {
+			x.end = size
+		}
+		out = append(out, x)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// logInflightJukebox emits a throttled diagnostic for an in-flight-hole JUKEBOX
+// hold on a REAL (non-._) file — the end-of-export "connection interrupted"
+// smoking gun. Throttled to ~1 line / 2s per entry (atomic CAS, no lock) so a
+// genuine hold with a retrying client can't flood the log (the JM_LOOKUP_TRACE
+// lesson). Called from the read path (spoolReadFile.ReadAt) without e.mu.
+func (e *SpoolEntry) logInflightJukebox(name string, off, cend, wend int64) {
+	now := time.Now().UnixNano()
+	last := e.lastJukeboxLogNs.Load()
+	if now-last < int64(2*time.Second) {
+		return
+	}
+	if !e.lastJukeboxLogNs.CompareAndSwap(last, now) {
+		return // another reader just logged for this entry
+	}
+	jmlog.Warn("spool: in-flight read JUKEBOX-held (offset past contiguous prefix)",
+		"path", name, "off", off, "contiguous_end", cend, "written_end", wend,
+		"gap", wend-cend,
+		"since_last_write_ms", time.Since(time.Unix(0, e.lastWrite.Load())).Milliseconds())
+}
+
 func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -1730,16 +1949,17 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 			// whole reservation since we never actually grew the file.
 			e.store.releaseCapacity(reserved)
 		}
-		// Extend the contiguous-written prefix if this write starts at or
-		// before its current end (sequential write, or a backfill that closes
-		// the gap). A write that starts ABOVE contiguousEnd leaves a hole and
-		// does NOT advance it — reads must not see that hole as zeros. This is
-		// conservative for fully out-of-order writers (the prefix lags until
-		// the gap fills) but never serves unwritten data; the dominant
-		// cp/Finder pattern is sequential, so contiguousEnd == writtenEnd.
-		if off <= e.contiguousEnd && end > e.contiguousEnd {
-			e.contiguousEnd = end
-		}
+		// Advance the contiguous-written prefix, COALESCING any already-written
+		// region this write makes contiguous. The old code bumped contiguousEnd
+		// only to this chunk's end, so an out-of-order writer (macOS dispatches
+		// WRITE RPCs on parallel goroutines) that filled a gap left contiguousEnd
+		// stuck below already-written higher bytes — and a read of those bytes
+		// then JUKEBOX-held for up to the 90s stall window, exceeding the client's
+		// ~40s soft-mount timeout ("connection interrupted" at end of export).
+		// advanceContiguousLocked pulls in every recorded extent above the filled
+		// gap; it is called only after a successful pwrite, so it never advances
+		// across an unwritten hole (the never-serve-zeros invariant holds).
+		e.advanceContiguousLocked(off, end)
 		if outOfOrder {
 			e.hashValid = false
 		}
@@ -1798,6 +2018,12 @@ func (e *SpoolEntry) Truncate(size int64) error {
 	if e.contiguousEnd > size {
 		// Shrink past the contiguous prefix: those bytes are gone.
 		e.contiguousEnd = size
+	}
+	// Drop/trim any recorded out-of-order extents the resize discarded, so a
+	// later gap-fill can't advance contiguousEnd past bytes that no longer
+	// exist. A grow adds only an unwritten hole — no extent to record.
+	if len(e.writtenExtents) > 0 {
+		e.writtenExtents = clipExtents(e.writtenExtents, size)
 	}
 	// NB: a GROW/preallocate (size > writtenEnd) leaves contiguousEnd alone —
 	// the extended region is an unwritten hole that reads must not serve.
@@ -1872,13 +2098,47 @@ func (e *SpoolEntry) Finalize() error {
 // it mutually exclusive with OpenWrite's reuse path (which also takes e.mu
 // before incrementing refcount), so the sweeper can never finalize an entry
 // a concurrent reopen is about to write to.
+// smallSpoolFinalizeBytes / smallSpoolFinalizeIdle (#105): a SMALL file is
+// written in a single burst with no multi-second mid-write gaps, so it can
+// finalize on a much shorter idle WITHOUT the mid-write-finalize→reopen
+// corruption risk. That corruption needs a write gap LONGER than the window
+// DURING active writing (the sweeper finalizes+drains the partial, then a later
+// write reopens a fresh entry whose drain os.Create-truncates the dest → a
+// zero-prefixed file). A file that writes in well under a second can't produce
+// such a gap. This cuts a Premiere project-save's spool→drain latency from ~30s
+// to ~5s. Large files (video exports/copies) keep the full window as the
+// guardrail — a slow encode or slow source CAN stall > the window mid-write.
+const smallSpoolFinalizeBytes = 16 * 1024 * 1024 // 16 MiB
+const smallSpoolFinalizeIdle = 5 * time.Second
+
+// MarkCommitted records that the client issued an NFS COMMIT for this entry —
+// an explicit durability request that lets the sweeper finalize it on the short
+// idle even when large (#105). Idempotent; safe under concurrent COMMITs.
+func (e *SpoolEntry) MarkCommitted() {
+	e.mu.Lock()
+	e.committed = true
+	e.mu.Unlock()
+}
+
 func (e *SpoolEntry) finalizeIfIdle(idle time.Duration) bool {
 	e.mu.Lock()
 	if e.closed || e.refcount != 0 {
 		e.mu.Unlock()
 		return false
 	}
-	if time.Since(time.Unix(0, e.lastWrite.Load())) < idle {
+	// #105 fast finalize: a COMMITted entry (the client explicitly asked for
+	// durability — a Premiere save/export close) OR a SMALL file (written in one
+	// burst) finalizes on the SHORT idle. This cuts a large export's close from
+	// the full window to ~the short idle after its close-COMMIT. Safe now that a
+	// continuation write during the resulting drain defers to the in-place
+	// fdPool path (OpenWrite sawClosed) instead of corrupting; large UNcommitted
+	// files keep the full window as the fallback.
+	effIdle := idle
+	small := e.writtenEnd > 0 && e.writtenEnd <= smallSpoolFinalizeBytes
+	if (e.committed || small) && smallSpoolFinalizeIdle < effIdle {
+		effIdle = smallSpoolFinalizeIdle
+	}
+	if time.Since(time.Unix(0, e.lastWrite.Load())) < effIdle {
 		e.mu.Unlock()
 		return false
 	}
@@ -1949,6 +2209,19 @@ func (e *SpoolEntry) finalizeLocked() error {
 		e.sha256 = e.hasher.Sum(nil)
 	}
 	finalSize := e.writtenEnd
+	// task #65: the writer has CLOSED — every byte it intended to write has landed
+	// on the spool file, so 0..writtenEnd is the complete file (any genuine sparse
+	// gap reads back as zeros, which IS the file's content). The in-flight
+	// contiguousEnd tracker (WriteAt) only advances on in-order writes and LAGS far
+	// behind writtenEnd under parallel / out-of-order NFS WRITEs — a 1GiB cp was
+	// observed stuck at 6MiB. The Stat read-shadow reports contiguousEnd as the
+	// file SIZE, so a lagged value made the NFS client cap reads and silently
+	// TRUNCATE the tail of a file read while it drained (the core #65 bug: the
+	// client never even issued a tail READ). A finalized file has no more writes
+	// coming, so its readable prefix IS its full written extent — advance it.
+	if e.contiguousEnd < e.writtenEnd {
+		e.contiguousEnd = e.writtenEnd
+	}
 	finalSha := e.sha256 // nil if streaming hash was invalidated (out-of-order)
 	finalSpoolFile := e.spoolFile
 	finalID := e.id // capture under mu: rename migration can re-bind id

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
@@ -180,15 +181,77 @@ func reachableNow() bool {
 // still a 6x+ reduction from the old 30s cadence (the link-saturation fix holds),
 // while bounding attr drift to <=5 min and a missed-delete ghost to
 // PruneThreshold x 5 min instead of x 45 min. See QA residual risks / REVERT_LOG.
+// reconcileBackstopOverride forces the demoted periodic-SCAN backstop to a
+// caller-chosen interval for ALL link classes when JM_RECONCILE_BACKSTOP_SEC is a
+// positive integer. Field-tuning kill switch per the cellular-revert-safety
+// doctrine (env-overridable + logged; record changes in docs/TUNING/REVERT_LOG.md).
+// 0 / unset keeps the class-gated defaults below.
+func reconcileBackstopOverride() (time.Duration, bool) {
+	if v := os.Getenv("JM_RECONCILE_BACKSTOP_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second, true
+		}
+	}
+	return 0, false
+}
+
+// backstopForClass returns the DEMOTED periodic full-SCAN cadence used while
+// keyspace-push is engaged. The push (real-time per-dir d-key reconcile) is the
+// live path; this SCAN is only a missed-event safety net, so it is a long
+// interval. SAFETY: if push DROPS, keyspaceLoop calls setEngagement(degraded)
+// which resets the cadence to DefaultReconcileInterval (30s) until push
+// re-engages — so a long value here only ever applies WHILE PUSH IS HEALTHY,
+// and a real outage still converges fast on reconnect.
+//
+// Lengthened 2026-06-30 (from 10/15/5 min) after field testing: the SCAN
+// "rebuilding the index every ~5 min" over WAN was too eager and churned the
+// 438MB mirror (177MB WAL) — visible to the user as periodic sluggishness. With
+// push proven engaged on the live NAS (subscribed + per-dir reconcile), the SCAN
+// can safely be rare. Tunable live via JM_RECONCILE_BACKSTOP_SEC.
 func backstopForClass(c linkClass) time.Duration {
+	if d, ok := reconcileBackstopOverride(); ok {
+		return d
+	}
 	switch c {
 	case classLAN:
-		return 10 * time.Minute
-	case classWiFi:
 		return 15 * time.Minute
-	default: // tunnel / cellular / WAN — capped low to bound staleness windows
-		return 5 * time.Minute
+	case classWiFi:
+		return 20 * time.Minute
+	default: // tunnel / cellular / WAN — the SCAN is MOST expensive here (377k
+		// rows over the tunnel), so a long backstop helps most; a missed push
+		// event for a dir is re-covered by that dir's next d-key event, and a true
+		// push drop snaps the cadence back to 30s (setEngagement above).
+		return 15 * time.Minute
 	}
+}
+
+// scanContextTimeout returns the wall-clock budget for ONE full-SCAN reconcile
+// attempt (syncMetadata's context deadline around the SCAN batch loop).
+//
+// G7 (task #80): the budget was a fixed 120s. On a degraded cellular relay the
+// full SCAN needs ~200-300s, so EVERY attempt died with "redis SCAN batch:
+// context deadline exceeded" (live 2026-07-01: 31 consecutive failures over
+// 3h), each one saturating the metered link for the full 120s first. Class
+// gate, same accessor as the backstop/coalescer/G6 gating:
+//
+//   - LAN / WiFi        → 120s (byte-identical to the historical fixed budget)
+//   - tunnel / cellular → 300s (utun*/tailscale0/JM_WAN_MODE=1 — enough for the
+//     observed ~200-300s slow-link SCAN to actually finish)
+//
+// Env override JM_SCAN_TIMEOUT_SEC: a positive integer forces that budget (in
+// seconds) for ALL classes — field-tuning kill switch per the cellular-revert
+// doctrine (docs/TUNING/REVERT_LOG.md). 0 / unset / garbage keeps the class
+// logic. Read per call so it can be flipped live.
+func scanContextTimeout() time.Duration {
+	if v := os.Getenv("JM_SCAN_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	if currentLinkClass() == classTunnel {
+		return 300 * time.Second
+	}
+	return 120 * time.Second
 }
 
 // coalescerTuning bundles the class-gated debounce/burst parameters.
@@ -218,15 +281,74 @@ func tuningForClass(c linkClass) coalescerTuning {
 
 // setEngagement records the engagement state and adjusts the backstop cadence.
 // ENABLED + backend reachable -> long class-gated interval; anything else ->
-// DefaultReconcileInterval (30s) so the periodic SCAN resumes as the
-// authoritative fallback. We never go long while the backend is known
-// unreachable: an unreachable backend means push delivery has stopped, so the
-// SCAN must stay frequent enough to converge fast on reconnect.
+// the config cadence / DefaultReconcileInterval (30s) so the periodic SCAN
+// resumes as the authoritative fallback. We never go long while the backend is
+// known unreachable: an unreachable backend means push delivery has stopped, so
+// the SCAN must stay frequent enough to converge fast on reconnect.
+//
+// The actual backstop value is computed by resolveBackstop, the SINGLE
+// precedence resolver shared with SetReconcileInterval (#90). setEngagement's
+// only extra job is to RECORD the new engagement state (rc.engaged) so a later
+// config change can re-derive with the same precedence.
 func (rc *RedisClient) setEngagement(e keyspaceEngagement) {
+	rc.engaged.Store(int32(e))
+	rc.resolveBackstop("engagement=" + e.String())
+}
+
+// resolveBackstop computes the live periodic-SCAN backstop with the #90
+// precedence and stores it into backstopNanos, logging every ACTUAL change
+// (old->new + reason) so a future 900->300 collapse can never hide.
+//
+// Precedence (highest first):
+//  1. JM_RECONCILE_BACKSTOP_SEC env override — folded INTO backstopForClass via
+//     reconcileBackstopOverride, so it wins for every class in the ENABLED path.
+//     (In the non-ENABLED path we also honor it explicitly, so the field-tuning
+//     kill switch wins regardless of engagement.)
+//  2. push ENABLED + backend reachable -> max(classBackstop, configReconcile):
+//     the config seed can only LENGTHEN the push-mode backstop, never shorten it
+//     below the class-gated floor. This is the crux of #90 — the 300s config seed
+//     used to clobber the 900s class value straight into backstopNanos.
+//  3. otherwise (DISABLED / DEGRADED / ENABLED-but-unreachable) -> the config
+//     cadence drives the SCAN directly (config, else DefaultReconcileInterval).
+//     This is the non-push authoritative fallback, so the LB-4 preference still
+//     applies when push isn't carrying deltas.
+//
+// reason is a short tag (e.g. "config", "engagement=ENABLED") threaded into the
+// change log so the driver of each transition is auditable.
+func (rc *RedisClient) resolveBackstop(reason string) {
+	e := keyspaceEngagement(rc.engaged.Load())
+	cfg := time.Duration(rc.configReconcileNanos.Load())
+
+	var next time.Duration
 	if e == keyspaceEnabled && reachableNow() {
-		rc.backstopNanos.Store(int64(backstopForClass(currentLinkClass())))
+		// Precedence 1+2. backstopForClass already short-circuits to the
+		// JM_RECONCILE_BACKSTOP_SEC override when set, so that override wins here.
+		classBackstop := backstopForClass(currentLinkClass())
+		next = classBackstop
+		if cfg > next {
+			// The config seed can only LENGTHEN the push-mode backstop.
+			next = cfg
+		}
 	} else {
-		rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+		// Precedence 1+3. The env override (highest precedence) still wins even
+		// off the push path; otherwise the config cadence drives the SCAN, else
+		// the 30s default.
+		if d, ok := reconcileBackstopOverride(); ok {
+			next = d
+		} else if cfg > 0 {
+			next = cfg
+		} else {
+			next = DefaultReconcileInterval
+		}
+	}
+
+	old := time.Duration(rc.backstopNanos.Swap(int64(next)))
+	if old != next {
+		jmlog.Info("metadata reconcile backstop changed",
+			"old_sec", old.Seconds(), "new_sec", next.Seconds(),
+			"reason", reason, "engaged", e.String(),
+			"class", currentLinkClass().String(),
+			"config_sec", cfg.Seconds())
 	}
 }
 
@@ -745,6 +867,18 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 		storeParent = ent.Path // non-root: path.Dir(parent+"/"+name) == parent
 	}
 
+	// Task #78: never reconcile a directory inside a scan-filtered namespace
+	// (.trash/, .juicemount/ — see scanFilteredPath). The full SCAN can never
+	// return these paths, so push-mirrored rows under them are permanently
+	// absent from every SCAN diff and cycle in the pruneAbsent ladder forever.
+	// Checked BEFORE any Redis round-trip: a trash/derivative burst (mass
+	// delete-to-trash, farm fan-out) otherwise costs one HGETALL + N attr GETs
+	// per event for rows we'd refuse to mirror anyway.
+	if parentPath != "" && scanFilteredPath(parentPath) {
+		noteScanFilteredSkip("reconcileDir", parentPath, 1)
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -758,6 +892,7 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 	// Build the fresh child set and the entries to upsert.
 	freshNames := make(map[string]struct{}, len(raw))
 	var toUpsert []*Entry
+	skippedFiltered := 0 // task #78: scan-filtered children not mirrored
 	for name, valStr := range raw {
 		val := []byte(valStr)
 		childInode, ft, ok := decodeDirChild(val)
@@ -780,6 +915,17 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 			childPath = name
 		} else {
 			childPath = parentPath + "/" + name
+		}
+
+		// Task #78: never mirror a child row in a scan-filtered namespace
+		// (reachable here only on a ROOT reconcile, where ".trash"/".juicemount"
+		// appear as bare child names — deeper dirs are skipped wholesale above).
+		// The name stays in freshNames (set above) so scopedPrune keeps seeing
+		// it as Redis-fresh; we just refuse to MIRROR it. Skipping before the
+		// attr GET also saves the per-child Redis round-trip.
+		if scanFilteredPath(childPath) {
+			skippedFiltered++
+			continue
 		}
 
 		// Fetch attrs for mtime/size (single GET, no scan). A missing/short
@@ -815,6 +961,10 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 			existing.Inode != e.Inode {
 			toUpsert = append(toUpsert, e)
 		}
+	}
+
+	if skippedFiltered > 0 {
+		noteScanFilteredSkip("reconcileDir children", parentPath, skippedFiltered)
 	}
 
 	// Apply upserts (cache-first, then SQLite) via the applyEvent fast path
@@ -858,6 +1008,28 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		return
 	}
 
+	// === Degrade gate (NFSv3 sprint slow-link false-flap, fix b.2 — task #66 salvage) ===
+	// Defer ALL pruning while the backend is degraded/unreachable. The periodic
+	// full-SCAN prune already gates on RecentlyDegraded (redis.go skipIncrement);
+	// the keyspace-push prune had NO such gate, so during a slow-link probe flap
+	// (drain + SCAN still succeeding, but the app arming offline) a single push
+	// 'hdel' observation could remove real files mid-copy → STALE → Finder copy
+	// error. fix b.1 makes RecentlyDegraded reachability-aware, so this gate is
+	// actually TRUE during the flap. This DEFERS the authoritative push-delete
+	// one cycle — it is NEVER dropped: the next keyspace event replays it, and
+	// the backstop SCAN heals any missed delete (a removed file lingers at most
+	// one degraded window). Placed AFTER the ListChildren early-out (cheap
+	// no-children skip first) and BEFORE any candidate computation; the gate
+	// covers the subtree-delete path too since the whole function returns.
+	// Upserts are UNGATED (handled in reconcileDir before this call), so
+	// navigation/convergence keeps working while pruning is paused. scopedPrune
+	// holds no rc.mu, so RecentlyDegraded's rc.mu.RLock cannot deadlock here.
+	if rc.RecentlyDegraded(60 * time.Second) {
+		jmlog.Info("metadata keyspace push: scoped prune deferred (backend degraded)",
+			"parent", parentPath, "candidates_unevaluated", len(children))
+		return
+	}
+
 	var candidates []string // internal paths to delete
 	for _, ch := range children {
 		if _, present := freshNames[ch.Name]; present {
@@ -877,9 +1049,39 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		if strings.HasPrefix(ch.Name, "._") {
 			continue
 		}
+		// Task #78: internal-namespace DESCENDANT rows (.trash/…,
+		// .juicemount/…) are managed by the one-time open-GC + push-insert
+		// filter, never by push-prune. Post-GC none should exist; if one does
+		// (seeded by an older build mid-session), a prune attempt here would
+		// just churn through Layer A every root reconcile (FUSE shows the
+		// path present → spared → re-candidate next cycle).
+		//
+		// Batch-3 adversarial review #5: scanFilteredDescendant, NOT
+		// scanFilteredPath — the BARE ".trash"/".juicemount" dir rows stay
+		// eligible as candidates so the QA-30 per-path FUSE Lstat below can
+		// prune them if the backend namespace is ever genuinely removed.
+		// While the namespace exists, FUSE shows it present and the spare
+		// keeps the row (bounded: 2 extra Lstats worst case per root
+		// reconcile that reaches this loop).
+		if scanFilteredDescendant(ch.Path) {
+			continue
+		}
 		candidates = append(candidates, ch.Path)
 	}
 	if len(candidates) == 0 {
+		return
+	}
+
+	// === V2.3 G0: FUSE identity gate — skip this scoped prune when the
+	// mountpoint has no real filesystem mounted (kext not loaded / mount
+	// absent / wedged). The per-path FUSE Lstat spare below reads ENOENT for
+	// everything against a plain directory, disabling its protection exactly
+	// when it's needed most. The backstop SCAN re-derives these candidates
+	// once the mount is real.
+	if identOK, identReason := pin.FUSEIdentityState(); !identOK {
+		jmlog.Warn("scoped prune: FUSE identity gate failed — skipping",
+			"parent", parentPath, "reason", identReason,
+			"would_have_pruned", len(candidates))
 		return
 	}
 

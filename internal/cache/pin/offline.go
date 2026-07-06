@@ -2,6 +2,7 @@ package pin
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,17 +66,109 @@ var (
 	autoOfflineMu     sync.RWMutex
 	autoOfflineReason string
 	autoOfflineSince  time.Time
+	// userOfflineSince records when the user-intent toggle last engaged
+	// (zero when not user-offline). Protected by autoOfflineMu alongside the
+	// auto fields. Used by WithinOfflineReadStallWindow to bound how long an
+	// in-flight read is JUKEBOX-stalled after going offline.
+	userOfflineSince time.Time
 )
+
+// V2.3 U3 (field report: "clicking the offline toggle doesn't just start it
+// in offline mode"): user-intent offline PERSISTS across launches via a
+// marker file. Armed at boot (SetOfflinePersistPath); SetOffline writes/
+// removes the marker best-effort, and the boot path consults
+// PersistedOfflineIntent() to start with the user-offline gates engaged.
+// NOTE (batch-3 adversarial review, HIGH): a persisted-offline start is NOT
+// a zero-network start — the boot still probes the backend and mounts FUSE
+// when reachable, because pinned reads require the mount (juicefs needs its
+// Redis metadata engine either way); the gates only refuse un-pinned opens.
+// See the boot block in bridge/cbridge.go. Unconfigured (tests, tools) →
+// fully inert.
+var (
+	offlinePersistMu   sync.Mutex
+	offlinePersistPath string
+)
+
+// SetOfflinePersistPath arms user-offline persistence at the given marker
+// path. "" disarms.
+func SetOfflinePersistPath(path string) {
+	offlinePersistMu.Lock()
+	offlinePersistPath = path
+	offlinePersistMu.Unlock()
+}
+
+// PersistedOfflineIntent reports whether a previous session left user-intent
+// offline engaged. False when persistence is unconfigured.
+func PersistedOfflineIntent() bool {
+	offlinePersistMu.Lock()
+	p := offlinePersistPath
+	offlinePersistMu.Unlock()
+	if p == "" {
+		return false
+	}
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// persistOfflineIntent mirrors the user flag to disk, best-effort — a
+// failed write must never block or fail the toggle itself.
+func persistOfflineIntent(on bool) {
+	offlinePersistMu.Lock()
+	p := offlinePersistPath
+	offlinePersistMu.Unlock()
+	if p == "" {
+		return
+	}
+	if on {
+		_ = os.WriteFile(p, []byte("user-offline\n"), 0o644)
+	} else {
+		_ = os.Remove(p)
+	}
+}
+
+// DropStaleOfflineIntent clears a persisted offline marker that has outlived
+// the data it gates (batch-3 adversarial review #10). companionDBPath is the
+// metadata mirror DB: when the marker is present but that DB is missing or
+// zero-length (an app-data reset wiped Application Support but not
+// ~/.juicemount), a persisted-offline boot would skip the empty-mirror
+// blocking sync and serve a completely empty volume that looks like data
+// loss. Returns true when a stale marker was found and removed; false when
+// there is no marker, persistence is unconfigured, or the companion DB looks
+// servable. Never touches the in-memory flags — call it at boot BEFORE the
+// user flag is engaged.
+func DropStaleOfflineIntent(companionDBPath string) bool {
+	if !PersistedOfflineIntent() {
+		return false
+	}
+	if fi, err := os.Stat(companionDBPath); err == nil && fi.Size() > 0 {
+		return false // mirror looks servable — honor the marker
+	}
+	persistOfflineIntent(false)
+	return true
+}
 
 // SetOffline switches the process to user-intent offline mode (or
 // back online). This is the existing API; preserved for callers that
 // only know about manual toggles.
 func SetOffline(on bool) {
 	if on {
+		// Stamp BEFORE the flag store: an in-flight read on another goroutine
+		// must never observe IsOffline()==true while WithinOfflineReadStallWindow()
+		// is still false (it would get a terminal NXIO instead of a retryable
+		// JUKEBOX — the exact abort this feature prevents).
+		autoOfflineMu.Lock()
+		if userOfflineSince.IsZero() {
+			userOfflineSince = time.Now()
+		}
+		autoOfflineMu.Unlock()
 		userOfflineFlag.Store(1)
 	} else {
 		userOfflineFlag.Store(0)
+		autoOfflineMu.Lock()
+		userOfflineSince = time.Time{}
+		autoOfflineMu.Unlock()
 	}
+	persistOfflineIntent(on)
 }
 
 // SetAutoOffline is called by the reachability monitor when the
@@ -87,13 +180,15 @@ func SetOffline(on bool) {
 // flags and never block each other.
 func SetAutoOffline(on bool, reason string) {
 	if on {
-		autoOfflineFlag.Store(1)
+		// Stamp BEFORE the flag store (see SetOffline) so WithinOfflineReadStallWindow()
+		// is already valid the instant IsOffline() flips true.
 		autoOfflineMu.Lock()
 		autoOfflineReason = reason
 		if autoOfflineSince.IsZero() {
 			autoOfflineSince = time.Now()
 		}
 		autoOfflineMu.Unlock()
+		autoOfflineFlag.Store(1)
 	} else {
 		autoOfflineFlag.Store(0)
 		autoOfflineMu.Lock()
@@ -121,6 +216,85 @@ func IsUserOffline() bool {
 func IsAutoOffline() bool {
 	return autoOfflineFlag.Load() != 0
 }
+
+// OfflineReadStallWindow bounds how long an IN-FLIGHT read (one already in
+// progress when offline engaged — the client is mid-file) is answered with
+// NFS3ERR_JUKEBOX (the kernel NFS client holds + retries the RPC, resuming on
+// reconnect) instead of a terminal NXIO. Measured from when offline engaged by
+// either source. Sized against the macOS soft-mount per-RPC budget so a brief
+// blip or a toggle-offline-then-back rides through and the copy survives, while
+// a genuinely sustained offline still fails the copy cleanly rather than
+// hanging it forever. A var so it can be tuned / env-overridden.
+var OfflineReadStallWindow = 90 * time.Second
+
+// WithinOfflineReadStallWindow reports whether offline (by either source)
+// engaged recently enough that an in-flight read should be JUKEBOX-stalled
+// (stall + resume on reconnect) rather than NXIO-failed. False when fully
+// online, and false once we've been continuously offline longer than
+// OfflineReadStallWindow (give up — don't beach-ball the copy forever).
+func WithinOfflineReadStallWindow() bool {
+	autoOfflineMu.RLock()
+	auto := autoOfflineSince
+	user := userOfflineSince
+	autoOfflineMu.RUnlock()
+	// "Since" = the EARLIEST still-active engage = how long we've been
+	// continuously offline. An in-flight copy is caught at the transition, so
+	// measuring from the first engage is what bounds its stall correctly.
+	since := auto
+	if since.IsZero() || (!user.IsZero() && user.Before(since)) {
+		since = user
+	}
+	if since.IsZero() {
+		return false
+	}
+	return time.Since(since) < OfflineReadStallWindow
+}
+
+// ErrSpoolIncomplete signals an NFS read landed at/past the contiguous-written
+// prefix of a file STILL ARRIVING in the write spool, with not-yet-written bytes
+// still expected below the high-water mark (off in [contiguousEnd, writtenEnd)).
+// The NFS read path (internal/nfs/nfs_on read) maps it to NFS3ERR_JUKEBOX so the
+// kernel client HOLDS and retries until the bytes land / the file drains — never
+// EOF, which would let a client treat a partially-arrived file as COMPLETE
+// (silent truncation, task #65). Cross-package sentinel (the nfs-side spool read
+// handle returns it; internal/nfs recognizes it) — same pattern as
+// ErrOfflineNotAvailable, avoiding an internal/nfs <- nfs import cycle.
+var ErrSpoolIncomplete = errors.New("spool: read offset not yet written (in-flight)")
+
+// IsSpoolIncomplete reports whether err is (or wraps) ErrSpoolIncomplete.
+func IsSpoolIncomplete(err error) bool { return errors.Is(err, ErrSpoolIncomplete) }
+
+// ErrSpoolDrained signals the spool file was evicted + unlinked (drain
+// completed) between a read's LookupActive hit and its first fd open — the
+// drain-evict race. The bytes are now in FUSE at the published size (the drainer
+// publishes BEFORE it evicts), so the NFS read path maps this to NFS3ERR_NOENT
+// so the client reissues OPEN and lands on the drained backend copy, rather than
+// a terminal NFSStatusIO that would abort the copy ("error 100060").
+var ErrSpoolDrained = errors.New("spool: file drained+evicted before read (reopen)")
+
+// IsSpoolDrained reports whether err is (or wraps) ErrSpoolDrained.
+func IsSpoolDrained(err error) bool { return errors.Is(err, ErrSpoolDrained) }
+
+// ErrSpoolBusy signals a WRITE that arrived for a path whose PRIOR spool entry
+// was finalized but is still draining (not yet evicted). It is RETRYABLE: the
+// drain evicts the shadow shortly, after which a fresh entry accepts the write.
+// The write path maps this to NFS3ERR_JUKEBOX so the client backs off and
+// retries — rather than a hard EACCES that would abort a copy/export at its
+// final (e.g. faststart moov seek-back) WRITE. Lives here, like
+// ErrSpoolIncomplete, so the internal/nfs handler can recognize it without an
+// internal/nfs <- nfs import cycle; the nfs-package spool.ErrSpoolBusy wraps it.
+var ErrSpoolBusy = errors.New("spool: path busy (prior entry still draining)")
+
+// IsSpoolBusy reports whether err is (or wraps) ErrSpoolBusy.
+func IsSpoolBusy(err error) bool { return errors.Is(err, ErrSpoolBusy) }
+
+// SpoolIncompleteStallWindow bounds how long a read of a not-yet-written spool
+// hole is held with JUKEBOX before giving up (EOF/terminal). Keyed off the
+// entry's LAST WRITE (applied where the entry is available, in the nfs-side read
+// handle): an actively-arriving file holds-and-resumes, but a wedged/abandoned
+// writer (silent past this window) stops beach-balling the client. A var so it
+// can be tuned / env-overridden; mirrors OfflineReadStallWindow's sizing.
+var SpoolIncompleteStallWindow = 90 * time.Second
 
 // OfflineState is a snapshot of the offline subsystem suitable for
 // surfacing to the UI or HTTP metrics endpoint.

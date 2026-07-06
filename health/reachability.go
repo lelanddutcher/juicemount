@@ -76,6 +76,33 @@ type Reachability struct {
 	// probe loop goroutine; MUST NOT block.
 	rttObserver func(time.Duration)
 
+	// livenessHook, if set, returns the elapsed time since the backend was last
+	// proven reachable by REAL data-plane I/O over the same link the probe uses
+	// (a completed drain / MinIO PUT). When a probe dial FAILS but the hook
+	// reports a recent success (within livenessWindow), the failure is treated as
+	// NOT-a-real-outage and the fail streak is left untouched — the cold SYN
+	// merely queued behind the drainer's own bulk PUT traffic on a saturated
+	// uplink (slow-link false-flap, NFSv3 sprint). A genuine outage stops the
+	// drains within seconds, the window lapses, and the normal failure flip
+	// proceeds. Kept as a plain func so this package stays free of an nfs import
+	// (clean layering). Returns a sentinel (e.g. a very large duration) when no
+	// drain has ever succeeded, which never satisfies the window. Called from the
+	// probe-loop goroutine; MUST NOT block.
+	livenessHook func() time.Duration
+
+	// livenessOverride enables the drain-liveness override above. Default ON;
+	// env kill-switch JM_REACH_DRAIN_LIVENESS=0 disables it so behavior is
+	// byte-identical to the pre-fix monitor (WAN-tuning revert discipline —
+	// docs/TUNING/REVERT_LOG.md). When disabled the hook is never consulted.
+	livenessOverride bool
+
+	// livenessWindow is the max age of a proven backend I/O that still suppresses
+	// a probe failure. Sized to ~2*baseInterval so the override covers the brief
+	// congestion spike that queues a cold SYN past its dial timeout, but lapses
+	// fast on a real outage (the next probe after drains stop sees a stale hook
+	// and flips). Derived once at construction from baseInterval.
+	livenessWindow time.Duration
+
 	dialer dialer
 
 	mu               sync.RWMutex
@@ -135,6 +162,23 @@ func WithRTTObserver(fn func(time.Duration)) ReachabilityOption {
 	return func(r *Reachability) { r.rttObserver = fn }
 }
 
+// WithLivenessHook registers a hook returning the elapsed time since the
+// backend was last proven reachable by real data-plane I/O (a completed drain /
+// MinIO PUT) over the same physical link the probe uses. It is consulted ONLY
+// on a probe-dial FAILURE: if the hook reports a success more recent than the
+// liveness window (~2*baseInterval), the failure is suppressed (the fail streak
+// is not advanced) because a successful drain is positive proof the backend is
+// reachable — the cold SYN merely queued behind the drainer's own bulk PUT
+// traffic on a saturated uplink. A genuine outage stops drains within seconds,
+// the window lapses, and the normal 2-failure flip proceeds. The hook MUST
+// return a large sentinel duration when no drain has ever succeeded so it never
+// satisfies the window. nil hook → override inert (behavior identical to
+// today). Disabled wholesale by JM_REACH_DRAIN_LIVENESS=0. Runs on the
+// probe-loop goroutine and MUST NOT block.
+func WithLivenessHook(fn func() time.Duration) ReachabilityOption {
+	return func(r *Reachability) { r.livenessHook = fn }
+}
+
 // NewReachability constructs a monitor against the given "host:port"
 // target. The monitor starts in the "presumed reachable" state — it
 // won't flip to unreachable until consecutive probes fail. This
@@ -142,24 +186,32 @@ func WithRTTObserver(fn func(time.Duration)) ReachabilityOption {
 // first probe is racing application initialization.
 func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 	r := &Reachability{
-		target:         target,
-		dialTimeout:    1 * time.Second,
-		baseInterval:   2 * time.Second,
-		maxDialTimeout: 10 * time.Second,
-		adaptive:       true,
-		failsToOffline: 2,
-		passesToOnline: 1,
-		reachable:      true, // presumed reachable until proven otherwise
-		dialer:         &net.Dialer{},
-		triggerCh:      make(chan struct{}, 1),
-		stopCh:         make(chan struct{}),
+		target:           target,
+		dialTimeout:      1 * time.Second,
+		baseInterval:     2 * time.Second,
+		maxDialTimeout:   10 * time.Second,
+		adaptive:         true,
+		failsToOffline:   2,
+		passesToOnline:   1,
+		reachable:        true, // presumed reachable until proven otherwise
+		livenessOverride: true, // drain-liveness false-flap suppression (kill: JM_REACH_DRAIN_LIVENESS=0)
+		dialer:           &net.Dialer{},
+		triggerCh:        make(chan struct{}, 1),
+		stopCh:           make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(r)
 	}
+	// livenessWindow is derived AFTER options so a non-default WithBaseInterval
+	// scales it. ~2*baseInterval: long enough to cover a congestion spike that
+	// queues a cold SYN past its dial timeout, short enough that a real outage
+	// (drains stop) lapses it within a probe cycle or two.
+	r.livenessWindow = 2 * r.baseInterval
 	// Env overrides (operator escape hatch; defaults are LAN-safe).
-	//   JM_REACH_ADAPTIVE=0        disable adaptive growth (fixed dialTimeout)
-	//   JM_REACH_MAX_DIAL_MS=<n>   ceiling for the adaptive dial timeout
+	//   JM_REACH_ADAPTIVE=0         disable adaptive growth (fixed dialTimeout)
+	//   JM_REACH_MAX_DIAL_MS=<n>    ceiling for the adaptive dial timeout
+	//   JM_REACH_DRAIN_LIVENESS=0   disable the drain-liveness false-flap override
+	//                               (byte-identical pre-fix behavior; REVERT_LOG)
 	if os.Getenv("JM_REACH_ADAPTIVE") == "0" {
 		r.adaptive = false
 	}
@@ -167,6 +219,9 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 		if ms, err := strconv.Atoi(v); err == nil && ms >= 1000 {
 			r.maxDialTimeout = time.Duration(ms) * time.Millisecond
 		}
+	}
+	if os.Getenv("JM_REACH_DRAIN_LIVENESS") == "0" {
+		r.livenessOverride = false
 	}
 	return r
 }
@@ -336,6 +391,25 @@ func (r *Reachability) probe() bool {
 	return true
 }
 
+// drainLivenessSuppresses reports whether a probe FAILURE should be ignored
+// because the backend was proven reachable by real data-plane I/O (a completed
+// drain) within the liveness window. A successful drain rides the SAME physical
+// link the probe dials, so it is direct evidence the link is up — the failed
+// cold SYN merely queued behind the drainer's bulk PUT traffic on a saturated
+// uplink (slow-link false-flap). Returns false when the override is disabled
+// (JM_REACH_DRAIN_LIVENESS=0), no hook is wired, or the last proven I/O is
+// older than the window (a real outage: drains stop landing → the override
+// lapses → the normal failure flip proceeds). Called from the probe-loop
+// goroutine OUTSIDE r.mu so the hook (which may touch the bridge's globalMu via
+// the drainer) never nests under the reachability lock.
+func (r *Reachability) drainLivenessSuppresses() bool {
+	if !r.livenessOverride || r.livenessHook == nil {
+		return false
+	}
+	since := r.livenessHook()
+	return since >= 0 && since <= r.livenessWindow
+}
+
 // applyResult updates the state machine. Holds r.mu only briefly;
 // fires callbacks outside the lock so callback delays can't park
 // the loop holding a writer lock.
@@ -346,6 +420,20 @@ func (r *Reachability) applyResult(ok bool) {
 		reason       string
 	)
 	now := time.Now()
+
+	// Drain-liveness false-flap override (NFSv3 sprint). A probe-dial FAILURE
+	// while a real drain landed within the liveness window is NOT a real outage
+	// — a cold SYN queued behind the drainer's own bulk PUT traffic on the
+	// saturated uplink. Suppress it entirely: do NOT advance (nor reset) the
+	// fail streak, leave reachable/consecutivePass untouched, fire no callback.
+	// Checked OUTSIDE r.mu (the hook may take the bridge's globalMu). A genuine
+	// outage stops drains within seconds → the window lapses → the very next
+	// failed probe falls through here and the normal 2-failure flip proceeds.
+	if !ok && r.drainLivenessSuppresses() {
+		jmlog.Info("reachability probe failed but drain proves backend live — suppressing false-flap",
+			"target", r.target, "liveness_window", r.livenessWindow.String())
+		return
+	}
 
 	r.mu.Lock()
 	if ok {

@@ -132,12 +132,24 @@ enum OnboardingPreflight {
                 using: .tcp
             )
             let queue = DispatchQueue(label: "com.juicemount.preflight.dial")
+            // #87: schedule the watchdog on an INDEPENDENT queue, never the
+            // connection's `queue`. If NWConnection setup wedges, work on
+            // `queue` can back up — a timeout scheduled there would be stuck
+            // behind it and never fire, exactly the 150 s-hang failure mode.
+            // An independent queue guarantees the timeout always fires.
+            let timeoutQueue = DispatchQueue(label: "com.juicemount.preflight.timeout")
+            // finish() is now reachable from two unrelated queues (the
+            // connection's stateUpdateHandler on `queue`, and the watchdog on
+            // `timeoutQueue`), so guard the once-only flag with a lock instead
+            // of relying on serialization by a single queue. The continuation
+            // resumes exactly once no matter which fires first.
+            let lock = NSLock()
             var finished = false
-            // All finish() calls are funneled through `queue`, so the
-            // flag is race-free and the continuation resumes exactly once.
             func finish(_ ok: Bool) {
-                guard !finished else { return }
+                lock.lock()
+                if finished { lock.unlock(); return }
                 finished = true
+                lock.unlock()
                 conn.cancel()
                 cont.resume(returning: ok)
             }
@@ -154,7 +166,7 @@ enum OnboardingPreflight {
                 }
             }
             conn.start(queue: queue)
-            queue.asyncAfter(deadline: .now() + timeout) {
+            timeoutQueue.asyncAfter(deadline: .now() + timeout) {
                 finish(false)
             }
         }

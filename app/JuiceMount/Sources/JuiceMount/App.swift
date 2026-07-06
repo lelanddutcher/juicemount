@@ -61,16 +61,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // at 3 s, well inside the existing start budget.
         if !NFSBridge.isRunning {
             if !server.preferences.hasCompletedOnboarding {
+                // Genuinely-first-run: a brand-new user must still onboard
+                // (set up backend + macFUSE) before the core can start.
                 menuBarController.openOnboardingWindow()
             } else {
+                // #87 first-launch hang fix: the Go core needs NOTHING from
+                // the preflight (start() reads only preferences.toServerConfig())
+                // and already boots-while-offline (R-4) and self-recovers when
+                // the backend returns. So START IMMEDIATELY — do NOT gate the
+                // mount on a cold TCP dial to Redis, which on first-connect
+                // could stall the whole launch ~150 s.
+                //
+                // The preflight still runs, but only as a NON-BLOCKING
+                // diagnostic that can never hold start() back: it re-opens the
+                // setup assistant ONLY for LOCAL hard-stops (juicefs binary or
+                // macFUSE missing) that the Go core genuinely cannot work
+                // around. A merely-unreachable backend is NOT a hard-stop — the
+                // core is already serving cached navigation offline and will
+                // reconnect on its own.
+                NFSBridge.appLog("start() invoked (pre-preflight)")
+                server.start()
+
                 let redisURL = server.preferences.redisURL
-                Task { @MainActor in
+                Task.detached { @MainActor in
                     let report = await OnboardingPreflight.run(redisURL: redisURL)
-                    if report.criticalOK {
-                        server.start()
-                    } else {
-                        NFSBridge.appLog("launch preflight failed (juicefs=\(report.juicefsPath ?? "missing") macfuse=\(report.macFUSEInstalled) backend=\(report.backendReachable) \(report.backendDetail)) — opening setup assistant")
+                    let localHardStop = report.juicefsPath == nil || !report.macFUSEInstalled
+                    if !report.criticalOK && localHardStop {
+                        NFSBridge.appLog("launch preflight LOCAL hard-stop (juicefs=\(report.juicefsPath ?? "missing") macfuse=\(report.macFUSEInstalled)) — opening setup assistant")
                         self.menuBarController.openOnboardingWindow()
+                    } else if !report.backendReachable {
+                        // Backend down at launch — the core boots offline (R-4)
+                        // and recovers. Log only; do NOT reopen the assistant.
+                        NFSBridge.appLog("launch preflight: backend unreachable (\(report.backendDetail)) — core started offline, will recover; not opening assistant")
                     }
                 }
             }

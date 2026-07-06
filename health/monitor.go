@@ -116,6 +116,18 @@ type HealthMonitor struct {
 	// Throttle timestamp for wedge diagnostics (logWedgeDiagnostics).
 	// Guarded by mu.
 	lastWedgeDiagAt time.Time
+
+	// drainProbe, if set, reports the drainer's live ingest state: the number
+	// of in-flight drains and the elapsed time since the last COMPLETED drain.
+	// Injected as a hook (not an nfs import) so package health stays free of an
+	// nfs dependency — mirrors the reachability WithLivenessHook idiom. Wired
+	// from bridge via globalDrainerAtomic. Nil when no spool/drainer is
+	// configured (the pre-drainer no-op — no online busy-suppression). Guarded
+	// by mu. See #89: an ONLINE analogue of the pin.IsOffline() readdir busy-
+	// suppression, so a legitimate high-concurrency ingest (the drain's
+	// synchronous MinIO PUTs saturating the FUSE request queue) is reported as
+	// "busy", not the false "mount losing communication" degraded state.
+	drainProbe func() (inFlight int64, sinceLastSuccess time.Duration)
 }
 
 // Tunables for NFS auto-remount. Exposed as vars so tests can override.
@@ -151,6 +163,16 @@ var (
 	// smooths the reported UI state.
 	FUSEFlapToDegraded = 3
 
+	// DrainBusyRecentWindow is how recently the LAST drain must have completed
+	// for a stat/readdir TIMEOUT to be treated as "busy (heavy ingest)" rather
+	// than a mount fault (#89). InFlight>0 is the primary signal; this window
+	// covers the brief lull between a burst's last completed PUT and the next
+	// enqueue, so a stat that queued behind the just-finished bulk traffic
+	// isn't misreported as degraded. Kept short so a genuinely-wedged mount
+	// (no drain activity) still degrades on the very next tick. Exposed as a
+	// var so tests can override.
+	DrainBusyRecentWindow = 15 * time.Second
+
 	// forceUnmountFn is the function used to force-unmount a stale mount.
 	// Replaceable so tests can avoid invoking `sudo`.
 	forceUnmountFn = forceUnmount
@@ -164,6 +186,36 @@ var (
 	// reassigns it, so behavior is identical to calling isJuiceFSProcessAlive.
 	isJuiceFSProcessAliveFn = isJuiceFSProcessAlive
 )
+
+// SetDrainProbe registers the drainer ingest-state hook used for the online
+// busy-suppression (#89). fn must return the drainer's current in-flight drain
+// count and the elapsed time since its last COMPLETED drain (a huge sentinel
+// when none has completed). Wired from bridge via globalDrainerAtomic. Passing
+// nil restores the pre-drainer no-op (no online suppression). Guarded by mu so
+// it is safe to (re)wire while the check loop runs.
+func (m *HealthMonitor) SetDrainProbe(fn func() (inFlight int64, sinceLastSuccess time.Duration)) {
+	m.mu.Lock()
+	m.drainProbe = fn
+	m.mu.Unlock()
+}
+
+// busyIngesting reports whether a legitimate heavy ingest/drain is active right
+// now — either drains in flight, or a drain completed within
+// DrainBusyRecentWindow. It is the ONLINE analogue of pin.IsOffline() for the
+// stat/readdir TIMEOUT suppression (#89): under such an ingest the drain's
+// synchronous MinIO PUTs saturate the FUSE request queue, so a foreground stat
+// can time out on a mount that is BUSY, not wedged. Returns false when no drain
+// probe is wired (pre-drainer no-op). Concurrent-safe (the hook reads atomics).
+func (m *HealthMonitor) busyIngesting() bool {
+	m.mu.RLock()
+	probe := m.drainProbe
+	m.mu.RUnlock()
+	if probe == nil {
+		return false
+	}
+	inFlight, since := probe()
+	return inFlight > 0 || since < DrainBusyRecentWindow
+}
 
 // New creates a HealthMonitor for the given configuration.
 func New(cfg Config) *HealthMonitor {
@@ -568,6 +620,19 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 			return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stat failed: %v", r.err)}
 		}
 	case <-time.After(5 * time.Second):
+		// #89 online busy-suppression: a foreground stat that TIMES OUT while a
+		// legitimate heavy ingest is draining is the drain's synchronous MinIO
+		// PUTs saturating the FUSE request queue — BUSY, not wedged. Reporting
+		// degraded here surfaces as the Finder "mount losing communication"
+		// report even though the mount is fine (the destructive remount path
+		// already defers safely; this is purely the reporting layer). The
+		// ONLINE analogue of the pin.IsOffline() readdir suppression below. Only
+		// a TIMEOUT is suppressed — a genuine stat error still degrades (that's
+		// the error branch above, unreachable from here).
+		if m.busyIngesting() {
+			jmlog.Info("fuse stat slow but drain in flight (busy, heavy ingest) — not flagging wedged", "path", m.cfg.FUSEPath)
+			return ComponentStatus{Healthy: true, LastCheck: now, Message: "busy (heavy ingest)"}
+		}
 		jmlog.Warn("fuse stat timed out (path likely wedged)", "path", m.cfg.FUSEPath)
 		go m.logWedgeDiagnostics("stat_timeout")
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "stat timed out (wedged FUSE mount)"}
@@ -585,6 +650,12 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 	}
 	if !strings.Contains(string(out), m.cfg.FUSEPath) {
 		jmlog.Debug("fuse mount not in mount table", "path", m.cfg.FUSEPath)
+		// V2.3 G0d: when the miss is the kext-approval loss, say so with the
+		// remediation — "no FUSE" alone reads like a transient.
+		if KextApprovalBlocked() {
+			return ComponentStatus{Healthy: false, LastCheck: now,
+				Message: "macFUSE not approved — System Settings → Privacy & Security → Allow, then reboot (writes buffered in spool)"}
+		}
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted (directory exists but no FUSE)"}
 	}
 
@@ -612,6 +683,16 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 		if pin.IsOffline() {
 			jmlog.Debug("fuse readdir slow but offline (busy draining) — not flagging stale", "path", m.cfg.FUSEPath)
 			return ComponentStatus{Healthy: true, LastCheck: now, Message: "offline (busy/draining)"}
+		}
+		// #89 ONLINE analogue of the offline suppression above: a readdir that
+		// times out while a heavy ingest is draining is the same saturated-FUSE-
+		// queue busy state, just ONLINE. Suppress it (busy, not stale) so a
+		// high-concurrency ingest doesn't surface as "mount losing communication"
+		// / feed the watchdog's escalate-to-remount. TIMEOUT-only (genuine
+		// readdir errors take the error branch above and still degrade).
+		if m.busyIngesting() {
+			jmlog.Info("fuse readdir slow but drain in flight (busy, heavy ingest) — not flagging stale", "path", m.cfg.FUSEPath)
+			return ComponentStatus{Healthy: true, LastCheck: now, Message: "busy (heavy ingest)"}
 		}
 		jmlog.Warn("fuse mount unresponsive (stale)", "path", m.cfg.FUSEPath)
 		go m.logWedgeDiagnostics("readdir_unresponsive")
@@ -701,8 +782,22 @@ func (m *HealthMonitor) checkNFS() ComponentStatus {
 
 	select {
 	case st := <-done:
+		// A resolved probe (success OR a genuine error/ENOTCONN from the inner
+		// goroutine) is authoritative — return it verbatim. The busy-suppression
+		// below covers ONLY the TIMEOUT branch, never a real error.
 		return st
 	case <-time.After(NFSStatTimeout):
+		// #89 online busy-suppression (same rationale as checkFUSE): an NFS stat
+		// that TIMES OUT while a heavy ingest is draining is the drain saturating
+		// the FUSE queue behind the NFS layer — BUSY, not stale. Suppress the
+		// degraded report so a legitimate ingest doesn't surface as "mount
+		// losing communication". TIMEOUT-only: a resolved error/ENOTCONN takes
+		// the `case st := <-done` branch above and still degrades.
+		if m.busyIngesting() {
+			jmlog.Info("nfs stat slow but drain in flight (busy, heavy ingest) — not flagging stale",
+				"mount_point", m.cfg.NFSMountPoint, "timeout_ms", NFSStatTimeout.Milliseconds())
+			return ComponentStatus{Healthy: true, LastCheck: now, Message: "busy (heavy ingest)"}
+		}
 		jmlog.Warn("nfs mount unresponsive (stat timed out)",
 			"mount_point", m.cfg.NFSMountPoint,
 			"timeout_ms", NFSStatTimeout.Milliseconds(),

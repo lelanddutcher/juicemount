@@ -56,3 +56,48 @@ func TestFUSEOfflineGuard_PreventsEscalation(t *testing.T) {
 		t.Fatal("kill-switch on + offline: guard must NOT skip (operator chose to restore escalate-when-offline)")
 	}
 }
+
+// TestFUSESkipRemountWhileUserOffline locks the V2.3 U4 predicate (field
+// report: "clicking offline doesn't just start it in offline mode" — the
+// gone-branch kept remounting every tick while the user was offline). The
+// guard is USER-INTENT ONLY: auto-offline (a link blip) must NOT suppress
+// the remount, or a dead juicefs would never self-heal after the blip
+// clears without user action. (Backend-unreachable churn is covered by the
+// separate backendReachable() check at the call site.)
+func TestFUSESkipRemountWhileUserOffline(t *testing.T) {
+	defer func() {
+		pin.SetOffline(false)
+		pin.SetAutoOffline(false, "test cleanup")
+	}()
+
+	// ONLINE: remount proceeds.
+	pin.SetOffline(false)
+	pin.SetAutoOffline(false, "")
+	if fuseSkipRemountWhileUserOffline() {
+		t.Fatal("online: gone-branch remount must NOT be suppressed")
+	}
+
+	// USER-OFFLINE: remount suppressed — the user asked us to stand down.
+	pin.SetOffline(true)
+	if !fuseSkipRemountWhileUserOffline() {
+		t.Fatal("user-offline: gone-branch remount MUST be suppressed (mirror serves nav; no churn)")
+	}
+	pin.SetOffline(false)
+
+	// AUTO-OFFLINE: remount NOT suppressed — blips must self-heal without
+	// user action once the backendReachable() call-site check passes.
+	pin.SetAutoOffline(true, "test link blip")
+	if fuseSkipRemountWhileUserOffline() {
+		t.Fatal("auto-offline: gone-branch remount must NOT be suppressed (self-heal after blips)")
+	}
+	pin.SetAutoOffline(false, "")
+
+	// KILL-SWITCH (JM_FUSE_OFFLINE_REMOUNT=1): restores always-retry.
+	pin.SetOffline(true)
+	saved := fuseOfflineNoRemount
+	fuseOfflineNoRemount = false // simulates JM_FUSE_OFFLINE_REMOUNT=1
+	defer func() { fuseOfflineNoRemount = saved }()
+	if fuseSkipRemountWhileUserOffline() {
+		t.Fatal("kill-switch on + user-offline: remount must NOT be suppressed")
+	}
+}

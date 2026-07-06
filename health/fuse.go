@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -170,6 +171,55 @@ func lastNonEmptyLine(s string) string {
 		}
 	}
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// macFUSE kext-approval classification (V2.3 G0d, 2026-07-01).
+//
+// A macOS update silently revokes the macFUSE system-extension approval
+// (kernelmanagerd: "Extension io.macfuse.filesystems.macfuse.N not approved
+// to load"). From then on EVERY juicefs mount hangs at "Mounting volume…"
+// and dies with "mount point is not ready in 10 seconds" — an error
+// indistinguishable from a slow backend unless the kext state is checked.
+// No amount of retrying can succeed; only the user can fix it (System
+// Settings approval). Classify once per failure so the log carries the exact
+// remediation and /health can surface it instead of a generic "no FUSE".
+
+// kextBlockedFlag latches "mount failed AND the macFUSE kext is not loaded".
+// Cleared on any successful mount. Read by the health monitor's FUSE check.
+var kextBlockedFlag atomic.Bool
+
+// KextApprovalBlocked reports whether the last mount failure was classified
+// as the macFUSE kext being unloaded (approval loss). Cheap; any goroutine.
+func KextApprovalBlocked() bool { return kextBlockedFlag.Load() }
+
+// noteMountFailure classifies a mount failure. Only latches the blocked flag
+// on high confidence (kmutil ran and macfuse is absent); on kmutil error or
+// timeout it stays quiet — the FUSE identity gate is the safety mechanism,
+// this is diagnosis for the human.
+func noteMountFailure() {
+	if kextLoaded() {
+		kextBlockedFlag.Store(false)
+		return
+	}
+	if kextBlockedFlag.CompareAndSwap(false, true) {
+		jmlog.Error("macFUSE kext is NOT loaded — juicefs mount cannot succeed until it is approved. " +
+			"Likely cause: a macOS update reset the system-extension approval. " +
+			"USER ACTION: System Settings → Privacy & Security → Allow \"Benjamin Fleischer\" (macFUSE), then reboot if prompted. " +
+			"Until then the FUSE identity gate parks drains and prunes; writes stay safely in the spool.")
+	}
+}
+
+// kextLoaded reports whether any macFUSE kext is currently loaded, bounded.
+// Returns true (= "can't claim blocked") when kmutil fails or times out.
+func kextLoaded() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "kmutil", "showloaded").Output()
+	if err != nil {
+		return true
+	}
+	return strings.Contains(strings.ToLower(string(out)), "macfuse")
 }
 
 // NewFUSEManager creates a FUSE mount manager.
@@ -482,6 +532,7 @@ func (fm *FUSEManager) Mount() error {
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
 
 	if err := cmd.Run(); err != nil {
+		noteMountFailure()
 		if launchCtx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("juicefs mount: timed out after 30s (backend unreachable?)")
 		}
@@ -492,9 +543,11 @@ func (fm *FUSEManager) Mount() error {
 	}
 
 	// Wait for the mount to become live (juicefs mount -d returns before FUSE is ready)
-	if err := fm.waitForMount(15 * time.Second); err != nil {
+	if err := fm.waitForMount(fm.mountVerifyTimeout()); err != nil {
+		noteMountFailure()
 		return fmt.Errorf("mount verification: %w", err)
 	}
+	kextBlockedFlag.Store(false)
 
 	log.Printf("[fuse] JuiceFS mounted at %s", fm.cfg.MountPoint)
 
@@ -758,8 +811,22 @@ func (fm *FUSEManager) isMountedLocked() bool {
 		return false
 	}
 
-	// Check 2: actually responsive — try listing the directory.
-	// A stale FUSE mount (dead process) will hang on any fs operation.
+	// Check 2: actually responsive — try listing the directory. A stale FUSE
+	// mount (dead daemon) hangs on any fs op. Kept as a root readdir (NOT the
+	// .config probe) because this same check gates LAUNCH readiness via
+	// waitForMount: right after `juicefs mount -d` the dir is listable before the
+	// .config control file is served, so a .config probe here false-fails the
+	// launch verification. Pure-read, no side-effect umount (QA-34 Slice 2): the
+	// monitorLoop owns the remount decision with its failure tolerance.
+	//
+	// task #72: this 5s readdir DOES flip to "stale" under backend slowness /
+	// cold-start warm, but the DESTRUCTIVE remount is gated by the escalation-
+	// confirm probe (mountResponsiveWithin), which reads the in-memory .config and
+	// so never trips on data-path slowness — a slow-but-alive mount is NEVER
+	// SIGKILLed even though this 5s readdir over-reports "stale" under load. (The
+	// residual cosmetic false "degraded" during heavy load is acceptable; the
+	// watchdog defers to the .config confirm, never destroys on this 5s probe. See
+	// mountResponsiveWithin for why .config beat a generous readdir here.)
 	done := make(chan bool, 1)
 	go func() {
 		_, err := os.ReadDir(fm.cfg.MountPoint)
@@ -769,25 +836,6 @@ func (fm *FUSEManager) isMountedLocked() bool {
 	case ok := <-done:
 		return ok
 	case <-time.After(5 * time.Second):
-		// QA-34 Slice 2 (2026-05-25): no longer fires a side-effect
-		// `umount -f` from inside this health probe.
-		//
-		// History of the bug: isMountedLocked is the leaf "is the mount
-		// healthy right now" check, called by the monitorLoop AND by
-		// any other code path that wants a snapshot. Pre-fix, a 5-second
-		// ReadDir timeout would trigger a fire-and-forget `umount -f`
-		// as a hidden side effect — which bypassed QA-33's 30-second
-		// consecutive-failure tolerance entirely. Under sustained
-		// writes, juicefs does fsync flushes that can take 15-30 s
-		// (observed: 16.86 s in production), during which ReadDir
-		// against the mount point hangs. The hidden umount then races
-		// the in-flight fsync, fails-or-succeeds depending on timing,
-		// and either way kills the daemon mid-write.
-		//
-		// New rule: this function is pure-read. It returns false on
-		// timeout and lets monitorLoop (which honors the consecutive-
-		// failure tolerance) decide whether to actually remount. The
-		// 5-second probe timeout stays so callers don't block forever.
 		log.Printf("[fuse] mount at %s is unresponsive (stale); reporting unhealthy. Remount decision deferred to monitorLoop.", fm.cfg.MountPoint)
 		return false
 	}
@@ -804,15 +852,46 @@ func (fm *FUSEManager) isMountedLocked() bool {
 // answers within 25s; a genuinely wedged one never does.
 const fuseConfirmProbeTimeout = 25 * time.Second
 
-// mountResponsiveWithin returns true if an os.ReadDir of the mount point
-// completes without error inside timeout. Same probe as isMountedLocked's
-// Check 2 but with a caller-chosen budget; used to CONFIRM wedged-ness before
-// an escalation remount. Safe to call without fm.mu (touches no fm state).
+// mountResponsiveWithin returns true (responsive → DEFER the destructive remount)
+// if juicefs answers a bounded .config read inside timeout. Safe to call without
+// fm.mu (touches no fm state).
+//
+// DELIBERATELY a .config (LIVENESS) probe, NOT a data-path readdir — empirically
+// grounded (2026-06-29). Three iterations were tried as the escalation-confirm:
+//
+//  1. root readdir (original) — false-SIGKILLs a slow-but-alive mount whenever a
+//     readdir exceeds the confirm window under transient load.
+//  2. root readdir gated by the GENEROUS 25s/45s/90s class window (the "obvious"
+//     fix an adversarial review recommended) — STILL false-escalated: during the
+//     cold-start metadata-sync burst the root readdir momentarily exceeded even
+//     25s, so the watchdog SIGKILLed a PERFECTLY HEALTHY juicefs (verified
+//     seconds later with escalation suppressed: readdir 130ms, reads 13ms, full
+//     bytes) and the follow-up remount then failed ("mount not ready after 15s")
+//     → a stuck no-mount loop. Destroying healthy mounts is the exact regression
+//     tasks #13/#72 exist to PREVENT, so this is strictly worse than (3).
+//  3. .config (this) — juicefs serves it from memory with NO backend round-trip,
+//     so it answers whenever the process + FUSE session are alive and hangs only
+//     on a TOTAL session death. It never false-trips on data-path slowness, so it
+//     never SIGKILLs a healthy mount; in the common case .config-healthy tracks
+//     data-path-healthy (verified: readdir 130ms / reads 13ms while .config OK).
+//
+// KNOWN LIMITATION (tracked as a #72 follow-up): a .config probe cannot see the
+// RARE "juicefs alive but backend CONNECTION wedged" shape (.config answers while
+// readdir hangs — the 2026-06-01 event). There this defers and the mount does not
+// auto-recover; manual app restart is the recovery. Accepted for now because
+// (a) it is rare, (b) the escalation's remount is itself currently broken ("mount
+// not ready after 15s"), so detecting the wedge would not recover it anyway, and
+// (c) the alternative (readdir-confirm) destroys HEALTHY mounts in the COMMON
+// case. The proper fix is a SEPARATE sustained-data-path-stall counter (escalate
+// only after readdir hangs for MINUTES while .config stays live) PLUS a fix for
+// the broken remount — both deferred to the follow-up, not rushed into a release.
 func (fm *FUSEManager) mountResponsiveWithin(timeout time.Duration) bool {
 	done := make(chan bool, 1)
 	go func() {
-		_, err := os.ReadDir(fm.cfg.MountPoint)
-		done <- (err == nil)
+		// Content OR a prompt error both mean juicefs ANSWERED (alive); only a
+		// genuine session death hangs this read, and then the select times out.
+		_, _ = os.ReadFile(fm.cfg.MountPoint + "/.config")
+		done <- true
 	}()
 	select {
 	case ok := <-done:
@@ -848,7 +927,14 @@ func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
 		if fm.isMountedLocked() {
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		// U5 review fix: with class-widened budgets (45s/90s) a failing
+		// verify would otherwise pin fm.mu through Mount() and park the
+		// user's Stop/quit for the whole window — abort promptly on Stop.
+		select {
+		case <-fm.stopCh:
+			return fmt.Errorf("mount verification aborted: manager stopping")
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("mount not ready after %v", timeout)
 }
@@ -1002,6 +1088,21 @@ func fuseSkipEscalateWhileOffline() bool {
 	return fuseOfflineNoEscalate && pin.IsOffline()
 }
 
+// V2.3 U4 (task #74/K3, field report "clicking offline doesn't help"): while
+// the USER has explicitly engaged offline mode, the gone-branch's app-side
+// remount of a dead juicefs is pure churn — a fresh juicefs mount needs the
+// backend anyway, and the user has asked us to stand down. Navigation keeps
+// serving from the SQLite mirror the whole time. AUTO-offline deliberately
+// does NOT gate this (blips must self-heal without user action); the
+// backend-reachability check next to the call site covers that shape.
+// Set JM_FUSE_OFFLINE_REMOUNT=1 to restore the pre-fix always-retry behavior
+// (cellular-revert-safety doctrine).
+var fuseOfflineNoRemount = os.Getenv("JM_FUSE_OFFLINE_REMOUNT") != "1"
+
+func fuseSkipRemountWhileUserOffline() bool {
+	return fuseOfflineNoRemount && pin.IsUserOffline()
+}
+
 // fuseColdStartGrace is how long after the watchdog starts (≈ app start / first
 // mount) the escalation to a destructive SIGKILL+remount is SUPPRESSED. During
 // cold start the JuiceFS mount is legitimately busy warming caches and serving
@@ -1069,6 +1170,29 @@ func (fm *FUSEManager) confirmProbeTimeout() time.Duration {
 	}
 }
 
+// mountVerifyTimeout is the launch-time mount-establish budget (V2.3 U5/K1,
+// field "mount not ready after 15s" churn on slow links). Same class gating
+// and kill switch as confirmProbeTimeout: byte-identical 15s on LAN/medium/
+// fast and whenever JM_FUSE_WATCHDOG_LINKAWARE is off; wider only where a
+// juicefs cold-start legitimately needs longer to answer its first readdir
+// (metadata warm-up over a slow/metered backend link). Note the kext-cant-
+// load shape fails FAST regardless (juicefs's own 10s "mount point is not
+// ready" fatal fires before any of these budgets — see noteMountFailure).
+func (fm *FUSEManager) mountVerifyTimeout() time.Duration {
+	const base = 15 * time.Second
+	if !fuseWatchdogLinkAware {
+		return base
+	}
+	switch netprofile.Default().Class() {
+	case netprofile.ClassMetered:
+		return 90 * time.Second
+	case netprofile.ClassSlow:
+		return 45 * time.Second
+	default:
+		return base
+	}
+}
+
 // backendReachable does a cheap TCP dial to the metadata (Redis) host to
 // decide whether a remount could even succeed. Mirrors the reachability
 // monitor's probe so the watchdog does NOT kill+remount juicefs during a real
@@ -1133,6 +1257,7 @@ func (fm *FUSEManager) monitorLoop() {
 	watchdogStart := time.Now() // for the cold-start escalation grace window
 	consecutiveFailures := 0    // ticks where the mount is stale AND juicefs is gone
 	staleWhileAliveTicks := 0   // ticks where the mount is stale but juicefs is alive
+	remountDeferTicks := 0      // gone-branch ticks deferred (user-offline / backend down) — V2.3 U4
 	offlineDeferTicks := 0      // ticks deferred because offline (busy draining, not wedged)
 	for {
 		select {
@@ -1250,6 +1375,31 @@ func (fm *FUSEManager) monitorLoop() {
 			// juicefs is genuinely GONE — its own supervisor exhausted its
 			// retries and exited. App-side recovery is now the only option.
 			staleWhileAliveTicks = 0
+
+			// V2.3 U4: suppress the retry loop when it cannot or should not
+			// succeed. (a) The user engaged offline — stand down until they
+			// come back online (the mirror keeps serving nav). (b) The
+			// backend is unreachable — a fresh juicefs mount needs Redis, so
+			// each attempt just burns a 30s launch timeout and churns macFUSE
+			// state. The next 10s tick re-evaluates both, so recovery is
+			// automatic the moment conditions clear. Rate-limited logging.
+			if fuseSkipRemountWhileUserOffline() {
+				remountDeferTicks++
+				if remountDeferTicks == 1 || remountDeferTicks%30 == 0 {
+					jmlog.Info("juicefs gone but user is OFFLINE — not remounting (mirror serves nav; remount resumes when back online)",
+						"defer_ticks", remountDeferTicks)
+				}
+				continue
+			}
+			if !fm.backendReachable() {
+				remountDeferTicks++
+				if remountDeferTicks == 1 || remountDeferTicks%30 == 0 {
+					jmlog.Info("juicefs gone but backend unreachable — not remounting (a mount cannot succeed; retrying on recovery)",
+						"defer_ticks", remountDeferTicks)
+				}
+				continue
+			}
+			remountDeferTicks = 0
 			consecutiveFailures++
 			jmlog.Warn("juicefs process tree gone — app-side remount",
 				"attempt", consecutiveFailures)

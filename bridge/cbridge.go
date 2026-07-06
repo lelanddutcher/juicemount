@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -116,6 +117,13 @@ var (
 	// /spool returns 503 between Stop and the next Start.
 	globalSpool   *jmnfs.SpoolStore
 	globalDrainer *jmnfs.Drainer
+
+	// globalDrainerAtomic mirrors globalDrainer for lock-free readers that
+	// must never contend on globalMu (review fix: the reachability liveness
+	// hook runs on the prober goroutine while NFSServerStart can hold
+	// globalMu for its entire body — a mutex read there freezes offline
+	// detection during start). Stored wherever globalDrainer is assigned.
+	globalDrainerAtomic atomic.Pointer[jmnfs.Drainer]
 
 	// Control-plane / contract identity (JM-1 /whoami, JM-6 version-of-record).
 	// Captured at Start because cfg.MountPoint/DBPath/MetricsAddr are otherwise
@@ -261,7 +269,102 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// reconcile loop recover everything automatically when the backend returns.
 	// A reachable backend — the overwhelmingly common case — takes the unchanged
 	// online path.
-	backendUp := backendReachableQuick(cfg.RedisURL, 1500*time.Millisecond)
+	// V2.3 U3: persisted user-offline intent — the user toggled offline in a
+	// previous session and never toggled back, so this session STARTS with
+	// the user-offline gates engaged (field report: "clicking the offline
+	// toggle doesn't just start it in offline mode"). One menu click returns
+	// online (SetOffline clears the marker).
+	//
+	// Batch-3 adversarial review (HIGH): a persisted-offline boot still
+	// PROBES the backend and — when reachable — MOUNTS FUSE. Offline pinned
+	// reads REQUIRE the mount: OpenFile's read path opens the FUSE fd and the
+	// JuiceFS LRU serves pinned bytes from local SSD, so the original
+	// skip-the-probe/skip-the-mount behavior made EVERY pinned-and-ready file
+	// unreadable (ENOENT against a plain empty dir) for the entire relaunched
+	// offline session — and the U4 watchdog stand-down (correctly) never
+	// remounts while the USER flag is held, so nothing recovered it. The
+	// original "touches no network at all" goal was WRONG for the same
+	// reason: juicefs needs its Redis metadata engine to mount, so a
+	// user-offline session was never a zero-network session (this also
+	// subsumes/rejects the companion suggestion to skip the boot Redis
+	// connect while user-offline). The split that actually holds:
+	//   - FUSE mount + Redis connect budget key on backendUp (TRUE probed
+	//     reachability, exactly like every other boot);
+	//   - boot sync/SCAN suppression, the offline read/readdir gates, and
+	//     the started_offline banner key on startedOffline (forced below).
+	// On a metered link the only added traffic is the 1.5s TCP probe + the
+	// juicefs mount metadata handshake — no data reads (the offline gates
+	// refuse un-pinned opens from the first RPC). On a dead link the probe
+	// fails fast and boot degenerates to the existing R-4 path.
+	//
+	// Batch-3 review #7: resolve the marker path via os.UserHomeDir with
+	// warn-and-disable — os.Getenv("HOME") made the marker path cwd-relative
+	// when HOME was unset (arbitrary in a launchd/daemon context), silently
+	// losing the user's offline choice. Unconfigured persistence is the pin
+	// package's designed inert mode: degrade loudly and safely.
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" {
+		pin.SetOfflinePersistPath(filepath.Join(home, ".juicemount", "offline-intent"))
+	} else {
+		jmlog.Warn("cannot resolve home directory — offline-intent persistence disabled (the offline toggle will not stick across launches)",
+			"error", fmt.Sprintf("%v", homeErr))
+	}
+	bootUserOffline := pin.PersistedOfflineIntent()
+	// Batch-3 review #10: a marker that outlived the metadata mirror DB (an
+	// app-data reset — including the app's own "Reset local metadata cache" —
+	// deletes Application Support but not ~/.juicemount) would make this boot
+	// skip the U1 empty-mirror blocking sync and serve a completely EMPTY
+	// volume that looks like data loss. Treat the marker as stale when there
+	// is nothing to serve: clear it and take the normal online boot.
+	if bootUserOffline && pin.DropStaleOfflineIntent(cfg.DBPath) {
+		jmlog.Warn("persisted offline intent but the metadata mirror DB is missing/empty (app data reset?) — ignoring the stale marker and booting online",
+			"db_path", cfg.DBPath)
+		bootUserOffline = false
+	}
+	if bootUserOffline {
+		jmlog.Info("persisted user-offline intent found — starting offline (U3); still probing + mounting FUSE so pinned files stay readable")
+	}
+	backendUp, bootRTT := backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+	// V2.3 U2/K2: a link can be reachable-but-useless — the TCP handshake
+	// completes inside 1.5s but the RTT is so high that the synchronous
+	// online boot (juicefs mount + first syncs) would churn for minutes.
+	// Above the threshold, take the SAME start-while-offline path as a dead
+	// backend: nav serves from the mirror instantly and the watchdog +
+	// reconcile loop bring everything online in the background. Conservative
+	// default (tonight's 42ms DERP-relay cellular booted fine in 19s —
+	// deferral is for genuinely broken links); JM_BOOT_DEFER_RTT_MS tunes,
+	// 0 disables (REVERT_LOG 2026-07-02).
+	// Batch-3 adversarial review (HIGH follow-through): the U2 RTT defer is
+	// SKIPPED on a persisted-offline (U3) boot. The defer works by fabricating
+	// backendUp=false, which skips the boot fm.Mount() — but a U3 session
+	// holds the USER offline flag, so the watchdog's gone-branch remount
+	// stands down (fuseSkipRemountWhileUserOffline) and FUSE would NEVER
+	// mount: the same pinned-files-unreadable failure on a slow-but-alive
+	// link. A U3 boot already has everything the defer buys (startedOffline
+	// is forced below: no boot sync, offline gates live, banner) EXCEPT the
+	// mount skip — which is exactly the part that must not happen.
+	bootRTTDeferred := false
+	if backendUp && bootRTT > 0 && !bootUserOffline {
+		deferMS := int64(500)
+		if v := os.Getenv("JM_BOOT_DEFER_RTT_MS"); v != "" {
+			if n, pErr := strconv.ParseInt(v, 10, 64); pErr == nil {
+				deferMS = n
+			}
+		}
+		if deferMS > 0 && bootRTT.Milliseconds() > deferMS {
+			// Review fix (HIGH): do NOT just flip backendUp — a
+			// reachable-but-slow backend ANSWERS the single connect attempt,
+			// which would leave startedOffline=false and produce the worst
+			// of both worlds (no offline gating, NFS serving over an
+			// unmounted FUSE, and a fresh-install boot blocking on a
+			// synchronous SCAN over the terrible link). Carry the decision
+			// and force the FULL offline-start semantics after the connect
+			// block below.
+			backendUp = false
+			bootRTTDeferred = true
+			jmlog.Warn("backend reachable but RTT above boot-defer threshold — forcing the start-while-offline path (U2)",
+				"rtt_ms", bootRTT.Milliseconds(), "threshold_ms", deferMS)
+		}
+	}
 	if !backendUp {
 		jmlog.Warn("metadata backend unreachable at startup — taking the start-while-offline path (serving cached navigation; reads resume when the backend returns)",
 			"redis_url", cfg.RedisURL)
@@ -276,129 +379,148 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// juicefs invocation entirely. FUSEManager.Mount() also handles this
 	// internally, but we want to avoid even creating a second monitor
 	// goroutine for the same mount.
-	if cfg.FUSEPath != "" {
+	//
+	// S1 (2026-07-02): this block, metadata.Open(), and connectRedisWithRetry
+	// are mutually independent (the mount needs only cfg + backendUp; connect
+	// needs only the opened store), so they are run CONCURRENTLY and JOINED
+	// before srv.Start(). No semantic change — identical work, identical
+	// causal order (store→connect stays serial; the mount overlaps both),
+	// only the ~1.4-7s fm.Mount() and the ~6s Open+~2s connect now overlap
+	// instead of stacking (the ~16s serial boot → ~max(mount, open+connect)).
+	// Extracted into a closure so the parallel and serial (JM_BOOT_PARALLEL=0
+	// kill switch) paths share ONE copy of the mount logic verbatim. Runs
+	// under the already-held globalMu; the only global it writes (globalFUSE /
+	// globalFUSEPath / globalFUSEMetricsAddr) is disjoint from the store lane's
+	// globalStore, and the parent blocks on the join before any other code
+	// reads them, so there is no added race.
+	mountFUSE := func() {
+		if cfg.FUSEPath == "" {
+			return
+		}
 		// Make sure the mount-point directory exists
 		_ = os.MkdirAll(cfg.FUSEPath, 0o755)
 		globalFUSEPath = cfg.FUSEPath
+		// V2.3 G0: arm the FUSE identity gate. Drains, phantom purges, and
+		// reconcile prunes all refuse to act while this path has no real
+		// filesystem mounted on it (kext-approval loss / mount absent /
+		// wedge) instead of silently operating against a plain local dir.
+		pin.SetFUSEIdentityPath(cfg.FUSEPath)
 
 		if globalFUSE != nil && fuseLooksHealthy(cfg.FUSEPath) {
 			jmlog.Info("juicefs FUSE already mounted, reusing", "path", cfg.FUSEPath)
+			return
+		}
+		// Forward the user's configured cache size to JuiceFS. Without this,
+		// JuiceFS uses an unspecified default and (worse) the user's
+		// preferred cap is silently ignored — see the regression in the
+		// CLI→GUI port where the menu-bar app was passing cache_size in
+		// the JSON config but cbridge never forwarded it.
+		//
+		// FreeSpaceRatio = 0.01 (1%) instead of JuiceFS's default 0.1.
+		// Video editors fill their disks; the default makes the cache
+		// silently disable below 10% free, sending every read straight
+		// to S3 with no warning. 1% is the sweet spot for our use case
+		// — the disk is the cache.
+		// QA-7 followup: if we're entering this branch with a still-
+		// live globalFUSE (e.g. fuseLooksHealthy misfired after
+		// NFSServerStopMount which intentionally preserved it), stop
+		// the old manager FIRST so we don't leak its monitor
+		// goroutine. The old FUSEManager's monitor would otherwise
+		// keep ticking against the now-replaced mount and could
+		// race with the new one. Idempotent — Stop on an already-
+		// stopped manager is a no-op.
+		if globalFUSE != nil {
+			jmlog.Warn("Start: replacing existing globalFUSE that fuseLooksHealthy rejected — stopping the old one first to prevent monitor leak",
+				"path", cfg.FUSEPath)
+			oldFM := globalFUSE
+			globalFUSE = nil
+			oldFM.Stop()
+		}
+		// Pre-read total pinned bytes so the cache-size policy can grow the
+		// cache just enough to keep the pinned set resident. The pin store
+		// proper is opened post-mount (~L413); this brief read-only open is
+		// best-effort — 0 on any error just means "respect the configured
+		// cache size."
+		var pinnedBytes int64
+		if ps, perr := pin.Open(pinStorePath(cfg.DBPath)); perr == nil {
+			if agg, aerr := ps.AggregateStats(); aerr == nil {
+				pinnedBytes = agg.TotalBytes
+			}
+			ps.Close()
+		}
+		fm := health.NewFUSEManager(health.FUSEConfig{
+			RedisURL:        cfg.RedisURL,
+			MountPoint:      cfg.FUSEPath,
+			CacheSize:       cfg.CacheSize,
+			FreeSpaceRatio:  "0.01",
+			BucketOverride:  cfg.BucketOverride,
+			PinnedBytes:     pinnedBytes,
+			FUSEMetricsAddr: health.DefaultFUSEMetricsAddr,
+		})
+		// Tell the block-cache scraper where the FUSE daemon's prometheus
+		// /metrics endpoint is so /cache-status can report the TRUE on-disk
+		// block-cache size (juicefs_blockcache_bytes) as cache_used_bytes.
+		globalFUSEMetricsAddr = fm.EffectiveMetricsAddr()
+		pin.SetBlockCacheMetricsAddr(globalFUSEMetricsAddr)
+		// Start the watchdog and register globalFUSE UNCONDITIONALLY —
+		// even if the initial mount fails (a transient backend blip at
+		// launch). Pre-2026-05-29 this returned before StartMonitor() on
+		// failure, so a launch-time error — especially on a restart that
+		// had just Stopped the previous watchdog (see line ~208) — left the
+		// app with NO FUSE self-heal at all. The watchdog retries once the
+		// backend is reachable; registering globalFUSE keeps a later retry
+		// from leaking a second monitor goroutine.
+		// R-4: skip the SYNCHRONOUS boot-time mount when the backend is
+		// unreachable. juicefs mount needs Redis as its metadata engine, so
+		// fm.Mount() would block up to ~30s before failing — the dominant
+		// offline-boot stall. We still StartMonitor + register globalFUSE so
+		// the watchdog mounts it the moment the backend returns (the same
+		// self-heal path a failed mount already relies on).
+		var mountErr error
+		if backendUp {
+			mountErr = fm.Mount()
+		}
+		fm.StartMonitor()
+		globalFUSE = fm
+		if !backendUp {
+			jmlog.Warn("deferred FUSE mount — backend unreachable at startup; the watchdog will mount it once the backend returns",
+				"path", cfg.FUSEPath)
+		} else if mountErr != nil {
+			// Launch-time mount failed — almost always a transient backend
+			// blip during startup. Do NOT abort startup: the watchdog
+			// (started above) brings FUSE up once the backend is reachable.
+			// Returning here used to leave the app HALF-STARTED — juicefs
+			// recovering in the background but NFS, the metrics/control
+			// server, and the spool never started, so /Volumes/zpool never
+			// mounted and the app looked dead (observed 2026-06-01 under a
+			// blippy link). Continue instead: the app comes up fully,
+			// un-pinned reads fail-fast until FUSE is ready, and the mount
+			// self-heals.
+			jmlog.Error("juicefs FUSE mount failed at launch — continuing startup; watchdog will mount it once the backend is reachable",
+				"error", mountErr.Error())
 		} else {
-			// Forward the user's configured cache size to JuiceFS. Without this,
-			// JuiceFS uses an unspecified default and (worse) the user's
-			// preferred cap is silently ignored — see the regression in the
-			// CLI→GUI port where the menu-bar app was passing cache_size in
-			// the JSON config but cbridge never forwarded it.
-			//
-			// FreeSpaceRatio = 0.01 (1%) instead of JuiceFS's default 0.1.
-			// Video editors fill their disks; the default makes the cache
-			// silently disable below 10% free, sending every read straight
-			// to S3 with no warning. 1% is the sweet spot for our use case
-			// — the disk is the cache.
-			// QA-7 followup: if we're entering this branch with a still-
-			// live globalFUSE (e.g. fuseLooksHealthy misfired after
-			// NFSServerStopMount which intentionally preserved it), stop
-			// the old manager FIRST so we don't leak its monitor
-			// goroutine. The old FUSEManager's monitor would otherwise
-			// keep ticking against the now-replaced mount and could
-			// race with the new one. Idempotent — Stop on an already-
-			// stopped manager is a no-op.
-			if globalFUSE != nil {
-				jmlog.Warn("Start: replacing existing globalFUSE that fuseLooksHealthy rejected — stopping the old one first to prevent monitor leak",
-					"path", cfg.FUSEPath)
-				oldFM := globalFUSE
-				globalFUSE = nil
-				oldFM.Stop()
-			}
-			// Pre-read total pinned bytes so the cache-size policy can grow the
-			// cache just enough to keep the pinned set resident. The pin store
-			// proper is opened post-mount (~L413); this brief read-only open is
-			// best-effort — 0 on any error just means "respect the configured
-			// cache size."
-			var pinnedBytes int64
-			if ps, perr := pin.Open(pinStorePath(cfg.DBPath)); perr == nil {
-				if agg, aerr := ps.AggregateStats(); aerr == nil {
-					pinnedBytes = agg.TotalBytes
-				}
-				ps.Close()
-			}
-			fm := health.NewFUSEManager(health.FUSEConfig{
-				RedisURL:        cfg.RedisURL,
-				MountPoint:      cfg.FUSEPath,
-				CacheSize:       cfg.CacheSize,
-				FreeSpaceRatio:  "0.01",
-				BucketOverride:  cfg.BucketOverride,
-				PinnedBytes:     pinnedBytes,
-				FUSEMetricsAddr: health.DefaultFUSEMetricsAddr,
-			})
-			// Tell the block-cache scraper where the FUSE daemon's prometheus
-			// /metrics endpoint is so /cache-status can report the TRUE on-disk
-			// block-cache size (juicefs_blockcache_bytes) as cache_used_bytes.
-			globalFUSEMetricsAddr = fm.EffectiveMetricsAddr()
-			pin.SetBlockCacheMetricsAddr(globalFUSEMetricsAddr)
-			// Start the watchdog and register globalFUSE UNCONDITIONALLY —
-			// even if the initial mount fails (a transient backend blip at
-			// launch). Pre-2026-05-29 this returned before StartMonitor() on
-			// failure, so a launch-time error — especially on a restart that
-			// had just Stopped the previous watchdog (see line ~208) — left the
-			// app with NO FUSE self-heal at all. The watchdog retries once the
-			// backend is reachable; registering globalFUSE keeps a later retry
-			// from leaking a second monitor goroutine.
-			// R-4: skip the SYNCHRONOUS boot-time mount when the backend is
-			// unreachable. juicefs mount needs Redis as its metadata engine, so
-			// fm.Mount() would block up to ~30s before failing — the dominant
-			// offline-boot stall. We still StartMonitor + register globalFUSE so
-			// the watchdog mounts it the moment the backend returns (the same
-			// self-heal path a failed mount already relies on).
-			var mountErr error
-			if backendUp {
-				mountErr = fm.Mount()
-			}
-			fm.StartMonitor()
-			globalFUSE = fm
-			if !backendUp {
-				jmlog.Warn("deferred FUSE mount — backend unreachable at startup; the watchdog will mount it once the backend returns",
-					"path", cfg.FUSEPath)
-			} else if mountErr != nil {
-				// Launch-time mount failed — almost always a transient backend
-				// blip during startup. Do NOT abort startup: the watchdog
-				// (started above) brings FUSE up once the backend is reachable.
-				// Returning here used to leave the app HALF-STARTED — juicefs
-				// recovering in the background but NFS, the metrics/control
-				// server, and the spool never started, so /Volumes/zpool never
-				// mounted and the app looked dead (observed 2026-06-01 under a
-				// blippy link). Continue instead: the app comes up fully,
-				// un-pinned reads fail-fast until FUSE is ready, and the mount
-				// self-heals.
-				jmlog.Error("juicefs FUSE mount failed at launch — continuing startup; watchdog will mount it once the backend is reachable",
-					"error", mountErr.Error())
-			} else {
-				// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
-				// the *effective* config from the mount, not the user input —
-				// otherwise the user reads "100 GiB" and is confused why the
-				// daemon was actually launched with 800 GiB.
-				jmlog.Info("juicefs FUSE mounted",
-					"path", cfg.FUSEPath,
-					"effective_cache_size_mb", fm.EffectiveCacheSize(),
-					"free_space_ratio", "0.01")
-			}
+			// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
+			// the *effective* config from the mount, not the user input —
+			// otherwise the user reads "100 GiB" and is confused why the
+			// daemon was actually launched with 800 GiB.
+			jmlog.Info("juicefs FUSE mounted",
+				"path", cfg.FUSEPath,
+				"effective_cache_size_mb", fm.EffectiveCacheSize(),
+				"free_space_ratio", "0.01")
 		}
 	}
 
-	// Open metadata store. If this fails, leave FUSE mounted — the next
-	// Start can pick it up. Tearing FUSE down here would force an admin
-	// password prompt on the next attempt, which is hostile.
-	store, err := metadata.Open(cfg.DBPath)
-	if err != nil {
-		return C.CString(fmt.Sprintf("error: open store: %v", err))
+	// openStore opens the metadata store. Fatal on error (as before): a caller
+	// with no store cannot serve nav. The connect lane runs AFTER this (it
+	// needs the opened store), so store→connect stays serial; only the mount
+	// overlaps them.
+	openStore := func() (*metadata.Store, error) {
+		// Open metadata store. If this fails, leave FUSE mounted — the next
+		// Start can pick it up. Tearing FUSE down here would force an admin
+		// password prompt on the next attempt, which is hostile.
+		return metadata.Open(cfg.DBPath)
 	}
-	globalStore = store
 
-	// Connect to Redis with bounded retry. Network can be flaky — wifi/cell
-	// handoffs, sleeping NAS, brief router restart. Without this, a 1s blip
-	// at launch leaves the user staring at "redis: connect: no route to host"
-	// even though the NAS comes back 3 seconds later.
-	//
 	// Retry schedule: 1s, 2s, 4s, 8s, 16s = 5 attempts, ~31s total worst case.
 	// R-4: when the up-front probe already found the backend down, don't burn
 	// those ~31s — one quick attempt, then take the offline-start path.
@@ -406,9 +528,69 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if !backendUp {
 		connectAttempts = 1
 	}
+
+	// S1: run mount ‖ (open → connect). The mount lane never returns from the
+	// function (mount failure is non-fatal, handled inline in mountFUSE); the
+	// store/connect lane can early-return (fatal open error / malformed URL),
+	// so it stays in the main flow where the C-string returns are clean. The
+	// only concurrency is the backgrounded mount; we JOIN it before any code
+	// below reads globalFUSE or reaches srv.Start(). Kill switch
+	// JM_BOOT_PARALLEL=0 runs the original strictly-serial order (mount, then
+	// open, then connect) for a bisect if the orchestration is ever suspected.
+	var store *metadata.Store
+	var rc *metadata.RedisClient
+	var connectErr error
+	if os.Getenv("JM_BOOT_PARALLEL") == "0" {
+		mountFUSE()
+		var openErr error
+		store, openErr = openStore()
+		if openErr != nil {
+			return C.CString(fmt.Sprintf("error: open store: %v", openErr))
+		}
+		globalStore = store
+		// Connect to Redis with bounded retry. Network can be flaky — wifi/cell
+		// handoffs, sleeping NAS, brief router restart. Without this, a 1s blip
+		// at launch leaves the user staring at "redis: connect: no route to host"
+		// even though the NAS comes back 3 seconds later.
+		rc, connectErr = connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
+	} else {
+		var mountWG sync.WaitGroup
+		mountWG.Add(1)
+		go func() {
+			defer mountWG.Done()
+			mountFUSE()
+		}()
+		// Main flow: open the store, then (if it opened) connect — serial
+		// because connect needs the store — while the mount runs concurrently.
+		var openErr error
+		store, openErr = openStore()
+		if openErr != nil {
+			// The mount goroutine writes only its own globals and never returns
+			// from the function; join it so we don't abandon an in-flight mount
+			// goroutine writing globalFUSE after we've released globalMu.
+			mountWG.Wait()
+			return C.CString(fmt.Sprintf("error: open store: %v", openErr))
+		}
+		globalStore = store
+		// Connect to Redis with bounded retry (see the schedule note above).
+		rc, connectErr = connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
+		// JOIN the mount before srv.Start() (preserves pinned-files-instant —
+		// NFS must not serve before the mount lane has registered globalFUSE +
+		// armed the identity gate). Done here, before we touch rc/globalFUSE
+		// below, so every downstream invariant sees the same post-join state as
+		// the serial path.
+		mountWG.Wait()
+	}
+
 	startedOffline := false
-	rc, err := connectRedisWithRetry(cfg.RedisURL, store, connectAttempts)
-	if err != nil {
+	// Batch-3 adversarial review #8: carry a per-cause reason for the
+	// "started_offline:" status instead of always reusing the R-4 constant —
+	// a deliberate user-offline relaunch was reported to Swift (and os_log'd)
+	// as "backend unreachable at launch", a false causal story, and the U2
+	// slow-backend defer claimed "unreachable" while its own SetAutoOffline
+	// reason said "responding slowly".
+	startOfflineReason := offlineStartReason
+	if err := connectErr; err != nil {
 		// R-4: do NOT abort. Start offline. A DEFERRED Redis client
 		// (connected=false) keeps every downstream rc.* call site working
 		// unchanged and self-heals via the reconcile loop (which flips
@@ -434,6 +616,33 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// true, which suppresses the phantom-purge so the offline session can't
 		// delete real entries from the mirror.
 		pin.SetAutoOffline(true, offlineStartReason)
+	}
+	// V2.3 U2 review fix (HIGH): the RTT defer must yield the SAME offline-
+	// start semantics as a dead backend even when the connect above
+	// SUCCEEDED (a reachable-but-slow backend usually answers within the
+	// 10s dial). With startedOffline forced true: the boot skips the
+	// synchronous fm.Mount() and the U1 blocking-sync branch (no full SCAN
+	// over the terrible link, fresh installs included), the offline
+	// read/readdir gates are live from the first RPC, and Swift gets the
+	// started_offline banner. Recovery is the standard R-4 machinery — the
+	// reachability monitor + watchdog bring the mount and sync up in the
+	// background (with a LIVE rc here, the first reconcile tick syncs
+	// without waiting for a reconnect).
+	if bootRTTDeferred && !startedOffline {
+		startedOffline = true
+		startOfflineReason = "backend responding slowly — started offline; recovering in background"
+		pin.SetAutoOffline(true, startOfflineReason)
+	}
+	// V2.3 U3: persisted USER intent — engage the user flag (not auto), so
+	// U4's watchdog stand-down holds and only an explicit toggle clears it.
+	// Batch-3 review (HIGH): when the backend was reachable, FUSE is ALREADY
+	// mounted above (the mount keys on backendUp, never on user intent) —
+	// this block only engages the gates/banner and suppresses the boot sync,
+	// so pinned files stay readable through the whole offline session.
+	if bootUserOffline {
+		startedOffline = true
+		startOfflineReason = "offline mode is on (your setting from last session)"
+		pin.SetOffline(true)
 	}
 	globalRC = rc
 	// QA-30 (2026-05-25): give the reconcile loop the path config it needs
@@ -461,7 +670,36 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// adaptive readahead can bootstrap link class (fast LAN vs slow WAN)
 		// before any throughput sample arrives (internal/netprofile).
 		globalReach = health.NewReachability(reachAddr,
-			health.WithRTTObserver(netprofile.Default().ObserveRTT))
+			health.WithRTTObserver(netprofile.Default().ObserveRTT),
+			// Drain-liveness false-flap override (task #66 salvage, NFSv3
+			// sprint): a completed drain (a MinIO PUT that landed) is positive
+			// proof the backend is reachable over the SAME link the probe
+			// dials. When the drainer saturates the uplink, a cold probe SYN
+			// can queue behind its bulk PUT traffic and exceed the dial
+			// timeout — a FALSE "unreachable" that would arm the 18s
+			// offline-engage deferral and (pre-fix) let a reconcile prune real
+			// files mid-copy. This hook reports the age of the last proven
+			// drain; the monitor suppresses a probe FAILURE while that age is
+			// within ~2*baseInterval. Review fix (phase-1 adversarial review):
+			// the hook runs on the reachability prober's goroutine — taking
+			// globalMu here would block the ENTIRE offline-detection loop for
+			// as long as NFSServerStart holds globalMu (its whole body, which
+			// includes this very Reachability.Start), freezing offline
+			// detection exactly during start-while-offline. Read the drainer
+			// through a dedicated atomic instead (LastDrainSuccess is
+			// internally synchronized). Nil (spool disabled / server stopped)
+			// → MaxInt64 sentinel → the override never fires.
+			health.WithLivenessHook(func() time.Duration {
+				d := globalDrainerAtomic.Load()
+				if d == nil {
+					return time.Duration(math.MaxInt64)
+				}
+				last := d.LastDrainSuccess()
+				if last.IsZero() {
+					return time.Duration(math.MaxInt64)
+				}
+				return time.Since(last)
+			}))
 		globalReach.OnChange(func(reachable bool, reason string) {
 			offlineEngageMu.Lock()
 			defer offlineEngageMu.Unlock()
@@ -525,29 +763,108 @@ func NFSServerStart(configJSON *C.char) *C.char {
 
 	// [metadata keyspace push] Wire the class-gating signals BEFORE rc.Start so
 	// the keyspace loop (started inside Start when JM_METADATA_KEYSPACE_PUSH=1)
-	// can class-gate its rare-backstop cadence + coalescer from launch. We always
-	// pass globalReach.Reachable for online/offline; the active-interface NAME
-	// signal needs a NetWatcher, which we only spin up when the push feature is
-	// enabled (avoids an extra 1s-poll goroutine in the default-off case). When
-	// the NetWatcher is absent, class-gating falls back to JM_WAN_MODE + a WiFi
-	// default — safe and link-sparing.
-	if os.Getenv("JM_METADATA_KEYSPACE_PUSH") == "1" {
-		globalKeyspaceNetWatcher = health.NewNetWatcher(1 * time.Second)
-		globalKeyspaceNetWatcher.Start()
-		var reachFn func() bool
-		if globalReach != nil {
-			reachFn = globalReach.Reachable
-		}
-		metadata.SetClassSignals(globalKeyspaceNetWatcher.ActiveInterface, reachFn)
+	// can class-gate its rare-backstop cadence + coalescer from launch.
+	// Review fix (phase-1 adversarial review): the reachability signal is
+	// wired UNCONDITIONALLY — RecentlyDegraded's reachableNow() gate (the G2
+	// b.1 false-flap prune protection) must be live in every config, not
+	// only when the push is enabled. Only the NetWatcher (active-interface
+	// NAME signal, an extra 1s-poll goroutine) stays push-gated; with a nil
+	// interface fn, class-gating falls back to JM_WAN_MODE + a WiFi default
+	// — safe and link-sparing, byte-identical to before for push-off.
+	var reachFn func() bool
+	if globalReach != nil {
+		reachFn = globalReach.Reachable
 	}
+	var ifaceFn func() string
+	if os.Getenv("JM_METADATA_KEYSPACE_PUSH") == "1" {
+		// G8 (task #81): classify by the route to the BACKEND, not the default
+		// route. Proven live 2026-07-02 (hotspot + Tailscale): the NAS route was
+		// utun6 but the default-route heuristic reported en0, so currentLinkClass
+		// said WiFi on a metered tunnel — G7's SCAN budget used 120s instead of
+		// 300s, the SCAN never finished, engagement never ENABLED, and the 60s
+		// retry loop burned the metered link (also mis-gated G6's deferral, the
+		// backstop cadence, and the coalescer). WithBackendTarget makes the
+		// watcher resolve the interface the kernel routes to the Redis host
+		// (connected-UDP trick, no probe traffic; resolver failure falls back to
+		// the old default-route behavior — see health/netwatch.go). JM_WAN_MODE /
+		// JM_NET_FORCE_CLASS override precedence is untouched: those are consulted
+		// in metadata.currentLinkClass / netprofile BEFORE this signal.
+		var opts []health.NetWatcherOption
+		if backendAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL); backendAddr != "" {
+			opts = append(opts, health.WithBackendTarget(backendAddr))
+		}
+		globalKeyspaceNetWatcher = health.NewNetWatcher(1*time.Second, opts...)
+		globalKeyspaceNetWatcher.Start()
+		ifaceFn = globalKeyspaceNetWatcher.ActiveInterface
+	}
+	metadata.SetClassSignals(ifaceFn, reachFn)
 
 	// Initial sync. R-4: skip when started offline — it would only fail against
 	// the dead backend. rc.Start() still launches the reconcile loop, which flips
 	// connected=true and catches up the mirror on its first success once the
 	// backend returns.
+	//
+	// V2.3 U1 (serve-first boot, field report "5+ min to first items"): the
+	// full-tree SyncOnce used to BLOCK here, ahead of the NFS server and the
+	// control plane — 136s of empty Finder over a cellular relay (measured
+	// 2026-07-02: mount up in 5s, everything else waiting on this call). The
+	// mirror is already RAM-hydrated from disk (metadata.Open→rebuildCaches),
+	// so serving it immediately is exactly what offline mode already does;
+	// the sync runs in the background (syncMu single-flights it against the
+	// reconcile loop) and IsSyncing drives the "Rebuilding index…" indicator.
+	// Blocking is kept for: (a) an EMPTY mirror (fresh install / wiped DB) —
+	// there is nothing to serve and an empty Finder tree is worse than a
+	// short wait; (b) JM_BOOT_SYNC_FIRST=1 (kill switch, restores the old
+	// ordering; REVERT_LOG 2026-07-02).
+	// Review fix (G6/U1 adversarial review): the background sync must not
+	// reach its prune pass before the prune guards are wired — SetPinChecker
+	// (Layer C) and SetSpoolGuard (Layer D) are installed further down in
+	// this function. bootSyncWired is closed by the deferred call on EVERY
+	// exit path (success = all wiring done; error = rc is being torn down
+	// and the goroutine's SyncOnce fails harmlessly), so the goroutine can
+	// never run a guard-less prune and never leaks.
+	bootSyncWired := make(chan struct{})
+	defer close(bootSyncWired)
 	if !startedOffline {
-		if err := rc.SyncOnce(); err != nil {
-			jmlog.Warn("initial sync failed", "error", err.Error())
+		// C1 (2026-07-02): skip the boot SCAN entirely when the mirror is fresh
+		// AND keyspace push is engaged. In that config the PSUBSCRIBE gap-fill +
+		// the periodic backstop already guarantee convergence, so a full boot
+		// SCAN over a recently-synced mirror is redundant work (the 174s
+		// "Rebuilding index…" spinner over a cellular relay). ShouldSkipBootSync
+		// fails safe on a first-run/wiped mirror (no persisted last_sync_time),
+		// on push-off, on a stale timestamp, and under the JM_BOOT_SYNC_SKIP=0
+		// kill switch — every one of those falls through to today's behavior
+		// below. We deliberately do NOT stamp lastSyncStartedAt here, so
+		// IsSyncing() stays false and G7's /activity never shows "Rebuilding
+		// index…" for a skipped boot. rc.Start() below still launches the
+		// reconcile + keyspace loops as normal.
+		if rc.ShouldSkipBootSync() {
+			jmlog.Info("boot SCAN skipped — mirror fresh + push engaged; PSUBSCRIBE + backstop carry deltas")
+		} else {
+			bootSyncBlocking := os.Getenv("JM_BOOT_SYNC_FIRST") == "1"
+			if !bootSyncBlocking {
+				if n, cErr := store.Count(); cErr != nil || n == 0 {
+					bootSyncBlocking = true
+				}
+			}
+			if bootSyncBlocking {
+				if err := rc.SyncOnce(); err != nil {
+					jmlog.Warn("initial sync failed", "error", err.Error())
+				}
+			} else {
+				go func() {
+					<-bootSyncWired
+					t0 := time.Now()
+					jmlog.Info("initial metadata sync running in background (serve-first boot)")
+					if err := rc.SyncOnce(); err != nil {
+						jmlog.Warn("background initial sync failed — reconcile loop retries",
+							"error", err.Error())
+						return
+					}
+					jmlog.Info("background initial sync complete",
+						"duration_ms", time.Since(t0).Round(time.Millisecond).Milliseconds())
+				}()
+			}
 		}
 	}
 	rc.Start()
@@ -639,6 +956,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// the absolute paths the pin store keys on.
 		srv.Handler().SetPinStore(ps, cfg.MountPoint)
 		jmlog.Info("pin store ready", "path", pinDBPath, "workers", 4)
+
+		// Item 0: heal dirs pinned in a PRIOR session. On boot the pin store
+		// remembers the pinned roots but the metadata mirror may not have their
+		// subtree rows (older build, or the warm never completed) — so those
+		// dirs would list empty offline. Enumerate PinRoots() and warm each
+		// root's ancestor chain + subtree. Runs in the background so it never
+		// blocks boot; self-gates on JM_PIN_WARM_METADATA and pin.IsOffline()
+		// (offline reconcileDir burns a 30s Redis timeout per dir — the metadata
+		// warm resumes when online; blocks are already cached).
+		warmMount := cfg.MountPoint
+		go warmPinnedRootsAtBoot(ps, rc, warmMount)
 	} else {
 		jmlog.Warn("pin store open failed (offline-pin disabled)", "error", err.Error())
 	}
@@ -761,6 +1089,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 
 					globalSpool = spool
 					globalDrainer = drainer
+					globalDrainerAtomic.Store(drainer)
 					srv.Handler().SetSpool(spool, drainer)
 					// QA-30 Layer D: let the reconcile's scopedPrune spare any
 					// path with a live, not-yet-drained spool entry so a
@@ -941,6 +1270,28 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		FUSEPath:      cfg.FUSEPath,
 		NFSMountPoint: cfg.MountPoint,
 	})
+	// #89 online busy-suppression: give the health monitor a lock-free view of
+	// the drainer's live ingest state so a stat/readdir TIMEOUT during a
+	// legitimate high-concurrency ingest is reported as "busy (heavy ingest)"
+	// rather than the false "mount losing communication" degraded state. Mirrors
+	// the reachability WithLivenessHook idiom EXACTLY (read the drainer via the
+	// dedicated atomic, never globalMu — the probe runs on the health-check
+	// goroutine and must not block on NFSServerStart holding globalMu). Nil
+	// drainer (spool disabled / server stopped) → inFlight 0 + MaxInt64 age
+	// sentinel → busyIngesting() is false → no suppression (byte-identical to
+	// the pre-drainer behavior).
+	globalMonitor.SetDrainProbe(func() (int64, time.Duration) {
+		d := globalDrainerAtomic.Load()
+		if d == nil {
+			return 0, time.Duration(math.MaxInt64)
+		}
+		inFlight := d.Metrics().InFlight.Load()
+		since := time.Duration(math.MaxInt64)
+		if last := d.LastDrainSuccess(); !last.IsZero() {
+			since = time.Since(last)
+		}
+		return inFlight, since
+	})
 	// LB-2: auto-remount for a stale/unmounted NFS volume — the same hook
 	// the jm5 CLI has always wired. STRICTLY the non-interactive tier
 	// (passwordless sudo): an unattended health tick must never pop an
@@ -1032,7 +1383,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// listen addr remains available via the stats path. Recovery is automatic
 	// (watchdog remounts FUSE; reachability OnChange lifts auto-offline).
 	if startedOffline {
-		return C.CString("started_offline: " + offlineStartReason)
+		// Batch-3 review #8: per-cause reason (R-4 unreachable / U2 slow
+		// backend / U3 persisted user intent), not the R-4 constant for all.
+		return C.CString("started_offline: " + startOfflineReason)
 	}
 	return C.CString(srv.Addr())
 }
@@ -1103,6 +1456,7 @@ func stopServerLocked() {
 	keyspaceNW := globalKeyspaceNetWatcher
 	spool := globalSpool
 	drainer := globalDrainer
+	globalDrainerAtomic.Store(nil)
 	derivStore := globalDerivStore
 	globalMetrics = nil
 	globalMonitor = nil
@@ -2129,6 +2483,7 @@ func NFSServerPin(rootPath *C.char) *C.char {
 	mountPath := globalMountPath
 	fusePath := globalFUSEPath
 	prefetcher := globalPrefetcher
+	rc := globalRC
 	globalMu.Unlock()
 
 	if pinStore == nil {
@@ -2136,6 +2491,15 @@ func NFSServerPin(rootPath *C.char) *C.char {
 	}
 	root := C.GoString(rootPath)
 	walkPath := translateMountToFUSE(root, mountPath, fusePath)
+
+	// Item 0 GUARD: a pin root inside a scan-filtered internal namespace
+	// (.trash/.juicemount) can never be metadata-warmed — reconcileDir #78-
+	// filters it — so pinning it is nonsensical. Reject with a clear error
+	// rather than warming blocks for a dir that will never list offline.
+	if rel := metaRelPath(root, mountPath); metadata.ScanFilteredPath(rel) {
+		jmlog.Warn("pin rejected: cannot pin internal namespace", "root", root, "rel", rel)
+		return jsonStr(PinResult{Error: "cannot pin internal namespace (.trash/.juicemount)"})
+	}
 
 	// Surface the spinner before the (slow) walk starts; return immediately.
 	pin.MarkScanning(root)
@@ -2172,6 +2536,15 @@ func NFSServerPin(rootPath *C.char) *C.char {
 		if prefetcher != nil {
 			prefetcher.Wake()
 		}
+
+		// Item 0: warm the pinned SUBTREE's metadata into the mirror so the dir
+		// (and its whole tree) LIST OFFLINE. PinMany above cached the file
+		// BLOCKS but wrote no subtree rows; without this, an offline ListChildren
+		// of the pinned dir returns empty. Reuses reconcileDir (durable SQLite
+		// `entries` write). Gated on !pin.IsOffline() and JM_PIN_WARM_METADATA
+		// inside the metadata calls. Best-effort; a failure leaves today's
+		// behavior (blocks cached, metadata warmed by the next full SCAN).
+		warmPinnedMetadata(rc, root, mountPath)
 	}()
 
 	// FilesPinned/BytesTotal are filled in via /cache-status as the walk lands.
@@ -2244,6 +2617,16 @@ func NFSServerCacheStatus() *C.char {
 	cs.CacheUsedBytes = cs.Capacity.CacheUsageBytes // fallback: cache-dir du
 	if bc, ok := pin.BlockCacheBytes(); ok {
 		cs.CacheUsedBytes = bc // authoritative block-cache gauge
+		// Clamp DOWN to the on-disk cache-dir du. After "Clear Cache" we
+		// os.Remove the chunk files behind the JuiceFS daemon's back, so its
+		// in-memory juicefs_blockcache_bytes gauge lingers stale-high until the
+		// daemon independently rescans — while the du already reflects the
+		// emptied dir. Never report more cached than is physically on disk; that
+		// stale-high gauge is the "X cached doesn't reset after Clear Cache"
+		// symptom. Normal operation: du ≈ gauge, so this is a no-op.
+		if du := cs.Capacity.CacheUsageBytes; du >= 0 && du < cs.CacheUsedBytes {
+			cs.CacheUsedBytes = du
+		}
 	}
 	if a, err := pinStore.AggregateStats(); err == nil {
 		cs.Aggregate = a
@@ -2377,6 +2760,100 @@ func writeContractJSON(w http.ResponseWriter, v any) {
 // path — do NOT translate pin lookups.)
 func metaRelPath(path, mountPoint string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(path, mountPoint), "/")
+}
+
+// warmPinnedMetadata reconciles a pinned root's ancestor chain and (if it is a
+// directory) its whole subtree into the metadata mirror so the pinned dir lists
+// OFFLINE (Item 0). The pin store keys on the full user-facing path (e.g.
+// "/Volumes/zpool/movies/reel"); the metadata store is keyed volume-relative,
+// so we translate once via metaRelPath and resolve the inode via LookupByPath.
+//
+// Everything here is best-effort and self-gating: the metadata calls no-op when
+// JM_PIN_WARM_METADATA=0 or pin.IsOffline(), and a nil RedisClient (pin issued
+// before the metadata layer wired, or a CLI build) simply skips warming. A
+// failure never breaks pinning — the blocks are already cached and the next
+// full SCAN eventually mirrors the subtree.
+func warmPinnedMetadata(rc *metadata.RedisClient, root, mountPath string) {
+	if rc == nil {
+		return
+	}
+	if !metadata.PinWarmMetadataEnabled() {
+		return
+	}
+	if pin.IsOffline() {
+		jmlog.Info("pin warm: skipped (offline)", "root", root)
+		return
+	}
+	rel := metaRelPath(root, mountPath)
+	if metadata.ScanFilteredPath(rel) {
+		// Already rejected at NFSServerPin entry; defensive double-check.
+		jmlog.Warn("pin warm: refusing scan-filtered namespace", "root", root, "rel", rel)
+		return
+	}
+
+	// Warm the ancestor chain first so the pinned dir is reachable from root,
+	// then warm the subtree. ReconcileAncestors also reconciles root inode 1.
+	if err := rc.ReconcileAncestors(rel); err != nil {
+		jmlog.Warn("pin warm: ReconcileAncestors failed", "root", root, "rel", rel, "error", err.Error())
+	}
+
+	ent := rc.Store().LookupByPath(rel)
+	if ent == nil {
+		jmlog.Warn("pin warm: pinned path not yet in mirror after ancestor warm — subtree left to SCAN",
+			"root", root, "rel", rel)
+		return
+	}
+	if ent.IsDir {
+		if err := rc.ReconcileSubtree(ent.Inode, 0); err != nil {
+			jmlog.Warn("pin warm: ReconcileSubtree failed", "root", root, "inode", ent.Inode, "error", err.Error())
+		}
+	}
+}
+
+// warmPinnedRootsAtBoot re-warms the metadata mirror for every pin root that
+// survived from a prior session (Item 0). Runs on a background goroutine at
+// boot. Self-gates: no-op when warming is disabled or offline; a nil
+// RedisClient (e.g. metadata layer not wired yet) skips silently. Each root is
+// warmed via the same warmPinnedMetadata path used at pin time.
+func warmPinnedRootsAtBoot(ps *pin.Store, rc *metadata.RedisClient, mountPath string) {
+	defer func() {
+		if r := recover(); r != nil {
+			jmlog.Warn("pin warm (boot) panicked (recovered)", "panic", fmt.Sprint(r))
+		}
+	}()
+	if ps == nil || rc == nil {
+		return
+	}
+	if !metadata.PinWarmMetadataEnabled() {
+		return
+	}
+	if pin.IsOffline() {
+		jmlog.Info("pin warm (boot): skipped (offline) — resumes when online")
+		return
+	}
+	roots, err := ps.PinRoots()
+	if err != nil {
+		jmlog.Warn("pin warm (boot): PinRoots failed", "error", err.Error())
+		return
+	}
+	if len(roots) == 0 {
+		return
+	}
+	jmlog.Info("pin warm (boot): warming pinned roots from prior session", "roots", len(roots))
+	for _, r := range roots {
+		if r.Root == "" {
+			continue
+		}
+		// Re-check offline between roots: the user may toggle offline mid-pass;
+		// each warmPinnedMetadata also self-gates, but bailing early avoids a
+		// stack of 30s-timeout dir reconciles.
+		if pin.IsOffline() {
+			jmlog.Info("pin warm (boot): offline mid-pass — stopping", "remaining_hint", r.Root)
+			return
+		}
+		warmPinnedMetadata(rc, r.Root, mountPath)
+	}
+	jmlog.Info("pin warm (boot): pinned-root warm pass complete", "roots", len(roots))
 }
 
 // handleWhoamiHTTP serves GET /whoami (contract JM-1): JuiceMount identity,
@@ -3336,14 +3813,38 @@ func handleActivityHTTP(w http.ResponseWriter, r *http.Request) {
 	if rc != nil {
 		op := activityOperation{Kind: "reconcile", Active: rc.IsSyncing()}
 		if op.Active {
-			op.Detail = "Rebuilding index…"
+			// V2.3 U6 (task #37): show real progress — an opaque
+			// multi-minute rebuild reads as "stuck" (field report). The
+			// total is the previous sync's entry count, hence the ~.
+			scanned, estTotal := rc.SyncProgress()
+			switch {
+			case estTotal > 0 && scanned > 0:
+				pct := scanned * 100 / estTotal
+				if pct > 99 {
+					pct = 99 // estimate — never claim done before completion
+				}
+				op.Detail = fmt.Sprintf("Rebuilding index… %d / ~%d (%d%%)", scanned, estTotal, pct)
+			case scanned > 0:
+				op.Detail = fmt.Sprintf("Rebuilding index… %d entries scanned", scanned)
+			default:
+				op.Detail = "Rebuilding index…"
+			}
+			op.Files = int(scanned)
 			working = append(working, "rebuilding index")
 		} else {
 			last := rc.LastSyncTime()
 			op.Files = rc.LastSyncEntries()
-			if last.IsZero() {
+			switch {
+			case rc.SyncDeferredReason() != "":
+				// G7 (task #80): the slow-link full rebuild was DEFERRED, not
+				// failed — IsSyncing() now reports false for a dead attempt,
+				// so say what actually happened instead of the eternal
+				// "Rebuilding index…" (live 2026-07-01: 3h of it while the
+				// push was engaged and healthy the whole time).
+				op.Detail = "Index sync deferred — link too slow for a full rebuild; live updates continue via push"
+			case last.IsZero():
 				op.Detail = "Index not yet built"
-			} else {
+			default:
 				op.Detail = fmt.Sprintf("Index up to date — %d entries, synced %s ago",
 					op.Files, time.Since(last).Round(time.Second))
 			}
@@ -3906,7 +4407,9 @@ func handleOfflineHTTP(w http.ResponseWriter, r *http.Request) {
 // offlineStartReason is the human-readable reason surfaced (via pin.SetAutoOffline
 // → pin.State().Reason and the "started_offline:" start result) when the app
 // boots with the metadata backend unreachable (R-4). The UI shows it in the
-// "Started offline — showing cached state" banner.
+// "Started offline — showing cached state" banner. Batch-3 review #8: this is
+// now only the R-4 DEFAULT for startOfflineReason — the U2 (slow backend) and
+// U3 (persisted user intent) offline starts carry their own per-cause reason.
 const offlineStartReason = "Started offline — backend unreachable at launch"
 
 // backendReachableQuick does a single cheap TCP dial to the metadata host so
@@ -3915,17 +4418,36 @@ const offlineStartReason = "Started offline — backend unreachable at launch"
 // latency. Returns true (assume reachable, fall through to the normal connect)
 // when the URL can't be parsed, so a parse quirk never forces a spurious
 // offline start.
-func backendReachableQuick(redisURL string, timeout time.Duration) bool {
+// backendReachableRTT is the boot reachability probe plus the dial RTT it
+// was previously performing-and-discarding (V2.3 U2/K2). The RTT seeds
+// netprofile (so class-gated behavior is correct from the first moment) and
+// lets the boot path treat a reachable-but-terrible link as effectively
+// down. rtt is 0 when the address can't be parsed (optimistic-up).
+//
+// Review fix (MED): DNS resolution happens OUTSIDE the timed window — a cold
+// resolver / MagicDNS lookup at wake could otherwise push a healthy link
+// past the defer threshold and seed netprofile with an inflated first
+// sample. Only the TCP connect against the resolved address is timed.
+func backendReachableRTT(redisURL string, timeout time.Duration) (up bool, rtt time.Duration) {
 	addr, _, err := metadata.ParseRedisURL(redisURL)
 	if err != nil || addr == "" {
-		return true
+		return true, 0
 	}
-	conn, derr := net.DialTimeout("tcp", addr, timeout)
+	resolved, rerr := net.ResolveTCPAddr("tcp", addr)
+	if rerr != nil {
+		// Resolution failure = unreachable for boot purposes (same signal a
+		// dial would return, just without burning the timeout on it).
+		return false, 0
+	}
+	t0 := time.Now()
+	conn, derr := net.DialTimeout("tcp", resolved.String(), timeout)
 	if derr != nil {
-		return false
+		return false, 0
 	}
+	rtt = time.Since(t0)
 	_ = conn.Close()
-	return true
+	netprofile.Default().ObserveRTT(rtt)
+	return true, rtt
 }
 
 // connectRedisWithRetry wraps metadata.NewRedisClient with exponential

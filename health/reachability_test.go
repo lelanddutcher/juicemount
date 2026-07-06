@@ -320,3 +320,151 @@ func TestReachabilityAdaptiveDialTimeout(t *testing.T) {
 		t.Errorf("adaptive-off: effectiveDialTimeout=%v, want fixed %v", got, off.dialTimeout)
 	}
 }
+
+// TestReachability_DrainLivenessSuppressesFalseFlap is the fix-(a) gate for the
+// NFSv3-sprint slow-link false-flap. When a Finder copy saturates the uplink,
+// the drainer's bulk PUT traffic queues a cold probe SYN past its dial timeout —
+// the dial FAILS though the backend is provably reachable (a drain just landed
+// over the same link). The monitor must consult the liveness hook on a probe
+// failure and SUPPRESS the false-failure (no fail-streak advance, no
+// unreachable transition) while a real drain is recent. A genuine outage stops
+// the drains → the window lapses → the normal 2-failure flip proceeds.
+//
+// All three subtests drive the SAME failing dialer so the ONLY variable is the
+// hook, proving the override (not some incidental timing) is what gates the
+// flip — i.e. the green case cannot false-pass via a never-failing probe.
+func TestReachability_DrainLivenessSuppressesFalseFlap(t *testing.T) {
+	t.Run("recent_drain_suppresses_flip", func(t *testing.T) {
+		d := &fakeDialer{reachable: false} // every probe FAILS (saturated-uplink stand-in)
+		// Hook reports a drain 1s ago — well inside the ~2*baseInterval window.
+		r := NewReachability("ignored:0",
+			withDialer(d),
+			WithBaseInterval(10*time.Millisecond),
+			WithFailureThreshold(2),
+			WithLivenessHook(func() time.Duration { return 1 * time.Second }),
+		)
+		// livenessWindow scales from baseInterval (2*10ms=20ms); 1s would be
+		// STALE against that. Set an explicit, realistic window so the test
+		// asserts the INTENT (a recent drain suppresses) rather than the tiny
+		// scaled value. This is a white-box field set, same idiom as the
+		// adaptive-timeout test above poking .adaptive/.observeRTT.
+		r.livenessWindow = 4 * time.Second
+
+		var transitions atomic.Int64
+		r.OnChange(func(bool, string) { transitions.Add(1) })
+
+		r.Start()
+		defer r.Stop()
+
+		// Let MANY probes fail (each would normally bump the fail streak). With
+		// the override active, NONE may flip the state.
+		if err := waitFor(300*time.Millisecond, func() bool { return d.attempts.Load() >= 5 }); err != nil {
+			t.Fatalf("probes did not run: attempts=%d", d.attempts.Load())
+		}
+		if transitions.Load() != 0 {
+			t.Errorf("liveness override failed: %d transition(s) on a failing dial with a recent drain — must suppress", transitions.Load())
+		}
+		if !r.Reachable() {
+			t.Error("liveness override failed: monitor went unreachable despite a recent proven drain")
+		}
+	})
+
+	t.Run("stale_drain_flips_as_before", func(t *testing.T) {
+		d := &fakeDialer{reachable: false}
+		// Hook reports the last drain was 10 minutes ago — far outside any
+		// window. A real outage looks like this (drains stopped landing).
+		r := NewReachability("ignored:0",
+			withDialer(d),
+			WithBaseInterval(10*time.Millisecond),
+			WithFailureThreshold(2),
+			WithLivenessHook(func() time.Duration { return 10 * time.Minute }),
+		)
+		var transitions atomic.Int64
+		var lastState atomic.Bool
+		lastState.Store(true)
+		r.OnChange(func(reachable bool, _ string) {
+			transitions.Add(1)
+			lastState.Store(reachable)
+		})
+
+		r.Start()
+		defer r.Stop()
+
+		if err := waitFor(500*time.Millisecond, func() bool { return transitions.Load() == 1 }); err != nil {
+			t.Fatalf("stale hook must NOT suppress: expected the normal unreachable flip, attempts=%d transitions=%d",
+				d.attempts.Load(), transitions.Load())
+		}
+		if lastState.Load() {
+			t.Error("expected the flip to be → unreachable (false) with a stale drain")
+		}
+	})
+
+	t.Run("absent_hook_flips_as_before", func(t *testing.T) {
+		d := &fakeDialer{reachable: false}
+		r := NewReachability("ignored:0",
+			withDialer(d),
+			WithBaseInterval(10*time.Millisecond),
+			WithFailureThreshold(2),
+		) // no WithLivenessHook → override inert
+		var transitions atomic.Int64
+		r.OnChange(func(bool, string) { transitions.Add(1) })
+
+		r.Start()
+		defer r.Stop()
+
+		if err := waitFor(500*time.Millisecond, func() bool { return transitions.Load() == 1 }); err != nil {
+			t.Fatalf("no hook must behave exactly like today (flip after 2 fails): attempts=%d transitions=%d",
+				d.attempts.Load(), transitions.Load())
+		}
+		if r.Reachable() {
+			t.Error("expected Reachable()=false after 2 failures with no liveness hook")
+		}
+	})
+}
+
+// TestReachability_DrainLivenessKillSwitchByteIdentical locks the WAN-tuning
+// revert discipline: JM_REACH_DRAIN_LIVENESS=0 must make behavior byte-identical
+// to the pre-fix monitor — the liveness hook is NOT consulted and a probe
+// failure flips after the normal threshold EVEN WHEN a drain just landed. This
+// is the 10GbE/regression guarantee in docs/TUNING/REVERT_LOG.md.
+func TestReachability_DrainLivenessKillSwitchByteIdentical(t *testing.T) {
+	t.Setenv("JM_REACH_DRAIN_LIVENESS", "0")
+
+	d := &fakeDialer{reachable: false}
+	hookCalls := atomic.Int64{}
+	r := NewReachability("ignored:0",
+		withDialer(d),
+		WithBaseInterval(10*time.Millisecond),
+		WithFailureThreshold(2),
+		// A "recent drain" that WOULD suppress if the override were on.
+		WithLivenessHook(func() time.Duration { hookCalls.Add(1); return 0 }),
+	)
+	r.livenessWindow = 4 * time.Second // generous — irrelevant when override is OFF
+
+	if r.livenessOverride {
+		t.Fatal("JM_REACH_DRAIN_LIVENESS=0 must clear livenessOverride")
+	}
+
+	var transitions atomic.Int64
+	var lastState atomic.Bool
+	lastState.Store(true)
+	r.OnChange(func(reachable bool, _ string) {
+		transitions.Add(1)
+		lastState.Store(reachable)
+	})
+
+	r.Start()
+	defer r.Stop()
+
+	// Identical to the pre-fix path: 2 failures → unreachable, hook never read.
+	if err := waitFor(500*time.Millisecond, func() bool { return transitions.Load() == 1 }); err != nil {
+		t.Fatalf("kill-switch must restore the old flip: attempts=%d transitions=%d",
+			d.attempts.Load(), transitions.Load())
+	}
+	if lastState.Load() {
+		t.Error("expected → unreachable (false) flip with the override killed")
+	}
+	if hookCalls.Load() != 0 {
+		t.Errorf("override disabled but liveness hook was consulted %d time(s) — must be byte-identical (never called)", hookCalls.Load())
+	}
+}

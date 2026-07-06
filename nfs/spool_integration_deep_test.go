@@ -261,7 +261,15 @@ func TestSpoolCapacityExhaustion(t *testing.T) {
 // (d) A write to a path whose prior entry is finalized-but-still-draining
 // blocks until the drain evicts it, then starts a FRESH entry — no dup-drain,
 // no write-to-closed error (Findings 2 & 4 on the live path).
-func TestSpoolReopenWhileDrainingBlocksThenFresh(t *testing.T) {
+// TestSpoolReopenWhileDrainingBlocksThenDefers: a continuation WRITE that
+// arrives while a finalized entry is still draining BLOCKS (waits for the
+// drain), and when the entry evicts it must return ErrSpoolBusy — NOT a fresh
+// spool entry. A fresh entry's drain would os.Create-truncate the just-drained
+// backend file and clobber it (proven by TestReopenDuringDrainDefersToFuse);
+// the ErrSpoolBusy → NFS3ERR_JUKEBOX retry reroutes the write to the in-place
+// fdPool path once the file is durable in FUSE. (Was ...BlocksThenFresh, which
+// asserted the destructive fresh-entry behavior.)
+func TestSpoolReopenWhileDrainingBlocksThenDefers(t *testing.T) {
 	s := newTestSpoolStore(t, 0)
 	e1, _ := s.OpenWrite("/reopen.bin")
 	_, _ = e1.WriteAt([]byte("first"), 0)
@@ -291,11 +299,8 @@ func TestSpoolReopenWhileDrainingBlocksThenFresh(t *testing.T) {
 
 	select {
 	case r := <-ch:
-		if r.err != nil {
-			t.Fatalf("reopen returned error: %v", r.err)
-		}
-		if r.e.ID() == e1.ID() {
-			t.Errorf("reopen returned the SAME (finalized) entry id=%d; expected a fresh one", e1.ID())
+		if r.e != nil || !errors.Is(r.err, ErrSpoolBusy) {
+			t.Fatalf("reopen after drain-evict: got entry!=nil=%v err=%v; want nil entry + ErrSpoolBusy (defer to in-place fdPool, not a destructive fresh entry)", r.e != nil, r.err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("blocked OpenWrite did not return after the prior entry drained")

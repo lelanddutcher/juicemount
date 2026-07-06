@@ -229,11 +229,9 @@ func (mb *MemoryBuffer) loadFile(path, fusePath string, fileSize int64, entry *m
 
 	fd, err := os.Open(fusePath)
 	if err != nil {
-		// Loading failed — remove entry
-		mb.mu.Lock()
-		delete(mb.entries, path)
-		mb.totalSize -= fileSize
-		mb.mu.Unlock()
+		// Loading failed — remove entry (identity-checked; a stale loader must
+		// not clobber a replacement inserted after Invalidate + re-Get).
+		mb.removeStaleEntry(path, entry)
 		return
 	}
 	defer fd.Close()
@@ -243,10 +241,7 @@ func (mb *MemoryBuffer) loadFile(path, fusePath string, fileSize int64, entry *m
 	for totalRead < int(fileSize) {
 		select {
 		case <-mb.stopCh:
-			mb.mu.Lock()
-			delete(mb.entries, path)
-			mb.totalSize -= fileSize
-			mb.mu.Unlock()
+			mb.removeStaleEntry(path, entry)
 			return
 		default:
 		}
@@ -257,10 +252,7 @@ func (mb *MemoryBuffer) loadFile(path, fusePath string, fileSize int64, entry *m
 			break
 		}
 		if err != nil {
-			mb.mu.Lock()
-			delete(mb.entries, path)
-			mb.totalSize -= fileSize
-			mb.mu.Unlock()
+			mb.removeStaleEntry(path, entry)
 			return
 		}
 	}
@@ -275,10 +267,7 @@ func (mb *MemoryBuffer) loadFile(path, fusePath string, fileSize int64, entry *m
 	// later Get re-attempts a clean full load. (A genuinely short file would
 	// have an accurate fileSize from the metadata cache, so totalRead==fileSize.)
 	if totalRead < int(fileSize) {
-		mb.mu.Lock()
-		delete(mb.entries, path)
-		mb.totalSize -= fileSize
-		mb.mu.Unlock()
+		mb.removeStaleEntry(path, entry)
 		return
 	}
 
@@ -286,6 +275,24 @@ func (mb *MemoryBuffer) loadFile(path, fusePath string, fileSize int64, entry *m
 	entry.data = data[:totalRead]
 	entry.size = int64(totalRead)
 	entry.loading = false
+	mb.mu.Unlock()
+}
+
+// removeStaleEntry drops path's entry and refunds its bytes ONLY if the map
+// still points to THIS exact entry. A loadFile goroutine can sit blocked in
+// os.Open on a wedged/slow FUSE mount long enough for Invalidate (fired on
+// every write/rename/delete) to drop its entry AND a fresh Get to insert a NEW
+// entry for the same path. Deleting by path key alone would then let the stale
+// loader clobber the good replacement (a silent cache drop) and subtract the
+// wrong byte count from totalSize — a monotonic leak that eventually makes the
+// budget gate in Get refuse ALL buffering until the process restarts. The
+// identity check (entries[path] == entry) makes stale cleanups no-ops.
+func (mb *MemoryBuffer) removeStaleEntry(path string, entry *memBufEntry) {
+	mb.mu.Lock()
+	if mb.entries[path] == entry {
+		delete(mb.entries, path)
+		mb.totalSize -= entry.size
+	}
 	mb.mu.Unlock()
 }
 
@@ -349,5 +356,11 @@ func (mb *MemoryBuffer) Stop() {
 	mb.mu.Lock()
 	mb.entries = nil
 	mb.mu.Unlock()
-	log.Printf("membuf: stopped (hits=%d, misses=%d, evicts=%d, loadSkipped=%d)", mb.hits, mb.misses, mb.evicts, mb.loadSkipped)
+	// Snapshot the counters under statsMu: a Get() racing shutdown (an NFS read
+	// in flight) writes these under the same lock; an unlocked read here is a
+	// data race (-race flags it).
+	mb.statsMu.Lock()
+	hits, misses, evicts, loadSkipped := mb.hits, mb.misses, mb.evicts, mb.loadSkipped
+	mb.statsMu.Unlock()
+	log.Printf("membuf: stopped (hits=%d, misses=%d, evicts=%d, loadSkipped=%d)", hits, misses, evicts, loadSkipped)
 }

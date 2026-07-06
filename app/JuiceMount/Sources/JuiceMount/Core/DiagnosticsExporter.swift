@@ -75,6 +75,12 @@ public final class DiagnosticsExporter {
         collectHTTPSnapshot(path: "/cache-status",
                             file: "cache-status.json",
                             into: stageRoot, errors: &errors)
+        // Spool state (pending/in-progress/drain queue) — the write-spool + NFS
+        // in/out-node work's live snapshot, so a diagnostics bundle shows the
+        // drain backlog alongside the spool: COMMIT/JUKEBOX/drain log lines.
+        collectHTTPSnapshot(path: "/spool",
+                            file: "spool.json",
+                            into: stageRoot, errors: &errors)
         collectCommand(["/usr/bin/pluginkit", "-m"],
                        file: "pluginkit.txt",
                        into: stageRoot, errors: &errors)
@@ -131,14 +137,32 @@ public final class DiagnosticsExporter {
     // MARK: - Collectors
 
     private func collectAppLog(into stage: URL, errors: inout [String]) {
-        let logURL = FileManager.default
+        let logDir = FileManager.default
             .homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/JuiceMount/juicemount.log")
+            .appendingPathComponent("Library/Logs/JuiceMount")
+        let logURL = logDir.appendingPathComponent("juicemount.log")
         let dest = stage.appendingPathComponent("juicemount.log")
         do {
-            try copyLastBytes(of: logURL, to: dest, maxBytes: 5 * 1024 * 1024)
+            // Capture a FULL rotation segment (jmlog rotates juicemount.log at
+            // 16 MiB), not a 5 MiB slice — otherwise the new-dev spool / NFS-node
+            // signal (spool: COMMIT, in-flight read JUKEBOX-held, reopen, drain
+            // lines) gets sliced out of a busy session's tail.
+            try copyLastBytes(of: logURL, to: dest, maxBytes: 16 * 1024 * 1024)
         } catch {
             errors.append("juicemount.log: \(error.localizedDescription)")
+        }
+        // Also bundle the rotated backups (juicemount.log.1 … .5 — up to ~96 MiB
+        // of history) so an export covers the whole session window, not just the
+        // live tail. Missing backups are silently skipped (not an error).
+        for i in 1...5 {
+            let backup = logDir.appendingPathComponent("juicemount.log.\(i)")
+            guard FileManager.default.fileExists(atPath: backup.path) else { continue }
+            let backupDest = stage.appendingPathComponent("juicemount.log.\(i)")
+            do {
+                try FileManager.default.copyItem(at: backup, to: backupDest)
+            } catch {
+                errors.append("juicemount.log.\(i): \(error.localizedDescription)")
+            }
         }
     }
 

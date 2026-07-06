@@ -168,6 +168,11 @@ func TestSearchAfterBulkInsert(t *testing.T) {
 	if err := s.BulkInsert(entries, 500); err != nil {
 		t.Fatal(err)
 	}
+	// Drain any deferred FTS backlog so the search below is deterministic under
+	// JM_FTS_DEFER=1 (no-op when the flag is off — fts_pending is empty).
+	if _, err := s.drainFTSPendingForTest(); err != nil {
+		t.Fatal(err)
+	}
 
 	// FTS triggers fire on INSERT, so search should work immediately
 	results, err := s.Search("transition", 50, "")

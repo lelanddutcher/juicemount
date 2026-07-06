@@ -197,6 +197,7 @@ func TestCurrentLinkClassBands(t *testing.T) {
 		{"eth0", classLAN},
 		{"en0", classWiFi},
 		{"utun4", classTunnel},
+		{"utun6", classTunnel}, // G8 (task #81): the live hotspot+Tailscale backend route
 		{"tailscale0", classTunnel},
 		{"weird9", classWiFi}, // unknown -> conservative WiFi
 	}
@@ -221,28 +222,39 @@ func TestCurrentLinkClassBands(t *testing.T) {
 }
 
 func TestBackstopAndTuningOrdering(t *testing.T) {
-	// Tunnel/cellular MUST get the longest backstop and loosest coalescing —
-	// that is the motivation (rare cellular SCAN) — but the cellular SCAN is
-	// CAPPED LOW, not maximally rare, to bound staleness.
-	// Every class demotes the SCAN well below the 30s DISABLED cadence:
+	// With keyspace-push engaged, the periodic full SCAN is only a missed-event
+	// backstop, so every class demotes it to a LONG interval in the intended
+	// 15-30m range (lengthened 2026-06-30 from 10/15/5m after field testing showed
+	// the ~5m WAN SCAN "rebuilding every 5 min" was too eager + churned the mirror).
+	// All stay well above the 30s DISABLED/DEGRADED cadence; staleness from a
+	// missed push event is bounded by that dir's next d-key event, and a real push
+	// DROP snaps the cadence back to 30s (the unreachable/DEGRADED cases below).
 	for _, c := range []linkClass{classLAN, classWiFi, classTunnel} {
-		if backstopForClass(c) <= DefaultReconcileInterval {
-			t.Errorf("class %v backstop %v must exceed the 30s DISABLED cadence", c, backstopForClass(c))
+		b := backstopForClass(c)
+		if b <= DefaultReconcileInterval {
+			t.Errorf("class %v backstop %v must exceed the 30s DISABLED cadence", c, b)
+		}
+		if b < 10*time.Minute || b > 30*time.Minute {
+			t.Errorf("class %v backstop %v out of the intended ~15-30m demoted-SCAN range", c, b)
 		}
 	}
-	// Tunnel/cellular is CAPPED LOW (<= lan/wifi), NOT the longest. The cap bounds
-	// the backstop-only staleness windows (foreign in-place attr edits + a delete
-	// missed during a reconnect gap) on the flap-prone metered link to minutes,
-	// not hours, while still making the expensive cellular SCAN rare vs the old
-	// constant 30s cadence.
+	// Tunnel/cellular stays <= lan/wifi (never the LONGEST): its SCAN is the most
+	// expensive (377k rows over the tunnel) AND push is flappiest there, so a
+	// missed in-place attr edit / reconnect-gap delete is caught soonest on the
+	// link most likely to miss one.
 	if backstopForClass(classTunnel) > backstopForClass(classLAN) ||
 		backstopForClass(classTunnel) > backstopForClass(classWiFi) {
-		t.Errorf("tunnel backstop must be capped <= lan/wifi: lan=%v wifi=%v tunnel=%v",
+		t.Errorf("tunnel backstop must be <= lan/wifi: lan=%v wifi=%v tunnel=%v",
 			backstopForClass(classLAN), backstopForClass(classWiFi), backstopForClass(classTunnel))
 	}
-	if backstopForClass(classTunnel) != 5*time.Minute {
-		t.Errorf("tunnel/cellular backstop must be the 5m staleness cap, got %v", backstopForClass(classTunnel))
+	// JM_RECONCILE_BACKSTOP_SEC overrides every class (field-tuning kill switch).
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "1800")
+	for _, c := range []linkClass{classLAN, classWiFi, classTunnel} {
+		if got := backstopForClass(c); got != 30*time.Minute {
+			t.Errorf("env override: class %v backstop = %v, want 30m", c, got)
+		}
 	}
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "")
 	// Coalescing is still LOOSER on the metered link (fewer, larger batches).
 	if !(tuningForClass(classLAN).debounce < tuningForClass(classTunnel).debounce) {
 		t.Error("tunnel debounce should be looser than LAN")
@@ -271,6 +283,96 @@ func TestBackstopAndTuningOrdering(t *testing.T) {
 		t.Errorf("ENABLED+unreachable backstop = %v, want 30s", rc.currentBackstop())
 	}
 	SetClassSignals(nil, nil) // reset global hooks for other tests
+}
+
+// TestReconcileBackstopPrecedence locks the #90 fix: the class-gated push
+// backstop must WIN over the 300s config seed. Before the fix, the config seed
+// (SetReconcileInterval, default 300s) wrote STRAIGHT into backstopNanos,
+// clobbering the 900s+ class value so a full ~247k-key SCAN fired every 300s on
+// every link class forever (the push backstop never engaged). The fix splits the
+// config into its own field and resolves precedence via resolveBackstop:
+//
+//   - push ENABLED + reachable + config=300s + tunnel class  -> class value (>=900s), NOT 300s
+//   - config can LENGTHEN the push backstop but never SHORTEN it below the floor
+//   - JM_RECONCILE_BACKSTOP_SEC still wins over both
+//   - push DISABLED -> the config cadence still applies (non-push fallback)
+func TestReconcileBackstopPrecedence(t *testing.T) {
+	t.Setenv("JM_WAN_MODE", "")
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "")
+
+	// --- push ENABLED + tunnel + config=300s: class value must win, NOT 300s ---
+	// JM_WAN_MODE=1 forces the tunnel/cellular class regardless of interface.
+	t.Setenv("JM_WAN_MODE", "1")
+	SetClassSignals(func() string { return "en21" }, func() bool { return true })
+	rc := &RedisClient{}
+	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+
+	// Seed the config to 300s (the exact value cfg.reconcileInterval() supplies).
+	rc.SetReconcileInterval(300 * time.Second)
+	// With push DISABLED (default engaged state), the config cadence applies —
+	// this is the non-push fallback path, so 300s is the honored value.
+	if got := rc.currentBackstop(); got != 300*time.Second {
+		t.Fatalf("push DISABLED + config=300s: backstop = %v, want 300s (config cadence)", got)
+	}
+
+	// Now engage push. The class-gated floor (tunnel = 15m here) must WIN over
+	// the 300s config seed — this is the crux of #90.
+	rc.setEngagement(keyspaceEnabled)
+	classFloor := backstopForClass(classTunnel)
+	if classFloor < 900*time.Second {
+		t.Fatalf("test premise broken: tunnel class floor %v < 900s", classFloor)
+	}
+	if got := rc.currentBackstop(); got != classFloor {
+		t.Fatalf("push ENABLED + tunnel + config=300s: backstop = %v, want class floor %v (NOT 300s)", got, classFloor)
+	}
+	if got := rc.currentBackstop(); got == 300*time.Second {
+		t.Fatalf("REGRESSION #90: config 300s clobbered the class backstop")
+	}
+
+	// --- config can LENGTHEN but never SHORTEN below the class floor ---
+	// A config LONGER than the class floor takes effect (max wins).
+	longer := classFloor + 30*time.Minute
+	rc.SetReconcileInterval(longer)
+	if got := rc.currentBackstop(); got != longer {
+		t.Fatalf("push ENABLED + config LONGER than floor: backstop = %v, want %v (config lengthens)", got, longer)
+	}
+	// A config SHORTER than the class floor is floored to the class value.
+	rc.SetReconcileInterval(60 * time.Second)
+	if got := rc.currentBackstop(); got != classFloor {
+		t.Fatalf("push ENABLED + config SHORTER than floor: backstop = %v, want class floor %v (never shorten)", got, classFloor)
+	}
+
+	// --- JM_RECONCILE_BACKSTOP_SEC override wins over both class and config ---
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "1800") // 30m
+	rc.setEngagement(keyspaceEnabled)             // re-resolve with the override live
+	if got := rc.currentBackstop(); got != 30*time.Minute {
+		t.Fatalf("env override + push ENABLED: backstop = %v, want 30m (override wins)", got)
+	}
+	// The override also wins on the non-push path.
+	rc.setEngagement(keyspaceDisabled)
+	if got := rc.currentBackstop(); got != 30*time.Minute {
+		t.Fatalf("env override + push DISABLED: backstop = %v, want 30m (override wins)", got)
+	}
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "")
+
+	// --- push DISABLED: the config cadence still applies (non-push fallback) ---
+	// The last SetReconcileInterval above set the config seed to 60s; with push
+	// DISABLED and no env override, that config cadence drives the SCAN directly
+	// (NOT floored to the class value — the floor only applies on the push path).
+	rc.setEngagement(keyspaceDisabled)
+	if got := rc.currentBackstop(); got != 60*time.Second {
+		t.Fatalf("push DISABLED after override cleared: backstop = %v, want 60s (config cadence, last set)", got)
+	}
+	// A fresh client with a 300s config and push disabled must serve 300s, not 30s.
+	rc2 := &RedisClient{}
+	rc2.backstopNanos.Store(int64(DefaultReconcileInterval))
+	rc2.SetReconcileInterval(300 * time.Second)
+	if got := rc2.currentBackstop(); got != 300*time.Second {
+		t.Fatalf("fresh client + config=300s + push DISABLED: backstop = %v, want 300s", got)
+	}
+
+	t.Setenv("JM_WAN_MODE", "")
+	SetClassSignals(nil, nil)
 }
 
 // TestNetworkChangeDeferralPredicate locks the exact gate the reconcileLoop
@@ -460,6 +562,7 @@ func TestScopedPruneRootKey(t *testing.T) {
 	}
 
 	rc := &RedisClient{store: store} // no fuseRoot, no pin checker
+	markPruneHealthy(rc)             // backend non-degraded → scopedPrune runs (NFSv3-sprint gate)
 
 	// Sanity: the root children live under "." not "".
 	if c, _ := store.ListChildren("."); len(c) != 2 {

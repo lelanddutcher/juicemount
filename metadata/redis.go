@@ -21,6 +21,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
@@ -44,6 +45,30 @@ const (
 	// regardless of threshold) and the per-path FUSE Lstat verification
 	// added separately to syncMetadata.
 	PruneThreshold = 10
+
+	// V2.3 G6 (task #79): bounds on the prune ladder's Layer-A per-path FUSE
+	// Lstat verification, mirroring collectFastPathPrunes' probe cap + wall
+	// budget. Proven live 2026-07-02: with ~112k permanent ladder candidates
+	// (SCAN-coverage bug) the UNBOUNDED Layer-A loop ran 86s on LAN and ~90
+	// minutes over a cellular relay (~50ms/Lstat), saturating the link and
+	// pinning "Rebuilding index…" forever. Candidates deferred by these bounds
+	// keep their ladder position (re-inserted into pruneAbsent at their prior
+	// count) so they re-qualify next cycle — deferral, never data loss.
+	// Kill switch: JM_LAYERA_BUDGET=0 restores the unbounded pre-G6 behavior.
+	layerAProbeCap    = 2048            // max ladder candidates Lstat-probed per cycle
+	layerAProbeBudget = 3 * time.Second // max wall time probing ladder candidates
+
+	// C1 (2026-07-02): store_meta key under which the wall-clock time of the
+	// last SUCCESSFUL full SCAN is persisted (unix seconds, as a decimal
+	// string). Read at boot by ShouldSkipBootSync to decide whether the mirror
+	// is fresh enough to skip the redundant boot SCAN.
+	metaKeyLastSyncTime = "last_sync_time"
+
+	// defaultBootSyncMaxAge is the freshness window ShouldSkipBootSync uses when
+	// JM_BOOT_SYNC_MAX_AGE_SEC is unset. A persisted last-sync newer than this
+	// (AND keyspace push engaged) is considered fresh — the PSUBSCRIBE gap-fill
+	// and periodic backstop carry any deltas since, so the boot SCAN is skipped.
+	defaultBootSyncMaxAge = 24 * time.Hour
 )
 
 // MetadataEvent represents a real-time metadata change published via Redis SUBSCRIBE.
@@ -106,10 +131,22 @@ type RedisClient struct {
 	lastSyncDuration  time.Duration
 	lastSyncTime      time.Time
 	lastSyncStartedAt time.Time // when the most recent sync BEGAN (for flap debounce)
-	lastSyncEntries   int
-	connected         bool
-	lastDisconnect    time.Time
-	lastReconnect     time.Time
+	// G7 (task #80): truthful IsSyncing across failed/deferred syncs.
+	// lastSyncEndedAt records when the most recent sync attempt ENDED —
+	// success, failure, OR deferral (set by noteSyncOutcome on every
+	// syncMetadata exit). Before G7, IsSyncing keyed only on
+	// lastSyncStartedAt > lastSyncTime, so a FAILING sync left /activity
+	// rendering "Rebuilding index…" forever (live 2026-07-01: 3h of it).
+	// lastSyncStartedAt itself is NEVER zeroed — the reconcileLoop flap
+	// debounce reads it and must keep suppressing flap-triggered SCANs
+	// right after a failed/deferred attempt (the link was just saturated).
+	lastSyncEndedAt    time.Time
+	syncDeferredReason string // non-empty while the most recent attempt was DEFERRED (G7)
+	syncDeferredStreak int    // consecutive DEFERRED attempts; Warn logs once per streak (G7)
+	lastSyncEntries    int
+	connected          bool
+	lastDisconnect     time.Time
+	lastReconnect      time.Time
 
 	// backstopNanos is the CURRENT desired interval (in nanoseconds) for the
 	// periodic full-SCAN reconcile loop, read every loop turn so a running
@@ -126,10 +163,56 @@ type RedisClient struct {
 	// 1; zero is treated as DefaultReconcileInterval by reconcileLoop.
 	backstopNanos atomic.Int64
 
+	// configReconcileNanos holds the CONFIG-SEED reconcile cadence (in
+	// nanoseconds) supplied by SetReconcileInterval — the LB-4 "Reconcile
+	// interval" preference (default 300s from cfg.reconcileInterval()). It is
+	// STORED SEPARATELY from backstopNanos so the config seed can never CLOBBER
+	// the live class-gated push backstop that setEngagement owns (#90: the old
+	// code wrote the 300s config value STRAIGHT into backstopNanos, collapsing
+	// the 900s+ push backstop back to a full ~247k-key SCAN every 300s on every
+	// link class — the push backstop never engaged).
+	//
+	// Precedence, resolved in setEngagement:
+	//   - JM_RECONCILE_BACKSTOP_SEC env override wins over everything (via
+	//     backstopForClass's reconcileBackstopOverride short-circuit).
+	//   - push ENABLED + reachable: live backstop = max(classBackstop,
+	//     configReconcileNanos) — the config can only LENGTHEN the push-mode
+	//     backstop, never SHORTEN it below the class-gated floor.
+	//   - push DISABLED / DEGRADED / unreachable: the config cadence drives the
+	//     periodic SCAN directly (the non-push authoritative fallback), so the
+	//     LB-4 preference is still honored when push isn't carrying deltas.
+	// Zero means "no config seed" (max() then yields the class value alone).
+	configReconcileNanos atomic.Int64
+
+	// engaged records the LAST keyspace engagement state passed to
+	// setEngagement (stored as the int32 keyspaceEngagement enum). It lets the
+	// live backstop be RE-DERIVED with correct precedence when the config seed
+	// changes (SetReconcileInterval) without a new engagement transition — so a
+	// config change at launch (before push engages) and a config change while
+	// push is ENABLED both flow through the same resolveBackstop precedence
+	// resolver. Defaults to keyspaceDisabled (0), the pre-push classic state.
+	engaged atomic.Int32
+
 	// pruneAbsent tracks how many consecutive reconciliation cycles each path
 	// has been absent from Redis. Only paths absent for PruneThreshold+ cycles
 	// are actually deleted from SQLite. Guarded by mu.
 	pruneAbsent map[string]int
+
+	// pruneFollowUp marks the next syncNowCh wake as a G5 fast-path
+	// CONTINUATION (a capped mass-delete with confirmed survivors) — it must
+	// bypass the keyspace-push deferral and the flap debounce in
+	// reconcileLoop, which exist to suppress network-flap triggers, not
+	// self-scheduled prune convergence. Set in syncMetadata; consumed
+	// (Swap(false)) by reconcileLoop.
+	pruneFollowUp atomic.Bool
+
+	// V2.3 U6 (task #37): live progress of the in-flight full SCAN, so the
+	// UI can render "Rebuilding index… N / ~M" instead of a bare spinner
+	// (field report: an opaque multi-minute rebuild feels broken). scanned
+	// counts raw child entries as SCAN batches land; the denominator is the
+	// PREVIOUS sync's entry count — an estimate (labelled ~), but accurate
+	// for a warm mirror and free (no extra Redis round-trip).
+	syncScanned atomic.Int64
 
 	// QA-30 (2026-05-25): path conversion config so syncMetadata can
 	// correctly cross-reference the pin store (mountpoint-prefixed paths)
@@ -171,6 +254,10 @@ type RedisClient struct {
 	// live Redis. See keyspaceReconcileDir / keyspaceTriggerSync below.
 	testReconcileDir func(uint64) error
 	testTriggerSync  func()
+	// testChildDirInodes overrides the d{inode} child-dir discovery that drives
+	// ReconcileSubtree's walk, so the bounding/dedup/cap logic is testable
+	// without a live Redis. Production leaves it nil (real HGETALL runs).
+	testChildDirInodes func(uint64) ([]uint64, error)
 }
 
 // keyspaceReconcileDir dispatches to the test seam when set, else the real
@@ -255,13 +342,24 @@ func (rc *RedisClient) SetReconcileInterval(d time.Duration) {
 		return
 	}
 	rc.reconcileInterval = d
-	// Seed the live backstop so the configured cadence actually takes effect:
-	// reconcileLoop reads backstopNanos (via currentBackstop), not
-	// reconcileInterval, on every turn. setEngagement (the keyspace loop) may
-	// override this live once push is engaged — but until then this is the
-	// authoritative periodic-SCAN interval, so the LB-4 preference is honored
-	// from launch rather than staying a placebo behind DefaultReconcileInterval.
-	rc.backstopNanos.Store(int64(d))
+	// #90: store the config seed in its OWN field, NEVER straight into
+	// backstopNanos. The old code did `rc.backstopNanos.Store(int64(d))`, which
+	// CLOBBERED the live class-gated push backstop that setEngagement owns —
+	// collapsing a 900s+ push backstop back to the 300s config value on every
+	// link class, so the demoted periodic full SCAN fired ~247k keys every 300s
+	// forever and the push backstop never engaged (the cellular full-SCAN churn).
+	rc.configReconcileNanos.Store(int64(d))
+	// Re-derive the live backstop through the SINGLE precedence resolver so the
+	// config change takes effect with the correct precedence:
+	//   - push ENABLED + reachable -> max(classBackstop, config): config can only
+	//     LENGTHEN, never shorten below the class floor.
+	//   - otherwise (DISABLED/DEGRADED/unreachable) -> the config cadence drives
+	//     the periodic SCAN directly (this is the non-push authoritative path,
+	//     so the LB-4 preference is honored from launch).
+	// resolveBackstop reads the current engagement (rc.engaged) and the class
+	// signals, so calling it here holds precedence regardless of whether push is
+	// up yet at config time.
+	rc.resolveBackstop("config")
 }
 
 // lstatFunc is the type of the package-level Lstat hook. Aliased so we can
@@ -522,6 +620,22 @@ func (rc *RedisClient) LastReconnect() time.Time {
 // consider the client degraded. Tuned for the typical metadata-sync
 // cycle (~30s) plus a safety margin.
 func (rc *RedisClient) RecentlyDegraded(cooldown time.Duration) bool {
+	// Reachability-aware (NFSv3 sprint slow-link false-flap, fix b.1 — task #66
+	// salvage). The rc.connected flag below is written ONLY by doReconcile /
+	// Reconnect / the keyspace sub — NEVER by the reachability monitor. During a
+	// slow-link probe flap the drain + SCAN keep SUCCEEDING (the backend is
+	// provably reachable; only the cold probe SYN false-fails), so rc.connected
+	// stays true and this returned false — leaving BOTH prune paths un-gated
+	// while the app was about to engage offline. Consult the injected
+	// reachability signal too (wired via metadata.SetClassSignals from bridge):
+	// an unreachable verdict means the offline-engage path is arming, so any
+	// prune in flight must DEFER (the authoritative delete replays next cycle /
+	// heals via the backstop SCAN — it is never dropped). Checked BEFORE taking
+	// rc.mu.RLock so reachableNow()'s separate keyspaceSignalMu never nests
+	// under rc.mu (no lock-order inversion).
+	if !reachableNow() {
+		return true
+	}
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 	if !rc.connected {
@@ -578,6 +692,111 @@ func (rc *RedisClient) Reconnect() error {
 	return nil
 }
 
+// collectFastPathPrunes implements the V2.3 G5 mass-delete fast-path (task
+// #73). It walks rc.pruneAbsent (single-writer: only syncMetadata's
+// goroutine), finds subtree ROOTS (absent paths whose parent is not absent),
+// FUSE-Lstat-confirms each root, and returns every absent path under a
+// confirmed-deleted root — removing them from pruneAbsent. `._` AppleDouble
+// sidecars are never included (scan-filtered from Redis; absence there is not
+// a delete signal — symmetric with the ladder's and scopedPrune's guard).
+//
+// Bounded three ways (root count, wall time, rows per cycle); `capped=true`
+// means work remains and the caller should schedule an immediate follow-up
+// cycle. Inert when: the cycle is RecentlyDegraded (a partial Redis view must
+// never confirm a deletion — same rule as the ladder), the G0 FUSE-identity
+// gate fails, fuseRoot is unset, or JM_PRUNE_FASTPATH=0 (kill switch).
+func (rc *RedisClient) collectFastPathPrunes(skipIncrement bool) (fastConfirmed map[string]struct{}, capped bool) {
+	fastConfirmed = make(map[string]struct{})
+	if len(rc.pruneAbsent) == 0 || skipIncrement || rc.fuseRoot == "" ||
+		os.Getenv("JM_PRUNE_FASTPATH") == "0" {
+		return fastConfirmed, false
+	}
+	if identOK, _ := pin.FUSEIdentityState(); !identOK {
+		return fastConfirmed, false
+	}
+	const (
+		fastPathRootCap   = 2048            // max subtree roots probed per cycle
+		fastPathBudget    = 3 * time.Second // max wall time probing roots
+		fastPathDeleteCap = 25000           // max rows fast-pruned per cycle (one DeletePaths tx)
+	)
+	absent := rc.pruneAbsent
+	// Review fix: exclude spool-pending paths at COLLECTION time (roots
+	// before their probe, descendants before the sweep), not only in the
+	// downstream Layer D filter. This restores the ladder's ordering
+	// invariant against a drain completing mid-cycle: the drainer
+	// materializes the FUSE dest BEFORE MarkDrainComplete evicts the spool
+	// shadow, so a path whose guard reads not-pending and whose root then
+	// Lstats ENOENT is genuinely deleted — every interleaving is caught by
+	// the guard (still pending) or the probe (already on FUSE). The
+	// downstream filterSpoolPending stays as a backstop.
+	guard := rc.loadSpoolGuard()
+	var roots []string
+	for p := range absent {
+		if strings.HasPrefix(path.Base(p), "._") {
+			continue
+		}
+		if guard != nil && guard(p) {
+			continue
+		}
+		if _, parentAbsent := absent[path.Dir(p)]; !parentAbsent {
+			roots = append(roots, p)
+		}
+	}
+	probeStart := time.Now()
+	probed, confirmedRoots := 0, 0
+	for _, root := range roots {
+		if probed >= fastPathRootCap || time.Since(probeStart) > fastPathBudget ||
+			len(fastConfirmed) >= fastPathDeleteCap {
+			capped = true
+			break
+		}
+		probed++
+		isAbsent, ok := lstatNotExistWithTimeout(rc.fusePathFor(root), time.Second)
+		if !ok || !isAbsent {
+			continue // timeout or FUSE-present — leave to the ladder
+		}
+		confirmedRoots++
+		prefix := root + "/"
+		fastConfirmed[root] = struct{}{}
+		for p := range absent {
+			if len(fastConfirmed) >= fastPathDeleteCap {
+				capped = true
+				break
+			}
+			if strings.HasPrefix(p, prefix) && !strings.HasPrefix(path.Base(p), "._") &&
+				(guard == nil || !guard(p)) {
+				fastConfirmed[p] = struct{}{}
+			}
+		}
+	}
+	// Review fix: ENOENT evidence is only trustworthy if the mount is
+	// verified REAL after the last probe — a mount dying to a plain dir
+	// mid-cycle turns every Lstat into a false "deleted". Cache-bypassing
+	// re-check before any pruneAbsent mutation; a discard leaves the ladder
+	// counters intact, and the re-stamped cache means the ladder-path
+	// identity gate in the prune pass sees the same fresh verdict.
+	if len(fastConfirmed) > 0 {
+		if identOK, identReason := pin.FUSEIdentityFresh(); !identOK {
+			jmlog.Warn("metadata sync: fast-path prune DISCARDED — FUSE identity failed post-probe",
+				"reason", identReason, "would_have_pruned", len(fastConfirmed))
+			return make(map[string]struct{}), false
+		}
+	}
+	for p := range fastConfirmed {
+		delete(rc.pruneAbsent, p)
+	}
+	if len(fastConfirmed) > 0 {
+		jmlog.Info("metadata sync: fast-path pruning confirmed-deleted subtrees",
+			"roots_probed", probed,
+			"roots_confirmed", confirmedRoots,
+			"paths", len(fastConfirmed),
+			"probe_ms", time.Since(probeStart).Round(time.Millisecond).Milliseconds(),
+			"capped", capped,
+		)
+	}
+	return fastConfirmed, capped
+}
+
 // TriggerSync signals the reconcile loop to run an immediate sync cycle.
 // Non-blocking: if a signal is already pending it does nothing.
 func (rc *RedisClient) TriggerSync() {
@@ -612,15 +831,120 @@ func (rc *RedisClient) LastSyncEntries() int {
 // right now — i.e. the most recent sync STARTED after the most recent sync
 // COMPLETED. Used by /activity to surface "Rebuilding index…" while a full
 // SCAN is in flight (the period when Finder can feel sluggish on cold paths).
+//
+// G7 (task #80): a sync attempt that FAILED or was DEFERRED is not "syncing".
+// lastSyncEndedAt is stamped on EVERY syncMetadata exit (noteSyncOutcome), so
+// the started-after-ended clause turns this false the moment an attempt dies —
+// previously only lastSyncTime (success-only) cleared it, and a failure streak
+// pinned /activity on an eternal "Rebuilding index…".
 func (rc *RedisClient) IsSyncing() bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
-	return !rc.lastSyncStartedAt.IsZero() && rc.lastSyncStartedAt.After(rc.lastSyncTime)
+	return !rc.lastSyncStartedAt.IsZero() &&
+		rc.lastSyncStartedAt.After(rc.lastSyncTime) &&
+		rc.lastSyncStartedAt.After(rc.lastSyncEndedAt)
+}
+
+// SyncDeferredReason returns a non-empty reason string while the most recent
+// sync attempt was classified DEFERRED (G7: SCAN budget exceeded on a slow
+// link while the keyspace push is engaged and carrying deltas). Cleared by
+// the next successful — or genuinely-failed — attempt. /activity renders a
+// plain-language "sync deferred, live updates continue via push" line off it
+// instead of the eternal "Rebuilding index…".
+func (rc *RedisClient) SyncDeferredReason() string {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	return rc.syncDeferredReason
+}
+
+// SyncProgress reports the in-flight rebuild's scanned-entry count and an
+// ESTIMATED total (the previous sync's entry count; 0 on a first-ever sync).
+// Progress covers the SCAN phase, which dominates rebuild time on slow links;
+// the diff/upsert tail after it is seconds. V2.3 U6 (task #37).
+func (rc *RedisClient) SyncProgress() (scanned, estTotal int64) {
+	rc.mu.RLock()
+	est := int64(rc.lastSyncEntries)
+	rc.mu.RUnlock()
+	// Review fix (MED): the first in-process sync — exactly the multi-minute
+	// boot rebuild the field report was about, now backgrounded by U1 — has
+	// lastSyncEntries==0. Fall back to the persisted mirror's row count so a
+	// warm 264k-entry mirror still gets a denominator. Cheap (indexed
+	// COUNT(*)), and only paid while est==0 during that first sync.
+	if est == 0 && rc.store != nil {
+		if n, err := rc.store.Count(); err == nil {
+			est = int64(n)
+		}
+	}
+	return rc.syncScanned.Load(), est
 }
 
 // SyncOnce performs a single batch reconciliation (Lua tree pull → SQLite).
 func (rc *RedisClient) SyncOnce() error {
 	return rc.syncMetadata()
+}
+
+// ShouldSkipBootSync reports whether the boot-time full SCAN can be safely
+// skipped because the persisted mirror is FRESH and the keyspace-notification
+// push is engaged (C1, 2026-07-02).
+//
+// Rationale: with JM_METADATA_KEYSPACE_PUSH=1 the PSUBSCRIBE gap-fill plus the
+// periodic backstop SCAN already guarantee convergence, so re-running a full
+// boot SCAN over a recently-synced mirror is pure redundant work (the 174s
+// "Rebuilding index…" spinner on a cellular relay). We skip it ONLY when both
+// hold:
+//
+//   - keyspacePushEnabled() — without push there is no gap-fill/backstop that
+//     would carry the deltas we'd miss, so the SCAN is still authoritative and
+//     must run;
+//   - a persisted last_sync_time exists AND is within the freshness window
+//     (default 24h; JM_BOOT_SYNC_MAX_AGE_SEC overrides, 0 = never skip).
+//
+// A first-run / wiped mirror has NO persisted last_sync_time (the store_meta
+// table lives in the same DB the reset wipes) → returns false → today's
+// blocking/background boot SCAN runs. A future or malformed timestamp is
+// treated conservatively as "not fresh" → false. The rc.Start() reconcile +
+// keyspace loops launch regardless of this decision; only the one-shot boot
+// SyncOnce is elided.
+//
+// Kill switch: JM_BOOT_SYNC_SKIP=0 forces the current always-sync behavior
+// (returns false unconditionally). REVERT_LOG 2026-07-02.
+func (rc *RedisClient) ShouldSkipBootSync() bool {
+	if os.Getenv("JM_BOOT_SYNC_SKIP") == "0" {
+		return false // kill switch: never skip
+	}
+	if !rc.keyspacePushEnabled() {
+		return false // no push → the SCAN is the only authoritative sync
+	}
+	if rc.store == nil {
+		return false
+	}
+
+	maxAge := defaultBootSyncMaxAge
+	if v := os.Getenv("JM_BOOT_SYNC_MAX_AGE_SEC"); v != "" {
+		n, perr := strconv.ParseInt(v, 10, 64)
+		if perr != nil {
+			return false // malformed override → conservative: don't skip
+		}
+		if n <= 0 {
+			return false // 0 (or negative) = never skip
+		}
+		maxAge = time.Duration(n) * time.Second
+	}
+
+	raw, ok, err := rc.store.GetMeta(metaKeyLastSyncTime)
+	if err != nil || !ok {
+		return false // no persisted sync (first run / wiped mirror) or read error
+	}
+	unix, perr := strconv.ParseInt(raw, 10, 64)
+	if perr != nil {
+		return false // corrupt value → don't skip
+	}
+	last := time.Unix(unix, 0)
+	age := time.Since(last)
+	if age < 0 {
+		return false // clock skew / future timestamp → conservative
+	}
+	return age <= maxAge
 }
 
 // Start begins the SUBSCRIBE listener, periodic batch reconciliation, and —
@@ -724,6 +1048,16 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 
 	switch evt.Op {
 	case "create", "update":
+		// Task #78: never mirror push events for scan-filtered namespaces
+		// (.trash/, .juicemount/ — see scanFilteredPath). The full SCAN can
+		// never return these paths, so a push-inserted row would be
+		// permanently absent from every SCAN diff and cycle in the
+		// pruneAbsent ladder forever. `._` sidecars are deliberately NOT
+		// filtered here (they are SCAN-visible once drained).
+		if scanFilteredPath(evt.Path) {
+			noteScanFilteredSkip("applyEvent", evt.Path, 1)
+			return
+		}
 		e := &Entry{
 			Path:       evt.Path,
 			Name:       path.Base(evt.Path),
@@ -742,15 +1076,26 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		}
 
 	case "delete":
+		// Deletes are NOT namespace-filtered: removing an internal-namespace
+		// row (if one was seeded by an older build) is convergent.
 		rc.store.DeleteFromCache(evt.Path)
 		if err := rc.store.Delete(evt.Path); err != nil {
 			log.Printf("subscribe apply delete: %v", err)
 		}
 
 	case "rename":
+		// The OldPath removal is UNGATED: a rename INTO .trash is JuiceFS's
+		// delete-to-trash, and the source row must still be dropped.
 		if evt.OldPath != "" {
 			rc.store.DeleteFromCache(evt.OldPath)
 			rc.store.Delete(evt.OldPath)
+		}
+		// Task #78: skip mirroring the DESTINATION when it lands in a
+		// scan-filtered namespace (delete-to-trash). A rename OUT of .trash
+		// (restore) has a non-filtered destination and is mirrored normally.
+		if scanFilteredPath(evt.Path) {
+			noteScanFilteredSkip("applyEvent", evt.Path, 1)
+			return
 		}
 		e := &Entry{
 			Path:       evt.Path,
@@ -832,6 +1177,18 @@ func (rc *RedisClient) reconcileLoop() {
 		case <-ticker.C:
 			rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
 		case <-rc.syncNowCh:
+			// G5 fast-path continuation (review fix): a capped mass-delete
+			// cycle with confirmed survivors schedules its own follow-up.
+			// It is authoritative prune convergence, not a network-flap
+			// trigger — run it immediately, bypassing the push deferral and
+			// flap debounce below (each continuation is still internally
+			// gated by RecentlyDegraded + the G0 identity checks inside
+			// collectFastPathPrunes, and stops the moment nothing survives).
+			if rc.pruneFollowUp.Swap(false) {
+				jmlog.Info("fast-path prune continuation — running immediate reconcile")
+				rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
+				continue
+			}
 			// Keyspace-push deferral (2026-06-27): when the push is actively
 			// ENABLED the backstop is long (setEngagement stores a >30s interval
 			// ONLY for ENABLED+reachable). In that state a network-change/reconnect
@@ -897,6 +1254,29 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 	// applies once we're connected+ENABLED and reset cleanly (below).
 	baseInterval := DefaultReconcileInterval
 	if err := rc.syncMetadata(); err != nil {
+		// G7 (task #80): DEFERRED, not failed. A SCAN that exceeded its
+		// class-gated budget WHILE the keyspace push is engaged (backstop >
+		// DefaultReconcileInterval — the established push-carrying test, see
+		// the reconcileLoop deferral above) is redundant convergence work:
+		// deltas are flowing via push the whole time. The failure backoff is
+		// deliberately FASTER than the backstop (outage recovery), which is
+		// exactly wrong here — live 2026-07-01, each fast retry saturated a
+		// metered cellular relay for the full budget and then died, 31
+		// consecutive times over 3h. Instead: no failure bookkeeping (no
+		// consecutiveFailures bump, no connected=false flip — push healthy
+		// means the backend IS reachable, and flipping it would poison
+		// RecentlyDegraded's prune/phantom-purge gates), and the next attempt
+		// waits for the normal backstop tick. Resetting the counter/ticker
+		// here also ends any PRIOR failure streak's fast cadence — otherwise
+		// a short backoff ticker would keep re-burning the link with deferred
+		// attempts. Warn is logged once per streak by noteSyncOutcome.
+		// Kill switch: JM_SYNC_DEFERRAL=0 (see isDeferredSyncErr).
+		if rc.isDeferredSyncErr(err) {
+			*consecutiveFailures = 0
+			*backoff = rc.currentBackstop()
+			ticker.Reset(*backoff)
+			return
+		}
 		*consecutiveFailures++
 		*backoff = baseInterval * time.Duration(1<<min(*consecutiveFailures, 6))
 		if *backoff > maxBackoff {
@@ -975,6 +1355,66 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 			*backoff = next
 			ticker.Reset(*backoff)
 		}
+	}
+}
+
+// isDeferredSyncErr reports whether a syncMetadata error should be classified
+// DEFERRED rather than FAILED (G7, task #80): the error wraps
+// context.DeadlineExceeded (the SCAN exceeded its class-gated wall budget —
+// syncMetadata guarantees the sentinel is present whenever its own context
+// expired) AND the keyspace push is engaged and carrying deltas
+// (currentBackstop() > DefaultReconcileInterval — the same push-carrying test
+// reconcileLoop's network-change deferral uses; setEngagement stores a long
+// backstop ONLY for ENABLED+reachable). In that state the backstop SCAN is
+// redundant convergence work and must not drive the fast failure backoff.
+//
+// If the push drops, setEngagement(degraded/disabled) snaps the backstop back
+// to 30s and this returns false — a real outage still gets the classic
+// fail-fast backoff and recovery. Kill switch: JM_SYNC_DEFERRAL=0 restores
+// the pre-G7 behavior exactly (every error is a failure). Read per call.
+func (rc *RedisClient) isDeferredSyncErr(err error) bool {
+	if err == nil || os.Getenv("JM_SYNC_DEFERRAL") == "0" {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) &&
+		rc.currentBackstop() > DefaultReconcileInterval
+}
+
+// noteSyncOutcome records the end of a sync attempt (G7, task #80). Called on
+// EVERY syncMetadata exit — success, failure, or deferral — so IsSyncing()
+// stops reporting an attempt that already died, and /activity can render the
+// deferred state truthfully instead of an eternal "Rebuilding index…".
+// lastSyncStartedAt is deliberately NOT touched: the reconcileLoop flap
+// debounce keys on it and must keep suppressing flap-triggered SCANs right
+// after a failed/deferred attempt (the link was just saturated for the full
+// budget). The deferral Warn logs ONCE per streak, not per attempt — on a
+// cellular relay the streak can run for hours at the backstop cadence.
+func (rc *RedisClient) noteSyncOutcome(err error) {
+	deferred := rc.isDeferredSyncErr(err)
+	now := time.Now()
+	rc.mu.Lock()
+	rc.lastSyncEndedAt = now
+	prevStreak := rc.syncDeferredStreak
+	if deferred {
+		rc.syncDeferredStreak++
+		rc.syncDeferredReason = "SCAN budget exceeded on slow link; keyspace push engaged"
+	} else {
+		rc.syncDeferredStreak = 0
+		rc.syncDeferredReason = ""
+	}
+	rc.mu.Unlock()
+
+	if deferred && prevStreak == 0 {
+		jmlog.Warn("metadata sync DEFERRED — full-SCAN budget exceeded while keyspace push is engaged; "+
+			"skipping failure backoff, next attempt at the backstop tick (logged once per streak)",
+			"budget_sec", int(scanContextTimeout().Seconds()),
+			"backstop_sec", int(rc.currentBackstop().Seconds()),
+			"class", currentLinkClass().String(),
+			"error", err.Error(),
+		)
+	} else if err == nil && prevStreak > 0 {
+		jmlog.Info("metadata sync recovered after deferred streak",
+			"deferred_attempts", prevStreak)
 	}
 }
 
@@ -1234,7 +1674,7 @@ return out
 // gap-fill can both reach here, but never concurrently — preserving the
 // pruneAbsent single-writer invariant and preventing two overlapping full
 // SCANs from racing each other's diff.
-func (rc *RedisClient) syncMetadata() error {
+func (rc *RedisClient) syncMetadata() (err error) {
 	rc.syncMu.Lock()
 	defer rc.syncMu.Unlock()
 
@@ -1243,9 +1683,22 @@ func (rc *RedisClient) syncMetadata() error {
 	// in-flight or just-ran and suppress redundant network-change triggers.
 	rc.mu.Lock()
 	rc.lastSyncStartedAt = start
+	// U6 review fix: reset progress in the same critical section that flips
+	// IsSyncing()=true, so a concurrent /activity poll can never see the
+	// previous sync's final count against an active rebuild ("99%" flash).
+	rc.syncScanned.Store(0)
 	rc.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// G7 (task #80): record the attempt's outcome on EVERY exit — success,
+	// failure, or deferral — so IsSyncing() turns false the moment this
+	// attempt ends (named return; runs before the syncMu unlock above).
+	defer func() { rc.noteSyncOutcome(err) }()
+
+	// G7 (task #80): class-gated SCAN budget (was a fixed 120s; LAN/WiFi are
+	// byte-identical, tunnel/cellular gets 300s so a ~200-300s slow-link SCAN
+	// can actually finish). Env override JM_SCAN_TIMEOUT_SEC.
+	scanBudget := scanContextTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), scanBudget)
 	defer cancel()
 
 	// Drive the SCAN cursor loop from Go so Redis only blocks for one small
@@ -1268,12 +1721,22 @@ func (rc *RedisClient) syncMetadata() error {
 	for {
 		res, err := rc.redisDB().Eval(ctx, luaScanBatch, nil, cursor, scanCount).StringSlice()
 		if err != nil {
+			// G7 (task #80): when OUR scan budget expired, make the returned
+			// error uniformly match errors.Is(_, context.DeadlineExceeded)
+			// regardless of how go-redis dressed the expiry (ctx sentinel vs
+			// a net "i/o timeout" from the ctx-derived read deadline) — the
+			// deferred-not-failed classification keys on that sentinel.
+			if ctx.Err() == context.DeadlineExceeded {
+				return fmt.Errorf("redis SCAN batch: %w (SCAN budget %v exceeded): %w",
+					err, scanBudget, context.DeadlineExceeded)
+			}
 			return fmt.Errorf("redis SCAN batch: %w", err)
 		}
 		if len(res) == 0 {
 			break
 		}
 		cursor = res[0]
+		rc.syncScanned.Add(int64(len(res) - 1)) // U6 progress
 		for _, raw := range res[1:] {
 			// "fileType:mtime:fileSize:inode:parentInode:name"
 			parts := strings.SplitN(raw, ":", 6)
@@ -1316,6 +1779,19 @@ func (rc *RedisClient) syncMetadata() error {
 			continue
 		}
 		entryPath := strings.Join(parts, "/")
+
+		// #78 follow-up (proven live 2026-07-02): `.juicemount/` IS
+		// SCAN-visible (unlike `.trash/`, which the root-walk excludes
+		// structurally), so without this gate the SCAN's upsert path
+		// resurrects ~17k internal-namespace rows every cycle and the
+		// open-time GC deletes them again next launch — a permanent churn
+		// loop. Filter here, at construction: the entry stays out of BOTH
+		// redisEntries (no upsert) and redisPaths (so the absent-tracking
+		// exclusion in trackAbsentPaths stays consistent — filtered paths
+		// are absent from both sides and tracked nowhere).
+		if scanFilteredPath(entryPath) {
+			continue
+		}
 
 		var mtime time.Time
 		if e.mtime > 0 {
@@ -1411,40 +1887,82 @@ func (rc *RedisClient) syncMetadata() error {
 	// (commit bbc6bff) to give recovery a full pruneThreshold-cycle
 	// window before any destructive cache mutation can fire.
 	skipIncrement := rc.RecentlyDegraded(60 * time.Second)
-	for p := range existingPaths {
-		if _, inRedis := redisPaths[p]; !inRedis {
-			if !skipIncrement {
-				rc.pruneAbsent[p]++
-			}
-		} else {
-			delete(rc.pruneAbsent, p)
-		}
-	}
-	// Remove stale entries from pruneAbsent (paths already deleted from SQLite).
-	for p := range rc.pruneAbsent {
-		if _, exists := existingPaths[p]; !exists {
-			delete(rc.pruneAbsent, p)
-		}
-	}
+	rc.trackAbsentPaths(existingPaths, redisPaths, skipIncrement)
 	// Collect paths that have been absent long enough to prune.
+	//
+	// V2.3 G6: ladderCounts snapshots each candidate's counter BEFORE the
+	// delete below erases it, so Layer A can re-insert budget-deferred
+	// candidates at their prior count (>= PruneThreshold) — preserving ladder
+	// position exactly: a deferred candidate re-qualifies on the very next
+	// cycle instead of restarting the 10-cycle climb.
 	var toDelete []string
-	for p, count := range rc.pruneAbsent {
-		if count >= PruneThreshold {
-			// `._` AppleDouble guard (symmetric with scopedPrune's `._`-skip):
-			// `._` sidecars are scan-filtered / managed Mac-side via the explicit
-			// Remove path, never the reconcile — their absence from Redis is not a
-			// delete signal. Pruning one whose path-stable Track-B handle the
-			// kernel still holds Forgets it → FromHandle STALE (the `._dirN`
-			// had_shadow STALE the release battery caught). Stop tracking it and
-			// never enqueue it for deletion.
-			if strings.HasPrefix(path.Base(p), "._") {
+	ladderCounts := make(map[string]int)
+	// Review fix (G6/U1 adversarial review, HIGH): qualification is gated on
+	// !skipIncrement. Pre-G6 this gate was implicit — no counter could
+	// survive a cycle boundary at >= PruneThreshold (the loop drained every
+	// qualifier; increments are skipped while RecentlyDegraded), so a
+	// degraded/recovery cycle was structurally incapable of prune progress
+	// (the invariant documented above; same rule gates the G5 fast-path).
+	// G6's deferral re-inserts candidates AT >= threshold, so without this
+	// gate a backend flap right after a deferring cycle would pull them into
+	// toDelete during the recovery window — where a rehydrating JuiceFS can
+	// return false ENOENT to Layer A → live entries pruned → ESTALE (QA-30
+	// class). Deferred candidates wait out the window at their preserved
+	// count and re-qualify on the next stable cycle.
+	if !skipIncrement {
+		for p, count := range rc.pruneAbsent {
+			if count >= PruneThreshold {
+				// `._` AppleDouble guard (symmetric with scopedPrune's `._`-skip):
+				// `._` sidecars are scan-filtered / managed Mac-side via the explicit
+				// Remove path, never the reconcile — their absence from Redis is not a
+				// delete signal. Pruning one whose path-stable Track-B handle the
+				// kernel still holds Forgets it → FromHandle STALE (the `._dirN`
+				// had_shadow STALE the release battery caught). Stop tracking it and
+				// never enqueue it for deletion.
+				if strings.HasPrefix(path.Base(p), "._") {
+					delete(rc.pruneAbsent, p)
+					continue
+				}
+				toDelete = append(toDelete, p)
+				ladderCounts[p] = count
 				delete(rc.pruneAbsent, p)
-				continue
 			}
-			toDelete = append(toDelete, p)
-			delete(rc.pruneAbsent, p)
 		}
 	}
+
+	// === V2.3 G5: mass-delete convergence fast-path (task #73) ===
+	// The counter ladder alone cannot converge a mass deletion:
+	// PruneThreshold(10) consecutive cycles × the 15m LAN backstop ≥ 2.5h,
+	// and pruneAbsent is in-memory — every app restart (and every
+	// RecentlyDegraded window) resets ALL counters, so a reorganized library
+	// lingers as a ghost tree indefinitely (live 2026-07-01: 125k pending,
+	// an entire deleted SFX tree still served, files erroring on open).
+	//
+	// A deletion is safe to confirm WITHOUT the ladder when two independent
+	// authorities agree on the SAME cycle: the path is absent from this
+	// cycle's Redis SCAN (authoritative metadata) AND its subtree ROOT is
+	// Lstat-ENOENT on an identity-verified FUSE mount (authoritative
+	// filesystem). Confirmation happens at the subtree-root level — a path
+	// whose parent is also absent needs no probe of its own — so a
+	// 120k-entry deleted tree costs a handful of Lstats, not 120k.
+	//
+	// Fast-pathed paths still pass Layer D (spool-pending) and Layer C
+	// (pinned) below; they skip only Layer A's per-path Lstat, which their
+	// root probe already answered. Bounded three ways (root count, wall
+	// time, rows per cycle); when the row cap truncates, TriggerSync
+	// schedules the next cycle immediately so full convergence takes
+	// minutes, not backstop-hours. Kill switch: JM_PRUNE_FASTPATH=0.
+	// Same stability rule as the ladder: skipped entirely on
+	// RecentlyDegraded cycles (a partial Redis view must never confirm a
+	// deletion), and the G0 FUSE-identity gate must pass.
+	fastConfirmed, fastCapped := rc.collectFastPathPrunes(skipIncrement)
+	for p := range fastConfirmed {
+		toDelete = append(toDelete, p)
+	}
+	// (Review fix: the capped follow-up is scheduled AFTER DeletePaths below,
+	// and only when fast-confirmed paths actually survived the filters —
+	// otherwise a fully-spared >cap backlog (all pinned/spool-pending) or a
+	// zero-progress timeout cycle would chain back-to-back full SCANs.)
 
 	// === QA-30 Layer D (review FIX 2): never prune a spool-pending path ===
 	// The periodic full-SCAN prune is the SAME ESTALE bug class as scopedPrune,
@@ -1477,6 +1995,22 @@ func (rc *RedisClient) syncMetadata() error {
 	// we're closing.
 	prunedPinned := 0
 	prunedFUSEpresent := 0
+	// === V2.3 G0: FUSE identity gate — skip the whole prune pass when the
+	// mountpoint has no real filesystem on it (macFUSE kext not loaded /
+	// mount absent / wedged). In that state Layer A's FUSE Lstat returns
+	// ENOENT for EVERY backend path, so its spare-if-present protection is
+	// silently disabled and the prune runs unprotected. Same fail-safe shape
+	// as the pin-checker error path below: a delayed prune costs one cycle
+	// of stale entries; an unprotected prune is the ESTALE bug class.
+	if len(toDelete) > 0 {
+		if identOK, identReason := pin.FUSEIdentityState(); !identOK {
+			jmlog.Warn("metadata sync: FUSE identity gate failed — skipping prune pass this cycle",
+				"reason", identReason,
+				"would_have_pruned", len(toDelete),
+			)
+			toDelete = nil
+		}
+	}
 	if len(toDelete) > 0 {
 		// === Layer C: filter out pinned paths ===
 		pinned, perr := rc.store.pinnedSetPublic()
@@ -1506,49 +2040,11 @@ func (rc *RedisClient) syncMetadata() error {
 		}
 
 		// === Layer A: per-path FUSE Lstat verification ===
-		// Even non-pinned paths shouldn't be pruned if FUSE still shows
-		// them present — that means JuiceFS still has them, Redis SCAN
-		// just happened to miss them this cycle. Each Lstat capped at 1s
-		// so a FUSE wedge can't pin the reconcile goroutine. If more than
-		// 25% of probes time out, treat FUSE as degraded and skip the
-		// whole prune (defensive — degraded FUSE plus blind prune was
-		// what surfaced the bug in production).
+		// Extracted to verifyPruneCandidates (V2.3 G6, task #79) so the
+		// probe-cap / wall-budget / class-gate bounding is unit-testable
+		// without a full syncMetadata run. See the method's doc comment.
 		if len(toDelete) > 0 && rc.fuseRoot != "" {
-			verified := toDelete[:0]
-			lstatTimeouts := 0
-			for _, p := range toDelete {
-				fusePath := rc.fusePathFor(p)
-				if fusePath == "" {
-					verified = append(verified, p)
-					continue
-				}
-				isAbsent, ok := lstatNotExistWithTimeout(fusePath, time.Second)
-				if !ok {
-					lstatTimeouts++
-					continue // timed out — don't prune, retry next cycle
-				}
-				if isAbsent {
-					verified = append(verified, p)
-				} else {
-					prunedFUSEpresent++ // FUSE says it's there — keep it
-				}
-			}
-			// QA-30 code review HIGH-3: absolute floor of 4 timeouts before
-			// bailing the whole cycle. Without this, a small batch
-			// (N<=3) trips the bail on a single transient timeout —
-			// effectively a 100%/50%/33% threshold instead of the
-			// intended 25%. Small batches handle individual timeouts
-			// fine via the `continue` above (paths simply stay
-			// unpruned this cycle, retried next time).
-			if lstatTimeouts >= 4 && lstatTimeouts*4 > len(toDelete) {
-				jmlog.Warn("metadata sync: FUSE degraded (>25% Lstat timeouts), skipping prune this cycle",
-					"timeouts", lstatTimeouts,
-					"total_probes", len(toDelete),
-				)
-				toDelete = nil
-			} else {
-				toDelete = verified
-			}
+			toDelete, prunedFUSEpresent = rc.verifyPruneCandidates(toDelete, fastConfirmed, ladderCounts)
 		}
 	}
 
@@ -1558,13 +2054,48 @@ func (rc *RedisClient) syncMetadata() error {
 		}
 	}
 
+	// Review fix: schedule the fast-path continuation only when capped AND
+	// fast-confirmed paths actually survived the filters into the executed
+	// delete — a fully-spared backlog (all pinned/spool-pending) or a
+	// zero-progress probe cycle must fall back to the periodic backstop, not
+	// chain back-to-back full SCANs. pruneFollowUp makes the follow-up bypass
+	// the keyspace-push deferral and flap debounce in reconcileLoop: it is a
+	// self-scheduled continuation of an already-authoritative SCAN, not a
+	// network-flap trigger (without it the accelerator is inert in the
+	// deployed push-enabled config).
+	if fastCapped && len(fastConfirmed) > 0 {
+		survived := false
+		for _, p := range toDelete {
+			if _, ok := fastConfirmed[p]; ok {
+				survived = true
+				break
+			}
+		}
+		if survived {
+			rc.pruneFollowUp.Store(true)
+			rc.TriggerSync()
+		}
+	}
+
 	duration := time.Since(start)
+	syncedAt := time.Now()
 	rc.mu.Lock()
 	rc.lastSyncDuration = duration
-	rc.lastSyncTime = time.Now()
+	rc.lastSyncTime = syncedAt
 	rc.lastSyncEntries = len(redisEntries)
 	pendingPrune := len(rc.pruneAbsent)
 	rc.mu.Unlock()
+
+	// C1 (2026-07-02): persist the successful-sync wall clock durably so the
+	// NEXT boot can decide (via ShouldSkipBootSync) whether the mirror is fresh
+	// enough to skip the redundant boot SCAN when keyspace push is engaged.
+	// Best-effort: a write error here must not fail the sync (it only costs the
+	// next boot a SCAN it could have skipped), so it is logged and swallowed.
+	if rc.store != nil {
+		if err := rc.store.SetMeta(metaKeyLastSyncTime, strconv.FormatInt(syncedAt.Unix(), 10)); err != nil {
+			jmlog.Warn("failed to persist last_sync_time (next boot may re-SCAN)", "error", err.Error())
+		}
+	}
 
 	jmlog.Info("metadata sync complete",
 		"entries", len(redisEntries),
@@ -1577,4 +2108,179 @@ func (rc *RedisClient) syncMetadata() error {
 		"duration_ms", duration.Round(time.Millisecond).Milliseconds(),
 	)
 	return nil
+}
+
+// trackAbsentPaths advances the pruneAbsent counter ladder from one full-SCAN
+// cycle's view (extracted from syncMetadata for task #78 so the tracking
+// policy is unit-testable).
+//
+// Task #78: paths STRICTLY UNDER scan-filtered namespaces (.trash/…,
+// .juicemount/… — see scanFilteredDescendant) are NEVER tracked. The SCAN
+// structurally cannot return them, so "absent from the SCAN" carries zero
+// delete signal for them; tracking them created a permanent ~112k
+// pending_prune floor (live-probed 2026-07-02), inflated every diff
+// iteration, and fueled the pre-G6 Layer-A probe storms. The cleanup loop
+// also actively drops any filtered-namespace counter (belt-and-braces —
+// pruneAbsent is in-memory, so restart already clears pre-fix counters).
+//
+// Batch-3 adversarial review #5: the BARE ".trash"/".juicemount" dir rows
+// (spared by the open-GC) ARE tracked — scanFilteredDescendant, not
+// scanFilteredPath. While the namespace exists on FUSE, the Layer-A Lstat
+// probe spares them every cycle (2 bounded probes, negligible); if the
+// backend namespace is ever genuinely removed, this is the ONLY path that
+// can prune the ghost dir row. The `._` AppleDouble guard stays where it
+// was: at qualification time in syncMetadata (sidecars ARE tracked but
+// never pruned).
+func (rc *RedisClient) trackAbsentPaths(existingPaths, redisPaths map[string]struct{}, skipIncrement bool) {
+	for p := range existingPaths {
+		if _, inRedis := redisPaths[p]; !inRedis {
+			if !skipIncrement && !scanFilteredDescendant(p) {
+				rc.pruneAbsent[p]++
+			}
+		} else {
+			delete(rc.pruneAbsent, p)
+		}
+	}
+	// Remove stale entries from pruneAbsent: paths already deleted from
+	// SQLite, and (task #78) scan-filtered-namespace-descendant counters.
+	for p := range rc.pruneAbsent {
+		if _, exists := existingPaths[p]; !exists || scanFilteredDescendant(p) {
+			delete(rc.pruneAbsent, p)
+		}
+	}
+}
+
+// verifyPruneCandidates is the prune ladder's Layer A: per-path FUSE Lstat
+// verification (QA-30), extracted from syncMetadata by V2.3 G6 (task #79) so
+// its bounding is unit-testable. Even non-pinned paths shouldn't be pruned if
+// FUSE still shows them present — that means JuiceFS still has them, Redis
+// SCAN just happened to miss them this cycle. Each Lstat capped at 1s so a
+// FUSE wedge can't pin the reconcile goroutine. If more than 25% of probes
+// time out, treat FUSE as degraded and skip the whole prune (defensive —
+// degraded FUSE plus blind prune was what surfaced the bug in production).
+//
+// V2.3 G6 bounding (task #79, proven live 2026-07-02): the loop is bounded
+// the same way as collectFastPathPrunes — layerAProbeCap probes / a
+// layerAProbeBudget wall clock. Without bounds, a large permanent candidate
+// backlog (~112k from a SCAN-coverage bug) ran 86s on LAN and ~90 min over a
+// cellular relay, saturating the link. Once EITHER bound trips, every
+// remaining unprobed LADDER candidate is deferred: NOT pruned this cycle and
+// re-inserted into rc.pruneAbsent at its prior counter (from ladderCounts, or
+// PruneThreshold if unknown), so it keeps its ladder position and re-qualifies
+// on the very next cycle. fastConfirmed entries are exempt from all gates —
+// their subtree root was FUSE-confirmed this same cycle (G5), so re-Lstat'ing
+// 120k descendants individually is exactly what root-level confirmation
+// exists to avoid.
+//
+// Class gate: on the metered/tunnel band (currentLinkClass() == classTunnel:
+// utun*/tailscale0/JM_WAN_MODE=1 — same accessor as the keyspace backstop and
+// coalescer gating) ladder candidates are NEVER probed — each Lstat costs an
+// NFS/FUSE round-trip over the metered link (~50ms each observed on the
+// cellular relay). All ladder candidates are deferred; deferral is the
+// fail-safe direction (a delayed prune costs a cycle of stale entries, an
+// unverified prune is the ESTALE bug class). fastConfirmed entries still
+// prune: they were root-verified already.
+//
+// Kill switch: JM_LAYERA_BUDGET=0 (read per call, like JM_PRUNE_FASTPATH)
+// restores the pre-G6 unbounded, un-gated behavior exactly.
+//
+// Caller contract: single-writer — runs on syncMetadata's goroutine only
+// (rc.pruneAbsent mutation). rc.fuseRoot must be non-empty. Returns the
+// verified (prunable) subset — nil when the FUSE-degraded bail trips — plus
+// the count of FUSE-present spared paths.
+func (rc *RedisClient) verifyPruneCandidates(toDelete []string, fastConfirmed map[string]struct{}, ladderCounts map[string]int) (prunable []string, fusePresent int) {
+	unbounded := os.Getenv("JM_LAYERA_BUDGET") == "0"
+	deferClass := !unbounded && currentLinkClass() == classTunnel
+	if rc.pruneAbsent == nil {
+		rc.pruneAbsent = make(map[string]int)
+	}
+	verified := toDelete[:0]
+	lstatTimeouts, probed, deferred := 0, 0, 0
+	probeStart := time.Now()
+	for _, p := range toDelete {
+		// V2.3 G5: fast-path entries were already FUSE-confirmed at
+		// their subtree root this same cycle.
+		if _, ok := fastConfirmed[p]; ok {
+			verified = append(verified, p)
+			continue
+		}
+		// V2.3 G6: defer the remaining ladder candidates once the class gate
+		// or either budget bound trips. Re-insert at the prior counter so the
+		// ladder position survives (see doc comment).
+		if deferClass || (!unbounded &&
+			(probed >= layerAProbeCap || time.Since(probeStart) > layerAProbeBudget)) {
+			deferred++
+			count, ok := ladderCounts[p]
+			if !ok {
+				count = PruneThreshold
+			}
+			rc.pruneAbsent[p] = count
+			continue
+		}
+		fusePath := rc.fusePathFor(p)
+		if fusePath == "" {
+			verified = append(verified, p)
+			continue
+		}
+		probed++
+		isAbsent, ok := lstatNotExistWithTimeout(fusePath, time.Second)
+		if !ok {
+			lstatTimeouts++
+			// Review fix: a timed-out candidate keeps its ladder position
+			// (same re-insertion as the defer branch) instead of restarting
+			// the 10-cycle climb — timeout is FUSE slowness, not evidence
+			// about the path.
+			count, ok2 := ladderCounts[p]
+			if !ok2 {
+				count = PruneThreshold
+			}
+			rc.pruneAbsent[p] = count
+			continue
+		}
+		if isAbsent {
+			verified = append(verified, p)
+		} else {
+			fusePresent++ // FUSE says it's there — keep it
+		}
+	}
+	if deferred > 0 {
+		reason := "budget"
+		if deferClass {
+			reason = "class_gate"
+		}
+		jmlog.Info("metadata sync: Layer-A prune verification bounded — deferring unprobed candidates (G6)",
+			"reason", reason,
+			"class", currentLinkClass().String(),
+			"probed", probed,
+			"verified", len(verified),
+			"deferred", deferred,
+			"elapsed_ms", time.Since(probeStart).Round(time.Millisecond).Milliseconds(),
+		)
+	}
+	// QA-30 code review HIGH-3: absolute floor of timeouts before bailing
+	// the whole cycle. Without this, a small batch (N<=3) trips the bail on
+	// a single transient timeout — effectively a 100%/50%/33% threshold
+	// instead of the intended 25%. Small batches handle individual timeouts
+	// fine via the `continue` above (paths simply stay unpruned this cycle,
+	// retried next time).
+	//
+	// Review fixes (G6/U1 adversarial review): the ratio denominator is
+	// `probed`, not len(toDelete) — the budget caps probes at 2048 and the
+	// list also contains deferred + fastConfirmed entries, so the old
+	// denominator made the bail unreachable on exactly the large backlogs it
+	// protects against. And under the 3s budget at most 3 serial 1s
+	// timeouts can occur before deferral kicks in, so the floor is 3 when
+	// budgeted (4 unbounded, preserving QA-30's original constant there).
+	bailFloor := 4
+	if !unbounded {
+		bailFloor = 3
+	}
+	if lstatTimeouts >= bailFloor && lstatTimeouts*4 > probed {
+		jmlog.Warn("metadata sync: FUSE degraded (>25% Lstat timeouts), skipping prune this cycle",
+			"timeouts", lstatTimeouts,
+			"total_probes", probed,
+		)
+		return nil, fusePresent
+	}
+	return verified, fusePresent
 }
