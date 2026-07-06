@@ -2617,6 +2617,16 @@ func NFSServerCacheStatus() *C.char {
 	cs.CacheUsedBytes = cs.Capacity.CacheUsageBytes // fallback: cache-dir du
 	if bc, ok := pin.BlockCacheBytes(); ok {
 		cs.CacheUsedBytes = bc // authoritative block-cache gauge
+		// Clamp DOWN to the on-disk cache-dir du. After "Clear Cache" we
+		// os.Remove the chunk files behind the JuiceFS daemon's back, so its
+		// in-memory juicefs_blockcache_bytes gauge lingers stale-high until the
+		// daemon independently rescans — while the du already reflects the
+		// emptied dir. Never report more cached than is physically on disk; that
+		// stale-high gauge is the "X cached doesn't reset after Clear Cache"
+		// symptom. Normal operation: du ≈ gauge, so this is a no-op.
+		if du := cs.Capacity.CacheUsageBytes; du >= 0 && du < cs.CacheUsedBytes {
+			cs.CacheUsedBytes = du
+		}
 	}
 	if a, err := pinStore.AggregateStats(); err == nil {
 		cs.Aggregate = a
