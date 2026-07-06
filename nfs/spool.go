@@ -294,6 +294,12 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	const reopenPoll = 10 * time.Millisecond
 	const reopenMaxWait = 30 * time.Second
 	var waited time.Duration
+	// sawClosed records that we encountered a FINALIZED (closed) entry for this
+	// path — i.e. this is a reopen of a file that is draining, not a brand-new
+	// create. If that entry then drains+evicts, we must NOT create a fresh spool
+	// entry (its drain would os.Create-truncate the just-drained backend file and
+	// clobber it); the write is bounced to the in-place fdPool path instead.
+	var sawClosed bool
 
 	// Same path always maps to the same shard, so the check-then-create
 	// dedup below is serialized exactly as the old global openMu did; opens
@@ -322,6 +328,7 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 			// Finalized-but-not-yet-drained entry holds this path. Don't
 			// reuse (writes would fail) and don't create a competing entry
 			// (dup drain). Wait for the drainer to evict it.
+			sawClosed = true
 			busyID := existing.id
 			existing.mu.Unlock()
 			shard.Unlock()
@@ -341,6 +348,21 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 			time.Sleep(reopenPoll)
 			waited += reopenPoll
 			continue
+		}
+
+		// A reopen whose prior (finalized) entry has now drained+evicted: do NOT
+		// create a fresh spool entry. That fresh entry's drain would
+		// os.Create-truncate the just-drained backend file and clobber it (probe:
+		// TestReopenAfterDrainSpoolLevelCorruptionProbe). The file is durably in
+		// FUSE now, so bounce the write with ErrSpoolBusy → NFS3ERR_JUKEBOX; the
+		// client retries, LookupActive is then false, and the handler routes it
+		// to the in-place fdPool path (no truncate). Only a genuinely NEW path
+		// (never saw a closed entry) falls through to create a fresh entry.
+		if sawClosed {
+			shard.Unlock()
+			jmlog.Info("spool: OpenWrite reopen after drain-evict — deferring to in-place FUSE path (no destructive fresh entry)",
+				"path", nfsPath, "waited_ms", waited.Milliseconds())
+			return nil, ErrSpoolBusy
 		}
 
 		// No entry for this path — create a fresh one under the path shard.

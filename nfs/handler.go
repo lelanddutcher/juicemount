@@ -2566,7 +2566,21 @@ func (jfs *juiceFS) CommitFile(path string) error {
 	}
 	path = strings.TrimPrefix(path, "/")
 	if e, ok := jfs.handler.spool.Index().Lookup(path); ok {
-		return e.Sync()
+		start := time.Now()
+		err := e.Sync()
+		// #105 COMMIT instrumentation: capture macOS's COMMIT cadence on a real
+		// export. written_end = how many bytes the client has asked to make
+		// durable; since_last_write_ms distinguishes a close-time COMMIT (large,
+		// after writes stopped) from a periodic mid-write COMMIT (writes still
+		// flowing). This decides whether a COMMIT is a reliable "done" signal we
+		// can finalize on, or periodic (needs the reopen-safety guard first).
+		// COMMITs are infrequent vs WRITEs, so Info is not a hot-path flood.
+		jmlog.Info("spool: COMMIT",
+			"path", path,
+			"written_end", e.WrittenEnd(),
+			"since_last_write_ms", time.Since(e.LastWrite()).Milliseconds(),
+			"sync_ms", time.Since(start).Milliseconds())
+		return err
 	}
 	return nil
 }
@@ -3719,9 +3733,10 @@ func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 // Finder doesn't show the red "no access" badge on the mount root.
 type rootDirInfo struct{}
 
-func (r *rootDirInfo) Name() string       { return "" }
-func (r *rootDirInfo) Size() int64        { return 0 }
-func (r *rootDirInfo) Mode() fs.FileMode  { return fs.ModeDir | 0755 }
+func (r *rootDirInfo) Name() string      { return "" }
+func (r *rootDirInfo) Size() int64       { return 0 }
+func (r *rootDirInfo) Mode() fs.FileMode { return fs.ModeDir | 0755 }
+
 // rootMtime is a STABLE modification time for the synthetic mount root, set once
 // at process start. Previously rootDirInfo.ModTime() returned time.Now() on EVERY
 // stat, so the root's mtime jittered on every LOOKUP/GETATTR — macOS Tahoe's Finder
