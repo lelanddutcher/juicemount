@@ -3272,9 +3272,25 @@ func (f *cachedFile) Name() string { return f.name }
 // "silent torn-read on concurrent NFS reads".
 var cacheReaderServeEnabled = os.Getenv("JM_ENABLE_CACHE_READER") == "1"
 
+// memBufServeEnabled gates serving reads from the in-RAM small-file buffer.
+// DISABLED by default (2026-07-05): the RAM buffer can cache a file that it
+// loaded during a transient partial-size window (the #85 stale/truncated
+// GETATTR-size window while a fresh write is still draining) — it reads only
+// the partial length, caches it AS COMPLETE, and never re-validates. It then
+// serves that truncated image from RAM until the process restarts (RAM is
+// cleared), so an image that finished draining correctly still renders as a
+// BLACK FRAME in Premiere until JuiceMount is relaunched — "exclusively image
+// media, fixed by a restart" (RC field report). Video bypasses membuf (over
+// the size threshold), which is why only images were affected. Same class of
+// stale-cache bug that already keeps the SSD block cache (Priority 2) OFF; the
+// coherent FUSE path (Priority 3) is correct AND fast for small files, so
+// disabling this "costs almost nothing." Re-enable only after membuf gains
+// size-revalidation + invalidation-on-content-change.
+var memBufServeEnabled = os.Getenv("JM_ENABLE_MEMBUF_SERVE") == "1"
+
 func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	// Priority 1: Memory buffer (zero-syscall, for small files like .prproj, LUTs)
-	if f.memBuf != nil {
+	if memBufServeEnabled && f.memBuf != nil {
 		n, hit := f.memBuf.ReadAt(f.name, p, off, f.fileSize, f.fusePath)
 		if hit {
 			if f.readahead != nil {
