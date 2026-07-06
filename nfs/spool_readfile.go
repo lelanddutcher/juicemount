@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -96,7 +97,12 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 		// the real size BEFORE it evicts+unlinks), so signal the protocol layer to
 		// make the client REOPEN onto the drained copy (NFS3ERR_NOENT) rather than
 		// fail the read — a terminal NFSStatusIO here would abort the copy (100060).
-		if os.IsNotExist(err) {
+		// errors.Is (NOT os.IsNotExist): OpenForRead wraps the open failure with
+		// %w ("spool: open read: %w"), and os.IsNotExist does NOT unwrap — so it
+		// returned false on the drain-evict race, dropping through to a terminal
+		// NFS3ERR_IO that ABORTS the copy instead of NFS3ERR_NOENT (which makes
+		// the client reopen onto the drained FUSE copy). errors.Is unwraps.
+		if errors.Is(err, os.ErrNotExist) {
 			return 0, pin.ErrSpoolDrained
 		}
 		return 0, err
@@ -141,6 +147,12 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 		// ._ sidecars skip the hold entirely (readEnd==wend already, so off>=wend
 		// here → plain EOF, matching a durable local server).
 		if !f.isAppleDouble && off < wend && time.Since(f.entry.LastWrite()) < pin.SpoolIncompleteStallWindow {
+			// Diagnostic (throttled): a real (non-._) file JUKEBOX-held because
+			// the read offset is past the contiguous prefix but below the
+			// high-water. Post-coalesce-fix this should be rare (a genuine
+			// not-yet-arrived hole); a burst keyed to an export path at its end
+			// is the "connection interrupted" smoking gun.
+			f.entry.logInflightJukebox(f.name, off, cend, wend)
 			return 0, pin.ErrSpoolIncomplete
 		}
 		return 0, io.EOF

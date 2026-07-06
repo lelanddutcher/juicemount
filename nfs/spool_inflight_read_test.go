@@ -138,57 +138,103 @@ func TestSpoolSequentialReadTracksContiguous(t *testing.T) {
 	}
 }
 
-// TestSpoolFinalizeAdvancesContiguousEnd is the regression test for task #65's
-// CORE bug: under parallel / out-of-order NFS WRITEs, the in-flight contiguousEnd
-// tracker advances only on in-order writes and LAGS far behind writtenEnd (a 1GiB
-// cp was observed stuck at 6MiB). The Stat read-shadow reports contiguousEnd as
-// the file SIZE, so a lagged value made the NFS client cap reads and silently
-// TRUNCATE the tail of a file read while it drained (the client never even issued
-// a tail READ). On finalize the writer has closed and every byte 0..writtenEnd is
-// on disk, so contiguousEnd must advance to writtenEnd → the full file readable.
-func TestSpoolFinalizeAdvancesContiguousEnd(t *testing.T) {
+// TestSpoolOutOfOrderCoalescesContiguousEnd is the regression test for the
+// end-of-export "connection interrupted" bug. Under macOS's parallel / out-of-
+// order WRITE dispatch, contiguousEnd used to advance only to the filling
+// write's end, leaving it STUCK below already-written higher bytes (a 1GiB cp
+// was observed stuck at 6MiB) until finalize ~30s later — so an end-of-export
+// re-READ of the already-written tail JUKEBOX-held for up to the 90s stall
+// window, past the client's ~40s soft-mount timeout. advanceContiguousLocked
+// now COALESCES: filling a gap pulls in every already-written extent above it,
+// so contiguousEnd reaches writtenEnd IMMEDIATELY (no finalize) and the tail
+// read serves real bytes at once. PRE-FIX this test fails at the post-fill
+// ContiguousEnd assertion (stuck at 8192) and the tail JUKEBOXes.
+func TestSpoolOutOfOrderCoalescesContiguousEnd(t *testing.T) {
 	s := newTestSpoolStore(t, 0)
 	e, err := s.OpenWrite("/oof.bin")
 	if err != nil {
 		t.Fatalf("OpenWrite: %v", err)
 	}
 
-	// Out-of-order writes that leave contiguousEnd LAGGING: [0,4K), then [8K,12K)
-	// (a hole at [4K,8K) → contiguousEnd stays 4K), then fill [4K,8K). The advance
-	// only bumps contiguousEnd to the filling write's end (8K), NOT past the
-	// already-written [8K,12K), so contiguousEnd lags at 8K while writtenEnd=12K.
-	blk := bytes.Repeat([]byte{0xCD}, 4096)
-	for _, off := range []int64{0, 8192, 4096} {
-		if _, err := e.WriteAt(blk, off); err != nil {
-			t.Fatalf("WriteAt %d: %v", off, err)
+	blk0 := bytes.Repeat([]byte{0xC0}, 4096)
+	blk8 := bytes.Repeat([]byte{0xC8}, 4096)
+	blk4 := bytes.Repeat([]byte{0xC4}, 4096)
+
+	// Out-of-order: [0,4K), then [8K,12K) — leaves a GENUINE hole at [4K,8K).
+	if _, err := e.WriteAt(blk0, 0); err != nil {
+		t.Fatalf("WriteAt 0: %v", err)
+	}
+	if _, err := e.WriteAt(blk8, 8192); err != nil {
+		t.Fatalf("WriteAt 8192: %v", err)
+	}
+	if got := e.ContiguousEnd(); got != 4096 {
+		t.Fatalf("pre-fill ContiguousEnd = %d, want 4096 (hole below the far write)", got)
+	}
+	// A read into the GENUINE hole [4K,8K) must still JUKEBOX — never serve zeros.
+	{
+		rf := &spoolReadFile{name: "/oof.bin", entry: e}
+		hole := make([]byte, 16)
+		n, herr := rf.ReadAt(hole, 5000)
+		_ = rf.Close()
+		if n != 0 || !pin.IsSpoolIncomplete(herr) {
+			t.Fatalf("genuine-hole read: n=%d err=%v, want n=0 ErrSpoolIncomplete (no zeros)", n, herr)
 		}
+	}
+
+	// Fill the gap [4K,8K). THE FIX: contiguousEnd must jump straight to 12K,
+	// coalescing the already-written [8K,12K) — not stop at 8K.
+	if _, err := e.WriteAt(blk4, 4096); err != nil {
+		t.Fatalf("WriteAt 4096 (fill): %v", err)
+	}
+	if got := e.ContiguousEnd(); got != 12288 {
+		t.Fatalf("post-fill ContiguousEnd = %d, want 12288 (coalesced past already-written [8K,12K)); pre-fix it stuck at 8192 and the tail JUKEBOXed", got)
 	}
 	if got := e.WrittenEnd(); got != 12288 {
 		t.Fatalf("WrittenEnd = %d, want 12288", got)
 	}
-	if got := e.ContiguousEnd(); got >= e.WrittenEnd() {
-		t.Fatalf("ContiguousEnd = %d — expected it to LAG behind writtenEnd %d pre-finalize (the bug)", got, e.WrittenEnd())
-	}
 
-	// Finalize (writer closed). Every byte is on disk now → contiguousEnd must
-	// advance to writtenEnd.
-	if err := e.Close(); err != nil {
-		t.Fatalf("Close/finalize: %v", err)
-	}
-	if got := e.ContiguousEnd(); got != 12288 {
-		t.Fatalf("ContiguousEnd after finalize = %d, want 12288 (= writtenEnd); otherwise the Stat shadow reports short and the NFS client truncates the tail", got)
-	}
-
-	// The read shadow now serves the tail that was previously past contiguousEnd.
+	// The end-of-export re-READ of the already-written tail [8K,12K) must serve
+	// the real bytes immediately — NO JUKEBOX, NO finalize. This is the exact
+	// read that produced "connection interrupted" pre-fix.
 	rf := &spoolReadFile{name: "/oof.bin", entry: e}
 	defer rf.Close()
 	tail := make([]byte, 4096)
 	n, err := rf.ReadAt(tail, 8192)
 	if err != nil && err != io.EOF {
-		t.Fatalf("tail ReadAt: %v", err)
+		t.Fatalf("tail ReadAt: %v (want the bytes, not a JUKEBOX hold)", err)
 	}
-	if n != 4096 || !bytes.Equal(tail[:n], blk) {
-		t.Fatalf("tail read after finalize: n=%d match=%v, want 4096 + correct bytes (no truncation)", n, bytes.Equal(tail[:n], blk))
+	if n != 4096 || !bytes.Equal(tail[:n], blk8) {
+		t.Fatalf("tail read: n=%d match=%v, want 4096 + correct bytes (no JUKEBOX, no zeros)", n, bytes.Equal(tail[:n], blk8))
+	}
+}
+
+// TestSpoolFinalizeForcesContiguousOverGenuineHole locks the finalize safety
+// net: a preallocated-but-only-partially-filled file has a GENUINE sparse hole
+// (contiguousEnd < writtenEnd even after coalescing — nothing filled it). On
+// finalize the writer is gone and the file is complete (the hole's zeros ARE
+// its content), so contiguousEnd advances to writtenEnd and the file is fully
+// readable. Distinct from the out-of-order case, which now coalesces mid-write.
+func TestSpoolFinalizeForcesContiguousOverGenuineHole(t *testing.T) {
+	s := newTestSpoolStore(t, 0)
+	e, err := s.OpenWrite("/prealloc.bin")
+	if err != nil {
+		t.Fatalf("OpenWrite: %v", err)
+	}
+	const size = 12288
+	if err := e.Truncate(size); err != nil { // preallocate → hole [0,size)
+		t.Fatalf("Truncate: %v", err)
+	}
+	if _, err := e.WriteAt(bytes.Repeat([]byte{0xAA}, 4096), 0); err != nil { // fill only [0,4K)
+		t.Fatalf("WriteAt: %v", err)
+	}
+	if got := e.ContiguousEnd(); got != 4096 {
+		t.Fatalf("pre-finalize ContiguousEnd = %d, want 4096 (genuine hole above)", got)
+	}
+	if err := e.Close(); err != nil { // finalize
+		t.Fatalf("Close/finalize: %v", err)
+	}
+	if got := e.ContiguousEnd(); got != size {
+		t.Fatalf("post-finalize ContiguousEnd = %d, want %d (finalize force-advance safety net)", got, size)
 	}
 }
 

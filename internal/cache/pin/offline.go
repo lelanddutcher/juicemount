@@ -275,6 +275,19 @@ var ErrSpoolDrained = errors.New("spool: file drained+evicted before read (reope
 // IsSpoolDrained reports whether err is (or wraps) ErrSpoolDrained.
 func IsSpoolDrained(err error) bool { return errors.Is(err, ErrSpoolDrained) }
 
+// ErrSpoolBusy signals a WRITE that arrived for a path whose PRIOR spool entry
+// was finalized but is still draining (not yet evicted). It is RETRYABLE: the
+// drain evicts the shadow shortly, after which a fresh entry accepts the write.
+// The write path maps this to NFS3ERR_JUKEBOX so the client backs off and
+// retries — rather than a hard EACCES that would abort a copy/export at its
+// final (e.g. faststart moov seek-back) WRITE. Lives here, like
+// ErrSpoolIncomplete, so the internal/nfs handler can recognize it without an
+// internal/nfs <- nfs import cycle; the nfs-package spool.ErrSpoolBusy wraps it.
+var ErrSpoolBusy = errors.New("spool: path busy (prior entry still draining)")
+
+// IsSpoolBusy reports whether err is (or wraps) ErrSpoolBusy.
+func IsSpoolBusy(err error) bool { return errors.Is(err, ErrSpoolBusy) }
+
 // SpoolIncompleteStallWindow bounds how long a read of a not-yet-written spool
 // hole is held with JUKEBOX before giving up (EOF/terminal). Keyed off the
 // entry's LAST WRITE (applied where the entry is available, in the nfs-side read

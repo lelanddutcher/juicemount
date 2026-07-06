@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"hash"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -38,9 +38,13 @@ var ErrSpoolFull = fmt.Errorf("spool: capacity full: %w", syscall.ENOSPC)
 
 // ErrSpoolBusy is returned by OpenWrite when a previous entry for the same
 // path was finalized but is still draining and did not clear within the
-// bounded wait. The handler maps this to a retryable NFS status so the
-// client retries (by which point the drain has almost always completed).
-var ErrSpoolBusy = errors.New("spool: path busy (prior entry still draining)")
+// bounded wait. It WRAPS pin.ErrSpoolBusy so the internal/nfs write handler —
+// which cannot import this package — recognizes it via pin.IsSpoolBusy and maps
+// it to the retryable NFS3ERR_JUKEBOX, so the client retries (by which point
+// the drain has almost always evicted the shadow) instead of aborting the copy
+// on a hard EACCES. errors.Is(err, ErrSpoolBusy) still works by identity for
+// in-package callers/tests.
+var ErrSpoolBusy = fmt.Errorf("spool: path busy (prior entry still draining): %w", pin.ErrSpoolBusy)
 
 // DefaultStuckEscalationWindow is how long an entry may sit QUIESCENT (no
 // writes) with refcount>0 before the sweeper treats the handles as leaked
@@ -318,9 +322,20 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 			// Finalized-but-not-yet-drained entry holds this path. Don't
 			// reuse (writes would fail) and don't create a competing entry
 			// (dup drain). Wait for the drainer to evict it.
+			busyID := existing.id
 			existing.mu.Unlock()
 			shard.Unlock()
+			if waited == 0 {
+				// First park for this OpenWrite: a WRITE (classically a
+				// faststart moov seek-back at end-of-export) arrived for a path
+				// whose prior entry finalized mid-copy and is still draining.
+				jmlog.Info("spool: OpenWrite waiting for finalized-not-drained entry to evict",
+					"path", nfsPath, "entry_id", busyID)
+			}
 			if waited >= reopenMaxWait {
+				jmlog.Warn("spool: OpenWrite gave up waiting for drain-evict — returning ErrSpoolBusy (client retries via JUKEBOX)",
+					"path", nfsPath, "entry_id", busyID,
+					"waited_ms", waited.Milliseconds(), "reopen_max_ms", reopenMaxWait.Milliseconds())
 				return nil, ErrSpoolBusy
 			}
 			time.Sleep(reopenPoll)
@@ -1535,6 +1550,12 @@ type SpoolEntry struct {
 	// each writing-extending WriteAt.
 	lastWrite atomic.Int64
 
+	// lastJukeboxLogNs throttles the in-flight-hole JUKEBOX diagnostic log
+	// (spoolReadFile.ReadAt) to ~1 line per entry per 2s, so a genuine hold
+	// with a retrying client can't flood the log (the JM_LOOKUP_TRACE lesson).
+	// Atomic — read/written from the read path without holding mu.
+	lastJukeboxLogNs atomic.Int64
+
 	mu         sync.RWMutex
 	file       *os.File // nil after Close
 	writtenEnd int64
@@ -1547,8 +1568,22 @@ type SpoolEntry struct {
 	// NLE reading a still-copying clip would get black frames / corrupt RAW),
 	// so the read shadow clamps to contiguousEnd. Monotonic; guarded by mu.
 	contiguousEnd int64
-	hasher        hash.Hash
-	sha256        []byte // populated on Close iff streaming hash is trustworthy
+	// writtenExtents tracks already-written regions that lie ABOVE
+	// contiguousEnd — the out-of-order writes macOS's parallel WRITE dispatch
+	// produces (each WRITE RPC runs on its own goroutine over one TCP conn, so
+	// they land out of order). When a later write fills the gap below such a
+	// region, advanceContiguousLocked coalesces it in so contiguousEnd jumps
+	// past ALL now-contiguous bytes — instead of the old single-chunk advance
+	// that left contiguousEnd stuck far below writtenEnd (a 1GiB cp was observed
+	// stuck at 6MiB) until finalize, JUKEBOX-holding end-of-export re-reads of
+	// already-written bytes past the client's soft-mount timeout. Coalesced,
+	// sorted by start, every entry strictly above contiguousEnd. Guarded by mu.
+	// Bounded small in practice (reorder window is shallow; entries collapse as
+	// gaps fill). NEVER holds an unwritten range — an extent is recorded only
+	// AFTER a successful pwrite, preserving the never-serve-a-hole invariant.
+	writtenExtents []spoolExtent
+	hasher         hash.Hash
+	sha256         []byte // populated on Close iff streaming hash is trustworthy
 	// hashValid tracks whether the streaming hasher reflects the on-disk
 	// contents. False once we observe any out-of-order WriteAt (off <
 	// current writtenEnd) — sparse / out-of-order writes make the streaming
@@ -1729,6 +1764,103 @@ func (e *SpoolEntry) StreamingHashValid() bool {
 // Out-of-order detection: if off < the current writtenEnd, the streaming
 // hash diverges from the file's at-rest hash. We mark hashValid=false so
 // the drainer knows to re-hash from disk rather than trust SHA256().
+// spoolExtent is a half-open written byte range [start,end) recorded above
+// contiguousEnd while an out-of-order writer leaves a gap below it.
+type spoolExtent struct{ start, end int64 }
+
+// advanceContiguousLocked records the just-written range [off,end) and advances
+// e.contiguousEnd past every already-written region it makes contiguous. MUST
+// be called with e.mu held, AFTER the bytes are durably pwritten. It preserves
+// the never-serve-a-hole invariant: contiguousEnd only ever moves across ranges
+// that were actually written (this range, or a previously-recorded extent),
+// never across a still-unwritten gap.
+func (e *SpoolEntry) advanceContiguousLocked(off, end int64) {
+	if end <= e.contiguousEnd {
+		// Entirely within the readable prefix — an in-place overwrite of
+		// already-contiguous bytes. Nothing to advance.
+		return
+	}
+	if off <= e.contiguousEnd {
+		// Touches/extends the prefix. Absorb it, then pull in every recorded
+		// extent now contiguous with the grown prefix.
+		e.contiguousEnd = end
+		for len(e.writtenExtents) > 0 && e.writtenExtents[0].start <= e.contiguousEnd {
+			if e.writtenExtents[0].end > e.contiguousEnd {
+				e.contiguousEnd = e.writtenExtents[0].end
+			}
+			e.writtenExtents = e.writtenExtents[1:]
+		}
+		if len(e.writtenExtents) == 0 {
+			e.writtenExtents = nil // reclaim the backing array
+		}
+		return
+	}
+	// Starts strictly above the prefix: an out-of-order write leaving a hole
+	// below it. Remember it (coalesced); it advances contiguousEnd once the gap
+	// below fills.
+	e.writtenExtents = insertExtent(e.writtenExtents, off, end)
+}
+
+// insertExtent inserts [s,e) into a start-sorted, coalesced extent slice,
+// merging any overlapping OR directly-adjacent ranges. The slice is tiny in
+// practice (the client's reorder window is shallow), so a sort+sweep per insert
+// is cheaper than the bookkeeping to avoid it.
+func insertExtent(exts []spoolExtent, s, e int64) []spoolExtent {
+	exts = append(exts, spoolExtent{s, e})
+	sort.Slice(exts, func(i, j int) bool { return exts[i].start < exts[j].start })
+	out := exts[:0]
+	for _, x := range exts {
+		if len(out) > 0 && x.start <= out[len(out)-1].end {
+			if x.end > out[len(out)-1].end {
+				out[len(out)-1].end = x.end
+			}
+			continue
+		}
+		out = append(out, x)
+	}
+	return out
+}
+
+// clipExtents drops (or trims) any recorded extent at/above size — used when a
+// SETATTR/Truncate shrink discards bytes the extents referenced, so a later
+// gap-fill can't advance contiguousEnd past bytes that no longer exist.
+func clipExtents(exts []spoolExtent, size int64) []spoolExtent {
+	out := exts[:0]
+	for _, x := range exts {
+		if x.start >= size {
+			continue
+		}
+		if x.end > size {
+			x.end = size
+		}
+		out = append(out, x)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// logInflightJukebox emits a throttled diagnostic for an in-flight-hole JUKEBOX
+// hold on a REAL (non-._) file — the end-of-export "connection interrupted"
+// smoking gun. Throttled to ~1 line / 2s per entry (atomic CAS, no lock) so a
+// genuine hold with a retrying client can't flood the log (the JM_LOOKUP_TRACE
+// lesson). Called from the read path (spoolReadFile.ReadAt) without e.mu.
+func (e *SpoolEntry) logInflightJukebox(name string, off, cend, wend int64) {
+	now := time.Now().UnixNano()
+	last := e.lastJukeboxLogNs.Load()
+	if now-last < int64(2*time.Second) {
+		return
+	}
+	if !e.lastJukeboxLogNs.CompareAndSwap(last, now) {
+		return // another reader just logged for this entry
+	}
+	jmlog.Warn("spool: in-flight read JUKEBOX-held (offset past contiguous prefix)",
+		"path", name, "off", off, "contiguous_end", cend, "written_end", wend,
+		"gap", wend-cend,
+		"since_last_write_ms", time.Since(time.Unix(0, e.lastWrite.Load())).Milliseconds())
+}
+
 func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -1788,16 +1920,17 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 			// whole reservation since we never actually grew the file.
 			e.store.releaseCapacity(reserved)
 		}
-		// Extend the contiguous-written prefix if this write starts at or
-		// before its current end (sequential write, or a backfill that closes
-		// the gap). A write that starts ABOVE contiguousEnd leaves a hole and
-		// does NOT advance it — reads must not see that hole as zeros. This is
-		// conservative for fully out-of-order writers (the prefix lags until
-		// the gap fills) but never serves unwritten data; the dominant
-		// cp/Finder pattern is sequential, so contiguousEnd == writtenEnd.
-		if off <= e.contiguousEnd && end > e.contiguousEnd {
-			e.contiguousEnd = end
-		}
+		// Advance the contiguous-written prefix, COALESCING any already-written
+		// region this write makes contiguous. The old code bumped contiguousEnd
+		// only to this chunk's end, so an out-of-order writer (macOS dispatches
+		// WRITE RPCs on parallel goroutines) that filled a gap left contiguousEnd
+		// stuck below already-written higher bytes — and a read of those bytes
+		// then JUKEBOX-held for up to the 90s stall window, exceeding the client's
+		// ~40s soft-mount timeout ("connection interrupted" at end of export).
+		// advanceContiguousLocked pulls in every recorded extent above the filled
+		// gap; it is called only after a successful pwrite, so it never advances
+		// across an unwritten hole (the never-serve-zeros invariant holds).
+		e.advanceContiguousLocked(off, end)
 		if outOfOrder {
 			e.hashValid = false
 		}
@@ -1856,6 +1989,12 @@ func (e *SpoolEntry) Truncate(size int64) error {
 	if e.contiguousEnd > size {
 		// Shrink past the contiguous prefix: those bytes are gone.
 		e.contiguousEnd = size
+	}
+	// Drop/trim any recorded out-of-order extents the resize discarded, so a
+	// later gap-fill can't advance contiguousEnd past bytes that no longer
+	// exist. A grow adds only an unwritten hole — no extent to record.
+	if len(e.writtenExtents) > 0 {
+		e.writtenExtents = clipExtents(e.writtenExtents, size)
 	}
 	// NB: a GROW/preallocate (size > writtenEnd) leaves contiguousEnd alone —
 	// the extended region is an unwritten hole that reads must not serve.

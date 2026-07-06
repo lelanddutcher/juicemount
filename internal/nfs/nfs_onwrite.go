@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
@@ -64,6 +65,18 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		if errors.Is(err, syscall.ENOSPC) {
 			return &NFSStatusError{NFSStatusNoSPC, err}
 		}
+		// A trailing WRITE (classically a faststart moov seek-back at the very
+		// end of an export) can hit a just-finalized entry that is still
+		// draining; handler OpenFile → spool.OpenWrite returns ErrSpoolBusy
+		// (wraps pin.ErrSpoolBusy). Map it to the RETRYABLE NFS3ERR_JUKEBOX — as
+		// its contract promises — so the client backs off and retries (the drain
+		// evicts the shadow within a copy) instead of a hard EACCES that aborts
+		// the export at its final write ("connection interrupted").
+		if pin.IsSpoolBusy(err) {
+			recordJukebox(inflightOpName(w.req))
+			return &NFSStatusError{NFSStatusJukebox, err}
+		}
+		Log.Errorf("write OpenFile failed → NFS3ERR_ACCES: path=%s off=%d err=%v", fullPath, req.Offset, err)
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 	end := req.Count
