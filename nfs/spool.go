@@ -1930,13 +1930,32 @@ func (e *SpoolEntry) Finalize() error {
 // it mutually exclusive with OpenWrite's reuse path (which also takes e.mu
 // before incrementing refcount), so the sweeper can never finalize an entry
 // a concurrent reopen is about to write to.
+// smallSpoolFinalizeBytes / smallSpoolFinalizeIdle (#105): a SMALL file is
+// written in a single burst with no multi-second mid-write gaps, so it can
+// finalize on a much shorter idle WITHOUT the mid-write-finalize→reopen
+// corruption risk. That corruption needs a write gap LONGER than the window
+// DURING active writing (the sweeper finalizes+drains the partial, then a later
+// write reopens a fresh entry whose drain os.Create-truncates the dest → a
+// zero-prefixed file). A file that writes in well under a second can't produce
+// such a gap. This cuts a Premiere project-save's spool→drain latency from ~30s
+// to ~5s. Large files (video exports/copies) keep the full window as the
+// guardrail — a slow encode or slow source CAN stall > the window mid-write.
+const smallSpoolFinalizeBytes = 16 * 1024 * 1024 // 16 MiB
+const smallSpoolFinalizeIdle = 5 * time.Second
+
 func (e *SpoolEntry) finalizeIfIdle(idle time.Duration) bool {
 	e.mu.Lock()
 	if e.closed || e.refcount != 0 {
 		e.mu.Unlock()
 		return false
 	}
-	if time.Since(time.Unix(0, e.lastWrite.Load())) < idle {
+	// #105 size-gated finalize: small files finalize on the short idle; large
+	// files keep the full (corruption-safe) window.
+	effIdle := idle
+	if size := e.writtenEnd; size > 0 && size <= smallSpoolFinalizeBytes && smallSpoolFinalizeIdle < effIdle {
+		effIdle = smallSpoolFinalizeIdle
+	}
+	if time.Since(time.Unix(0, e.lastWrite.Load())) < effIdle {
 		e.mu.Unlock()
 		return false
 	}
