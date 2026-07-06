@@ -2568,6 +2568,10 @@ func (jfs *juiceFS) CommitFile(path string) error {
 	if e, ok := jfs.handler.spool.Index().Lookup(path); ok {
 		start := time.Now()
 		err := e.Sync()
+		// #105: mark committed so the sweeper finalizes even a large entry on the
+		// short idle — a Premiere save/export close finalizes ~seconds after its
+		// COMMIT instead of waiting the full window (safe via the reopen-defer).
+		e.MarkCommitted()
 		// #105 COMMIT instrumentation: capture macOS's COMMIT cadence on a real
 		// export. written_end = how many bytes the client has asked to make
 		// durable; since_last_write_ms distinguishes a close-time COMMIT (large,

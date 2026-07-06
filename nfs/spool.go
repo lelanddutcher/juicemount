@@ -1614,6 +1614,13 @@ type SpoolEntry struct {
 	// streaming SHA is a usable optimization or just noise.
 	hashValid bool
 	closed    bool
+	// committed records that the client issued an NFS COMMIT for this path — an
+	// explicit durability request. It lets the sweeper finalize the entry on the
+	// SHORT idle even when large (#105), so a Premiere save/export finalizes ~a
+	// few seconds after its close-COMMIT instead of waiting the full window.
+	// Safe because a continuation write during the resulting drain defers to the
+	// in-place fdPool path (OpenWrite sawClosed) rather than corrupting.
+	committed bool
 
 	// refcount is the number of live write handles for this entry (one per
 	// in-flight spoolWriteFile). Guarded by mu. OpenWrite increments on
@@ -2104,16 +2111,31 @@ func (e *SpoolEntry) Finalize() error {
 const smallSpoolFinalizeBytes = 16 * 1024 * 1024 // 16 MiB
 const smallSpoolFinalizeIdle = 5 * time.Second
 
+// MarkCommitted records that the client issued an NFS COMMIT for this entry —
+// an explicit durability request that lets the sweeper finalize it on the short
+// idle even when large (#105). Idempotent; safe under concurrent COMMITs.
+func (e *SpoolEntry) MarkCommitted() {
+	e.mu.Lock()
+	e.committed = true
+	e.mu.Unlock()
+}
+
 func (e *SpoolEntry) finalizeIfIdle(idle time.Duration) bool {
 	e.mu.Lock()
 	if e.closed || e.refcount != 0 {
 		e.mu.Unlock()
 		return false
 	}
-	// #105 size-gated finalize: small files finalize on the short idle; large
-	// files keep the full (corruption-safe) window.
+	// #105 fast finalize: a COMMITted entry (the client explicitly asked for
+	// durability — a Premiere save/export close) OR a SMALL file (written in one
+	// burst) finalizes on the SHORT idle. This cuts a large export's close from
+	// the full window to ~the short idle after its close-COMMIT. Safe now that a
+	// continuation write during the resulting drain defers to the in-place
+	// fdPool path (OpenWrite sawClosed) instead of corrupting; large UNcommitted
+	// files keep the full window as the fallback.
 	effIdle := idle
-	if size := e.writtenEnd; size > 0 && size <= smallSpoolFinalizeBytes && smallSpoolFinalizeIdle < effIdle {
+	small := e.writtenEnd > 0 && e.writtenEnd <= smallSpoolFinalizeBytes
+	if (e.committed || small) && smallSpoolFinalizeIdle < effIdle {
 		effIdle = smallSpoolFinalizeIdle
 	}
 	if time.Since(time.Unix(0, e.lastWrite.Load())) < effIdle {
