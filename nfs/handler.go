@@ -2250,6 +2250,23 @@ func (jfs *juiceFS) StatCacheOnly(filename string) (os.FileInfo, bool) {
 	if e := jfs.handler.store.LookupByPath(filename); e != nil {
 		return e.FileInfo(), true
 	}
+	// Flicker fix: a name being actively written/downloaded lives only in the
+	// spool index until it drains, and its metadata-cache entry races Insert/
+	// Delete during a rename cascade (e.g. Chrome's Unconfirmed.crdownload →
+	// final → "(1)" download churn). Without this fallback a LOOKUP that lands
+	// in that window returns NoEnt for a file that DOES exist → the macOS NFS
+	// client surfaces a transient "connection interrupted" and the file
+	// flickers in and out (the emoji found⇄noent flicker was this exact path).
+	// Mirror the spool short-circuit Stat/Lstat/OpenFile already do so LOOKUP
+	// agrees with them. ~8 ns when the spool is empty (QA-35 benchmarked), so
+	// the guarded-CREATE hot path this also serves is unaffected — and a
+	// genuinely-new name (the CREATE case) is NOT in the spool, so CREATE still
+	// correctly sees "absent" and proceeds.
+	if jfs.handler.spool != nil {
+		if e, ok := jfs.handler.spool.LookupActive(filename); ok {
+			return spoolFileInfoForEntry(path.Base(filename), e), true
+		}
+	}
 	return nil, false
 }
 
