@@ -85,7 +85,7 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 		// cookie equates to index within contents + 2 (for '.' and '..')
 		cookie := uint64(i + 2)
 		if started {
-			maxBytes += 512 // TODO: better estimation.
+			maxBytes += readDirEntryMaxBytes(c.Name())
 			if maxBytes > obj.Count || len(entities) > maxEntities {
 				eof = false
 				break
@@ -183,6 +183,32 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 
 	id := hashPathAndContents(path, contents)
 	return contents, id, nil
+}
+
+// readDirAccurateSizing gates C11: accurate per-entry READDIR size estimation.
+// OFF (default) preserves the historical flat 512-byte/entry over-estimate,
+// which breaks the READDIR page after ~15 entries regardless of the client's
+// Count and forces many small round-trips — marginal on a µs-RTT LAN, real on a
+// high-RTT cellular link. Enable with JM_READDIR_ACCURATE_SIZING=1 after the
+// live big-dir completeness check passes.
+func readDirAccurateSizing() bool { return os.Getenv("JM_READDIR_ACCURATE_SIZING") == "1" }
+
+// readDirEntryMaxBytes returns a CONSERVATIVE upper bound on the XDR-encoded
+// size of one readDirEntity — FileID(8) + Name(4+padded) + Cookie(8) + Next(4)
+// = 24 + namePadded — plus an 8-byte per-entry safety margin. The margin also
+// absorbs the fixed reply-header and '.'/'..' overhead the running counter does
+// not itemize: it scales with entry count, so it covers that fixed under-count
+// exactly at the large-dir boundary where packing matters. The estimate MUST
+// never fall below the actual encoded size, or a READDIR reply could exceed the
+// client's requested Count and overflow its buffer (a walk-correctness bug).
+// When accurate sizing is OFF, returns the historical flat 512.
+func readDirEntryMaxBytes(name string) uint32 {
+	if !readDirAccurateSizing() {
+		return 512
+	}
+	nameLen := uint32(len(name))
+	namePadded := (nameLen + 3) &^ 3          // XDR pads names to a 4-byte boundary
+	return 8 + 4 + namePadded + 8 + 4 + 8     // FileID + NameLen + name + Cookie + Next + margin
 }
 
 func hashPathAndContents(path string, contents []fs.FileInfo) uint64 {
