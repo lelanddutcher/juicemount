@@ -1755,14 +1755,25 @@ func (s *Store) BulkClearLocalOnly(paths []string) error {
 	}
 	s.writeMu.Unlock()
 
-	// Update in-memory cache
-	s.mu.Lock()
-	for _, p := range paths {
-		if e, ok := s.pathCache[p]; ok {
-			e.LocalOnly = false
+	// Update in-memory cache in bounded chunks (S5 / nav-latency H3) so a large
+	// offline->online reconcile clear (e.g. ~146k local_only paths after a big
+	// offload) cannot hold s.mu across the WHOLE slice and block concurrent
+	// LOOKUP/GETATTR/READDIR readers (was ~12-17ms). Mirrors the per-chunk
+	// release BulkInsert/BulkInsertAbsent/DeletePaths already use; same semantics
+	// (each entry cleared exactly once), no syscall, caps a reader stall at one chunk.
+	for i := 0; i < len(paths); i += cacheMutationChunk {
+		end := i + cacheMutationChunk
+		if end > len(paths) {
+			end = len(paths)
 		}
+		s.mu.Lock()
+		for _, p := range paths[i:end] {
+			if e, ok := s.pathCache[p]; ok {
+				e.LocalOnly = false
+			}
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
 
 	return nil
 }
