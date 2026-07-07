@@ -1976,6 +1976,9 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 				// prefetch pool busy — shed this one
 			}
 		}
+		// WAVE 0: one inc per warm readdir served from the RAM mirror fast path
+		// (the len(children)>0 branch). QA-35-safe single atomic increment.
+		metrics.Default().IncReaddirMirrorHit()
 		return infos, nil
 	}
 
@@ -2022,6 +2025,9 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	// QA-35 hot-path discipline: this RPC path does only in-memory checks —
 	// the FUSE readdir happens strictly on the background goroutine.
 	if asyncDirRefreshEnabled() {
+		// WAVE 0: a zero-row (unmirrored) dir returned EMPTY + kicked an async
+		// refresh — the empty-then-pop-in case. One atomic inc.
+		metrics.Default().IncReaddirEmptyRefill()
 		jfs.maybeAsyncRefreshDir(dirname, fusePath)
 		return []os.FileInfo{}, nil
 	}
@@ -2153,6 +2159,10 @@ func (jfs *juiceFS) maybeAsyncRefreshDir(dirname, fusePath string) {
 	default:
 		// All refresh workers busy — shed. Clear the singleflight key now so
 		// the NEXT readdir on this directory can re-dispatch.
+		// WAVE 0: this shed was previously SILENT — it is the grader for the
+		// S3/S4 refresh fixes (shed rate should drop to ~0 after them). One
+		// atomic inc, off the RPC hot path (this fn does only in-memory work).
+		metrics.Default().IncReaddirColdShed()
 		clear()
 	}
 }
@@ -3306,6 +3316,17 @@ var cacheReaderServeEnabled = os.Getenv("JM_ENABLE_CACHE_READER") == "1"
 // size-revalidation + invalidation-on-content-change.
 var memBufServeEnabled = os.Getenv("JM_ENABLE_MEMBUF_SERVE") == "1"
 
+// coldSubreadDur is the wall-clock threshold that classifies a Priority-3 FUSE
+// subread as COLD (a real backend/MinIO GET over the link) vs WARM (an SSD
+// block-cache hit). It MIRRORS internal/netprofile.minThroughputDur (3ms) — the
+// SAME discriminator ObserveThroughput uses to decide whether a read sample
+// reflects the wire or the SSD cache. Reusing that threshold keeps the
+// read_cold_subread / read_warm_subread counters consistent with the link
+// estimator, and — crucially (QA-35) — the signal is the read's OWN measured
+// duration (already captured as readStart for ObserveThroughput), so classifying
+// it adds NO syscall and NO lock, just one atomic increment.
+const coldSubreadDur = 3 * time.Millisecond
+
 func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	// Priority 1: Memory buffer (zero-syscall, for small files like .prproj, LUTs)
 	if memBufServeEnabled && f.memBuf != nil {
@@ -3475,12 +3496,24 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	}
 	if n > 0 {
 		metrics.Default().AddBytesRead(int64(n))
+		elapsed := time.Since(readStart)
+		// WAVE 0 (RC-1/RC-3 grader): split this Priority-3 FUSE subread into
+		// cold (real backend/MinIO GET over the link) vs warm (local SSD block
+		// cache) using the read's OWN measured duration — the SAME >=3ms
+		// discriminator ObserveThroughput uses below. No new syscall: elapsed is
+		// already measured for the link estimator. The cold ratio is the grader
+		// for whether preview READs hit MinIO or the local SSD cache.
+		if elapsed >= coldSubreadDur {
+			metrics.Default().IncReadColdSubread()
+		} else {
+			metrics.Default().IncReadWarmSubread()
+		}
 		// [#16 phase 2] Feed the link estimator from the MAIN read path. This is
 		// the signal the prefetch-only sampler missed (juicefs pre-pulls whole
 		// files before our readahead runs, so our prefetch reads were all cache
 		// hits). A cold subread here is a real backend transfer; ObserveThroughput
 		// filters warm/sub-256KB reads so only wire-speed moves the estimate.
-		netprofile.Default().ObserveThroughput(int64(n), time.Since(readStart))
+		netprofile.Default().ObserveThroughput(int64(n), elapsed)
 	}
 	return n, err
 }

@@ -49,6 +49,76 @@ func TestRegistryObserve(t *testing.T) {
 	}
 }
 
+func TestNavLatencyCounters(t *testing.T) {
+	r := NewRegistry()
+
+	// Increment each nav-latency counter a distinct number of times so a
+	// mis-wired Inc method (wrong field) is caught by the exact-count asserts.
+	r.IncReaddirMirrorHit()
+	r.IncReaddirMirrorHit()
+	r.IncReaddirEmptyRefill()
+	r.IncReaddirColdShed()
+	r.IncReaddirColdShed()
+	r.IncReaddirColdShed()
+	r.IncLookupHit()
+	r.IncLookupHit()
+	r.IncLookupHit()
+	r.IncLookupHit()
+	r.IncLookupNoent()
+	r.IncReadColdSubread()
+	r.IncReadColdSubread()
+	r.IncReadWarmSubread()
+	r.IncReadaheadTriggered()
+	r.AddReadaheadPrefetchedBlocks(7)
+	r.AddReadaheadPrefetchedBlocks(0)  // no-op guard
+	r.AddReadaheadPrefetchedBlocks(-5) // negative guard
+
+	snap := r.Snapshot()
+
+	checks := []struct {
+		name string
+		got  uint64
+		want uint64
+	}{
+		{"readdir_mirror_hit", snap.ReaddirMirrorHit, 2},
+		{"readdir_empty_refill", snap.ReaddirEmptyRefill, 1},
+		{"readdir_cold_shed", snap.ReaddirColdShed, 3},
+		{"lookup_hit", snap.LookupHit, 4},
+		{"lookup_noent", snap.LookupNoent, 1},
+		{"read_cold_subread", snap.ReadColdSubread, 2},
+		{"read_warm_subread", snap.ReadWarmSubread, 1},
+		{"readahead_triggered", snap.ReadaheadTriggered, 1},
+		{"readahead_prefetched_blocks", snap.ReadaheadPrefetchedBlocks, 7},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+
+	// The counters must serialize to /metrics under their documented JSON keys.
+	blob, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	js := string(blob)
+	for _, key := range []string{
+		`"readdir_mirror_hit":2`,
+		`"readdir_empty_refill":1`,
+		`"readdir_cold_shed":3`,
+		`"lookup_hit":4`,
+		`"lookup_noent":1`,
+		`"read_cold_subread":2`,
+		`"read_warm_subread":1`,
+		`"readahead_triggered":1`,
+		`"readahead_prefetched_blocks":7`,
+	} {
+		if !strings.Contains(js, key) {
+			t.Errorf("serialized /metrics JSON missing %q\nfull: %s", key, js)
+		}
+	}
+}
+
 func TestRegistryStableShape(t *testing.T) {
 	r := NewRegistry()
 	snap := r.Snapshot()

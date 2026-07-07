@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
@@ -150,6 +151,8 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 		rm.statsMu.Lock()
 		rm.triggered++
 		rm.statsMu.Unlock()
+		// WAVE 0 (grades S2): one inc per readahead schedule (SeqThreshold trip).
+		metrics.Default().IncReadaheadTriggered()
 
 		// Fire background prefetch (non-blocking), capped by the policy's worker budget.
 		go rm.prefetch(filePath, prefetchStart, prefetchEnd, policy.Workers)
@@ -224,6 +227,8 @@ func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorke
 			rm.statsMu.Lock()
 			rm.prefetched++
 			rm.statsMu.Unlock()
+			// WAVE 0 (grades S2): accumulate blocks actually prefetched.
+			metrics.Default().AddReadaheadPrefetchedBlocks(1)
 			// Feed the link estimator. A cold block is a real backend transfer
 			// (slow); a cache hit is sub-ms and gets filtered out inside
 			// ObserveThroughput, so only wire-speed samples move the estimate.

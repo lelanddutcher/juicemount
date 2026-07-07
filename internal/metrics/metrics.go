@@ -189,6 +189,45 @@ type Registry struct {
 	readRetries atomic.Uint64
 	readFails   atomic.Uint64
 
+	// Nav-latency observability counters (WAVE 0). These are QA-35-safe:
+	// each is a single atomic.Uint64 increment on an EXISTING fork point in
+	// the readdir / lookup / read / readahead paths — never a per-RPC FUSE
+	// syscall or a hot-path lock. They exist so every nav-latency fix is
+	// gradeable by a /metrics diff instead of an external fs_usage/accesslog
+	// session (see NAV_LATENCY_DOSSIER §5).
+	//
+	// readdirMirrorHit  — a warm READDIR served from the RAM mirror fast path.
+	// readdirEmptyRefill— a zero-row (unmirrored) dir returned EMPTY + kicked
+	//                     an async refresh (the empty-then-pop-in case).
+	// readdirColdShed   — an async dir-refresh SHED because all refresh workers
+	//                     were busy (previously SILENT; grades the S3/S4 fixes).
+	readdirMirrorHit   atomic.Uint64
+	readdirEmptyRefill atomic.Uint64
+	readdirColdShed    atomic.Uint64
+
+	// lookupHit / lookupNoent — the LOOKUP resolve outcome (name resolved from
+	// the cache vs returned NoEnt). One inc per LOOKUP that reaches the
+	// child-resolution branch.
+	lookupHit   atomic.Uint64
+	lookupNoent atomic.Uint64
+
+	// readColdSubread / readWarmSubread — THE KEY grader (RC-1/RC-3). Split off
+	// the EXISTING warm/cold discriminator on the FUSE read path: a subread
+	// whose wall-clock duration crosses the same threshold ObserveThroughput
+	// uses to treat a sample as a real backend transfer (a cold MinIO GET over
+	// the link) is counted cold; a sub-threshold subread (SSD block-cache hit)
+	// is counted warm. No new syscall — the read latency is already measured
+	// for ObserveThroughput. The cold ratio is the grader for whether preview
+	// READs hit MinIO or the local SSD cache.
+	readColdSubread atomic.Uint64
+	readWarmSubread atomic.Uint64
+
+	// readaheadTriggered / readaheadPrefetchedBlocks — grades S2. One inc per
+	// readahead schedule (SeqThreshold trip); prefetched-blocks accumulates the
+	// block count actually pulled by the background prefetch.
+	readaheadTriggered        atomic.Uint64
+	readaheadPrefetchedBlocks atomic.Uint64
+
 	// Health hook — set by main.go so /health can answer accurately.
 	healthMu sync.RWMutex
 	healthFn func() HealthSnapshot
@@ -305,17 +344,64 @@ func (r *Registry) IncReadRetry() { r.readRetries.Add(1) }
 // (the genuinely-bad case — bytes were surfaced to the client as an error).
 func (r *Registry) IncReadFail() { r.readFails.Add(1) }
 
+// --- Nav-latency observability counters (WAVE 0). All QA-35-safe atomics. ---
+
+// IncReaddirMirrorHit records a warm READDIR served from the RAM mirror.
+func (r *Registry) IncReaddirMirrorHit() { r.readdirMirrorHit.Add(1) }
+
+// IncReaddirEmptyRefill records a zero-row dir returned empty + async-refreshed.
+func (r *Registry) IncReaddirEmptyRefill() { r.readdirEmptyRefill.Add(1) }
+
+// IncReaddirColdShed records an async dir-refresh shed because all workers were
+// busy (previously silent — the grader for the S3/S4 refresh fixes).
+func (r *Registry) IncReaddirColdShed() { r.readdirColdShed.Add(1) }
+
+// IncLookupHit records a LOOKUP whose child name resolved.
+func (r *Registry) IncLookupHit() { r.lookupHit.Add(1) }
+
+// IncLookupNoent records a LOOKUP that returned NoEnt (name not present).
+func (r *Registry) IncLookupNoent() { r.lookupNoent.Add(1) }
+
+// IncReadColdSubread records a FUSE subread served cold (real backend/MinIO GET
+// over the link) — see the discriminator in cachedFile.ReadAt.
+func (r *Registry) IncReadColdSubread() { r.readColdSubread.Add(1) }
+
+// IncReadWarmSubread records a FUSE subread served warm (local SSD block cache).
+func (r *Registry) IncReadWarmSubread() { r.readWarmSubread.Add(1) }
+
+// IncReadaheadTriggered records one readahead schedule (SeqThreshold trip).
+func (r *Registry) IncReadaheadTriggered() { r.readaheadTriggered.Add(1) }
+
+// AddReadaheadPrefetchedBlocks adds the count of blocks a prefetch pass pulled.
+func (r *Registry) AddReadaheadPrefetchedBlocks(n int64) {
+	if n > 0 {
+		r.readaheadPrefetchedBlocks.Add(uint64(n))
+	}
+}
+
 // Snapshot is the JSON shape returned by /metrics.
 type Snapshot struct {
-	UptimeSec    int64                  `json:"uptime_sec"`
-	RPCTotal     uint64                 `json:"rpc_total"`
-	RPCErrors    uint64                 `json:"rpc_errors"`
-	BytesRead    uint64                 `json:"bytes_read"`
-	BytesWritten uint64                 `json:"bytes_written"`
-	ReadRetries  uint64                 `json:"read_retries"`
-	ReadFails    uint64                 `json:"read_fails"`
-	RPCs         map[string]RPCSnapshot `json:"rpcs"`
-	Network      *NetworkSnapshot       `json:"network,omitempty"`
+	UptimeSec    int64  `json:"uptime_sec"`
+	RPCTotal     uint64 `json:"rpc_total"`
+	RPCErrors    uint64 `json:"rpc_errors"`
+	BytesRead    uint64 `json:"bytes_read"`
+	BytesWritten uint64 `json:"bytes_written"`
+	ReadRetries  uint64 `json:"read_retries"`
+	ReadFails    uint64 `json:"read_fails"`
+
+	// Nav-latency observability counters (WAVE 0). See NAV_LATENCY_DOSSIER §5.
+	ReaddirMirrorHit          uint64 `json:"readdir_mirror_hit"`
+	ReaddirEmptyRefill        uint64 `json:"readdir_empty_refill"`
+	ReaddirColdShed           uint64 `json:"readdir_cold_shed"`
+	LookupHit                 uint64 `json:"lookup_hit"`
+	LookupNoent               uint64 `json:"lookup_noent"`
+	ReadColdSubread           uint64 `json:"read_cold_subread"`
+	ReadWarmSubread           uint64 `json:"read_warm_subread"`
+	ReadaheadTriggered        uint64 `json:"readahead_triggered"`
+	ReadaheadPrefetchedBlocks uint64 `json:"readahead_prefetched_blocks"`
+
+	RPCs    map[string]RPCSnapshot `json:"rpcs"`
+	Network *NetworkSnapshot       `json:"network,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -338,7 +424,18 @@ func (r *Registry) Snapshot() Snapshot {
 		BytesWritten: r.bytesWrite.Load(),
 		ReadRetries:  r.readRetries.Load(),
 		ReadFails:    r.readFails.Load(),
-		RPCs:         make(map[string]RPCSnapshot, len(trackedTypes)),
+
+		ReaddirMirrorHit:          r.readdirMirrorHit.Load(),
+		ReaddirEmptyRefill:        r.readdirEmptyRefill.Load(),
+		ReaddirColdShed:           r.readdirColdShed.Load(),
+		LookupHit:                 r.lookupHit.Load(),
+		LookupNoent:               r.lookupNoent.Load(),
+		ReadColdSubread:           r.readColdSubread.Load(),
+		ReadWarmSubread:           r.readWarmSubread.Load(),
+		ReadaheadTriggered:        r.readaheadTriggered.Load(),
+		ReadaheadPrefetchedBlocks: r.readaheadPrefetchedBlocks.Load(),
+
+		RPCs: make(map[string]RPCSnapshot, len(trackedTypes)),
 	}
 
 	r.netMu.RLock()
