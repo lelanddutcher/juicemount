@@ -225,8 +225,12 @@ type Registry struct {
 	// readaheadTriggered / readaheadPrefetchedBlocks — grades S2. One inc per
 	// readahead schedule (SeqThreshold trip); prefetched-blocks accumulates the
 	// block count actually pulled by the background prefetch.
+	// readaheadSuppressed — one inc per SeqThreshold trip that the S2 short-run
+	// guard capped (a preview probe that would have escalated to the 64MB window
+	// but was skipped). Rising counter = the guard is doing its job.
 	readaheadTriggered        atomic.Uint64
 	readaheadPrefetchedBlocks atomic.Uint64
+	readaheadSuppressed       atomic.Uint64
 
 	// Health hook — set by main.go so /health can answer accurately.
 	healthMu sync.RWMutex
@@ -379,6 +383,10 @@ func (r *Registry) AddReadaheadPrefetchedBlocks(n int64) {
 	}
 }
 
+// IncReadaheadSuppressed records a SeqThreshold trip that the S2 short-run guard
+// capped instead of escalating to the full prefetch window (a preview probe).
+func (r *Registry) IncReadaheadSuppressed() { r.readaheadSuppressed.Add(1) }
+
 // Snapshot is the JSON shape returned by /metrics.
 type Snapshot struct {
 	UptimeSec    int64  `json:"uptime_sec"`
@@ -399,6 +407,7 @@ type Snapshot struct {
 	ReadWarmSubread           uint64 `json:"read_warm_subread"`
 	ReadaheadTriggered        uint64 `json:"readahead_triggered"`
 	ReadaheadPrefetchedBlocks uint64 `json:"readahead_prefetched_blocks"`
+	ReadaheadSuppressed       uint64 `json:"readahead_suppressed"`
 
 	RPCs    map[string]RPCSnapshot `json:"rpcs"`
 	Network *NetworkSnapshot       `json:"network,omitempty"`
@@ -434,6 +443,7 @@ func (r *Registry) Snapshot() Snapshot {
 		ReadWarmSubread:           r.readWarmSubread.Load(),
 		ReadaheadTriggered:        r.readaheadTriggered.Load(),
 		ReadaheadPrefetchedBlocks: r.readaheadPrefetchedBlocks.Load(),
+		ReadaheadSuppressed:       r.readaheadSuppressed.Load(),
 
 		RPCs: make(map[string]RPCSnapshot, len(trackedTypes)),
 	}

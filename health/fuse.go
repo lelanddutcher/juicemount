@@ -391,6 +391,19 @@ func (fm *FUSEManager) Mount() error {
 		"--prefetch", strconv.Itoa(jfp.Prefetch),
 		"-o", "nobrowse", // hide from Finder (MNT_DONTBROWSE flag)
 	)
+	// S1 (WAVE 1, RC-5): cap JuiceFS session readahead on a WAN link only.
+	// juicefs's --max-readahead defaults to 8×BlockSize = 32 MiB, so a single
+	// cold 4 KB preview touch pulls up to 32 MiB extra off the backend across
+	// the tunnel. On the metered/slow class we set --max-readahead 1M to disable
+	// session readahead entirely (~28 MiB less per cold first-touch). Mount-time
+	// flag ONLY — zero NFS hot-path impact. Fast/Medium (10GbE/GbE) are left
+	// UNSET so they keep the JuiceFS 32 MiB default (LAN behavior unchanged).
+	// Kill-switch: JM_JFS_MAX_READAHEAD=0. Auto-reverts on 10GbE by class.
+	if cls := netprofile.Default().Class(); cls == netprofile.ClassMetered || cls == netprofile.ClassSlow {
+		if os.Getenv("JM_JFS_MAX_READAHEAD") != "0" {
+			args = append(args, "--max-readahead", "1M")
+		}
+	}
 	// Bind the Prometheus metrics endpoint EXPLICITLY so the bridge can scrape
 	// `juicefs_blockcache_bytes` (the true on-disk block-cache size) for the
 	// cache_used_bytes field. We do NOT rely on JuiceFS's :9567 default — that
