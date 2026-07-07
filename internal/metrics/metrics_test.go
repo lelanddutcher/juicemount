@@ -73,6 +73,33 @@ func TestNavLatencyCounters(t *testing.T) {
 	r.AddReadaheadPrefetchedBlocks(0)  // no-op guard
 	r.AddReadaheadPrefetchedBlocks(-5) // negative guard
 
+	// S6 H2 stale-recovery graders.
+	r.IncRecoverLstat()
+	r.IncRecoverLstat()
+	r.IncRecoverLstat()
+	r.IncRecoverLstat()
+	r.IncRecoverLstat()
+	r.IncRecoverStale()
+	r.IncRecoverStale()
+	r.IncRecoverSuccess()
+
+	// S6 paged-readdir cache graders.
+	r.IncReaddirVerifierHit()
+	r.IncReaddirVerifierHit()
+	r.IncReaddirVerifierHit()
+	r.IncReaddirVerifierHit()
+	r.IncReaddirVerifierHit()
+	r.IncReaddirVerifierHit()
+	r.IncReaddirFsReaddir()
+	r.IncReaddirFsReaddir()
+
+	// S6 H1 admission-wait grader. Exercise the CAS-max gauge, both threshold
+	// buckets, and the us<=0 drop (a sub-microsecond wait records nothing).
+	r.ObserveAdmitWait(5 * time.Millisecond)  // max=5000, over_1ms=1
+	r.ObserveAdmitWait(2 * time.Millisecond)  // max stays 5000, over_1ms=2
+	r.ObserveAdmitWait(100 * time.Nanosecond) // rounds to 0µs → dropped entirely
+	r.ObserveAdmitWait(12 * time.Millisecond) // max=12000, over_1ms=3, over_10ms=1
+
 	snap := r.Snapshot()
 
 	checks := []struct {
@@ -89,6 +116,14 @@ func TestNavLatencyCounters(t *testing.T) {
 		{"read_warm_subread", snap.ReadWarmSubread, 1},
 		{"readahead_triggered", snap.ReadaheadTriggered, 1},
 		{"readahead_prefetched_blocks", snap.ReadaheadPrefetchedBlocks, 7},
+		{"recover_lstat_total", snap.RecoverLstat, 5},
+		{"recover_stale_total", snap.RecoverStale, 2},
+		{"recover_success_total", snap.RecoverSuccess, 1},
+		{"readdir_verifier_hit", snap.ReaddirVerifierHit, 6},
+		{"readdir_fs_readdir", snap.ReaddirFsReaddir, 2},
+		{"rpc_admit_wait_us", snap.RPCAdmitWaitUs, 12000},
+		{"rpc_admit_wait_over_1ms", snap.RPCAdmitWaitOver1ms, 3},
+		{"rpc_admit_wait_over_10ms", snap.RPCAdmitWaitOver10ms, 1},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -112,10 +147,69 @@ func TestNavLatencyCounters(t *testing.T) {
 		`"read_warm_subread":1`,
 		`"readahead_triggered":1`,
 		`"readahead_prefetched_blocks":7`,
+		`"recover_lstat_total":5`,
+		`"recover_stale_total":2`,
+		`"recover_success_total":1`,
+		`"readdir_verifier_hit":6`,
+		`"readdir_fs_readdir":2`,
+		`"rpc_admit_wait_us":12000`,
+		`"rpc_admit_wait_over_1ms":3`,
+		`"rpc_admit_wait_over_10ms":1`,
 	} {
 		if !strings.Contains(js, key) {
 			t.Errorf("serialized /metrics JSON missing %q\nfull: %s", key, js)
 		}
+	}
+}
+
+// TestAdmitWaitGauge pins the H1 admission-wait mechanism (S6): the max-gauge
+// is monotonic (a smaller wait after a larger one does NOT lower it), a zero /
+// sub-microsecond wait records nothing, and the threshold buckets are exact.
+func TestAdmitWaitGauge(t *testing.T) {
+	r := NewRegistry()
+
+	// Nothing observed yet → all zero (the warm/uncontended expectation).
+	if s := r.Snapshot(); s.RPCAdmitWaitUs != 0 || s.RPCAdmitWaitOver1ms != 0 || s.RPCAdmitWaitOver10ms != 0 {
+		t.Fatalf("fresh registry admit-wait not zero: %+v", s)
+	}
+
+	r.ObserveAdmitWait(0)                     // exact zero → dropped
+	r.ObserveAdmitWait(500 * time.Nanosecond) // sub-µs → rounds to 0 → dropped
+	if s := r.Snapshot(); s.RPCAdmitWaitUs != 0 || s.RPCAdmitWaitOver1ms != 0 {
+		t.Fatalf("sub-µs / zero wait should record nothing, got %+v", s)
+	}
+
+	r.ObserveAdmitWait(8 * time.Millisecond) // max=8000, over_1ms=1
+	r.ObserveAdmitWait(3 * time.Millisecond) // SMALLER: max must stay 8000, over_1ms=2
+	s := r.Snapshot()
+	if s.RPCAdmitWaitUs != 8000 {
+		t.Errorf("max-gauge not monotonic: rpc_admit_wait_us = %d, want 8000", s.RPCAdmitWaitUs)
+	}
+	if s.RPCAdmitWaitOver1ms != 2 {
+		t.Errorf("rpc_admit_wait_over_1ms = %d, want 2", s.RPCAdmitWaitOver1ms)
+	}
+	if s.RPCAdmitWaitOver10ms != 0 {
+		t.Errorf("rpc_admit_wait_over_10ms = %d, want 0 (no wait >= 10ms yet)", s.RPCAdmitWaitOver10ms)
+	}
+
+	r.ObserveAdmitWait(25 * time.Millisecond) // max=25000, over_1ms=3, over_10ms=1
+	s = r.Snapshot()
+	if s.RPCAdmitWaitUs != 25000 || s.RPCAdmitWaitOver1ms != 3 || s.RPCAdmitWaitOver10ms != 1 {
+		t.Errorf("after 25ms wait: got max=%d over1ms=%d over10ms=%d, want 25000/3/1",
+			s.RPCAdmitWaitUs, s.RPCAdmitWaitOver1ms, s.RPCAdmitWaitOver10ms)
+	}
+}
+
+// BenchmarkObserveAdmitWait guards the QA-35 invariant that the H1 admission
+// grader's recording path (taken only when the acquire actually blocked) is
+// atomic-only and allocation-free. The uncontended fast path in conn.go records
+// nothing at all, so this benchmarks the worst case — the contended branch.
+func BenchmarkObserveAdmitWait(b *testing.B) {
+	r := NewRegistry()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.ObserveAdmitWait(5 * time.Millisecond)
 	}
 }
 

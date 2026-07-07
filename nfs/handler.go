@@ -1336,6 +1336,13 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 		// AND FUSE confirms the path still exists, re-insert it and serve
 		// normally. Singleflight by inode so DaVinci's scrub retries don't
 		// cascade into N redundant Lstat calls.
+		//
+		// S6 (H2 grader): one inc as the FromHandle cache-miss ENTERS the
+		// evicted-recovery branch — the attempt/denominator for the stale-
+		// recovery path. Warm-mount expectation ~0; a spike localizes a
+		// stale-storm. Atomic-only, no new syscall (the Lstat, if any, is
+		// inside tryRecoverEvicted and already existed).
+		metrics.Default().IncRecoverLstat()
 		if recovered := h.tryRecoverEvicted(inode); recovered != nil {
 			parts := splitPath(recovered.Path)
 			return &juiceFS{handler: h}, parts, nil
@@ -1378,6 +1385,13 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 		if shadow, ok := h.store.LookupRecentlyEvicted(inode); ok {
 			hadShadow = true
 			pathSample = shadow.Path
+			// S6 (H2 grader): the had-shadow STALE case. Both recovery paths
+			// above already FAILED for this inode, yet a Layer-B shadow still
+			// exists within ShadowTTL — a prune/rename orphan whose handle the
+			// client still holds. Counting only the had-shadow subset (not
+			// genuinely-foreign handles) is what makes this a stale-storm
+			// localizer. Atomic-only; the shadow lookup already ran for the log.
+			metrics.Default().IncRecoverStale()
 		}
 		ps, is := h.store.CacheStats()
 		jmlog.Warn("FromHandle STALE",
@@ -1508,6 +1522,11 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 
 	// File exists. Promote the shadow back to live cache.
 	recovered := h.store.RecoverShadow(shadow, inode)
+	// S6 (H2 grader): the ms-cost success case — an evicted inode re-confirmed
+	// via the FUSE Lstat above and promoted back to the live cache. (The
+	// spool-pending fast recovery at the top of this function is deliberately
+	// NOT counted here: it skips the Lstat and is not the ms-cost path.)
+	metrics.Default().IncRecoverSuccess()
 	jmlog.Info("FromHandle recovered evicted entry",
 		"inode", fmt.Sprintf("%x", inode),
 		"path", shadow.Path,
