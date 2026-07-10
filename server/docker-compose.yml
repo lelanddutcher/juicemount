@@ -38,6 +38,14 @@ services:
       - "--save"
       - "900"
       - "1"
+      # Keyspace notifications power the client's instant metadata push
+      # (PSUBSCRIBE __keyspace@1__:d*). Without this the client can only
+      # fall back to a periodic full SCAN — on a slow/remote link that is
+      # the "index rebuild takes 10 minutes" failure mode. The client also
+      # self-heals this at runtime (CONFIG SET on connect), but baking it
+      # in here makes every fresh deploy + restart correct from boot.
+      - "--notify-keyspace-events"
+      - "KEA"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
