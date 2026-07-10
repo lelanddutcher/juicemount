@@ -275,6 +275,14 @@ type Registry struct {
 	readdirVerifierHit atomic.Uint64
 	readdirFsReaddir   atomic.Uint64
 
+	// zeroTailSuspect (#104) — a spool entry finalized with unwritten hole(s)
+	// below its written size (interrupted preallocate-then-write download: the
+	// file drains FULL-SIZE with a zero tail; Premiere black-frames it).
+	// Detection-only: the drain proceeds unchanged; this counter + the /spool
+	// per-entry flag are the surfacing. Cold-path increment (once per suspect
+	// finalize), QA-35-safe.
+	zeroTailSuspect atomic.Uint64
+
 	// Health hook — set by main.go so /health can answer accurately.
 	healthMu sync.RWMutex
 	healthFn func() HealthSnapshot
@@ -486,6 +494,11 @@ func (r *Registry) IncReaddirVerifierHit() { r.readdirVerifierHit.Add(1) }
 // IncReaddirFsReaddir records a READDIR(PLUS) that fell to a full fs.ReadDir.
 func (r *Registry) IncReaddirFsReaddir() { r.readdirFsReaddir.Add(1) }
 
+// IncZeroTailSuspect records a spool entry that finalized with unwritten
+// hole(s) below its written size — the interrupted preallocate-then-write
+// download signature (#104). Detection-only; the drain is never gated on it.
+func (r *Registry) IncZeroTailSuspect() { r.zeroTailSuspect.Add(1) }
+
 // Snapshot is the JSON shape returned by /metrics.
 type Snapshot struct {
 	UptimeSec    int64  `json:"uptime_sec"`
@@ -520,6 +533,10 @@ type Snapshot struct {
 	RPCAdmitWaitOver10ms uint64 `json:"rpc_admit_wait_over_10ms"`
 	ReaddirVerifierHit   uint64 `json:"readdir_verifier_hit"`
 	ReaddirFsReaddir     uint64 `json:"readdir_fs_readdir"`
+
+	// Spool zero-tail detection (#104): entries that finalized with unwritten
+	// hole(s) below their written size (drained full-size with zero tails).
+	ZeroTailSuspect uint64 `json:"zero_tail_suspect_total"`
 
 	RPCs    map[string]RPCSnapshot `json:"rpcs"`
 	Network *NetworkSnapshot       `json:"network,omitempty"`
@@ -565,6 +582,8 @@ func (r *Registry) Snapshot() Snapshot {
 		RPCAdmitWaitOver10ms: r.rpcAdmitWaitOver10ms.Load(),
 		ReaddirVerifierHit:   r.readdirVerifierHit.Load(),
 		ReaddirFsReaddir:     r.readdirFsReaddir.Load(),
+
+		ZeroTailSuspect: r.zeroTailSuspect.Load(),
 
 		RPCs: make(map[string]RPCSnapshot, len(trackedTypes)),
 	}

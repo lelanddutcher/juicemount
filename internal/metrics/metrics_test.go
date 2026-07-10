@@ -93,6 +93,10 @@ func TestNavLatencyCounters(t *testing.T) {
 	r.IncReaddirFsReaddir()
 	r.IncReaddirFsReaddir()
 
+	// #104 spool zero-tail detection.
+	r.IncZeroTailSuspect()
+	r.IncZeroTailSuspect()
+
 	// S6 H1 admission-wait grader. Exercise the CAS-max gauge, both threshold
 	// buckets, and the us<=0 drop (a sub-microsecond wait records nothing).
 	r.ObserveAdmitWait(5 * time.Millisecond)  // max=5000, over_1ms=1
@@ -124,6 +128,7 @@ func TestNavLatencyCounters(t *testing.T) {
 		{"rpc_admit_wait_us", snap.RPCAdmitWaitUs, 12000},
 		{"rpc_admit_wait_over_1ms", snap.RPCAdmitWaitOver1ms, 3},
 		{"rpc_admit_wait_over_10ms", snap.RPCAdmitWaitOver10ms, 1},
+		{"zero_tail_suspect_total", snap.ZeroTailSuspect, 2},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -155,6 +160,7 @@ func TestNavLatencyCounters(t *testing.T) {
 		`"rpc_admit_wait_us":12000`,
 		`"rpc_admit_wait_over_1ms":3`,
 		`"rpc_admit_wait_over_10ms":1`,
+		`"zero_tail_suspect_total":2`,
 	} {
 		if !strings.Contains(js, key) {
 			t.Errorf("serialized /metrics JSON missing %q\nfull: %s", key, js)

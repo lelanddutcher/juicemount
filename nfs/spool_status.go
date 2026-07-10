@@ -32,9 +32,16 @@ type SpoolStatusResponse struct {
 	// OldestPendingAgeSec is the age of the oldest writing/ready/
 	// draining row, so the UI can say "queued · 2h" without timestamp
 	// math. All three are LB-5 stuck-spool affordance signals.
-	StalledFiles        int              `json:"stalled_files"`
-	FailedFiles         int              `json:"failed_files"`
-	OldestPendingAgeSec int64            `json:"oldest_pending_age_sec"`
+	StalledFiles        int   `json:"stalled_files"`
+	FailedFiles         int   `json:"failed_files"`
+	OldestPendingAgeSec int64 `json:"oldest_pending_age_sec"`
+	// SuspectZeroTail counts listed entries flagged suspect_zero_tail (#104):
+	// the entry finalized with unwritten hole(s) below its written size — the
+	// interrupted preallocate-then-write download signature (drains FULL-SIZE
+	// with a zero tail; Premiere black-frames it). Same listed-rows counting
+	// convention as StalledFiles/FailedFiles. Detection-only surfacing — a
+	// flagged entry's drain proceeded normally.
+	SuspectZeroTail int `json:"suspect_zero_tail"`
 	// StallWaiters is the number of writes currently PARKED in the capacity
 	// stall (spool full, blocking for headroom). Offline reports the current
 	// offline state. OfflineBufferFull is the derived UI trigger: while offline
@@ -43,9 +50,9 @@ type SpoolStatusResponse struct {
 	// letting the bare NFS NOSPC read as "your disk is full". (With the graceful
 	// stall the copy no longer FAILS — it pauses — so this is the signal that
 	// tells the user WHY it paused and what to do.)
-	StallWaiters      int  `json:"stall_waiters"`
-	Offline           bool `json:"offline"`
-	OfflineBufferFull bool `json:"offline_buffer_full"`
+	StallWaiters      int              `json:"stall_waiters"`
+	Offline           bool             `json:"offline"`
+	OfflineBufferFull bool             `json:"offline_buffer_full"`
 	Entries           []SpoolEntryView `json:"entries"`
 }
 
@@ -68,6 +75,13 @@ type SpoolEntryView struct {
 	// claim). Failed rows are NOT stalled — they get FailedFiles and the
 	// retry-failed action instead.
 	Stalled bool `json:"stalled"`
+	// SuspectZeroTail flags a #104 zero-tail suspect (see the response-level
+	// counter doc). SuspectZeroTailDetail carries the detector's compact JSON
+	// {detected_at,size,contiguous,holes} verbatim for diagnose tooling;
+	// omitted when clean (string omitempty — key-absent decodes fine in
+	// Swift, unlike JSON null).
+	SuspectZeroTail       bool   `json:"suspect_zero_tail"`
+	SuspectZeroTailDetail string `json:"suspect_zero_tail_detail,omitempty"`
 }
 
 // SpoolStatusEntryCap caps the per-response entry list so menu-bar
@@ -168,6 +182,15 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 
 	views := make([]SpoolEntryView, 0)
 	doneTail := make([]SpoolEntryView, 0)
+	// countIfSuspect tallies the #104 response-level counter at each
+	// list-append site, so it counts exactly the rows that passed the
+	// relevance filters (the StalledFiles/FailedFiles convention: pre-cap,
+	// listed-relevant rows only — an ancient unlisted failure doesn't count).
+	countIfSuspect := func(v SpoolEntryView) {
+		if v.SuspectZeroTail {
+			resp.SuspectZeroTail++
+		}
+	}
 	for _, r := range rows {
 		v := SpoolEntryView{
 			Path:          r.NFSPath,
@@ -177,6 +200,9 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 			LastError:     r.LastError,
 			UpdatedAtUnix: r.UpdatedAt.Unix(),
 			AgeSec:        ageOf(r.UpdatedAt),
+			// #104 zero-tail suspect marker, persisted at finalize.
+			SuspectZeroTail:       r.SuspectZeroTail != "",
+			SuspectZeroTailDetail: r.SuspectZeroTail,
 		}
 		switch r.DrainState {
 		case metadata.DrainWriting, metadata.DrainReady, metadata.DrainDraining:
@@ -216,6 +242,7 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 			if v.AgeSec > resp.OldestPendingAgeSec {
 				resp.OldestPendingAgeSec = v.AgeSec
 			}
+			countIfSuspect(v)
 			views = append(views, v)
 
 		case metadata.DrainFailed:
@@ -231,6 +258,7 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 			}
 			if fileExists || now.Sub(r.UpdatedAt) <= SpoolStatusFailedRetention {
 				resp.FailedFiles++
+				countIfSuspect(v)
 				views = append(views, v)
 			}
 
@@ -239,6 +267,7 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 			// historical done rows listed with pending=0). `succeeded`
 			// remains the all-time counter.
 			if now.Sub(r.UpdatedAt) <= SpoolStatusDoneTailWindow {
+				countIfSuspect(v)
 				doneTail = append(doneTail, v)
 			}
 		}

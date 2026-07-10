@@ -3,6 +3,7 @@ package metadata
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // spoolSchema defines the spool_entries table.
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS spool_entries (
     drain_state     TEXT NOT NULL CHECK(drain_state IN ('writing','ready','draining','done','failed')),
     drain_attempts  INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
+    suspect_zero_tail TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -80,6 +82,22 @@ CREATE TABLE IF NOT EXISTS pending_symlinks (
 func InitSpoolSchema(db *sql.DB) error {
 	if _, err := db.Exec(spoolSchema); err != nil {
 		return fmt.Errorf("init spool schema: %w", err)
+	}
+	// Column migration for pre-existing databases (CREATE TABLE IF NOT EXISTS
+	// never alters an existing table). Attempt-and-ignore-duplicate is the
+	// established pattern (internal/derivatives/store.go): SQLite's ALTER TABLE
+	// ADD COLUMN is idempotent-by-error — a second run fails with "duplicate
+	// column name", which we treat as already-migrated.
+	//
+	// suspect_zero_tail (#104 zero-tail detection): NULL/empty = clean;
+	// non-empty = compact JSON detail {detected_at,size,contiguous,holes}
+	// recorded at finalize when the entry closed with unwritten hole(s) below
+	// its written size (an interrupted preallocate-then-write download drains
+	// FULL-SIZE with a zero tail). Detection/surfacing only — no code path
+	// reads it to gate a drain.
+	if _, err := db.Exec(`ALTER TABLE spool_entries ADD COLUMN suspect_zero_tail TEXT`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("init spool schema (suspect_zero_tail migration): %w", err)
 	}
 	if _, err := db.Exec(pendingSymlinkSchema); err != nil {
 		return fmt.Errorf("init pending-symlink schema: %w", err)
