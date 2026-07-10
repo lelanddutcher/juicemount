@@ -32,6 +32,13 @@ type API struct {
 	volName        string   // for ModeStandalone dest-validation
 	farmStatusPath string   // juicefarm rollup JSON path (farm-status.json); empty = Farm tab shows "not configured"
 
+	// farmChangesPath is the farm's pre-aggregated /derivatives/changes feed
+	// (JM-15 #56): the contract changes-array the farm writes next to
+	// farm-status.json on every status write. Resolved by
+	// deriveFarmChangesPath (explicit config → JM_FARM_CHANGES env →
+	// farm-status sibling); empty = the changes route returns 503.
+	farmChangesPath string
+
 	// overview is the SLICE-2 fan-out aggregator. Nil only in unit
 	// tests that hand-construct an API without going through Register
 	// (the handler defensively returns an "overview not configured"
@@ -100,6 +107,12 @@ type Config struct {
 	AdminKey       string   // empty = no auth (LAN-only)
 	StateFile      string   // optional JSON path for job-history persistence (empty = ephemeral)
 	FarmStatusPath string   // optional path to the juicefarm rollup (farm-status.json) for the Farm tab
+	// FarmChangesPath optionally overrides where the farm's pre-aggregated
+	// derivatives-changes.json feed is read from (JM-15 #56). Normally left
+	// empty: it falls back to the JM_FARM_CHANGES env var, then to the
+	// sibling of FarmStatusPath (the farm writes the two side by side), so
+	// existing deployments need zero new configuration.
+	FarmChangesPath string
 	// MinIOURL is the http endpoint the SLICE-2 Overview tab pings via
 	// /minio/health/live. Optional — when empty the MinIO card on the
 	// dashboard renders an "endpoint not configured" hint rather than a
@@ -154,6 +167,8 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		prefix:         prefix,
 		fuseMount:      cfg.FUSEMount,
 		volName:        cfg.VolName,
+		farmChangesPath: deriveFarmChangesPath(
+			cfg.FarmChangesPath, os.Getenv("JM_FARM_CHANGES"), cfg.FarmStatusPath),
 	}
 	// SLICE 2: wire the overview aggregator. Picks OverviewMetaURL when
 	// set (embedded mode passes it explicitly so the dashboard can probe
@@ -212,6 +227,12 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// queue depth + recent job status back. Both admin-key gated.
 	mux.HandleFunc(prefix+"/api/farm/sweep", a.auth(a.handleFarmSweep))
 	mux.HandleFunc(prefix+"/api/farm/jobs", a.auth(a.handleFarmJobs))
+	// JM-15 #56 (server half): relay the farm's pre-aggregated
+	// /derivatives/changes feed (contract derivatives-changes.schema.json,
+	// filtered by ?since=&limit=) so the Mac client learns farm-generated
+	// derivatives without full sidecar re-sweeps. Same exact-pattern
+	// registration + admin-key gate as its /api/farm siblings.
+	mux.HandleFunc(prefix+"/api/farm/derivatives/changes", a.auth(a.handleFarmDerivativesChanges))
 	// SLICE 3: Trash tab — list/restore/delete/empty/config.
 	// /api/trash/empty enforces a typed-confirmation header
 	// (X-Confirm-Empty: yes) server-side so a typo'd curl can't wipe

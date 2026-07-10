@@ -204,7 +204,15 @@ func WriteFarmStatus(store *derivatives.Store, path, mount string, sweep SweepIn
 	if econ, err := ComputeProxyEconomics(store, mount); err == nil {
 		fs.ProxyEconomics = econ
 	}
-	return writeStatusFile(path, fs)
+	if err := writeStatusFile(path, fs); err != nil {
+		return err
+	}
+	// JM-15 #56: refresh the pre-aggregated /derivatives/changes feed alongside
+	// the status rollup (same volume, sibling file) so the manager can serve
+	// deltas without opening the farm's SQLite. Ordered AFTER the status write
+	// so a feed error never blanks the dashboard; the error still surfaces to
+	// the caller's log.
+	return WriteChangesFeed(store, path)
 }
 
 // WriteFarmProgress writes a mid-sweep status file carrying the live in_progress
@@ -218,7 +226,13 @@ func WriteFarmProgress(store *derivatives.Store, path, mount string, sweep Sweep
 		return err
 	}
 	fs := FarmStatus{Index: st, LastSweep: sweep, Governor: gov, InProgress: &ip, WrittenAt: time.Now().Unix()}
-	return writeStatusFile(path, fs)
+	if err := writeStatusFile(path, fs); err != nil {
+		return err
+	}
+	// JM-15 #56: the mid-sweep tick refreshes the changes feed too — that's
+	// what makes the manager's feed LIVE while a sweep is running (rows appear
+	// within ~3s of each derivative committing, no sidecar re-sweep).
+	return WriteChangesFeed(store, path)
 }
 
 // writeStatusFile marshals + atomically-ish writes the status JSON, creating the
