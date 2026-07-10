@@ -3131,8 +3131,31 @@ func (jfs *juiceFS) MkdirAll(dirname string, perm os.FileMode) error {
 	// LocalOnly=true both flags "not yet on the backend" (the drainer/reconcile
 	// clear it once it lands in Redis) and protects it from the reconcile prune
 	// while it's only local — essential for offline-created dirs.
+	//
+	// REAL INODE AT BIRTH (#70 root cause, 2026-07-10): a dir minted with a
+	// SYNTHETIC inode serves that as its NFS fileid; seconds later the keyspace
+	// push reconciles the dir and swaps in JuiceFS's REAL inode — and the macOS
+	// client, seeing the fileid CHANGE for a name whose handle it holds,
+	// invalidates it → ESTALE on the very next op through that handle. During a
+	// bundle copy (ditto/Finder) the parent-dir handles are held throughout, so
+	// framework symlink creates died with "Stale NFS file handle" (reproduced:
+	// mkdir → fileid 92233...860 → 4s later 1326119). Online the dir ALREADY
+	// exists on FUSE here, so capture its real inode with one bounded Lstat —
+	// the fileid then never changes. Synthetic remains the offline/Lstat-fail
+	// fallback (offline dirs materialize at reconnect, when no copy holds them).
 	now := time.Now()
-	e := metadata.MakeEntry(dirname, true, 0, now, jfs.handler.nextSyntheticInode())
+	inode := uint64(0)
+	if !pin.IsOffline() {
+		if fi, ok := lstatWithTimeout(jfs.fullPath(dirname), fuseStatTimeout); ok && fi != nil {
+			if st, sok := fi.Sys().(*syscall.Stat_t); sok && st.Ino != 0 {
+				inode = st.Ino
+			}
+		}
+	}
+	if inode == 0 {
+		inode = jfs.handler.nextSyntheticInode()
+	}
+	e := metadata.MakeEntry(dirname, true, 0, now, inode)
 	e.LocalOnly = true
 	jfs.handler.store.InsertToCache(e)
 
@@ -3230,13 +3253,24 @@ func (jfs *juiceFS) Symlink(target, link string) error {
 	// is cosmetic for NFS type classification — READLINK serves the real target).
 	now := time.Now()
 	var size int64
+	inode := uint64(0)
 	if !offline {
 		if fi, err := os.Lstat(fusePath); err == nil {
 			size = fi.Size()
 			now = fi.ModTime()
+			// REAL INODE AT BIRTH (#70): this Lstat already runs for size/mtime
+			// — also take the real inode so the fileid never swaps under the
+			// client when the push-reconcile later sees this link (the swap is
+			// what ESTALE'd framework symlinks mid-bundle-copy; see MkdirAll).
+			if st, sok := fi.Sys().(*syscall.Stat_t); sok && st.Ino != 0 {
+				inode = st.Ino
+			}
 		}
 	}
-	e := metadata.MakeEntry(link, false, size, now, jfs.handler.nextSyntheticInode())
+	if inode == 0 {
+		inode = jfs.handler.nextSyntheticInode()
+	}
+	e := metadata.MakeEntry(link, false, size, now, inode)
 	e.Mode = (e.Mode &^ os.ModeType) | os.ModeSymlink
 	e.LocalOnly = true
 	jfs.handler.store.InsertToCache(e)
