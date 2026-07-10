@@ -361,14 +361,15 @@ func (h *JuiceMountHandler) sidecarWarmDir(dir string) {
 				if pin.IsOffline() {
 					return
 				}
-				release, ok := defaultReadQoS.tryAcquireBulk()
-				if !ok {
-					return // contended — interactive reads own the tunnel
-				}
+				// Deliberately NOT QoS-shed: a `._` sidecar is the exact byte
+				// Finder is about to read to display this folder — it is the
+				// critical path, not speculative prefetch. And it is ~4KB
+				// (latency-bound), so 16 in flight is ~64KB, no bandwidth
+				// threat to a concurrent media read. Shedding here (the v1 bug)
+				// let the serial foreground reads win the race → warm=0.
 				if h.warmSidecar(rel, h.fusePath+"/"+rel) {
 					atomic.AddInt64(&warmed, 1)
 				}
-				release()
 			}
 		}()
 	}
