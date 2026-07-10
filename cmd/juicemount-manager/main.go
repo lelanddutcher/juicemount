@@ -54,6 +54,7 @@ func main() {
 	minioURL := flag.String("minio-url", envOr("JM_MINIO_URL", ""), "SLICE 2: MinIO base URL the Overview dashboard pings via /minio/health/live. Empty disables the MinIO probe (Overview card shows an actionable hint). Use the same URL Mac clients connect to so the dashboard reflects what they see.")
 	farmStatus := flag.String("farm-status", envOr("JM_FARM_STATUS", ""), "Path to the juicefarm rollup (farm-status.json) for the Farm tab. Empty = Farm tab shows an empty state. Mount the juicefarm-state volume read-only to enable.")
 	mountOwner := flag.String("mount-owner", envOr("JM_MOUNT_OWNER", ""), "POSIX owner (uid[:gid], e.g. 501:20) that migrated data is chowned to after an embedded-mode sync, so the CLIENT mounting the volume can WRITE it — not just read it. The manager runs as root on the NAS, so without this, `juicefs sync` leaves migrated files root:wheel and a uid-501 Mac client can only read them. Empty = leave raw sync ownership. Set to the uid your Mac client mounts as (usually 501:20).")
+	overviewMeta := flag.String("overview-meta", envOr("JM_OVERVIEW_META", ""), "Redis URL for the Overview tab's `juicefs status` + Redis INFO probes. Use this in EMBEDDED mode (--fuse-mount), where --meta is unavailable (mutually exclusive), so Overview still works. In standalone mode --meta already serves both and this can stay empty.")
 	flag.Parse()
 
 	roots := splitNonEmpty(*sourceRoots, ",")
@@ -74,18 +75,19 @@ func main() {
 
 	mux := http.NewServeMux()
 	cfg := manager.Config{
-		JuiceFSBin:     *juicefsBin,
-		FUSEMount:      *fuseMount, // embedded mode if non-empty
-		MetaURL:        *metaURL,   // standalone mode if non-empty
-		VolName:        *volName,
-		SourceRoots:    roots,
-		DestMount:      *destMount,
-		AdminKey:       *adminKey,
-		StateFile:      *stateFile,
-		MinIOURL:       *minioURL,
-		FarmStatusPath: *farmStatus,
-		MountOwnerUID:  ownerUID,
-		MountOwnerGID:  ownerGID,
+		JuiceFSBin:      *juicefsBin,
+		FUSEMount:       *fuseMount, // embedded mode if non-empty
+		MetaURL:         *metaURL,   // standalone mode if non-empty
+		VolName:         *volName,
+		SourceRoots:     roots,
+		DestMount:       *destMount,
+		AdminKey:        *adminKey,
+		StateFile:       *stateFile,
+		MinIOURL:        *minioURL,
+		FarmStatusPath:  *farmStatus,
+		MountOwnerUID:   ownerUID,
+		MountOwnerGID:   ownerGID,
+		OverviewMetaURL: *overviewMeta,
 	}
 	mgr := manager.Register(mux, "", cfg)
 
