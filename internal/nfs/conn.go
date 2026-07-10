@@ -16,6 +16,8 @@ import (
 	xdr2 "github.com/rasky/go-xdr/xdr2"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
+
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
 
 // [JM5] Buffer pool to avoid allocations on the RPC hot path.
@@ -199,10 +201,28 @@ func (c *conn) serve(ctx context.Context) {
 		isWrite := w.req.Header.Prog == nfsServiceID &&
 			w.req.Header.Proc == uint32(NFSProcedureWrite)
 		if !isWrite && c.Server.rpcSem != nil {
+			// [S6 / H1 grader] Admission is the read head-of-line point: when the
+			// shared rpcSem is saturated the reader parks HERE, blocking every
+			// following LOOKUP/GETATTR/READ on this single TCP mount. Grade the
+			// wait WITHOUT adding cost to the uncontended path: attempt a
+			// NON-BLOCKING acquire first — on the common warm case (a free slot)
+			// we take it immediately with NO time.Now(), NO atomic, NO record.
+			// Only when the slot is FULL (exactly the HOL case we want to measure)
+			// do we sample the clock once and record the blocked duration via an
+			// atomic CAS-max gauge + threshold buckets (ObserveAdmitWait — no
+			// lock, no syscall). Warm expectation: rpc_admit_wait_us stays 0. A
+			// fat tail here PROVES admission HOL before any readSem surgery.
 			select {
 			case c.Server.rpcSem <- struct{}{}:
-			case <-connCtx.Done():
-				return
+				// fast path: slot free, zero admission wait — record nothing.
+			default:
+				admitStart := time.Now()
+				select {
+				case c.Server.rpcSem <- struct{}{}:
+					metrics.Default().ObserveAdmitWait(time.Since(admitStart))
+				case <-connCtx.Done():
+					return
+				}
 			}
 		}
 

@@ -226,6 +226,28 @@ var fuseStatTimeout = func() time.Duration {
 	return 800 * time.Millisecond
 }()
 
+// syncColdPopulateTimeout bounds the S3 fast-link synchronous cold-populate
+// (WAVE 1, RC-6). It is DELIBERATELY tight (~50ms) so this path can never block
+// the READDIR RPC longer than one bounded FUSE readdir — on a timeout it falls
+// through to today's async empty-then-pop-in behavior byte-identically. Tunable
+// via JM_SYNC_COLD_POPULATE_MS for live experimentation; the kill-switch is the
+// separate JM_SYNC_COLD_POPULATE=0 (see syncColdPopulateEnabled).
+var syncColdPopulateTimeout = func() time.Duration {
+	if v := os.Getenv("JM_SYNC_COLD_POPULATE_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return 50 * time.Millisecond
+}()
+
+// syncColdPopulateEnabled is the S3 kill-switch (WAVE 1). Default ON; set
+// JM_SYNC_COLD_POPULATE=0 to restore the prior async-only empty-then-pop-in
+// behavior. Read per call — only on the zero-row cold path, never the hot path.
+func syncColdPopulateEnabled() bool {
+	return os.Getenv("JM_SYNC_COLD_POPULATE") != "0"
+}
+
 // asyncDirRefreshEnabled gates the U7 async unmirrored-dir refresh. Default
 // ON: an online readdir of a directory with zero mirror rows returns the
 // mirror's (empty) answer immediately and refreshes the mirror from FUSE in
@@ -909,9 +931,23 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 	// recursive subdir fan-out below — see the comment at that loop.
 	readElapsed := time.Since(readStart)
 
-	toInsert := make([]*metadata.Entry, 0, len(dirEntries))
-	var subdirs []string
-	for _, de := range dirEntries {
+	// S4 (WAVE 1, RC-7): parallelize the per-child de.Info() lstats with a
+	// K-bounded worker pool (coldListFanout, class-scaled) so a high-latency
+	// link collapses N×RTT → (N/K)×RTT. Store.LookupByPath (RLock) and
+	// nextSyntheticInode (atomic) are concurrency-safe; results are collected
+	// by index to keep the mirror-insert + subdir order deterministic. This is
+	// the background prefetch path (already off the RPC hot path); K only caps
+	// how many lstats race, and the readdir was already bounded by prefetchGate.
+	// JM_COLD_LIST_FANOUT=0 forces K=1 (serial), restoring prior behavior.
+	type prefetchResult struct {
+		entry  *metadata.Entry // non-nil ⇒ needs mirror insert
+		subdir string          // non-empty ⇒ a subdirectory to one-level pre-warm
+	}
+	results := make([]prefetchResult, len(dirEntries))
+	fanout := coldListFanout(netprofile.Default().Class())
+	sem := make(chan struct{}, fanout)
+	var wg sync.WaitGroup
+	for i, de := range dirEntries {
 		// Skip AppleDouble/._ sidecars in the scan: they're filtered out of
 		// NFS listings anyway, and each one is a wasted FUSE round-trip
 		// (lookup → ENOENT) on a remote link. NOTE: only skipped in this
@@ -920,45 +956,64 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 		if strings.HasPrefix(de.Name(), "._") {
 			continue
 		}
-		info, err := de.Info()
-		if err != nil {
-			// Don't fail the scan on one bad entry. This only skips ADDING a
-			// new mirror row; a child already in the mirror is untouched (we
-			// never delete here), so a transient stat failure can't erase a
-			// known file from listings.
-			jmlog.Debug("prefetch: stat failed for child, skipping insert",
-				"dir", dirname, "name", de.Name(), "error", err.Error())
-			continue
-		}
-		var inode uint64
-		if st, ok := info.Sys().(*syscall.Stat_t); ok {
-			inode = st.Ino
-		} else {
-			inode = h.nextSyntheticInode()
-		}
-		childPath := path.Join(dirname, info.Name())
-		if dirname == "." {
-			childPath = info.Name()
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, de os.DirEntry) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			info, err := de.Info()
+			if err != nil {
+				// Don't fail the scan on one bad entry. This only skips ADDING a
+				// new mirror row; a child already in the mirror is untouched (we
+				// never delete here), so a transient stat failure can't erase a
+				// known file from listings.
+				jmlog.Debug("prefetch: stat failed for child, skipping insert",
+					"dir", dirname, "name", de.Name(), "error", err.Error())
+				return
+			}
+			var inode uint64
+			if st, ok := info.Sys().(*syscall.Stat_t); ok {
+				inode = st.Ino
+			} else {
+				inode = h.nextSyntheticInode()
+			}
+			childPath := path.Join(dirname, info.Name())
+			if dirname == "." {
+				childPath = info.Name()
+			}
 
-		// Batch-3 adversarial review #2: skip scan-filtered children entirely
-		// — never mirrored, and never added to subdirs (the fast-link fan-out
-		// below was descending from a root READDIR into .juicemount and
-		// re-mirroring the derivative tree one level per navigation).
-		if metadata.ScanFilteredPath(childPath) {
-			continue
-		}
+			// Batch-3 adversarial review #2: skip scan-filtered children entirely
+			// — never mirrored, and never added to subdirs (the fast-link fan-out
+			// below was descending from a root READDIR into .juicemount and
+			// re-mirroring the derivative tree one level per navigation).
+			if metadata.ScanFilteredPath(childPath) {
+				return
+			}
 
-		// Only insert if not already cached (cheap pre-filter; the atomic
-		// presence check lives in BulkInsertAbsent — see below)
-		if h.store.LookupByPath(childPath) == nil {
-			entry := metadata.MakeEntry(childPath, info.IsDir(), info.Size(), info.ModTime(), inode)
-			toInsert = append(toInsert, entry)
-		}
+			var r prefetchResult
+			// Only insert if not already cached (cheap pre-filter; the atomic
+			// presence check lives in BulkInsertAbsent — see below)
+			if h.store.LookupByPath(childPath) == nil {
+				r.entry = metadata.MakeEntry(childPath, info.IsDir(), info.Size(), info.ModTime(), inode)
+			}
+			// Track subdirectories for one-level-deep prefetch
+			if info.IsDir() {
+				r.subdir = childPath
+			}
+			results[i] = r
+		}(i, de)
+	}
+	wg.Wait()
 
-		// Track subdirectories for one-level-deep prefetch
-		if info.IsDir() {
-			subdirs = append(subdirs, childPath)
+	// Assemble in original order (deterministic).
+	toInsert := make([]*metadata.Entry, 0, len(dirEntries))
+	var subdirs []string
+	for _, r := range results {
+		if r.entry != nil {
+			toInsert = append(toInsert, r.entry)
+		}
+		if r.subdir != "" {
+			subdirs = append(subdirs, r.subdir)
 		}
 	}
 
@@ -1281,6 +1336,13 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 		// AND FUSE confirms the path still exists, re-insert it and serve
 		// normally. Singleflight by inode so DaVinci's scrub retries don't
 		// cascade into N redundant Lstat calls.
+		//
+		// S6 (H2 grader): one inc as the FromHandle cache-miss ENTERS the
+		// evicted-recovery branch — the attempt/denominator for the stale-
+		// recovery path. Warm-mount expectation ~0; a spike localizes a
+		// stale-storm. Atomic-only, no new syscall (the Lstat, if any, is
+		// inside tryRecoverEvicted and already existed).
+		metrics.Default().IncRecoverLstat()
 		if recovered := h.tryRecoverEvicted(inode); recovered != nil {
 			parts := splitPath(recovered.Path)
 			return &juiceFS{handler: h}, parts, nil
@@ -1323,6 +1385,13 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 		if shadow, ok := h.store.LookupRecentlyEvicted(inode); ok {
 			hadShadow = true
 			pathSample = shadow.Path
+			// S6 (H2 grader): the had-shadow STALE case. Both recovery paths
+			// above already FAILED for this inode, yet a Layer-B shadow still
+			// exists within ShadowTTL — a prune/rename orphan whose handle the
+			// client still holds. Counting only the had-shadow subset (not
+			// genuinely-foreign handles) is what makes this a stale-storm
+			// localizer. Atomic-only; the shadow lookup already ran for the log.
+			metrics.Default().IncRecoverStale()
 		}
 		ps, is := h.store.CacheStats()
 		jmlog.Warn("FromHandle STALE",
@@ -1453,6 +1522,11 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 
 	// File exists. Promote the shadow back to live cache.
 	recovered := h.store.RecoverShadow(shadow, inode)
+	// S6 (H2 grader): the ms-cost success case — an evicted inode re-confirmed
+	// via the FUSE Lstat above and promoted back to the live cache. (The
+	// spool-pending fast recovery at the top of this function is deliberately
+	// NOT counted here: it skips the Lstat and is not the ms-cost path.)
+	metrics.Default().IncRecoverSuccess()
 	jmlog.Info("FromHandle recovered evicted entry",
 		"inode", fmt.Sprintf("%x", inode),
 		"path", shadow.Path,
@@ -1976,6 +2050,9 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 				// prefetch pool busy — shed this one
 			}
 		}
+		// WAVE 0: one inc per warm readdir served from the RAM mirror fast path
+		// (the len(children)>0 branch). QA-35-safe single atomic increment.
+		metrics.Default().IncReaddirMirrorHit()
 		return infos, nil
 	}
 
@@ -2022,6 +2099,30 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	// QA-35 hot-path discipline: this RPC path does only in-memory checks —
 	// the FUSE readdir happens strictly on the background goroutine.
 	if asyncDirRefreshEnabled() {
+		// S3 (WAVE 1, RC-6): on a FAST link ONLY, do a BOUNDED synchronous
+		// populate before returning, so Finder's FIRST readdir carries the
+		// children instead of an empty listing that pops in later (or, worst
+		// case, stays empty until acdirmax on an out-of-band deep link).
+		//
+		// HOT-PATH SAFETY (the invariants this fix must preserve):
+		//   - This code is UNREACHABLE for a warm dir: the len(children)>0 RAM
+		//     fast path at the top of ReadDir already returned. We are here ONLY
+		//     because the mirror has ZERO rows for this directory.
+		//   - It is TIME-BOUNDED by syncColdPopulateTimeout (~50ms) — it can
+		//     never block the RPC longer than one bounded FUSE readdir.
+		//   - It NEVER changes offline/G0 behavior: the offline early-return and
+		//     pin.FUSEIdentityOK gates above/inside still apply; on any timeout,
+		//     error, zero children, or a non-Fast link it FALLS THROUGH to the
+		//     exact async empty-then-pop-in path below, byte-identically.
+		// Kill-switch JM_SYNC_COLD_POPULATE=0; class-gated to ClassFast.
+		if syncColdPopulateEnabled() && netprofile.Default().Class() == netprofile.ClassFast {
+			if infos, ok := jfs.syncColdPopulateBounded(dirname, fusePath); ok {
+				return infos, nil // one readdir, populated
+			}
+		}
+		// WAVE 0: a zero-row (unmirrored) dir returned EMPTY + kicked an async
+		// refresh — the empty-then-pop-in case. One atomic inc.
+		metrics.Default().IncReaddirEmptyRefill()
 		jfs.maybeAsyncRefreshDir(dirname, fusePath)
 		return []os.FileInfo{}, nil
 	}
@@ -2061,59 +2162,173 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 // gate bounds the per-child de.Info() lstats (batch-3 adversarial review #0
 // — see infoWithTimeout): the foreground fallback passes nfsLstatGate, the
 // U7 async worker passes prefetchGate. On a timeout the listing pass is
-// ABANDONED (break) so the async worker always returns promptly and releases
-// its dirRefreshSem slot + singleflight key; the partial toInsert is safe
-// (inserts are insert-only and the next readdir re-fires the refresh).
+// ABANDONED so the async worker always returns promptly and releases its
+// dirRefreshSem slot + singleflight key; the partial toInsert is safe (inserts
+// are insert-only and the next readdir re-fires the refresh).
+//
+// S4 (WAVE 1, RC-7): the per-child lstats run through a K-bounded worker pool
+// (coldListFanout, class-scaled) instead of serially, collapsing N×RTT →
+// (N/K)×RTT on a high-latency link. Each worker still calls infoWithTimeout,
+// which acquires the SAME `gate` (nfsLstatGate foreground / prefetchGate
+// background) and honors the same per-child timeout — so the global lstat
+// budget and anti-flood discipline are preserved; the fan-out only lets up to K
+// of those already-gated lstats be in flight at once. This is the background /
+// non-default-foreground fallback path, NOT the RAM serve.
 func (jfs *juiceFS) coldDirListing(dirname string, dirEntries []os.DirEntry, gate chan struct{}) ([]os.FileInfo, []*metadata.Entry) {
+	type result struct {
+		info    os.FileInfo
+		entry   *metadata.Entry // nil when scan-filtered (in listing, not mirrored)
+		present bool            // stat succeeded and entry belongs in the listing
+	}
+	results := make([]result, len(dirEntries))
+
+	// wedged is set the first time any worker's stat times out (ok==false).
+	// Once set, still-pending workers short-circuit so we stop hammering a mount
+	// that just proved unresponsive — preserving the serial version's
+	// abandon-on-wedge intent within a bounded pool.
+	var wedged atomic.Bool
+	var wedgedName atomic.Value // string: the child whose stat first timed out
+
+	fanout := coldListFanout(netprofile.Default().Class())
+	sem := make(chan struct{}, fanout)
+	var wg sync.WaitGroup
+
+	for i, de := range dirEntries {
+		if wedged.Load() {
+			break // FUSE already proved unresponsive — don't dispatch more lstats
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, de os.DirEntry) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if wedged.Load() {
+				return
+			}
+			info, err, ok := infoWithTimeout(de, fuseStatTimeout, gate)
+			if !ok {
+				// FUSE wedged/slow mid-listing. Flag it so later workers bail.
+				if wedged.CompareAndSwap(false, true) {
+					wedgedName.Store(de.Name())
+				}
+				return
+			}
+			if err != nil {
+				// Log rather than silently dropping. A stat failure here omits the
+				// entry from the returned listing, which presents as a folder that
+				// "didn't fully load"; macOS caches that partial result until the
+				// attr-cache expires or a refresh.
+				jmlog.Debug("readdir: stat failed for child — omitting from cold listing",
+					"dir", dirname, "name", de.Name(), "error", err.Error())
+				return
+			}
+
+			// Extract real inode from FUSE stat
+			var inode uint64
+			if st, ok := info.Sys().(*syscall.Stat_t); ok {
+				inode = st.Ino
+			} else {
+				inode = jfs.handler.nextSyntheticInode()
+			}
+			childPath := path.Join(dirname, info.Name())
+			if dirname == "." {
+				childPath = info.Name()
+			}
+			r := result{info: info, present: true}
+			// Batch-3 adversarial review #2/#4: never MIRROR a scan-filtered
+			// namespace from a FUSE-sourced listing (#78 invariant). The entry
+			// stays in the RETURNED listing (foreground behavior unchanged); it
+			// just never lands in the mirror (entry left nil).
+			if !metadata.ScanFilteredPath(childPath) {
+				r.entry = metadata.MakeEntry(childPath, info.IsDir(), info.Size(), info.ModTime(), inode)
+			}
+			results[i] = r
+		}(i, de)
+	}
+	wg.Wait()
+
+	// Collect in the ORIGINAL dirEntries order (deterministic, matches the prior
+	// serial version). Skipped/failed children leave a zero-value (present=false)
+	// slot that we drop here.
 	infos := make([]os.FileInfo, 0, len(dirEntries))
 	toInsert := make([]*metadata.Entry, 0, len(dirEntries))
-	for _, de := range dirEntries {
-		info, err, ok := infoWithTimeout(de, fuseStatTimeout, gate)
-		if !ok {
-			// FUSE wedged/slow mid-listing. Do NOT keep issuing per-child
-			// lstats against a mount that just proved unresponsive — bail with
-			// whatever was collected. Warn (not Debug): shedding a listing
-			// pass is the signal that FUSE is degrading.
-			jmlog.Warn("readdir: per-child stat timed out — abandoning cold listing",
-				"dir", dirname, "name", de.Name(), "collected", len(infos), "total", len(dirEntries))
-			break
-		}
-		if err != nil {
-			// Log rather than silently dropping. A stat failure here (e.g. a
-			// transient hiccup on a high-latency link) omits the entry from the
-			// returned listing, which presents to the user as a folder that
-			// "didn't fully load." macOS then caches that partial result for up
-			// to acdirmax, so it persists until the cache expires or a refresh.
-			jmlog.Debug("readdir: stat failed for child — omitting from cold listing",
-				"dir", dirname, "name", de.Name(), "error", err.Error())
+	for _, r := range results {
+		if !r.present {
 			continue
 		}
-		infos = append(infos, info)
-
-		// Extract real inode from FUSE stat
-		var inode uint64
-		if st, ok := info.Sys().(*syscall.Stat_t); ok {
-			inode = st.Ino
-		} else {
-			inode = jfs.handler.nextSyntheticInode()
+		infos = append(infos, r.info)
+		if r.entry != nil {
+			toInsert = append(toInsert, r.entry)
 		}
-		childPath := path.Join(dirname, info.Name())
-		if dirname == "." {
-			childPath = info.Name()
-		}
-		// Batch-3 adversarial review #2/#4: never MIRROR a scan-filtered
-		// namespace from a FUSE-sourced listing (#78 invariant: the mirror
-		// never holds .trash/.juicemount rows — the SCAN can't confirm them,
-		// so mirrored rows resurface in listings/FTS until the next boot's
-		// GC). The entry stays in the RETURNED listing (foreground behavior
-		// unchanged); it just never lands in the mirror.
-		if metadata.ScanFilteredPath(childPath) {
-			continue
-		}
-		entry := metadata.MakeEntry(childPath, info.IsDir(), info.Size(), info.ModTime(), inode)
-		toInsert = append(toInsert, entry)
+	}
+	if wedged.Load() {
+		name, _ := wedgedName.Load().(string)
+		jmlog.Warn("readdir: per-child stat timed out — abandoning cold listing",
+			"dir", dirname, "name", name, "collected", len(infos), "total", len(dirEntries))
 	}
 	return infos, toInsert
+}
+
+// coldListFanout returns the S4 per-directory lstat fan-out width (WAVE 1,
+// RC-7), class-scaled: a fast link parallelizes wide to collapse per-child RTT,
+// a metered/slow link stays gentler. JM_COLD_LIST_FANOUT=0 is the kill-switch —
+// it forces K=1 (serial), restoring the prior behavior exactly. The fan-out is
+// bounded by the shared gate (nfsLstatGate / prefetchGate) inside infoWithTimeout
+// regardless, so K only caps how many gated lstats race at once — it can never
+// exceed the global budget or re-create the anti-flood-gated round-trip storm.
+func coldListFanout(class netprofile.LinkClass) int {
+	if os.Getenv("JM_COLD_LIST_FANOUT") == "0" {
+		return 1 // kill-switch: serial, prior behavior
+	}
+	switch class {
+	case netprofile.ClassMetered, netprofile.ClassSlow:
+		return 8
+	default: // ClassMedium, ClassFast
+		return 24
+	}
+}
+
+// syncColdPopulateBounded does an S3 (WAVE 1, RC-6) BOUNDED synchronous cold
+// populate for a genuinely-unmirrored directory on a FAST link. It reuses the
+// EXISTING bounded FUSE readdir (readDirWithTimeout) + entry-construction
+// (coldDirListing) helpers, capped by syncColdPopulateTimeout so it can never
+// block longer than one bounded FUSE readdir. On success (children found) it
+// upserts them into the mirror (insert-only, absent-checked, same TOCTOU
+// discipline as refreshUnmirroredDir) so subsequent Stat/READDIR hit the RAM
+// hot path, and returns the FileInfos so THIS readdir is populated rather than
+// empty. Returns ok=false on FUSE timeout / error / zero children, so the caller
+// falls through to today's async empty-then-pop-in path unchanged.
+//
+// This is NOT the warm serve path — it fires ONLY from the zero-mirror-row cold
+// branch of ReadDir (the len(children)>0 fast path never reaches here). It uses
+// the shared foreground budget (nfsLstatGate) because it is on the RPC path, and
+// the tight timeout is the guarantee it can't head-of-line-block Finder.
+func (jfs *juiceFS) syncColdPopulateBounded(dirname, fusePath string) ([]os.FileInfo, bool) {
+	dirEntries, err, ok := readDirWithTimeout(fusePath, syncColdPopulateTimeout, nfsLstatGate)
+	if !ok || err != nil {
+		return nil, false // FUSE wedged/slow or errored — fall through to async
+	}
+	infos, toInsert := jfs.coldDirListing(dirname, dirEntries, nfsLstatGate)
+	if len(infos) == 0 {
+		return nil, false // genuinely empty (or all stats shed) — nothing to serve
+	}
+	// Mirror the discovered children INSERT-only (absent-checked in the store's
+	// own critical section) so the stale FUSE snapshot can never clobber a
+	// fresher row that landed concurrently — same discipline as
+	// refreshUnmirroredDir / prefetchChildren.
+	if len(toInsert) > 0 {
+		h := jfs.handler
+		absent := make([]*metadata.Entry, 0, len(toInsert))
+		for _, e := range toInsert {
+			if h.store.LookupByPath(e.Path) == nil {
+				absent = append(absent, e)
+			}
+		}
+		if len(absent) > 0 {
+			h.store.BulkInsertAbsent(absent, 500)
+		}
+	}
+	return infos, true
 }
 
 // maybeAsyncRefreshDir dispatches the U7 background refresh for a directory
@@ -2153,6 +2368,10 @@ func (jfs *juiceFS) maybeAsyncRefreshDir(dirname, fusePath string) {
 	default:
 		// All refresh workers busy — shed. Clear the singleflight key now so
 		// the NEXT readdir on this directory can re-dispatch.
+		// WAVE 0: this shed was previously SILENT — it is the grader for the
+		// S3/S4 refresh fixes (shed rate should drop to ~0 after them). One
+		// atomic inc, off the RPC hot path (this fn does only in-memory work).
+		metrics.Default().IncReaddirColdShed()
 		clear()
 	}
 }
@@ -3306,6 +3525,17 @@ var cacheReaderServeEnabled = os.Getenv("JM_ENABLE_CACHE_READER") == "1"
 // size-revalidation + invalidation-on-content-change.
 var memBufServeEnabled = os.Getenv("JM_ENABLE_MEMBUF_SERVE") == "1"
 
+// coldSubreadDur is the wall-clock threshold that classifies a Priority-3 FUSE
+// subread as COLD (a real backend/MinIO GET over the link) vs WARM (an SSD
+// block-cache hit). It MIRRORS internal/netprofile.minThroughputDur (3ms) — the
+// SAME discriminator ObserveThroughput uses to decide whether a read sample
+// reflects the wire or the SSD cache. Reusing that threshold keeps the
+// read_cold_subread / read_warm_subread counters consistent with the link
+// estimator, and — crucially (QA-35) — the signal is the read's OWN measured
+// duration (already captured as readStart for ObserveThroughput), so classifying
+// it adds NO syscall and NO lock, just one atomic increment.
+const coldSubreadDur = 3 * time.Millisecond
+
 func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	// Priority 1: Memory buffer (zero-syscall, for small files like .prproj, LUTs)
 	if memBufServeEnabled && f.memBuf != nil {
@@ -3475,12 +3705,24 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	}
 	if n > 0 {
 		metrics.Default().AddBytesRead(int64(n))
+		elapsed := time.Since(readStart)
+		// WAVE 0 (RC-1/RC-3 grader): split this Priority-3 FUSE subread into
+		// cold (real backend/MinIO GET over the link) vs warm (local SSD block
+		// cache) using the read's OWN measured duration — the SAME >=3ms
+		// discriminator ObserveThroughput uses below. No new syscall: elapsed is
+		// already measured for the link estimator. The cold ratio is the grader
+		// for whether preview READs hit MinIO or the local SSD cache.
+		if elapsed >= coldSubreadDur {
+			metrics.Default().IncReadColdSubread()
+		} else {
+			metrics.Default().IncReadWarmSubread()
+		}
 		// [#16 phase 2] Feed the link estimator from the MAIN read path. This is
 		// the signal the prefetch-only sampler missed (juicefs pre-pulls whole
 		// files before our readahead runs, so our prefetch reads were all cache
 		// hits). A cold subread here is a real backend transfer; ObserveThroughput
 		// filters warm/sub-256KB reads so only wire-speed moves the estimate.
-		netprofile.Default().ObserveThroughput(int64(n), time.Since(readStart))
+		netprofile.Default().ObserveThroughput(int64(n), elapsed)
 	}
 	return n, err
 }

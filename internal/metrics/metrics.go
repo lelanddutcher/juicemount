@@ -189,6 +189,92 @@ type Registry struct {
 	readRetries atomic.Uint64
 	readFails   atomic.Uint64
 
+	// Nav-latency observability counters (WAVE 0). These are QA-35-safe:
+	// each is a single atomic.Uint64 increment on an EXISTING fork point in
+	// the readdir / lookup / read / readahead paths — never a per-RPC FUSE
+	// syscall or a hot-path lock. They exist so every nav-latency fix is
+	// gradeable by a /metrics diff instead of an external fs_usage/accesslog
+	// session (see NAV_LATENCY_DOSSIER §5).
+	//
+	// readdirMirrorHit  — a warm READDIR served from the RAM mirror fast path.
+	// readdirEmptyRefill— a zero-row (unmirrored) dir returned EMPTY + kicked
+	//                     an async refresh (the empty-then-pop-in case).
+	// readdirColdShed   — an async dir-refresh SHED because all refresh workers
+	//                     were busy (previously SILENT; grades the S3/S4 fixes).
+	readdirMirrorHit   atomic.Uint64
+	readdirEmptyRefill atomic.Uint64
+	readdirColdShed    atomic.Uint64
+
+	// lookupHit / lookupNoent — the LOOKUP resolve outcome (name resolved from
+	// the cache vs returned NoEnt). One inc per LOOKUP that reaches the
+	// child-resolution branch.
+	lookupHit   atomic.Uint64
+	lookupNoent atomic.Uint64
+
+	// readColdSubread / readWarmSubread — THE KEY grader (RC-1/RC-3). Split off
+	// the EXISTING warm/cold discriminator on the FUSE read path: a subread
+	// whose wall-clock duration crosses the same threshold ObserveThroughput
+	// uses to treat a sample as a real backend transfer (a cold MinIO GET over
+	// the link) is counted cold; a sub-threshold subread (SSD block-cache hit)
+	// is counted warm. No new syscall — the read latency is already measured
+	// for ObserveThroughput. The cold ratio is the grader for whether preview
+	// READs hit MinIO or the local SSD cache.
+	readColdSubread atomic.Uint64
+	readWarmSubread atomic.Uint64
+
+	// readaheadTriggered / readaheadPrefetchedBlocks — grades S2. One inc per
+	// readahead schedule (SeqThreshold trip); prefetched-blocks accumulates the
+	// block count actually pulled by the background prefetch.
+	// readaheadSuppressed — one inc per SeqThreshold trip that the S2 short-run
+	// guard capped (a preview probe that would have escalated to the 64MB window
+	// but was skipped). Rising counter = the guard is doing its job.
+	readaheadTriggered        atomic.Uint64
+	readaheadPrefetchedBlocks atomic.Uint64
+	readaheadSuppressed       atomic.Uint64
+
+	// H2 stale-recovery graders (S6). FromHandle's evicted-inode recovery path
+	// (nfs/handler.go tryRecoverEvicted). Warm-mount expectation is a FLAT ~0 on
+	// all three; a spike localizes a FromHandle stale-storm. QA-35-safe — each is
+	// a single atomic increment on an EXISTING FromHandle fork point, never a new
+	// FUSE syscall or a hot-path lock.
+	//
+	// recoverLstat   — a FromHandle inode-cache MISS entered the evicted-recovery
+	//                  branch (tryRecoverEvicted): the cache-miss that may fall to
+	//                  a FUSE Lstat. The attempt/denominator counter.
+	// recoverStale   — the had-shadow STALE outcome: both recovery paths failed
+	//                  but a Layer-B shadow still existed within ShadowTTL (a
+	//                  prune/rename orphan whose handle the client still holds).
+	// recoverSuccess — the ms-cost success: an evicted inode re-confirmed via the
+	//                  FUSE Lstat and promoted back to the live cache.
+	recoverLstat   atomic.Uint64
+	recoverStale   atomic.Uint64
+	recoverSuccess atomic.Uint64
+
+	// H1 read-admission head-of-line grader (S6). The per-connection serve loop
+	// blocks acquiring the shared rpcSem before dispatching a non-WRITE RPC
+	// (internal/nfs/conn.go). When the semaphore is saturated the reader parks,
+	// head-of-line-blocking every following LOOKUP/GETATTR/READ on that mount.
+	// Graded WITHOUT a lock or a histogram: a monotonic CAS-max gauge (µs) plus
+	// two bucketed atomic counters. The admission FAST path (a free slot) records
+	// NOTHING — no time.Now(), no atomic — so the warm expectation is a literal 0
+	// and the counter adds zero measurable cost to the uncontended per-RPC path
+	// (QA-35). A fat tail here PROVES admission HOL before any readSem surgery.
+	//
+	// rpcAdmitWaitMaxUs    — monotonic max admission wait seen, µs (CAS-max gauge).
+	// rpcAdmitWaitOver1ms  — count of admissions that blocked ≥ 1ms.
+	// rpcAdmitWaitOver10ms — count of admissions that blocked ≥ 10ms.
+	rpcAdmitWaitMaxUs    atomic.Uint64
+	rpcAdmitWaitOver1ms  atomic.Uint64
+	rpcAdmitWaitOver10ms atomic.Uint64
+
+	// readdirVerifierHit / readdirFsReaddir — grades whether a paged
+	// READDIR(PLUS) scroll was served from the verifier/cookie cache
+	// (DataForVerifier hit → no ReadDir ran) or fell to a full fs.ReadDir
+	// (internal/nfs/nfs_onreaddir.go). A high fs-readdir share during a scroll =
+	// the verifier cache is missing paged reads.
+	readdirVerifierHit atomic.Uint64
+	readdirFsReaddir   atomic.Uint64
+
 	// Health hook — set by main.go so /health can answer accurately.
 	healthMu sync.RWMutex
 	healthFn func() HealthSnapshot
@@ -305,17 +391,138 @@ func (r *Registry) IncReadRetry() { r.readRetries.Add(1) }
 // (the genuinely-bad case — bytes were surfaced to the client as an error).
 func (r *Registry) IncReadFail() { r.readFails.Add(1) }
 
+// --- Nav-latency observability counters (WAVE 0). All QA-35-safe atomics. ---
+
+// IncReaddirMirrorHit records a warm READDIR served from the RAM mirror.
+func (r *Registry) IncReaddirMirrorHit() { r.readdirMirrorHit.Add(1) }
+
+// IncReaddirEmptyRefill records a zero-row dir returned empty + async-refreshed.
+func (r *Registry) IncReaddirEmptyRefill() { r.readdirEmptyRefill.Add(1) }
+
+// IncReaddirColdShed records an async dir-refresh shed because all workers were
+// busy (previously silent — the grader for the S3/S4 refresh fixes).
+func (r *Registry) IncReaddirColdShed() { r.readdirColdShed.Add(1) }
+
+// IncLookupHit records a LOOKUP whose child name resolved.
+func (r *Registry) IncLookupHit() { r.lookupHit.Add(1) }
+
+// IncLookupNoent records a LOOKUP that returned NoEnt (name not present).
+func (r *Registry) IncLookupNoent() { r.lookupNoent.Add(1) }
+
+// IncReadColdSubread records a FUSE subread served cold (real backend/MinIO GET
+// over the link) — see the discriminator in cachedFile.ReadAt.
+func (r *Registry) IncReadColdSubread() { r.readColdSubread.Add(1) }
+
+// IncReadWarmSubread records a FUSE subread served warm (local SSD block cache).
+func (r *Registry) IncReadWarmSubread() { r.readWarmSubread.Add(1) }
+
+// IncReadaheadTriggered records one readahead schedule (SeqThreshold trip).
+func (r *Registry) IncReadaheadTriggered() { r.readaheadTriggered.Add(1) }
+
+// AddReadaheadPrefetchedBlocks adds the count of blocks a prefetch pass pulled.
+func (r *Registry) AddReadaheadPrefetchedBlocks(n int64) {
+	if n > 0 {
+		r.readaheadPrefetchedBlocks.Add(uint64(n))
+	}
+}
+
+// IncReadaheadSuppressed records a SeqThreshold trip that the S2 short-run guard
+// capped instead of escalating to the full prefetch window (a preview probe).
+func (r *Registry) IncReadaheadSuppressed() { r.readaheadSuppressed.Add(1) }
+
+// --- H2 stale-recovery graders (S6). QA-35-safe atomics on FromHandle. ---
+
+// IncRecoverLstat records a FromHandle inode-cache miss that entered the
+// evicted-inode recovery branch (tryRecoverEvicted) — the attempt/denominator
+// counter for the H2 stale-recovery path.
+func (r *Registry) IncRecoverLstat() { r.recoverLstat.Add(1) }
+
+// IncRecoverStale records a had-shadow STALE outcome: FromHandle recovery failed
+// but a Layer-B shadow still existed within ShadowTTL (a prune/rename orphan the
+// client still holds a handle for).
+func (r *Registry) IncRecoverStale() { r.recoverStale.Add(1) }
+
+// IncRecoverSuccess records an evicted inode re-confirmed via the FUSE Lstat and
+// promoted back to the live cache — the ms-cost recovery success case.
+func (r *Registry) IncRecoverSuccess() { r.recoverSuccess.Add(1) }
+
+// --- H1 read-admission head-of-line grader (S6). Atomic-only, no lock. ---
+
+// ObserveAdmitWait records how long the per-connection serve loop blocked
+// acquiring the rpcSem admission slot. Callers MUST invoke it ONLY when the
+// acquire actually blocked — a zero-wait fast-path acquire records nothing, so
+// the uncontended per-RPC path pays no cost at all. Mechanism: a monotonic
+// CAS-max gauge plus two threshold buckets — all atomic, never a lock or a
+// syscall. A sub-microsecond wait (rounds to 0 µs) is dropped by the us<=0 guard.
+func (r *Registry) ObserveAdmitWait(d time.Duration) {
+	us := d.Microseconds()
+	if us <= 0 {
+		return
+	}
+	uus := uint64(us)
+	for {
+		cur := r.rpcAdmitWaitMaxUs.Load()
+		if uus <= cur {
+			break
+		}
+		if r.rpcAdmitWaitMaxUs.CompareAndSwap(cur, uus) {
+			break
+		}
+	}
+	if d >= time.Millisecond {
+		r.rpcAdmitWaitOver1ms.Add(1)
+	}
+	if d >= 10*time.Millisecond {
+		r.rpcAdmitWaitOver10ms.Add(1)
+	}
+}
+
+// --- Paged-readdir cache grader (S6). ---
+
+// IncReaddirVerifierHit records a READDIR(PLUS) served from the verifier/cookie
+// cache (DataForVerifier hit — no fs.ReadDir ran).
+func (r *Registry) IncReaddirVerifierHit() { r.readdirVerifierHit.Add(1) }
+
+// IncReaddirFsReaddir records a READDIR(PLUS) that fell to a full fs.ReadDir.
+func (r *Registry) IncReaddirFsReaddir() { r.readdirFsReaddir.Add(1) }
+
 // Snapshot is the JSON shape returned by /metrics.
 type Snapshot struct {
-	UptimeSec    int64                  `json:"uptime_sec"`
-	RPCTotal     uint64                 `json:"rpc_total"`
-	RPCErrors    uint64                 `json:"rpc_errors"`
-	BytesRead    uint64                 `json:"bytes_read"`
-	BytesWritten uint64                 `json:"bytes_written"`
-	ReadRetries  uint64                 `json:"read_retries"`
-	ReadFails    uint64                 `json:"read_fails"`
-	RPCs         map[string]RPCSnapshot `json:"rpcs"`
-	Network      *NetworkSnapshot       `json:"network,omitempty"`
+	UptimeSec    int64  `json:"uptime_sec"`
+	RPCTotal     uint64 `json:"rpc_total"`
+	RPCErrors    uint64 `json:"rpc_errors"`
+	BytesRead    uint64 `json:"bytes_read"`
+	BytesWritten uint64 `json:"bytes_written"`
+	ReadRetries  uint64 `json:"read_retries"`
+	ReadFails    uint64 `json:"read_fails"`
+
+	// Nav-latency observability counters (WAVE 0). See NAV_LATENCY_DOSSIER §5.
+	ReaddirMirrorHit          uint64 `json:"readdir_mirror_hit"`
+	ReaddirEmptyRefill        uint64 `json:"readdir_empty_refill"`
+	ReaddirColdShed           uint64 `json:"readdir_cold_shed"`
+	LookupHit                 uint64 `json:"lookup_hit"`
+	LookupNoent               uint64 `json:"lookup_noent"`
+	ReadColdSubread           uint64 `json:"read_cold_subread"`
+	ReadWarmSubread           uint64 `json:"read_warm_subread"`
+	ReadaheadTriggered        uint64 `json:"readahead_triggered"`
+	ReadaheadPrefetchedBlocks uint64 `json:"readahead_prefetched_blocks"`
+	ReadaheadSuppressed       uint64 `json:"readahead_suppressed"`
+
+	// H1/H2 nav-latency graders (S6). See NAV_LATENCY_DOSSIER §5-6.
+	// recover_* grade FromHandle stale-recovery (H2); rpc_admit_wait_* grade
+	// read-admission head-of-line block (H1); readdir_verifier_hit /
+	// readdir_fs_readdir grade paged-readdir cache service.
+	RecoverLstat         uint64 `json:"recover_lstat_total"`
+	RecoverStale         uint64 `json:"recover_stale_total"`
+	RecoverSuccess       uint64 `json:"recover_success_total"`
+	RPCAdmitWaitUs       uint64 `json:"rpc_admit_wait_us"`
+	RPCAdmitWaitOver1ms  uint64 `json:"rpc_admit_wait_over_1ms"`
+	RPCAdmitWaitOver10ms uint64 `json:"rpc_admit_wait_over_10ms"`
+	ReaddirVerifierHit   uint64 `json:"readdir_verifier_hit"`
+	ReaddirFsReaddir     uint64 `json:"readdir_fs_readdir"`
+
+	RPCs    map[string]RPCSnapshot `json:"rpcs"`
+	Network *NetworkSnapshot       `json:"network,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -338,7 +545,28 @@ func (r *Registry) Snapshot() Snapshot {
 		BytesWritten: r.bytesWrite.Load(),
 		ReadRetries:  r.readRetries.Load(),
 		ReadFails:    r.readFails.Load(),
-		RPCs:         make(map[string]RPCSnapshot, len(trackedTypes)),
+
+		ReaddirMirrorHit:          r.readdirMirrorHit.Load(),
+		ReaddirEmptyRefill:        r.readdirEmptyRefill.Load(),
+		ReaddirColdShed:           r.readdirColdShed.Load(),
+		LookupHit:                 r.lookupHit.Load(),
+		LookupNoent:               r.lookupNoent.Load(),
+		ReadColdSubread:           r.readColdSubread.Load(),
+		ReadWarmSubread:           r.readWarmSubread.Load(),
+		ReadaheadTriggered:        r.readaheadTriggered.Load(),
+		ReadaheadPrefetchedBlocks: r.readaheadPrefetchedBlocks.Load(),
+		ReadaheadSuppressed:       r.readaheadSuppressed.Load(),
+
+		RecoverLstat:         r.recoverLstat.Load(),
+		RecoverStale:         r.recoverStale.Load(),
+		RecoverSuccess:       r.recoverSuccess.Load(),
+		RPCAdmitWaitUs:       r.rpcAdmitWaitMaxUs.Load(),
+		RPCAdmitWaitOver1ms:  r.rpcAdmitWaitOver1ms.Load(),
+		RPCAdmitWaitOver10ms: r.rpcAdmitWaitOver10ms.Load(),
+		ReaddirVerifierHit:   r.readdirVerifierHit.Load(),
+		ReaddirFsReaddir:     r.readdirFsReaddir.Load(),
+
+		RPCs: make(map[string]RPCSnapshot, len(trackedTypes)),
 	}
 
 	r.netMu.RLock()
