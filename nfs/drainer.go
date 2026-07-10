@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -48,10 +49,19 @@ type Drainer struct {
 	backoffBase  time.Duration
 	pollFallback time.Duration
 
-	sem    chan struct{}
-	notify chan struct{}
-	stop   chan struct{}
-	done   chan struct{}
+	sem chan struct{}
+	// slowGate serializes drains on slow/metered links (cap 1). [cellular
+	// drain saturation 2026-07-10] 4 concurrent whole-file copies + blocking
+	// Sync saturated a cellular tunnel's uplink: FUSE fsyncs stretched past
+	// 120s, the macFUSE session degraded (EBADF), and the mount died while
+	// "draining normally" — on every boot, killing both a new deploy AND its
+	// rollback. One in-flight drain keeps FUSE responsive; the spool absorbs
+	// the backlog. Class is read per-dispatch (a LAN↔cellular flip adapts
+	// live, no restart). JM_DRAIN_CLASS_GATE=0 disables.
+	slowGate chan struct{}
+	notify   chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
 
 	// started gates Stop's wait on d.done: set true by Start (which launches
 	// the dispatcher that closes d.done). Without it, Stop on a never-started
@@ -219,6 +229,7 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		atRestVerify: os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
 		batchInsert:  os.Getenv("JM_DRAIN_BATCH_INSERT") == "1",
 		sem:          make(chan struct{}, cfg.Workers),
+		slowGate:     make(chan struct{}, 1),
 		notify:       make(chan struct{}, 1),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
@@ -627,15 +638,40 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 	}
 
 	go func(r *metadata.SpoolRow) {
-		d.metrics.InFlight.Add(1)
 		defer func() {
-			d.metrics.InFlight.Add(-1)
 			<-d.sem
 			d.inFlight.Done()
 		}()
+		// Slow/metered link: serialize (see slowGate doc). Acquired BEFORE
+		// the InFlight metric so the UI shows the one truly-active drain,
+		// not N workers parked on the gate. On stop, the parked row resets
+		// to Ready — same contract as the dispatch-side stop case.
+		if drainClassGateEnabled() && drainLinkIsSlow() {
+			select {
+			case d.slowGate <- struct{}{}:
+				defer func() { <-d.slowGate }()
+			case <-d.stop:
+				_ = d.spool.Meta().ResetToReady(r.ID)
+				return
+			}
+		}
+		d.metrics.InFlight.Add(1)
+		defer d.metrics.InFlight.Add(-1)
 		d.drainOne(r)
 	}(row)
 	return true
+}
+
+// drainClassGateEnabled: JM_DRAIN_CLASS_GATE=0 disables the slow-link
+// serialization (restores unconditional Workers-wide concurrency).
+func drainClassGateEnabled() bool { return os.Getenv("JM_DRAIN_CLASS_GATE") != "0" }
+
+// drainLinkIsSlow reports whether the measured link class is slow or metered —
+// the classes where concurrent whole-file drains saturate the uplink and
+// starve FUSE (see slowGate). Read per-dispatch: class flips apply live.
+func drainLinkIsSlow() bool {
+	c := netprofile.Default().Class()
+	return c == netprofile.ClassSlow || c == netprofile.ClassMetered
 }
 
 // drainOne copies a single spool file into the FUSE mount, SHA-verifies
