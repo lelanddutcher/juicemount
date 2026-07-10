@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
@@ -559,6 +560,34 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 		}
 	}()
 
+	// [#6/C1] Push-liveness heartbeat: while subscribed, persist a wall-clock
+	// "push was alive" stamp every minute (one tiny SQLite meta upsert). On
+	// the NEXT boot, a recent stamp bounds our downtime — the basis for
+	// skipping the boot gap-fill SCAN below. Stamped immediately so even a
+	// short-lived subscription records liveness.
+	heartbeatStop := make(chan struct{})
+	defer close(heartbeatStop)
+	stampAlive := func() {
+		if err := rc.store.SetMeta(metaKeyPushLastAlive, strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
+			jmlog.Debug("keyspace push: liveness stamp failed", "error", err.Error())
+		}
+	}
+	stampAlive()
+	go func() {
+		t := time.NewTicker(pushHeartbeatInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-heartbeatStop:
+				return
+			case <-rc.stopCh:
+				return
+			case <-t.C:
+				stampAlive()
+			}
+		}
+	}()
+
 	// Gap-fill: one immediate authoritative full SCAN, run SYNCHRONOUSLY now
 	// that the subscriber is established and draining. Covers any change that
 	// happened while we were absent. We only flip to ENABLED (long backstop,
@@ -566,17 +595,30 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	// let keyspaceLoop retry, so push is never trusted before its baseline
 	// exists (EDGE Bug C). The SCAN is single-flighted internally, so a
 	// concurrent periodic doReconcile cannot double-run it.
-	if err := rc.SyncOnce(); err != nil {
-		jmlog.Warn("metadata keyspace push: gap-fill SCAN failed, staying DEGRADED",
-			"error", err.Error())
-		// Return; defers stop the coalescer and close the subscription. The
-		// subscription WAS established, so keyspaceLoop should mark DEGRADED.
-		return true
+	//
+	// [#6/C1 skip-SCAN-when-fresh] EXCEPTION: on the FIRST subscribe of this
+	// process, if the previous process's push heartbeat is recent (downtime <
+	// the freshness window), the gap the SCAN would fill is bounded and tiny —
+	// and on a cellular/tunnel link that SCAN costs 160s+ of boot latency plus
+	// real data (measured live: 297k entries, 163s, every boot). Skip it, flip
+	// to ENABLED on the fresh mirror, and let the push + the periodic backstop
+	// (which still runs on its normal cadence) cover the bounded gap. A STALE
+	// stamp, a disabled kill-switch (JM_BOOT_SCAN_FRESH_SKIP=0), or any later
+	// re-subscribe runs the full gap-fill exactly as before.
+	if rc.shouldSkipBootGapFill() {
+		rc.setEngagement(keyspaceEnabled)
+	} else {
+		if err := rc.SyncOnce(); err != nil {
+			jmlog.Warn("metadata keyspace push: gap-fill SCAN failed, staying DEGRADED",
+				"error", err.Error())
+			// Return; defers stop the coalescer and close the subscription. The
+			// subscription WAS established, so keyspaceLoop should mark DEGRADED.
+			return true
+		}
+		// Gap-fill complete — NOW ENABLED. Push carries deltas; the periodic
+		// SCAN demotes to the rare class-gated backstop.
+		rc.setEngagement(keyspaceEnabled)
 	}
-
-	// Gap-fill complete — NOW ENABLED. Push carries deltas; the periodic SCAN
-	// demotes to the rare class-gated backstop.
-	rc.setEngagement(keyspaceEnabled)
 
 	// Block until the pump exits (subscription dropped or stop fired).
 	select {
@@ -585,6 +627,67 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	}
 	return true
 }
+
+// pushHeartbeatInterval is how often the live subscription persists its
+// "push alive" stamp (see stampAlive above). One SQLite meta upsert per tick.
+const pushHeartbeatInterval = 60 * time.Second
+
+// bootGapFillEvaluated makes the fresh-skip a strictly boot-time (first
+// subscribe per process) decision: reconnect gap-fills mid-run always SCAN.
+// Guarded by the subscribe loop's serial execution; atomic for safety.
+var bootGapFillEvaluated atomic.Bool
+
+// shouldSkipBootGapFill reports whether the boot gap-fill SCAN can be safely
+// skipped: first subscribe of the process AND the persisted push heartbeat is
+// younger than the freshness window AND the kill-switch is not set. Logs its
+// decision either way (the skip saves 160s+ and real data on cellular boots,
+// so the operator should always see which path ran).
+func (rc *RedisClient) shouldSkipBootGapFill() bool {
+	if bootGapFillEvaluated.Swap(true) {
+		return false // not the boot subscribe — reconnects always gap-fill
+	}
+	if os.Getenv("JM_BOOT_SCAN_FRESH_SKIP") == "0" {
+		return false
+	}
+	window := bootScanFreshWindow
+	if v := os.Getenv("JM_BOOT_SCAN_FRESH_WINDOW_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			window = time.Duration(n) * time.Second
+		}
+	}
+	// Freshness evidence, either signal suffices: (a) the push heartbeat —
+	// bounds true downtime; (b) the existing C1 ShouldSkipBootSync (recent
+	// full SCAN + push engaged) — covers a first boot after a clean SCAN
+	// before any heartbeat existed.
+	downtime := time.Duration(-1)
+	if raw, ok, err := rc.store.GetMeta(metaKeyPushLastAlive); err == nil && ok {
+		if sec, perr := strconv.ParseInt(raw, 10, 64); perr == nil {
+			if d := time.Since(time.Unix(sec, 0)); d >= 0 {
+				downtime = d
+			}
+		}
+	}
+	if downtime >= 0 && downtime <= window {
+		jmlog.Info("metadata keyspace push: boot gap-fill SCAN SKIPPED (mirror fresh)",
+			"downtime", downtime.Round(time.Second).String(), "window", window.String(),
+			"note", "push+backstop cover the bounded gap; JM_BOOT_SCAN_FRESH_SKIP=0 disables")
+		return true
+	}
+	if rc.ShouldSkipBootSync() {
+		jmlog.Info("metadata keyspace push: boot gap-fill SCAN SKIPPED (recent full SCAN, C1)",
+			"note", "JM_BOOT_SCAN_FRESH_SKIP=0 disables")
+		return true
+	}
+	jmlog.Info("metadata keyspace push: boot gap-fill SCAN required (mirror not fresh)",
+		"heartbeat_downtime", downtime.Round(time.Second).String(), "window", window.String())
+	return false
+}
+
+// bootScanFreshWindow is the default max downtime for which the boot gap-fill
+// SCAN is skipped. Chosen ≥ several heartbeat intervals and ≥ a typical
+// deploy/relaunch cycle, but well under the shortest interval in which large
+// out-of-band changes typically accumulate.
+const bootScanFreshWindow = 15 * time.Minute
 
 // parseDirInodeFromChannel extracts the parent inode from a keyspace channel
 // name. channel looks like "__keyspace@1__:d732093"; prefix is

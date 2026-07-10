@@ -1122,27 +1122,16 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// data path left here. A clean disabled start with zero pending rows needs
 	// no action.)
 
-	// Mount NFS at the user-visible mount point (e.g. /Volumes/zpool) so
-	// Finder can browse it. This requires sudo, which we obtain via an
-	// AppleScript "with administrator privileges" prompt the user accepts once.
-	//
-	// Idempotent path: if the user already has an NFS mount at this path
-	// from a previous soft-stop cycle, reuse it. Re-running mount_nfs would
-	// fail because the mount point is busy and would prompt for a password
-	// for no reason.
+	// [#6 metrics-server-first] Record the intended mount point NOW, but do
+	// the actual NFS mount AFTER the metrics server is up (below). The mount
+	// step can hang or fail (haunted mountpoint EBUSY, osascript admin
+	// prompt, wedged diskarbitrationd — all observed live 2026-07-10), and
+	// when it ran first, a hung mount left the app fully functional but
+	// HEADLESS: no /health, /offline, /diagnose, /spool — undebuggable and
+	// uncontrollable unattended. The control plane must never be gated on
+	// the mount.
 	if cfg.MountPoint != "" {
 		globalWantMountPoint = cfg.MountPoint
-		if isMounted(cfg.MountPoint) {
-			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
-			globalMountPath = cfg.MountPoint
-		} else if err := mountNFSWithPrompt(srv.Addr(), cfg.MountPoint); err != nil {
-			jmlog.Warn("nfs mount failed (server still running)",
-				"mount_point", cfg.MountPoint, "error", err.Error())
-			// Non-fatal — the server is up, user can mount manually if needed
-		} else {
-			jmlog.Info("nfs mounted", "mount_point", cfg.MountPoint)
-			globalMountPath = cfg.MountPoint
-		}
 	}
 
 	// Wire NFS RPC observation into the metrics package.
@@ -1271,6 +1260,30 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		} else {
 			globalMetrics = ms
 			jmlog.Info("metrics server listening", "addr", ms.Addr())
+		}
+	}
+
+	// Mount NFS at the user-visible mount point (e.g. /Volumes/zpool) so
+	// Finder can browse it. Runs AFTER the metrics server (see the [#6
+	// metrics-server-first] note above) so a hung/failed mount never leaves
+	// the app headless. Requires sudo, obtained via an AppleScript "with
+	// administrator privileges" prompt the user accepts once.
+	//
+	// Idempotent path: if the user already has an NFS mount at this path
+	// from a previous soft-stop cycle, reuse it. Re-running mount_nfs would
+	// fail because the mount point is busy and would prompt for a password
+	// for no reason.
+	if cfg.MountPoint != "" {
+		if isMounted(cfg.MountPoint) {
+			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
+			globalMountPath = cfg.MountPoint
+		} else if err := mountNFSWithPrompt(srv.Addr(), cfg.MountPoint); err != nil {
+			jmlog.Warn("nfs mount failed (server still running)",
+				"mount_point", cfg.MountPoint, "error", err.Error())
+			// Non-fatal — the server is up, user can mount manually if needed
+		} else {
+			jmlog.Info("nfs mounted", "mount_point", cfg.MountPoint)
+			globalMountPath = cfg.MountPoint
 		}
 	}
 

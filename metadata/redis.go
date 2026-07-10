@@ -64,6 +64,14 @@ const (
 	// is fresh enough to skip the redundant boot SCAN.
 	metaKeyLastSyncTime = "last_sync_time"
 
+	// [#6/C1] store_meta key under which the keyspace push persists a
+	// once-a-minute "push was alive" heartbeat (unix seconds). Unlike
+	// last_sync_time (stamped only on rare full SCANs once push is engaged),
+	// this bounds the actual DOWNTIME across a restart — the basis for
+	// skipping the boot gap-fill SCAN (shouldSkipBootGapFill, keyspace.go),
+	// which costs 160s+ and real data per boot on a cellular link.
+	metaKeyPushLastAlive = "push_last_alive"
+
 	// defaultBootSyncMaxAge is the freshness window ShouldSkipBootSync uses when
 	// JM_BOOT_SYNC_MAX_AGE_SEC is unset. A persisted last-sync newer than this
 	// (AND keyspace push engaged) is considered fresh — the PSUBSCRIBE gap-fill
