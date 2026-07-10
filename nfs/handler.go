@@ -43,6 +43,7 @@ type JuiceMountHandler struct {
 	redisClient *metadata.RedisClient // for publishing events
 	pinStore    *pin.Store            // optional; gates reads when offline mode is on
 	thumbWarmer *ThumbWarmer          // optional (#1 hydration pack); nil-safe
+	sidecar     *sidecarCache         // `._` AppleDouble body cache (nav crux); nil-safe
 	blipHook    func() bool           // test override for backendBlipActive (#9)
 
 	// Synthetic inode counter for locally-created entries (atomic)
@@ -71,6 +72,13 @@ type JuiceMountHandler struct {
 	prefetchMu  sync.Mutex
 	prefetched  map[string]time.Time
 	prefetchSem chan struct{} // limits concurrent prefetch goroutines
+
+	// sidecarWarmSem bounds concurrent `._` sidecar warm passes (nav crux):
+	// on a readdir, a background pass pre-reads the dir's `._` bodies into the
+	// sidecar cache so Finder's per-entry AppleDouble reads are RAM-served.
+	sidecarWarmSem chan struct{}
+	sidecarWarmMu  sync.Mutex
+	sidecarWarmed  map[string]time.Time // dir → last warm (dedupe)
 
 	// Async phantom-purge dedup (RC drain-latency fix, 2026-06-28). The
 	// Stat hot path no longer FUSE-Lstats inline to confirm a phantom; it
@@ -591,6 +599,9 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		dirRefreshInFlight:   make(map[string]struct{}),
 		dirRefreshSem:        make(chan struct{}, 4), // max 4 concurrently-refreshing dirs (U7)
 		verifierStop:         make(chan struct{}),
+		sidecar:              newSidecarCache(),      // `._` AppleDouble body cache (nav crux)
+		sidecarWarmSem:       make(chan struct{}, 3), // max 3 concurrent dir warm passes
+		sidecarWarmed:        make(map[string]time.Time),
 	}
 	go h.verifierCleanupLoop(60*time.Second, 5*time.Minute)
 	return h
@@ -847,6 +858,12 @@ func (h *JuiceMountHandler) incActiveWriter(path string) {
 	h.activeWritersMu.Lock()
 	h.activeWriters[path]++
 	h.activeWritersMu.Unlock()
+	// A write handle opening on a `._` sidecar means its body is changing —
+	// drop any cached copy so a subsequent read repopulates from the fresh
+	// file (belt-and-suspenders with the mtime/size mirror-validation).
+	if h.sidecar != nil && isSidecarName(path[strings.LastIndexByte(path, '/')+1:]) {
+		h.sidecar.invalidate(path)
+	}
 }
 
 // decActiveWriter releases one in-flight handle reference. Deletes the map
@@ -2070,6 +2087,9 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 			// the local cache in the background. Non-blocking enqueue
 			// (TTL-deduped inside); nil when the warmer isn't wired.
 			jfs.handler.thumbWarmer.WarmDirAsync(dirname)
+			// Nav crux: front-run Finder's per-entry `._` AppleDouble reads
+			// by warming this dir's sidecar bodies into the RAM cache.
+			jfs.handler.sidecarWarmDirAsync(dirname)
 		}
 		// WAVE 0: one inc per warm readdir served from the RAM mirror fast path
 		// (the len(children)>0 branch). QA-35-safe single atomic increment.
@@ -3657,6 +3677,20 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		return bn, berr
 	}
 
+	// Priority 2.5: `._` AppleDouble sidecar cache (nav crux). A Finder listing
+	// of a `._`-heavy folder reads every sidecar over the tunnel (~700ms each);
+	// serve the complete body from RAM instead. Mirror-validated + writer-
+	// bypassed inside sidecarServe, so a changed/being-written sidecar never
+	// serves stale. Skips the QoS lane entirely on a hit.
+	if f.handler != nil {
+		if sn, ok := f.handler.sidecarServe(f.name, p, off); ok {
+			if sn == 0 {
+				return 0, io.EOF
+			}
+			return sn, nil
+		}
+	}
+
 	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time).
 	// Read-QoS (#4, INSTANT-NAV): on slow/metered links, admit through the
 	// two-lane gate so a bulk/preview storm can't starve the first-block
@@ -3666,6 +3700,13 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	defer releaseQoS()
 	readStart := time.Now()
 	n, err := f.fuseFD.ReadAt(p, off)
+	// Populate the sidecar cache from a COMPLETE single read of a `._` file
+	// (off==0 and the read returned the whole file) so the next visit — and
+	// every other client's Finder — is RAM-served. Only complete reads cache
+	// (the membuf-stale-partial guard); sidecarMaybePopulate re-checks.
+	if f.handler != nil && err == nil && off == 0 {
+		f.handler.sidecarMaybePopulate(f.name, off, p[:n], f.fileSize)
+	}
 	// [JM6 readback-resilience, 2026-06-14 / 2026-06-15] Two JuiceFS-under-
 	// concurrent-load transients corrupt a read even though the bytes at rest
 	// are intact (a sequential or retried re-read always succeeds):

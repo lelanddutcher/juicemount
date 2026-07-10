@@ -242,6 +242,13 @@ type Registry struct {
 	// during a backend blip window instead of failing hard.
 	backendBlipParked atomic.Uint64
 
+	// sidecar* — grades the `._` AppleDouble body cache (nav crux). hit/miss on
+	// the read path; warmPopulated = sidecars pre-read by the readdir warmer.
+	sidecarCacheHit      atomic.Uint64
+	sidecarCacheMiss     atomic.Uint64
+	sidecarCachePut      atomic.Uint64
+	sidecarWarmPopulated atomic.Uint64
+
 	// readaheadTriggered / readaheadPrefetchedBlocks — grades S2. One inc per
 	// readahead schedule (SeqThreshold trip); prefetched-blocks accumulates the
 	// block count actually pulled by the background prefetch.
@@ -468,6 +475,18 @@ func (r *Registry) IncThumbWarmShed() { r.thumbWarmShed.Add(1) }
 // backend blip instead of failing hard.
 func (r *Registry) IncBackendBlipParked() { r.backendBlipParked.Add(1) }
 
+// IncSidecarCacheHit records a `._` sidecar read served from the RAM cache.
+func (r *Registry) IncSidecarCacheHit() { r.sidecarCacheHit.Add(1) }
+
+// IncSidecarCacheMiss records a `._` sidecar read that fell through to FUSE.
+func (r *Registry) IncSidecarCacheMiss() { r.sidecarCacheMiss.Add(1) }
+
+// IncSidecarCachePut records a complete `._` body inserted into the cache.
+func (r *Registry) IncSidecarCachePut() { r.sidecarCachePut.Add(1) }
+
+// IncSidecarWarmPopulated records a `._` sidecar pre-read by the readdir warmer.
+func (r *Registry) IncSidecarWarmPopulated() { r.sidecarWarmPopulated.Add(1) }
+
 // IncReadaheadTriggered records one readahead schedule (SeqThreshold trip).
 func (r *Registry) IncReadaheadTriggered() { r.readaheadTriggered.Add(1) }
 
@@ -568,6 +587,10 @@ type Snapshot struct {
 	ThumbWarmNegative         uint64 `json:"thumb_warm_negative"`
 	ThumbWarmShed             uint64 `json:"thumb_warm_shed"`
 	BackendBlipParked         uint64 `json:"backend_blip_parked"`
+	SidecarCacheHit           uint64 `json:"sidecar_cache_hit"`
+	SidecarCacheMiss          uint64 `json:"sidecar_cache_miss"`
+	SidecarCachePut           uint64 `json:"sidecar_cache_put"`
+	SidecarWarmPopulated      uint64 `json:"sidecar_warm_populated"`
 	ReadaheadTriggered        uint64 `json:"readahead_triggered"`
 	ReadaheadPrefetchedBlocks uint64 `json:"readahead_prefetched_blocks"`
 	ReadaheadSuppressed       uint64 `json:"readahead_suppressed"`
@@ -628,6 +651,10 @@ func (r *Registry) Snapshot() Snapshot {
 		ThumbWarmNegative:         r.thumbWarmNegative.Load(),
 		ThumbWarmShed:             r.thumbWarmShed.Load(),
 		BackendBlipParked:         r.backendBlipParked.Load(),
+		SidecarCacheHit:           r.sidecarCacheHit.Load(),
+		SidecarCacheMiss:          r.sidecarCacheMiss.Load(),
+		SidecarCachePut:           r.sidecarCachePut.Load(),
+		SidecarWarmPopulated:      r.sidecarWarmPopulated.Load(),
 		ReadaheadTriggered:        r.readaheadTriggered.Load(),
 		ReadaheadPrefetchedBlocks: r.readaheadPrefetchedBlocks.Load(),
 		ReadaheadSuppressed:       r.readaheadSuppressed.Load(),
