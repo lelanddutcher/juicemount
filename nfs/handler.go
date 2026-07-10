@@ -3637,6 +3637,12 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time).
+	// Read-QoS (#4, INSTANT-NAV): on slow/metered links, admit through the
+	// two-lane gate so a bulk/preview storm can't starve the first-block
+	// probes Finder browsing depends on. The token spans the retry loop
+	// below (a retrying read must not re-queue). Inert on medium/fast.
+	releaseQoS := defaultReadQoS.acquire(off, len(p))
+	defer releaseQoS()
 	readStart := time.Now()
 	n, err := f.fuseFD.ReadAt(p, off)
 	// [JM6 readback-resilience, 2026-06-14 / 2026-06-15] Two JuiceFS-under-
@@ -3984,6 +3990,11 @@ func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 		}
 		return bn, berr
 	}
+	// Read-QoS (#4, INSTANT-NAV): this branch is a FUSE-backed read (the
+	// no-metadata-cache open path) — backend-capable, so it shapes through
+	// the same two-lane gate as cachedFile.ReadAt. Inert on medium/fast.
+	releaseQoS := defaultReadQoS.acquire(off, len(p))
+	defer releaseQoS()
 	return f.File.ReadAt(p, off)
 }
 

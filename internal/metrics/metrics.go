@@ -222,6 +222,14 @@ type Registry struct {
 	readColdSubread atomic.Uint64
 	readWarmSubread atomic.Uint64
 
+	// readQoS* — grades #4 (INSTANT-NAV read-QoS, slow/metered links only).
+	// queued = a read hit a full lane and waited; failOpen = a wait crossed
+	// its bound and proceeded ungated; prefetchShed = a readahead round was
+	// dropped because the bulk lane was contended.
+	readQoSQueued       atomic.Uint64
+	readQoSFailOpen     atomic.Uint64
+	readQoSPrefetchShed atomic.Uint64
+
 	// readaheadTriggered / readaheadPrefetchedBlocks — grades S2. One inc per
 	// readahead schedule (SeqThreshold trip); prefetched-blocks accumulates the
 	// block count actually pulled by the background prefetch.
@@ -424,6 +432,17 @@ func (r *Registry) IncReadColdSubread() { r.readColdSubread.Add(1) }
 // IncReadWarmSubread records a FUSE subread served warm (local SSD block cache).
 func (r *Registry) IncReadWarmSubread() { r.readWarmSubread.Add(1) }
 
+// IncReadQoSQueued records a read that found its QoS lane full and waited.
+func (r *Registry) IncReadQoSQueued() { r.readQoSQueued.Add(1) }
+
+// IncReadQoSFailOpen records a QoS wait that crossed its bound and proceeded
+// ungated (the fail-open guarantee — shaping degraded, nothing broke).
+func (r *Registry) IncReadQoSFailOpen() { r.readQoSFailOpen.Add(1) }
+
+// IncReadQoSPrefetchShed records a readahead round dropped because the bulk
+// lane was contended (bandwidth handed back to interactive reads).
+func (r *Registry) IncReadQoSPrefetchShed() { r.readQoSPrefetchShed.Add(1) }
+
 // IncReadaheadTriggered records one readahead schedule (SeqThreshold trip).
 func (r *Registry) IncReadaheadTriggered() { r.readaheadTriggered.Add(1) }
 
@@ -517,6 +536,9 @@ type Snapshot struct {
 	LookupNoent               uint64 `json:"lookup_noent"`
 	ReadColdSubread           uint64 `json:"read_cold_subread"`
 	ReadWarmSubread           uint64 `json:"read_warm_subread"`
+	ReadQoSQueued             uint64 `json:"read_qos_queued"`
+	ReadQoSFailOpen           uint64 `json:"read_qos_fail_open"`
+	ReadQoSPrefetchShed       uint64 `json:"read_qos_prefetch_shed"`
 	ReadaheadTriggered        uint64 `json:"readahead_triggered"`
 	ReadaheadPrefetchedBlocks uint64 `json:"readahead_prefetched_blocks"`
 	ReadaheadSuppressed       uint64 `json:"readahead_suppressed"`
@@ -570,6 +592,9 @@ func (r *Registry) Snapshot() Snapshot {
 		LookupNoent:               r.lookupNoent.Load(),
 		ReadColdSubread:           r.readColdSubread.Load(),
 		ReadWarmSubread:           r.readWarmSubread.Load(),
+		ReadQoSQueued:             r.readQoSQueued.Load(),
+		ReadQoSFailOpen:           r.readQoSFailOpen.Load(),
+		ReadQoSPrefetchShed:       r.readQoSPrefetchShed.Load(),
 		ReadaheadTriggered:        r.readaheadTriggered.Load(),
 		ReadaheadPrefetchedBlocks: r.readaheadPrefetchedBlocks.Load(),
 		ReadaheadSuppressed:       r.readaheadSuppressed.Load(),

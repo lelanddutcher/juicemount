@@ -242,6 +242,17 @@ func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorke
 	default:
 	}
 
+	// Read-QoS (#4, INSTANT-NAV): prefetch is the LOWEST read class. On
+	// slow/metered links it only runs when the bulk lane has a free token,
+	// and holds it for the whole block loop below — a contended lane sheds
+	// the round entirely (it re-triggers on the next sequential read),
+	// handing the bandwidth back to interactive reads. Inert on medium/fast.
+	qosRelease, qosOK := defaultReadQoS.tryAcquireBulk()
+	if !qosOK {
+		return
+	}
+	defer qosRelease()
+
 	fusePath := rm.fusePath + "/" + filePath
 
 	// Use FDPool if available, otherwise fall back to direct open
