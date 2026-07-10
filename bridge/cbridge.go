@@ -1422,6 +1422,25 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			globalMu.Unlock()
 			return nil
 		})
+		// #93 NFS-layer absent-mount recovery: when the volume is genuinely
+		// GONE from the mount table while juicefs is alive and this listener
+		// is up, the monitor re-runs the SAME two-tier mount boot uses
+		// (passwordless sudo → bounded 180s prompt). Shares /mount-now's
+		// single-flight CAS so it can never stack a prompt on a user click.
+		globalMonitor.SetNFSServerAddr(remountAddr)
+		globalMonitor.EnableNFSAbsentRemount(func() error {
+			if !mountNowInFlight.CompareAndSwap(false, true) {
+				return fmt.Errorf("mount already in flight")
+			}
+			defer mountNowInFlight.Store(false)
+			if err := mountNFSWithPrompt(remountAddr, remountPoint); err != nil {
+				return err
+			}
+			globalMu.Lock()
+			globalMountPath = remountPoint
+			globalMu.Unlock()
+			return nil
+		})
 	}
 	globalMonitor.Start()
 
@@ -1705,6 +1724,7 @@ func NFSServerStopMount() {
 	// be neutered before the unmount window opens.
 	if mon != nil {
 		mon.EnableNFSRemount(nil)
+		mon.EnableNFSAbsentRemount(nil) // #93 path too — same rationale
 	}
 
 	// Step 1: unmount NFS while server is still alive so the kernel
@@ -1760,6 +1780,7 @@ func NFSServerShutdown() {
 	// landing mid-unmount must not remount the volume we're shutting down.
 	if mon != nil {
 		mon.EnableNFSRemount(nil)
+		mon.EnableNFSAbsentRemount(nil) // #93 path too — same rationale
 	}
 
 	// Step 1: unmount NFS while the server is still alive (handler can
