@@ -941,17 +941,38 @@ func (fm *FUSEManager) mountResponsiveWithin(timeout time.Duration) bool {
 // previously called `.Start()` without ever calling `.Wait()` — leaking
 // zombies and silently failing.
 func runBoundedCommand(timeout time.Duration, name string, args ...string) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	if err := exec.CommandContext(ctx, name, args...).Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			jmlog.Warn("bounded command timed out",
-				"cmd", name, "args", strings.Join(args, " "),
-				"timeout_sec", int(timeout.Seconds()))
-		} else {
+	// TRULY bounded (2026-07-10): the old CommandContext(...).Run() killed
+	// the child at the deadline but then BLOCKED waiting to reap it — and a
+	// child parked in an uninterruptible kernel call (diskutil against a
+	// wedged diskarbitrationd, umount of a haunted mountpoint) ignores
+	// SIGKILL until its syscall returns, so the "bounded" call itself hung
+	// (observed live: 30s-bounded diskutils surviving 20+ minutes while the
+	// watchdog's remount crawled at ~65s/attempt). Now: kill at the deadline
+	// and RETURN; a reaper goroutine collects the child whenever the kernel
+	// finally releases it.
+	cmd := exec.Command(name, args...)
+	if err := cmd.Start(); err != nil {
+		jmlog.Debug("bounded command failed to start",
+			"cmd", name, "args", strings.Join(args, " "), "error", err.Error())
+		return
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
 			jmlog.Debug("bounded command failed",
 				"cmd", name, "args", strings.Join(args, " "), "error", err.Error())
 		}
+	case <-timer.C:
+		_ = cmd.Process.Kill()
+		jmlog.Warn("bounded command timed out — killed, not waiting for reap",
+			"cmd", name, "args", strings.Join(args, " "),
+			"timeout_sec", int(timeout.Seconds()))
+		// The Wait goroutine reaps the child when (if) the kernel releases
+		// it; an unkillable D-state child must never pin the caller.
 	}
 }
 
@@ -1000,6 +1021,21 @@ func (fm *FUSEManager) unmountLocked() {
 			"count", killed, "mountpoint", fm.cfg.MountPoint)
 	}
 	time.Sleep(500 * time.Millisecond)
+
+	// FAST PATH (2026-07-10): when the mountpoint is NOT in the kernel mount
+	// table there is nothing to tear down — the diskutil + umount calls were
+	// pure waste that burned their bounds against the (possibly wedged)
+	// diskarbitrationd. This was the dominant cost of the 12:01→12:04 organic
+	// remount (vs 35s when the teardown had real work): juicefs had died, the
+	// mountpoint was already a plain dir, and every ensureUnmounted attempt
+	// still crawled through both commands. The juicefs-process kill above
+	// already ran (ensureUnmountedLocked depends on it even when the table is
+	// clear).
+	if !fm.stillInMountTable() {
+		jmlog.Debug("unmount: mountpoint not in the kernel mount table — teardown skipped",
+			"mountpoint", fm.cfg.MountPoint)
+		return
+	}
 
 	// QA-34 Slice 2 (2026-05-25): umount is now BLOCKING on this
 	// goroutine with a 60s budget. Pre-fix it was fire-and-forget,
