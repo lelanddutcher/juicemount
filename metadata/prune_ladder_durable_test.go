@@ -296,11 +296,12 @@ func TestDurableLadderKillSwitch(t *testing.T) {
 	}
 }
 
-// TestDurableLadderLoadFilterDropsGuardedPaths: rows the ladder's own guards
-// would never track/prune — scan-filtered namespaces (.trash/, .juicemount/)
-// and `._` AppleDouble sidecars — must be dropped on load (defense against a
-// table written by an older/buggier build), and then purged from the table by
-// the next cycle-end diff.
+// TestDurableLadderLoadFilterDropsGuardedPaths: scan-filtered namespaces
+// (.trash/, .juicemount/) must be dropped on load (absence there carries no
+// delete signal), and then purged from the table by the next cycle-end diff.
+// `._` AppleDouble rows RESUME since the ._-pair rule (task #73 completion):
+// they are legitimate candidates whose qualification is gated on the
+// principal's absence + Layer-A Lstat.
 func TestDurableLadderLoadFilterDropsGuardedPaths(t *testing.T) {
 	durableLadderEnv(t)
 	s := durableLadderStore(t, filepath.Join(t.TempDir(), "mirror.db"))
@@ -318,8 +319,8 @@ func TestDurableLadderLoadFilterDropsGuardedPaths(t *testing.T) {
 	if _, ok := rc.pruneAbsent[".trash/x"]; ok {
 		t.Error("scan-filtered .trash/ row resumed onto the ladder — absence there carries zero delete signal")
 	}
-	if _, ok := rc.pruneAbsent["dir/._sidecar"]; ok {
-		t.Error("`._` AppleDouble row resumed onto the ladder — sidecars are never prune candidates")
+	if got := rc.pruneAbsent["dir/._sidecar"]; got != 4 {
+		t.Errorf("`._` row must RESUME under the ._-pair rule (got %d, want 4)", got)
 	}
 	if got := rc.pruneAbsent["SFX/legit.wav"]; got != 5 {
 		t.Errorf("legit row not resumed (got %d, want 5)", got)
@@ -335,8 +336,8 @@ func TestDurableLadderLoadFilterDropsGuardedPaths(t *testing.T) {
 	if _, ok := durable[".trash/x"]; ok {
 		t.Error("dropped .trash/ row not purged from prune_ladder")
 	}
-	if _, ok := durable["dir/._sidecar"]; ok {
-		t.Error("dropped `._` row not purged from prune_ladder")
+	if got := durable["dir/._sidecar"]; got != 4 {
+		t.Errorf("resumed `._` durable row disturbed (got %d, want 4)", got)
 	}
 	if got := durable["SFX/legit.wav"]; got != 5 {
 		t.Errorf("legit durable row disturbed by the purge (got %d, want 5)", got)

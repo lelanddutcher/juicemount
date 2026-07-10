@@ -837,6 +837,29 @@ func (rc *RedisClient) collectFastPathPrunes(skipIncrement bool) (fastConfirmed 
 	return fastConfirmed, capped
 }
 
+// appleDoublePrincipal maps `dir/._name` to its principal `dir/name` —
+// the data file a macOS AppleDouble sidecar belongs to.
+func appleDoublePrincipal(p string) string {
+	dir, base := path.Split(p)
+	return dir + strings.TrimPrefix(base, "._")
+}
+
+// appleDoublePruneEnabled: JM_PRUNE_APPLEDOUBLE=0 restores the pre-2026-07-10
+// blanket refusal to prune `._` mirror rows (the ._-pair rule's kill switch).
+func appleDoublePruneEnabled() bool { return os.Getenv("JM_PRUNE_APPLEDOUBLE") != "0" }
+
+// appleDoubleQualifies is the ._-PAIR RULE's decision: a `._` ladder
+// candidate may proceed to qualification only when the rule is enabled AND
+// its principal has no live mirror row (the data file is gone — the sidecar
+// row is residue). Split out for direct testing; the caller's downstream
+// gates (Layer-A FUSE Lstat, spool, pin, G0) all still apply.
+func appleDoubleQualifies(p string, lookup func(string) *Entry) bool {
+	if !appleDoublePruneEnabled() {
+		return false
+	}
+	return lookup(appleDoublePrincipal(p)) == nil
+}
+
 // TriggerSync signals the reconcile loop to run an immediate sync cycle.
 // Non-blocking: if a signal is already pending it does nothing.
 func (rc *RedisClient) TriggerSync() {
@@ -1952,17 +1975,40 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	if !skipIncrement {
 		for p, count := range rc.pruneAbsent {
 			if count >= PruneThreshold {
-				// `._` AppleDouble guard (symmetric with scopedPrune's `._`-skip):
-				// `._` sidecars are scan-filtered / managed Mac-side via the explicit
-				// Remove path, never the reconcile — their absence from Redis is not a
-				// delete signal. Pruning one whose path-stable Track-B handle the
-				// kernel still holds Forgets it → FromHandle STALE (the `._dirN`
-				// had_shadow STALE the release battery caught). Stop tracking it and
-				// never enqueue it for deletion.
-				if strings.HasPrefix(path.Base(p), "._") {
+				// `._` AppleDouble ._-PAIR RULE (2026-07-10, task #73 completion —
+				// found live: 28,400/28,400 pending_prune rows were `._` sidecars
+				// of long-deleted files, parked FOREVER because every prune layer
+				// blanket-refused `._`, so Finder/rsync saw phantom sidecars and
+				// pending_prune was pinned permanently).
+				//
+				// History of the blanket guard: `._` names are SCAN-filtered
+				// (#78), so a LIVE sidecar is permanently SCAN-absent and the old
+				// unconditional prune STALE'd kernel-held handles mid-copy (#92
+				// class). The refusal was right for LIVE pairs, wrong for DEAD
+				// ones.
+				//
+				// A `._name` candidate may now qualify IFF its PRINCIPAL
+				// (`name` in the same dir) has no live mirror row — the data
+				// file is gone, so the sidecar row is residue. Every remaining
+				// gate still applies downstream, and each closes a specific
+				// hazard:
+				//   - Layer-A per-path FUSE Lstat (verifyPruneCandidates): a
+				//     REAL on-disk `._foo` (user file, or an orphaned sidecar
+				//     that genuinely exists) Lstats present → kept (#97 safe);
+				//   - spool-pending guard: a mid-copy sidecar is in-flight →
+				//     excluded (the #92 fix);
+				//   - pin guard, G0 identity, !RecentlyDegraded as usual.
+				// A LIVE pair (principal present) stays blocked here and keeps
+				// its ladder position wiped, exactly as before.
+				// Kill switch: JM_PRUNE_APPLEDOUBLE=0 restores the blanket
+				// refusal.
+				if strings.HasPrefix(path.Base(p), "._") &&
+					!appleDoubleQualifies(p, rc.store.LookupByPath) {
 					delete(rc.pruneAbsent, p)
 					continue
 				}
+				// A qualified `._` falls through like any candidate
+				// (Layer A / spool / pin / G0 still gate).
 				toDelete = append(toDelete, p)
 				ladderCounts[p] = count
 				delete(rc.pruneAbsent, p)

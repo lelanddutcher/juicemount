@@ -2,8 +2,6 @@ package metadata
 
 import (
 	"os"
-	"path"
-	"strings"
 
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
@@ -85,7 +83,11 @@ func (rc *RedisClient) loadDurablePruneLadder() {
 		// the next cycle-end diff then sees dropped rows in ladderPersisted
 		// but not in pruneAbsent and deletes them from the table.
 		rc.ladderPersisted[p] = c
-		if scanFilteredPath(p) || strings.HasPrefix(path.Base(p), "._") {
+		// ._-pair rule (task #73 completion): `._` rows are now legitimate
+		// ladder candidates (they prune when their principal is gone), so
+		// their persisted progress must survive restarts — only the
+		// scan-filtered namespaces stay dropped.
+		if scanFilteredPath(p) {
 			dropped++
 			continue
 		}
