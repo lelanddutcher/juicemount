@@ -42,6 +42,7 @@ type JuiceMountHandler struct {
 	memBuf      *MemoryBuffer
 	redisClient *metadata.RedisClient // for publishing events
 	pinStore    *pin.Store            // optional; gates reads when offline mode is on
+	thumbWarmer *ThumbWarmer          // optional (#1 hydration pack); nil-safe
 
 	// Synthetic inode counter for locally-created entries (atomic)
 	inodeCounter atomic.Uint64
@@ -632,6 +633,11 @@ func (h *JuiceMountHandler) SetPinStore(ps *pin.Store, mountPoint string) {
 	h.pinStore = ps
 	h.mountPoint = mountPoint
 }
+
+// SetThumbWarmer attaches the #1 hydration-pack warmer (optional; the
+// readdir hook is nil-safe). Wired by the bridge after the derivative
+// index + thumb cache exist.
+func (h *JuiceMountHandler) SetThumbWarmer(w *ThumbWarmer) { h.thumbWarmer = w }
 
 // canonicalize converts an in-mount relative path (the form go-nfs hands us
 // in OpenFile) into the absolute path that the pin store keys on. It is
@@ -2049,6 +2055,10 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 			default:
 				// prefetch pool busy — shed this one
 			}
+			// #1 hydration pack: hydrate this dir's farm thumbnails into
+			// the local cache in the background. Non-blocking enqueue
+			// (TTL-deduped inside); nil when the warmer isn't wired.
+			jfs.handler.thumbWarmer.WarmDirAsync(dirname)
 		}
 		// WAVE 0: one inc per warm readdir served from the RAM mirror fast path
 		// (the len(children)>0 branch). QA-35-safe single atomic increment.

@@ -230,6 +230,14 @@ type Registry struct {
 	readQoSFailOpen     atomic.Uint64
 	readQoSPrefetchShed atomic.Uint64
 
+	// thumbWarm* — grades #1 (hydration pack). hydrated = posters pulled
+	// into the local thumb cache; negative = inodes with no ready thumbnail
+	// (TTL'd, not re-probed per browse); shed = a warm pass abandoned at the
+	// QoS bulk lane (interactive traffic had priority).
+	thumbWarmHydrated atomic.Uint64
+	thumbWarmNegative atomic.Uint64
+	thumbWarmShed     atomic.Uint64
+
 	// readaheadTriggered / readaheadPrefetchedBlocks — grades S2. One inc per
 	// readahead schedule (SeqThreshold trip); prefetched-blocks accumulates the
 	// block count actually pulled by the background prefetch.
@@ -443,6 +451,15 @@ func (r *Registry) IncReadQoSFailOpen() { r.readQoSFailOpen.Add(1) }
 // lane was contended (bandwidth handed back to interactive reads).
 func (r *Registry) IncReadQoSPrefetchShed() { r.readQoSPrefetchShed.Add(1) }
 
+// IncThumbWarmHydrated records one thumbnail blob hydrated into the local cache.
+func (r *Registry) IncThumbWarmHydrated() { r.thumbWarmHydrated.Add(1) }
+
+// IncThumbWarmNegative records an inode found to have no ready thumbnail.
+func (r *Registry) IncThumbWarmNegative() { r.thumbWarmNegative.Add(1) }
+
+// IncThumbWarmShed records a warm pass abandoned at the read-QoS bulk lane.
+func (r *Registry) IncThumbWarmShed() { r.thumbWarmShed.Add(1) }
+
 // IncReadaheadTriggered records one readahead schedule (SeqThreshold trip).
 func (r *Registry) IncReadaheadTriggered() { r.readaheadTriggered.Add(1) }
 
@@ -539,6 +556,9 @@ type Snapshot struct {
 	ReadQoSQueued             uint64 `json:"read_qos_queued"`
 	ReadQoSFailOpen           uint64 `json:"read_qos_fail_open"`
 	ReadQoSPrefetchShed       uint64 `json:"read_qos_prefetch_shed"`
+	ThumbWarmHydrated         uint64 `json:"thumb_warm_hydrated"`
+	ThumbWarmNegative         uint64 `json:"thumb_warm_negative"`
+	ThumbWarmShed             uint64 `json:"thumb_warm_shed"`
 	ReadaheadTriggered        uint64 `json:"readahead_triggered"`
 	ReadaheadPrefetchedBlocks uint64 `json:"readahead_prefetched_blocks"`
 	ReadaheadSuppressed       uint64 `json:"readahead_suppressed"`
@@ -595,6 +615,9 @@ func (r *Registry) Snapshot() Snapshot {
 		ReadQoSQueued:             r.readQoSQueued.Load(),
 		ReadQoSFailOpen:           r.readQoSFailOpen.Load(),
 		ReadQoSPrefetchShed:       r.readQoSPrefetchShed.Load(),
+		ThumbWarmHydrated:         r.thumbWarmHydrated.Load(),
+		ThumbWarmNegative:         r.thumbWarmNegative.Load(),
+		ThumbWarmShed:             r.thumbWarmShed.Load(),
 		ReadaheadTriggered:        r.readaheadTriggered.Load(),
 		ReadaheadPrefetchedBlocks: r.readaheadPrefetchedBlocks.Load(),
 		ReadaheadSuppressed:       r.readaheadSuppressed.Load(),
