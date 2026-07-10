@@ -248,6 +248,17 @@ type RedisClient struct {
 	// (default).
 	spoolPending atomic.Pointer[spoolGuardFunc]
 
+	// keyspaceRequeue re-enqueues a directory inode into the live push
+	// coalescer. Wired to inodeCoalescer.add while a subscription is up,
+	// nil otherwise (SCAN/pinwarm-driven reconciles don't recurse). This is
+	// the B4' burst-ordering fix: when reconcileDir discovers a child dir
+	// the mirror has never seen (or whose inode changed — a recreate), that
+	// dir's OWN contents were never mirrored and its create-events were
+	// dropped as unknown-ancestor. Requeueing it walks the new subtree
+	// through the same debounced, burst-ceilinged machinery until nothing
+	// new is discovered. Same atomic-pointer idiom as spoolPending.
+	keyspaceRequeue atomic.Pointer[requeueFunc]
+
 	// Test seams for the keyspace-push path. Production leaves these nil and
 	// the real methods run. Tests set them to observe coalescer behavior
 	// (which dirs got reconciled, how many full-SCAN promotions) without a
@@ -259,6 +270,9 @@ type RedisClient struct {
 	// without a live Redis. Production leaves it nil (real HGETALL runs).
 	testChildDirInodes func(uint64) ([]uint64, error)
 }
+
+// requeueFunc re-enqueues a dir inode into the live push coalescer.
+type requeueFunc func(uint64)
 
 // keyspaceReconcileDir dispatches to the test seam when set, else the real
 // single-dir reconcile. Used by the coalescer so tests can count calls.

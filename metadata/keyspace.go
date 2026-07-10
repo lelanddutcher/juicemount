@@ -528,6 +528,15 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	co := newInodeCoalescer(rc)
 	defer co.stop()
 
+	// Wire reconcileDir's new-subtree discovery back into THIS coalescer (the
+	// B4' burst-ordering fix): a newly-discovered child dir is requeued so a
+	// burst-created tree mirrors completely, not just its top level. Cleared
+	// before co.stop() runs (defers are LIFO) so SCAN/pinwarm reconciles never
+	// recurse through a dead coalescer; co.add's stopped-guard double-covers.
+	requeue := requeueFunc(co.add)
+	rc.keyspaceRequeue.Store(&requeue)
+	defer rc.keyspaceRequeue.Store(nil)
+
 	pumpDone := make(chan struct{})
 	go func() {
 		defer close(pumpDone)
@@ -892,6 +901,10 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 	// Build the fresh child set and the entries to upsert.
 	freshNames := make(map[string]struct{}, len(raw))
 	var toUpsert []*Entry
+	// Child DIRS the mirror has never seen (or whose inode changed — a
+	// recreate): their contents were never reconciled and their create-burst
+	// events were dropped as unknown-ancestor. Requeued below (B4' fix).
+	var newDirs []uint64
 	skippedFiltered := 0 // task #78: scan-filtered children not mirrored
 	for name, valStr := range raw {
 		val := []byte(valStr)
@@ -961,6 +974,11 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 			existing.Inode != e.Inode {
 			toUpsert = append(toUpsert, e)
 		}
+		// A never-mirrored (or recreated) child DIR needs its own contents
+		// reconciled — collect for the post-upsert requeue (B4' fix).
+		if isDir && (existing == nil || existing.Inode != e.Inode) {
+			newDirs = append(newDirs, childInode)
+		}
 	}
 
 	if skippedFiltered > 0 {
@@ -981,6 +999,26 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 					jmlog.Warn("metadata keyspace push: child insert", "path", e.Path, "error", err.Error())
 				}
 			}
+		}
+	}
+
+	// B4' burst-ordering fix: requeue newly-discovered child dirs into the
+	// LIVE push coalescer (wired only while a subscription is up), so a
+	// burst-created subtree is walked top-down until nothing new upserts —
+	// debounced, burst-ceilinged, idempotent. Runs AFTER the upserts land so
+	// the requeued reconcile can resolve the child via LookupByInode. Without
+	// this, a tree created in one burst (server-side import, farm fan-out)
+	// mirrors only its top level: the children's own create-events arrived
+	// before their parent was mirrored and were dropped as unknown-ancestor,
+	// and the SCAN backstop is tunnel-gated — measured live as B4' (server
+	// content invisible to the client indefinitely on cellular).
+	if len(newDirs) > 0 {
+		if fnp := rc.keyspaceRequeue.Load(); fnp != nil {
+			for _, ino := range newDirs {
+				(*fnp)(ino)
+			}
+			jmlog.Info("metadata keyspace push: requeued newly-discovered dirs",
+				"parent", parentPath, "count", len(newDirs))
 		}
 	}
 
