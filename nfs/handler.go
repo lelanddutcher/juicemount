@@ -2975,6 +2975,19 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 			jfs.handler.store.Insert(newEntry)
 		}()
 
+		// [#8 / task #109] A DIRECTORY rename must re-key its DESCENDANTS too:
+		// re-keying only the dir's own entry left every child under the OLD
+		// path in pathCache/childrenIdx/SQLite — the moved folder listed
+		// EMPTY until a remount or full SCAN rebuilt the mirror ("files
+		// vanish on move"). RenameSubtree re-keys the whole subtree: RAM
+		// synchronously (chunked), SQLite+FTS async via the proven
+		// DeletePaths/BulkInsert paths, subtree-size aggregates moved.
+		if oldEntry.IsDir {
+			if n := jfs.handler.store.RenameSubtree(oldpath, newpath); n > 0 {
+				jmlog.Info("rename: subtree re-keyed", "old", oldpath, "new", newpath, "descendants", n)
+			}
+		}
+
 		// Publish rename event
 		jfs.handler.publishEvent(metadata.MetadataEvent{
 			Op: "rename", Path: newpath, OldPath: oldpath,
