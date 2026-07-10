@@ -572,6 +572,12 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 			jmlog.Debug("keyspace push: liveness stamp failed", "error", err.Error())
 		}
 	}
+	// ORDER MATTERS: the boot gap-fill freshness decision must read the
+	// PREVIOUS process's heartbeat — so it is evaluated HERE, before the
+	// first stampAlive() below. (v1 stamped first and then read its own
+	// fresh stamp: downtime always ~0s, the skip always fired, and a
+	// weeks-stale mirror would have skipped its baseline SCAN.)
+	skipBootGapFill := rc.shouldSkipBootGapFill()
 	stampAlive()
 	go func() {
 		t := time.NewTicker(pushHeartbeatInterval)
@@ -605,7 +611,7 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	// (which still runs on its normal cadence) cover the bounded gap. A STALE
 	// stamp, a disabled kill-switch (JM_BOOT_SCAN_FRESH_SKIP=0), or any later
 	// re-subscribe runs the full gap-fill exactly as before.
-	if rc.shouldSkipBootGapFill() {
+	if skipBootGapFill {
 		rc.setEngagement(keyspaceEnabled)
 	} else {
 		if err := rc.SyncOnce(); err != nil {
