@@ -2091,9 +2091,25 @@ func nfsMountOpts(port string) string {
 	// amplification); medium/fast keep 16. nfsReadahead() falls back to 16 if
 	// netprofile has no signal, so behavior is unchanged absent a classification.
 	ra := netprofile.Default().NFSReadahead()
+	// [B4' Fix B] actimeo=3600 → split attribute caching: acreg stays 3600
+	// (file attrs — unchanged behavior for the read/write paths), but acdir
+	// drops to 3-15s. With actimeo=3600 the client cached DIRECTORY attributes
+	// — and therefore its name cache, including NEGATIVE entries — for up to
+	// AN HOUR: one NoEnt answered during the ~3s keyspace-push window and
+	// server-created content (farm output, another machine's import, a
+	// folder move) stayed invisible until a manual readdir flushed it.
+	// Measured live on cellular: content never appeared (>120s, sprint B4').
+	// With the metadata mirror serving GETATTR in µs over loopback, client
+	// dir-attr caching is obsolete — re-validating every 3-15s costs nothing
+	// and bounds new-content visibility at ~(push 3s + acdirmax 15s).
+	// JM_NFS_LEGACY_ACTIMEO=1 restores the old single actimeo=3600.
+	acOpts := "acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15"
+	if os.Getenv("JM_NFS_LEGACY_ACTIMEO") == "1" {
+		acOpts = "actimeo=3600"
+	}
 	return fmt.Sprintf(
-		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,actimeo=3600,vers=3,tcp",
-		port, port, ra)
+		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,%s,vers=3,tcp",
+		port, port, ra, acOpts)
 }
 
 // unmountNFS removes the NFS mount.
