@@ -6,6 +6,7 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -37,6 +38,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/internal/thumbcache"
 	"github.com/lelanddutcher/juicemount/internal/version"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
@@ -85,6 +87,10 @@ var (
 	// later; for now the farm (JM-16) and tests populate it. Read-only on the
 	// query path. nil between Stop and the next Start ⇒ endpoints fail closed.
 	globalDerivStore *derivatives.Store
+	// #1 hydration pack: bounded local thumbnail blob cache + the
+	// folder-open warmer feeding it (nil when JM_THUMB_WARM=0 or open failed).
+	globalThumbCache  *thumbcache.Cache
+	globalThumbWarmer *jmnfs.ThumbWarmer
 
 	// [JM6 tier-1.7-1.10] Reachability monitor for offline-mode
 	// auto-engage. Runs independently of the health monitor: the
@@ -990,6 +996,44 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		jmlog.Warn("derivative index open failed (JM-14 reads disabled)", "error", err.Error())
 	}
 
+	// #1 (INSTANT-NAV) hydration pack: bounded local thumb cache + the
+	// folder-open warmer. The warmer hydrates farm poster thumbnails (kind
+	// "thumbnail", ~10-50KB) into the local cache when a dir is listed, so
+	// preview bytes are local before anything asks for source bytes; /blob
+	// serves small kinds local-first from the same cache. Fail-quiet: no
+	// derivative index / cache-open failure just leaves them nil.
+	// Kill switch JM_THUMB_WARM=0; size JM_THUMB_CACHE_MB (default 2048).
+	if os.Getenv("JM_THUMB_WARM") != "0" && globalDerivStore != nil && derivDBPath != ":memory:" {
+		maxBytes := int64(thumbcache.DefaultMaxBytes)
+		if v := os.Getenv("JM_THUMB_CACHE_MB"); v != "" {
+			if mb, perr := strconv.Atoi(v); perr == nil && mb >= 64 && mb <= 65536 {
+				maxBytes = int64(mb) << 20
+			}
+		}
+		thumbDir := derivDBPath[:len(derivDBPath)-len("/derivatives.db")] + "/thumbs"
+		if tc, terr := thumbcache.Open(thumbDir, maxBytes); terr == nil {
+			globalThumbCache = tc
+			warmer := jmnfs.NewThumbWarmer(tc, resolveThumbBlobPath, func(dir string) []jmnfs.ThumbChildRef {
+				entries, lerr := store.ListChildren(dir)
+				if lerr != nil {
+					return nil
+				}
+				refs := make([]jmnfs.ThumbChildRef, 0, len(entries))
+				for _, e := range entries {
+					refs = append(refs, jmnfs.ThumbChildRef{Inode: e.Inode, Name: e.Name, IsDir: e.IsDir})
+				}
+				return refs
+			})
+			globalThumbWarmer = warmer
+			srv.Handler().SetThumbWarmer(warmer)
+			st := tc.Stats()
+			jmlog.Info("thumb cache ready", "path", thumbDir,
+				"resident_mb", st.Bytes>>20, "files", st.Files, "max_mb", maxBytes>>20)
+		} else {
+			jmlog.Warn("thumb cache open failed (hydration pack disabled)", "error", terr.Error())
+		}
+	}
+
 	// Spool wiring (Option 2). Env-gated by JM_SPOOL_ENABLE so the
 	// pre-spool behavior is preserved by default until the rollout
 	// completes (docs/ROADMAP/option-2-spool.md section 9). When
@@ -1169,6 +1213,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// unranged — what a browser <video> / remote AVPlayer need to seek over
 			// HTTP. Capability token `blob` (route path == token).
 			"/blob": handleBlobHTTP,
+			// #1 hydration pack observability: local thumb-cache stats
+			// (bytes/files/hits/misses/puts/evictions). Read-only.
+			"/thumbs": handleThumbsHTTP,
 			// JM-ASSERT (#51) portable-human-metadata channel. POST /assertions writes
 			// the <media>.loupe.json sidecar (source of truth — atomic, LWW,
 			// merge-not-clobber) + upserts the asset_key-keyed Tier-B index; GET
@@ -1506,12 +1553,18 @@ func stopServerLocked() {
 	globalSpool = nil
 	globalDrainer = nil
 	globalDerivStore = nil
+	thumbWarmer := globalThumbWarmer
+	globalThumbWarmer = nil
+	globalThumbCache = nil
 	globalMu.Unlock()
 
 	// Now run the slow shutdown work on the snapshots, no lock held.
 	// During this window, Stats / IsRunning / CacheStatus correctly
 	// report "Running: false" — we already nil'd the publicly-visible
 	// state, so the answer is honest, not a lie.
+	if thumbWarmer != nil {
+		thumbWarmer.Stop()
+	}
 	if metricsSrv != nil {
 		metricsSrv.Stop()
 	}
@@ -3589,6 +3642,29 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	// mount (direct JuiceFS — no NFS self-loop). filepath.Clean on the rel path
 	// keeps it inside the inode dir (the farm only ever writes flat names there).
 	blobPath := filepath.Join(farm.DerivBlobDir(mount, inode), filepath.Clean("/"+blobRel))
+
+	// #1 hydration pack: SMALL kinds (everything but proxy) serve LOCAL-FIRST
+	// from the thumb cache, populated by the folder-open warmer or a prior
+	// read-through here. The manifest row above still authorized the kind and
+	// supplied the media type, so the fail-closed 404 semantics are identical
+	// — only the byte source swaps (local SSD instead of a FUSE round-trip).
+	globalMu.Lock()
+	tc := globalThumbCache
+	globalMu.Unlock()
+	smallKind := kind != "proxy"
+	if tc != nil && smallKind {
+		if lp, ok := tc.Path(inode, kind); ok {
+			if lf, lerr := os.Open(lp); lerr == nil {
+				defer lf.Close()
+				if lfi, serr := lf.Stat(); serr == nil {
+					w.Header().Set("Content-Type", mediaType)
+					http.ServeContent(w, r, "", lfi.ModTime(), lf)
+					return
+				}
+			}
+		}
+	}
+
 	f, err := os.Open(blobPath)
 	if err != nil {
 		http.Error(w, "blob unreadable", http.StatusNotFound)
@@ -3599,6 +3675,25 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "blob stat failed", http.StatusInternalServerError)
 		return
+	}
+	// Read-through populate: a small blob served from FUSE lands in the local
+	// cache so the NEXT request (and offline browsing) is 0-RTT. Bounded by
+	// thumbReadThroughCap; the bytes are served from RAM in the same response.
+	if tc != nil && smallKind && fi.Size() <= thumbReadThroughCap {
+		data, rerr := io.ReadAll(io.LimitReader(f, thumbReadThroughCap))
+		if rerr == nil && int64(len(data)) == fi.Size() {
+			if _, perr := tc.Put(inode, kind, bytes.NewReader(data)); perr != nil {
+				jmlog.Debug("thumb read-through populate failed", "inode", inode, "kind", kind, "error", perr.Error())
+			}
+			w.Header().Set("Content-Type", mediaType)
+			http.ServeContent(w, r, fi.Name(), fi.ModTime(), bytes.NewReader(data))
+			return
+		}
+		// Short/failed read: fall back to the plain file path from offset 0.
+		if _, serr := f.Seek(0, io.SeekStart); serr != nil {
+			http.Error(w, "blob read failed", http.StatusInternalServerError)
+			return
+		}
 	}
 	// http.ServeContent sets Content-Type (we pin it from the manifest media_type),
 	// Accept-Ranges: bytes, and the full 200/206 + Content-Range/Content-Length
