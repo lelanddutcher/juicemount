@@ -234,6 +234,108 @@ public func presentRemediation(
     }
 }
 
+/// Presents the "Why is it slow?" self-diagnosis report (INSTANT-NAV
+/// #14) — the /diagnose endpoint's six checks — in the same NSAlert
+/// style as presentRemediation: what the verdict is, a compact per-
+/// check list (status glyph + title; detail + fix for anything non-ok),
+/// and a "Copy diagnostic" button for bug reports. Safe to call from
+/// any queue — internally hops to main if needed.
+public func presentDiagnosis(_ report: NFSBridge.DiagnoseReport) {
+    let work = {
+        let alert = NSAlert()
+        switch report.overall {
+        case "ok":
+            alert.messageText = "Everything looks healthy"
+            alert.alertStyle = .informational
+        case "degraded":
+            alert.messageText = "Found likely causes of slowness"
+            alert.alertStyle = .warning
+        default: // "broken" (or unknown — treat as attention-worthy)
+            alert.messageText = "Found problems that need attention"
+            alert.alertStyle = .warning
+        }
+        alert.informativeText = diagnosisSummaryText(report)
+
+        let okButton = alert.addButton(withTitle: "OK")
+        okButton.keyEquivalent = "\r"
+        let copyButton = alert.addButton(withTitle: "Copy diagnostic")
+        // Non-default, same rationale as presentRemediation: accidental
+        // Enter must not overwrite the clipboard.
+        copyButton.keyEquivalent = ""
+
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(buildDiagnosisDiagnostic(report), forType: .string)
+        }
+    }
+    if Thread.isMainThread {
+        work()
+    } else {
+        DispatchQueue.main.async(execute: work)
+    }
+}
+
+/// Status glyph for a check line. Plain text glyphs (not emoji) so the
+/// alert reads cleanly at any size.
+private func diagnosisGlyph(_ status: String) -> String {
+    switch status {
+    case "ok":   return "✓"
+    case "warn": return "!"
+    default:     return "✕" // fail / unknown
+    }
+}
+
+/// The compact list shown in the alert body: one line per check; non-ok
+/// checks get their detail and the concrete fix indented beneath.
+private func diagnosisSummaryText(_ report: NFSBridge.DiagnoseReport) -> String {
+    var lines: [String] = []
+    for check in report.checks {
+        lines.append("\(diagnosisGlyph(check.status)) \(check.title)")
+        if !check.isOK {
+            if !check.detail.isEmpty {
+                lines.append("    \(check.detail)")
+            }
+            if !check.remedy.isEmpty {
+                lines.append("    Fix: \(check.remedy)")
+            }
+        }
+        lines.append("")
+    }
+    if report.checks.allSatisfy({ $0.isOK }) {
+        lines.append("Nothing to fix — if it still feels slow, run Export Diagnostics… and file an issue.")
+    }
+    return lines.joined(separator: "\n")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Plain-text snippet for "Copy diagnostic" — same header style as
+/// buildDiagnostic, with every check's full detail and remedy so a bug
+/// report carries the whole picture, including the ok checks.
+private func buildDiagnosisDiagnostic(_ report: NFSBridge.DiagnoseReport) -> String {
+    let ts = ISO8601DateFormatter().string(from: Date())
+    let bundle = Bundle.main
+    let version = bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    let build = bundle.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+    var lines: [String] = [
+        "JuiceMount self-diagnosis report",
+        "  overall    : \(report.overall)",
+        "  timestamp  : \(ts)",
+        "  version    : \(version) (build \(build))",
+    ]
+    for check in report.checks {
+        lines.append("  [\(check.status)] \(check.id) — \(check.title)")
+        if !check.detail.isEmpty {
+            lines.append("      detail : \(check.detail)")
+        }
+        if !check.remedy.isEmpty {
+            lines.append("      remedy : \(check.remedy)")
+        }
+    }
+    return lines.joined(separator: "\n")
+}
+
 /// Builds the plain-text snippet placed on the clipboard when the
 /// user clicks "Copy diagnostic". One header line + the raw error +
 /// JuiceMount version + timestamp + any per-call extra context.

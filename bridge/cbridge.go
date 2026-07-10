@@ -141,6 +141,12 @@ var (
 	globalVolumeName      string   // basename of the mount point
 	globalInstanceID      string   // stable per-install UUID (minted/persisted once)
 	globalCapabilities    []string // capabilities DERIVED from this binary's routes
+	// globalRedisURL is the configured metadata-backend URL from the last
+	// Start — the /diagnose network probes (INSTANT-NAV #14) dial its
+	// host:port. Like globalWantMountPoint it is deliberately NOT cleared on
+	// stop: diagnosing "why did it break" right after a stop still needs to
+	// know where the backend was.
+	globalRedisURL string
 )
 
 // offlineEngageDelay is how long the backend must be CONTINUOUSLY unreachable
@@ -235,6 +241,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	globalMetricsAddr = cfg.MetricsAddr
 	globalVolumeName = filepath.Base(cfg.MountPoint)
 	globalInstanceID = cplane.LoadOrMintInstanceID(cfg.DBPath)
+	globalRedisURL = cfg.RedisURL
 
 	// Initialize structured logging early so all subsequent log lines
 	// flow through the JSON sink (and optional log file).
@@ -1215,6 +1222,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// Finder is momentarily slow ("Uploading 412 files", "Rebuilding
 			// index…", "Warming pinned project"). GET, loopback.
 			"/activity": handleActivityHTTP,
+			// "Why is it slow?" self-diagnosis (INSTANT-NAV #14): runs the six
+			// known silent-failure probes (Local Network permission, tunnel
+			// route, FUSE identity, backend components, spool backlog, link
+			// RTT) concurrently and time-bounded, on demand only. GET, loopback.
+			// Not in the contract capability vocabulary — operational/UI route,
+			// excluded from /whoami automatically like reclaim/mount-now.
+			"/diagnose": handleDiagnoseHTTP,
 			// Spool recovery actions (LB-5): ?action=retry-failed
 			// requeues failed rows whose spool file survives;
 			// ?action=clear-stalled force-finalizes leaked-handle

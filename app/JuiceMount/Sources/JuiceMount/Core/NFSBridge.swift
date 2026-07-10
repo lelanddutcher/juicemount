@@ -802,6 +802,83 @@ public enum NFSBridge {
         return result
     }
 
+    // MARK: - Self-diagnosis (INSTANT-NAV #14 "Why is it slow?")
+
+    /// One check from `/diagnose`. Mirrors diagnoseCheck in
+    /// bridge/diagnose.go: id/title identify the probe, status is
+    /// "ok" | "warn" | "fail", and remedy is the concrete next step for a
+    /// non-ok check.
+    public struct DiagnoseCheck: Codable, Equatable, Identifiable {
+        public var checkID: String = ""
+        public var title: String = ""
+        public var status: String = ""
+        public var detail: String = ""
+        public var remedy: String = ""
+        public var id: String { checkID }
+
+        public var isOK: Bool { status == "ok" }
+
+        enum CodingKeys: String, CodingKey {
+            case checkID = "id"
+            case title, status, detail, remedy
+        }
+
+        /// Tolerant decode — same JSON-null discipline as Activity et al.
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.checkID = try c.decodeIfPresent(String.self, forKey: .checkID) ?? ""
+            self.title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+            self.status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
+            self.detail = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
+            self.remedy = try c.decodeIfPresent(String.self, forKey: .remedy) ?? ""
+        }
+    }
+
+    /// The `/diagnose` report — overall is "ok" | "degraded" | "broken".
+    public struct DiagnoseReport: Codable, Equatable {
+        public var overall: String = ""
+        public var checks: [DiagnoseCheck] = []
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.overall = try c.decodeIfPresent(String.self, forKey: .overall) ?? ""
+            self.checks = try c.decodeIfPresent([DiagnoseCheck].self, forKey: .checks) ?? []
+        }
+        enum CodingKeys: String, CodingKey { case overall, checks }
+    }
+
+    /// Run the on-demand "Why is it slow?" self-diagnosis. Blocking — call
+    /// from a background queue, never the main thread. The Go side runs six
+    /// bounded probes concurrently under a 5 s budget, so this uses its own
+    /// ephemeral session with more headroom than loopbackSession()'s 5 s
+    /// resource cap (a broken-network diagnosis rides the full budget by
+    /// design — that's exactly the case the user is diagnosing).
+    public static func diagnose(metricsAddr: String = "127.0.0.1:11050") -> DiagnoseReport? {
+        guard let url = URL(string: "http://\(metricsAddr)/diagnose") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 10
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 10
+        cfg.timeoutIntervalForResource = 12
+        cfg.waitsForConnectivity = false
+        let session = URLSession(configuration: cfg)
+        let sem = DispatchSemaphore(value: 0)
+        var result: DiagnoseReport?
+        session.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            do {
+                result = try JSONDecoder().decode(DiagnoseReport.self, from: data)
+            } catch {
+                appLog("diagnose decode failed: \(error)")
+            }
+        }.resume()
+        sem.wait()
+        session.finishTasksAndInvalidate()
+        return result
+    }
+
     // MARK: - Mount Now (LB-2)
 
     /// Result of `/mount-now` — the control-plane action that re-runs the

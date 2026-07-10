@@ -36,6 +36,9 @@ struct MenuPopoverView: View {
     @State private var showStopEverythingConfirm = false
     /// True while a /spool-recover action (LB-5) is round-tripping.
     @State private var spoolRecoverInFlight = false
+    /// True while a "Why is it slow?" /diagnose run (INSTANT-NAV #14) is
+    /// round-tripping — the action row shows "Diagnosing…" and disables.
+    @State private var diagnoseBusy = false
     // Self-test dashboard (B.2). Health is fetched from /health on the
     // same 2s tick as cache-status. Each component is "ok" or a reason
     // string ("ping failed: …"); render as colored dots, full reason
@@ -371,6 +374,36 @@ struct MenuPopoverView: View {
                 NSLog("[JuiceMount] verify-pins: re-enqueued %d / %d files", n, total)
                 DispatchQueue.main.async { refreshCacheStatus() }
             }.resume()
+        }
+    }
+
+    /// INSTANT-NAV #14 "Why is it slow?": runs the six-probe /diagnose
+    /// self-check off the main thread and presents the verdict in the
+    /// RemediationAlert style (status glyph + title per check; detail +
+    /// concrete fix for anything non-ok). The endpoint is time-bounded
+    /// server-side (~5 s worst case, checks run concurrently) so the
+    /// button can't hang the popover; while in flight the row shows
+    /// "Diagnosing…" and disables.
+    private func runDiagnose() {
+        diagnoseBusy = true
+        let metricsAddr = server.preferences.metricsAddr
+        DispatchQueue.global(qos: .userInitiated).async {
+            let report = NFSBridge.diagnose(metricsAddr: metricsAddr)
+            DispatchQueue.main.async {
+                diagnoseBusy = false
+                if let report {
+                    presentDiagnosis(report)
+                } else {
+                    // The control plane itself didn't answer — that IS a
+                    // diagnosis: the app core is stopped or not responding.
+                    // Reuse the standard remediation surface for it.
+                    presentRemediation(
+                        .generic(action: "Diagnose"),
+                        rawError: "no response from http://\(metricsAddr)/diagnose — the app core is stopped or not responding",
+                        extraContext: "server state: \(server.state)"
+                    )
+                }
+            }
         }
     }
 
@@ -1769,6 +1802,20 @@ struct MenuPopoverView: View {
                     server.syncNow()
                     triggerVerifyPins()
                 }
+            )
+
+            // INSTANT-NAV #14: on-demand self-diagnosis of the six known
+            // silent-failure classes (Local Network permission, tunnel
+            // route, FUSE identity, backend components, spool backlog,
+            // link RTT). Deliberately NOT gated on isRunningLike — the
+            // whole point is answering "why is it slow/broken", and a
+            // dead control plane is itself a diagnosis (surfaced via the
+            // remediation alert in runDiagnose).
+            ActionButton(
+                title: diagnoseBusy ? "Diagnosing…" : "Why is it slow?",
+                systemImage: "stethoscope",
+                disabled: diagnoseBusy,
+                action: { runDiagnose() }
             )
 
             ActionButton(
