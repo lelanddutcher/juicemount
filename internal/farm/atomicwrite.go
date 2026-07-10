@@ -62,17 +62,37 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 }
 
 // atomicCommitFile durably and atomically publishes a fully-written temp file
-// onto finalPath via os.Rename, then fsyncs the parent directory. tmpPath MUST
+// onto finalPath: it fsyncs tmpPath's BYTES first (the producer — ffmpeg — has
+// closed it but nothing guarantees writeback yet; renaming before fsync is the
+// classic hole where a crash leaves the final name pointing at truncated data),
+// then os.Renames it into place and fsyncs the parent directory. tmpPath MUST
 // be on the same filesystem as finalPath (callers create it in the same
 // directory) so the rename is atomic. Used by the ffmpeg derivative producers,
 // which encode to tmpPath and then commit, so OpenLoupe never observes a
 // partially-encoded proxy/thumbnail/filmstrip at finalPath.
 func atomicCommitFile(tmpPath, finalPath string) error {
+	if err := syncFile(tmpPath); err != nil {
+		return err
+	}
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return err
 	}
 	syncDir(filepath.Dir(finalPath))
 	return nil
+}
+
+// syncFile fsyncs an already-written file's bytes by path. A read-only open is
+// sufficient for fsync(2) on both Linux and macOS.
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // atomicTempPath returns a unique sibling path of finalPath suitable for an
