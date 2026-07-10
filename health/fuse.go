@@ -402,14 +402,25 @@ func (fm *FUSEManager) Mount() error {
 	// link so a metered/cellular mount doesn't pull whole files for a 4 KB touch,
 	// while a 10GbE mount keeps blocks in flight. Medium == historical defaults.
 	jfp := fm.linkAwareJuiceFSPolicy()
+	// --buffer-size caps JuiceFS's in-memory DIRTY-data ceiling, which is
+	// exactly what a shutdown/remount FlushAll must push to MinIO before the
+	// mount worker exits (2026-07-10: a 1 GB slow-class buffer = a 4m17s flush
+	// over a cellular tunnel = a ~3-min mount outage on any restart). The class
+	// policy already shrinks it on slow/metered links; JM_JFS_BUFFER_MB is the
+	// absolute field-override (32-8192; set it to the old per-class value to
+	// revert). Writes land on the spool first, so a smaller buffer never risks
+	// durability — it only backpressures the drainer to MinIO throughput.
+	bufMB := jfp.BufferSizeMB
+	if v := os.Getenv("JM_JFS_BUFFER_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 32 && n <= 8192 {
+			bufMB = n
+		}
+	}
 	args = append(args,
 		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
 		"-d", // daemon mode
 		"--no-usage-report",
-		// --buffer-size also backs write-burst absorption, but writes land on the
-		// spool first and durability is independent of it, so scaling it by link
-		// costs only throughput (already upload-bound on a slow link).
-		"--buffer-size", strconv.Itoa(jfp.BufferSizeMB),
+		"--buffer-size", strconv.Itoa(bufMB),
 		"--prefetch", strconv.Itoa(jfp.Prefetch),
 		"-o", "nobrowse", // hide from Finder (MNT_DONTBROWSE flag)
 	)

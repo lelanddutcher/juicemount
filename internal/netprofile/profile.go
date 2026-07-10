@@ -87,11 +87,21 @@ type JuiceFSPolicy struct {
 func (p *Profile) JuiceFS() JuiceFSPolicy {
 	switch p.Class() {
 	case ClassMetered:
-		// Minimize readahead + metered-data waste. 512 MB still absorbs any
-		// single CR3/RAW write; prefetch 0 kills the concurrent block pull.
-		return JuiceFSPolicy{BufferSizeMB: 512, Prefetch: 0}
+		// Minimize readahead + metered-data waste AND bound the shutdown/remount
+		// FlushAll (2026-07-10: a correctly-classified 1 GB slow-class buffer took
+		// 4m17s to flush dirty data to MinIO over a cellular tunnel when the mount
+		// worker exited under drain saturation — turning a routine restart into a
+		// ~3-min mount outage). 256 MB still absorbs any single CR3/RAW write:
+		// writes land on the SPOOL first (durability is independent of this
+		// buffer), so a smaller FUSE buffer only backpressures the drainer to
+		// match MinIO throughput — which on a metered link it is already bound to
+		// — while capping the worst-case flush to ~256 MB. prefetch 0 kills the
+		// concurrent block pull. Field-tunable via JM_JFS_BUFFER_MB.
+		return JuiceFSPolicy{BufferSizeMB: 256, Prefetch: 0}
 	case ClassSlow:
-		return JuiceFSPolicy{BufferSizeMB: 1024, Prefetch: 1}
+		// 512 MB (was 1024): a 2× cut to the worst-case shutdown flush with
+		// negligible throughput cost on a 3-30 MB/s link (see ClassMetered).
+		return JuiceFSPolicy{BufferSizeMB: 512, Prefetch: 1}
 	case ClassFast:
 		// 10GbE: keep the big buffer and widen concurrent prefetch to keep more
 		// 4 MB blocks in flight to MinIO (addresses the ~3-of-10 Gbit/s starve).
