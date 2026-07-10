@@ -221,6 +221,15 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mux.HandleFunc(prefix+"/api/trash/delete", a.auth(a.handleTrashDelete))
 	mux.HandleFunc(prefix+"/api/trash/empty", a.auth(a.handleTrashEmpty))
 	mux.HandleFunc(prefix+"/api/trash/config", a.auth(a.handleTrashConfig))
+
+	// Permissions tab (Part 2/3): inspect a path's owner/mode + a "writable
+	// by the mount client" verdict; a typed-confirm-gated (X-Confirm-Fix)
+	// recursive chown+chmod remedy for root-owned files already on the volume;
+	// and the default migration owner (rule #0 of a future ACL list). Embedded
+	// mode only (501 in standalone — nothing to chown without a FUSE mount).
+	mux.HandleFunc(prefix+"/api/permissions/inspect", a.auth(a.handlePermissionsInspect))
+	mux.HandleFunc(prefix+"/api/permissions/fix", a.auth(a.handlePermissionsFix))
+	mux.HandleFunc(prefix+"/api/permissions/default-owner", a.auth(a.handlePermissionsDefaultOwner))
 	// SLICE 6: Maintenance tab — five operational levers wrapping
 	// juicefs CLI subprocesses with SSE-streamed live output. Each
 	// kind has its own mutex (one op per kind at a time, 409 if

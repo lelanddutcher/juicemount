@@ -44,6 +44,7 @@
     'destinations',
     'backups',
     'maintenance',
+    'permissions',
     'settings',
   ];
   const DEFAULT_TAB = 'migrations';
@@ -107,6 +108,12 @@
     // GET /api/maintenance/{kind}.
     if (name === 'maintenance') {
       initMaintenanceOnce();
+    }
+    // Permissions tab: lazy-init the handlers once, then refresh the
+    // default-owner field each activation so it reflects any out-of-band change.
+    if (name === 'permissions') {
+      initPermissionsOnce();
+      refreshPermissions();
     }
     // SLICE 4: lazy-init Destinations. Loads the saved-destinations
     // list and wires the kind-picker → dynamic-fields swap. Returning
@@ -2997,6 +3004,103 @@
         status.textContent = 'Rotation failed: ' + (err.message || err);
       }
     }
+  }
+
+  // -------- Permissions --------
+  let permissionsInited = false;
+  let lastLoadedDefaultOwner = '';
+
+  function initPermissionsOnce() {
+    if (permissionsInited) return;
+    permissionsInited = true;
+    $('#perm-inspect-btn').addEventListener('click', inspectPermissions);
+    $('#perm-inspect-path').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); inspectPermissions(); }
+    });
+    $('#perm-fix-confirm').addEventListener('input', (e) => {
+      $('#perm-fix-btn').disabled = e.target.value !== 'FIX'; // typed-confirm gate
+    });
+    $('#perm-fix-btn').addEventListener('click', fixPermissions);
+    $('#perm-default-save').addEventListener('click', saveDefaultOwner);
+    $('#perm-default-revert').addEventListener('click', () => {
+      $('#perm-default-owner').value = lastLoadedDefaultOwner;
+    });
+  }
+
+  // Render an owner as "uid[:gid]"; gid < 0 means "group unchanged" (chownSpec).
+  function fmtOwner(uid, gid) {
+    return (gid != null && gid >= 0) ? `${uid}:${gid}` : String(uid);
+  }
+
+  function showPermError(msg) { const el = $('#perm-error'); el.textContent = msg; el.hidden = false; }
+
+  async function refreshPermissions() {
+    try {
+      const d = await api('GET', '/api/permissions/default-owner');
+      lastLoadedDefaultOwner = fmtOwner(d.uid, d.gid);
+      $('#perm-default-owner').value = lastLoadedDefaultOwner;
+      if (d.client_uid != null) $('#perm-client-uid').textContent = String(d.client_uid);
+    } catch (err) { showPermError('Load failed: ' + (err.message || err)); }
+  }
+
+  async function inspectPermissions() {
+    const path = ($('#perm-inspect-path').value || '').trim();
+    if (!path) return;
+    $('#perm-error').hidden = true;
+    try {
+      const r = await api('GET', '/api/permissions/inspect?path=' + encodeURIComponent(path));
+      $('#perm-inspect-result').hidden = false;
+      $('#perm-r-path').textContent = r.path || path;
+      const pill = $('#perm-verdict');
+      pill.classList.remove('ok', 'warn', 'error');
+      if (!r.exists) {
+        $('#perm-r-owner').textContent = '—';
+        $('#perm-r-mode').textContent = '—';
+        $('#perm-r-reason').textContent = 'Path does not exist.';
+        pill.textContent = 'Not found'; pill.classList.add('warn');
+        return;
+      }
+      $('#perm-r-owner').textContent = fmtOwner(r.uid, r.gid) + (r.owner_name ? ` (${r.owner_name})` : '');
+      $('#perm-r-mode').textContent = `${r.mode_octal || ''} ${r.mode || ''}`.trim() || '—';
+      $('#perm-r-reason').textContent = r.reason || '';
+      if (r.writable_by_client) { pill.textContent = 'Writable by client'; pill.classList.add('ok'); }
+      else { pill.textContent = 'Not writable'; pill.classList.add('error'); }
+    } catch (err) { showPermError('Inspect failed: ' + (err.message || err)); }
+  }
+
+  async function fixPermissions() {
+    const path = ($('#perm-fix-path').value || '').trim();
+    const status = $('#perm-fix-status');
+    status.hidden = false; status.className = 'settings-rotate-status';
+    if (!path) { status.classList.add('error'); status.textContent = 'A path to fix is required.'; return; }
+    try {
+      const headers = authHeaders();
+      headers['X-Confirm-Fix'] = 'yes'; // server-side typed-confirm gate
+      const r = await fetch(BASE + '/api/permissions/fix', {
+        method: 'POST', headers,
+        body: JSON.stringify({ path, recursive: $('#perm-fix-recursive').checked }),
+      });
+      if (!r.ok) { const m = await r.text(); throw new Error(m.trim() || `${r.status} ${r.statusText}`); }
+      const data = await r.json();
+      status.classList.add('success');
+      status.textContent = data.note || `Fixed ${data.path}.`;
+      $('#perm-fix-confirm').value = ''; $('#perm-fix-btn').disabled = true; // require a fresh confirm
+    } catch (err) { status.classList.add('error'); status.textContent = 'Fix failed: ' + (err.message || err); }
+  }
+
+  async function saveDefaultOwner() {
+    const raw = ($('#perm-default-owner').value || '').trim();
+    $('#perm-default-saved').hidden = true; $('#perm-error').hidden = true;
+    const parts = raw.split(':');
+    const uid = parseInt(parts[0], 10) || 0;
+    const gid = parts.length > 1 ? (parseInt(parts[1], 10) || 0) : -1; // bare uid → -1 (group unchanged)
+    try {
+      const d = await api('PUT', '/api/permissions/default-owner', { uid, gid });
+      lastLoadedDefaultOwner = fmtOwner(d.uid, d.gid);
+      $('#perm-default-owner').value = lastLoadedDefaultOwner;
+      $('#perm-default-saved').hidden = false;
+      setTimeout(() => { $('#perm-default-saved').hidden = true; }, 2500);
+    } catch (err) { showPermError('Save failed: ' + (err.message || err)); }
   }
 
   // -------- Boot --------

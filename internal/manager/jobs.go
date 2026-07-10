@@ -218,6 +218,20 @@ type persistedState struct {
 	// first PUT materializes a settingsState and from that point on the
 	// state file carries the configured values.
 	Settings *settingsState `json:"settings,omitempty"`
+	// Permissions rule #0 — the default owner migrated data is chowned to
+	// (RunSyncSpec.OwnerUID). Pointer + omitempty so a v1/unseeded-v2 file
+	// (no mount_owner key) decodes to nil = "use the --mount-owner flag that
+	// seeded the spec". Schema stays v2 (v2 readers tolerate unknown keys,
+	// same as settings/schedules). Grows into a permissions.rules[] list
+	// later, with this as rule #0.
+	MountOwner *mountOwnerState `json:"mount_owner,omitempty"`
+}
+
+// mountOwnerState is the on-disk form of the default migration owner.
+// GID == -1 encodes "leave group unchanged" (see chownSpec, sync.go).
+type mountOwnerState struct {
+	UID int `json:"uid"`
+	GID int `json:"gid"`
 }
 
 // NewJobManager constructs a JobManager. juicefsBin is the path to
@@ -338,6 +352,14 @@ func (m *JobManager) SetStateFile(path string) {
 	} else {
 		m.pendingSettings = s.Settings
 	}
+	// Permissions rule #0: a runtime-SET default owner (persisted) wins over
+	// the --mount-owner flag that seeded m.spec in NewJobManager — the flag
+	// is only the bootstrap default. Applied directly to m.spec, the field
+	// applyPostSyncPermissions reads per migration job.
+	if s.MountOwner != nil {
+		m.spec.OwnerUID = s.MountOwner.UID
+		m.spec.OwnerGID = s.MountOwner.GID
+	}
 	// Log v1→v2 schema upgrades distinctly so an operator can spot
 	// them in startup logs without diffing the state file.
 	if s.SchemaVersion == 0 {
@@ -406,6 +428,28 @@ func (m *JobManager) SetSettings(s settingsStore) {
 	}
 }
 
+// MountOwner returns the live default migration owner (Permissions rule #0):
+// the uid:gid applyPostSyncPermissions chowns a migration's destination to.
+// Reads the same m.spec field the migration consumes, so the Permissions tab
+// shows the EFFECTIVE owner — the --mount-owner flag default until the first
+// SET, the persisted value thereafter. gid < 0 = "leave group unchanged".
+func (m *JobManager) MountOwner() (uid, gid int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.spec.OwnerUID, m.spec.OwnerGID
+}
+
+// SetMountOwner updates the default migration owner and persists it. Takes
+// effect on the next submitted job (run re-reads m.spec under lock). gid < 0
+// leaves the group unchanged (chownSpec semantics).
+func (m *JobManager) SetMountOwner(uid, gid int) {
+	m.mu.Lock()
+	m.spec.OwnerUID = uid
+	m.spec.OwnerGID = gid
+	m.saveStateLocked()
+	m.mu.Unlock()
+}
+
 // saveStateLocked atomically writes the current jobs map + order to
 // stateFile. Caller must hold m.mu (any level). Best-effort — logs
 // errors but never blocks the caller; persistence is convenience, not
@@ -444,6 +488,11 @@ func (m *JobManager) saveStateLocked() {
 	} else if m.pendingSettings != nil {
 		cp := *m.pendingSettings
 		out.Settings = &cp
+	}
+	// Persist the runtime default owner iff a real (non-root) owner is set,
+	// so an unset spec never writes a misleading mount_owner:{0,-1}.
+	if m.spec.OwnerUID > 0 {
+		out.MountOwner = &mountOwnerState{UID: m.spec.OwnerUID, GID: m.spec.OwnerGID}
 	}
 	for id, j := range m.jobs {
 		j.mu.Lock()

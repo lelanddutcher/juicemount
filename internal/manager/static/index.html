@@ -27,6 +27,7 @@
         <li><a href="#/destinations" data-tab-link="destinations">Destinations</a></li>
         <li><a href="#/backups"      data-tab-link="backups">Backups</a></li>
         <li><a href="#/maintenance"  data-tab-link="maintenance">Maintenance</a></li>
+        <li><a href="#/permissions"  data-tab-link="permissions">Permissions</a></li>
         <li><a href="#/settings"     data-tab-link="settings">Settings</a></li>
       </ul>
     </nav>
@@ -759,6 +760,71 @@
             <p class="maintenance-error" data-field="error" hidden></p>
           </article>
         </div>
+      </section>
+
+      <!-- Permissions tab. Inspect owner/mode + "writable by the mount client";
+           a one-shot recursive chown+chmod FIX gated by typed-confirm + the
+           X-Confirm-Fix server header; and the default migration owner (rule #0
+           of a future per-path ACL list). Every wire value set via textContent. -->
+      <section data-tab="permissions" class="tab-pane settings-pane" hidden>
+        <div class="settings-header">
+          <h2>Permissions</h2>
+          <p class="hint">
+            Inspect and repair ownership so migrated data is writable by the Mac
+            mount client (uid <code id="perm-client-uid">501</code>), not just
+            root. The one-shot Fix repairs the root-owned
+            <code>.loupe.json</code> derivatives and copied trees already on the volume.
+          </p>
+        </div>
+
+        <p id="perm-error" class="error" hidden></p>
+
+        <fieldset class="settings-section">
+          <legend>Inspect a path</legend>
+          <p class="hint">Read-only. Current owner, mode, and whether the mount client can write here.</p>
+          <label class="field"><span>Path</span>
+            <input id="perm-inspect-path" type="text" placeholder="/jfs/.juicemount/derivatives"
+                   autocomplete="off" spellcheck="false"></label>
+          <div class="settings-actions"><button id="perm-inspect-btn" type="button">Inspect</button></div>
+          <article id="perm-inspect-result" class="overview-card" hidden>
+            <header><h3>Result</h3><span id="perm-verdict" class="overview-card-state">—</span></header>
+            <dl>
+              <dt>Path</dt>    <dd id="perm-r-path">—</dd>
+              <dt>Owner</dt>   <dd id="perm-r-owner">—</dd>
+              <dt>Mode</dt>    <dd id="perm-r-mode">—</dd>
+              <dt>Verdict</dt> <dd id="perm-r-reason">—</dd>
+            </dl>
+          </article>
+        </fieldset>
+
+        <fieldset class="settings-section settings-danger">
+          <legend>Make writable by the mount client</legend>
+          <p class="hint">Recursively <code>chown</code> + <code>chmod</code> so the client owns and can
+            write every file underneath. Run once to repair the root-owned files already on the volume.</p>
+          <label class="field"><span>Path to fix</span>
+            <input id="perm-fix-path" type="text" placeholder="/jfs/.juicemount/derivatives"
+                   autocomplete="off" spellcheck="false"></label>
+          <label class="opt"><input type="checkbox" id="perm-fix-recursive" checked>
+            <span><strong>Recurse into subdirectories</strong><em>Off touches only the named path.</em></span></label>
+          <p>To confirm, type <code>FIX</code> below:</p>
+          <label class="field"><span>Confirmation</span>
+            <input id="perm-fix-confirm" type="text" autocomplete="off" spellcheck="false"></label>
+          <div class="settings-actions">
+            <button id="perm-fix-btn" type="button" class="danger" disabled>Make writable by client</button></div>
+          <p id="perm-fix-status" class="settings-rotate-status" hidden></p>
+        </fieldset>
+
+        <fieldset class="settings-section">
+          <legend>Default migration owner</legend>
+          <p class="hint">New migrations chown their destination to this owner (<code>--mount-owner</code> /
+            <code>JM_MOUNT_OWNER</code>). Format <code>uid</code> or <code>uid:gid</code>; a bare uid leaves the group unchanged.</p>
+          <label class="field"><span>Owner (uid or uid:gid)</span>
+            <input id="perm-default-owner" type="text" placeholder="501:20" autocomplete="off" spellcheck="false"></label>
+          <div class="settings-actions">
+            <button id="perm-default-save" type="button">Save default owner</button>
+            <button id="perm-default-revert" type="button">Revert</button></div>
+          <p id="perm-default-saved" class="settings-saved" hidden>Saved.</p>
+        </fieldset>
       </section>
 
       <!-- Settings tab — wired to GET/PUT /api/settings and POST
