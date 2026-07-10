@@ -926,6 +926,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		srv.Handler().SetCacheReader(globalCache)
 	}
 	srv.Handler().SetRedisClient(rc)
+
+	// #12: after a watchdog FUSE remount, every pooled fd references the
+	// DEAD mount — Get kept re-serving them ("stale fd → 0-byte reads").
+	// Flush the pool the moment a remount succeeds.
+	if globalFUSE != nil {
+		h := srv.Handler()
+		globalFUSE.SetOnRemount(func() {
+			closed, marked := h.FlushStaleFDs()
+			jmlog.Info("fd pool flushed after FUSE remount (#12)",
+				"closed_idle", closed, "marked_stale_held", marked)
+		})
+	}
 	globalServer = srv
 
 	// Pin store + prefetcher. The pin store lives in its own SQLite file so

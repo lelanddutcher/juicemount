@@ -640,6 +640,16 @@ func (h *JuiceMountHandler) SetPinStore(ps *pin.Store, mountPoint string) {
 // index + thumb cache exist.
 func (h *JuiceMountHandler) SetThumbWarmer(w *ThumbWarmer) { h.thumbWarmer = w }
 
+// FlushStaleFDs invalidates every pooled FUSE fd (#12) — called by the
+// bridge after a watchdog remount, when all pooled fds reference the dead
+// mount. Returns (closed, marked) for the caller's log line.
+func (h *JuiceMountHandler) FlushStaleFDs() (closed, marked int) {
+	if h == nil || h.fdPool == nil {
+		return 0, 0
+	}
+	return h.fdPool.FlushStale()
+}
+
 // canonicalize converts an in-mount relative path (the form go-nfs hands us
 // in OpenFile) into the absolute path that the pin store keys on. It is
 // tolerant of the various shapes filenames arrive in:

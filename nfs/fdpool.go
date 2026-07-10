@@ -10,6 +10,12 @@ import (
 const (
 	fdIdleTimeout = 2 * time.Minute
 	fdEvictTick   = 30 * time.Second
+	// fdOrphanGrace bounds how long a displaced stale fd (see FlushStale /
+	// displaceStaleLocked) stays open for its unreachable holders before the
+	// evict loop closes it. The fd references a DEAD mount either way; the
+	// grace only spares holders an ErrClosed during their (already-failing)
+	// final reads.
+	fdOrphanGrace = 2 * time.Minute
 )
 
 // FDPool manages a pool of reusable file descriptors for JuiceFS FUSE reads.
@@ -28,13 +34,29 @@ type fdKey struct {
 type FDPool struct {
 	mu      sync.Mutex
 	entries map[fdKey]*poolEntry
+	// orphans holds stale-but-held entries displaced by a post-remount
+	// fresh open (#12). Their holders' Releases land on the NEW map entry
+	// (Release is key-based), so orphan refcounts can't be tracked — they
+	// are closed by the evict loop after fdOrphanGrace instead. The fds
+	// are dead (old mount) either way; the grace only bounds how long a
+	// long-held handle keeps an fd object alive.
+	orphans []orphanEntry
 	stopCh  chan struct{}
+}
+
+type orphanEntry struct {
+	fd       *os.File
+	orphaned time.Time
 }
 
 type poolEntry struct {
 	fd       *os.File
 	lastUsed time.Time
 	refCount int
+	// stale marks an fd that predates a FUSE remount (#12): it references
+	// the DEAD mount and must never be re-served. Set by FlushStale; a
+	// stale entry is replaced on the next Get/GetWrite.
+	stale bool
 }
 
 func NewFDPool() *FDPool {
@@ -53,12 +75,14 @@ func NewFDPool() *FDPool {
 func (p *FDPool) Get(path string) (*os.File, error) {
 	k := fdKey{path: path, write: false}
 	p.mu.Lock()
-	if entry, ok := p.entries[k]; ok {
+	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
 		entry.refCount++
 		fd := entry.fd
 		p.mu.Unlock()
 		return fd, nil
+	} else if ok {
+		p.displaceStaleLocked(k, entry)
 	}
 	p.mu.Unlock()
 
@@ -69,13 +93,15 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 
 	p.mu.Lock()
 	// Double-check under lock — another goroutine may have inserted
-	if entry, ok := p.entries[k]; ok {
+	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
 		entry.refCount++
 		existingFD := entry.fd
 		p.mu.Unlock()
 		fd.Close() // close the one we just opened
 		return existingFD, nil
+	} else if ok {
+		p.displaceStaleLocked(k, entry)
 	}
 	p.entries[k] = &poolEntry{
 		fd:       fd,
@@ -92,12 +118,14 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, error) {
 	k := fdKey{path: path, write: true}
 	p.mu.Lock()
-	if entry, ok := p.entries[k]; ok {
+	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
 		entry.refCount++
 		fd := entry.fd
 		p.mu.Unlock()
 		return fd, nil
+	} else if ok {
+		p.displaceStaleLocked(k, entry)
 	}
 	p.mu.Unlock()
 
@@ -107,13 +135,15 @@ func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, er
 	}
 
 	p.mu.Lock()
-	if entry, ok := p.entries[k]; ok {
+	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
 		entry.refCount++
 		existingFD := entry.fd
 		p.mu.Unlock()
 		fd.Close()
 		return existingFD, nil
+	} else if ok {
+		p.displaceStaleLocked(k, entry)
 	}
 	p.entries[k] = &poolEntry{
 		fd:       fd,
@@ -124,12 +154,52 @@ func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, er
 	return fd, nil
 }
 
+// displaceStaleLocked removes a stale entry from the map so a fresh open can
+// take its slot. A 0-ref stale fd closes immediately; a HELD one is moved to
+// the orphan list (its holders' key-based Releases will land on the NEW
+// entry — see Release's clamp — so orphans are grace-closed by the evict
+// loop rather than ref-tracked). Caller holds p.mu.
+func (p *FDPool) displaceStaleLocked(k fdKey, entry *poolEntry) {
+	delete(p.entries, k)
+	if entry.refCount <= 0 {
+		entry.fd.Close()
+		return
+	}
+	p.orphans = append(p.orphans, orphanEntry{fd: entry.fd, orphaned: time.Now()})
+}
+
+// FlushStale invalidates every pooled fd (#12): after a FUSE remount the
+// pooled fds reference the DEAD mount — reads through them fail forever,
+// and Get kept RE-SERVING them (the "stale fd → 0-byte reads" class).
+// Idle entries close immediately; held entries are marked stale so the
+// next Get/GetWrite displaces them with a fresh open through the new
+// mount. Returns (closed, marked) for the caller's log line.
+func (p *FDPool) FlushStale() (closed, marked int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k, e := range p.entries {
+		if e.refCount <= 0 {
+			e.fd.Close()
+			delete(p.entries, k)
+			closed++
+		} else if !e.stale {
+			e.stale = true
+			marked++
+		}
+	}
+	return closed, marked
+}
+
 // Release decrements the refcount for a path on the READ-side slot.
 // Use ReleaseWrite for fds obtained via GetWrite.
 func (p *FDPool) Release(path string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if entry, ok := p.entries[fdKey{path: path, write: false}]; ok {
+	if entry, ok := p.entries[fdKey{path: path, write: false}]; ok && entry.refCount > 0 {
+		// Clamped at 0: after a FlushStale displacement, an OLD holder's
+		// Release lands here (key-based) — without the clamp it could
+		// drive the NEW entry negative and let the evict loop close it
+		// under a live reader.
 		entry.refCount--
 	}
 }
@@ -138,8 +208,8 @@ func (p *FDPool) Release(path string) {
 func (p *FDPool) ReleaseWrite(path string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if entry, ok := p.entries[fdKey{path: path, write: true}]; ok {
-		entry.refCount--
+	if entry, ok := p.entries[fdKey{path: path, write: true}]; ok && entry.refCount > 0 {
+		entry.refCount-- // clamped — see Release
 	}
 }
 
@@ -189,11 +259,24 @@ func (p *FDPool) evictLoop() {
 			var toClose []*os.File
 			p.mu.Lock()
 			for path, entry := range p.entries {
-				if entry.refCount <= 0 && now.Sub(entry.lastUsed) > fdIdleTimeout {
+				// Stale entries (post-remount, #12) are dead-mount fds:
+				// close them the moment their refs drain, no idle wait.
+				if entry.refCount <= 0 && (entry.stale || now.Sub(entry.lastUsed) > fdIdleTimeout) {
 					toClose = append(toClose, entry.fd)
 					delete(p.entries, path)
 				}
 			}
+			// Orphaned stale fds close after the grace window (their
+			// refcounts are untrackable — see displaceStaleLocked).
+			keep := p.orphans[:0]
+			for _, o := range p.orphans {
+				if now.Sub(o.orphaned) > fdOrphanGrace {
+					toClose = append(toClose, o.fd)
+				} else {
+					keep = append(keep, o)
+				}
+			}
+			p.orphans = keep
 			p.mu.Unlock()
 			for _, fd := range toClose {
 				fd.Close()

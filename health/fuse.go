@@ -140,6 +140,28 @@ type FUSEManager struct {
 	cmd    *exec.Cmd
 	stopCh chan struct{}
 	done   chan struct{}
+	// onRemount fires after a successful WATCHDOG remount (#12): pooled
+	// FUSE fds reference the dead mount and must be flushed. Guarded by mu;
+	// invoked without mu held. Set via SetOnRemount (bridge wiring).
+	onRemount func()
+}
+
+// SetOnRemount registers a callback invoked after every successful
+// watchdog-driven remount. Safe to call before or after StartMonitor.
+func (fm *FUSEManager) SetOnRemount(fn func()) {
+	fm.mu.Lock()
+	fm.onRemount = fn
+	fm.mu.Unlock()
+}
+
+// fireOnRemount invokes the registered callback (if any) without holding mu.
+func (fm *FUSEManager) fireOnRemount() {
+	fm.mu.Lock()
+	fn := fm.onRemount
+	fm.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // EffectiveCacheSize returns the cache-size string actually passed to the
@@ -1443,6 +1465,9 @@ func (fm *FUSEManager) monitorLoop() {
 			} else {
 				jmlog.Info("fuse remount succeeded", "after_attempts", consecutiveFailures)
 				consecutiveFailures = 0
+				// #12: every pooled fd predating this remount references the
+				// DEAD mount — notify the bridge so the FDPool flushes them.
+				fm.fireOnRemount()
 			}
 		}
 	}

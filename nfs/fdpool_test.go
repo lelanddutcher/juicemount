@@ -149,3 +149,129 @@ func TestFDPoolConcurrentGetWrite(t *testing.T) {
 		t.Fatalf("expected all refs drained after N=%d ReleaseWrite", N)
 	}
 }
+
+// TestFlushStaleClosesIdleAndReopens pins #12's main population: idle pooled
+// fds (cached for reuse) close immediately on FlushStale, and the next Get
+// opens a FRESH fd instead of re-serving the dead one.
+func TestFlushStaleClosesIdleAndReopens(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.bin")
+	os.WriteFile(path, []byte("hello"), 0o644)
+
+	p := NewFDPool()
+	defer p.Stop()
+
+	fd1, err := p.Get(path)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	p.Release(path) // idle now (refCount 0, still pooled)
+
+	closed, marked := p.FlushStale()
+	if closed != 1 || marked != 0 {
+		t.Fatalf("FlushStale = (%d,%d), want (1,0)", closed, marked)
+	}
+	// The old fd must actually be closed.
+	if _, err := fd1.ReadAt(make([]byte, 1), 0); err == nil {
+		t.Fatal("stale idle fd still readable after FlushStale")
+	}
+	// Next Get reopens fresh and works.
+	fd2, err := p.Get(path)
+	if err != nil {
+		t.Fatalf("Get after flush: %v", err)
+	}
+	defer p.Release(path)
+	if _, err := fd2.ReadAt(make([]byte, 1), 0); err != nil {
+		t.Fatalf("fresh fd unreadable: %v", err)
+	}
+	if fd2 == fd1 {
+		t.Fatal("Get re-served the flushed fd object")
+	}
+}
+
+// TestFlushStaleHeldDisplaced pins the held-entry path: a HELD fd is marked
+// (not closed under its holder), the next Get displaces it with a fresh fd,
+// the displaced fd lands in the orphan list, and the old holder's key-based
+// Release cannot drive the new entry negative (clamp).
+func TestFlushStaleHeldDisplaced(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.bin")
+	os.WriteFile(path, []byte("hello"), 0o644)
+
+	p := NewFDPool()
+	defer p.Stop()
+
+	held, err := p.Get(path) // holder A keeps this across the "remount"
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	closed, marked := p.FlushStale()
+	if closed != 0 || marked != 1 {
+		t.Fatalf("FlushStale = (%d,%d), want (0,1)", closed, marked)
+	}
+	// Held fd must NOT be closed under its holder yet.
+	if _, err := held.ReadAt(make([]byte, 1), 0); err != nil {
+		t.Fatalf("held fd closed under its holder: %v", err)
+	}
+
+	// Holder B: must get a FRESH fd, never the stale one.
+	fresh, err := p.Get(path)
+	if err != nil {
+		t.Fatalf("Get after flush: %v", err)
+	}
+	if fresh == held {
+		t.Fatal("Get re-served the stale held fd")
+	}
+	p.mu.Lock()
+	orphans := len(p.orphans)
+	entry := p.entries[fdKey{path: path, write: false}]
+	p.mu.Unlock()
+	if orphans != 1 {
+		t.Fatalf("orphans = %d, want 1 (displaced held fd)", orphans)
+	}
+	if entry == nil || entry.stale || entry.refCount != 1 {
+		t.Fatalf("fresh entry state wrong: %+v", entry)
+	}
+
+	// Old holder A releases: key-based, lands on the NEW entry — clamp
+	// means it can take it to 0 but the later B release must not underflow.
+	p.Release(path) // A (mis-landed, tolerated)
+	p.Release(path) // B
+	p.mu.Lock()
+	rc := p.entries[fdKey{path: path, write: false}].refCount
+	p.mu.Unlock()
+	if rc < 0 {
+		t.Fatalf("refCount underflow: %d", rc)
+	}
+}
+
+// TestFlushStaleWriteSide: the write keyspace gets the same treatment.
+func TestFlushStaleWriteSide(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "w.bin")
+	os.WriteFile(path, []byte("hello"), 0o644)
+
+	p := NewFDPool()
+	defer p.Stop()
+
+	wfd, err := p.GetWrite(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("GetWrite: %v", err)
+	}
+	p.ReleaseWrite(path)
+	if closed, _ := p.FlushStale(); closed != 1 {
+		t.Fatalf("write-side idle fd not closed")
+	}
+	fresh, err := p.GetWrite(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("GetWrite after flush: %v", err)
+	}
+	defer p.ReleaseWrite(path)
+	if fresh == wfd {
+		t.Fatal("GetWrite re-served the flushed fd")
+	}
+	if _, err := fresh.WriteAt([]byte("x"), 0); err != nil {
+		t.Fatalf("fresh write fd broken: %v", err)
+	}
+}
