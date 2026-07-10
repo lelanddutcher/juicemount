@@ -392,6 +392,13 @@ func keyspaceNotifySufficient(flags string) bool {
 			(strings.Contains(flags, "g") && strings.Contains(flags, "h")))
 }
 
+// keyspaceNotifyWant is the notify-keyspace-events value the self-heal path
+// (JM_KEYSPACE_AUTOCONFIG) writes when the NAS has it unset/insufficient. "KEA"
+// = Keyspace + Keyevent + All-classes — the canonical "enable everything" that
+// keyspaceNotifySufficient accepts; the extra classes cost negligible publish
+// overhead on a dedicated metadata Redis and we only PSUBSCRIBE :d*.
+const keyspaceNotifyWant = "KEA"
+
 // probeKeyspaceConfig runs CONFIG GET notify-keyspace-events and reports
 // whether the live config is sufficient, along with the raw flags string for
 // logging. On any error it returns (false, "") — fail safe to DISABLED.
@@ -491,6 +498,32 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	// SCAN run. Returning here exits runKeyspaceSubscribe; keyspaceLoop will
 	// retry in 2s and re-probe (cheap), so a later NAS enablement is picked up.
 	sufficient, flags := rc.probeKeyspaceConfig(ctx)
+	if !sufficient {
+		// SELF-HEAL (2026-07-10): the perpetual 30s SCAN over a slow/cellular
+		// link — root cause of "index rebuild takes 10 minutes" — is caused by
+		// the NAS Redis simply not having notify-keyspace-events enabled (its
+		// default is off, and a Redis started without a config file loses any
+		// manual CONFIG SET on restart). Rather than passively fall back to
+		// SCAN forever, ENABLE the feature we need: CONFIG SET the flags
+		// ourselves (best-effort) and re-probe. This is our own dedicated
+		// metadata Redis, the flag only affects our own d-key subscription, and
+		// it makes push work on any fresh NAS with zero manual setup + survive a
+		// Redis restart (we re-set on every reconnect). Kill switch
+		// JM_KEYSPACE_AUTOCONFIG=0 restores the passive-fallback behavior; a SET
+		// that fails (ACL/read-only) just falls through to the 30s SCAN as before.
+		if os.Getenv("JM_KEYSPACE_AUTOCONFIG") != "0" {
+			if err := rc.redisDB().ConfigSet(ctx, "notify-keyspace-events", keyspaceNotifyWant).Err(); err != nil {
+				jmlog.Info("metadata keyspace push: auto-enable CONFIG SET failed (staying on SCAN)",
+					"error", err.Error(), "want", keyspaceNotifyWant)
+			} else {
+				sufficient, flags = rc.probeKeyspaceConfig(ctx)
+				if sufficient {
+					jmlog.Info("metadata keyspace push: auto-enabled notify-keyspace-events (self-heal)",
+						"flags", flags, "db", db)
+				}
+			}
+		}
+	}
 	if !sufficient {
 		rc.setEngagement(keyspaceDisabled)
 		jmlog.Info("metadata keyspace push: notify-keyspace-events insufficient, staying on 30s SCAN",

@@ -159,6 +159,12 @@ func TestKeyspaceNotifySufficient(t *testing.T) {
 			t.Errorf("keyspaceNotifySufficient(%q) = %v, want %v", c.flags, got, c.want)
 		}
 	}
+	// INVARIANT (self-heal, 2026-07-10): the value the auto-config path writes
+	// MUST itself pass our sufficiency check — otherwise self-heal would SET a
+	// value, re-probe, still see "insufficient", and loop uselessly.
+	if !keyspaceNotifySufficient(keyspaceNotifyWant) {
+		t.Fatalf("keyspaceNotifyWant %q is not self-sufficient — auto-config would never engage", keyspaceNotifyWant)
+	}
 }
 
 // ---------------------------------------------------------------------------
