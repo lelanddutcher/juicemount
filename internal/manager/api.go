@@ -71,8 +71,10 @@ type API struct {
 	// OverviewMetaURL, or a hand-constructed API in tests) — the
 	// /api/farm/sweep + /api/farm/jobs handlers degrade to 503 /
 	// {available:false} rather than NPE'ing. Dialed once in Register
-	// from the same metaURL the Overview tab probes.
-	farmQ *farmqueue.Client
+	// from the same metaURL the Overview tab probes. Typed as the small
+	// farmQueue interface (farm.go) so tests can fake the queue; the
+	// production value is always a *farmqueue.Client.
+	farmQ farmQueue
 }
 
 // Config bundles the fields needed to construct + register the API.
