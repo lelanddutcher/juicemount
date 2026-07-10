@@ -1320,17 +1320,34 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// from a previous soft-stop cycle, reuse it. Re-running mount_nfs would
 	// fail because the mount point is busy and would prompt for a password
 	// for no reason.
+	// DEADLOCK FIX (2026-07-10, INSTANT-NAV): this mount attempt used to run
+	// INLINE here — inside NFSServerStart's whole-body globalMu hold — and
+	// mountNFSWithPrompt blocks on an INTERACTIVE admin-password prompt. An
+	// unanswered prompt (user away, unattended window, or the kernel-haunted
+	// mountpoint forcing a prompt every boot) therefore deadlocked every
+	// globalMu consumer: /du, /diagnose, /thumbs, offline detection — while
+	// /health kept answering, masking it. Now: reuse-check + mount run on
+	// their own goroutine AFTER the boot wiring, taking globalMu only for
+	// the globalMountPath publish; the prompt itself is bounded (180s) in
+	// mountNFSWithPrompt. Boot never waits on a human again.
 	if cfg.MountPoint != "" {
 		if isMounted(cfg.MountPoint) {
 			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
 			globalMountPath = cfg.MountPoint
-		} else if err := mountNFSWithPrompt(srv.Addr(), cfg.MountPoint); err != nil {
-			jmlog.Warn("nfs mount failed (server still running)",
-				"mount_point", cfg.MountPoint, "error", err.Error())
-			// Non-fatal — the server is up, user can mount manually if needed
 		} else {
-			jmlog.Info("nfs mounted", "mount_point", cfg.MountPoint)
-			globalMountPath = cfg.MountPoint
+			mountAddr, mountPoint := srv.Addr(), cfg.MountPoint
+			go func() {
+				if err := mountNFSWithPrompt(mountAddr, mountPoint); err != nil {
+					jmlog.Warn("nfs mount failed (server still running)",
+						"mount_point", mountPoint, "error", err.Error())
+					// Non-fatal — the server is up, user can mount manually.
+					return
+				}
+				jmlog.Info("nfs mounted", "mount_point", mountPoint)
+				globalMu.Lock()
+				globalMountPath = mountPoint
+				globalMu.Unlock()
+			}()
 		}
 	}
 
@@ -2058,7 +2075,15 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 		shellCmd, mountPoint,
 	)
 
-	out, err := exec.Command("osascript", "-e", osaScript).CombinedOutput()
+	// Bounded: an unanswered admin prompt must never hang forever (see the
+	// NFSServerStart deadlock-fix note). 180s is generous for an attended
+	// user; unattended it self-clears and the next app start re-prompts.
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "osascript", "-e", osaScript).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("mount prompt timed out after 180s (unanswered)")
+	}
 	if err != nil {
 		return fmt.Errorf("osascript: %v\n%s", err, string(out))
 	}
