@@ -322,6 +322,21 @@ type Store struct {
 	// Non-nil for the process lifetime; the statements inside are nil until the
 	// first flag-on serve query prepares them (default-off = never prepared).
 	serve *serveStmts
+
+	// INSTANT-NAV #2: per-directory recursive aggregates — subtreeBytes[P] /
+	// subtreeFiles[P] = total bytes / count of all non-dir entries currently
+	// in pathCache anywhere under dir P ("." = volume root). Maintained
+	// incrementally on every cache mutation (O(depth) walk up the ParentPath
+	// chain under the SAME s.mu write hold the mutation already takes) and
+	// recomputed wholesale on rebuildCaches. Guarded by mu. Read via
+	// SubtreeSize (O(1) under RLock). nil when JM_SUBTREE_SIZES=0 (subtreeOn
+	// false ⇒ every maintenance helper no-ops before touching them). Full
+	// design + invariant: subtree_size.go.
+	subtreeBytes map[string]int64
+	subtreeFiles map[string]int64
+	// subtreeOn is the once-at-Open snapshot of JM_SUBTREE_SIZES (default ON;
+	// matches the ftsDefer snapshot pattern). Read-only after Open.
+	subtreeOn bool
 }
 
 // maxSyntheticHandles bounds syntheticHandles. Generous — far above any real
@@ -477,11 +492,13 @@ func (s *Store) RecoverShadow(rec evictedShadow, inode uint64) *Entry {
 		Mode:       rec.Mode,
 	}
 	s.mu.Lock()
-	if old, ok := s.pathCache[e.Path]; ok {
+	old := s.pathCache[e.Path]
+	if old != nil {
 		s.removeFromChildrenIdx(old)
 		s.evictPathOrphanLocked(old, e)
 	}
 	s.evictInodeOrphanLocked(e)
+	s.subtreeUpsertLocked(old, e) // INSTANT-NAV #2
 	s.inodeCache[e.Inode] = e
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
@@ -693,6 +710,15 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		syntheticHandles: make(map[uint64]string),
 		serve:            &serveStmts{},
 		ftsDefer:         ftsDeferEnabled(),
+		subtreeOn:        subtreeSizesEnabled(),
+	}
+	// Allocate the subtree-aggregate maps only when the gate is on: flag-off
+	// leaves them nil and untouched forever (every maintenance helper checks
+	// subtreeOn first), so the off path is byte-identical to pre-feature
+	// behavior. rebuildCaches below recomputes them from the loaded mirror.
+	if s.subtreeOn {
+		s.subtreeBytes = make(map[string]int64)
+		s.subtreeFiles = make(map[string]int64)
 	}
 
 	// Item 2: log the serve substrate ONCE per boot (RAM shadow vs SQLite-WAL)
@@ -829,7 +855,8 @@ func (s *Store) Insert(e *Entry) error {
 
 	s.mu.Lock()
 	// Remove old entry from children index if path existed with different parent
-	if old, ok := s.pathCache[e.Path]; ok {
+	old := s.pathCache[e.Path]
+	if old != nil {
 		s.removeFromChildrenIdx(old)
 		// QA-27 (2026-05-21): if the displaced entry had a different inode,
 		// clean up its now-orphaned inodeCache mapping. See evictPathOrphanLocked.
@@ -842,6 +869,7 @@ func (s *Store) Insert(e *Entry) error {
 	// evictOldest can rebuild inodeCache from the stale pathCache pointer,
 	// re-creating the QA-25 stale-handle bug.
 	s.evictInodeOrphanLocked(e)
+	s.subtreeUpsertLocked(old, e) // INSTANT-NAV #2: (new−old) size/count delta
 	s.inodeCache[e.Inode] = e
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
@@ -914,6 +942,13 @@ func (s *Store) Delete(entryPath string) error {
 		// later proves the file actually exists. Cheap; bounded TTL.
 		s.shadowEvictedLocked(e)
 	}
+	// INSTANT-NAV #2: subtract whatever entry is ACTUALLY leaving pathCache
+	// NOW — re-fetched under this lock, not the pre-fetched e, which can be
+	// stale if a concurrent Insert replaced the path since the RLock above.
+	// The aggregates' invariant is anchored on pathCache contents.
+	if cur, ok := s.pathCache[entryPath]; ok {
+		s.subtreeRemoveLocked(cur)
+	}
 	delete(s.pathCache, entryPath)
 	s.mu.Unlock()
 
@@ -925,13 +960,15 @@ func (s *Store) Delete(entryPath string) error {
 // SQLite write may be blocked by a concurrent BulkInsert transaction.
 func (s *Store) InsertToCache(e *Entry) {
 	s.mu.Lock()
-	if old, ok := s.pathCache[e.Path]; ok {
+	old := s.pathCache[e.Path]
+	if old != nil {
 		s.removeFromChildrenIdx(old)
 		// QA-27: see Insert.
 		s.evictPathOrphanLocked(old, e)
 	}
 	// QA-25: see Insert.
 	s.evictInodeOrphanLocked(e)
+	s.subtreeUpsertLocked(old, e) // INSTANT-NAV #2
 	s.inodeCache[e.Inode] = e
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
@@ -949,6 +986,7 @@ func (s *Store) DeleteFromCache(entryPath string) {
 		s.removeFromChildrenIdx(e)
 		// QA-30 Layer B: shadow for possible recovery (see Delete).
 		s.shadowEvictedLocked(e)
+		s.subtreeRemoveLocked(e) // INSTANT-NAV #2
 		delete(s.pathCache, entryPath)
 	}
 	s.mu.Unlock()
@@ -966,6 +1004,14 @@ func (s *Store) evictInodeOrphanLocked(new *Entry) {
 		return
 	}
 	s.removeFromChildrenIdx(prev)
+	// INSTANT-NAV #2: the delete below removes pathCache[prev.Path] — an
+	// existence removal at a DIFFERENT path than new — so undo the aggregate
+	// contribution of whatever object is ACTUALLY stored there (normally prev
+	// itself; subtracting the stored object keeps the invariant exact even if
+	// the two maps ever alias differently). See subtree_size.go.
+	if cur, curOk := s.pathCache[prev.Path]; curOk {
+		s.subtreeRemoveLocked(cur)
+	}
 	delete(s.pathCache, prev.Path)
 }
 
@@ -1150,13 +1196,15 @@ func (s *Store) BulkInsert(entries []*Entry, batchSize int) error {
 		}
 		s.mu.Lock()
 		for _, e := range entries[i:end] {
-			if old, ok := s.pathCache[e.Path]; ok {
+			old := s.pathCache[e.Path]
+			if old != nil {
 				s.removeFromChildrenIdx(old)
 				// QA-27: see Insert.
 				s.evictPathOrphanLocked(old, e)
 			}
 			// QA-25: see Insert.
 			s.evictInodeOrphanLocked(e)
+			s.subtreeUpsertLocked(old, e) // INSTANT-NAV #2
 			s.inodeCache[e.Inode] = e
 			s.pathCache[e.Path] = e
 			s.addToChildrenIdx(e)
@@ -1478,6 +1526,7 @@ func (s *Store) BulkInsertAbsent(entries []*Entry, batchSize int) error {
 				// converges the mirror.
 				continue
 			}
+			s.subtreeUpsertLocked(nil, e) // INSTANT-NAV #2: genuinely new (absent-only path)
 			s.inodeCache[e.Inode] = e
 			s.pathCache[e.Path] = e
 			s.addToChildrenIdx(e)
@@ -1639,9 +1688,13 @@ func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error 
 
 	s.mu.Lock()
 	if e, ok := s.pathCache[entryPath]; ok {
+		oldSize := e.Size
 		if size > e.Size {
 			e.Size = size
 		}
+		// INSTANT-NAV #2: in-place size change — apply the (new−old) delta to
+		// the ancestor aggregates. Zero delta (MAX rejected a shrink) no-ops.
+		s.subtreeResizeLocked(e, oldSize)
 		e.Mtime = mtime
 		e.PreSerializedGetAttr = nil // [JM5] invalidate cached XDR bytes
 	}
@@ -2238,6 +2291,7 @@ func (s *Store) DeletePaths(paths []string) error {
 				s.removeFromChildrenIdx(e)
 				// QA-30 Layer B: shadow for possible recovery (see Delete).
 				s.shadowEvictedLocked(e)
+				s.subtreeRemoveLocked(e) // INSTANT-NAV #2
 				delete(s.pathCache, p)
 			}
 		}
@@ -2358,9 +2412,17 @@ func (s *Store) evictOldest() {
 	// so FromHandle can recover if FUSE proves they still exist. Iterate
 	// the OLD pathCache (still in scope until we replace it) and shadow
 	// anything that didn't make it into newPathCache.
+	//
+	// INSTANT-NAV #2: a dropped entry leaves pathCache, so its aggregate
+	// contribution is subtracted here too — the invariant tracks what the
+	// RAM mirror currently holds. (Production no-op: eviction never fires at
+	// ~300k entries vs the 500k budget; dirs are always retained, so the
+	// aggregate keys themselves stay valid.) A later re-insert of the same
+	// path re-adds exactly once via subtreeUpsertLocked(old=nil, e).
 	for path, e := range s.pathCache {
 		if _, kept := newPathCache[path]; !kept {
 			s.shadowEvictedLocked(e)
+			s.subtreeRemoveLocked(e)
 		}
 	}
 
@@ -2405,6 +2467,12 @@ func (s *Store) rebuildCaches() error {
 	s.pathCache = pCache
 	s.childrenIdx = cIdx
 	s.evictOldest()
+	// INSTANT-NAV #2: the caches were replaced wholesale (boot / full rebuild
+	// from SQLite), so recompute the subtree aggregates in one O(N×depth)
+	// pass over the FINAL pathCache — after evictOldest, so the pass sees
+	// exactly the serving state. (evictOldest's own per-drop subtractions
+	// above ran against the superseded maps; this recompute replaces them.)
+	s.recomputeSubtreeAggregatesLocked()
 	s.mu.Unlock()
 
 	return rows.Err()

@@ -1229,6 +1229,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// Not in the contract capability vocabulary — operational/UI route,
 			// excluded from /whoami automatically like reclaim/mount-now.
 			"/diagnose": handleDiagnoseHTTP,
+			// Instant recursive folder size (INSTANT-NAV #2): GET /du?path=…
+			// answers "total bytes + file count under this folder" in O(1)
+			// from the mirror's incrementally-maintained subtree aggregates
+			// (JM_SUBTREE_SIZES, default on) — the app/OpenLoupe surface that
+			// replaces du-walking. GET, loopback. Operational/UI route,
+			// excluded from /whoami automatically like reclaim/mount-now.
+			"/du": handleDuHTTP,
 			// Spool recovery actions (LB-5): ?action=retry-failed
 			// requeues failed rows whose spool file survives;
 			// ?action=clear-stalled force-finalizes leaked-handle
@@ -3054,6 +3061,78 @@ func handleLookupHTTP(w http.ResponseWriter, r *http.Request) {
 	mtime := entry.Mtime.Unix()
 	resp.Mtime = &mtime
 	writeContractJSON(w, resp)
+}
+
+// duResponse is the GET /du body (INSTANT-NAV #2): instant recursive folder
+// totals from the metadata mirror's incrementally-maintained subtree
+// aggregates — no du-walk, no FUSE, no backend round-trip.
+type duResponse struct {
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+	Files int64  `json:"files"`
+	Human string `json:"human"`
+}
+
+// duHuman renders a byte count the way the app's UI does elsewhere (binary
+// units, one decimal). Kept tiny and local — presentation only.
+func duHuman(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// handleDuHTTP serves GET /du?path=<user-path>: O(1) "total bytes + file count
+// under this folder" from the mirror's subtree aggregates (metadata.Store.
+// SubtreeSize, JM_SUBTREE_SIZES default-on). Path convention matches /lookup:
+// entries are keyed VOLUME-RELATIVE, so translate via metaRelPath; the mount
+// root maps to "." (root children key under "." in the mirror). A file path
+// answers with its own size (files=1), du-style. 503 when the store isn't up
+// or the gate is off; 404 when the path isn't in the mirror.
+func handleDuHTTP(w http.ResponseWriter, r *http.Request) {
+	userPath := r.URL.Query().Get("path")
+	if userPath == "" {
+		http.Error(w, "missing ?path", 400)
+		return
+	}
+	globalMu.Lock()
+	store := globalStore
+	mp := globalMountPath
+	if mp == "" {
+		mp = globalWantMountPoint
+	}
+	globalMu.Unlock()
+	if store == nil {
+		http.Error(w, "metadata store not initialized", 503)
+		return
+	}
+
+	rel := metaRelPath(userPath, mp)
+	if rel == "" {
+		rel = "." // volume root
+	}
+	bytes, files, ok := store.SubtreeSize(rel)
+	if !ok {
+		http.Error(w, "subtree sizes disabled (JM_SUBTREE_SIZES=0)", 503)
+		return
+	}
+	if rel != "." {
+		entry := store.LookupByPath(rel)
+		if entry == nil {
+			http.Error(w, "path not in metadata mirror", 404)
+			return
+		}
+		if !entry.IsDir {
+			bytes, files = entry.Size, 1 // du on a file: its own size
+		}
+	}
+	writeContractJSON(w, duResponse{Path: userPath, Bytes: bytes, Files: files, Human: duHuman(bytes)})
 }
 
 // derivativesResponse is the GET /derivatives body. Schema:
