@@ -110,6 +110,16 @@ type Config struct {
 	// MetaURL — useful for standalone mode where the one URL serves
 	// both purposes.
 	OverviewMetaURL string
+	// MountOwnerUID/MountOwnerGID: the POSIX owner migrated data is chowned
+	// to after an embedded-mode sync, so the client mounting the volume can
+	// WRITE the copied data (not just read it). The manager runs as root on
+	// the NAS, so `juicefs sync` leaves migrated files root:wheel — a uid-501
+	// Mac client can then only read them. Setting this makes "migrate, then
+	// use it from the mount" actually work. <= 0 (default) skips the chown
+	// and preserves raw sync ownership. Set via --mount-owner / JM_MOUNT_OWNER
+	// or the Permissions tab. A future per-user ACL policy supersedes this.
+	MountOwnerUID int
+	MountOwnerGID int
 }
 
 // Register wires the manager's routes onto an existing ServeMux at
@@ -122,7 +132,7 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// Derive the RunSync spec from the Config's destination-mode fields.
 	// Embedded (FUSEMount) takes precedence; falls back to standalone
 	// (MetaURL+VolName) if FUSEMount is unset.
-	spec := RunSyncSpec{}
+	spec := RunSyncSpec{OwnerUID: cfg.MountOwnerUID, OwnerGID: cfg.MountOwnerGID}
 	if cfg.FUSEMount != "" {
 		spec.Mode = ModeEmbedded
 		spec.FUSEMount = cfg.FUSEMount
