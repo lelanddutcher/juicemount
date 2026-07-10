@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -112,6 +113,11 @@ type HealthMonitor struct {
 	absentRemountFn func() error
 	nfsServerAddr   string
 	absentTicks     int
+
+	// #106: per-component "local-network-permission suspected" latches, so
+	// the guidance WARN fires once per suspicion streak instead of every
+	// 10s tick. Guarded by mu; lazily allocated.
+	localNetSuspected map[string]bool
 
 	// FUSE health debounce (anti-flap). The raw checkFUSE probe flips on
 	// every backend-link blip; reporting that verbatim strobes the menu bar.
@@ -723,8 +729,10 @@ func (m *HealthMonitor) checkRedis(ctx context.Context) ComponentStatus {
 	err := m.rdb.Ping(ctx).Err()
 	if err != nil {
 		jmlog.Debug("redis ping failed", "error", err.Error())
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("ping failed: %v", err)}
+		return m.classifyBackendFailure("redis", m.cfg.RedisURL, err,
+			ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("ping failed: %v", err)})
 	}
+	m.clearLocalNetSuspect("redis")
 	return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 }
 
@@ -737,8 +745,10 @@ func (m *HealthMonitor) checkMinIO() ComponentStatus {
 	resp, err := m.http.Get(url)
 	if err != nil {
 		jmlog.Debug("minio health check failed", "error", err.Error())
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("request failed: %v", err)}
+		return m.classifyBackendFailure("minio", minioHostPort(m.cfg.MinIOURL), err,
+			ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("request failed: %v", err)})
 	}
+	m.clearLocalNetSuspect("minio")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -747,6 +757,60 @@ func (m *HealthMonitor) checkMinIO() ComponentStatus {
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: msg}
 	}
 	return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
+}
+
+// classifyBackendFailure upgrades a generic backend-dial failure to the
+// distinct MsgLocalNetworkPermission status when the failure matches the
+// macOS Local Network permission-denial signature (#106 — see localnet.go
+// for the exact, deliberately conservative conditions). Non-matching
+// failures pass through untouched, so every existing report is preserved.
+// The first tick of a suspicion streak logs a WARN with the remediation.
+func (m *HealthMonitor) classifyBackendFailure(component, targetAddr string, err error, base ComponentStatus) ComponentStatus {
+	if targetAddr == "" || !IsLocalNetPermissionSignature(err, targetAddr, localNetSnapshotFn()) {
+		m.clearLocalNetSuspect(component)
+		return base
+	}
+	base.Message = MsgLocalNetworkPermission
+
+	m.mu.Lock()
+	first := !m.localNetSuspected[component]
+	if first {
+		if m.localNetSuspected == nil {
+			m.localNetSuspected = make(map[string]bool)
+		}
+		m.localNetSuspected[component] = true
+	}
+	m.mu.Unlock()
+	if first {
+		jmlog.Warn("backend dial blocked — macOS Local Network permission likely denied (it silently resets after every rebuild/re-sign/update)",
+			"component", component,
+			"target", targetAddr,
+			"error", err.Error(),
+			"action", "enable JuiceMount in System Settings → Privacy & Security → Local Network, then relaunch",
+		)
+	}
+	return base
+}
+
+// clearLocalNetSuspect drops a component's permission-suspected latch so
+// the next suspicion streak logs its WARN again.
+func (m *HealthMonitor) clearLocalNetSuspect(component string) {
+	m.mu.Lock()
+	if m.localNetSuspected[component] {
+		delete(m.localNetSuspected, component)
+	}
+	m.mu.Unlock()
+}
+
+// minioHostPort extracts "host:port" from the configured MinIO base URL so
+// the #106 classifier can judge the target address. Empty on parse failure
+// (classifier stays silent — conservative).
+func minioHostPort(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
 }
 
 func (m *HealthMonitor) checkFUSE() ComponentStatus {

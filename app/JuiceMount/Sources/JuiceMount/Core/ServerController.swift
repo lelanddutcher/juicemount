@@ -72,6 +72,15 @@ public final class ServerController {
     /// and double-click guard.
     public private(set) var mountNowInFlight = false
 
+    /// #106: true when the Go health monitor reports a backend component as
+    /// "local-network-permission" — the conservative signature of macOS
+    /// having silently reset this app's Local Network privacy permission
+    /// (it happens on every rebuild/re-sign/update: dials to the NAS fail
+    /// EHOSTUNREACH while the network is otherwise fine). Drives the
+    /// popover's "Local Network permission needed" remedy row. Keeps
+    /// last-known on a failed probe, same policy as volumeMounted.
+    public private(set) var localNetworkPermissionSuspected = false
+
     public var preferences: Preferences
 
     private let log = Logger(subsystem: "com.juicemount.app", category: "ServerController")
@@ -350,6 +359,19 @@ public final class ServerController {
                     self.volumeMounted = !nfsLabel.contains("not mounted")
                     if prevMounted != self.volumeMounted {
                         NFSBridge.appLog("volumeMounted \(prevMounted) -> \(self.volumeMounted) (nfs=\(nfsLabel))")
+                    }
+
+                    // #106: the Go monitor reports the distinct
+                    // "local-network-permission" component status when a
+                    // backend dial failure matches the macOS Local Network
+                    // permission-denial signature (health/localnet.go — it
+                    // never fires while genuinely offline). Piggybacks on
+                    // the same /health snapshot; no new polling.
+                    let prevPerm = self.localNetworkPermissionSuspected
+                    self.localNetworkPermissionSuspected =
+                        hp.components.values.contains { $0.contains("local-network-permission") }
+                    if prevPerm != self.localNetworkPermissionSuspected {
+                        NFSBridge.appLog("localNetworkPermissionSuspected \(prevPerm) -> \(self.localNetworkPermissionSuspected)")
                     }
                 }
 

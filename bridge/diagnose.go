@@ -47,14 +47,12 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/health"
@@ -151,40 +149,27 @@ var diagnoseDeps = struct {
 // Pure classification (unit-tested in diagnose_test.go)
 // ----------------------------------------------------------------------------
 
-// Dial-error classes returned by dialErrorClass.
+// Dial-error classes returned by dialErrorClass. The taxonomy moved to the
+// health package (#106) so the periodic health monitor's local-network-
+// permission classifier and this on-demand check share ONE bucketing
+// instead of two drifting copies; these aliases keep every existing use
+// (and test) in place. health adds a "denied" (EACCES/EPERM) class, which
+// the switch in classifyBackendDial folds into its default arm — same
+// verdict those errors always got here.
 const (
-	dialClassOK      = ""
-	dialClassNoRoute = "no-route"
-	dialClassRefused = "refused"
-	dialClassDNS     = "dns"
-	dialClassTimeout = "timeout"
-	dialClassOther   = "other"
+	dialClassOK      = health.DialClassOK
+	dialClassNoRoute = health.DialClassNoRoute
+	dialClassRefused = health.DialClassRefused
+	dialClassDNS     = health.DialClassDNS
+	dialClassTimeout = health.DialClassTimeout
+	dialClassOther   = health.DialClassOther
 )
 
 // dialErrorClass buckets a TCP dial error into the coarse classes the
-// diagnosis cares about. DNS is checked before the generic timeout so a
-// resolver timeout reads as a name problem, not a route problem.
+// diagnosis cares about. Delegates to the shared health.DialErrorClass —
+// see the note on the class aliases above.
 func dialErrorClass(err error) string {
-	if err == nil {
-		return dialClassOK
-	}
-	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) ||
-		strings.Contains(err.Error(), "no route to host") {
-		return dialClassNoRoute
-	}
-	if errors.Is(err, syscall.ECONNREFUSED) ||
-		strings.Contains(err.Error(), "connection refused") {
-		return dialClassRefused
-	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
-		return dialClassDNS
-	}
-	var nerr net.Error
-	if (errors.As(err, &nerr) && nerr.Timeout()) || errors.Is(err, context.DeadlineExceeded) {
-		return dialClassTimeout
-	}
-	return dialClassOther
+	return health.DialErrorClass(err)
 }
 
 // classifyBackendDial turns the backend dial outcome into the local-network

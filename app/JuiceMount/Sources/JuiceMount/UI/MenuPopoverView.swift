@@ -1471,6 +1471,7 @@ struct MenuPopoverView: View {
             cacheGlanceRow
             uploadsGlanceRow
             mountRemedyRow
+            localNetworkRemedyRow
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -1512,6 +1513,41 @@ struct MenuPopoverView: View {
                 }
                 .disabled(server.mountNowInFlight)
                 .help("Re-mounts the volume via mount_nfs. May ask for your password once unless the scoped sudoers rule is installed.")
+            }
+        }
+    }
+
+    /// #106 remedy row: macOS silently resets the app's Local Network
+    /// privacy permission on every rebuild/re-sign/update; the backend then
+    /// fails EHOSTUNREACH while the network is fine and the app used to
+    /// just look "offline" with no explanation. The Go health monitor
+    /// detects the signature (health/localnet.go, conservative — never
+    /// while genuinely offline) and this row names the fix, with a button
+    /// straight to the right System Settings pane.
+    @ViewBuilder
+    private var localNetworkRemedyRow: some View {
+        if server.localNetworkPermissionSuspected, isRunningLikeForMountRemedy {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(Self.glanceAmber)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Local Network permission needed")
+                        .font(.caption)
+                        .foregroundStyle(Self.glanceAmber)
+                    Text("Enable in System Settings → Privacy & Security → Local Network")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork") {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    Text("Open Settings").font(.caption)
+                }
+                .help("Opens System Settings → Privacy & Security → Local Network. Enable JuiceMount there, then relaunch the app.")
             }
         }
     }
@@ -1600,6 +1636,14 @@ struct MenuPopoverView: View {
         case .healthy:
             return "Healthy"
         case .degraded:
+            // #106: name the actual cause when the backend is unreachable
+            // because macOS is denying Local Network access — "Redis
+            // unreachable" is technically true but sends the user hunting
+            // for network problems that don't exist. The remedy row with
+            // the System Settings button sits right below.
+            if server.localNetworkPermissionSuspected, isRunningLikeForMountRemedy {
+                return "Local Network permission needed"
+            }
             // Running-but-unmounted is its own honest message (review B-gap:
             // this used to fall through to .running's "Connected" — amber dot
             // with a green word). The Mount Now remedy row sits right below.
