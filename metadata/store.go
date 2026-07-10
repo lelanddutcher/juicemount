@@ -669,6 +669,15 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		return nil, fmt.Errorf("create FTS pending schema: %w", err)
 	}
 
+	// prune_ladder (#10, task #73 second half) is additive the same way, so it
+	// lands on existing mirror DBs at open. Always created — harmless when
+	// JM_PRUNE_LADDER_DURABLE=0 (it just stays empty/stale and is never read),
+	// so toggling the kill switch never needs a schema migration.
+	if _, err := db.Exec(pruneLadderSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create prune ladder schema: %w", err)
+	}
+
 	// Drop legacy triggers (FTS is maintained manually for performance)
 	if _, err := db.Exec(dropFTSTriggers); err != nil {
 		db.Close()

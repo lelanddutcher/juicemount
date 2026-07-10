@@ -206,6 +206,14 @@ type RedisClient struct {
 	// are actually deleted from SQLite. Guarded by mu.
 	pruneAbsent map[string]int
 
+	// ladderPersisted mirrors the durable prune_ladder table's contents (#10,
+	// task #73 second half): it is the previous-cycle snapshot that
+	// persistPruneLadderDiff diffs pruneAbsent against at each cycle's tail,
+	// so only changed rows are written. Same single-writer discipline as
+	// pruneAbsent (constructors seed it via loadDurablePruneLadder before any
+	// goroutine starts; thereafter only syncMetadata's goroutine touches it).
+	ladderPersisted map[string]int
+
 	// pruneFollowUp marks the next syncNowCh wake as a G5 fast-path
 	// CONTINUATION (a capped mass-delete with confirmed survivors) — it must
 	// bypass the keyspace-push deferral and the flap debounce in
@@ -544,9 +552,13 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 		syncNowCh:         make(chan struct{}, 1),
 		connected:         true,
 		pruneAbsent:       make(map[string]int),
+		ladderPersisted:   make(map[string]int),
 	}
 	rc.rdb.Store(rdb)
 	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+	// #10 (task #73): resume the durable prune ladder BEFORE any goroutine or
+	// SyncOnce can run a cycle — see the safety analysis on the method.
+	rc.loadDurablePruneLadder()
 	return rc, nil
 }
 
@@ -588,9 +600,15 @@ func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error)
 		connected:         false,
 		lastDisconnect:    time.Now(),
 		pruneAbsent:       make(map[string]int),
+		ladderPersisted:   make(map[string]int),
 	}
 	rc.rdb.Store(rdb) // rdb is atomic.Pointer (see the field doc / Reconnect race)
 	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+	// #10 (task #73): resume the durable prune ladder here too — the
+	// start-while-offline path is exactly a restart-churn scenario (see the
+	// safety analysis on the method; offline cycles are RecentlyDegraded, so
+	// resumed counts sit inert until the first stable SCAN).
+	rc.loadDurablePruneLadder()
 	return rc, nil
 }
 
@@ -2098,6 +2116,17 @@ func (rc *RedisClient) syncMetadata() (err error) {
 			rc.TriggerSync()
 		}
 	}
+
+	// #10 (task #73 second half): persist the ladder's post-cycle state. This
+	// is the SINGLE durable-ladder call site, deliberately placed after every
+	// pruneAbsent mutation this cycle — trackAbsentPaths increments and
+	// reappearance clears, the qualification drain, collectFastPathPrunes
+	// removals, and verifyPruneCandidates deferral re-insertions — so the
+	// snapshot-diff observes only the cycle's final state (correct by
+	// construction against any future mutation site too). Best-effort and
+	// no-op when the diff is empty; see the method for degraded-cycle and
+	// error-exit semantics.
+	rc.persistPruneLadderDiff()
 
 	duration := time.Since(start)
 	syncedAt := time.Now()
