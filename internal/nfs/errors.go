@@ -179,6 +179,12 @@ func basicErrorFormatter(err error) RPCError {
 // nfslib) reference the same value.
 var ErrFUSETimeout = errors.New("nfs: fuse operation timed out (mount wedged)")
 
+// ErrBackendBlip marks a data-plane op that failed with a transport-class
+// error while the metadata backend was inside a blip window (#9 / task #36).
+// conn.handle maps it — like ErrFUSETimeout — to the retryable
+// NFS3ERR_JUKEBOX so the client retries across the blip instead of aborting.
+var ErrBackendBlip = errors.New("nfs: backend blip — parked for client retry")
+
 // NFSStatusError represents an error at the NFS level.
 type NFSStatusError struct {
 	NFSStatus

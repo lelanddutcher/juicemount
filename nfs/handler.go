@@ -43,6 +43,7 @@ type JuiceMountHandler struct {
 	redisClient *metadata.RedisClient // for publishing events
 	pinStore    *pin.Store            // optional; gates reads when offline mode is on
 	thumbWarmer *ThumbWarmer          // optional (#1 hydration pack); nil-safe
+	blipHook    func() bool           // test override for backendBlipActive (#9)
 
 	// Synthetic inode counter for locally-created entries (atomic)
 	inodeCounter atomic.Uint64
@@ -3753,7 +3754,11 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		// filters warm/sub-256KB reads so only wire-speed moves the estimate.
 		netprofile.Default().ObserveThroughput(int64(n), elapsed)
 	}
-	return n, err
+	// #9 blip park: a transport-class hard error during a backend blip
+	// window re-maps to the retryable JUKEBOX (see nfs/blip.go). The
+	// torn-read guards above (premature-EOF → ErrUnexpectedEOF) and
+	// offline errors pass through untouched.
+	return n, f.handler.classifyBlipError(err)
 }
 
 func (f *cachedFile) Read(p []byte) (int, error)  { return f.fuseFD.Read(p) }
@@ -3823,7 +3828,7 @@ func (f *writeFile) Write(p []byte) (int, error) {
 		}
 		metrics.Default().AddBytesWritten(int64(n))
 	}
-	return n, err
+	return n, f.handler.classifyBlipError(err) // #9 blip park
 }
 
 func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
@@ -3836,7 +3841,7 @@ func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
 		}
 		metrics.Default().AddBytesWritten(int64(n))
 	}
-	return n, err
+	return n, f.handler.classifyBlipError(err) // #9 blip park
 }
 
 func (f *writeFile) Close() error {
@@ -4005,7 +4010,8 @@ func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 	// the same two-lane gate as cachedFile.ReadAt. Inert on medium/fast.
 	releaseQoS := defaultReadQoS.acquire(off, len(p))
 	defer releaseQoS()
-	return f.File.ReadAt(p, off)
+	n, err := f.File.ReadAt(p, off)
+	return n, f.handler.classifyBlipError(err) // #9 blip park
 }
 
 // rootDirInfo is the FileInfo for the root directory.

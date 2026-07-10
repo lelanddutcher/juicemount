@@ -238,6 +238,10 @@ type Registry struct {
 	thumbWarmNegative atomic.Uint64
 	thumbWarmShed     atomic.Uint64
 
+	// backendBlipParked — grades #9: data-plane ops re-mapped to JUKEBOX
+	// during a backend blip window instead of failing hard.
+	backendBlipParked atomic.Uint64
+
 	// readaheadTriggered / readaheadPrefetchedBlocks — grades S2. One inc per
 	// readahead schedule (SeqThreshold trip); prefetched-blocks accumulates the
 	// block count actually pulled by the background prefetch.
@@ -460,6 +464,10 @@ func (r *Registry) IncThumbWarmNegative() { r.thumbWarmNegative.Add(1) }
 // IncThumbWarmShed records a warm pass abandoned at the read-QoS bulk lane.
 func (r *Registry) IncThumbWarmShed() { r.thumbWarmShed.Add(1) }
 
+// IncBackendBlipParked records a data-plane op parked (JUKEBOX) across a
+// backend blip instead of failing hard.
+func (r *Registry) IncBackendBlipParked() { r.backendBlipParked.Add(1) }
+
 // IncReadaheadTriggered records one readahead schedule (SeqThreshold trip).
 func (r *Registry) IncReadaheadTriggered() { r.readaheadTriggered.Add(1) }
 
@@ -559,6 +567,7 @@ type Snapshot struct {
 	ThumbWarmHydrated         uint64 `json:"thumb_warm_hydrated"`
 	ThumbWarmNegative         uint64 `json:"thumb_warm_negative"`
 	ThumbWarmShed             uint64 `json:"thumb_warm_shed"`
+	BackendBlipParked         uint64 `json:"backend_blip_parked"`
 	ReadaheadTriggered        uint64 `json:"readahead_triggered"`
 	ReadaheadPrefetchedBlocks uint64 `json:"readahead_prefetched_blocks"`
 	ReadaheadSuppressed       uint64 `json:"readahead_suppressed"`
@@ -618,6 +627,7 @@ func (r *Registry) Snapshot() Snapshot {
 		ThumbWarmHydrated:         r.thumbWarmHydrated.Load(),
 		ThumbWarmNegative:         r.thumbWarmNegative.Load(),
 		ThumbWarmShed:             r.thumbWarmShed.Load(),
+		BackendBlipParked:         r.backendBlipParked.Load(),
 		ReadaheadTriggered:        r.readaheadTriggered.Load(),
 		ReadaheadPrefetchedBlocks: r.readaheadPrefetchedBlocks.Load(),
 		ReadaheadSuppressed:       r.readaheadSuppressed.Load(),

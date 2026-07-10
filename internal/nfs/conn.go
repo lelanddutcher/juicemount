@@ -392,7 +392,11 @@ func (c *conn) handle(ctx context.Context, w *response) error {
 	// retries instead of aborting on a permanent error. The handler has already
 	// returned — freeing its rpcSem slot — which is what keeps a backend wedge
 	// from exhausting the slot budget and staling the whole mount.
-	if appError != nil && errors.Is(appError, ErrFUSETimeout) {
+	// Same treatment for a backend blip (#9): the op failed only because the
+	// metadata backend was mid-restart; a client retry after the reconnect
+	// succeeds. Both sentinels are BOUNDED at their source (wedge probe /
+	// blipParkWindow), so neither can tarpit forever.
+	if appError != nil && (errors.Is(appError, ErrFUSETimeout) || errors.Is(appError, ErrBackendBlip)) {
 		appError = &NFSStatusError{NFSStatusJukebox, appError}
 		// Count it: a JUKEBOX reply is a "success" to the latency metrics, so a
 		// retry storm (the "error 100060" mechanism) is otherwise invisible.
