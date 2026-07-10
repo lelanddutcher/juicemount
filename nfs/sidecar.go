@@ -5,6 +5,7 @@ import (
 	"path"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
@@ -308,9 +309,16 @@ func (h *JuiceMountHandler) sidecarWarmDirAsync(dir string) {
 	}
 }
 
-// sidecarWarmDir reads a dir's `._` children (from the mirror listing) into
-// the sidecar cache. Each fetch passes the read-QoS bulk lane at prefetch
-// class (sheds under contention — interactive reads always win).
+// sidecarWarmParallel bounds concurrent `._` reads WITHIN a warm pass. A `._`
+// body is ~4KB, so the read is LATENCY-bound (one tunnel RTT), not bandwidth-
+// bound — reading them in parallel collapses a serial 199×700ms≈2min crawl to
+// ~(199/N)×700ms while adding negligible bytes-in-flight. This is what lets the
+// warmer front-run Finder's foreground per-entry reads on the FIRST visit.
+const sidecarWarmParallel = 16
+
+// sidecarWarmDir warms a dir's `._` children (from the mirror listing) into the
+// sidecar cache, in parallel. Each fetch passes the read-QoS bulk lane at
+// prefetch class (sheds under contention — interactive reads always win).
 func (h *JuiceMountHandler) sidecarWarmDir(dir string) {
 	if h.store == nil {
 		return
@@ -319,27 +327,52 @@ func (h *JuiceMountHandler) sidecarWarmDir(dir string) {
 	if err != nil {
 		return
 	}
-	warmed := 0
+	// Collect the eligible `._` children first.
+	work := make([]string, 0, len(kids))
 	for _, e := range kids {
-		if warmed >= sidecarWarmMaxPerDir {
+		if len(work) >= sidecarWarmMaxPerDir {
 			break
 		}
-		if e.IsDir || !isSidecarName(e.Name) || e.Size <= 0 || e.Size > sidecarMaxFile {
-			continue
+		if !e.IsDir && isSidecarName(e.Name) && e.Size > 0 && e.Size <= sidecarMaxFile {
+			work = append(work, e.Path)
 		}
-		if pin.IsOffline() {
-			return
-		}
-		release, ok := defaultReadQoS.tryAcquireBulk()
-		if !ok {
-			return // contended — abandon; interactive reads have the tunnel
-		}
-		fusePath := h.fusePath + "/" + e.Path
-		if h.warmSidecar(e.Path, fusePath) {
-			warmed++
-		}
-		release()
 	}
+	if len(work) == 0 {
+		return
+	}
+
+	jobs := make(chan string, len(work))
+	for _, p := range work {
+		jobs <- p
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	var warmed int64
+	workers := sidecarWarmParallel
+	if workers > len(work) {
+		workers = len(work)
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for rel := range jobs {
+				if pin.IsOffline() {
+					return
+				}
+				release, ok := defaultReadQoS.tryAcquireBulk()
+				if !ok {
+					return // contended — interactive reads own the tunnel
+				}
+				if h.warmSidecar(rel, h.fusePath+"/"+rel) {
+					atomic.AddInt64(&warmed, 1)
+				}
+				release()
+			}
+		}()
+	}
+	wg.Wait()
 	if warmed > 0 {
 		jmlog.Debug("sidecar warm: dir warmed", "dir", dir, "sidecars", warmed)
 	}
