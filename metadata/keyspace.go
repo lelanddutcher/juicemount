@@ -904,6 +904,78 @@ func decodeInodeAttr(attr []byte) (mtime int64, size int64, ok bool) {
 	return mtime, size, true
 }
 
+// dirChild is one decoded, mirrorable child of a reconciling directory
+// (reconcileDir PASS 1 output).
+type dirChild struct {
+	inode     uint64
+	childPath string
+	mode      fs.FileMode
+	isDir     bool
+}
+
+// buildReconcileChildEntries is reconcileDir's PASS 2, split out for direct
+// testing: build the upsert set from the decoded children + their (possibly
+// incomplete) attr map.
+//
+// SIZE-CLOBBER FIX (2026-07-10, found live: 1,922 mirror rows zeroed while
+// backend data was intact): a FAILED attr read (transient error, blown
+// deadline, MGET miss) used to leave size/mtime 0 and upsert that over a
+// known-good row — the upsert-diff saw real≠0 as "changed" and wrote the
+// zero, so every farm sweep / dir-event storm on a slow link progressively
+// zeroed the mirror ("0-byte file" UX, OL verified-offload false-fails,
+// task #38's family). A failed read is NOT evidence of an empty file:
+// PRESERVE the existing row's size/mtime (the diff then sees no change — no
+// write). A genuinely empty file still mirrors as 0 because its attr READS
+// OK with size 0. A NEW child with an unreadable attr inserts with 0 (the
+// SCAN's new-file semantics) and heals on the next successful read.
+func buildReconcileChildEntries(children []dirChild, attrByInode map[uint64][]byte, lookup func(string) *Entry) (toUpsert []*Entry, newDirs []uint64) {
+	for _, c := range children {
+		var mtime time.Time
+		var size int64
+		attrOK := false
+		if attr, ok := attrByInode[c.inode]; ok {
+			if mt, sz, ok2 := decodeInodeAttr(attr); ok2 {
+				if mt > 0 {
+					mtime = time.Unix(mt, 0)
+				}
+				size = sz
+				attrOK = true
+			}
+		}
+		existing := lookup(c.childPath)
+		if !attrOK && existing != nil {
+			size = existing.Size
+			mtime = existing.Mtime
+		}
+
+		e := &Entry{
+			Path:       c.childPath,
+			Name:       path.Base(c.childPath),
+			ParentPath: path.Dir(c.childPath),
+			IsDir:      c.isDir,
+			Size:       size,
+			Mtime:      mtime,
+			Inode:      c.inode,
+			Mode:       c.mode,
+		}
+
+		// Upsert-diff: only write if new or changed (same compare as
+		// syncMetadata). Idempotent — harmless under double-processing.
+		if existing == nil ||
+			existing.Mtime.Unix() != e.Mtime.Unix() ||
+			existing.Size != e.Size ||
+			existing.Inode != e.Inode {
+			toUpsert = append(toUpsert, e)
+		}
+		// A never-mirrored (or recreated) child DIR needs its own contents
+		// reconciled — collect for the post-upsert requeue (B4' fix).
+		if c.isDir && (existing == nil || existing.Inode != e.Inode) {
+			newDirs = append(newDirs, c.inode)
+		}
+	}
+	return toUpsert, newDirs
+}
+
 // JuiceFS directory-entry file-type bytes (the first byte of the 9-byte dir
 // HASH value; see decodeDirChild). These mirror the upstream meta encoding.
 const (
@@ -1015,6 +1087,13 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 	// events were dropped as unknown-ancestor. Requeued below (B4' fix).
 	var newDirs []uint64
 	skippedFiltered := 0 // task #78: scan-filtered children not mirrored
+	// PASS 1: decode the dir listing and collect mirrorable children. Attrs
+	// are fetched in PASS 2 via chunked MGET — one round trip per chunk
+	// instead of one sequential GET per child. The old per-child GETs shared
+	// this function's single 30s ctx: a 257-child dir on a ~300ms tunnel
+	// needs ~77s of sequential round-trips, so BIG DIRS' TAILS FAILED EVERY
+	// RECONCILE on high-RTT links — feeding the size-clobber below.
+	children := make([]dirChild, 0, len(raw))
 	for name, valStr := range raw {
 		val := []byte(valStr)
 		childInode, ft, ok := decodeDirChild(val)
@@ -1044,50 +1123,43 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 		// appear as bare child names — deeper dirs are skipped wholesale above).
 		// The name stays in freshNames (set above) so scopedPrune keeps seeing
 		// it as Redis-fresh; we just refuse to MIRROR it. Skipping before the
-		// attr GET also saves the per-child Redis round-trip.
+		// attr fetch also saves the per-child Redis payload.
 		if scanFilteredPath(childPath) {
 			skippedFiltered++
 			continue
 		}
+		children = append(children, dirChild{inode: childInode, childPath: childPath, mode: mode, isDir: isDir})
+	}
 
-		// Fetch attrs for mtime/size (single GET, no scan). A missing/short
-		// attr leaves mtime/size 0 — identical to the Lua's behavior.
-		var mtime time.Time
-		var size int64
-		if attrStr, aerr := rdb.Get(ctx, "i"+strconv.FormatUint(childInode, 10)).Result(); aerr == nil {
-			if mt, sz, ok := decodeInodeAttr([]byte(attrStr)); ok {
-				if mt > 0 {
-					mtime = time.Unix(mt, 0)
-				}
-				size = sz
+	// PASS 2: bulk attr fetch (mtime/size) via chunked MGET.
+	attrByInode := make(map[uint64][]byte, len(children))
+	attrFetchErr := false
+	const attrMGetChunk = 1000
+	for start := 0; start < len(children); start += attrMGetChunk {
+		end := start + attrMGetChunk
+		if end > len(children) {
+			end = len(children)
+		}
+		keys := make([]string, 0, end-start)
+		for _, c := range children[start:end] {
+			keys = append(keys, "i"+strconv.FormatUint(c.inode, 10))
+		}
+		vals, merr := rdb.MGet(ctx, keys...).Result()
+		if merr != nil {
+			attrFetchErr = true
+			break
+		}
+		for i, v := range vals {
+			if str, okS := v.(string); okS {
+				attrByInode[children[start+i].inode] = []byte(str)
 			}
 		}
+	}
 
-		e := &Entry{
-			Path:       childPath,
-			Name:       path.Base(childPath),
-			ParentPath: path.Dir(childPath),
-			IsDir:      isDir,
-			Size:       size,
-			Mtime:      mtime,
-			Inode:      childInode,
-			Mode:       mode,
-		}
-
-		// Upsert-diff: only write if new or changed (same compare as
-		// syncMetadata). Idempotent — harmless under double-processing.
-		existing := rc.store.LookupByPath(e.Path)
-		if existing == nil ||
-			existing.Mtime.Unix() != e.Mtime.Unix() ||
-			existing.Size != e.Size ||
-			existing.Inode != e.Inode {
-			toUpsert = append(toUpsert, e)
-		}
-		// A never-mirrored (or recreated) child DIR needs its own contents
-		// reconciled — collect for the post-upsert requeue (B4' fix).
-		if isDir && (existing == nil || existing.Inode != e.Inode) {
-			newDirs = append(newDirs, childInode)
-		}
+	toUpsert, newDirs = buildReconcileChildEntries(children, attrByInode, rc.store.LookupByPath)
+	if attrFetchErr {
+		jmlog.Warn("reconcileDir: attr MGET failed — existing mirror sizes preserved, new children mirror with size 0 until the next successful read",
+			"dir_inode", dirInode, "children", len(children))
 	}
 
 	if skippedFiltered > 0 {
