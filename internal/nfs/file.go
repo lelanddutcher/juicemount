@@ -115,10 +115,16 @@ func ToFileAttribute(info os.FileInfo, filePath string) *FileAttribute {
 		f.GID = a.GID
 		f.SpecData = [2]uint32{a.Major, a.Minor}
 		f.Fileid = a.Fileid
+		if nfsTrace {
+			Log.Infof("TRACE attr path=%q fileid=%d type=%d src=info", filePath, f.Fileid, f.Type)
+		}
 	} else {
 		hasher := fnv.New64()
 		_, _ = hasher.Write([]byte(filePath))
 		f.Fileid = hasher.Sum64()
+		if nfsTrace {
+			Log.Infof("TRACE attr path=%q fileid=%d type=%d src=HASH infoType=%T", filePath, f.Fileid, f.Type, info)
+		}
 	}
 
 	f.Filesize = uint64(info.Size())

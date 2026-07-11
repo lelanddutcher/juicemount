@@ -387,6 +387,13 @@ func (c *conn) handle(ctx context.Context, w *response) error {
 		return c.err(ctx, w, &ResponseCodeProcUnavailableError{})
 	}
 	appError := handler(ctx, w, c.Server.Handler)
+	if nfsTrace {
+		if appError != nil {
+			Log.Infof("TRACE rpc %s -> ERR %v", w.req.String(), appError)
+		} else {
+			Log.Infof("TRACE rpc %s -> OK", w.req.String())
+		}
+	}
 	// A wedged JuiceFS surfaces as ErrFUSETimeout from the filesystem layer.
 	// Map it (however the handler wrapped it) to NFS3ERR_JUKEBOX so the client
 	// retries instead of aborting on a permanent error. The handler has already
