@@ -3007,7 +3007,23 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	oldEntry := jfs.handler.store.LookupByPath(oldpath)
 	jfs.handler.store.DeleteFromCache(oldpath)
 	if oldEntry != nil {
-		newEntry := metadata.MakeEntry(newpath, oldEntry.IsDir, oldEntry.Size, oldEntry.Mtime, oldEntry.Inode)
+		// CLONE the old entry, never MakeEntry a fresh one (#70 tail, 2026-07-10):
+		// MakeEntry hardcodes Mode to 0644/dir, so renaming a SYMLINK downgraded
+		// its mirror entry to a regular file — same fileid, flipped fattr3 type —
+		// and the macOS client treats a type flip on a live fileid as vnode death
+		// → "Stale NFS file handle" on the rename ditto/Finder just issued.
+		// Bundle copies create framework links as .BC.* temp names and RENAME
+		// them into place, so every .app copy died here (JM_NFS_TRACE proof:
+		// Symlink reply type=5 → post-Rename Lookup of the same fileid type=1).
+		// Cloning also preserves LocalOnly (prune protection must survive a
+		// rename). The pre-serialized GETATTR blob is dropped defensively; the
+		// first GETATTR at the new path recomputes it.
+		clone := *oldEntry
+		clone.Path = newpath
+		clone.Name = path.Base(newpath)
+		clone.ParentPath = path.Dir(newpath)
+		clone.PreSerializedGetAttr = nil
+		newEntry := &clone
 		jfs.handler.store.InsertToCache(newEntry)
 
 		// SQLite update async (won't block NFS)
@@ -3029,18 +3045,25 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 			}
 		}
 
-		// Publish rename event
+		// Publish rename event. IsSymlink must ride along: applyEvent (self-write
+		// pub/sub AND peers) rebuilds the destination entry from the event alone,
+		// and without the discriminator it collapses a renamed symlink back to a
+		// 0644 regular file — re-clobbering the type the clone above preserved.
 		jfs.handler.publishEvent(metadata.MetadataEvent{
 			Op: "rename", Path: newpath, OldPath: oldpath,
 			Size: oldEntry.Size, Mtime: oldEntry.Mtime.Unix(),
 			Inode: oldEntry.Inode, IsDir: oldEntry.IsDir,
+			IsSymlink: oldEntry.Mode&os.ModeSymlink != 0,
 		})
 	} else {
 		// No cached entry — still do the SQLite ops async
 		go func() {
 			jfs.handler.store.Delete(oldpath)
-			// Stat from FUSE to get the new entry's info
-			info, err := os.Stat(jfs.fullPath(newpath))
+			// Lstat, not Stat: a renamed SYMLINK must be recorded as itself.
+			// os.Stat follows the link, so this branch used to insert the
+			// TARGET's type/size under the link's path (same type-flip class
+			// as the MakeEntry clobber above), or skip dangling links entirely.
+			info, err := os.Lstat(jfs.fullPath(newpath))
 			if err == nil {
 				var inode uint64
 				if st, ok := info.Sys().(*syscall.Stat_t); ok {
@@ -3049,6 +3072,7 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 					inode = jfs.handler.nextSyntheticInode()
 				}
 				e := metadata.MakeEntry(newpath, info.IsDir(), info.Size(), info.ModTime(), inode)
+				e.Mode = info.Mode()
 				jfs.handler.store.Insert(e)
 			}
 		}()
