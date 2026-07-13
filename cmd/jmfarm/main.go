@@ -478,6 +478,30 @@ func runQueue(cfg queueConfig) {
 	fmt.Printf("jmfarm queue: worker %s draining %s (db=%s mount=%s producer=%s)\n",
 		worker.ID, cfg.meta, cfg.dbPath, cfg.mount, cfg.producer)
 
+	// Wave-3 auto-discovery: subscribe to the volume's keyspace events and
+	// self-enqueue derivative jobs for directories where new media settles —
+	// the farm no longer waits for a manager sweep to notice ingests. Runs in
+	// this process beside the drain loop; jobs it enqueues flow through the
+	// exact same BRPOP path below. JM_FARM_WATCH=0 disables.
+	if farm.WatchEnabled() {
+		kinds := farm.WatchKindsFromEnv()
+		watcher := farm.NewWatcher(farm.WatchConfig{
+			MetaURL: cfg.meta,
+			Mount:   cfg.mount,
+			Enqueue: func(ectx context.Context, relDir string) error {
+				return q.Enqueue(ectx, farmqueue.NewJob(relDir, kinds, "farm-watch"))
+			},
+			Logf: func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) },
+		})
+		go func() {
+			if err := watcher.Run(ctx); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "farm watch: exited: %v (manager sweeps remain the discovery path)\n", err)
+			}
+		}()
+	} else {
+		fmt.Fprintln(os.Stderr, "farm watch: disabled (JM_FARM_WATCH=0)")
+	}
+
 	for {
 		if ctx.Err() != nil {
 			break
