@@ -1228,6 +1228,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// #1 hydration pack observability: local thumb-cache stats
 			// (bytes/files/hits/misses/puts/evictions). Read-only.
 			"/thumbs": handleThumbsHTTP,
+			// Wave-3 QuickLook appex fetch: GET /thumb-local?path=<abs>&size=N
+			// serves the farm poster from the LOCAL cache (hit <5ms), does a
+			// bounded read-through populate on miss, or 404s fast so the appex
+			// errors and macOS falls back to its own generator.
+			"/thumb-local": handleThumbLocalHTTP,
 			// JM-ASSERT (#51) portable-human-metadata channel. POST /assertions writes
 			// the <media>.loupe.json sidecar (source of truth — atomic, LWW,
 			// merge-not-clobber) + upserts the asset_key-keyed Tier-B index; GET
