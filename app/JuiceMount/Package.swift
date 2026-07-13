@@ -7,7 +7,11 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "JuiceMount", targets: ["JuiceMount"])
+        .executable(name: "JuiceMount", targets: ["JuiceMount"]),
+        // QuickLook thumbnail appex executable. scripts/build-app.sh wraps it
+        // into Contents/PlugIns/JuiceMountThumbnails.appex and signs it
+        // (sandboxed) before the outer app — see that script.
+        .executable(name: "JuiceMountThumbnails", targets: ["JuiceMountThumbnails"])
     ],
     dependencies: [
         // Sparkle 2 auto-updater. Distributed as a SwiftPM binary artifact
@@ -24,6 +28,19 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "Sources/JuiceMount"
+        ),
+        .executableTarget(
+            name: "JuiceMountThumbnails",
+            path: "Sources/JuiceMountThumbnails",
+            linkerSettings: [
+                // Explicit so the appex never depends on Swift autolink
+                // pulling these in. Foundation provides _NSExtensionMain
+                // (the appex entry point main.swift trampolines into).
+                .linkedFramework("Foundation"),
+                .linkedFramework("QuickLookThumbnailing"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("ImageIO")
+            ]
         ),
         .target(
             name: "JuiceMountCore",
