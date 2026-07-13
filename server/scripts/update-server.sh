@@ -46,6 +46,7 @@ HOST="root@192.168.0.197"
 DEST="/root/juicefarm-build"
 FARM_CONTAINER="juicefarm-worker"
 MANAGER_CONTAINER="juicemount-manager"
+SKIP_MANAGER=0
 FARM_IMAGE="juicefarm:local"
 MANAGER_IMAGE="juicemount-manager:local"
 DRY_RUN=0
@@ -60,6 +61,7 @@ while [ $# -gt 0 ]; do
     --dest)              DEST="$2"; shift 2 ;;
     --farm-container)    FARM_CONTAINER="$2"; shift 2 ;;
     --manager-container) MANAGER_CONTAINER="$2"; shift 2 ;;
+    --skip-manager)      SKIP_MANAGER=1; shift ;;
     --dry-run)           DRY_RUN=1; shift ;;
     -h|--help)           usage 0 ;;
     *) echo "update-server: unknown arg: $1" >&2; usage 1 ;;
@@ -97,6 +99,7 @@ build_remote_script() {
   printf 'DEST=%q\n'              "$DEST"
   printf 'FARM_CONTAINER=%q\n'    "$FARM_CONTAINER"
   printf 'MANAGER_CONTAINER=%q\n' "$MANAGER_CONTAINER"
+  printf 'SKIP_MANAGER=%q\n' "$SKIP_MANAGER"
   printf 'FARM_IMAGE=%q\n'        "$FARM_IMAGE"
   printf 'MANAGER_IMAGE=%q\n'     "$MANAGER_IMAGE"
   cat <<'REMOTE_EOF'
@@ -241,7 +244,11 @@ recreate() {
 }
 
 recreate "$FARM_CONTAINER" "$FARM_IMAGE"
-recreate "$MANAGER_CONTAINER" "$MANAGER_IMAGE"
+if [ "$SKIP_MANAGER" = "1" ]; then
+  log "skipping manager recreate (--skip-manager: compose-managed manager — retag its compose image + docker compose up -d instead; introspective recreate DROPS compose-set entrypoint overrides, live-proven 2026-07-13)"
+else
+  recreate "$MANAGER_CONTAINER" "$MANAGER_IMAGE"
+fi
 
 # ---- verify -----------------------------------------------------------------
 log "verifying farm worker stays up"
@@ -253,30 +260,34 @@ if [ "$(docker inspect -f '{{.State.Running}}' "$FARM_CONTAINER")" != "true" ]; 
 fi
 log "farm worker up"
 
-log "verifying manager /api/farm returns 200"
-ADMIN_KEY="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MANAGER_CONTAINER" | sed -n 's/^JM_ADMIN_KEY=//p' | head -1)"
-MGR_PORT="$(docker inspect -f '{{range $port, $binds := .HostConfig.PortBindings}}{{range $binds}}{{.HostPort}}{{println}}{{end}}{{end}}' "$MANAGER_CONTAINER" | sed '/^$/d' | head -1)"
-verify_mgr() {
-  if [ -n "$MGR_PORT" ]; then
-    curl -fsS -o /dev/null -w '%{http_code}' ${ADMIN_KEY:+-H "X-JuiceMount-Admin-Key: $ADMIN_KEY"} "http://127.0.0.1:${MGR_PORT}/api/farm"
-  else
-    # no published port → probe from inside the container (image ships curl)
-    docker exec "$MANAGER_CONTAINER" curl -fsS -o /dev/null -w '%{http_code}' ${ADMIN_KEY:+-H "X-JuiceMount-Admin-Key: $ADMIN_KEY"} "http://127.0.0.1:8080/api/farm"
+if [ "$SKIP_MANAGER" = "1" ]; then
+  log "manager verify skipped (--skip-manager)"
+else
+  log "verifying manager /api/farm returns 200"
+  ADMIN_KEY="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MANAGER_CONTAINER" | sed -n 's/^JM_ADMIN_KEY=//p' | head -1)"
+  MGR_PORT="$(docker inspect -f '{{range $port, $binds := .HostConfig.PortBindings}}{{range $binds}}{{.HostPort}}{{println}}{{end}}{{end}}' "$MANAGER_CONTAINER" | sed '/^$/d' | head -1)"
+  verify_mgr() {
+    if [ -n "$MGR_PORT" ]; then
+      curl -fsS -o /dev/null -w '%{http_code}' ${ADMIN_KEY:+-H "X-JuiceMount-Admin-Key: $ADMIN_KEY"} "http://127.0.0.1:${MGR_PORT}/api/farm"
+    else
+      # no published port → probe from inside the container (image ships curl)
+      docker exec "$MANAGER_CONTAINER" curl -fsS -o /dev/null -w '%{http_code}' ${ADMIN_KEY:+-H "X-JuiceMount-Admin-Key: $ADMIN_KEY"} "http://127.0.0.1:8080/api/farm"
+    fi
+  }
+  ok=0
+  for i in $(seq 1 12); do
+    code="$(verify_mgr || true)"
+    if [ "$code" = "200" ]; then ok=1; break; fi
+    sleep 5
+  done
+  if [ "$ok" != "1" ]; then
+    log "FAIL: manager /api/farm did not return 200; last logs:"
+    docker logs --tail 40 "$MANAGER_CONTAINER" || true
+    exit 1
   fi
-}
-ok=0
-for i in $(seq 1 12); do
-  code="$(verify_mgr || true)"
-  if [ "$code" = "200" ]; then ok=1; break; fi
-  sleep 5
-done
-if [ "$ok" != "1" ]; then
-  log "FAIL: manager /api/farm did not return 200; last logs:"
-  docker logs --tail 40 "$MANAGER_CONTAINER" || true
-  exit 1
+  log "manager /api/farm → 200"
 fi
-log "manager /api/farm → 200"
-log "DONE: farm + manager updated. redis/minio/juicefs untouched."
+log "DONE: farm updated. redis/minio/juicefs untouched."
 REMOTE_EOF
 }
 
