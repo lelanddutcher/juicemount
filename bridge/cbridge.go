@@ -1038,6 +1038,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			})
 			globalThumbWarmer = warmer
 			srv.Handler().SetThumbWarmer(warmer)
+			// Sidecar-cache disk persistence (2026-07-13): `._`/.DS_Store
+			// bodies survive restarts, so a re-launch no longer re-cools
+			// every folder (the tunnel first-visit tax was ~2min/dir).
+			// Same parent dir as the thumb cache; per-serve mirror
+			// validation makes loading stale entries harmless.
+			srv.Handler().SidecarPersistEnable(thumbDir + "/../sidecars.gob")
 			st := tc.Stats()
 			jmlog.Info("thumb cache ready", "path", thumbDir,
 				"resident_mb", st.Bytes>>20, "files", st.Files, "max_mb", maxBytes>>20)
@@ -1617,6 +1623,12 @@ func stopServerLocked() {
 	// state, so the answer is honest, not a lie.
 	if thumbWarmer != nil {
 		thumbWarmer.Stop()
+	}
+	if server != nil {
+		// Final sidecar-cache snapshot: a clean stop preserves every warmed
+		// `._`/.DS_Store body for the next launch (the periodic saver bounds
+		// loss on a hard kill to the last interval).
+		server.Handler().SidecarPersistStop()
 	}
 	if metricsSrv != nil {
 		metricsSrv.Stop()

@@ -60,6 +60,14 @@ type sidecarCache struct {
 	bytes    int64
 	maxBytes int64
 	tick     int64
+
+	// Disk persistence (sidecar_persist.go). persistPath is set once by
+	// enablePersist; dirty counts puts/invalidates since the last snapshot
+	// (atomic — bumped on the serve-adjacent put path without the saver
+	// needing the cache lock).
+	persistPath string
+	persistStop chan struct{}
+	dirty       int64
 }
 
 func newSidecarCache() *sidecarCache {
@@ -79,6 +87,20 @@ func newSidecarCache() *sidecarCache {
 // isSidecarName reports whether base is a `._` AppleDouble sidecar name.
 func isSidecarName(base string) bool {
 	return len(base) > sidecarNamePfxLn && base[0] == '.' && base[1] == '_'
+}
+
+// cacheableMetaName reports whether base is a Finder-metadata file the
+// sidecar cache may serve: `._` AppleDouble sidecars AND `.DS_Store`
+// (2026-07-13, cellular): Finder reads a folder's .DS_Store on every open —
+// one more tunnel round-trip chain per navigation. It gets the exact same
+// correctness treatment as `._` bodies: complete-read-only populate,
+// per-serve (mtime,size) mirror validation, and write-open invalidation
+// (Finder rewrites .DS_Store constantly — the invalidate hook plus the
+// mtime bump make a stale serve structurally impossible). The WARM pass
+// stays `._`-only: .DS_Store is one file per dir and demand-populates on
+// Finder's own first read.
+func cacheableMetaName(base string) bool {
+	return isSidecarName(base) || base == ".DS_Store"
 }
 
 // get returns the cached complete body for path IFF it is present and its
@@ -119,6 +141,7 @@ func (c *sidecarCache) put(path string, data []byte, mtime, size int64) {
 	for c.bytes > c.maxBytes && len(c.m) > 1 {
 		c.evictOneLRULocked()
 	}
+	atomic.AddInt64(&c.dirty, 1)
 	metrics.Default().IncSidecarCachePut()
 }
 
@@ -132,6 +155,7 @@ func (c *sidecarCache) invalidate(path string) {
 	if e, ok := c.m[path]; ok {
 		c.bytes -= int64(len(e.data))
 		delete(c.m, path)
+		atomic.AddInt64(&c.dirty, 1)
 	}
 }
 
@@ -181,7 +205,7 @@ func (h *JuiceMountHandler) sidecarServe(name string, p []byte, off int64) (int,
 	if h == nil || h.sidecar == nil || !h.sidecar.enabled {
 		return 0, false
 	}
-	if !isSidecarName(path.Base(name)) {
+	if !cacheableMetaName(path.Base(name)) {
 		return 0, false
 	}
 	if h.hasActiveWriter(name) {
@@ -215,7 +239,7 @@ func (h *JuiceMountHandler) sidecarMaybePopulate(name string, off int64, data []
 	if off != 0 || fileSize <= 0 || fileSize > sidecarMaxFile || int64(len(data)) != fileSize {
 		return // only a complete single-read [0,size) populates
 	}
-	if !isSidecarName(path.Base(name)) || h.hasActiveWriter(name) {
+	if !cacheableMetaName(path.Base(name)) || h.hasActiveWriter(name) {
 		return
 	}
 	mtime, size, ok := h.sidecarCurrentMeta(name)

@@ -861,7 +861,7 @@ func (h *JuiceMountHandler) incActiveWriter(path string) {
 	// A write handle opening on a `._` sidecar means its body is changing —
 	// drop any cached copy so a subsequent read repopulates from the fresh
 	// file (belt-and-suspenders with the mtime/size mirror-validation).
-	if h.sidecar != nil && isSidecarName(path[strings.LastIndexByte(path, '/')+1:]) {
+	if h.sidecar != nil && cacheableMetaName(path[strings.LastIndexByte(path, '/')+1:]) {
 		h.sidecar.invalidate(path)
 	}
 }
