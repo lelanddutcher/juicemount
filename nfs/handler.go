@@ -1118,7 +1118,35 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 // ONE confirmation in flight per path; concurrent Stats on a path already being
 // confirmed return immediately. Uses fuseStatTimeout (the WAN-aware hot-path
 // FUSE budget), NOT the old hardcoded 2s.
+// phantomConfirmMode is the JM_PHANTOM_CONFIRM override for the slow-link
+// gate in asyncConfirmPhantomPurge: "1" = always confirm (pre-2026-07-13
+// behavior), "0" = never confirm, anything else = class-gated (skip on
+// Metered/Slow). Read once at init — the gate runs per non-dir Stat.
+var phantomConfirmMode = os.Getenv("JM_PHANTOM_CONFIRM")
+
 func (h *JuiceMountHandler) asyncConfirmPhantomPurge(filename, fusePath string) {
+	// Slow-link gate (2026-07-13, cellular nav diagnosis): each confirmation
+	// is one background FUSE Lstat — µs on LAN, but 100-500ms over a tunnel,
+	// and ONE 500-entry Finder listing spawns hundreds of them (deduped per
+	// path, but every path is distinct). Live-measured on cellular: they
+	// saturate nfsLstatGate + the link + juicefs itself (the recurring
+	// "mount table query timed out" checkFUSE flap), turning a mirror-served
+	// 1s listing into 10-40s — while the payoff is only phantom-entry
+	// cleanup that the keyspace push now delivers within seconds anyway
+	// (deletions arrive as events; this check predates push). On
+	// Metered/Slow links skip the confirmation entirely: the mirror stays
+	// authoritative and push + the LAN-gated SCAN own convergence.
+	// JM_PHANTOM_CONFIRM=1 forces the confirm everywhere; =0 disables it
+	// everywhere. Fast/Medium behavior is byte-for-byte unchanged.
+	if phantomConfirmMode == "0" {
+		return
+	}
+	if phantomConfirmMode != "1" {
+		if c := netprofile.Default().Class(); c == netprofile.ClassMetered || c == netprofile.ClassSlow {
+			return
+		}
+	}
+
 	h.phantomPurgeMu.Lock()
 	if _, inFlight := h.phantomPurgeInFlight[filename]; inFlight {
 		h.phantomPurgeMu.Unlock()
