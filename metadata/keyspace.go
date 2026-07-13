@@ -226,6 +226,65 @@ func backstopForClass(c linkClass) time.Duration {
 	}
 }
 
+// unknownAncestorSyncMin is the global floor between full-SCAN promotions
+// from the unknown-ancestor path (reconcileDir). Env override
+// JM_UNKNOWN_ANCESTOR_SYNC_SEC. See noteUnknownAncestor.
+func unknownAncestorSyncMin() time.Duration {
+	if raw := os.Getenv("JM_UNKNOWN_ANCESTOR_SYNC_SEC"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 10 * time.Minute
+}
+
+// unknownAncestorSeenCap bounds the seen-inode set. On overflow the set
+// resets wholesale — worst case each accumulated inode earns ONE more
+// (rate-limited) promotion round, then re-suppresses.
+const unknownAncestorSeenCap = 65536
+
+// noteUnknownAncestor handles a dir event whose inode the mirror doesn't
+// hold. First sighting of an inode → promote to a full SCAN, but never more
+// than one promotion per unknownAncestorSyncMin globally. Repeat sightings
+// (the permanent steady state for scan-filtered farm namespaces, which the
+// promoted SCAN can never establish) are dropped with a counter that logs
+// every 1000 drops.
+func (rc *RedisClient) noteUnknownAncestor(dirInode uint64) {
+	rc.unknownAncestorMu.Lock()
+	if rc.unknownAncestorSeen == nil {
+		rc.unknownAncestorSeen = make(map[uint64]struct{})
+	}
+	if _, seen := rc.unknownAncestorSeen[dirInode]; seen {
+		rc.unknownAncestorDrops++
+		drops := rc.unknownAncestorDrops
+		rc.unknownAncestorMu.Unlock()
+		if drops%1000 == 1 {
+			jmlog.Info("metadata keyspace push: unknown-ancestor events suppressed (scan-filtered namespace churn — farm output)",
+				"dropped_total", drops)
+		}
+		return
+	}
+	if len(rc.unknownAncestorSeen) >= unknownAncestorSeenCap {
+		rc.unknownAncestorSeen = make(map[uint64]struct{})
+	}
+	rc.unknownAncestorSeen[dirInode] = struct{}{}
+	now := time.Now()
+	allowed := now.Sub(rc.unknownAncestorLastSync) >= unknownAncestorSyncMin()
+	if allowed {
+		rc.unknownAncestorLastSync = now
+	}
+	rc.unknownAncestorMu.Unlock()
+
+	if allowed {
+		jmlog.Info("metadata keyspace push: unknown ancestor — promoting ONE full SCAN (rate-limited)",
+			"inode", dirInode)
+		rc.keyspaceTriggerSync()
+	} else {
+		jmlog.Debug("metadata keyspace push: unknown ancestor deferred to backstop (promotion rate-limited)",
+			"inode", dirInode)
+	}
+}
+
 // scanContextTimeout returns the wall-clock budget for ONE full-SCAN reconcile
 // attempt (syncMetadata's context deadline around the SCAN batch loop).
 //
@@ -1082,8 +1141,27 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 	} else {
 		ent := rc.store.LookupByInode(dirInode)
 		if ent == nil {
-			// Unknown ancestor — let the authoritative SCAN establish it.
-			rc.keyspaceTriggerSync()
+			// Unknown ancestor. Historically this promoted straight to a full
+			// SCAN ("let the authoritative SCAN establish it") — right for the
+			// rare out-of-order USER event, catastrophic for the farm: its
+			// derivative writes land under .juicemount/…, a namespace the
+			// mirror DELIBERATELY never holds (task #78 scan-filter), so every
+			// farm output dir arrives here — and the promoted SCAN can never
+			// establish it, so the SAME inode re-promotes on every subsequent
+			// write, forever. Live 2026-07-13 (single user, farm backfill
+			// sweep running): a tunnel-priced full SCAN per coalescer flush —
+			// the user-visible "index rebuilding every so often" and a
+			// saturated cellular link doing zero useful work.
+			//
+			// noteUnknownAncestor promotes AT MOST ONCE per inode (a genuine
+			// user dir is established by that one SCAN and never re-enters; a
+			// filtered farm dir stays unknown and is dropped forever after)
+			// and rate-limits promotions globally. The class backstop SCAN
+			// still guarantees eventual convergence for anything deferred.
+			// New user dirs normally never reach this branch at all: their
+			// PARENT is known, and the parent's own d-key event mirrors the
+			// child.
+			rc.noteUnknownAncestor(dirInode)
 			return nil
 		}
 		parentPath = ent.Path

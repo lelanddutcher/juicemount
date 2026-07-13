@@ -239,6 +239,16 @@ type RedisClient struct {
 	mountPoint string
 	fuseRoot   string
 
+	// Unknown-ancestor promotion limiter (see keyspace.go
+	// noteUnknownAncestor): once-per-inode + globally rate-limited full-SCAN
+	// promotion, so scan-filtered namespace churn (farm derivative writes)
+	// can't storm tunnel-priced SCANs. Guarded by unknownAncestorMu — this
+	// path runs per coalescer flush, never per NFS RPC.
+	unknownAncestorMu       sync.Mutex
+	unknownAncestorSeen     map[uint64]struct{}
+	unknownAncestorLastSync time.Time
+	unknownAncestorDrops    uint64
+
 	// spoolPending (QA-30 Layer D, NFSv3 sprint) reports whether a store path
 	// has a LIVE write-spool entry that has not yet drain-succeeded — i.e. the
 	// user just created the file and it is still on local SSD, NOT yet in
