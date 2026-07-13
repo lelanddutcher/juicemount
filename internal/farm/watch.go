@@ -300,7 +300,13 @@ func (w *Watcher) Run(ctx context.Context) error {
 func juicefsInfoResolve(ctx context.Context, mount string, inode uint64) (string, bool) {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "juicefs", "info", "-i", strconv.FormatUint(inode, 10), mount).CombinedOutput()
+	// With -i the positional args are INODES, and the mount is implied by the
+	// working directory (juicefs finds the .control file relative to cwd) —
+	// verified live against juicefs 1.3.1: `juicefs info -i N <mount>` parses
+	// the mount path as an inode and errors.
+	cmd := exec.CommandContext(cctx, "juicefs", "info", "-i", strconv.FormatUint(inode, 10))
+	cmd.Dir = mount
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", false
 	}
