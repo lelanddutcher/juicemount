@@ -489,7 +489,12 @@ func runQueue(cfg queueConfig) {
 			MetaURL: cfg.meta,
 			Mount:   cfg.mount,
 			Enqueue: func(ectx context.Context, relDir string) error {
-				return q.Enqueue(ectx, farmqueue.NewJob(relDir, kinds, "farm-watch"))
+				// Job.Path is worker-absolute by convention (runJob walks it
+				// verbatim; the manager passes its callers' /jfs paths through
+				// unmodified) — live-proven: a mount-relative path fails the
+				// runner's lstat. The watcher core stays mount-relative for
+				// filtering; join here at the seam.
+				return q.Enqueue(ectx, farmqueue.NewJob(filepath.Join(cfg.mount, relDir), kinds, "farm-watch"))
 			},
 			Logf: func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) },
 		})
