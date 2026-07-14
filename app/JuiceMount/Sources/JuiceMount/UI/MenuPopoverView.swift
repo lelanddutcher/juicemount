@@ -58,6 +58,13 @@ struct MenuPopoverView: View {
     // Background-operation activity (4.10): polled from /activity on the same
     // 2s tick. nil until the first fetch lands; the row hides when not busy.
     @State private var activity: NFSBridge.Activity?
+    // Warm-up phase card (INSTANT-NAV): polled from GET /warmup while the
+    // popover is visible, at ~4s cadence — piggybacked on the existing 2s
+    // tick with a timestamp guard, no second timer. nil (endpoint
+    // unreachable / undecodable) or phase "steady" hides the card; the
+    // popover itself is never blocked on the fetch (background queue).
+    @State private var warmup: NFSBridge.WarmupStatus?
+    @State private var lastWarmupFetchAt: Date = .distantPast
     // Clear-failed confirm flow (4.8): the preview result drives an alert that
     // shows what will be discarded BEFORE the destructive confirm.
     @State private var showClearFailedConfirm = false
@@ -65,6 +72,7 @@ struct MenuPopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            warmupCard
             header
             Divider()
             volumeSection
@@ -106,6 +114,43 @@ struct MenuPopoverView: View {
         server.refreshCacheStatus()
         updatePinRate()
         refreshSelfTest()
+        refreshWarmup()
+    }
+
+    /// Warm-up card poll. Rides the popover's 2s tick but self-throttles to
+    /// ~4s (the card is coarse startup progress; hammering /warmup buys
+    /// nothing). Fire-and-forget on a background queue — the blocking HTTP
+    /// helper must never run on MainActor. A nil result (endpoint
+    /// unreachable) HIDES the card by design: an unreachable control plane
+    /// already has louder surfaces, and a stale "Warming up" card over a
+    /// dead core would be a lie.
+    private func refreshWarmup() {
+        guard Date().timeIntervalSince(lastWarmupFetchAt) >= 3.5 else { return }
+        lastWarmupFetchAt = Date()
+        let metricsAddr = server.preferences.metricsAddr
+        DispatchQueue.global(qos: .utility).async {
+            let w = NFSBridge.warmupStatus(metricsAddr: metricsAddr)
+            DispatchQueue.main.async {
+                // Animate only the transitions that move layout (card
+                // appears/disappears, phase title swaps) so the popover
+                // doesn't flicker on a phase flip; steady-state progress
+                // updates publish plainly and the ProgressView tracks them.
+                if isWarmupCardVisible(warmup) != isWarmupCardVisible(w)
+                    || warmup?.phase != w?.phase {
+                    withAnimation(.easeInOut(duration: 0.25)) { warmup = w }
+                } else {
+                    warmup = w
+                }
+            }
+        }
+    }
+
+    /// Card visibility rule: a decoded snapshot in any non-steady phase.
+    /// Empty phase (older core / malformed body) counts as hidden — never
+    /// show an unlabeled progress card.
+    private func isWarmupCardVisible(_ w: NFSBridge.WarmupStatus?) -> Bool {
+        guard let w else { return false }
+        return !w.phase.isEmpty && !w.isSteady
     }
 
     /// B.2: pulls /health + /metrics on the same 2s cadence the
@@ -1440,6 +1485,87 @@ struct MenuPopoverView: View {
 
     private func formatBytes(_ b: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: b, countStyle: .file)
+    }
+
+    // MARK: - Warm-up card (INSTANT-NAV)
+
+    /// Top-of-popover card shown only while the core is still climbing its
+    /// startup ladder (phase != "steady"): phase title, determinate
+    /// progress, the Go-authored hint verbatim, and during indexing the
+    /// "N / ~M entries" counter. Styled like the existing popover sections
+    /// (caption typography, 12/8 padding like the header, trailing Divider)
+    /// so it reads native above the header. Hidden the moment the phase
+    /// reaches steady or /warmup stops answering.
+    @ViewBuilder
+    private var warmupCard: some View {
+        if let w = warmup, isWarmupCardVisible(w) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: warmupIcon(w.phase))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(warmupTitle(w.phase))
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    Spacer()
+                    Text("\(Int(min(max(w.progressPct, 0), 100)))%")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                ProgressView(value: min(max(w.progressPct / 100.0, 0), 1))
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+                if w.phase == "indexing", w.indexTotalEst > 0 {
+                    Text("\(w.indexScanned.formatted()) / ~\(w.indexTotalEst.formatted()) entries")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                if !w.hint.isEmpty {
+                    Text(w.hint)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .help(warmupTooltip(w))
+            Divider()
+        }
+    }
+
+    /// Phase → user-facing title. Unknown (future) phases fall back to the
+    /// generic warming title rather than leaking an internal identifier.
+    private func warmupTitle(_ phase: String) -> String {
+        switch phase {
+        case "starting": return "Starting up…"
+        case "indexing": return "Rebuilding index…"
+        case "warming":  return "Warming up…"
+        default:         return "Warming up…"
+        }
+    }
+
+    private func warmupIcon(_ phase: String) -> String {
+        switch phase {
+        case "starting": return "hourglass"
+        case "indexing": return "list.bullet"
+        default:         return "flame.fill"
+        }
+    }
+
+    /// Hover detail: the fields worth exposing without spending card rows
+    /// on them (uptime, serving flag, warm counters).
+    private func warmupTooltip(_ w: NFSBridge.WarmupStatus) -> String {
+        var lines = [
+            "Uptime \(formatAge(w.uptimeSec)) · \(w.serving ? "serving files" : "not serving yet")"
+        ]
+        if w.indexTotalEst > 0 {
+            lines.append("Index: \(w.indexScanned.formatted()) of ~\(w.indexTotalEst.formatted()) entries")
+        }
+        if w.sidecarCachePut > 0 || w.thumbWarmHydrated > 0 {
+            lines.append("Warmed: \(w.sidecarCachePut.formatted()) sidecars · \(w.thumbWarmHydrated.formatted()) thumbnails")
+        }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - Header (at-a-glance, Phase 3)
