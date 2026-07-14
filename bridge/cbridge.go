@@ -470,6 +470,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			PinnedBytes:     pinnedBytes,
 			FUSEMetricsAddr: health.DefaultFUSEMetricsAddr,
 		})
+		// Pin-capacity baseline (audit fix v2, 2026-07-14): record the
+		// CONFIGURED budget before any mount attempt so the capacity
+		// verdict caps correctly on EVERY mount path (inline success,
+		// launch-fail → watchdog remount, adopt-existing). The
+		// inline-success branch below refines it with the effective
+		// (possibly auto-expanded) value; watchdog paths keep this
+		// config baseline — the user's intent and the right ceiling
+		// for pin math. Live gap: first deploy only wired the inline
+		// branch and a watchdog-remounted boot reported budget 0.
+		if mb, perr := strconv.Atoi(cfg.CacheSize); perr == nil && mb > 0 {
+			pin.SetCacheBudgetBytes(int64(mb) << 20)
+		}
 		// Tell the block-cache scraper where the FUSE daemon's prometheus
 		// /metrics endpoint is so /cache-status can report the TRUE on-disk
 		// block-cache size (juicefs_blockcache_bytes) as cache_used_bytes.
