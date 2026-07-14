@@ -1239,6 +1239,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// bounded read-through populate on miss, or 404s fast so the appex
 			// errors and macOS falls back to its own generator.
 			"/thumb-local": handleThumbLocalHTTP,
+			// Release UX: the popover's warm-up card — one consolidated phase
+			// machine (starting/indexing/warming/steady) with a progress pct.
+			"/warmup": handleWarmupHTTP,
 			// JM-ASSERT (#51) portable-human-metadata channel. POST /assertions writes
 			// the <media>.loupe.json sidecar (source of truth — atomic, LWW,
 			// merge-not-clobber) + upserts the asset_key-keyed Tier-B index; GET
@@ -1356,6 +1359,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if cfg.MountPoint != "" {
 		if isMounted(cfg.MountPoint) {
 			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
+			warmupMarkServing()
 			globalMountPath = cfg.MountPoint
 		} else {
 			mountAddr, mountPoint := srv.Addr(), cfg.MountPoint
@@ -1367,6 +1371,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					return
 				}
 				jmlog.Info("nfs mounted", "mount_point", mountPoint)
+				warmupMarkServing()
 				globalMu.Lock()
 				globalMountPath = mountPoint
 				globalMu.Unlock()
@@ -1629,6 +1634,7 @@ func stopServerLocked() {
 		// `._`/.DS_Store body for the next launch (the periodic saver bounds
 		// loss on a hard kill to the last interval).
 		server.Handler().SidecarPersistStop()
+		warmupReset()
 	}
 	if metricsSrv != nil {
 		metricsSrv.Stop()
