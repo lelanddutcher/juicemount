@@ -30,3 +30,21 @@ func TestFFmpegThreadArgs(t *testing.T) {
 		t.Fatalf("FFmpegThreads()=%d want 3", FFmpegThreads())
 	}
 }
+
+func TestProxyThreadArgs(t *testing.T) {
+	defer SetProxyThreads(0)
+	SetProxyThreads(0) // uncapped default — x264 auto (encode wants threads)
+	if got := proxyThreadArgs(); got != nil {
+		t.Fatalf("proxy default should be uncapped, got %v", got)
+	}
+	SetProxyThreads(8)
+	if got := proxyThreadArgs(); len(got) != 2 || got[0] != "-threads" || got[1] != "8" {
+		t.Fatalf("proxyThreadArgs(8) = %v", got)
+	}
+	// Proxy cap is INDEPENDENT of the derivative cap.
+	SetFFmpegThreads(2)
+	defer SetFFmpegThreads(0)
+	if proxyThreadArgs()[1] != "8" || ffmpegThreadArgs()[1] != "2" {
+		t.Fatal("proxy and derivative thread caps must be independent")
+	}
+}

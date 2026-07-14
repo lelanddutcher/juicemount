@@ -279,16 +279,24 @@ func main() {
 		// N parallel workers oversubscribed the box (load 33-45, CPU pinned but
 		// ~7.6s/file). Cap per-ffmpeg threads and size the worker pool so
 		// workers×threads ≈ cores. Env: JM_FARM_FFMPEG_THREADS, JM_FARM_CONCURRENCY.
-		ffThreads = flag.Int("ffmpeg-threads", farmEnvInt("JM_FARM_FFMPEG_THREADS", 3),
-			"threads per ffmpeg invocation (0 = ffmpeg default/uncapped); keep workers*threads ≈ cores")
-		conc = flag.Int("concurrency", farmEnvInt("JM_FARM_CONCURRENCY", defaultConcurrency(farmEnvInt("JM_FARM_FFMPEG_THREADS", 3))),
-			"parallel workers (default ≈ cores / ffmpeg-threads)")
-		// Derivative size gate (2026-07-14): skip pre-processing trivially small
-		// media — a poster/filmstrip/waveform for a sub-megabyte clip is pure
-		// overhead in a 90k-file sweep. Raise it to bias toward "only massive."
-		// Env: JM_FARM_MIN_SIZE_MB. 0 = process everything (old behavior).
+		// threads=2: decode frame-threads sub-linearly (~1.8x at 2, flat after),
+		// so spend parallelism on FILES not threads (90k independent files). The
+		// keyframe-only filmstrip makes decode nearly free, so few threads / many
+		// workers is ideal. CAUTION: runtime.NumCPU() returns the HOST logical
+		// cores in a cgroup-limited container, not the quota — set
+		// JM_FARM_CONCURRENCY explicitly on the deploy to the real core budget.
+		ffThreads = flag.Int("ffmpeg-threads", farmEnvInt("JM_FARM_FFMPEG_THREADS", 2),
+			"threads per derivative ffmpeg (0 = uncapped); keep workers*threads ≈ cores")
+		proxyThreads = flag.Int("proxy-threads", farmEnvInt("JM_FARM_PROXY_THREADS", 0),
+			"threads per proxy TRANSCODE (0 = x264 auto; encode-bound, wants threads — separate from derivative cap)")
+		conc = flag.Int("concurrency", farmEnvInt("JM_FARM_CONCURRENCY", defaultConcurrency(farmEnvInt("JM_FARM_FFMPEG_THREADS", 2))),
+			"parallel workers (default ≈ cores / ffmpeg-threads; SET EXPLICITLY in containers — NumCPU is the host count)")
+		// Blob size gate (2026-07-14): media below this skips the decode-heavy
+		// poster/filmstrip/waveform but STILL gets its cheap tech row (stays
+		// discoverable). Raise it to bias toward "only massive." Applied in
+		// farm.Process. Env: JM_FARM_MIN_SIZE_MB. 0 = generate blobs for all.
 		minSizeMB = flag.Int("min-size-mb", farmEnvInt("JM_FARM_MIN_SIZE_MB", 1),
-			"skip media smaller than this many MB (0 = no minimum)")
+			"skip poster/filmstrip/waveform for media smaller than this many MB, keeping tech metadata (0 = no minimum)")
 		producer  = flag.String("producer", "macos-node", "producer tag")
 		version   = flag.Int("version", 1, "producer version")
 		dryRun    = flag.Bool("dry-run", false, "probe + report, do not write")
@@ -336,8 +344,9 @@ func main() {
 	// Apply the ffmpeg thread cap globally before any generator runs (queue or
 	// one-shot). Log the effective throughput config so the ratio is auditable.
 	farm.SetFFmpegThreads(*ffThreads)
-	fmt.Printf("jmfarm: throughput config — workers=%d ffmpeg-threads=%d (cores=%d) min-size=%dMB\n",
-		*conc, *ffThreads, runtime.NumCPU(), *minSizeMB)
+	farm.SetProxyThreads(*proxyThreads)
+	fmt.Printf("jmfarm: throughput config — workers=%d ffmpeg-threads=%d proxy-threads=%d (NumCPU=%d) min-blob-size=%dMB\n",
+		*conc, *ffThreads, *proxyThreads, runtime.NumCPU(), *minSizeMB)
 	minSizeBytes := int64(*minSizeMB) << 20
 
 	if *queue {
@@ -372,7 +381,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	targets, err := collectTargets(*root, *files, *limit, minSizeBytes)
+	targets, err := collectTargets(*root, *files, *limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "jmfarm: %v\n", err)
 		os.Exit(1)
@@ -402,6 +411,7 @@ func main() {
 		Waveform: *wave, WaveformSPP: *waveSPP,
 		WhisperBin: *wBin, WhisperModel: *wModel,
 		ProxyVCodec: *vcodec, ProxyCRF: *pCRF, ProxyPreset: *pPreset,
+		MinBlobSizeBytes: minSizeBytes,
 	}
 
 	// Proxy transcode pins a core per clip, so it gets its own (lower)
@@ -638,7 +648,7 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 
 	// Collect the media under the job's path once; every selected pass sweeps the
 	// same target set.
-	targets, cErr := collectTargets(job.Path, "", 0, cfg.minSize)
+	targets, cErr := collectTargets(job.Path, "", 0)
 	if cErr != nil {
 		return 0, 0, fmt.Errorf("collect %q: %w", job.Path, cErr)
 	}
@@ -683,6 +693,7 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		Waveform: true, WaveformSPP: cfg.waveSPP,
 		WhisperBin: cfg.wBin, WhisperModel: wModel,
 		ProxyVCodec: vcodec, ProxyCRF: crf, ProxyPreset: preset,
+		MinBlobSizeBytes: cfg.minSize,
 	}
 
 	fmt.Printf("jmfarm queue: job %s path=%q kinds=%v files=%d\n",
@@ -744,9 +755,8 @@ func recordErr(mu *sync.Mutex, errs *[]string, path string, err error) {
 	}
 }
 
-func collectTargets(root, files string, limit int, minSizeBytes int64) ([]string, error) {
+func collectTargets(root, files string, limit int) ([]string, error) {
 	var out []string
-	var skippedSmall int
 	add := func(p string) bool {
 		if limit > 0 && len(out) >= limit {
 			return false
@@ -758,28 +768,18 @@ func collectTargets(root, files string, limit int, minSizeBytes int64) ([]string
 	if files != "" {
 		for _, f := range strings.Split(files, ",") {
 			f = strings.TrimSpace(f)
-			if f == "" {
-				continue
-			}
-			// Explicit files still honor the size gate (a size-0 stat error
-			// falls through to processing — never drop a named file on a
-			// transient stat failure).
-			if minSizeBytes > 0 {
-				if fi, serr := os.Stat(f); serr == nil && fi.Size() < minSizeBytes {
-					skippedSmall++
-					continue
-				}
-			}
-			if !add(f) {
+			if f != "" && !add(f) {
 				break
 			}
-		}
-		if skippedSmall > 0 {
-			fmt.Fprintf(os.Stderr, "jmfarm: size gate skipped %d file(s) < %d bytes (JM_FARM_MIN_SIZE_MB)\n", skippedSmall, minSizeBytes)
 		}
 		return out, nil
 	}
 
+	// NOTE: the min-size quota is applied per-file inside farm.Process
+	// (Options.MinBlobSizeBytes), which skips only the expensive blob
+	// generators while STILL emitting the cheap tech row — so a sub-threshold
+	// clip stays discoverable in OpenLoupe. Collecting every media file here
+	// (no size drop) preserves that metadata coverage.
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			// Skip unreadable entries but make it audible — a stale/partial
@@ -799,13 +799,6 @@ func collectTargets(root, files string, limit int, minSizeBytes int64) ([]string
 		if !mediaExts[strings.ToLower(filepath.Ext(p))] {
 			return nil
 		}
-		// Size gate: skip trivially small media (info.Size() is free from the
-		// Walk stat — no extra syscall). A poster/filmstrip/waveform for a
-		// sub-threshold clip costs more than it's worth in a mass sweep.
-		if minSizeBytes > 0 && info.Size() < minSizeBytes {
-			skippedSmall++
-			return nil
-		}
 		if !add(p) {
 			return filepath.SkipAll
 		}
@@ -813,9 +806,6 @@ func collectTargets(root, files string, limit int, minSizeBytes int64) ([]string
 	})
 	if err != nil {
 		return nil, err
-	}
-	if skippedSmall > 0 {
-		fmt.Fprintf(os.Stderr, "jmfarm: size gate skipped %d media file(s) < %d bytes (JM_FARM_MIN_SIZE_MB)\n", skippedSmall, minSizeBytes)
 	}
 	return out, nil
 }

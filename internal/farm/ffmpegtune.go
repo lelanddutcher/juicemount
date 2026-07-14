@@ -40,3 +40,28 @@ func ffmpegThreadArgs() []string {
 	n := strconv.Itoa(ffmpegThreadCap)
 	return []string{"-threads", n, "-filter_threads", n, "-filter_complex_threads", n}
 }
+
+// proxyThreadCap is the SEPARATE ffmpeg thread cap for the proxy TRANSCODE.
+// Proxy generation is ENCODE-bound (x264 -preset slow scales well to ~8-16
+// threads), the inverse of the decode-bound derivative rule — capping it to
+// the derivative thread count would throttle the exact workload that most
+// wants threads. Proxy parallelism is already bounded separately by pConc
+// (few workers), so 0 (uncapped, x264's own auto) is the right default.
+var proxyThreadCap int
+
+// SetProxyThreads sets the proxy-transcode thread cap (0 = uncapped).
+func SetProxyThreads(n int) {
+	if n < 0 {
+		n = 0
+	}
+	proxyThreadCap = n
+}
+
+// proxyThreadArgs is the proxy encoder's thread-cap args (uncapped by default).
+func proxyThreadArgs() []string {
+	if proxyThreadCap <= 0 {
+		return nil
+	}
+	n := strconv.Itoa(proxyThreadCap)
+	return []string{"-threads", n}
+}
