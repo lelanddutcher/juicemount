@@ -245,6 +245,14 @@ struct PreferencesWindowView: View {
             Section {
                 numericRow("SSD cache size", value: $preferences.ssdCacheGB,
                            unit: "GB", range: 10...2000, fallback: 100)
+                // The --cache-size flag is minted when the JuiceFS daemon
+                // launches, so a committed change can't reach the running
+                // volume. The commit raises the Restart Now / Later alert
+                // (see .onChange below); "Later" leaves this persistent
+                // badge so the saved-but-not-live state stays visible.
+                if server.cacheSizePendingRestart {
+                    cacheSizePendingRow
+                }
                 numericRow("Memory buffer budget", value: $preferences.memoryBufferMB,
                            unit: "MB", range: 128...16384, fallback: 2048)
                 numericRow("Buffer files smaller than", value: $preferences.memBufFileLimitMB,
@@ -252,7 +260,7 @@ struct PreferencesWindowView: View {
             } header: {
                 Text("Cache layers")
             } footer: {
-                footnote("The SSD cache stores file blocks via JuiceFS (it may grow automatically to keep pinned files resident). The memory buffer serves small files (project files, LUTs) under the size threshold from RAM with zero syscalls. Memory-buffer changes apply on the next start — Restart Server is enough; the SSD cache size is read by the JuiceFS daemon, so Stop everything → Start to apply it.")
+                footnote("The SSD cache stores file blocks via JuiceFS (it may grow automatically to keep pinned files resident). The memory buffer serves small files (project files, LUTs) under the size threshold from RAM with zero syscalls. Memory-buffer changes apply on the next start — Restart Server is enough; the SSD cache size is read by the JuiceFS daemon, so it needs the full volume restart offered when you change it.")
             }
 
             Section {
@@ -296,6 +304,25 @@ struct PreferencesWindowView: View {
             }
         }
         .formStyle(.grouped)
+        // Cache-size restart prompt. TextField(value:format:) commits on
+        // Enter/focus loss, so this fires once per committed edit — never
+        // mid-keystroke. Only prompt while a change is actually PENDING
+        // (a live daemon holds a different minted size); with no daemon up,
+        // the next start applies the value and no ceremony is needed.
+        // Editing back to the applied value clears the pending state, so
+        // no alert fires for a no-op round trip.
+        .onChange(of: preferences.ssdCacheGB) { _, _ in
+            if server.cacheSizePendingRestart {
+                showCacheSizeRestartAlert = true
+            }
+        }
+        .alert("Restart to apply the new cache size?",
+               isPresented: $showCacheSizeRestartAlert) {
+            Button("Restart Now") { server.restartFull() }
+            Button("Later", role: .cancel) {}
+        } message: {
+            Text("The new cache size takes effect after JuiceMount restarts the volume. \"Later\" keeps the setting saved — it applies on the next restart.")
+        }
         // LB-3 stranded-writes guard dialogs. confirmationDialog matches the
         // destructive-action idiom used elsewhere (Stop everything, Reset DB).
         .confirmationDialog(
@@ -393,6 +420,52 @@ struct PreferencesWindowView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    // MARK: - Cache-size pending-restart flow
+
+    /// Raised when a committed SSD cache-size edit diverges from the size
+    /// the live JuiceFS daemon was minted with (see
+    /// `ServerController.cacheSizePendingRestart`).
+    @State private var showCacheSizeRestartAlert = false
+
+    /// Persistent "pending restart" badge under the SSD cache size field.
+    /// Amber remedy-row conventions (same palette as the popover's remedy
+    /// rows) — informative, not alarming. The inline Restart Now mirrors
+    /// the alert action for users who picked "Later" and changed their
+    /// mind; it is the full Stop → Start (restartFull), because a soft
+    /// Restart Server keeps the daemon — and its old --cache-size — alive.
+    private var cacheSizePendingRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.caption)
+                .foregroundStyle(MenuPopoverView.glanceAmber)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Pending restart")
+                    .font(.caption)
+                    .foregroundStyle(MenuPopoverView.glanceAmber)
+                Text(cacheSizePendingDetail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Restart Now") { server.restartFull() }
+                .controlSize(.small)
+                .disabled(isStartingState)
+                .help("Stops everything and starts again so the JuiceFS daemon relaunches with the new cache size. The volume disappears from Finder for a moment; re-mounting may ask for your password once unless the scoped sudoers rule is installed.")
+        }
+    }
+
+    private var cacheSizePendingDetail: String {
+        if let applied = server.appliedSsdCacheGB {
+            return "The volume is running with \(applied) GB — the new \(preferences.ssdCacheGB) GB size applies when it restarts."
+        }
+        return "The new cache size applies when the volume restarts."
+    }
+
+    private var isStartingState: Bool {
+        if case .starting = server.state { return true }
+        return false
     }
 
     // MARK: - Shared bits

@@ -81,6 +81,16 @@ public final class ServerController {
     /// last-known on a failed probe, same policy as volumeMounted.
     public private(set) var localNetworkPermissionSuspected = false
 
+    /// SSD cache size (GB) the live JuiceFS daemon is believed to have been
+    /// launched with. `--cache-size` is minted when the daemon is spawned,
+    /// so a Settings change does NOT reach a running mount. nil = no daemon
+    /// launched this app session, or a full Stop killed it (the next Start
+    /// mints fresh flags from preferences). Deliberately NOT reset by
+    /// softStop/stopMount/restart() — those keep the JuiceFS daemon (and
+    /// its original flags) alive, which is exactly why the Settings pane
+    /// needs `cacheSizePendingRestart` below.
+    public private(set) var appliedSsdCacheGB: Int?
+
     public var preferences: Preferences
 
     private let log = Logger(subsystem: "com.juicemount.app", category: "ServerController")
@@ -148,6 +158,10 @@ public final class ServerController {
         state = .starting
         userStopRequested = false
         let cfg = preferences.toServerConfig()
+        // Cache size the daemon will be minted with IF this start spawns a
+        // fresh JuiceFS daemon (see appliedSsdCacheGB). Captured on MainActor
+        // before the hop — preferences is MainActor-isolated.
+        let startCacheGB = preferences.ssdCacheGB
         // Spool (Option 2) settings travel in the config JSON (cfg.spoolEnable
         // / spoolSizeGB), NOT via env: Go snapshots os.Environ at c-archive
         // init, so a host-side setenv() after that is invisible to os.Getenv.
@@ -175,6 +189,14 @@ public final class ServerController {
                     }
                     self.state = .running
                     self.lastError = nil
+                    // Record the daemon's minted cache size only when this
+                    // start could have spawned it (nil = no live daemon).
+                    // After a soft-stop/restart the daemon SURVIVED with its
+                    // original flags, so the old value must stay — that's the
+                    // signal Settings uses to show "pending restart".
+                    if self.appliedSsdCacheGB == nil {
+                        self.appliedSsdCacheGB = startCacheGB
+                    }
                     self.startPolling()
                     // Phase A2: pull the post-mount self-test result. The Go
                     // side runs the probe in a background goroutine at start,
@@ -209,6 +231,9 @@ public final class ServerController {
             Task { @MainActor in
                 self?.state = .idle
                 self?.stats = .zero
+                // Full stop kills the JuiceFS daemon — its minted flags die
+                // with it, so the next start() records fresh ones.
+                self?.appliedSsdCacheGB = nil
                 completion?()
             }
         }
@@ -259,6 +284,32 @@ public final class ServerController {
         softStop { [weak self] in
             self?.start()
         }
+    }
+
+    /// FULL restart — Stop everything → Start, with the same completion
+    /// handoff as `restart()`. Unlike the soft restart above, this tears
+    /// down the JuiceFS daemon too, so flags minted at daemon launch
+    /// (--cache-size) are re-read from preferences on the way back up.
+    /// This is the Settings "Restart Now" action for a pending SSD
+    /// cache-size change. Never called silently — only from an explicit
+    /// user confirmation.
+    public func restartFull() {
+        // Don't yank an in-flight start out from under itself.
+        if case .starting = state { return }
+        stop { [weak self] in
+            self?.start()
+        }
+    }
+
+    /// True when the user's saved SSD cache size differs from the size the
+    /// live JuiceFS daemon was launched with. The setting is safely saved,
+    /// but it cannot take effect until the volume fully restarts (the
+    /// daemon re-mints --cache-size at launch). Drives the Settings prompt
+    /// and its persistent "pending restart" badge. False when no daemon is
+    /// up (nil applied) — the next start applies the new value anyway.
+    public var cacheSizePendingRestart: Bool {
+        guard let applied = appliedSsdCacheGB else { return false }
+        return applied != preferences.ssdCacheGB
     }
 
     /// S-6 Reset-DB flow: expose the soft-stop for maintenance work that
