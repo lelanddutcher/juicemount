@@ -74,8 +74,12 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 	tmpPath := atomicTempPath(outPath)
 	defer os.Remove(tmpPath) // no-op once the commit rename consumes it
 	vf := fmt.Sprintf("fps=%.6f,scale=%d:%d,tile=%dx%d", fps, cellW, cellH, cols, rows)
-	cmd := exec.Command(ffmpegBin, "-y", "-loglevel", "error",
-		"-i", srcPath, "-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", tmpPath)
+	// -an: the filmstrip is video-only — never demux/decode the audio track
+	// alongside the full video decode (the fps= filter already forces a full
+	// video decode; pulling audio too is pure waste). Threads capped globally.
+	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
+	args = append(args, "-an", "-i", srcPath, "-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", tmpPath)
+	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("ffmpeg filmstrip %q: %w: %s", srcPath, err, out)
 	}

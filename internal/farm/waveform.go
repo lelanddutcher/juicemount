@@ -47,7 +47,12 @@ func Waveform(ffmpegBin, srcPath, outPath string, samplesPerPixel int) (int, err
 	if !hasAudio {
 		return 0, nil // no audio ⇒ no waveform
 	}
-	cmdArgs := append([]string{"-v", "error", "-i", srcPath}, foldArgs...)
+	// -vn: waveform is audio-only — disabling video at the input skips the
+	// entire video demux+decode (which the waveform never uses). Threads
+	// capped globally so the audio decode doesn't grab the whole box.
+	cmdArgs := append([]string{"-v", "error"}, ffmpegThreadArgs()...)
+	cmdArgs = append(cmdArgs, "-vn", "-i", srcPath)
+	cmdArgs = append(cmdArgs, foldArgs...)
 	cmdArgs = append(cmdArgs, "-f", "s16le", "-")
 	cmd := exec.Command(ffmpegBin, cmdArgs...)
 	stdout, err := cmd.StdoutPipe()

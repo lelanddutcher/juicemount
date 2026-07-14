@@ -29,8 +29,9 @@ func Thumbnail(ffmpegBin, srcPath, outPath string, maxDim int) error {
 	tmpPath := atomicTempPath(outPath)
 	defer os.Remove(tmpPath) // no-op once the commit rename consumes it
 	vf := fmt.Sprintf("thumbnail,scale=w=%d:h=%d:force_original_aspect_ratio=decrease", maxDim, maxDim)
-	cmd := exec.Command(ffmpegBin, "-y", "-loglevel", "error",
-		"-i", srcPath, "-vf", vf, "-frames:v", "1", "-q:v", "3", "-f", "image2", tmpPath)
+	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
+	args = append(args, "-i", srcPath, "-vf", vf, "-frames:v", "1", "-q:v", "3", "-f", "image2", tmpPath)
+	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg thumbnail %q: %w: %s", srcPath, err, out)
 	}

@@ -27,6 +27,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -253,26 +255,40 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 
 func main() {
 	var (
-		dbPath    = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
-		root      = flag.String("root", "", "directory to walk for media (required unless -files)")
-		files     = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
-		mount     = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
-		blobs     = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
-		thumbDim  = flag.Int("thumb-dim", 640, "poster fit box in px")
-		filmstr   = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
-		filmCell  = flag.Int("filmstrip-cell", 160, "filmstrip cell width in px")
-		wave      = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
-		waveSPP   = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
-		transcr   = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.loupe.json (instead of basic derivatives)")
-		proxyGen  = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
-		vcodec    = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
-		pCRF      = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")
-		pPreset   = flag.String("preset", "slow", "proxy x264 preset (faster preset = quicker, larger)")
-		pConc     = flag.Int("proxy-concurrency", 0, "separate (lower) worker count for proxy mode; 0 = use -concurrency (proxy transcode is the CPU hog)")
-		wModel    = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
-		wBin      = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
-		limit     = flag.Int("limit", 0, "max files to process (0 = no limit)")
-		conc      = flag.Int("concurrency", 4, "parallel workers")
+		dbPath   = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
+		root     = flag.String("root", "", "directory to walk for media (required unless -files)")
+		files    = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
+		mount    = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
+		blobs    = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
+		thumbDim = flag.Int("thumb-dim", 640, "poster fit box in px")
+		filmstr  = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
+		filmCell = flag.Int("filmstrip-cell", 160, "filmstrip cell width in px")
+		wave     = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
+		waveSPP  = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
+		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.loupe.json (instead of basic derivatives)")
+		proxyGen = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
+		vcodec   = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
+		pCRF     = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")
+		pPreset  = flag.String("preset", "slow", "proxy x264 preset (faster preset = quicker, larger)")
+		pConc    = flag.Int("proxy-concurrency", 0, "separate (lower) worker count for proxy mode; 0 = use -concurrency (proxy transcode is the CPU hog)")
+		wModel   = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
+		wBin     = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
+		limit    = flag.Int("limit", 0, "max files to process (0 = no limit)")
+		// Throughput audit (2026-07-14): ffmpeg default -threads 0 spawns one
+		// decode thread per core PLUS filter threads (~61 on a 22-core box), so
+		// N parallel workers oversubscribed the box (load 33-45, CPU pinned but
+		// ~7.6s/file). Cap per-ffmpeg threads and size the worker pool so
+		// workers×threads ≈ cores. Env: JM_FARM_FFMPEG_THREADS, JM_FARM_CONCURRENCY.
+		ffThreads = flag.Int("ffmpeg-threads", farmEnvInt("JM_FARM_FFMPEG_THREADS", 3),
+			"threads per ffmpeg invocation (0 = ffmpeg default/uncapped); keep workers*threads ≈ cores")
+		conc = flag.Int("concurrency", farmEnvInt("JM_FARM_CONCURRENCY", defaultConcurrency(farmEnvInt("JM_FARM_FFMPEG_THREADS", 3))),
+			"parallel workers (default ≈ cores / ffmpeg-threads)")
+		// Derivative size gate (2026-07-14): skip pre-processing trivially small
+		// media — a poster/filmstrip/waveform for a sub-megabyte clip is pure
+		// overhead in a 90k-file sweep. Raise it to bias toward "only massive."
+		// Env: JM_FARM_MIN_SIZE_MB. 0 = process everything (old behavior).
+		minSizeMB = flag.Int("min-size-mb", farmEnvInt("JM_FARM_MIN_SIZE_MB", 1),
+			"skip media smaller than this many MB (0 = no minimum)")
 		producer  = flag.String("producer", "macos-node", "producer tag")
 		version   = flag.Int("version", 1, "producer version")
 		dryRun    = flag.Bool("dry-run", false, "probe + report, do not write")
@@ -317,6 +333,13 @@ func main() {
 	// It needs BOTH -mount (the FUSE files path the generators read) and -meta
 	// (the Redis the queue lives in). All the other flags supply the run defaults
 	// a job's options override where non-zero.
+	// Apply the ffmpeg thread cap globally before any generator runs (queue or
+	// one-shot). Log the effective throughput config so the ratio is auditable.
+	farm.SetFFmpegThreads(*ffThreads)
+	fmt.Printf("jmfarm: throughput config — workers=%d ffmpeg-threads=%d (cores=%d) min-size=%dMB\n",
+		*conc, *ffThreads, runtime.NumCPU(), *minSizeMB)
+	minSizeBytes := int64(*minSizeMB) << 20
+
 	if *queue {
 		runQueue(queueConfig{
 			meta:     *meta,
@@ -336,6 +359,7 @@ func main() {
 			thumbDim: *thumbDim,
 			filmCell: *filmCell,
 			waveSPP:  *waveSPP,
+			minSize:  minSizeBytes,
 			gNice:    *gNice,
 			gIONice:  *gIONice,
 		})
@@ -348,7 +372,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	targets, err := collectTargets(*root, *files, *limit)
+	targets, err := collectTargets(*root, *files, *limit, minSizeBytes)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "jmfarm: %v\n", err)
 		os.Exit(1)
@@ -438,6 +462,7 @@ type queueConfig struct {
 	thumbDim int
 	filmCell int
 	waveSPP  int
+	minSize  int64 // skip media smaller than this (bytes); 0 = no minimum
 	gNice    int
 	gIONice  int
 }
@@ -613,7 +638,7 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 
 	// Collect the media under the job's path once; every selected pass sweeps the
 	// same target set.
-	targets, cErr := collectTargets(job.Path, "", 0)
+	targets, cErr := collectTargets(job.Path, "", 0, cfg.minSize)
 	if cErr != nil {
 		return 0, 0, fmt.Errorf("collect %q: %w", job.Path, cErr)
 	}
@@ -719,8 +744,9 @@ func recordErr(mu *sync.Mutex, errs *[]string, path string, err error) {
 	}
 }
 
-func collectTargets(root, files string, limit int) ([]string, error) {
+func collectTargets(root, files string, limit int, minSizeBytes int64) ([]string, error) {
 	var out []string
+	var skippedSmall int
 	add := func(p string) bool {
 		if limit > 0 && len(out) >= limit {
 			return false
@@ -732,9 +758,24 @@ func collectTargets(root, files string, limit int) ([]string, error) {
 	if files != "" {
 		for _, f := range strings.Split(files, ",") {
 			f = strings.TrimSpace(f)
-			if f != "" && !add(f) {
+			if f == "" {
+				continue
+			}
+			// Explicit files still honor the size gate (a size-0 stat error
+			// falls through to processing — never drop a named file on a
+			// transient stat failure).
+			if minSizeBytes > 0 {
+				if fi, serr := os.Stat(f); serr == nil && fi.Size() < minSizeBytes {
+					skippedSmall++
+					continue
+				}
+			}
+			if !add(f) {
 				break
 			}
+		}
+		if skippedSmall > 0 {
+			fmt.Fprintf(os.Stderr, "jmfarm: size gate skipped %d file(s) < %d bytes (JM_FARM_MIN_SIZE_MB)\n", skippedSmall, minSizeBytes)
 		}
 		return out, nil
 	}
@@ -758,6 +799,13 @@ func collectTargets(root, files string, limit int) ([]string, error) {
 		if !mediaExts[strings.ToLower(filepath.Ext(p))] {
 			return nil
 		}
+		// Size gate: skip trivially small media (info.Size() is free from the
+		// Walk stat — no extra syscall). A poster/filmstrip/waveform for a
+		// sub-threshold clip costs more than it's worth in a mass sweep.
+		if minSizeBytes > 0 && info.Size() < minSizeBytes {
+			skippedSmall++
+			return nil
+		}
 		if !add(p) {
 			return filepath.SkipAll
 		}
@@ -766,7 +814,36 @@ func collectTargets(root, files string, limit int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if skippedSmall > 0 {
+		fmt.Fprintf(os.Stderr, "jmfarm: size gate skipped %d media file(s) < %d bytes (JM_FARM_MIN_SIZE_MB)\n", skippedSmall, minSizeBytes)
+	}
 	return out, nil
+}
+
+// defaultConcurrency sizes the worker pool so workers × ffmpeg-threads ≈
+// physical cores (no oversubscription). Clamped to [2, 32].
+func defaultConcurrency(ffThreads int) int {
+	if ffThreads < 1 {
+		ffThreads = 1
+	}
+	n := runtime.NumCPU() / ffThreads
+	if n < 2 {
+		n = 2
+	}
+	if n > 32 {
+		n = 32
+	}
+	return n
+}
+
+// farmEnvInt reads a non-negative int from env, falling back to def.
+func farmEnvInt(name string, def int) int {
+	if raw := os.Getenv(name); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
 }
 
 func defaultDBPath() string {

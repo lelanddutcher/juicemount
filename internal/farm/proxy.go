@@ -53,7 +53,8 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 	// -pix_fmt yuv420p forces 8-bit 4:2:0 from any source (10-bit/HDR/422
 	// originals included), the lowest-common-denominator both decoders accept.
 	// crf/preset are the quality knob (size/quality only — interchange-safe).
-	cmd := exec.Command(ffmpegBin, "-y", "-loglevel", "error",
+	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
+	args = append(args,
 		"-i", srcPath,
 		"-c:v", vcodec, "-pix_fmt", "yuv420p", "-crf", strconv.Itoa(crf), "-preset", preset,
 		"-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
@@ -62,6 +63,7 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 		// would otherwise infer the container from.
 		"-f", "mp4",
 		tmpPath)
+	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg proxy %q: %w: %s", srcPath, err, out)
 	}
