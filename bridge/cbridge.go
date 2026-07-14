@@ -520,6 +520,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				"path", cfg.FUSEPath,
 				"effective_cache_size_mb", fm.EffectiveCacheSize(),
 				"free_space_ratio", "0.01")
+			// Pin-capacity audit (2026-07-14): the user's cache budget is a
+			// hard ceiling on what juicefs will keep resident — capacity
+			// verdicts must cap at it, or a budget-exceeding pin set is
+			// approved and then perpetually evicted.
+			if mb, perr := strconv.Atoi(fm.EffectiveCacheSize()); perr == nil && mb > 0 {
+				pin.SetCacheBudgetBytes(int64(mb) << 20)
+			}
 		}
 	}
 
@@ -975,6 +982,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// and feeds the over-capacity banner in /cache-status. Empty cacheBaseDir
 		// uses the default ~/.juicefs/cache.
 		pf.Go(func() { pf.CapacityLoop(pinCtx, 60*time.Second, "") })
+		// Eviction watch (pin-integrity guarantee, 2026-07-14): juicefs
+		// eviction has no pin awareness, so transient traffic pushing the
+		// cache past its budget can evict pinned blocks even when the
+		// pinned set itself fits. CapacityLoop refreshes CacheUsageBytes
+		// every 60s; a large drop with a stable pinned set means eviction
+		// churn ran — schedule ONE VerifyAndRepair (re-read: present
+		// blocks local-speed, missing blocks re-pulled) so pinned content
+		// converges back to fully-resident within minutes instead of the
+		// 6h re-warm TTL. Gated: never over-capacity (R-1 thrash guard),
+		// never on Metered/Slow links (the re-pull belongs on LAN), and
+		// single-flight with a cooldown.
+		pf.Go(func() { evictionWatchLoop(pinCtx) })
 		// Wire the pin store into the NFS handler so the offline-mode
 		// open gate can fail-fast on un-pinned reads. The mount point is
 		// the prefix the gate uses to canonicalize in-mount filenames into

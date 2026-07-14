@@ -61,6 +61,14 @@ type CapacityVerdict struct {
 	// and for debugging the verdict.
 	DiskFreeBytes   int64 `json:"disk_free_bytes"`
 	CacheUsageBytes int64 `json:"cache_usage_bytes"`
+	// CacheBudgetBytes is the USER-CONFIGURED juicefs --cache-size (0 =
+	// unknown/unlimited). When set, it caps sustainable capacity: juicefs
+	// will never hold more than the budget no matter how roomy the disk is,
+	// so a pinned set larger than the budget is perpetually evicted — the
+	// exact futile-rewarm thrash R-1 exists to stop (audit 2026-07-14: the
+	// verdict previously compared against DISK capacity only and approved
+	// budget-exceeding pin sets).
+	CacheBudgetBytes int64 `json:"cache_budget_bytes"`
 	// Computed is when this verdict was last recomputed. Zero until the first
 	// CapacityLoop pass runs.
 	Computed time.Time `json:"-"`
@@ -113,11 +121,24 @@ func Capacity() CapacityVerdict {
 // falls back to the default. The walk of that tree is the only non-trivial
 // cost — bounded by sequential SSD stat throughput and run on a slow cadence
 // (CapacityLoop), so it never competes with the read hot path.
+// cacheBudgetBytes is the user-configured juicefs --cache-size ceiling,
+// set once at mount time via SetCacheBudgetBytes. 0 = unknown.
+var cacheBudgetBytes atomic.Int64
+
+// SetCacheBudgetBytes records the configured cache budget so capacity
+// verdicts cap sustainable capacity at it (see evaluateCapacity).
+func SetCacheBudgetBytes(b int64) {
+	if b < 0 {
+		b = 0
+	}
+	cacheBudgetBytes.Store(b)
+}
+
 func ComputeCapacity(store *Store, cacheBaseDir string) CapacityVerdict {
 	if cacheBaseDir == "" {
 		cacheBaseDir = defaultCacheBaseDir()
 	}
-	v := CapacityVerdict{Computed: time.Now()}
+	v := CapacityVerdict{Computed: time.Now(), CacheBudgetBytes: cacheBudgetBytes.Load()}
 
 	if store != nil {
 		if agg, err := store.AggregateStats(); err == nil {
@@ -143,6 +164,12 @@ func evaluateCapacity(v *CapacityVerdict) {
 	capacity := v.DiskFreeBytes + v.CacheUsageBytes - CacheFreeFloorBytes
 	if capacity < 0 {
 		capacity = 0
+	}
+	// The user's --cache-size budget is a hard ceiling regardless of disk
+	// headroom: juicefs evicts past it, so pins beyond it can never stay
+	// resident.
+	if v.CacheBudgetBytes > 0 && v.CacheBudgetBytes < capacity {
+		capacity = v.CacheBudgetBytes
 	}
 	v.CacheCapacityBytes = capacity
 
