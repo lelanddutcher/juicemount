@@ -1558,6 +1558,15 @@ struct MenuPopoverView: View {
     /// used-vs-capacity (`capacity.cache_capacity_bytes`, the honest pairing).
     /// The pinned-resident readiness number lives in the cache section's
     /// "pinned" line below.
+    ///
+    /// Pinned overlay: a second segment from the bar's left edge shows how
+    /// much of the used cache is held by PINNED content
+    /// (`capacity.pinned_bytes`, clamped to what's actually on disk — pins
+    /// still downloading shouldn't paint cache they don't occupy yet).
+    /// Orange = the app's established pin identity (pin.fill rows, the Pin
+    /// button tint); system orange adapts to light/dark. Reading order:
+    /// [pinned][other cache][free]. With zero pins the overlay and its
+    /// legend vanish and the bar renders exactly as before.
     private var cacheGlanceRow: some View {
         // Block-cache used vs the cache's sustainable capacity (the honest
         // pairing). Fall back to disk free for the "GB free" label when the
@@ -1565,6 +1574,11 @@ struct MenuPopoverView: View {
         let cachedBytes = max(0, cacheStatus.cache_used_bytes)
         let capacityBytes = max(0, cacheStatus.capacity.cache_capacity_bytes)
         let fraction = capacityBytes > 0 ? Double(cachedBytes) / Double(capacityBytes) : 0
+        let pinnedBytes = min(max(0, cacheStatus.capacity.pinned_bytes), cachedBytes)
+        let pinnedFraction = capacityBytes > 0 ? Double(pinnedBytes) / Double(capacityBytes) : 0
+        let otherBytes = max(0, cachedBytes - pinnedBytes)
+        let freeBytes = max(0, capacityBytes - cachedBytes)
+        let legend = "Pinned \(formatBytes(pinnedBytes)) · Other cache \(formatBytes(otherBytes)) · Free \(formatBytes(freeBytes))"
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
                 Image(systemName: "internaldrive")
@@ -1581,9 +1595,40 @@ struct MenuPopoverView: View {
                     Capsule()
                         .fill(Color.accentColor.opacity(0.85))
                         .frame(width: max(0, min(1, fraction)) * geo.size.width)
+                    if pinnedFraction > 0 {
+                        Capsule()
+                            .fill(Color.orange.opacity(0.9))
+                            .frame(width: max(0, min(1, pinnedFraction)) * geo.size.width)
+                    }
                 }
             }
             .frame(height: 3)
+            .help(pinnedBytes > 0
+                  ? "\(legend)\n\nPinned content is kept resident for offline use; other cache is recently-read blocks JuiceFS may evict."
+                  : "Cache used vs. its capacity.")
+            // Quiet legend — only earns its row when pins actually occupy
+            // cache (capacity known implies the byte split is meaningful).
+            if pinnedBytes > 0 && capacityBytes > 0 {
+                HStack(spacing: 5) {
+                    legendChip(color: Color.orange.opacity(0.9), label: "Pinned \(formatBytes(pinnedBytes))")
+                    legendChip(color: Color.accentColor.opacity(0.85), label: "Other \(formatBytes(otherBytes))")
+                    legendChip(color: Color.secondary.opacity(0.35), label: "Free \(formatBytes(freeBytes))")
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    /// One "● label" legend entry under the cache bar. Dot colors match the
+    /// bar segments exactly so the legend explains itself.
+    private func legendChip(color: Color, label: String) -> some View {
+        HStack(spacing: 3) {
+            Circle()
+                .fill(color)
+                .frame(width: 5, height: 5)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
     }
 
