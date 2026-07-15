@@ -68,12 +68,37 @@ func NewPrefetcher(store *Store, fusePath, mountPoint string, workers int) *Pref
 	return p
 }
 
-// Stop drains active workers and closes the prefetcher. Pending queue items
-// are dropped; in-flight reads complete naturally.
+// Stop signals shutdown and waits for the workers + tracked loops to exit.
+// Pending queue items are DROPPED and an in-flight read aborts at its next
+// 1 MB chunk, so Stop() returns promptly.
+//
+// 2026-07-15 teardown-hang fix: this used to `close(p.jobs)` and let each
+// worker's `for range p.jobs` DRAIN the whole buffered queue (up to 256 jobs,
+// each a full file read through FUSE) before exiting — so on a large pinned set
+// being warmed, Stop() blocked reading gigabytes through FUSE, hanging the
+// "Stop everything"/quit teardown (stopServerLocked never got past
+// prefetcher.Stop). Closing the queue also races a producer's non-blocking
+// Enqueue → "send on closed channel" panic. Workers now exit on stopCh
+// (see workerLoop), so we neither drain the queue nor close the channel.
 func (p *Prefetcher) Stop() {
 	close(p.stopCh)
-	close(p.jobs)
-	p.wg.Wait()
+	// Bound the join. Workers and the tracked loops (PullPending, ReWarmupLoop,
+	// CapacityLoop, evictionWatchLoop) all check stopCh, but one may be mid a
+	// non-abortable operation — most notably CapacityLoop's ComputeCapacity walk
+	// of a large (~100 GB) cache tree, or a worker's in-flight FUSE read. An
+	// unbounded wg.Wait() here therefore stalled the whole "Stop everything"/quit
+	// teardown until that walk finished (stopServerLocked never got past
+	// prefetcher.Stop — the 2026-07-15 field hang). We must NOT hold the
+	// user-visible teardown hostage to it: wait briefly, then proceed. A loop
+	// still finishing its operation exits on its own once it returns and re-checks
+	// stopCh; any pin-store access it makes after the subsequent pinStore.Close
+	// returns a "database is closed" error (database/sql), never a panic.
+	done := make(chan struct{})
+	go func() { p.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+	}
 }
 
 // Wake nudges PullPending to drain the Pending queue immediately instead of
@@ -319,13 +344,26 @@ func (p *Prefetcher) VerifyAndRepair(ctx context.Context) (*VerifyReport, error)
 	return report, nil
 }
 
-// workerLoop pulls jobs and runs the prefetch.
+// workerLoop pulls jobs and runs the prefetch. It exits on stopCh WITHOUT
+// draining the queue — a shutdown must not wait to read every buffered job
+// through FUSE (that was the teardown hang; see Stop). stopCh is checked with
+// priority so a Stop() in flight wins over a ready job.
 func (p *Prefetcher) workerLoop() {
 	defer p.wg.Done()
-	for j := range p.jobs {
-		err := p.prefetch(j.entry)
-		if j.done != nil {
-			j.done <- err
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		default:
+		}
+		select {
+		case <-p.stopCh:
+			return
+		case j := <-p.jobs:
+			err := p.prefetch(j.entry)
+			if j.done != nil {
+				j.done <- err
+			}
 		}
 	}
 }
@@ -349,6 +387,15 @@ func (p *Prefetcher) prefetch(e Entry) error {
 	buf := make([]byte, 1024*1024) // 1 MB read chunks
 	var totalRead int64
 	for {
+		// Abort a large in-flight prefetch promptly on shutdown so Stop()'s
+		// wg.Wait() returns within one chunk instead of reading out a multi-GB
+		// file through FUSE. The entry stays Prefetching and is re-warmed on the
+		// next launch / verify pass.
+		select {
+		case <-p.stopCh:
+			return nil
+		default:
+		}
 		n, rerr := f.Read(buf)
 		if n > 0 {
 			totalRead += int64(n)

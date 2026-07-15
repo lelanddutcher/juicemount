@@ -1657,20 +1657,27 @@ func stopServerLocked() {
 	// During this window, Stats / IsRunning / CacheStatus correctly
 	// report "Running: false" — we already nil'd the publicly-visible
 	// state, so the answer is honest, not a lie.
+	// DIAGNOSTIC (2026-07-15): per-step logging to pinpoint the "Stop
+	// everything"/quit teardown deadlock — the last "shutdown step" logged
+	// before the freeze names the component whose Stop()/Close() hangs.
 	if thumbWarmer != nil {
+		jmlog.Info("shutdown step", "component", "thumbWarmer.Stop")
 		thumbWarmer.Stop()
 	}
 	if server != nil {
 		// Final sidecar-cache snapshot: a clean stop preserves every warmed
 		// `._`/.DS_Store body for the next launch (the periodic saver bounds
 		// loss on a hard kill to the last interval).
+		jmlog.Info("shutdown step", "component", "SidecarPersistStop")
 		server.Handler().SidecarPersistStop()
 		warmupReset()
 	}
 	if metricsSrv != nil {
+		jmlog.Info("shutdown step", "component", "metricsSrv.Stop")
 		metricsSrv.Stop()
 	}
 	if monitor != nil {
+		jmlog.Info("shutdown step", "component", "monitor.Stop")
 		monitor.Stop()
 	}
 	if server != nil {
@@ -1679,44 +1686,58 @@ func stopServerLocked() {
 		// fall through to redundant Stop calls below as belt-and-
 		// suspenders for the case where SetSpool was bypassed for
 		// some reason — the global is the durable handle.
+		jmlog.Info("shutdown step", "component", "StopHandler")
 		server.Handler().StopHandler()
+		jmlog.Info("shutdown step", "component", "server.Stop")
 		server.Stop()
 	}
 	if drainer != nil {
 		// Belt-and-suspenders: handler StopHandler already drained
 		// this 30 s above. Calling Stop again is idempotent.
+		jmlog.Info("shutdown step", "component", "drainer.Stop")
 		drainer.Stop(5 * time.Second)
 	}
 	if spool != nil {
+		jmlog.Info("shutdown step", "component", "spool.Stop")
 		spool.Stop()
 	}
 	if cache != nil {
+		jmlog.Info("shutdown step", "component", "cache.Stop")
 		cache.Stop()
 	}
 	if rc != nil {
+		jmlog.Info("shutdown step", "component", "rc.Stop")
 		rc.Stop()
 	}
 	if reach != nil {
+		jmlog.Info("shutdown step", "component", "reach.Stop")
 		reach.Stop()
 	}
 	if keyspaceNW != nil {
+		jmlog.Info("shutdown step", "component", "keyspaceNW.Stop")
 		keyspaceNW.Stop()
 	}
 	if prefetcher != nil {
+		jmlog.Info("shutdown step", "component", "prefetcher.Stop")
 		prefetcher.Stop()
 	}
 	if pinStore != nil {
+		jmlog.Info("shutdown step", "component", "pinStore.Close")
 		pinStore.Close()
 	}
 	if derivStore != nil {
+		jmlog.Info("shutdown step", "component", "derivStore.Close")
 		derivStore.Close()
 	}
 	if store != nil {
+		jmlog.Info("shutdown step", "component", "store.Close")
 		store.Close()
 	}
 	if rdb != nil {
+		jmlog.Info("shutdown step", "component", "rdb.Close")
 		rdb.Close()
 	}
+	jmlog.Info("shutdown step", "component", "stopServerLocked-complete")
 
 	// Detach the RPC observer so the next start cleanly re-registers.
 	jmlibnfs.SetObserver(nil)
