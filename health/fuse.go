@@ -802,6 +802,22 @@ func (fm *FUSEManager) StartMonitor() {
 func (fm *FUSEManager) Stop() {
 	close(fm.stopCh)
 
+	// Kill juicefs FIRST — lock-free, before the monitor join and before
+	// fm.mu.Lock() below. 2026-07-15 teardown-deadlock fix: the watchdog's
+	// escalation Mount() holds fm.mu across an un-abortable `juicefs mount` +
+	// umount (up to the verify budget, longer on a wedged mount). If the user
+	// hits "Stop everything" during a remount, the ONLY juicefs kill (inside
+	// unmountLocked) sits behind that contended fm.mu.Lock — so the whole
+	// NFSServerShutdown blocked, the daemon stayed alive, and because Swift
+	// flips state=.idle only AFTER this cgo call returns, the UI froze,
+	// couldn't relaunch, and a force-quit orphaned the mount. Killing the
+	// daemon up front makes that in-flight mount/umount return at once, so
+	// Mount() releases fm.mu and the Lock() below can't deadlock behind it —
+	// and juicefs is guaranteed dead even if the steps below stall. A daemon
+	// the watchdog's last tick may re-spawn in the tiny window before it sees
+	// stopCh is caught by unmountLocked's own (idempotent) kill.
+	fm.killJuiceFSProcesses()
+
 	// Bound the wait for monitorLoop to exit. Even with iteration-2's
 	// bounded `mount` syscall (5 s context), one tick can still take that
 	// long if it fires while we're trying to stop. Race the join against
@@ -1020,11 +1036,12 @@ func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
 	return fmt.Errorf("mount not ready after %v", timeout)
 }
 
-// unmountLocked forcibly unmounts the FUSE mount. Must be called with fm.mu held.
-// Every shell-out is time-bounded so a wedged kernel state can't pin fm.mu.
-func (fm *FUSEManager) unmountLocked() {
-	// Kill any lingering JuiceFS mount processes for this mount point first.
-	// Killing the process lets the kernel release the mount.
+// killJuiceFSProcesses SIGKILLs every `juicefs mount` process bound to this
+// mountpoint. It takes NO lock and each shell-out is time-bounded, so it is safe
+// to call from Stop() BEFORE fm.mu is held — killing the daemon is what releases
+// the FUSE mount, and doing it lock-free breaks the teardown deadlock (see Stop).
+// Returns the number killed. Idempotent: a second call finds nothing.
+func (fm *FUSEManager) killJuiceFSProcesses() int {
 	pgrepCtx, pgrepCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	procs, _ := exec.CommandContext(pgrepCtx, "pgrep", "-f", "juicefs mount.*"+filepath.Base(fm.cfg.MountPoint)).Output()
 	pgrepCancel()
@@ -1045,6 +1062,15 @@ func (fm *FUSEManager) unmountLocked() {
 		jmlog.Warn("unmount: SIGKILL'd juicefs processes for mountpoint",
 			"count", killed, "mountpoint", fm.cfg.MountPoint)
 	}
+	return killed
+}
+
+// unmountLocked forcibly unmounts the FUSE mount. Must be called with fm.mu held.
+// Every shell-out is time-bounded so a wedged kernel state can't pin fm.mu.
+func (fm *FUSEManager) unmountLocked() {
+	// Kill any lingering JuiceFS mount processes for this mount point first.
+	// Killing the process lets the kernel release the mount.
+	fm.killJuiceFSProcesses()
 	time.Sleep(500 * time.Millisecond)
 
 	// FAST PATH (2026-07-10): when the mountpoint is NOT in the kernel mount
