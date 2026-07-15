@@ -291,12 +291,14 @@ func main() {
 			"threads per proxy TRANSCODE (0 = x264 auto; encode-bound, wants threads — separate from derivative cap)")
 		conc = flag.Int("concurrency", farmEnvInt("JM_FARM_CONCURRENCY", defaultConcurrency(farmEnvInt("JM_FARM_FFMPEG_THREADS", 2))),
 			"parallel workers (default ≈ cores / ffmpeg-threads; SET EXPLICITLY in containers — NumCPU is the host count)")
-		// Blob size gate (2026-07-14): media below this skips the decode-heavy
-		// poster/filmstrip/waveform but STILL gets its cheap tech row (stays
-		// discoverable). Raise it to bias toward "only massive." Applied in
-		// farm.Process. Env: JM_FARM_MIN_SIZE_MB. 0 = generate blobs for all.
-		minSizeMB = flag.Int("min-size-mb", farmEnvInt("JM_FARM_MIN_SIZE_MB", 1),
-			"skip poster/filmstrip/waveform for media smaller than this many MB, keeping tech metadata (0 = no minimum)")
+		// Size floor (2026-07-14, user-directed): media below this is skipped
+		// ENTIRELY at collection — no tech, no poster/filmstrip/waveform ("if
+		// something is too small to be relevant, under 20 megs, we shouldn't [cache
+		// it]"). Also passed to farm.Process as MinBlobSizeBytes so any file that
+		// slips through (e.g. -files list) still gates its blobs. Env:
+		// JM_FARM_MIN_SIZE_MB. 0 = no minimum (process everything).
+		minSizeMB = flag.Int("min-size-mb", farmEnvInt("JM_FARM_MIN_SIZE_MB", 20),
+			"skip media smaller than this many MB entirely — no derivatives at all (0 = no minimum)")
 		producer  = flag.String("producer", "macos-node", "producer tag")
 		version   = flag.Int("version", 1, "producer version")
 		dryRun    = flag.Bool("dry-run", false, "probe + report, do not write")
@@ -381,7 +383,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	targets, err := collectTargets(*root, *files, *limit)
+	targets, err := collectTargets(*root, *files, *limit, minSizeBytes)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "jmfarm: %v\n", err)
 		os.Exit(1)
@@ -647,8 +649,9 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 	}
 
 	// Collect the media under the job's path once; every selected pass sweeps the
-	// same target set.
-	targets, cErr := collectTargets(job.Path, "", 0)
+	// same target set. cfg.minSize applies the same size floor here (skip entirely)
+	// that MinBlobSizeBytes applies in Process — single source, the -min-size-mb flag.
+	targets, cErr := collectTargets(job.Path, "", 0, cfg.minSize)
 	if cErr != nil {
 		return 0, 0, fmt.Errorf("collect %q: %w", job.Path, cErr)
 	}
@@ -755,7 +758,7 @@ func recordErr(mu *sync.Mutex, errs *[]string, path string, err error) {
 	}
 }
 
-func collectTargets(root, files string, limit int) ([]string, error) {
+func collectTargets(root, files string, limit int, minBytes int64) ([]string, error) {
 	var out []string
 	add := func(p string) bool {
 		if limit > 0 && len(out) >= limit {
@@ -765,21 +768,43 @@ func collectTargets(root, files string, limit int) ([]string, error) {
 		return true
 	}
 
+	// Derivative-exclusion policy (user-directed): proxies (any spelling, folder
+	// or filename), media under the size floor (minBytes, from -min-size-mb), and
+	// NLE ephemeral dirs are skipped entirely — never queued, so no
+	// tech/poster/filmstrip ("shouldn't cache it with any items"). See
+	// internal/farm/exclude.go. Counts logged by reason at the end.
+	skipSubs := farm.SkipDirSubstrings()
+	var nProxy, nSmall, nDir int
+
 	if files != "" {
 		for _, f := range strings.Split(files, ",") {
 			f = strings.TrimSpace(f)
-			if f != "" && !add(f) {
+			if f == "" {
+				continue
+			}
+			var sz int64 = -1
+			if fi, serr := os.Stat(f); serr == nil {
+				sz = fi.Size()
+			}
+			switch r := farm.ExcludeReason(f, sz, minBytes, skipSubs); {
+			case r == "proxy":
+				nProxy++
+				continue
+			case r == "too-small":
+				nSmall++
+				continue
+			case strings.HasPrefix(r, "skip-dir"):
+				nDir++
+				continue
+			}
+			if !add(f) {
 				break
 			}
 		}
+		logExcludes(nProxy, nSmall, nDir, minBytes)
 		return out, nil
 	}
 
-	// NOTE: the min-size quota is applied per-file inside farm.Process
-	// (Options.MinBlobSizeBytes), which skips only the expensive blob
-	// generators while STILL emitting the cheap tech row — so a sub-threshold
-	// clip stays discoverable in OpenLoupe. Collecting every media file here
-	// (no size drop) preserves that metadata coverage.
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			// Skip unreadable entries but make it audible — a stale/partial
@@ -791,12 +816,39 @@ func collectTargets(root, files string, limit int) ([]string, error) {
 			if strings.HasPrefix(info.Name(), ".") && p != root {
 				return filepath.SkipDir // skip dotdirs (incl. .juicemount)
 			}
+			// Prune whole excluded dirs at the dir level — don't descend into a
+			// Proxies/ or Media Cache/ tree at all. Bucket by reason (size rule
+			// disabled with -1/0; a dir has no size) so a pruned proxy tree counts
+			// as proxy, not skip-dir.
+			if p != root {
+				switch r := farm.ExcludeReason(p, -1, 0, skipSubs); {
+				case r == "proxy":
+					nProxy++
+					return filepath.SkipDir
+				case strings.HasPrefix(r, "skip-dir"):
+					nDir++
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		if strings.HasPrefix(info.Name(), "._") {
 			return nil // AppleDouble sidecar
 		}
 		if !mediaExts[strings.ToLower(filepath.Ext(p))] {
+			return nil
+		}
+		// Per-file exclusion (proxy in the filename, too-small, or a skip-dir
+		// substring the walk-level prune above didn't catch).
+		switch r := farm.ExcludeReason(p, info.Size(), minBytes, skipSubs); {
+		case r == "proxy":
+			nProxy++
+			return nil
+		case r == "too-small":
+			nSmall++
+			return nil
+		case strings.HasPrefix(r, "skip-dir"):
+			nDir++
 			return nil
 		}
 		if !add(p) {
@@ -807,7 +859,20 @@ func collectTargets(root, files string, limit int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	logExcludes(nProxy, nSmall, nDir, minBytes)
 	return out, nil
+}
+
+// logExcludes prints a one-line rollup of what the exclusion policy skipped, so a
+// sweep's coverage is auditable ("why is this not derived?"). Counts mix skipped
+// files with pruned directory subtrees (a pruned dir counts once, not per file
+// under it). Silent when nothing was excluded.
+func logExcludes(nProxy, nSmall, nDir int, minBytes int64) {
+	if nProxy == 0 && nSmall == 0 && nDir == 0 {
+		return
+	}
+	fmt.Printf("jmfarm: excluded (files + pruned dirs) — proxy=%d too-small(<%dMB)=%d skip-dir=%d\n",
+		nProxy, minBytes>>20, nSmall, nDir)
 }
 
 // defaultConcurrency sizes the worker pool so workers × ffmpeg-threads ≈

@@ -231,6 +231,12 @@ func (w *Watcher) Tick(ctx context.Context, now time.Time) int {
 // never enqueued — the watcher must not schedule work in response to its own
 // output. Root and empty paths are refused too (Note already drops inode 1;
 // this keeps the guard self-sufficient for tests and future callers).
+//
+// It also honors the derivative-exclusion policy (proxies in any spelling,
+// NLE ephemeral/cache dirs — see DirIsExcluded) so the live watcher never
+// enqueues what a sweep's collectTargets would skip. Size isn't checked here
+// (the watcher has only the path); the collectTargets size floor still catches
+// a too-small file if the sweep reaches it.
 func WatchPathAllowed(rel string) bool {
 	rel = strings.Trim(strings.TrimSpace(rel), "/")
 	if rel == "" || rel == "." {
@@ -240,6 +246,9 @@ func WatchPathAllowed(rel string) bool {
 		if strings.HasPrefix(seg, ".") {
 			return false // .juicemount, .trash, .Spotlight-V100, any dot-dir
 		}
+	}
+	if DirIsExcluded(rel) {
+		return false // proxy / NLE-cache path — matches collectTargets exclusion
 	}
 	return true
 }
