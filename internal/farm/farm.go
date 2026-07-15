@@ -133,7 +133,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		rel := "poster.jpg"
 		mt := "image/jpeg"
 		out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
-		if err := Thumbnail(opt.FFmpegBin, path, out, opt.ThumbMaxDim); err != nil {
+		if err := Thumbnail(opt.FFmpegBin, path, out, opt.ThumbMaxDim, tech.DurationMS); err != nil {
 			blobErrs = append(blobErrs, fmt.Errorf("thumbnail: %w", err))
 			rows = append(rows, derivatives.DerivRow{
 				Kind: "thumbnail", Status: "failed", Producer: opt.Producer, Version: opt.Version,

@@ -78,15 +78,16 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 	// sits DOWNSTREAM of the decoder, so without this ffmpeg fully reconstructs
 	// every frame (a 5-min 25fps proxy = ~7,500 frames) just to keep 144 — the
 	// filmstrip was ~80-90% of per-file CPU and the reason a 90k backfill ETA'd
-	// 190h. -skip_frame nokey makes the decoder reconstruct ONLY keyframes and
-	// drop inter-frame work for P/B packets; fps= then resamples that sparse
+	// 190h. -discard nokey drops non-keyframe PACKETS at the demuxer (the decoder
+	// never sees P/B packets — less work AND less read than -skip_frame, which
+	// still parses every packet: live-measured 15s→8s on a 4K/HEVC original); fps= then resamples that sparse
 	// keyframe stream to the target rate, so we STILL emit exactly cols×rows
 	// evenly-spaced cells (grid math unchanged) — each cell just snaps to the
 	// nearest preceding keyframe, a ≤1-2s error invisible in a scrub strip.
 	// Live-benchmarked 9-16× faster with byte-identical sprite dimensions.
 	// -an: never demux/decode the audio track for a video-only sprite.
 	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
-	args = append(args, "-skip_frame", "nokey", "-an", "-i", srcPath,
+	args = append(args, "-discard", "nokey", "-an", "-i", srcPath,
 		"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", tmpPath)
 	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
