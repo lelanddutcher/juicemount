@@ -1,5 +1,63 @@
 # JuiceMount6 Changelog
 
+## 0.4.0 — 2026-07-15 — Resilience & recovery, faster navigation on slow links
+
+### Added
+- **The app tells you when macOS is blocking it.** If macOS's Local Network
+  permission is denied, JuiceMount now detects it and says so with a clear,
+  actionable alert — instead of silently appearing "offline" while the network
+  is actually fine.
+- **"Why is it slow?" self-diagnosis.** A new diagnostic surfaces *why* the mount
+  feels slow at a given moment (warming up, on a metered link, backend
+  unreachable) rather than leaving you guessing.
+- **QuickLook thumbnails in Finder.** When the server has pre-rendered a poster
+  for a clip, Finder shows it from a local cache instead of streaming and
+  decoding the remote video just to draw an icon; on any miss it falls back to
+  Apple's generator. (Thumbnail generation is a server-side feature.)
+- **Instant folder sizes.** Folder sizes are aggregated incrementally, so a
+  directory reports its total size immediately instead of after a full walk.
+
+### Fixed
+- **Automatic recovery when the mount drops.** If the volume disappears while the
+  backend is still alive, the app now remounts it automatically instead of
+  getting stuck showing the drive as unavailable.
+- **Survives a backend restart mid-operation.** In-flight reads and writes now
+  park and retry across a brief backend (Redis) restart instead of failing the
+  copy or read outright.
+- **Moving a folder keeps its contents.** Renaming or moving a folder now carries
+  all of its children with it — no more items appearing to vanish after a move.
+- **Copying bundles and packages is reliable.** Fixed the remaining cases where
+  copying `.app`/`.framework`/NLE bundles could fail with a stale-file error,
+  by keeping symlink identity and inode numbers stable.
+- **Faster, more reliable startup.** Removed a startup deadlock and added a
+  boot fast-path that skips redundant index work when the local mirror is
+  already fresh — the mount becomes responsive sooner.
+- **Interrupted downloads are flagged, not served as good.** A file left
+  zero-tailed by an interrupted download (e.g. a browser download that dropped)
+  is detected at finalize so it can't masquerade as complete.
+
+### Changed
+- **Much faster navigation on cellular and other slow links.** Directory listings
+  and first-visit folder opens are dramatically quicker over metered/high-latency
+  connections: AppleDouble sidecar bodies are served from RAM (and persist across
+  restarts), reads use a two-lane gate so a big transfer can't starve browsing,
+  drains are serialized so uploads don't saturate the uplink, and the metadata
+  push channel self-heals so the app no longer periodically drops into a long
+  "rebuilding index" over a slow link.
+- **Newly created content shows up in seconds, not up to an hour.** Tightened the
+  directory attribute cache so files created on another machine become visible
+  almost immediately.
+- **A warm-up phase card with progress.** After launch or a reconnect, the popover
+  now shows the warm-up phase and its progress, with a note that the mount may be
+  slower until it reaches steady state.
+- **Cache bar shows how much is pinned.** The menu-bar cache bar now overlays the
+  portion of your cache budget consumed by pinned items.
+- **Changing the SSD cache size prompts a restart.** The cache size is set when the
+  daemon launches, so the app now offers Restart Now / Later when you change it —
+  rather than silently not taking effect until the next launch.
+- **Pinned items can't be evicted.** Hardened the guarantee that pinned files stay
+  resident even under cache pressure, with eviction-triggered repair.
+
 ## 0.3.0 — 2026-07-06 — Reliability: no more "connection interrupted", instant saves & exports
 
 ### Fixed
