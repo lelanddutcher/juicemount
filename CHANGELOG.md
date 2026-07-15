@@ -32,6 +32,11 @@
 - **Faster, more reliable startup.** Removed a startup deadlock and added a
   boot fast-path that skips redundant index work when the local mirror is
   already fresh — the mount becomes responsive sooner.
+- **No more repeated disconnects on machines with a large local cache.** The
+  mount health-check now allows enough time for a big on-disk cache to warm up
+  at launch, so the app no longer mistakes a busy-but-healthy mount for a failed
+  one and cycles it — which previously showed up as the drive dropping and
+  reconnecting every couple of minutes.
 - **Interrupted downloads are flagged, not served as good.** A file left
   zero-tailed by an interrupted download (e.g. a browser download that dropped)
   is detected at finalize so it can't masquerade as complete.
