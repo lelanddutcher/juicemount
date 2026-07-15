@@ -656,7 +656,13 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		return 0, 0, fmt.Errorf("collect %q: %w", job.Path, cErr)
 	}
 	if len(targets) == 0 {
-		return 0, 0, fmt.Errorf("no media files under %q", job.Path)
+		// Not a failure: an empty path OR one whose media is all excluded (a
+		// Proxy/ folder, sub-threshold clips) legitimately has nothing to
+		// derive. Marking it done-with-zero keeps proxy dirs out of the failed
+		// count — otherwise every excluded folder shows up as a false failure.
+		fmt.Printf("jmfarm queue: job %s path=%q — no derivable media (empty or all-excluded); nothing to do\n",
+			job.ID, job.Path)
+		return 0, 0, nil
 	}
 
 	// Expand the job's kinds into the concrete passes to run, in cheap→expensive
