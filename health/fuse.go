@@ -932,12 +932,26 @@ const fuseConfirmProbeTimeout = 25 * time.Second
 // only after readdir hangs for MINUTES while .config stays live) PLUS a fix for
 // the broken remount — both deferred to the follow-up, not rushed into a release.
 func (fm *FUSEManager) mountResponsiveWithin(timeout time.Duration) bool {
-	done := make(chan bool, 1)
+	// This is the LAST gate before a destructive SIGKILL+remount, so it must
+	// return true on ANY sign of life. Race two liveness signals:
+	//   1. reading .config (the in-memory control file) — content OR a prompt
+	//      error both mean juicefs ANSWERED (alive);
+	//   2. a root readdir succeeding — the DATA path serving.
+	// Either returning ⇒ alive ⇒ do NOT remount. Only a genuine wedge hangs
+	// BOTH past the timeout. 2026-07-15: .config alone false-negatived during
+	// cold-warm churn — juicefs serves the data-path readdir before it serves
+	// the .config control file, so a .config-only probe could hang and greenlight
+	// a SIGKILL of a mount that was listing fine (the remount-thrash trigger on a
+	// large-local-cache box). A serving readdir is definitive proof of life.
+	done := make(chan bool, 2)
 	go func() {
-		// Content OR a prompt error both mean juicefs ANSWERED (alive); only a
-		// genuine session death hangs this read, and then the select times out.
 		_, _ = os.ReadFile(fm.cfg.MountPoint + "/.config")
 		done <- true
+	}()
+	go func() {
+		if _, err := os.ReadDir(fm.cfg.MountPoint); err == nil {
+			done <- true // a successful readdir is unambiguous liveness
+		}
 	}()
 	select {
 	case ok := <-done:
@@ -1253,23 +1267,42 @@ func (fm *FUSEManager) confirmProbeTimeout() time.Duration {
 }
 
 // mountVerifyTimeout is the launch-time mount-establish budget (V2.3 U5/K1,
-// field "mount not ready after 15s" churn on slow links). Same class gating
-// and kill switch as confirmProbeTimeout: byte-identical 15s on LAN/medium/
-// fast and whenever JM_FUSE_WATCHDOG_LINKAWARE is off; wider only where a
-// juicefs cold-start legitimately needs longer to answer its first readdir
-// (metadata warm-up over a slow/metered backend link). Note the kext-cant-
-// load shape fails FAST regardless (juicefs's own 10s "mount point is not
-// ready" fatal fires before any of these budgets — see noteMountFailure).
+// field "mount not ready after 15s" churn). Wider only where a juicefs
+// cold-start legitimately needs longer to answer its first readdir.
+//
+// 2026-07-15 field regression (0.4.0 RC, Leland's box): the old 15s LAN/fast
+// base assumed warm-up latency tracks LINK speed. It does NOT — a large LOCAL
+// block cache (here ~100GB, --cache-size 102400) makes juicefs scan/index the
+// cache dir on mount before its FUSE root readdir answers, ~30s on a FAST LAN.
+// The 15s base false-failed ("mount not ready after 15s"); the watchdog then
+// SIGKILL'd a HEALTHY-but-warming juicefs, and — because the NFS server holds
+// the mount open — the follow-up unmount left a ZOMBIE macFUSE entry that made
+// getfsstat (isMountedLocked check 1) hang → perpetual false-"stale" → remount
+// thrash. So the base must cover local cache-warm, not just slow links. A real
+// mount failure still fails FAST regardless (juicefs's own 10s "mount point is
+// not ready" fatal fires from cmd.Run before we ever reach waitForMount — see
+// noteMountFailure), so a generous verify budget only helps the slow-warm case
+// and never delays genuine-failure detection.
+//
+// Env override JM_FUSE_VERIFY_SEC (seconds) for field-tuning without a rebuild.
 func (fm *FUSEManager) mountVerifyTimeout() time.Duration {
-	const base = 15 * time.Second
+	if v := os.Getenv("JM_FUSE_VERIFY_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	// 60s base covers a large-local-cache cold warm-up on any link class; the
+	// slow/metered link classes still widen further (metadata warm-up over the
+	// backend stacks on top of local warm-up).
+	const base = 60 * time.Second
 	if !fuseWatchdogLinkAware {
 		return base
 	}
 	switch netprofile.Default().Class() {
 	case netprofile.ClassMetered:
-		return 90 * time.Second
+		return 120 * time.Second
 	case netprofile.ClassSlow:
-		return 45 * time.Second
+		return 90 * time.Second
 	default:
 		return base
 	}
