@@ -251,6 +251,43 @@ func (c *Client) ListJobs(ctx context.Context, n int) ([]JobStatus, error) {
 	return out, nil
 }
 
+// ClearFinished removes terminal (done/failed) job records — and any
+// leaked index entries whose hash has already expired — from Redis, so
+// the Recent-jobs list can be cleared and the JobIndexKey ZSET does not
+// grow without bound over the lifetime of the shared metadata Redis.
+//
+// Queued/running jobs are NEVER removed: dropping a job a worker is about
+// to (or is actively) processing would orphan it. Returns the number of
+// index entries removed.
+func (c *Client) ClearFinished(ctx context.Context) (int, error) {
+	ids, err := c.rdb.ZRange(ctx, JobIndexKey, 0, -1).Result()
+	if err != nil {
+		return 0, err
+	}
+	pipe := c.rdb.TxPipeline()
+	removed := 0
+	for _, id := range ids {
+		m, err := c.rdb.HGetAll(ctx, JobHashPrefix+id).Result()
+		if err != nil {
+			continue
+		}
+		// len(m)==0 => the hash expired but the index entry leaked; prune
+		// it. Otherwise only prune terminal jobs. queued/running stay.
+		if st := m["status"]; len(m) == 0 || st == StatusDone || st == StatusFailed {
+			pipe.ZRem(ctx, JobIndexKey, id)
+			pipe.Del(ctx, JobHashPrefix+id)
+			removed++
+		}
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
 // ActiveWorkers returns the currently-heartbeating workers (their keys are
 // alive). An empty slice means the farm is NOT draining — the producer should
 // surface "farm offline / not accepting work."

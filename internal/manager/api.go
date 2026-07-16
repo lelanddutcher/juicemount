@@ -227,6 +227,9 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// queue depth + recent job status back. Both admin-key gated.
 	mux.HandleFunc(prefix+"/api/farm/sweep", a.auth(a.handleFarmSweep))
 	mux.HandleFunc(prefix+"/api/farm/jobs", a.auth(a.handleFarmJobs))
+	// Exact path (registered before any subtree) — POST clears terminal
+	// job records from the Recent-jobs list + prunes the leaked index.
+	mux.HandleFunc(prefix+"/api/farm/jobs/clear", a.auth(a.handleFarmJobsClear))
 	// JM-15 #56 (server half): relay the farm's pre-aggregated
 	// /derivatives/changes feed (contract derivatives-changes.schema.json,
 	// filtered by ?since=&limit=) so the Mac client learns farm-generated
@@ -863,7 +866,16 @@ func (a *API) resolveSavedDestination(w http.ResponseWriter, source, name string
 }
 
 func (a *API) handleListJobs(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, a.jobs.List())
+	// Snapshot each job under its own lock before marshaling. The live
+	// *Job pointers List() returns are mutated by the runner goroutine
+	// (run() writes State/Last/Error under j.mu), so marshaling them
+	// directly races json's field reads. GetSnapshot copies under j.mu.
+	live := a.jobs.List()
+	snaps := make([]Job, 0, len(live))
+	for _, j := range live {
+		snaps = append(snaps, j.GetSnapshot())
+	}
+	writeJSON(w, http.StatusOK, snaps)
 }
 
 // handlePreview walks the source path (file or directory) and returns
@@ -1266,7 +1278,10 @@ func (a *API) handleJobOps(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "job not found", http.StatusNotFound)
 			return
 		}
-		writeJSON(w, http.StatusOK, j)
+		// Marshal a locked snapshot, not the live pointer — run() mutates
+		// the job concurrently (data race with json's field reads).
+		snap := j.GetSnapshot()
+		writeJSON(w, http.StatusOK, snap)
 	case r.Method == http.MethodGet && subpath == "stream":
 		a.streamJob(w, r, id)
 	case r.Method == http.MethodDelete && subpath == "":

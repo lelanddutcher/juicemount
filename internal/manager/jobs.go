@@ -618,18 +618,23 @@ func (j *Job) GetSnapshot() Job {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	// Copy by value; listeners + cancel + mu are zero-valued in the
-	// returned struct.
+	// returned struct. Must include EVERY json-serialized field — this
+	// snapshot is what the /api/jobs handlers marshal, so an omission
+	// silently drops that field from the API (e.g. schedule_name).
 	return Job{
-		ID:          j.ID,
-		Source:      j.Source,
-		Destination: j.Destination,
-		Options:     j.Options,
-		State:       j.State,
-		CreatedAt:   j.CreatedAt,
-		StartedAt:   j.StartedAt,
-		FinishedAt:  j.FinishedAt,
-		Last:        j.Last,
-		Error:       j.Error,
+		ID:           j.ID,
+		Source:       j.Source,
+		Destination:  j.Destination,
+		Options:      j.Options,
+		State:        j.State,
+		CreatedAt:    j.CreatedAt,
+		StartedAt:    j.StartedAt,
+		FinishedAt:   j.FinishedAt,
+		TotalBytes:   j.TotalBytes,
+		Direction:    j.Direction,
+		ScheduleName: j.ScheduleName,
+		Last:         j.Last,
+		Error:        j.Error,
 	}
 }
 

@@ -902,7 +902,36 @@
       });
     }
     if (btn) btn.addEventListener('click', submitFarmSweep);
+    const clearBtn = $('#farm-jobs-clear');
+    if (clearBtn) clearBtn.addEventListener('click', clearFarmFinishedJobs);
     updateFarmSweepButton();
+  }
+
+  // clearFarmFinishedJobs removes terminal (done/failed) rows from the
+  // Recent-jobs list server-side, then refreshes. Running/queued jobs are
+  // preserved by the backend (POST /api/farm/jobs/clear). A brief inline
+  // flash reports the count.
+  async function clearFarmFinishedJobs() {
+    const btn = $('#farm-jobs-clear');
+    const flash = $('#farm-jobs-clear-flash');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('POST', '/api/farm/jobs/clear');
+      const n = (res && typeof res.cleared === 'number') ? res.cleared : 0;
+      if (flash) {
+        flash.textContent = n === 0 ? 'No finished jobs to clear.' : ('Cleared ' + n + ' finished job' + (n === 1 ? '' : 's') + '.');
+        flash.hidden = false;
+        setTimeout(() => { flash.hidden = true; }, 4000);
+      }
+      await loadFarmJobs();
+    } catch (e) {
+      if (flash) {
+        flash.textContent = 'Clear failed: ' + (e.message || e);
+        flash.hidden = false;
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   // updateFarmSweepButton keeps the Queue button disabled while in-flight or
@@ -988,7 +1017,7 @@
     try { res = await api('GET', '/api/farm/jobs'); } catch (e) { return; }
     if (!res) return;
     renderFarmActiveBanner(!!res.available, res.queue_depth || 0);
-    renderFarmJobsList(Array.isArray(res.jobs) ? res.jobs : []);
+    renderFarmJobsList(Array.isArray(res.jobs) ? res.jobs : [], !!res.available);
   }
 
   // renderFarmActiveBanner shows worker presence: green + "draining the queue"
@@ -1024,7 +1053,7 @@
   // parent dir muted), the kinds, processed/failed counts when present, and a
   // relative enqueue time. Failed rows surface .error. Everything goes through
   // textContent / DOM nodes — no innerHTML on wire values.
-  function renderFarmJobsList(jobs) {
+  function renderFarmJobsList(jobs, workersActive) {
     const list = $('#farm-jobs-list');
     if (!list) return;
     list.innerHTML = '';
@@ -1035,7 +1064,17 @@
       list.appendChild(li);
       return;
     }
-    jobs.forEach((j) => {
+    // Float the running job(s) to the top so the active sweep is always
+    // visible without scrolling. Array.sort is stable (ES2019+), so the
+    // backend's recent-first order is preserved within each group.
+    // Guard: only treat "running" as top-worthy when a worker is actually
+    // alive — a worker that dies mid-job leaves a phantom "running"
+    // record for up to the job TTL, and pinning that at the top forever
+    // would mislead. When no worker is active, keep the plain order.
+    const ordered = workersActive
+      ? [...jobs].sort((a, b) => ((a.status === 'running') ? 0 : 1) - ((b.status === 'running') ? 0 : 1))
+      : jobs;
+    ordered.forEach((j) => {
       const status = j.status || 'queued';
       const li = document.createElement('li');
       li.className = 'farm-job-row';

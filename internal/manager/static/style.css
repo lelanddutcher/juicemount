@@ -1692,6 +1692,31 @@ footer a:hover { text-decoration: underline; }
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+.farm-jobs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+}
+.farm-jobs-header .farm-jobs-title { margin: 0; }
+.farm-jobs-clear {
+  font-size: 0.72rem;
+  padding: 0.2rem 0.55rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+  border-radius: 4px;
+  cursor: pointer;
+}
+.farm-jobs-clear:hover:not(:disabled) { filter: brightness(1.15); color: var(--text); }
+.farm-jobs-clear:disabled { opacity: 0.5; cursor: default; }
+.farm-jobs-flash {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin: 0 0 0.4rem;
+}
 .farm-jobs-list { list-style: none; margin: 0; padding: 0; }
 .farm-jobs-empty {
   color: var(--text-muted);

@@ -177,7 +177,11 @@
 
           <!-- Recent jobs from the queue, newest first. -->
           <div class="farm-jobs-wrap">
-            <h4 class="farm-jobs-title">Recent jobs</h4>
+            <div class="farm-jobs-header">
+              <h4 class="farm-jobs-title">Recent jobs</h4>
+              <button id="farm-jobs-clear" class="farm-jobs-clear" type="button" title="Remove finished (done/failed) jobs from this list. Running and queued jobs are kept.">Clear finished</button>
+            </div>
+            <span id="farm-jobs-clear-flash" class="farm-jobs-flash" hidden></span>
             <ul id="farm-jobs-list" class="farm-jobs-list">
               <li class="farm-jobs-empty">No jobs queued yet.</li>
             </ul>

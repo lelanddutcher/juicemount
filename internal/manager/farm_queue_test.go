@@ -131,6 +131,7 @@ type fakeFarmQueue struct {
 	workers    []farmqueue.Worker
 	depth      int64
 	jobs       []farmqueue.JobStatus
+	clearErr   error
 }
 
 func (f *fakeFarmQueue) Enqueue(_ context.Context, j farmqueue.Job) error {
@@ -146,6 +147,22 @@ func (f *fakeFarmQueue) ActiveWorkers(context.Context) ([]farmqueue.Worker, erro
 func (f *fakeFarmQueue) QueueDepth(context.Context) (int64, error) { return f.depth, nil }
 func (f *fakeFarmQueue) ListJobs(context.Context, int) ([]farmqueue.JobStatus, error) {
 	return f.jobs, nil
+}
+func (f *fakeFarmQueue) ClearFinished(context.Context) (int, error) {
+	if f.clearErr != nil {
+		return 0, f.clearErr
+	}
+	kept := f.jobs[:0]
+	removed := 0
+	for _, j := range f.jobs {
+		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed {
+			removed++
+			continue
+		}
+		kept = append(kept, j)
+	}
+	f.jobs = kept
+	return removed, nil
 }
 
 // compileContractSchema loads + compiles one vendored contract schema. loc may
@@ -414,5 +431,48 @@ func TestHandleFarmJobsEmptyNeverNull(t *testing.T) {
 	}
 	if _, ok := m["jobs"].([]any); !ok {
 		t.Errorf("jobs is %T, want [] (never null)", m["jobs"])
+	}
+}
+
+// TestHandleFarmJobsClear verifies POST /api/farm/jobs/clear removes ONLY
+// terminal (done/failed) records and returns the count — queued/running
+// jobs must survive so an in-flight sweep is never orphaned. 503 when the
+// queue is unconfigured.
+func TestHandleFarmJobsClear(t *testing.T) {
+	fake := &fakeFarmQueue{jobs: []farmqueue.JobStatus{
+		{ID: "a", Status: farmqueue.StatusRunning},
+		{ID: "b", Status: farmqueue.StatusDone},
+		{ID: "c", Status: farmqueue.StatusQueued},
+		{ID: "d", Status: farmqueue.StatusFailed},
+	}}
+	a := &API{farmQ: fake}
+	rec := httptest.NewRecorder()
+	a.handleFarmJobsClear(rec, httptest.NewRequest(http.MethodPost, "/api/farm/jobs/clear", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Cleared int `json:"cleared"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("bad JSON: %v", err)
+	}
+	if body.Cleared != 2 {
+		t.Fatalf("cleared = %d, want 2 (done+failed)", body.Cleared)
+	}
+	if len(fake.jobs) != 2 {
+		t.Fatalf("remaining jobs = %d, want 2 (running+queued kept)", len(fake.jobs))
+	}
+	for _, j := range fake.jobs {
+		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed {
+			t.Fatalf("terminal job %q survived clear", j.ID)
+		}
+	}
+
+	a2 := &API{}
+	rec2 := httptest.NewRecorder()
+	a2.handleFarmJobsClear(rec2, httptest.NewRequest(http.MethodPost, "/api/farm/jobs/clear", nil))
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured status = %d, want 503", rec2.Code)
 	}
 }
