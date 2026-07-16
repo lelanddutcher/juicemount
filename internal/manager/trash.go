@@ -455,7 +455,14 @@ func parseTrashConfig(raw []byte) (int, error) {
 		}
 		// rest now should be the digit string ("7"). Tolerate a
 		// trailing unit if juicefs ever decides to add one.
-		rest = strings.Fields(rest)[0]
+		valueFields := strings.Fields(rest)
+		if len(valueFields) == 0 {
+			// "TrashDays:" row present but value empty/unreadable — treat
+			// as "unknown" (-1) rather than panicking on an empty-slice
+			// index. Reached from getTrashConfig via handleTrashConfig GET.
+			return -1, nil
+		}
+		rest = valueFields[0]
 		n, err := strconv.Atoi(rest)
 		if err != nil {
 			return 0, fmt.Errorf("parse trash-days value %q: %w", rest, err)
@@ -715,6 +722,18 @@ func (a *API) handleTrashRestore(w http.ResponseWriter, r *http.Request) {
 		// root, NOT to /jfs. Prepend the destMount so it matches the
 		// user-facing path the UI showed.
 		target = strings.TrimSuffix(a.destMount, "/") + orig
+	}
+	// SECURITY: confine the restore TARGET to the /jfs volume. The entry
+	// (source) is gated by isInsideTrash above, but without this the
+	// target was only checked for not-being-inside-.trash — a caller
+	// could pass target_path="/etc/cron.d/pwn", which userToFusePath
+	// passes through unchanged (not under destMount), and restoreTrash
+	// would os.MkdirAll+os.Rename a caller-controlled file there as root.
+	// jfsPathAllowed filepath.Clean's first, so "/jfs/../etc" is rejected
+	// too. Mirrors the gate handleMigrate / handlePermissionsFix use.
+	if !a.jfsPathAllowed(target) {
+		http.Error(w, "restore target must be under "+a.destMount, http.StatusForbidden)
+		return
 	}
 	fuseTarget := userToFusePath(target, a.fuseMount, a.destMount)
 	// Refuse to restore over the .trash subtree itself.

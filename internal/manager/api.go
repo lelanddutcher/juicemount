@@ -300,6 +300,23 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	a.schedules = sched
 	sched.SetOnChange(mgr.SaveState)
 	mgr.SetSchedules(sched)
+	// SECURITY: gate schedule sources exactly like handleMigrate — an In
+	// (or default) source must live under sourceRoots, an Out source
+	// under /jfs. Without this a backup schedule could juicefs-sync an
+	// arbitrary host path (e.g. /etc) to a remote destination as root.
+	sched.SetSourceGate(func(path string, dir Direction) error {
+		switch dir {
+		case DirectionOut:
+			if !a.jfsPathAllowed(path) {
+				return fmt.Errorf("source outside /jfs (FUSE mount)")
+			}
+		default: // In / "" (default)
+			if !a.pathAllowed(path) {
+				return fmt.Errorf("source outside permitted source roots")
+			}
+		}
+		return nil
+	})
 	sched.Start(context.Background())
 	mux.HandleFunc(prefix+"/api/schedules", a.auth(a.handleSchedules))
 	mux.HandleFunc(prefix+"/api/schedules/", a.auth(a.handleScheduleItem))
