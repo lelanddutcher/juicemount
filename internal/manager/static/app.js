@@ -2096,11 +2096,16 @@
       if (cfg.error) {
         cur.textContent = `current: (${cfg.error})`;
       } else if (cfg.days < 0) {
-        cur.textContent = 'current: unknown';
+        // metaURL resolved but juicefs config had no readable TrashDays
+        // row — most often retention was never enabled on this volume.
+        // Make it actionable rather than a dead "unknown".
+        cur.textContent = 'current: unknown — retention may be disabled; pick a value below to enable it';
       } else {
-        cur.textContent = `current: ${cfg.days} day(s)`;
-        // Sync the drop-down. If the current value isn't in our
-        // choices list, the select shows blank — fine, the user
+        cur.textContent = cfg.days === 0
+          ? 'current: disabled (0 — deleted files are purged immediately, no trash kept)'
+          : `current: ${cfg.days} day(s)`;
+        // Sync the drop-down to the current value (0 is a valid choice).
+        // If it isn't in the list the select shows blank — fine, the user
         // can still pick a new one.
         const sel = $('#trash-retention-select');
         const match = Array.from(sel.options).find((o) => parseInt(o.value, 10) === cfg.days);
