@@ -1294,9 +1294,11 @@ func (a *API) handleJobOps(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Marshal a locked snapshot, not the live pointer — run() mutates
-		// the job concurrently (data race with json's field reads).
+		// the job concurrently (data race with json's field reads). Pass
+		// &snap (not snap) so we don't copy the Job's embedded Mutex into
+		// the any-arg (go vet copylock); json marshals the pointee fine.
 		snap := j.GetSnapshot()
-		writeJSON(w, http.StatusOK, snap)
+		writeJSON(w, http.StatusOK, &snap)
 	case r.Method == http.MethodGet && subpath == "stream":
 		a.streamJob(w, r, id)
 	case r.Method == http.MethodDelete && subpath == "":
