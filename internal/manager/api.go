@@ -64,6 +64,10 @@ type API struct {
 	// JobManager are wired; mgr.StopAll() drains it on shutdown.
 	schedules *scheduleStoreImpl
 
+	// maintenanceSched is the per-lever GC/FSCK/compact cron scheduler.
+	// Nil in tests that bypass Register.
+	maintenanceSched *maintenanceScheduler
+
 	// settings is the SLICE-8 Settings store (per-job defaults, theme,
 	// log retention, admin-key rotation). Nil in tests that bypass
 	// Register; handlers return 503. The store delegates rotation to
@@ -323,6 +327,17 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	sched.Start(context.Background())
 	mux.HandleFunc(prefix+"/api/schedules", a.auth(a.handleSchedules))
 	mux.HandleFunc(prefix+"/api/schedules/", a.auth(a.handleScheduleItem))
+
+	// Per-lever maintenance scheduler (GC/FSCK/compact-meta on a cron).
+	// Own cron engine; persists via the JobManager alongside backups.
+	if a.maintenance != nil {
+		ms := newMaintenanceScheduler(a.maintenance)
+		a.maintenanceSched = ms
+		ms.SetOnChange(mgr.SaveState)
+		mgr.SetMaintenanceSchedules(ms)
+		ms.Start(context.Background())
+		mux.HandleFunc(prefix+"/api/maintenance/schedules", a.auth(a.handleMaintenanceSchedules))
+	}
 	// SLICE 8: Settings tab — per-job defaults, theme, log retention,
 	// admin-key rotation. The store wires its persistence callback to
 	// SaveState; rotation re-encrypts every destination via

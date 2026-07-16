@@ -126,3 +126,16 @@ type settingsState struct {
 	LogRetentionLines    int         `json:"log_retention_lines"`
 	DestinationsRedacted bool        `json:"destinations_redacted,omitempty"`
 }
+
+// maintenanceScheduleRow is the persisted form of a per-lever maintenance
+// schedule (GC/FSCK/compact-meta on a cron). One row per configured
+// MaintenanceKind. Enabled=false keeps the row so the operator's chosen
+// cadence is remembered when they toggle it back on. Stored at
+// persistedState.MaintenanceSchedules; schema stays v2 (additive — v2
+// readers tolerate unknown keys, same convention as schedules/settings).
+type maintenanceScheduleRow struct {
+	Kind    string `json:"kind"` // "gc" | "fsck" | "compact-meta"
+	Cron    string `json:"cron"`
+	Enabled bool   `json:"enabled"`
+	LastRun int64  `json:"last_run,omitempty"` // unix-ms
+}

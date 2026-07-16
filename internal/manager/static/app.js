@@ -2178,6 +2178,109 @@
       // case; we swallow it and leave the idle state.
       refreshMaintenanceState(kind).catch(() => {});
     });
+    // Inject per-lever scheduling controls (GC/FSCK/compact-meta).
+    loadMaintenanceSchedules();
+  }
+
+  // ---- per-lever maintenance scheduling ----
+  // Cadence buckets the select offers. Each maps to a cron the backend
+  // accepts; the backend's recommended_cron is matched to a bucket so we
+  // can mark it "(recommended)". These sweeps are optional (JuiceFS
+  // auto-cleans the routine equivalents), so Off is a first-class choice.
+  const MAINT_CADENCES = [
+    { key: 'off', label: 'Off', cron: '' },
+    { key: 'weekly', label: 'Weekly', cron: '0 3 * * 0' },
+    { key: 'monthly', label: 'Monthly', cron: '0 3 1 * *' },
+    { key: 'quarterly', label: 'Quarterly', cron: '0 5 1 1,4,7,10 *' },
+  ];
+  function maintBucketForCron(cron) {
+    const hit = MAINT_CADENCES.find((c) => c.cron && c.cron === cron);
+    return hit ? hit.key : 'custom';
+  }
+  function maintRecommendedBucket(recCron) {
+    if (!recCron) return 'monthly';
+    if (/\b1,4,7,10\b/.test(recCron)) return 'quarterly';
+    if (/\*\s+[0-6]$/.test(recCron)) return 'weekly';
+    return 'monthly';
+  }
+
+  async function loadMaintenanceSchedules() {
+    let res;
+    try { res = await api('GET', '/api/maintenance/schedules'); } catch (e) { return; }
+    const rows = (res && Array.isArray(res.schedules)) ? res.schedules : [];
+    rows.forEach((row) => injectMaintenanceSchedule(row));
+  }
+
+  function injectMaintenanceSchedule(row) {
+    const card = document.querySelector(`.maintenance-card[data-kind="${row.kind}"]`);
+    if (!card) return;
+    const controls = card.querySelector('.maintenance-controls');
+    if (!controls) return;
+    const prior = card.querySelector('.maintenance-schedule');
+    if (prior) prior.remove();
+
+    const box = document.createElement('div');
+    box.className = 'maintenance-schedule';
+    const recBucket = maintRecommendedBucket(row.recommended_cron);
+    const curBucket = row.enabled ? maintBucketForCron(row.cron) : 'off';
+
+    const label = document.createElement('label');
+    label.className = 'maintenance-schedule-label';
+    label.textContent = 'Run automatically: ';
+    const sel = document.createElement('select');
+    MAINT_CADENCES.forEach((c) => {
+      const opt = document.createElement('option');
+      opt.value = c.key;
+      opt.textContent = c.label + (c.key === recBucket ? ' (recommended)' : '');
+      sel.appendChild(opt);
+    });
+    if (curBucket === 'custom') {
+      const opt = document.createElement('option');
+      opt.value = 'custom';
+      opt.textContent = 'Custom (' + row.cron + ')';
+      sel.appendChild(opt);
+    }
+    sel.value = curBucket;
+    label.appendChild(sel);
+    box.appendChild(label);
+
+    const advice = document.createElement('p');
+    advice.className = 'maintenance-schedule-advice';
+    advice.textContent = row.advice || '';
+    box.appendChild(advice);
+
+    if (!row.runnable) {
+      const warn = document.createElement('p');
+      warn.className = 'maintenance-schedule-warn';
+      warn.textContent = 'Scheduling is saved, but this op needs the volume metadata URL to run (embedded mode: set JM_OVERVIEW_META).';
+      box.appendChild(warn);
+    }
+
+    const flash = document.createElement('span');
+    flash.className = 'maintenance-schedule-flash';
+    flash.hidden = true;
+    box.appendChild(flash);
+
+    sel.addEventListener('change', async () => {
+      const key = sel.value;
+      if (key === 'custom') return;
+      const bucket = MAINT_CADENCES.find((c) => c.key === key);
+      const enabled = key !== 'off';
+      // When turning off, keep the last cadence so the row remembers it.
+      const cron = enabled ? bucket.cron : (row.cron || row.recommended_cron);
+      try {
+        await api('PUT', '/api/maintenance/schedules', { kind: row.kind, cron: cron, enabled: enabled });
+        row.enabled = enabled; row.cron = cron;
+        flash.textContent = enabled ? ('Scheduled: ' + bucket.label.toLowerCase()) : 'Schedule off';
+        flash.hidden = false;
+        setTimeout(() => { flash.hidden = true; }, 3500);
+      } catch (e) {
+        flash.textContent = 'Failed: ' + (e.message || e);
+        flash.hidden = false;
+      }
+    });
+
+    controls.insertAdjacentElement('afterend', box);
   }
 
   async function runMaintenance(kind) {

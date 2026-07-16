@@ -147,6 +147,12 @@ type JobManager struct {
 	schedules        scheduleStore
 	pendingSchedules []scheduleState
 
+	// maintenanceSchedules is the per-lever GC/FSCK/compact cron store.
+	// Same pending-buffer dance as schedules so a state-file load before
+	// the store is attached doesn't drop persisted rows.
+	maintenanceSchedules  maintenanceScheduleStore
+	pendingMaintSchedules []maintenanceScheduleRow
+
 	// settings is the SLICE-8 hook for the per-instance Settings store
 	// (per-job defaults, theme, log retention, etc.). Same lifecycle
 	// pattern as destinations/schedules — Register attaches the store
@@ -181,6 +187,14 @@ type scheduleStore interface {
 	Stop()
 }
 
+// maintenanceScheduleStore is the per-lever maintenance cron counterpart.
+// Opaque to JobManager — maintenance_schedule.go owns its lifecycle.
+type maintenanceScheduleStore interface {
+	snapshot() []maintenanceScheduleRow
+	load(rows []maintenanceScheduleRow)
+	Stop()
+}
+
 // settingsStore is the SLICE-8 counterpart. Same shape as
 // destinationStore — opaque to JobManager so settings.go owns its own
 // persistence/lifecycle. snapshot returns a pointer (not a value) so a
@@ -211,6 +225,9 @@ type persistedState struct {
 	// identically. Schema version stays at 2 because v2 readers tolerate
 	// unknown keys (Go's json.Unmarshal leaves them at zero values).
 	Schedules []scheduleState `json:"schedules,omitempty"`
+	// Per-lever maintenance schedules (GC/FSCK/compact-meta on a cron).
+	// omitempty + additive to v2, same convention as Schedules.
+	MaintenanceSchedules []maintenanceScheduleRow `json:"maintenance_schedules,omitempty"`
 	// SLICE 8: per-instance Settings. Pointer + omitempty so that a v1
 	// or unseeded v2 state file (no settings key) decodes to nil. The
 	// Settings handler treats nil as "use code defaults" — GET returns
@@ -343,6 +360,12 @@ func (m *JobManager) SetStateFile(path string) {
 	} else {
 		m.pendingSchedules = s.Schedules
 	}
+	// Same dance for the per-lever maintenance schedules.
+	if m.maintenanceSchedules != nil {
+		m.maintenanceSchedules.load(s.MaintenanceSchedules)
+	} else {
+		m.pendingMaintSchedules = s.MaintenanceSchedules
+	}
 	// SLICE 8: same pattern for settings. The settingsStore.load
 	// contract distinguishes nil (no settings persisted yet — use code
 	// defaults) from a non-nil row, so we pass s.Settings through
@@ -403,6 +426,20 @@ func (m *JobManager) SetSchedules(s scheduleStore) {
 	m.schedules = s
 	pending := m.pendingSchedules
 	m.pendingSchedules = nil
+	m.mu.Unlock()
+	if s != nil && pending != nil {
+		s.load(pending)
+	}
+}
+
+// SetMaintenanceSchedules attaches the per-lever maintenance cron store.
+// Mirrors SetSchedules — drains any pending rows the state-file loader
+// buffered before the store was attached.
+func (m *JobManager) SetMaintenanceSchedules(s maintenanceScheduleStore) {
+	m.mu.Lock()
+	m.maintenanceSchedules = s
+	pending := m.pendingMaintSchedules
+	m.pendingMaintSchedules = nil
 	m.mu.Unlock()
 	if s != nil && pending != nil {
 		s.load(pending)
@@ -478,6 +515,11 @@ func (m *JobManager) saveStateLocked() {
 		out.Schedules = m.schedules.snapshot()
 	} else if m.pendingSchedules != nil {
 		out.Schedules = append([]scheduleState(nil), m.pendingSchedules...)
+	}
+	if m.maintenanceSchedules != nil {
+		out.MaintenanceSchedules = m.maintenanceSchedules.snapshot()
+	} else if m.pendingMaintSchedules != nil {
+		out.MaintenanceSchedules = append([]maintenanceScheduleRow(nil), m.pendingMaintSchedules...)
 	}
 	// SLICE 8: persist settings if a store is wired, else round-trip
 	// any pending row so an early save (e.g. before SetSettings has
@@ -728,6 +770,7 @@ func (m *JobManager) Subscribe(id string) (<-chan ProgressEvent, func(), bool) {
 func (m *JobManager) StopAll() {
 	m.mu.RLock()
 	sched := m.schedules
+	maintSched := m.maintenanceSchedules
 	ids := make([]string, 0, len(m.jobs))
 	for id := range m.jobs {
 		ids = append(ids, id)
@@ -735,6 +778,9 @@ func (m *JobManager) StopAll() {
 	m.mu.RUnlock()
 	if sched != nil {
 		sched.Stop()
+	}
+	if maintSched != nil {
+		maintSched.Stop()
 	}
 	for _, id := range ids {
 		m.Cancel(id)
