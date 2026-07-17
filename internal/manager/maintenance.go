@@ -716,3 +716,24 @@ func (mm *MaintenanceManager) binOrDefault() string {
 	}
 	return mm.juicefsBin
 }
+
+// scheduledArgv builds the CLI argv for a schedulable maintenance kind
+// (gc/fsck/compact-meta), matching the manual handlers exactly. Returns
+// ok=false when the kind isn't schedulable or metaURL is unset (the op
+// would 501). Shared by the manual handlers' intent and the scheduler so
+// the two never drift.
+func (mm *MaintenanceManager) scheduledArgv(kind MaintenanceKind) ([]string, bool) {
+	if mm.metaURL == "" {
+		return nil, false
+	}
+	bin := mm.binOrDefault()
+	switch kind {
+	case MaintenanceGC:
+		return []string{bin, "gc", mm.metaURL, "--delete"}, true
+	case MaintenanceFSCK:
+		return []string{bin, "fsck", mm.metaURL}, true
+	case MaintenanceCompactMeta:
+		return []string{bin, "gc", "--compact", mm.metaURL}, true
+	}
+	return nil, false
+}

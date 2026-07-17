@@ -31,8 +31,15 @@ type SpoolRow struct {
 	DrainState    DrainState
 	DrainAttempts int
 	LastError     string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// SuspectZeroTail is the #104 zero-tail-detection marker. Empty = clean.
+	// Non-empty = compact JSON detail {detected_at,size,contiguous,holes}
+	// written by MarkSuspectZeroTail when the entry finalized with unwritten
+	// hole(s) below its written size (the interrupted preallocate-then-write
+	// download signature — the file drains FULL-SIZE with a zero tail).
+	// Surfacing only: nothing gates a drain on this field.
+	SuspectZeroTail string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // SpoolStore is the SQLite-backed CRUD layer for spool_entries.
@@ -201,7 +208,7 @@ func (s *SpoolStore) DeleteActiveByPath(nfsPath string) ([]*SpoolRow, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	rows, err := s.db.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
 		 FROM spool_entries WHERE nfs_path=? AND drain_state IN ('writing','ready','draining')`,
 		nfsPath,
 	)
@@ -289,7 +296,7 @@ func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMig
 	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
 	rows, err := tx.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
 		 FROM spool_entries
 		 WHERE drain_state IN ('writing','ready','draining')
 		   AND (nfs_path = ? OR substr(nfs_path, 1, ?) = ?)`,
@@ -333,11 +340,13 @@ func (s *SpoolStore) MigrateActivePaths(oldPath, newPath string) ([]SpoolPathMig
 			// created_at preserved so the requeued row keeps its FIFO
 			// position in ListReady; attempts carried (the cancelled
 			// attempt wasn't a data failure, but the budget shouldn't
-			// reset on rename either).
+			// reset on rename either). suspect_zero_tail carried too —
+			// the requeued row shares the SAME spool file (same bytes,
+			// same holes), so the #104 marker follows the data.
 			res, err := tx.Exec(
-				`INSERT INTO spool_entries (nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				newRowPath, r.SpoolFile, r.Size, r.SHA256, DrainReady, r.DrainAttempts, r.LastError, r.CreatedAt.Unix(), now,
+				`INSERT INTO spool_entries (nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				newRowPath, r.SpoolFile, r.Size, r.SHA256, DrainReady, r.DrainAttempts, r.LastError, r.SuspectZeroTail, r.CreatedAt.Unix(), now,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("spool migrate-paths requeue %d: %w", r.ID, err)
@@ -389,6 +398,28 @@ func (s *SpoolStore) MarkFailed(id int64, errMsg string) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// MarkSuspectZeroTail records the #104 zero-tail-detection marker on a row.
+// detail is the compact JSON blob {detected_at,size,contiguous,holes} the
+// finalize-time detector assembled. State-independent by design (UPDATE by id
+// only, drain_state untouched, updated_at untouched): the marking is pure
+// surfacing — the row's lifecycle (ready→draining→done) proceeds exactly as
+// if the marker were absent, and a marking must never reset the age/staleness
+// signals derived from updated_at. Called between finalize and MarkReady, so
+// the common case marks a `writing` row; a scrubber/cancel race that removed
+// the row first makes this affect 0 rows, which is fine — detection-only.
+func (s *SpoolStore) MarkSuspectZeroTail(id int64, detail string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.Exec(
+		`UPDATE spool_entries SET suspect_zero_tail=? WHERE id=?`,
+		detail, id,
+	)
+	if err != nil {
+		return fmt.Errorf("spool mark suspect-zero-tail %d: %w", id, err)
+	}
+	return nil
 }
 
 // HasNewerRowForPath reports whether any row exists for nfsPath with an id
@@ -472,7 +503,7 @@ func (s *SpoolStore) ResetForRetry(id int64) (bool, error) {
 // Get returns the row for id, or sql.ErrNoRows if it doesn't exist.
 func (s *SpoolStore) Get(id int64) (*SpoolRow, error) {
 	row := s.db.QueryRow(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
 		 FROM spool_entries WHERE id=?`,
 		id,
 	)
@@ -484,7 +515,7 @@ func (s *SpoolStore) Get(id int64) (*SpoolRow, error) {
 // Reads of in-progress writes consult this to serve from spool.
 func (s *SpoolStore) LookupByPath(nfsPath string) (*SpoolRow, error) {
 	row := s.db.QueryRow(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
 		 FROM spool_entries
 		 WHERE nfs_path=? AND drain_state IN ('writing','ready','draining')
 		 ORDER BY id DESC LIMIT 1`,
@@ -497,7 +528,7 @@ func (s *SpoolStore) LookupByPath(nfsPath string) (*SpoolRow, error) {
 // Used by the drainer to fetch its next batch.
 func (s *SpoolStore) ListReady(limit int) ([]*SpoolRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
 		 FROM spool_entries WHERE drain_state=? ORDER BY created_at ASC LIMIT ?`,
 		DrainReady, limit,
 	)
@@ -520,7 +551,7 @@ func (s *SpoolStore) ListReady(limit int) ([]*SpoolRow, error) {
 // disk state against the index. Intentionally unfiltered.
 func (s *SpoolStore) ListAll() ([]*SpoolRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
 		 FROM spool_entries`,
 	)
 	if err != nil {
@@ -553,7 +584,7 @@ func (s *SpoolStore) ListAll() ([]*SpoolRow, error) {
 // to Finder as "operation can't be completed (error 100060)" mid-copy.
 func (s *SpoolStore) ListForStatus(doneSince time.Time) ([]*SpoolRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, created_at, updated_at
+		`SELECT id, nfs_path, spool_file, size, sha256, drain_state, drain_attempts, last_error, suspect_zero_tail, created_at, updated_at
 		 FROM spool_entries
 		 WHERE drain_state != ? OR updated_at >= ?
 		 ORDER BY id`,
@@ -706,14 +737,17 @@ func (s *SpoolStore) DeletePendingSymlink(linkPath string) error {
 func scanSpoolRow(scan func(...any) error) (*SpoolRow, error) {
 	var r SpoolRow
 	var state string
-	var lastErr sql.NullString
+	var lastErr, suspect sql.NullString
 	var createdAt, updatedAt int64
-	if err := scan(&r.ID, &r.NFSPath, &r.SpoolFile, &r.Size, &r.SHA256, &state, &r.DrainAttempts, &lastErr, &createdAt, &updatedAt); err != nil {
+	if err := scan(&r.ID, &r.NFSPath, &r.SpoolFile, &r.Size, &r.SHA256, &state, &r.DrainAttempts, &lastErr, &suspect, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	r.DrainState = DrainState(state)
 	if lastErr.Valid {
 		r.LastError = lastErr.String
+	}
+	if suspect.Valid {
+		r.SuspectZeroTail = suspect.String
 	}
 	r.CreatedAt = time.Unix(createdAt, 0)
 	r.UpdatedAt = time.Unix(updatedAt, 0)

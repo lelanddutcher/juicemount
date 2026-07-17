@@ -549,7 +549,11 @@ func mountNFS(addr, mountPoint string) error {
 	// hard (was soft): a soft mount's ETIMEDOUT (errno 60) on a timed-out mmap
 	// pagein becomes SIGBUS, crashing apps that mmap media. See bridge/cbridge.go
 	// nfsMountOpts + [mmap-SIGBUS 2026-06-15].
-	opts := fmt.Sprintf("port=%s,mountport=%s,hard,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,actimeo=3600,vers=3,tcp", port, port)
+	// [B4' Fix B] acdir 3-15s (was actimeo=3600): dir-attr + negative-name
+	// cache re-validates in seconds so server-created content becomes visible
+	// at ~(push 3s + acdirmax 15s) instead of up to an hour. acreg stays 3600.
+	// Mirrors bridge/cbridge.go nfsMountOpts — keep in sync.
+	opts := fmt.Sprintf("port=%s,mountport=%s,hard,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15,vers=3,tcp", port, port)
 	cmd := exec.Command("sudo", "mount_nfs", "-o", opts,
 		fmt.Sprintf("%s:/", host), mountPoint)
 

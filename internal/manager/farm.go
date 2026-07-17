@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -10,6 +11,23 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/farmqueue"
 )
+
+// farmQueue is the slice of *farmqueue.Client the manager's producer surface
+// (POST /api/farm/sweep + GET /api/farm/jobs) actually uses. Factored as an
+// interface so handler tests can exercise the SUCCESS paths against a fake
+// without a live Redis, and so the compiler pins exactly which queue operations
+// the manager depends on. *farmqueue.Client satisfies it; api.go assigns one
+// when a meta/redis URL is configured.
+type farmQueue interface {
+	Enqueue(ctx context.Context, j farmqueue.Job) error
+	ActiveWorkers(ctx context.Context) ([]farmqueue.Worker, error)
+	QueueDepth(ctx context.Context) (int64, error)
+	ListJobs(ctx context.Context, n int) ([]farmqueue.JobStatus, error)
+	ClearFinished(ctx context.Context) (int, error)
+}
+
+// Compile-time proof the real client implements the manager's queue slice.
+var _ farmQueue = (*farmqueue.Client)(nil)
 
 // farmQueueProbeTimeout caps any single Redis round-trip the Farm tab makes
 // (ActiveWorkers SCAN, QueueDepth LLEN, ListJobs ZREVRANGE+HGETALL) so a wedged
@@ -137,7 +155,12 @@ func (a *API) handleFarmSweep(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), farmQueueProbeTimeout)
 	defer cancel()
 	if err := a.farmQ.Enqueue(ctx, job); err != nil {
-		http.Error(w, "enqueue failed: "+err.Error(), http.StatusInternalServerError)
+		// Contract (FARM_QUEUE_PROTOCOL.md, Manager HTTP surface): "503 if
+		// Redis/meta unavailable" — an enqueue that can't reach Redis is the
+		// unavailable case, not a manager bug, so 503 (retryable) not 500.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "enqueue failed (Redis/meta unreachable): " + err.Error(),
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -215,4 +238,29 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 		"queue_depth": depth,
 		"jobs":        jobs,
 	})
+}
+
+// handleFarmJobsClear is POST /api/farm/jobs/clear. Clears terminal
+// (done/failed) records from the Recent-jobs list — and prunes any
+// leaked index entries — via farmqueue.ClearFinished. queued/running
+// jobs are preserved so an in-flight sweep is never orphaned. Returns
+// {"cleared": N}. 503 when the queue is unconfigured (no meta/redis URL).
+func (a *API) handleFarmJobsClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.farmQ == nil {
+		http.Error(w, "farm queue unavailable (manager has no meta/redis URL)", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), farmQueueProbeTimeout)
+	defer cancel()
+	n, err := a.farmQ.ClearFinished(ctx)
+	if err != nil {
+		log.Printf("manager: farm jobs clear failed: %v", err)
+		http.Error(w, "clear failed", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cleared": n})
 }

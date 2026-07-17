@@ -5,8 +5,10 @@
 # Steps:
 #   1. Rebuild the Go c-archive (libnfsd.a + libnfsd.h)
 #   2. Build the Swift app via Swift Package Manager (release config)
+#      2b. Build the QuickLook thumbnail appex (JuiceMountThumbnails)
 #   3. Assemble the .app bundle with proper Info.plist and Resources
-#   4. Ad-hoc codesign so macOS allows it to run
+#      (including Contents/PlugIns/JuiceMountThumbnails.appex)
+#   4. Codesign inside-out (Sparkle helpers, appex, then the app)
 #
 # Output: build/JuiceMount.app
 #
@@ -62,7 +64,11 @@ cd "$SWIFT_PKG"
 # pass but production behavior is stale." Painful to debug; cheap to
 # prevent.
 rm -rf "$SWIFT_PKG/.build/$SWIFT_CONFIG/JuiceMount"
-swift build -c "$SWIFT_CONFIG" \
+# --product JuiceMount: the -Xlinker flags below (libnfsd.a, app frameworks,
+# Sparkle rpath) belong to the app executable ONLY. The thumbnail appex is
+# built in step 2b as a separate product so these flags never leak into its
+# link (and its differing link flags never dirty the app's incremental build).
+swift build -c "$SWIFT_CONFIG" --product JuiceMount \
     -Xlinker "-L$BUILD_DIR" \
     -Xlinker "-lnfsd" \
     -Xlinker "-framework" -Xlinker "CoreFoundation" \
@@ -86,6 +92,22 @@ if [ ! -f "$SWIFT_BIN" ]; then
     exit 1
 fi
 echo "    Built: $SWIFT_BIN"
+
+# 2b. QuickLook thumbnail appex executable. A tiny sandboxed XPC process that
+# serves the farm-pre-rendered posters from the daemon's loopback endpoint
+# (127.0.0.1:11050/thumb-local) so Finder never decodes remote video just to
+# draw a thumbnail; on any miss/error it fails fast and macOS falls back to
+# Apple's generator. Its link settings (QuickLookThumbnailing etc.) live in
+# Package.swift — no -Xlinker flags here on purpose (see step 2 comment).
+echo ""
+echo "==> [2b] Building QuickLook thumbnail appex (JuiceMountThumbnails)..."
+swift build -c "$SWIFT_CONFIG" --product JuiceMountThumbnails
+APPEX_BIN="$SWIFT_PKG/.build/$SWIFT_CONFIG/JuiceMountThumbnails"
+if [ ! -f "$APPEX_BIN" ]; then
+    echo "ERROR: appex binary not found at $APPEX_BIN"
+    exit 1
+fi
+echo "    Built: $APPEX_BIN"
 
 # 3. Assemble the .app bundle
 echo ""
@@ -232,6 +254,29 @@ else
 fi
 # --- end Sparkle.framework embed --------------------------------------------
 
+# --- QuickLook thumbnail appex embed -----------------------------------------
+# Contents/PlugIns/JuiceMountThumbnails.appex — the QuickLook thumbnail
+# provider built in step 2b. This is the ONLY extension JuiceMount ships; the
+# PlugIns guard at the end of this script enforces exactly that.
+APPEX_DIR="$APP_DIR/Contents/PlugIns/JuiceMountThumbnails.appex"
+mkdir -p "$APPEX_DIR/Contents/MacOS"
+cp "$APPEX_BIN" "$APPEX_DIR/Contents/MacOS/JuiceMountThumbnails"
+cp "$SWIFT_PKG/Resources/JuiceMountThumbnails-Info.plist" "$APPEX_DIR/Contents/Info.plist"
+# Keep the appex version in lockstep with the app's (single source of truth:
+# the app Info.plist already copied above) so a release bump can't drift the
+# two apart — mismatched versions are a notarization/App-verify footgun.
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+APP_SHORT_VER="$($PLISTBUDDY -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
+APP_BUNDLE_VER="$($PLISTBUDDY -c 'Print :CFBundleVersion' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
+if [ -n "$APP_SHORT_VER" ]; then
+    "$PLISTBUDDY" -c "Set :CFBundleShortVersionString $APP_SHORT_VER" "$APPEX_DIR/Contents/Info.plist"
+fi
+if [ -n "$APP_BUNDLE_VER" ]; then
+    "$PLISTBUDDY" -c "Set :CFBundleVersion $APP_BUNDLE_VER" "$APPEX_DIR/Contents/Info.plist"
+fi
+echo "    Embedded: JuiceMountThumbnails.appex -> Contents/PlugIns/ (v${APP_SHORT_VER:-?})"
+# --- end QuickLook thumbnail appex embed --------------------------------------
+
 echo "    Bundle: $APP_DIR"
 
 # 4. Codesign
@@ -339,9 +384,23 @@ if [ "$SPARKLE_EMBEDDED" = 1 ]; then
 fi
 # --- end inside-out Sparkle signing -----------------------------------------
 
-# Sign the app LAST (its seal now covers the already-signed framework). No
-# --deep: every nested code item is signed explicitly above, and --deep would
-# re-sign Sparkle's helpers with the wrong (app) entitlements.
+# --- QuickLook thumbnail appex signing ---------------------------------------
+# Nested code signs BEFORE the app (inside-out), same rule as Sparkle above.
+# Unlike Sparkle's helpers, the appex signs WITH its own entitlements file:
+# app extensions MUST carry com.apple.security.app-sandbox (macOS refuses to
+# host unsandboxed appexes) plus network.client for the loopback poster
+# fetch. The app's entitlements.plist would be wrong here — do not reuse it.
+APPEX_ENT="$SWIFT_PKG/Resources/JuiceMountThumbnails.entitlements"
+if [ -d "$APPEX_DIR" ]; then
+    echo "    Signing JuiceMountThumbnails.appex ($SIGN_IDENTITY_LABEL)..."
+    codesign --force "${HARDEN_ARGS[@]}" --entitlements "$APPEX_ENT" --sign "$SIGN_IDENTITY" "$APPEX_DIR"
+fi
+# --- end appex signing --------------------------------------------------------
+
+# Sign the app LAST (its seal now covers the already-signed framework and
+# appex). No --deep: every nested code item is signed explicitly above, and
+# --deep would re-sign Sparkle's helpers and the appex with the wrong (app)
+# entitlements.
 CS_ARGS=(--force "${HARDEN_ARGS[@]}" --sign "$SIGN_IDENTITY")
 if [ -n "$ENT_FILE" ]; then
     CS_ARGS+=(--entitlements "$ENT_FILE")
@@ -440,27 +499,48 @@ if [ "$SIGN_IDENTITY" != "-" ] && [ "$NOTARIZED" != "yes" ]; then
     echo "             JM_ADHOC=1 to sign ad-hoc and launch instantly.${RESET}"
 fi
 
-# Guard: refuse to ship a build that contains a FileProvider extension.
+# Guard: Contents/PlugIns must contain EXACTLY JuiceMountThumbnails.appex —
+# the QuickLook thumbnail provider — and nothing else.
 #
-# Why: a Xcode-Debug build from an older JuiceMount project once registered
-# a FileProviderExtension domain with macOS. The registration persists in
-# fileproviderd's database FOREVER (even after the project is deleted),
-# silently routes /Volumes/zpool file access through file-coordination
-# arbitration, and pins filecoordinationd at 100%+ CPU. Recovery required
-# Finder's privileged XPC removeDomain to dislodge -- see
+# Why so strict: a Xcode-Debug build from an older JuiceMount project once
+# registered a FileProviderExtension domain with macOS. The registration
+# persists in fileproviderd's database FOREVER (even after the project is
+# deleted), silently routes /Volumes/zpool file access through
+# file-coordination arbitration, and pins filecoordinationd at 100%+ CPU.
+# Recovery required Finder's privileged XPC removeDomain to dislodge -- see
 # docs/no-fileprovider.md for the postmortem.
 #
-# JuiceMount serves files via NFS and FUSE. It does not need a FileProvider
-# extension. If somebody adds one (even an empty stub), this guard fires.
-if [ -d "$APP_DIR/Contents/PlugIns" ]; then
+# JuiceMount serves files via NFS and FUSE and needs no FileProvider
+# extension — ever. The ONE sanctioned extension is the QuickLook thumbnail
+# appex (extension point com.apple.quicklook.thumbnail), whose registration
+# is benign and user-visible in System Settings > Extensions. Anything else
+# appearing here (even an empty stub) fails the build; adding a new extension
+# means changing this guard intentionally and documenting its registration
+# lifecycle.
+PLUGINS_GUARD_FAIL=""
+if [ ! -d "$APP_DIR/Contents/PlugIns/JuiceMountThumbnails.appex" ]; then
+    PLUGINS_GUARD_FAIL="Contents/PlugIns/JuiceMountThumbnails.appex is missing (appex not assembled?)"
+else
+    UNEXPECTED_PLUGINS="$(find "$APP_DIR/Contents/PlugIns" -mindepth 1 -maxdepth 1 ! -name 'JuiceMountThumbnails.appex' -print 2>/dev/null)"
+    if [ -n "$UNEXPECTED_PLUGINS" ]; then
+        PLUGINS_GUARD_FAIL="unexpected item(s) in Contents/PlugIns: $UNEXPECTED_PLUGINS"
+    else
+        APPEX_POINT="$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' \
+            "$APP_DIR/Contents/PlugIns/JuiceMountThumbnails.appex/Contents/Info.plist" 2>/dev/null || true)"
+        if [ "$APPEX_POINT" != "com.apple.quicklook.thumbnail" ]; then
+            PLUGINS_GUARD_FAIL="JuiceMountThumbnails.appex extension point is '${APPEX_POINT:-<none>}' (want com.apple.quicklook.thumbnail)"
+        fi
+    fi
+fi
+if [ -n "$PLUGINS_GUARD_FAIL" ]; then
     echo ""
-    echo "ERROR: build output contains $APP_DIR/Contents/PlugIns"
-    echo "  Bundled extensions (especially FileProviderExtension) silently"
-    echo "  register with macOS on first launch and can persist as ghost"
-    echo "  domains for the life of this Mac. See docs/no-fileprovider.md."
-    echo "  If a future architectural change genuinely needs an app extension,"
-    echo "  remove this guard intentionally and document the removeDomain"
-    echo "  lifecycle plan."
+    echo "ERROR: PlugIns guard failed: $PLUGINS_GUARD_FAIL"
+    echo "  Bundled extensions silently register with macOS on first launch and"
+    echo "  can persist as ghost domains for the life of this Mac (a stray"
+    echo "  FileProviderExtension once pinned filecoordinationd at 100% CPU --"
+    echo "  see docs/no-fileprovider.md). Only the QuickLook thumbnail appex is"
+    echo "  sanctioned; anything new needs an explicit guard change plus a"
+    echo "  registration-lifecycle plan."
     exit 1
 fi
 

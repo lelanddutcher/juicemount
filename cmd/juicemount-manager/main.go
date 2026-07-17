@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -52,6 +53,8 @@ func main() {
 	stateFile := flag.String("state-file", os.Getenv("JM_STATE_FILE"), "Optional JSON path for job-history persistence (empty = jobs lost on restart). Bind-mount the dir to make history survive container churn.")
 	minioURL := flag.String("minio-url", envOr("JM_MINIO_URL", ""), "SLICE 2: MinIO base URL the Overview dashboard pings via /minio/health/live. Empty disables the MinIO probe (Overview card shows an actionable hint). Use the same URL Mac clients connect to so the dashboard reflects what they see.")
 	farmStatus := flag.String("farm-status", envOr("JM_FARM_STATUS", ""), "Path to the juicefarm rollup (farm-status.json) for the Farm tab. Empty = Farm tab shows an empty state. Mount the juicefarm-state volume read-only to enable.")
+	mountOwner := flag.String("mount-owner", envOr("JM_MOUNT_OWNER", ""), "POSIX owner (uid[:gid], e.g. 501:20) that migrated data is chowned to after an embedded-mode sync, so the CLIENT mounting the volume can WRITE it — not just read it. The manager runs as root on the NAS, so without this, `juicefs sync` leaves migrated files root:wheel and a uid-501 Mac client can only read them. Empty = leave raw sync ownership. Set to the uid your Mac client mounts as (usually 501:20).")
+	overviewMeta := flag.String("overview-meta", envOr("JM_OVERVIEW_META", ""), "Redis URL for the Overview tab's `juicefs status` + Redis INFO probes. Use this in EMBEDDED mode (--fuse-mount), where --meta is unavailable (mutually exclusive), so Overview still works. In standalone mode --meta already serves both and this can stay empty.")
 	flag.Parse()
 
 	roots := splitNonEmpty(*sourceRoots, ",")
@@ -68,18 +71,23 @@ func main() {
 		log.Fatal("--vol-name is required with --meta (standalone mode)")
 	}
 
+	ownerUID, ownerGID := parseOwner(*mountOwner)
+
 	mux := http.NewServeMux()
 	cfg := manager.Config{
-		JuiceFSBin:     *juicefsBin,
-		FUSEMount:      *fuseMount, // embedded mode if non-empty
-		MetaURL:        *metaURL,   // standalone mode if non-empty
-		VolName:        *volName,
-		SourceRoots:    roots,
-		DestMount:      *destMount,
-		AdminKey:       *adminKey,
-		StateFile:      *stateFile,
-		MinIOURL:       *minioURL,
-		FarmStatusPath: *farmStatus,
+		JuiceFSBin:      *juicefsBin,
+		FUSEMount:       *fuseMount, // embedded mode if non-empty
+		MetaURL:         *metaURL,   // standalone mode if non-empty
+		VolName:         *volName,
+		SourceRoots:     roots,
+		DestMount:       *destMount,
+		AdminKey:        *adminKey,
+		StateFile:       *stateFile,
+		MinIOURL:        *minioURL,
+		FarmStatusPath:  *farmStatus,
+		MountOwnerUID:   ownerUID,
+		MountOwnerGID:   ownerGID,
+		OverviewMetaURL: *overviewMeta,
 	}
 	mgr := manager.Register(mux, "", cfg)
 
@@ -128,6 +136,28 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseOwner parses a "uid[:gid]" mount-owner string into numeric ids.
+// Empty / unparseable → (0, -1), which the migration treats as "unset"
+// (uid <= 0 skips the post-sync chown, preserving raw ownership). A gid is
+// optional; when absent it returns -1, leaving the group unchanged.
+func parseOwner(s string) (uid, gid int) {
+	uid, gid = 0, -1
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return uid, gid
+	}
+	parts := strings.SplitN(s, ":", 2)
+	if u, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+		uid = u
+	}
+	if len(parts) == 2 {
+		if g, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+			gid = g
+		}
+	}
+	return uid, gid
 }
 
 func splitNonEmpty(s, sep string) []string {

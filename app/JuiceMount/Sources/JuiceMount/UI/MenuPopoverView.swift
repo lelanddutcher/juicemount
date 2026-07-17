@@ -36,6 +36,9 @@ struct MenuPopoverView: View {
     @State private var showStopEverythingConfirm = false
     /// True while a /spool-recover action (LB-5) is round-tripping.
     @State private var spoolRecoverInFlight = false
+    /// True while a "Why is it slow?" /diagnose run (INSTANT-NAV #14) is
+    /// round-tripping — the action row shows "Diagnosing…" and disables.
+    @State private var diagnoseBusy = false
     // Self-test dashboard (B.2). Health is fetched from /health on the
     // same 2s tick as cache-status. Each component is "ok" or a reason
     // string ("ping failed: …"); render as colored dots, full reason
@@ -55,6 +58,13 @@ struct MenuPopoverView: View {
     // Background-operation activity (4.10): polled from /activity on the same
     // 2s tick. nil until the first fetch lands; the row hides when not busy.
     @State private var activity: NFSBridge.Activity?
+    // Warm-up phase card (INSTANT-NAV): polled from GET /warmup while the
+    // popover is visible, at ~4s cadence — piggybacked on the existing 2s
+    // tick with a timestamp guard, no second timer. nil (endpoint
+    // unreachable / undecodable) or phase "steady" hides the card; the
+    // popover itself is never blocked on the fetch (background queue).
+    @State private var warmup: NFSBridge.WarmupStatus?
+    @State private var lastWarmupFetchAt: Date = .distantPast
     // Clear-failed confirm flow (4.8): the preview result drives an alert that
     // shows what will be discarded BEFORE the destructive confirm.
     @State private var showClearFailedConfirm = false
@@ -62,6 +72,7 @@ struct MenuPopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            warmupCard
             header
             Divider()
             volumeSection
@@ -103,6 +114,43 @@ struct MenuPopoverView: View {
         server.refreshCacheStatus()
         updatePinRate()
         refreshSelfTest()
+        refreshWarmup()
+    }
+
+    /// Warm-up card poll. Rides the popover's 2s tick but self-throttles to
+    /// ~4s (the card is coarse startup progress; hammering /warmup buys
+    /// nothing). Fire-and-forget on a background queue — the blocking HTTP
+    /// helper must never run on MainActor. A nil result (endpoint
+    /// unreachable) HIDES the card by design: an unreachable control plane
+    /// already has louder surfaces, and a stale "Warming up" card over a
+    /// dead core would be a lie.
+    private func refreshWarmup() {
+        guard Date().timeIntervalSince(lastWarmupFetchAt) >= 3.5 else { return }
+        lastWarmupFetchAt = Date()
+        let metricsAddr = server.preferences.metricsAddr
+        DispatchQueue.global(qos: .utility).async {
+            let w = NFSBridge.warmupStatus(metricsAddr: metricsAddr)
+            DispatchQueue.main.async {
+                // Animate only the transitions that move layout (card
+                // appears/disappears, phase title swaps) so the popover
+                // doesn't flicker on a phase flip; steady-state progress
+                // updates publish plainly and the ProgressView tracks them.
+                if isWarmupCardVisible(warmup) != isWarmupCardVisible(w)
+                    || warmup?.phase != w?.phase {
+                    withAnimation(.easeInOut(duration: 0.25)) { warmup = w }
+                } else {
+                    warmup = w
+                }
+            }
+        }
+    }
+
+    /// Card visibility rule: a decoded snapshot in any non-steady phase.
+    /// Empty phase (older core / malformed body) counts as hidden — never
+    /// show an unlabeled progress card.
+    private func isWarmupCardVisible(_ w: NFSBridge.WarmupStatus?) -> Bool {
+        guard let w else { return false }
+        return !w.phase.isEmpty && !w.isSteady
     }
 
     /// B.2: pulls /health + /metrics on the same 2s cadence the
@@ -371,6 +419,36 @@ struct MenuPopoverView: View {
                 NSLog("[JuiceMount] verify-pins: re-enqueued %d / %d files", n, total)
                 DispatchQueue.main.async { refreshCacheStatus() }
             }.resume()
+        }
+    }
+
+    /// INSTANT-NAV #14 "Why is it slow?": runs the six-probe /diagnose
+    /// self-check off the main thread and presents the verdict in the
+    /// RemediationAlert style (status glyph + title per check; detail +
+    /// concrete fix for anything non-ok). The endpoint is time-bounded
+    /// server-side (~5 s worst case, checks run concurrently) so the
+    /// button can't hang the popover; while in flight the row shows
+    /// "Diagnosing…" and disables.
+    private func runDiagnose() {
+        diagnoseBusy = true
+        let metricsAddr = server.preferences.metricsAddr
+        DispatchQueue.global(qos: .userInitiated).async {
+            let report = NFSBridge.diagnose(metricsAddr: metricsAddr)
+            DispatchQueue.main.async {
+                diagnoseBusy = false
+                if let report {
+                    presentDiagnosis(report)
+                } else {
+                    // The control plane itself didn't answer — that IS a
+                    // diagnosis: the app core is stopped or not responding.
+                    // Reuse the standard remediation surface for it.
+                    presentRemediation(
+                        .generic(action: "Diagnose"),
+                        rawError: "no response from http://\(metricsAddr)/diagnose — the app core is stopped or not responding",
+                        extraContext: "server state: \(server.state)"
+                    )
+                }
+            }
         }
     }
 
@@ -1409,6 +1487,87 @@ struct MenuPopoverView: View {
         ByteCountFormatter.string(fromByteCount: b, countStyle: .file)
     }
 
+    // MARK: - Warm-up card (INSTANT-NAV)
+
+    /// Top-of-popover card shown only while the core is still climbing its
+    /// startup ladder (phase != "steady"): phase title, determinate
+    /// progress, the Go-authored hint verbatim, and during indexing the
+    /// "N / ~M entries" counter. Styled like the existing popover sections
+    /// (caption typography, 12/8 padding like the header, trailing Divider)
+    /// so it reads native above the header. Hidden the moment the phase
+    /// reaches steady or /warmup stops answering.
+    @ViewBuilder
+    private var warmupCard: some View {
+        if let w = warmup, isWarmupCardVisible(w) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: warmupIcon(w.phase))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(warmupTitle(w.phase))
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    Spacer()
+                    Text("\(Int(min(max(w.progressPct, 0), 100)))%")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                ProgressView(value: min(max(w.progressPct / 100.0, 0), 1))
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+                if w.phase == "indexing", w.indexTotalEst > 0 {
+                    Text("\(w.indexScanned.formatted()) / ~\(w.indexTotalEst.formatted()) entries")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                if !w.hint.isEmpty {
+                    Text(w.hint)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .help(warmupTooltip(w))
+            Divider()
+        }
+    }
+
+    /// Phase → user-facing title. Unknown (future) phases fall back to the
+    /// generic warming title rather than leaking an internal identifier.
+    private func warmupTitle(_ phase: String) -> String {
+        switch phase {
+        case "starting": return "Starting up…"
+        case "indexing": return "Rebuilding index…"
+        case "warming":  return "Warming up…"
+        default:         return "Warming up…"
+        }
+    }
+
+    private func warmupIcon(_ phase: String) -> String {
+        switch phase {
+        case "starting": return "hourglass"
+        case "indexing": return "list.bullet"
+        default:         return "flame.fill"
+        }
+    }
+
+    /// Hover detail: the fields worth exposing without spending card rows
+    /// on them (uptime, serving flag, warm counters).
+    private func warmupTooltip(_ w: NFSBridge.WarmupStatus) -> String {
+        var lines = [
+            "Uptime \(formatAge(w.uptimeSec)) · \(w.serving ? "serving files" : "not serving yet")"
+        ]
+        if w.indexTotalEst > 0 {
+            lines.append("Index: \(w.indexScanned.formatted()) of ~\(w.indexTotalEst.formatted()) entries")
+        }
+        if w.sidecarCachePut > 0 || w.thumbWarmHydrated > 0 {
+            lines.append("Warmed: \(w.sidecarCachePut.formatted()) sidecars · \(w.thumbWarmHydrated.formatted()) thumbnails")
+        }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - Header (at-a-glance, Phase 3)
     //
     // Three glanceable elements — what the user ultimately needs to know:
@@ -1438,6 +1597,7 @@ struct MenuPopoverView: View {
             cacheGlanceRow
             uploadsGlanceRow
             mountRemedyRow
+            localNetworkRemedyRow
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -1483,12 +1643,56 @@ struct MenuPopoverView: View {
         }
     }
 
+    /// #106 remedy row: macOS silently resets the app's Local Network
+    /// privacy permission on every rebuild/re-sign/update; the backend then
+    /// fails EHOSTUNREACH while the network is fine and the app used to
+    /// just look "offline" with no explanation. The Go health monitor
+    /// detects the signature (health/localnet.go, conservative — never
+    /// while genuinely offline) and this row names the fix, with a button
+    /// straight to the right System Settings pane.
+    @ViewBuilder
+    private var localNetworkRemedyRow: some View {
+        if server.localNetworkPermissionSuspected, isRunningLikeForMountRemedy {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(Self.glanceAmber)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Local Network permission needed")
+                        .font(.caption)
+                        .foregroundStyle(Self.glanceAmber)
+                    Text("Enable in System Settings → Privacy & Security → Local Network")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork") {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    Text("Open Settings").font(.caption)
+                }
+                .help("Opens System Settings → Privacy & Security → Local Network. Enable JuiceMount there, then relaunch the app.")
+            }
+        }
+    }
+
     /// (b) "X cached · Y GB free" + a thin proportional bar of cache used vs
     /// cache capacity. Cached = the TRUE on-disk JuiceFS block cache
     /// (`cache_used_bytes`, every block read — not just pinned); the bar is
     /// used-vs-capacity (`capacity.cache_capacity_bytes`, the honest pairing).
     /// The pinned-resident readiness number lives in the cache section's
     /// "pinned" line below.
+    ///
+    /// Pinned overlay: a second segment from the bar's left edge shows how
+    /// much of the used cache is held by PINNED content
+    /// (`capacity.pinned_bytes`, clamped to what's actually on disk — pins
+    /// still downloading shouldn't paint cache they don't occupy yet).
+    /// Orange = the app's established pin identity (pin.fill rows, the Pin
+    /// button tint); system orange adapts to light/dark. Reading order:
+    /// [pinned][other cache][free]. With zero pins the overlay and its
+    /// legend vanish and the bar renders exactly as before.
     private var cacheGlanceRow: some View {
         // Block-cache used vs the cache's sustainable capacity (the honest
         // pairing). Fall back to disk free for the "GB free" label when the
@@ -1496,6 +1700,11 @@ struct MenuPopoverView: View {
         let cachedBytes = max(0, cacheStatus.cache_used_bytes)
         let capacityBytes = max(0, cacheStatus.capacity.cache_capacity_bytes)
         let fraction = capacityBytes > 0 ? Double(cachedBytes) / Double(capacityBytes) : 0
+        let pinnedBytes = min(max(0, cacheStatus.capacity.pinned_bytes), cachedBytes)
+        let pinnedFraction = capacityBytes > 0 ? Double(pinnedBytes) / Double(capacityBytes) : 0
+        let otherBytes = max(0, cachedBytes - pinnedBytes)
+        let freeBytes = max(0, capacityBytes - cachedBytes)
+        let legend = "Pinned \(formatBytes(pinnedBytes)) · Other cache \(formatBytes(otherBytes)) · Free \(formatBytes(freeBytes))"
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
                 Image(systemName: "internaldrive")
@@ -1512,9 +1721,40 @@ struct MenuPopoverView: View {
                     Capsule()
                         .fill(Color.accentColor.opacity(0.85))
                         .frame(width: max(0, min(1, fraction)) * geo.size.width)
+                    if pinnedFraction > 0 {
+                        Capsule()
+                            .fill(Color.orange.opacity(0.9))
+                            .frame(width: max(0, min(1, pinnedFraction)) * geo.size.width)
+                    }
                 }
             }
             .frame(height: 3)
+            .help(pinnedBytes > 0
+                  ? "\(legend)\n\nPinned content is kept resident for offline use; other cache is recently-read blocks JuiceFS may evict."
+                  : "Cache used vs. its capacity.")
+            // Quiet legend — only earns its row when pins actually occupy
+            // cache (capacity known implies the byte split is meaningful).
+            if pinnedBytes > 0 && capacityBytes > 0 {
+                HStack(spacing: 5) {
+                    legendChip(color: Color.orange.opacity(0.9), label: "Pinned \(formatBytes(pinnedBytes))")
+                    legendChip(color: Color.accentColor.opacity(0.85), label: "Other \(formatBytes(otherBytes))")
+                    legendChip(color: Color.secondary.opacity(0.35), label: "Free \(formatBytes(freeBytes))")
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    /// One "● label" legend entry under the cache bar. Dot colors match the
+    /// bar segments exactly so the legend explains itself.
+    private func legendChip(color: Color, label: String) -> some View {
+        HStack(spacing: 3) {
+            Circle()
+                .fill(color)
+                .frame(width: 5, height: 5)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
     }
 
@@ -1567,6 +1807,14 @@ struct MenuPopoverView: View {
         case .healthy:
             return "Healthy"
         case .degraded:
+            // #106: name the actual cause when the backend is unreachable
+            // because macOS is denying Local Network access — "Redis
+            // unreachable" is technically true but sends the user hunting
+            // for network problems that don't exist. The remedy row with
+            // the System Settings button sits right below.
+            if server.localNetworkPermissionSuspected, isRunningLikeForMountRemedy {
+                return "Local Network permission needed"
+            }
             // Running-but-unmounted is its own honest message (review B-gap:
             // this used to fall through to .running's "Connected" — amber dot
             // with a green word). The Mount Now remedy row sits right below.
@@ -1769,6 +2017,20 @@ struct MenuPopoverView: View {
                     server.syncNow()
                     triggerVerifyPins()
                 }
+            )
+
+            // INSTANT-NAV #14: on-demand self-diagnosis of the six known
+            // silent-failure classes (Local Network permission, tunnel
+            // route, FUSE identity, backend components, spool backlog,
+            // link RTT). Deliberately NOT gated on isRunningLike — the
+            // whole point is answering "why is it slow/broken", and a
+            // dead control plane is itself a diagnosis (surfaced via the
+            // remediation alert in runDiagnose).
+            ActionButton(
+                title: diagnoseBusy ? "Diagnosing…" : "Why is it slow?",
+                systemImage: "stethoscope",
+                disabled: diagnoseBusy,
+                action: { runDiagnose() }
             )
 
             ActionButton(

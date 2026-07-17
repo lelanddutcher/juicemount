@@ -147,6 +147,12 @@ type JobManager struct {
 	schedules        scheduleStore
 	pendingSchedules []scheduleState
 
+	// maintenanceSchedules is the per-lever GC/FSCK/compact cron store.
+	// Same pending-buffer dance as schedules so a state-file load before
+	// the store is attached doesn't drop persisted rows.
+	maintenanceSchedules  maintenanceScheduleStore
+	pendingMaintSchedules []maintenanceScheduleRow
+
 	// settings is the SLICE-8 hook for the per-instance Settings store
 	// (per-job defaults, theme, log retention, etc.). Same lifecycle
 	// pattern as destinations/schedules — Register attaches the store
@@ -181,6 +187,14 @@ type scheduleStore interface {
 	Stop()
 }
 
+// maintenanceScheduleStore is the per-lever maintenance cron counterpart.
+// Opaque to JobManager — maintenance_schedule.go owns its lifecycle.
+type maintenanceScheduleStore interface {
+	snapshot() []maintenanceScheduleRow
+	load(rows []maintenanceScheduleRow)
+	Stop()
+}
+
 // settingsStore is the SLICE-8 counterpart. Same shape as
 // destinationStore — opaque to JobManager so settings.go owns its own
 // persistence/lifecycle. snapshot returns a pointer (not a value) so a
@@ -211,6 +225,9 @@ type persistedState struct {
 	// identically. Schema version stays at 2 because v2 readers tolerate
 	// unknown keys (Go's json.Unmarshal leaves them at zero values).
 	Schedules []scheduleState `json:"schedules,omitempty"`
+	// Per-lever maintenance schedules (GC/FSCK/compact-meta on a cron).
+	// omitempty + additive to v2, same convention as Schedules.
+	MaintenanceSchedules []maintenanceScheduleRow `json:"maintenance_schedules,omitempty"`
 	// SLICE 8: per-instance Settings. Pointer + omitempty so that a v1
 	// or unseeded v2 state file (no settings key) decodes to nil. The
 	// Settings handler treats nil as "use code defaults" — GET returns
@@ -218,6 +235,20 @@ type persistedState struct {
 	// first PUT materializes a settingsState and from that point on the
 	// state file carries the configured values.
 	Settings *settingsState `json:"settings,omitempty"`
+	// Permissions rule #0 — the default owner migrated data is chowned to
+	// (RunSyncSpec.OwnerUID). Pointer + omitempty so a v1/unseeded-v2 file
+	// (no mount_owner key) decodes to nil = "use the --mount-owner flag that
+	// seeded the spec". Schema stays v2 (v2 readers tolerate unknown keys,
+	// same as settings/schedules). Grows into a permissions.rules[] list
+	// later, with this as rule #0.
+	MountOwner *mountOwnerState `json:"mount_owner,omitempty"`
+}
+
+// mountOwnerState is the on-disk form of the default migration owner.
+// GID == -1 encodes "leave group unchanged" (see chownSpec, sync.go).
+type mountOwnerState struct {
+	UID int `json:"uid"`
+	GID int `json:"gid"`
 }
 
 // NewJobManager constructs a JobManager. juicefsBin is the path to
@@ -329,6 +360,12 @@ func (m *JobManager) SetStateFile(path string) {
 	} else {
 		m.pendingSchedules = s.Schedules
 	}
+	// Same dance for the per-lever maintenance schedules.
+	if m.maintenanceSchedules != nil {
+		m.maintenanceSchedules.load(s.MaintenanceSchedules)
+	} else {
+		m.pendingMaintSchedules = s.MaintenanceSchedules
+	}
 	// SLICE 8: same pattern for settings. The settingsStore.load
 	// contract distinguishes nil (no settings persisted yet — use code
 	// defaults) from a non-nil row, so we pass s.Settings through
@@ -337,6 +374,14 @@ func (m *JobManager) SetStateFile(path string) {
 		m.settings.load(s.Settings)
 	} else {
 		m.pendingSettings = s.Settings
+	}
+	// Permissions rule #0: a runtime-SET default owner (persisted) wins over
+	// the --mount-owner flag that seeded m.spec in NewJobManager — the flag
+	// is only the bootstrap default. Applied directly to m.spec, the field
+	// applyPostSyncPermissions reads per migration job.
+	if s.MountOwner != nil {
+		m.spec.OwnerUID = s.MountOwner.UID
+		m.spec.OwnerGID = s.MountOwner.GID
 	}
 	// Log v1→v2 schema upgrades distinctly so an operator can spot
 	// them in startup logs without diffing the state file.
@@ -387,6 +432,20 @@ func (m *JobManager) SetSchedules(s scheduleStore) {
 	}
 }
 
+// SetMaintenanceSchedules attaches the per-lever maintenance cron store.
+// Mirrors SetSchedules — drains any pending rows the state-file loader
+// buffered before the store was attached.
+func (m *JobManager) SetMaintenanceSchedules(s maintenanceScheduleStore) {
+	m.mu.Lock()
+	m.maintenanceSchedules = s
+	pending := m.pendingMaintSchedules
+	m.pendingMaintSchedules = nil
+	m.mu.Unlock()
+	if s != nil && pending != nil {
+		s.load(pending)
+	}
+}
+
 // SetSettings attaches the settings store. Mirrors SetDestinations /
 // SetSchedules — drains any pending row the state-file loader buffered
 // before the store was attached. nil pending stays nil (the store's
@@ -404,6 +463,28 @@ func (m *JobManager) SetSettings(s settingsStore) {
 		// when no settings key was in the state file.
 		s.load(pending)
 	}
+}
+
+// MountOwner returns the live default migration owner (Permissions rule #0):
+// the uid:gid applyPostSyncPermissions chowns a migration's destination to.
+// Reads the same m.spec field the migration consumes, so the Permissions tab
+// shows the EFFECTIVE owner — the --mount-owner flag default until the first
+// SET, the persisted value thereafter. gid < 0 = "leave group unchanged".
+func (m *JobManager) MountOwner() (uid, gid int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.spec.OwnerUID, m.spec.OwnerGID
+}
+
+// SetMountOwner updates the default migration owner and persists it. Takes
+// effect on the next submitted job (run re-reads m.spec under lock). gid < 0
+// leaves the group unchanged (chownSpec semantics).
+func (m *JobManager) SetMountOwner(uid, gid int) {
+	m.mu.Lock()
+	m.spec.OwnerUID = uid
+	m.spec.OwnerGID = gid
+	m.saveStateLocked()
+	m.mu.Unlock()
 }
 
 // saveStateLocked atomically writes the current jobs map + order to
@@ -435,6 +516,11 @@ func (m *JobManager) saveStateLocked() {
 	} else if m.pendingSchedules != nil {
 		out.Schedules = append([]scheduleState(nil), m.pendingSchedules...)
 	}
+	if m.maintenanceSchedules != nil {
+		out.MaintenanceSchedules = m.maintenanceSchedules.snapshot()
+	} else if m.pendingMaintSchedules != nil {
+		out.MaintenanceSchedules = append([]maintenanceScheduleRow(nil), m.pendingMaintSchedules...)
+	}
 	// SLICE 8: persist settings if a store is wired, else round-trip
 	// any pending row so an early save (e.g. before SetSettings has
 	// fired in Register's ordering window) doesn't blank the settings
@@ -444,6 +530,11 @@ func (m *JobManager) saveStateLocked() {
 	} else if m.pendingSettings != nil {
 		cp := *m.pendingSettings
 		out.Settings = &cp
+	}
+	// Persist the runtime default owner iff a real (non-root) owner is set,
+	// so an unset spec never writes a misleading mount_owner:{0,-1}.
+	if m.spec.OwnerUID > 0 {
+		out.MountOwner = &mountOwnerState{UID: m.spec.OwnerUID, GID: m.spec.OwnerGID}
 	}
 	for id, j := range m.jobs {
 		j.mu.Lock()
@@ -569,18 +660,23 @@ func (j *Job) GetSnapshot() Job {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	// Copy by value; listeners + cancel + mu are zero-valued in the
-	// returned struct.
+	// returned struct. Must include EVERY json-serialized field — this
+	// snapshot is what the /api/jobs handlers marshal, so an omission
+	// silently drops that field from the API (e.g. schedule_name).
 	return Job{
-		ID:          j.ID,
-		Source:      j.Source,
-		Destination: j.Destination,
-		Options:     j.Options,
-		State:       j.State,
-		CreatedAt:   j.CreatedAt,
-		StartedAt:   j.StartedAt,
-		FinishedAt:  j.FinishedAt,
-		Last:        j.Last,
-		Error:       j.Error,
+		ID:           j.ID,
+		Source:       j.Source,
+		Destination:  j.Destination,
+		Options:      j.Options,
+		State:        j.State,
+		CreatedAt:    j.CreatedAt,
+		StartedAt:    j.StartedAt,
+		FinishedAt:   j.FinishedAt,
+		TotalBytes:   j.TotalBytes,
+		Direction:    j.Direction,
+		ScheduleName: j.ScheduleName,
+		Last:         j.Last,
+		Error:        j.Error,
 	}
 }
 
@@ -674,6 +770,7 @@ func (m *JobManager) Subscribe(id string) (<-chan ProgressEvent, func(), bool) {
 func (m *JobManager) StopAll() {
 	m.mu.RLock()
 	sched := m.schedules
+	maintSched := m.maintenanceSchedules
 	ids := make([]string, 0, len(m.jobs))
 	for id := range m.jobs {
 		ids = append(ids, id)
@@ -681,6 +778,9 @@ func (m *JobManager) StopAll() {
 	m.mu.RUnlock()
 	if sched != nil {
 		sched.Stop()
+	}
+	if maintSched != nil {
+		maintSched.Stop()
 	}
 	for _, id := range ids {
 		m.Cancel(id)

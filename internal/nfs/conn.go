@@ -16,6 +16,8 @@ import (
 	xdr2 "github.com/rasky/go-xdr/xdr2"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
+
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
 
 // [JM5] Buffer pool to avoid allocations on the RPC hot path.
@@ -199,10 +201,28 @@ func (c *conn) serve(ctx context.Context) {
 		isWrite := w.req.Header.Prog == nfsServiceID &&
 			w.req.Header.Proc == uint32(NFSProcedureWrite)
 		if !isWrite && c.Server.rpcSem != nil {
+			// [S6 / H1 grader] Admission is the read head-of-line point: when the
+			// shared rpcSem is saturated the reader parks HERE, blocking every
+			// following LOOKUP/GETATTR/READ on this single TCP mount. Grade the
+			// wait WITHOUT adding cost to the uncontended path: attempt a
+			// NON-BLOCKING acquire first — on the common warm case (a free slot)
+			// we take it immediately with NO time.Now(), NO atomic, NO record.
+			// Only when the slot is FULL (exactly the HOL case we want to measure)
+			// do we sample the clock once and record the blocked duration via an
+			// atomic CAS-max gauge + threshold buckets (ObserveAdmitWait — no
+			// lock, no syscall). Warm expectation: rpc_admit_wait_us stays 0. A
+			// fat tail here PROVES admission HOL before any readSem surgery.
 			select {
 			case c.Server.rpcSem <- struct{}{}:
-			case <-connCtx.Done():
-				return
+				// fast path: slot free, zero admission wait — record nothing.
+			default:
+				admitStart := time.Now()
+				select {
+				case c.Server.rpcSem <- struct{}{}:
+					metrics.Default().ObserveAdmitWait(time.Since(admitStart))
+				case <-connCtx.Done():
+					return
+				}
 			}
 		}
 
@@ -367,12 +387,23 @@ func (c *conn) handle(ctx context.Context, w *response) error {
 		return c.err(ctx, w, &ResponseCodeProcUnavailableError{})
 	}
 	appError := handler(ctx, w, c.Server.Handler)
+	if nfsTrace {
+		if appError != nil {
+			Log.Infof("TRACE rpc %s -> ERR %v", w.req.String(), appError)
+		} else {
+			Log.Infof("TRACE rpc %s -> OK", w.req.String())
+		}
+	}
 	// A wedged JuiceFS surfaces as ErrFUSETimeout from the filesystem layer.
 	// Map it (however the handler wrapped it) to NFS3ERR_JUKEBOX so the client
 	// retries instead of aborting on a permanent error. The handler has already
 	// returned — freeing its rpcSem slot — which is what keeps a backend wedge
 	// from exhausting the slot budget and staling the whole mount.
-	if appError != nil && errors.Is(appError, ErrFUSETimeout) {
+	// Same treatment for a backend blip (#9): the op failed only because the
+	// metadata backend was mid-restart; a client retry after the reconnect
+	// succeeds. Both sentinels are BOUNDED at their source (wedge probe /
+	// blipParkWindow), so neither can tarpit forever.
+	if appError != nil && (errors.Is(appError, ErrFUSETimeout) || errors.Is(appError, ErrBackendBlip)) {
 		appError = &NFSStatusError{NFSStatusJukebox, appError}
 		// Count it: a JUKEBOX reply is a "success" to the latency metrics, so a
 		// retry storm (the "error 100060" mechanism) is otherwise invisible.

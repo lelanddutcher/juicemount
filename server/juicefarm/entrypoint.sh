@@ -32,7 +32,17 @@ TARGET="${JM_FARM_TARGET:-$MNT}"
 DB="${JM_FARM_DB:-/state/derivatives.db}"
 PRODUCER="${JM_FARM_PRODUCER:-linux-farm}"
 MODE="${JM_FARM_MODE:-all}"
-WORKERS="${JM_FARM_WORKERS:-4}"
+# Derivative work is decode-bound — each ffmpeg wants only a few threads
+# (frame-threading is sub-linear), so throughput comes from running MANY
+# files in parallel, not from one job grabbing the box. Size the pool so
+# workers × ffmpeg-threads ≈ cores. The old flat default of 4 left a
+# many-core NAS ~80% idle (2026-07-14 throughput fix: a 90k-file sweep
+# ETA'd 190h, mostly from thread oversubscription + full-decode filmstrips).
+NPROC="$(nproc 2>/dev/null || echo 4)"
+FFMPEG_THREADS="${JM_FARM_FFMPEG_THREADS:-2}"
+_DEF_WORKERS=$(( NPROC / FFMPEG_THREADS ))
+[ "$_DEF_WORKERS" -lt 2 ] && _DEF_WORKERS=2
+WORKERS="${JM_FARM_WORKERS:-$_DEF_WORKERS}"
 INTERVAL="${JM_FARM_INTERVAL:-900}"
 VCODEC="${JM_FARM_VCODEC:-libx264}"
 CRF="${JM_FARM_CRF:-21}"
@@ -90,7 +100,7 @@ do_pass() {
   # record 0. These are recorded for display; the wrap above actually applies them.
   ion="${IONICE:-0}"
   # shellcheck disable=SC2086
-  $wrap jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" -status "$STATUS" \
+  $wrap jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" -ffmpeg-threads "$FFMPEG_THREADS" -status "$STATUS" \
     -nice "$NICE" -ionice "$ion" -interval "$INTERVAL" "$@" -root "$TARGET" || true
 }
 
@@ -121,7 +131,7 @@ if [ "${JM_FARM_QUEUE:-0}" = "1" ] || [ "$MODE" = "queue" ]; then
   # shellcheck disable=SC2086
   exec $wrap jmfarm -queue -meta "$JM_META" -mount "$MNT" -db "$DB" -producer "$PRODUCER" \
     -status "$STATUS" -nice "$NICE" -ionice "$ion" \
-    -concurrency "$WORKERS" -proxy-concurrency "$PROXY_WORKERS" \
+    -concurrency "$WORKERS" -ffmpeg-threads "$FFMPEG_THREADS" -proxy-concurrency "$PROXY_WORKERS" \
     -vcodec "$VCODEC" -crf "$CRF" -preset "$PRESET" -whisper-model "$MODEL"
 fi
 

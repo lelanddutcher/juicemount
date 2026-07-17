@@ -802,6 +802,162 @@ public enum NFSBridge {
         return result
     }
 
+    // MARK: - Warm-up phase (INSTANT-NAV)
+
+    /// The `/warmup` snapshot — where the core is in its startup ladder:
+    /// "starting" | "indexing" | "warming" | "steady". The popover shows a
+    /// progress card until the phase reaches steady. `hint` is authored by
+    /// the Go side and rendered verbatim (it already explains "may be
+    /// slower until done"). The index_* fields let the indexing phase show
+    /// "N / ~M entries"; the counters are decoded for tooltips/diagnostics.
+    public struct WarmupStatus: Codable, Equatable {
+        public var phase: String = ""
+        public var progressPct: Double = 0
+        public var hint: String = ""
+        public var uptimeSec: Int64 = 0
+        public var serving: Bool = false
+        public var indexPct: Double = 0
+        public var indexScanned: Int64 = 0
+        public var indexTotalEst: Int64 = 0
+        public var sidecarCachePut: Int64 = 0
+        public var thumbWarmHydrated: Int64 = 0
+
+        public var isSteady: Bool { phase == "steady" }
+
+        enum CodingKeys: String, CodingKey {
+            case phase, hint, serving
+            case progressPct = "progress_pct"
+            case uptimeSec = "uptime_sec"
+            case indexPct = "index_pct"
+            case indexScanned = "index_scanned"
+            case indexTotalEst = "index_total_est"
+            case sidecarCachePut = "sidecar_cache_put"
+            case thumbWarmHydrated = "thumb_warm_hydrated"
+        }
+
+        public init() {}
+
+        /// Null/absence-tolerant decode — same JSON-null discipline as
+        /// CacheStatus et al. (a nil Go value must never abort the decode
+        /// and silently blank the card).
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.phase = try c.decodeIfPresent(String.self, forKey: .phase) ?? ""
+            self.progressPct = try c.decodeIfPresent(Double.self, forKey: .progressPct) ?? 0
+            self.hint = try c.decodeIfPresent(String.self, forKey: .hint) ?? ""
+            self.uptimeSec = try c.decodeIfPresent(Int64.self, forKey: .uptimeSec) ?? 0
+            self.serving = try c.decodeIfPresent(Bool.self, forKey: .serving) ?? false
+            self.indexPct = try c.decodeIfPresent(Double.self, forKey: .indexPct) ?? 0
+            self.indexScanned = try c.decodeIfPresent(Int64.self, forKey: .indexScanned) ?? 0
+            self.indexTotalEst = try c.decodeIfPresent(Int64.self, forKey: .indexTotalEst) ?? 0
+            self.sidecarCachePut = try c.decodeIfPresent(Int64.self, forKey: .sidecarCachePut) ?? 0
+            self.thumbWarmHydrated = try c.decodeIfPresent(Int64.self, forKey: .thumbWarmHydrated) ?? 0
+        }
+    }
+
+    /// Fetch the warm-up snapshot. Blocking — call from a background queue.
+    /// Endpoint: `/warmup` (GET). Returns nil when the metrics server is
+    /// unreachable or the body is unparseable (logged, not swallowed) —
+    /// the popover hides the card on nil rather than blocking anything.
+    public static func warmupStatus(metricsAddr: String = "127.0.0.1:11050") -> WarmupStatus? {
+        guard let url = URL(string: "http://\(metricsAddr)/warmup") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 2
+        let sem = DispatchSemaphore(value: 0)
+        var result: WarmupStatus?
+        let session = loopbackSession()
+        session.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            do {
+                result = try JSONDecoder().decode(WarmupStatus.self, from: data)
+            } catch {
+                appLog("warmupStatus decode failed — returning nil: \(error)")
+            }
+        }.resume()
+        sem.wait()
+        session.finishTasksAndInvalidate()
+        return result
+    }
+
+    // MARK: - Self-diagnosis (INSTANT-NAV #14 "Why is it slow?")
+
+    /// One check from `/diagnose`. Mirrors diagnoseCheck in
+    /// bridge/diagnose.go: id/title identify the probe, status is
+    /// "ok" | "warn" | "fail", and remedy is the concrete next step for a
+    /// non-ok check.
+    public struct DiagnoseCheck: Codable, Equatable, Identifiable {
+        public var checkID: String = ""
+        public var title: String = ""
+        public var status: String = ""
+        public var detail: String = ""
+        public var remedy: String = ""
+        public var id: String { checkID }
+
+        public var isOK: Bool { status == "ok" }
+
+        enum CodingKeys: String, CodingKey {
+            case checkID = "id"
+            case title, status, detail, remedy
+        }
+
+        /// Tolerant decode — same JSON-null discipline as Activity et al.
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.checkID = try c.decodeIfPresent(String.self, forKey: .checkID) ?? ""
+            self.title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+            self.status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
+            self.detail = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
+            self.remedy = try c.decodeIfPresent(String.self, forKey: .remedy) ?? ""
+        }
+    }
+
+    /// The `/diagnose` report — overall is "ok" | "degraded" | "broken".
+    public struct DiagnoseReport: Codable, Equatable {
+        public var overall: String = ""
+        public var checks: [DiagnoseCheck] = []
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.overall = try c.decodeIfPresent(String.self, forKey: .overall) ?? ""
+            self.checks = try c.decodeIfPresent([DiagnoseCheck].self, forKey: .checks) ?? []
+        }
+        enum CodingKeys: String, CodingKey { case overall, checks }
+    }
+
+    /// Run the on-demand "Why is it slow?" self-diagnosis. Blocking — call
+    /// from a background queue, never the main thread. The Go side runs six
+    /// bounded probes concurrently under a 5 s budget, so this uses its own
+    /// ephemeral session with more headroom than loopbackSession()'s 5 s
+    /// resource cap (a broken-network diagnosis rides the full budget by
+    /// design — that's exactly the case the user is diagnosing).
+    public static func diagnose(metricsAddr: String = "127.0.0.1:11050") -> DiagnoseReport? {
+        guard let url = URL(string: "http://\(metricsAddr)/diagnose") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 10
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 10
+        cfg.timeoutIntervalForResource = 12
+        cfg.waitsForConnectivity = false
+        let session = URLSession(configuration: cfg)
+        let sem = DispatchSemaphore(value: 0)
+        var result: DiagnoseReport?
+        session.dataTask(with: req) { data, _, _ in
+            defer { sem.signal() }
+            guard let data else { return }
+            do {
+                result = try JSONDecoder().decode(DiagnoseReport.self, from: data)
+            } catch {
+                appLog("diagnose decode failed: \(error)")
+            }
+        }.resume()
+        sem.wait()
+        session.finishTasksAndInvalidate()
+        return result
+    }
+
     // MARK: - Mount Now (LB-2)
 
     /// Result of `/mount-now` — the control-plane action that re-runs the

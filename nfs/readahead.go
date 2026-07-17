@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
@@ -96,9 +97,52 @@ func NewReadaheadManager(fusePath string, fdPool *FDPool, profile *netprofile.Pr
 	return rm
 }
 
+// serverReadaheadEnabled is the S2 kill-switch (WAVE 1, RC-4). The server-side
+// ReadaheadManager previously had NO env off-switch, violating the kill-switch
+// doctrine. JM_SERVER_READAHEAD=0 disables all server prefetch scheduling; every
+// other value (incl. unset) keeps the historical behavior. Read per call — this
+// only executes on the read path's schedule decision, never a per-RPC syscall.
+func serverReadaheadEnabled() bool {
+	return os.Getenv("JM_SERVER_READAHEAD") != "0"
+}
+
+// smallPreviewRunBlocks returns the S2 short-run guard threshold (WAVE 1, RC-4):
+// a sequential run SHORTER than this many blocks is treated as a Finder preview
+// probe and is NOT escalated to the full prefetch window — the run keeps
+// accumulating, so a GENUINE sequential read still escalates once it grows past
+// the guard.
+//
+// Class-scaled so 10GbE/GbE (Fast/Medium) are UNCHANGED — the guard is DISABLED
+// there (0) so LAN prefetch fires exactly as before; only the slow WAN class
+// tightens, where an over-pull crosses the tunnel and costs seconds. ClassMetered
+// never reaches the trip at all (its policy is Enabled:false — the OnRead early
+// return above), so the guard is moot there. The value is set ABOVE the slow
+// class's SeqThreshold (4) so it actually creates a suppression band (runs of
+// 4–5 blocks are held; 6+ escalate) rather than being inert. nil profile ⇒
+// Medium (0, disabled), so an unwired manager behaves exactly as before.
+func smallPreviewRunBlocks(prof *netprofile.Profile) int {
+	if prof == nil {
+		return 0 // Medium default — guard disabled, historical behavior
+	}
+	switch prof.Class() {
+	case netprofile.ClassMetered, netprofile.ClassSlow:
+		// Slow WAN: hold runs under 6 blocks (~24MiB). Above SeqThreshold(=4)
+		// so trips at hits 4–5 are suppressed as preview probes; 6+ escalates.
+		return 6
+	default: // ClassMedium, ClassFast — 10GbE/GbE unchanged
+		return 0
+	}
+}
+
 // OnRead is called by the NFS read handler after every READ operation.
 // It tracks the read pattern and triggers readahead if sequential.
 func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePath string) {
+	// S2 kill-switch (WAVE 1): default-on, env-disable. Off the per-RPC FUSE
+	// path — a single env read + early return, no lock taken when disabled.
+	if !serverReadaheadEnabled() {
+		return
+	}
+
 	policy := rm.effectivePolicy()
 
 	rm.mu.Lock()
@@ -134,6 +178,19 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 
 	// Trigger readahead after the link-aware threshold of consecutive sequential reads
 	if tracker.sequentialHits >= policy.SeqThreshold {
+		// S2 short-run guard (WAVE 1, RC-4): a SHORT sequential run on a WAN link
+		// is a Finder preview probe (a few 256KiB subreads of one file), not a
+		// real large sequential reel read. Escalating it to the policy's 64MB
+		// window whole-file-pulls across the tunnel for nothing. If the run so
+		// far is below the class-scaled small-preview threshold, cap (skip) this
+		// round instead — the run keeps accumulating, so a GENUINE sequential
+		// read still escalates once it grows past the threshold. This is a plain
+		// comparison on the already-tracked sequentialHits — NO new syscall.
+		// Disabled (threshold 0) on Fast/Medium, so 10GbE/GbE are unchanged.
+		if guard := smallPreviewRunBlocks(rm.profile); guard > 0 && tracker.sequentialHits < guard {
+			metrics.Default().IncReadaheadSuppressed()
+			return
+		}
 		// Calculate the range to prefetch (depth scales with the link).
 		prefetchStart := offset + int64(size)
 		prefetchEnd := prefetchStart + int64(policy.Blocks)*readaheadBlockSize
@@ -150,6 +207,8 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 		rm.statsMu.Lock()
 		rm.triggered++
 		rm.statsMu.Unlock()
+		// WAVE 0 (grades S2): one inc per readahead schedule (SeqThreshold trip).
+		metrics.Default().IncReadaheadTriggered()
 
 		// Fire background prefetch (non-blocking), capped by the policy's worker budget.
 		go rm.prefetch(filePath, prefetchStart, prefetchEnd, policy.Workers)
@@ -182,6 +241,17 @@ func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorke
 		return
 	default:
 	}
+
+	// Read-QoS (#4, INSTANT-NAV): prefetch is the LOWEST read class. On
+	// slow/metered links it only runs when the bulk lane has a free token,
+	// and holds it for the whole block loop below — a contended lane sheds
+	// the round entirely (it re-triggers on the next sequential read),
+	// handing the bandwidth back to interactive reads. Inert on medium/fast.
+	qosRelease, qosOK := defaultReadQoS.tryAcquireBulk()
+	if !qosOK {
+		return
+	}
+	defer qosRelease()
 
 	fusePath := rm.fusePath + "/" + filePath
 
@@ -224,6 +294,8 @@ func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorke
 			rm.statsMu.Lock()
 			rm.prefetched++
 			rm.statsMu.Unlock()
+			// WAVE 0 (grades S2): accumulate blocks actually prefetched.
+			metrics.Default().AddReadaheadPrefetchedBlocks(1)
 			// Feed the link estimator. A cold block is a real backend transfer
 			// (slow); a cache hit is sub-ms and gets filtered out inside
 			// ObserveThroughput, so only wire-speed samples move the estimate.

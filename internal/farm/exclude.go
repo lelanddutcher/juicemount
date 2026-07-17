@@ -1,0 +1,107 @@
+package farm
+
+import (
+	"os"
+	"strings"
+)
+
+// Derivative exclusion (2026-07-14, user-directed): the farm should not spend
+// decode budget on media that isn't worth deriving. Three rules, applied at the
+// walk (collectTargets) so an excluded file is never queued — no tech, no
+// poster, no filmstrip, nothing:
+//
+//  1. PROXY — anything labeled a proxy (either spelling: "proxy" or "proxies"),
+//     in a PARENT FOLDER or the FILENAME, is skipped. Proxies are already the
+//     lightweight browse copy; deriving them duplicates the original's work.
+//  2. TOO SMALL — media under the size floor (default 20 MiB, JM_FARM_MIN_SIZE_MB)
+//     is skipped: a thumbnail/strip for a trivially small clip isn't worth the
+//     per-file overhead in a mass sweep.
+//  3. SKIP-DIR — a small default set of NLE ephemeral/cache dir names that hold
+//     throwaway media (render previews, media caches). Extend with
+//     JM_FARM_SKIP_DIRS (comma-separated, case-insensitive substrings).
+//
+// Everything is case-insensitive and matched against the path components.
+
+// defaultSkipDirSubstrings are lowercased path substrings that mark a directory
+// as non-content (ephemeral NLE output the farm should never derive). Kept
+// deliberately CONSERVATIVE so real footage folders are never caught; the user
+// adds more via JM_FARM_SKIP_DIRS.
+var defaultSkipDirSubstrings = []string{
+	"proxy", "proxies",
+	"adobe premiere pro video previews",
+	"adobe premiere pro audio previews",
+	// "media cache" already covers "Media Cache Files/" (superstring), so the
+	// longer form is intentionally omitted — a shorter substring matches both.
+	"media cache",
+	".cache", "peak files",
+}
+
+// SkipDirSubstrings is the exported resolver (defaults + JM_FARM_SKIP_DIRS)
+// for callers that pass the list into ExcludeReason.
+func SkipDirSubstrings() []string { return skipDirSubstrings() }
+
+// skipDirSubstrings returns the default skip substrings plus any from
+// JM_FARM_SKIP_DIRS (comma-separated). All lowercased.
+func skipDirSubstrings() []string {
+	subs := make([]string, len(defaultSkipDirSubstrings))
+	copy(subs, defaultSkipDirSubstrings)
+	if raw := os.Getenv("JM_FARM_SKIP_DIRS"); raw != "" {
+		for _, s := range strings.Split(raw, ",") {
+			if s = strings.ToLower(strings.TrimSpace(s)); s != "" {
+				subs = append(subs, s)
+			}
+		}
+	}
+	return subs
+}
+
+// pathIsProxy reports whether any path component or the filename marks this as
+// a proxy — "proxy" OR "proxies" (the two spellings), case-insensitive. Note
+// "proxies" does not contain the substring "proxy", so both are checked.
+func pathIsProxy(lowerPath string) bool {
+	return strings.Contains(lowerPath, "proxy") || strings.Contains(lowerPath, "proxies")
+}
+
+// ExcludeReason reports why a media file should be skipped from derivation, or
+// "" to process it. size<0 means "size unknown" (the size rule is not applied).
+// skipSubs is the resolved skip-dir substring list (pass skipDirSubstrings());
+// minBytes is the size floor (0 = no floor).
+func ExcludeReason(path string, size, minBytes int64, skipSubs []string) string {
+	l := strings.ToLower(path)
+	if pathIsProxy(l) {
+		return "proxy"
+	}
+	for _, sub := range skipSubs {
+		// A bare "proxy"/"proxies" is already handled above; skip re-matching
+		// them here so the reason string is the specific "proxy".
+		if sub == "proxy" || sub == "proxies" {
+			continue
+		}
+		if strings.Contains(l, sub) {
+			return "skip-dir:" + sub
+		}
+	}
+	if minBytes > 0 && size >= 0 && size < minBytes {
+		return "too-small"
+	}
+	return ""
+}
+
+// DirIsExcluded reports whether a DIRECTORY path should be skipped wholesale
+// (proxy or a skip-dir) — used by the watcher to avoid even enqueuing it. Size
+// is not a dir concept, so only the name rules apply.
+func DirIsExcluded(path string) bool {
+	l := strings.ToLower(path)
+	if pathIsProxy(l) {
+		return true
+	}
+	for _, sub := range skipDirSubstrings() {
+		if sub == "proxy" || sub == "proxies" {
+			continue
+		}
+		if strings.Contains(l, sub) {
+			return true
+		}
+	}
+	return false
+}

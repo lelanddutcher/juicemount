@@ -32,6 +32,13 @@ type API struct {
 	volName        string   // for ModeStandalone dest-validation
 	farmStatusPath string   // juicefarm rollup JSON path (farm-status.json); empty = Farm tab shows "not configured"
 
+	// farmChangesPath is the farm's pre-aggregated /derivatives/changes feed
+	// (JM-15 #56): the contract changes-array the farm writes next to
+	// farm-status.json on every status write. Resolved by
+	// deriveFarmChangesPath (explicit config → JM_FARM_CHANGES env →
+	// farm-status sibling); empty = the changes route returns 503.
+	farmChangesPath string
+
 	// overview is the SLICE-2 fan-out aggregator. Nil only in unit
 	// tests that hand-construct an API without going through Register
 	// (the handler defensively returns an "overview not configured"
@@ -57,6 +64,10 @@ type API struct {
 	// JobManager are wired; mgr.StopAll() drains it on shutdown.
 	schedules *scheduleStoreImpl
 
+	// maintenanceSched is the per-lever GC/FSCK/compact cron scheduler.
+	// Nil in tests that bypass Register.
+	maintenanceSched *maintenanceScheduler
+
 	// settings is the SLICE-8 Settings store (per-job defaults, theme,
 	// log retention, admin-key rotation). Nil in tests that bypass
 	// Register; handlers return 503. The store delegates rotation to
@@ -71,8 +82,10 @@ type API struct {
 	// OverviewMetaURL, or a hand-constructed API in tests) — the
 	// /api/farm/sweep + /api/farm/jobs handlers degrade to 503 /
 	// {available:false} rather than NPE'ing. Dialed once in Register
-	// from the same metaURL the Overview tab probes.
-	farmQ *farmqueue.Client
+	// from the same metaURL the Overview tab probes. Typed as the small
+	// farmQueue interface (farm.go) so tests can fake the queue; the
+	// production value is always a *farmqueue.Client.
+	farmQ farmQueue
 }
 
 // Config bundles the fields needed to construct + register the API.
@@ -98,6 +111,12 @@ type Config struct {
 	AdminKey       string   // empty = no auth (LAN-only)
 	StateFile      string   // optional JSON path for job-history persistence (empty = ephemeral)
 	FarmStatusPath string   // optional path to the juicefarm rollup (farm-status.json) for the Farm tab
+	// FarmChangesPath optionally overrides where the farm's pre-aggregated
+	// derivatives-changes.json feed is read from (JM-15 #56). Normally left
+	// empty: it falls back to the JM_FARM_CHANGES env var, then to the
+	// sibling of FarmStatusPath (the farm writes the two side by side), so
+	// existing deployments need zero new configuration.
+	FarmChangesPath string
 	// MinIOURL is the http endpoint the SLICE-2 Overview tab pings via
 	// /minio/health/live. Optional — when empty the MinIO card on the
 	// dashboard renders an "endpoint not configured" hint rather than a
@@ -110,6 +129,16 @@ type Config struct {
 	// MetaURL — useful for standalone mode where the one URL serves
 	// both purposes.
 	OverviewMetaURL string
+	// MountOwnerUID/MountOwnerGID: the POSIX owner migrated data is chowned
+	// to after an embedded-mode sync, so the client mounting the volume can
+	// WRITE the copied data (not just read it). The manager runs as root on
+	// the NAS, so `juicefs sync` leaves migrated files root:wheel — a uid-501
+	// Mac client can then only read them. Setting this makes "migrate, then
+	// use it from the mount" actually work. <= 0 (default) skips the chown
+	// and preserves raw sync ownership. Set via --mount-owner / JM_MOUNT_OWNER
+	// or the Permissions tab. A future per-user ACL policy supersedes this.
+	MountOwnerUID int
+	MountOwnerGID int
 }
 
 // Register wires the manager's routes onto an existing ServeMux at
@@ -122,7 +151,7 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// Derive the RunSync spec from the Config's destination-mode fields.
 	// Embedded (FUSEMount) takes precedence; falls back to standalone
 	// (MetaURL+VolName) if FUSEMount is unset.
-	spec := RunSyncSpec{}
+	spec := RunSyncSpec{OwnerUID: cfg.MountOwnerUID, OwnerGID: cfg.MountOwnerGID}
 	if cfg.FUSEMount != "" {
 		spec.Mode = ModeEmbedded
 		spec.FUSEMount = cfg.FUSEMount
@@ -142,6 +171,8 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		prefix:         prefix,
 		fuseMount:      cfg.FUSEMount,
 		volName:        cfg.VolName,
+		farmChangesPath: deriveFarmChangesPath(
+			cfg.FarmChangesPath, os.Getenv("JM_FARM_CHANGES"), cfg.FarmStatusPath),
 	}
 	// SLICE 2: wire the overview aggregator. Picks OverviewMetaURL when
 	// set (embedded mode passes it explicitly so the dashboard can probe
@@ -200,6 +231,15 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// queue depth + recent job status back. Both admin-key gated.
 	mux.HandleFunc(prefix+"/api/farm/sweep", a.auth(a.handleFarmSweep))
 	mux.HandleFunc(prefix+"/api/farm/jobs", a.auth(a.handleFarmJobs))
+	// Exact path (registered before any subtree) — POST clears terminal
+	// job records from the Recent-jobs list + prunes the leaked index.
+	mux.HandleFunc(prefix+"/api/farm/jobs/clear", a.auth(a.handleFarmJobsClear))
+	// JM-15 #56 (server half): relay the farm's pre-aggregated
+	// /derivatives/changes feed (contract derivatives-changes.schema.json,
+	// filtered by ?since=&limit=) so the Mac client learns farm-generated
+	// derivatives without full sidecar re-sweeps. Same exact-pattern
+	// registration + admin-key gate as its /api/farm siblings.
+	mux.HandleFunc(prefix+"/api/farm/derivatives/changes", a.auth(a.handleFarmDerivativesChanges))
 	// SLICE 3: Trash tab — list/restore/delete/empty/config.
 	// /api/trash/empty enforces a typed-confirmation header
 	// (X-Confirm-Empty: yes) server-side so a typo'd curl can't wipe
@@ -211,6 +251,15 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mux.HandleFunc(prefix+"/api/trash/delete", a.auth(a.handleTrashDelete))
 	mux.HandleFunc(prefix+"/api/trash/empty", a.auth(a.handleTrashEmpty))
 	mux.HandleFunc(prefix+"/api/trash/config", a.auth(a.handleTrashConfig))
+
+	// Permissions tab (Part 2/3): inspect a path's owner/mode + a "writable
+	// by the mount client" verdict; a typed-confirm-gated (X-Confirm-Fix)
+	// recursive chown+chmod remedy for root-owned files already on the volume;
+	// and the default migration owner (rule #0 of a future ACL list). Embedded
+	// mode only (501 in standalone — nothing to chown without a FUSE mount).
+	mux.HandleFunc(prefix+"/api/permissions/inspect", a.auth(a.handlePermissionsInspect))
+	mux.HandleFunc(prefix+"/api/permissions/fix", a.auth(a.handlePermissionsFix))
+	mux.HandleFunc(prefix+"/api/permissions/default-owner", a.auth(a.handlePermissionsDefaultOwner))
 	// SLICE 6: Maintenance tab — five operational levers wrapping
 	// juicefs CLI subprocesses with SSE-streamed live output. Each
 	// kind has its own mutex (one op per kind at a time, 409 if
@@ -258,9 +307,37 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	a.schedules = sched
 	sched.SetOnChange(mgr.SaveState)
 	mgr.SetSchedules(sched)
+	// SECURITY: gate schedule sources exactly like handleMigrate — an In
+	// (or default) source must live under sourceRoots, an Out source
+	// under /jfs. Without this a backup schedule could juicefs-sync an
+	// arbitrary host path (e.g. /etc) to a remote destination as root.
+	sched.SetSourceGate(func(path string, dir Direction) error {
+		switch dir {
+		case DirectionOut:
+			if !a.jfsPathAllowed(path) {
+				return fmt.Errorf("source outside /jfs (FUSE mount)")
+			}
+		default: // In / "" (default)
+			if !a.pathAllowed(path) {
+				return fmt.Errorf("source outside permitted source roots")
+			}
+		}
+		return nil
+	})
 	sched.Start(context.Background())
 	mux.HandleFunc(prefix+"/api/schedules", a.auth(a.handleSchedules))
 	mux.HandleFunc(prefix+"/api/schedules/", a.auth(a.handleScheduleItem))
+
+	// Per-lever maintenance scheduler (GC/FSCK/compact-meta on a cron).
+	// Own cron engine; persists via the JobManager alongside backups.
+	if a.maintenance != nil {
+		ms := newMaintenanceScheduler(a.maintenance)
+		a.maintenanceSched = ms
+		ms.SetOnChange(mgr.SaveState)
+		mgr.SetMaintenanceSchedules(ms)
+		ms.Start(context.Background())
+		mux.HandleFunc(prefix+"/api/maintenance/schedules", a.auth(a.handleMaintenanceSchedules))
+	}
 	// SLICE 8: Settings tab — per-job defaults, theme, log retention,
 	// admin-key rotation. The store wires its persistence callback to
 	// SaveState; rotation re-encrypts every destination via
@@ -804,7 +881,16 @@ func (a *API) resolveSavedDestination(w http.ResponseWriter, source, name string
 }
 
 func (a *API) handleListJobs(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, a.jobs.List())
+	// Snapshot each job under its own lock before marshaling. The live
+	// *Job pointers List() returns are mutated by the runner goroutine
+	// (run() writes State/Last/Error under j.mu), so marshaling them
+	// directly races json's field reads. GetSnapshot copies under j.mu.
+	live := a.jobs.List()
+	snaps := make([]Job, 0, len(live))
+	for _, j := range live {
+		snaps = append(snaps, j.GetSnapshot())
+	}
+	writeJSON(w, http.StatusOK, snaps)
 }
 
 // handlePreview walks the source path (file or directory) and returns
@@ -1207,7 +1293,12 @@ func (a *API) handleJobOps(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "job not found", http.StatusNotFound)
 			return
 		}
-		writeJSON(w, http.StatusOK, j)
+		// Marshal a locked snapshot, not the live pointer — run() mutates
+		// the job concurrently (data race with json's field reads). Pass
+		// &snap (not snap) so we don't copy the Job's embedded Mutex into
+		// the any-arg (go vet copylock); json marshals the pointee fine.
+		snap := j.GetSnapshot()
+		writeJSON(w, http.StatusOK, &snap)
 	case r.Method == http.MethodGet && subpath == "stream":
 		a.streamJob(w, r, id)
 	case r.Method == http.MethodDelete && subpath == "":

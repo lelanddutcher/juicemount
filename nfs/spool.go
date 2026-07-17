@@ -4,13 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"hash"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,6 +21,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -1870,6 +1874,80 @@ func clipExtents(exts []spoolExtent, size int64) []spoolExtent {
 	return out
 }
 
+// --- #104 zero-tail detection -------------------------------------------
+//
+// An interrupted preallocate-then-write download (Chrome→mount, task #104)
+// leaves a spool entry whose declared size was pre-set (SETATTR/ftruncate
+// grow) or whose out-of-order writes stopped before every gap filled. At
+// finalize the entry looks CLOSED and CLEAN — the #65 rule then (correctly)
+// treats 0..writtenEnd as the complete file and the drain ships a FULL-SIZE
+// file whose unwritten ranges read back as zeros. Premiere black-frames it,
+// silently. Detection-only: we count, WARN, and mark the row so /spool and
+// the UI can surface it — the drain itself is NEVER blocked, held, or altered
+// (a legitimately-sparse file is byte-indistinguishable from an interrupted
+// download, so a heuristic must never hold user bytes hostage).
+
+// zeroTailDetectEnabled gates the finalize-time zero-tail detector. Default
+// ON — it is detection + marking only. JM_ZERO_TAIL_DETECT=0 kills it
+// entirely (counter, WARN, row marker). Read per finalize — a cold path, one
+// call per file — so tests can toggle via t.Setenv and operators can flip it
+// live, following the drainClassGateEnabled pattern.
+func zeroTailDetectEnabled() bool { return os.Getenv("JM_ZERO_TAIL_DETECT") != "0" }
+
+// isAppleDoubleNFSPath reports whether the in-mount path names a ._
+// AppleDouble sidecar. Mirrors the read path's isAppleDouble classification
+// (handler.go). ._ files are EXCLUDED from zero-tail detection: copyfile
+// assembles them with seeks and legitimately leaves sparse padding below
+// writtenEnd (the #100 finding), so flagging them would be systematic
+// false-positive WARN spam — and they are metadata sidecars, never media an
+// NLE decodes frames from.
+func isAppleDoubleNFSPath(p string) bool { return strings.HasPrefix(path.Base(p), "._") }
+
+// zeroTailHoleBytes computes how many bytes in [contiguousEnd, writtenEnd)
+// were NEVER written: the span above the contiguous prefix minus the
+// out-of-order extents that actually landed there. Extents are maintained
+// strictly above contiguousEnd and clipped to writtenEnd by the WriteAt/
+// Truncate invariants, but the math clamps defensively anyway. A result > 0
+// at finalize time means the finalized file contains that many bytes of
+// never-written zeros below its size — the zero-tail signature.
+func zeroTailHoleBytes(writtenEnd, contiguousEnd int64, exts []spoolExtent) int64 {
+	if writtenEnd <= contiguousEnd {
+		return 0
+	}
+	holes := writtenEnd - contiguousEnd
+	for _, x := range exts {
+		lo, hi := x.start, x.end
+		if lo < contiguousEnd {
+			lo = contiguousEnd
+		}
+		if hi > writtenEnd {
+			hi = writtenEnd
+		}
+		if hi > lo {
+			holes -= hi - lo
+		}
+	}
+	if holes < 0 {
+		return 0 // defensive: overlapping extents can't happen (insertExtent coalesces)
+	}
+	return holes
+}
+
+// zeroTailDetail is the compact JSON blob persisted in the spool row's
+// suspect_zero_tail column (metadata.SpoolRow.SuspectZeroTail) and echoed
+// per-entry by /spool. Field names are the #104 spec's sidecar shape.
+type zeroTailDetail struct {
+	DetectedAt string `json:"detected_at"` // RFC3339Nano UTC (manifest convention)
+	Size       int64  `json:"size"`        // finalized size (writtenEnd)
+	Contiguous int64  `json:"contiguous"`  // contiguous prefix end at finalize
+	Holes      int64  `json:"holes"`       // never-written bytes below size
+	// Extents is the count of out-of-order written regions still parked above
+	// the contiguous prefix at finalize — 0 distinguishes a pure truncated
+	// tail (preallocate + sequential writes stopped) from a mid-file gap
+	// pattern (out-of-order writer interrupted).
+	Extents int `json:"extents,omitempty"`
+}
+
 // logInflightJukebox emits a throttled diagnostic for an in-flight-hole JUKEBOX
 // hold on a REAL (non-._) file — the end-of-export "connection interrupted"
 // smoking gun. Throttled to ~1 line / 2s per entry (atomic CAS, no lock) so a
@@ -2209,6 +2287,31 @@ func (e *SpoolEntry) finalizeLocked() error {
 		e.sha256 = e.hasher.Sum(nil)
 	}
 	finalSize := e.writtenEnd
+	// #104 zero-tail detection: capture the suspect signature BEFORE the #65
+	// advance below — that advance folds contiguousEnd up to writtenEnd and
+	// destroys the only evidence that holes existed. This is the single point
+	// in the entry's life where (a) the writer is definitively done (every
+	// finalize path — idle sweeper, explicit Finalize/Close, stuck-handle
+	// escalation — funnels here) and (b) writtenEnd, contiguousEnd, and the
+	// out-of-order extent set are all still intact under e.mu. Drain-claim
+	// time is too late: the row carries only size+sha by then, and after a
+	// restart the in-RAM extent state is gone entirely. Detection-only — the
+	// finalize, MarkReady, and drain below proceed IDENTICALLY whether or not
+	// this fires.
+	var suspect *zeroTailDetail
+	suspectPath := ""
+	if zeroTailDetectEnabled() && !isAppleDoubleNFSPath(e.nfsPath) {
+		if holes := zeroTailHoleBytes(e.writtenEnd, e.contiguousEnd, e.writtenExtents); holes > 0 {
+			suspect = &zeroTailDetail{
+				DetectedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				Size:       e.writtenEnd,
+				Contiguous: e.contiguousEnd,
+				Holes:      holes,
+				Extents:    len(e.writtenExtents),
+			}
+			suspectPath = e.nfsPath
+		}
+	}
 	// task #65: the writer has CLOSED — every byte it intended to write has landed
 	// on the spool file, so 0..writtenEnd is the complete file (any genuine sparse
 	// gap reads back as zeros, which IS the file's content). The in-flight
@@ -2226,6 +2329,29 @@ func (e *SpoolEntry) finalizeLocked() error {
 	finalSpoolFile := e.spoolFile
 	finalID := e.id // capture under mu: rename migration can re-bind id
 	e.mu.Unlock()
+
+	// #104 surfacing, off the entry lock: one counter bump, ONE Warn (finalize
+	// runs once per entry — the closed guard above makes this unrepeatable),
+	// and the row marker. Runs BEFORE MarkReady so the row is still `writing`
+	// and no drainer can be racing it; a marker failure is logged and ignored
+	// — detection must never fail a finalize.
+	if suspect != nil {
+		metrics.Default().IncZeroTailSuspect()
+		jmlog.Warn("spool: ZERO-TAIL SUSPECT at finalize — unwritten hole(s) will drain as zeros (interrupted download?)",
+			"path", suspectPath,
+			"size", suspect.Size,
+			"written_end", suspect.Size,
+			"contiguous_end", suspect.Contiguous,
+			"hole_bytes", suspect.Holes,
+			"oo_extents", suspect.Extents,
+		)
+		if detail, merr := json.Marshal(suspect); merr == nil {
+			if serr := e.store.meta.MarkSuspectZeroTail(finalID, string(detail)); serr != nil {
+				jmlog.Warn("spool: zero-tail suspect row-mark failed",
+					"path", suspectPath, "id", finalID, "error", serr.Error())
+			}
+		}
+	}
 
 	// If the streaming hash was invalidated (out-of-order / truncate-resized
 	// writes), derive a reference SHA from the finalized on-disk spool file —

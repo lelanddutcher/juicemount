@@ -6,6 +6,7 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -37,6 +38,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/internal/thumbcache"
 	"github.com/lelanddutcher/juicemount/internal/version"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
@@ -85,6 +87,10 @@ var (
 	// later; for now the farm (JM-16) and tests populate it. Read-only on the
 	// query path. nil between Stop and the next Start ⇒ endpoints fail closed.
 	globalDerivStore *derivatives.Store
+	// #1 hydration pack: bounded local thumbnail blob cache + the
+	// folder-open warmer feeding it (nil when JM_THUMB_WARM=0 or open failed).
+	globalThumbCache  *thumbcache.Cache
+	globalThumbWarmer *jmnfs.ThumbWarmer
 
 	// [JM6 tier-1.7-1.10] Reachability monitor for offline-mode
 	// auto-engage. Runs independently of the health monitor: the
@@ -141,6 +147,12 @@ var (
 	globalVolumeName      string   // basename of the mount point
 	globalInstanceID      string   // stable per-install UUID (minted/persisted once)
 	globalCapabilities    []string // capabilities DERIVED from this binary's routes
+	// globalRedisURL is the configured metadata-backend URL from the last
+	// Start — the /diagnose network probes (INSTANT-NAV #14) dial its
+	// host:port. Like globalWantMountPoint it is deliberately NOT cleared on
+	// stop: diagnosing "why did it break" right after a stop still needs to
+	// know where the backend was.
+	globalRedisURL string
 )
 
 // offlineEngageDelay is how long the backend must be CONTINUOUSLY unreachable
@@ -235,6 +247,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	globalMetricsAddr = cfg.MetricsAddr
 	globalVolumeName = filepath.Base(cfg.MountPoint)
 	globalInstanceID = cplane.LoadOrMintInstanceID(cfg.DBPath)
+	globalRedisURL = cfg.RedisURL
 
 	// Initialize structured logging early so all subsequent log lines
 	// flow through the JSON sink (and optional log file).
@@ -457,6 +470,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			PinnedBytes:     pinnedBytes,
 			FUSEMetricsAddr: health.DefaultFUSEMetricsAddr,
 		})
+		// Pin-capacity baseline (audit fix v2, 2026-07-14): record the
+		// CONFIGURED budget before any mount attempt so the capacity
+		// verdict caps correctly on EVERY mount path (inline success,
+		// launch-fail → watchdog remount, adopt-existing). The
+		// inline-success branch below refines it with the effective
+		// (possibly auto-expanded) value; watchdog paths keep this
+		// config baseline — the user's intent and the right ceiling
+		// for pin math. Live gap: first deploy only wired the inline
+		// branch and a watchdog-remounted boot reported budget 0.
+		if mb, perr := strconv.Atoi(cfg.CacheSize); perr == nil && mb > 0 {
+			pin.SetCacheBudgetBytes(int64(mb) << 20)
+		}
 		// Tell the block-cache scraper where the FUSE daemon's prometheus
 		// /metrics endpoint is so /cache-status can report the TRUE on-disk
 		// block-cache size (juicefs_blockcache_bytes) as cache_used_bytes.
@@ -507,6 +532,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				"path", cfg.FUSEPath,
 				"effective_cache_size_mb", fm.EffectiveCacheSize(),
 				"free_space_ratio", "0.01")
+			// Pin-capacity audit (2026-07-14): the user's cache budget is a
+			// hard ceiling on what juicefs will keep resident — capacity
+			// verdicts must cap at it, or a budget-exceeding pin set is
+			// approved and then perpetually evicted.
+			if mb, perr := strconv.Atoi(fm.EffectiveCacheSize()); perr == nil && mb > 0 {
+				pin.SetCacheBudgetBytes(int64(mb) << 20)
+			}
 		}
 	}
 
@@ -913,6 +945,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		srv.Handler().SetCacheReader(globalCache)
 	}
 	srv.Handler().SetRedisClient(rc)
+
+	// #12: after a watchdog FUSE remount, every pooled fd references the
+	// DEAD mount — Get kept re-serving them ("stale fd → 0-byte reads").
+	// Flush the pool the moment a remount succeeds.
+	if globalFUSE != nil {
+		h := srv.Handler()
+		globalFUSE.SetOnRemount(func() {
+			closed, marked := h.FlushStaleFDs()
+			jmlog.Info("fd pool flushed after FUSE remount (#12)",
+				"closed_idle", closed, "marked_stale_held", marked)
+		})
+	}
 	globalServer = srv
 
 	// Pin store + prefetcher. The pin store lives in its own SQLite file so
@@ -950,6 +994,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// and feeds the over-capacity banner in /cache-status. Empty cacheBaseDir
 		// uses the default ~/.juicefs/cache.
 		pf.Go(func() { pf.CapacityLoop(pinCtx, 60*time.Second, "") })
+		// Eviction watch (pin-integrity guarantee, 2026-07-14): juicefs
+		// eviction has no pin awareness, so transient traffic pushing the
+		// cache past its budget can evict pinned blocks even when the
+		// pinned set itself fits. CapacityLoop refreshes CacheUsageBytes
+		// every 60s; a large drop with a stable pinned set means eviction
+		// churn ran — schedule ONE VerifyAndRepair (re-read: present
+		// blocks local-speed, missing blocks re-pulled) so pinned content
+		// converges back to fully-resident within minutes instead of the
+		// 6h re-warm TTL. Gated: never over-capacity (R-1 thrash guard),
+		// never on Metered/Slow links (the re-pull belongs on LAN), and
+		// single-flight with a cooldown.
+		pf.Go(func() { evictionWatchLoop(pinCtx) })
 		// Wire the pin store into the NFS handler so the offline-mode
 		// open gate can fail-fast on un-pinned reads. The mount point is
 		// the prefix the gate uses to canonicalize in-mount filenames into
@@ -981,6 +1037,50 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		jmlog.Info("derivative index ready", "path", derivDBPath)
 	} else {
 		jmlog.Warn("derivative index open failed (JM-14 reads disabled)", "error", err.Error())
+	}
+
+	// #1 (INSTANT-NAV) hydration pack: bounded local thumb cache + the
+	// folder-open warmer. The warmer hydrates farm poster thumbnails (kind
+	// "thumbnail", ~10-50KB) into the local cache when a dir is listed, so
+	// preview bytes are local before anything asks for source bytes; /blob
+	// serves small kinds local-first from the same cache. Fail-quiet: no
+	// derivative index / cache-open failure just leaves them nil.
+	// Kill switch JM_THUMB_WARM=0; size JM_THUMB_CACHE_MB (default 2048).
+	if os.Getenv("JM_THUMB_WARM") != "0" && globalDerivStore != nil && derivDBPath != ":memory:" {
+		maxBytes := int64(thumbcache.DefaultMaxBytes)
+		if v := os.Getenv("JM_THUMB_CACHE_MB"); v != "" {
+			if mb, perr := strconv.Atoi(v); perr == nil && mb >= 64 && mb <= 65536 {
+				maxBytes = int64(mb) << 20
+			}
+		}
+		thumbDir := derivDBPath[:len(derivDBPath)-len("/derivatives.db")] + "/thumbs"
+		if tc, terr := thumbcache.Open(thumbDir, maxBytes); terr == nil {
+			globalThumbCache = tc
+			warmer := jmnfs.NewThumbWarmer(tc, resolveThumbBlobPath, func(dir string) []jmnfs.ThumbChildRef {
+				entries, lerr := store.ListChildren(dir)
+				if lerr != nil {
+					return nil
+				}
+				refs := make([]jmnfs.ThumbChildRef, 0, len(entries))
+				for _, e := range entries {
+					refs = append(refs, jmnfs.ThumbChildRef{Inode: e.Inode, Name: e.Name, IsDir: e.IsDir})
+				}
+				return refs
+			})
+			globalThumbWarmer = warmer
+			srv.Handler().SetThumbWarmer(warmer)
+			// Sidecar-cache disk persistence (2026-07-13): `._`/.DS_Store
+			// bodies survive restarts, so a re-launch no longer re-cools
+			// every folder (the tunnel first-visit tax was ~2min/dir).
+			// Same parent dir as the thumb cache; per-serve mirror
+			// validation makes loading stale entries harmless.
+			srv.Handler().SidecarPersistEnable(thumbDir + "/../sidecars.gob")
+			st := tc.Stats()
+			jmlog.Info("thumb cache ready", "path", thumbDir,
+				"resident_mb", st.Bytes>>20, "files", st.Files, "max_mb", maxBytes>>20)
+		} else {
+			jmlog.Warn("thumb cache open failed (hydration pack disabled)", "error", terr.Error())
+		}
 	}
 
 	// Spool wiring (Option 2). Env-gated by JM_SPOOL_ENABLE so the
@@ -1115,27 +1215,16 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// data path left here. A clean disabled start with zero pending rows needs
 	// no action.)
 
-	// Mount NFS at the user-visible mount point (e.g. /Volumes/zpool) so
-	// Finder can browse it. This requires sudo, which we obtain via an
-	// AppleScript "with administrator privileges" prompt the user accepts once.
-	//
-	// Idempotent path: if the user already has an NFS mount at this path
-	// from a previous soft-stop cycle, reuse it. Re-running mount_nfs would
-	// fail because the mount point is busy and would prompt for a password
-	// for no reason.
+	// [#6 metrics-server-first] Record the intended mount point NOW, but do
+	// the actual NFS mount AFTER the metrics server is up (below). The mount
+	// step can hang or fail (haunted mountpoint EBUSY, osascript admin
+	// prompt, wedged diskarbitrationd — all observed live 2026-07-10), and
+	// when it ran first, a hung mount left the app fully functional but
+	// HEADLESS: no /health, /offline, /diagnose, /spool — undebuggable and
+	// uncontrollable unattended. The control plane must never be gated on
+	// the mount.
 	if cfg.MountPoint != "" {
 		globalWantMountPoint = cfg.MountPoint
-		if isMounted(cfg.MountPoint) {
-			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
-			globalMountPath = cfg.MountPoint
-		} else if err := mountNFSWithPrompt(srv.Addr(), cfg.MountPoint); err != nil {
-			jmlog.Warn("nfs mount failed (server still running)",
-				"mount_point", cfg.MountPoint, "error", err.Error())
-			// Non-fatal — the server is up, user can mount manually if needed
-		} else {
-			jmlog.Info("nfs mounted", "mount_point", cfg.MountPoint)
-			globalMountPath = cfg.MountPoint
-		}
 	}
 
 	// Wire NFS RPC observation into the metrics package.
@@ -1173,6 +1262,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// unranged — what a browser <video> / remote AVPlayer need to seek over
 			// HTTP. Capability token `blob` (route path == token).
 			"/blob": handleBlobHTTP,
+			// #1 hydration pack observability: local thumb-cache stats
+			// (bytes/files/hits/misses/puts/evictions). Read-only.
+			"/thumbs": handleThumbsHTTP,
+			// Wave-3 QuickLook appex fetch: GET /thumb-local?path=<abs>&size=N
+			// serves the farm poster from the LOCAL cache (hit <5ms), does a
+			// bounded read-through populate on miss, or 404s fast so the appex
+			// errors and macOS falls back to its own generator.
+			"/thumb-local": handleThumbLocalHTTP,
+			// Release UX: the popover's warm-up card — one consolidated phase
+			// machine (starting/indexing/warming/steady) with a progress pct.
+			"/warmup": handleWarmupHTTP,
 			// JM-ASSERT (#51) portable-human-metadata channel. POST /assertions writes
 			// the <media>.loupe.json sidecar (source of truth — atomic, LWW,
 			// merge-not-clobber) + upserts the asset_key-keyed Tier-B index; GET
@@ -1215,6 +1315,20 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// Finder is momentarily slow ("Uploading 412 files", "Rebuilding
 			// index…", "Warming pinned project"). GET, loopback.
 			"/activity": handleActivityHTTP,
+			// "Why is it slow?" self-diagnosis (INSTANT-NAV #14): runs the six
+			// known silent-failure probes (Local Network permission, tunnel
+			// route, FUSE identity, backend components, spool backlog, link
+			// RTT) concurrently and time-bounded, on demand only. GET, loopback.
+			// Not in the contract capability vocabulary — operational/UI route,
+			// excluded from /whoami automatically like reclaim/mount-now.
+			"/diagnose": handleDiagnoseHTTP,
+			// Instant recursive folder size (INSTANT-NAV #2): GET /du?path=…
+			// answers "total bytes + file count under this folder" in O(1)
+			// from the mirror's incrementally-maintained subtree aggregates
+			// (JM_SUBTREE_SIZES, default on) — the app/OpenLoupe surface that
+			// replaces du-walking. GET, loopback. Operational/UI route,
+			// excluded from /whoami automatically like reclaim/mount-now.
+			"/du": handleDuHTTP,
 			// Spool recovery actions (LB-5): ?action=retry-failed
 			// requeues failed rows whose spool file survives;
 			// ?action=clear-stalled force-finalizes leaked-handle
@@ -1250,6 +1364,49 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		} else {
 			globalMetrics = ms
 			jmlog.Info("metrics server listening", "addr", ms.Addr())
+		}
+	}
+
+	// Mount NFS at the user-visible mount point (e.g. /Volumes/zpool) so
+	// Finder can browse it. Runs AFTER the metrics server (see the [#6
+	// metrics-server-first] note above) so a hung/failed mount never leaves
+	// the app headless. Requires sudo, obtained via an AppleScript "with
+	// administrator privileges" prompt the user accepts once.
+	//
+	// Idempotent path: if the user already has an NFS mount at this path
+	// from a previous soft-stop cycle, reuse it. Re-running mount_nfs would
+	// fail because the mount point is busy and would prompt for a password
+	// for no reason.
+	// DEADLOCK FIX (2026-07-10, INSTANT-NAV): this mount attempt used to run
+	// INLINE here — inside NFSServerStart's whole-body globalMu hold — and
+	// mountNFSWithPrompt blocks on an INTERACTIVE admin-password prompt. An
+	// unanswered prompt (user away, unattended window, or the kernel-haunted
+	// mountpoint forcing a prompt every boot) therefore deadlocked every
+	// globalMu consumer: /du, /diagnose, /thumbs, offline detection — while
+	// /health kept answering, masking it. Now: reuse-check + mount run on
+	// their own goroutine AFTER the boot wiring, taking globalMu only for
+	// the globalMountPath publish; the prompt itself is bounded (180s) in
+	// mountNFSWithPrompt. Boot never waits on a human again.
+	if cfg.MountPoint != "" {
+		if isMounted(cfg.MountPoint) {
+			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
+			warmupMarkServing()
+			globalMountPath = cfg.MountPoint
+		} else {
+			mountAddr, mountPoint := srv.Addr(), cfg.MountPoint
+			go func() {
+				if err := mountNFSWithPrompt(mountAddr, mountPoint); err != nil {
+					jmlog.Warn("nfs mount failed (server still running)",
+						"mount_point", mountPoint, "error", err.Error())
+					// Non-fatal — the server is up, user can mount manually.
+					return
+				}
+				jmlog.Info("nfs mounted", "mount_point", mountPoint)
+				warmupMarkServing()
+				globalMu.Lock()
+				globalMountPath = mountPoint
+				globalMu.Unlock()
+			}()
 		}
 	}
 
@@ -1305,6 +1462,25 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		remountPoint := cfg.MountPoint
 		globalMonitor.EnableNFSRemount(func() error {
 			if err := mountNFSNonInteractive(remountAddr, remountPoint); err != nil {
+				return err
+			}
+			globalMu.Lock()
+			globalMountPath = remountPoint
+			globalMu.Unlock()
+			return nil
+		})
+		// #93 NFS-layer absent-mount recovery: when the volume is genuinely
+		// GONE from the mount table while juicefs is alive and this listener
+		// is up, the monitor re-runs the SAME two-tier mount boot uses
+		// (passwordless sudo → bounded 180s prompt). Shares /mount-now's
+		// single-flight CAS so it can never stack a prompt on a user click.
+		globalMonitor.SetNFSServerAddr(remountAddr)
+		globalMonitor.EnableNFSAbsentRemount(func() error {
+			if !mountNowInFlight.CompareAndSwap(false, true) {
+				return fmt.Errorf("mount already in flight")
+			}
+			defer mountNowInFlight.Store(false)
+			if err := mountNFSWithPrompt(remountAddr, remountPoint); err != nil {
 				return err
 			}
 			globalMu.Lock()
@@ -1472,16 +1648,36 @@ func stopServerLocked() {
 	globalSpool = nil
 	globalDrainer = nil
 	globalDerivStore = nil
+	thumbWarmer := globalThumbWarmer
+	globalThumbWarmer = nil
+	globalThumbCache = nil
 	globalMu.Unlock()
 
 	// Now run the slow shutdown work on the snapshots, no lock held.
 	// During this window, Stats / IsRunning / CacheStatus correctly
 	// report "Running: false" — we already nil'd the publicly-visible
 	// state, so the answer is honest, not a lie.
+	// DIAGNOSTIC (2026-07-15): per-step logging to pinpoint the "Stop
+	// everything"/quit teardown deadlock — the last "shutdown step" logged
+	// before the freeze names the component whose Stop()/Close() hangs.
+	if thumbWarmer != nil {
+		jmlog.Info("shutdown step", "component", "thumbWarmer.Stop")
+		thumbWarmer.Stop()
+	}
+	if server != nil {
+		// Final sidecar-cache snapshot: a clean stop preserves every warmed
+		// `._`/.DS_Store body for the next launch (the periodic saver bounds
+		// loss on a hard kill to the last interval).
+		jmlog.Info("shutdown step", "component", "SidecarPersistStop")
+		server.Handler().SidecarPersistStop()
+		warmupReset()
+	}
 	if metricsSrv != nil {
+		jmlog.Info("shutdown step", "component", "metricsSrv.Stop")
 		metricsSrv.Stop()
 	}
 	if monitor != nil {
+		jmlog.Info("shutdown step", "component", "monitor.Stop")
 		monitor.Stop()
 	}
 	if server != nil {
@@ -1490,44 +1686,58 @@ func stopServerLocked() {
 		// fall through to redundant Stop calls below as belt-and-
 		// suspenders for the case where SetSpool was bypassed for
 		// some reason — the global is the durable handle.
+		jmlog.Info("shutdown step", "component", "StopHandler")
 		server.Handler().StopHandler()
+		jmlog.Info("shutdown step", "component", "server.Stop")
 		server.Stop()
 	}
 	if drainer != nil {
 		// Belt-and-suspenders: handler StopHandler already drained
 		// this 30 s above. Calling Stop again is idempotent.
+		jmlog.Info("shutdown step", "component", "drainer.Stop")
 		drainer.Stop(5 * time.Second)
 	}
 	if spool != nil {
+		jmlog.Info("shutdown step", "component", "spool.Stop")
 		spool.Stop()
 	}
 	if cache != nil {
+		jmlog.Info("shutdown step", "component", "cache.Stop")
 		cache.Stop()
 	}
 	if rc != nil {
+		jmlog.Info("shutdown step", "component", "rc.Stop")
 		rc.Stop()
 	}
 	if reach != nil {
+		jmlog.Info("shutdown step", "component", "reach.Stop")
 		reach.Stop()
 	}
 	if keyspaceNW != nil {
+		jmlog.Info("shutdown step", "component", "keyspaceNW.Stop")
 		keyspaceNW.Stop()
 	}
 	if prefetcher != nil {
+		jmlog.Info("shutdown step", "component", "prefetcher.Stop")
 		prefetcher.Stop()
 	}
 	if pinStore != nil {
+		jmlog.Info("shutdown step", "component", "pinStore.Close")
 		pinStore.Close()
 	}
 	if derivStore != nil {
+		jmlog.Info("shutdown step", "component", "derivStore.Close")
 		derivStore.Close()
 	}
 	if store != nil {
+		jmlog.Info("shutdown step", "component", "store.Close")
 		store.Close()
 	}
 	if rdb != nil {
+		jmlog.Info("shutdown step", "component", "rdb.Close")
 		rdb.Close()
 	}
+	jmlog.Info("shutdown step", "component", "stopServerLocked-complete")
 
 	// Detach the RPC observer so the next start cleanly re-registers.
 	jmlibnfs.SetObserver(nil)
@@ -1589,6 +1799,7 @@ func NFSServerStopMount() {
 	// be neutered before the unmount window opens.
 	if mon != nil {
 		mon.EnableNFSRemount(nil)
+		mon.EnableNFSAbsentRemount(nil) // #93 path too — same rationale
 	}
 
 	// Step 1: unmount NFS while server is still alive so the kernel
@@ -1644,6 +1855,7 @@ func NFSServerShutdown() {
 	// landing mid-unmount must not remount the volume we're shutting down.
 	if mon != nil {
 		mon.EnableNFSRemount(nil)
+		mon.EnableNFSAbsentRemount(nil) // #93 path too — same rationale
 	}
 
 	// Step 1: unmount NFS while the server is still alive (handler can
@@ -1971,7 +2183,15 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 		shellCmd, mountPoint,
 	)
 
-	out, err := exec.Command("osascript", "-e", osaScript).CombinedOutput()
+	// Bounded: an unanswered admin prompt must never hang forever (see the
+	// NFSServerStart deadlock-fix note). 180s is generous for an attended
+	// user; unattended it self-clears and the next app start re-prompts.
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "osascript", "-e", osaScript).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("mount prompt timed out after 180s (unanswered)")
+	}
 	if err != nil {
 		return fmt.Errorf("osascript: %v\n%s", err, string(out))
 	}
@@ -2077,9 +2297,25 @@ func nfsMountOpts(port string) string {
 	// amplification); medium/fast keep 16. nfsReadahead() falls back to 16 if
 	// netprofile has no signal, so behavior is unchanged absent a classification.
 	ra := netprofile.Default().NFSReadahead()
+	// [B4' Fix B] actimeo=3600 → split attribute caching: acreg stays 3600
+	// (file attrs — unchanged behavior for the read/write paths), but acdir
+	// drops to 3-15s. With actimeo=3600 the client cached DIRECTORY attributes
+	// — and therefore its name cache, including NEGATIVE entries — for up to
+	// AN HOUR: one NoEnt answered during the ~3s keyspace-push window and
+	// server-created content (farm output, another machine's import, a
+	// folder move) stayed invisible until a manual readdir flushed it.
+	// Measured live on cellular: content never appeared (>120s, sprint B4').
+	// With the metadata mirror serving GETATTR in µs over loopback, client
+	// dir-attr caching is obsolete — re-validating every 3-15s costs nothing
+	// and bounds new-content visibility at ~(push 3s + acdirmax 15s).
+	// JM_NFS_LEGACY_ACTIMEO=1 restores the old single actimeo=3600.
+	acOpts := "acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15"
+	if os.Getenv("JM_NFS_LEGACY_ACTIMEO") == "1" {
+		acOpts = "actimeo=3600"
+	}
 	return fmt.Sprintf(
-		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,actimeo=3600,vers=3,tcp",
-		port, port, ra)
+		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,%s,vers=3,tcp",
+		port, port, ra, acOpts)
 }
 
 // unmountNFS removes the NFS mount.
@@ -3026,6 +3262,78 @@ func handleLookupHTTP(w http.ResponseWriter, r *http.Request) {
 	writeContractJSON(w, resp)
 }
 
+// duResponse is the GET /du body (INSTANT-NAV #2): instant recursive folder
+// totals from the metadata mirror's incrementally-maintained subtree
+// aggregates — no du-walk, no FUSE, no backend round-trip.
+type duResponse struct {
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+	Files int64  `json:"files"`
+	Human string `json:"human"`
+}
+
+// duHuman renders a byte count the way the app's UI does elsewhere (binary
+// units, one decimal). Kept tiny and local — presentation only.
+func duHuman(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// handleDuHTTP serves GET /du?path=<user-path>: O(1) "total bytes + file count
+// under this folder" from the mirror's subtree aggregates (metadata.Store.
+// SubtreeSize, JM_SUBTREE_SIZES default-on). Path convention matches /lookup:
+// entries are keyed VOLUME-RELATIVE, so translate via metaRelPath; the mount
+// root maps to "." (root children key under "." in the mirror). A file path
+// answers with its own size (files=1), du-style. 503 when the store isn't up
+// or the gate is off; 404 when the path isn't in the mirror.
+func handleDuHTTP(w http.ResponseWriter, r *http.Request) {
+	userPath := r.URL.Query().Get("path")
+	if userPath == "" {
+		http.Error(w, "missing ?path", 400)
+		return
+	}
+	globalMu.Lock()
+	store := globalStore
+	mp := globalMountPath
+	if mp == "" {
+		mp = globalWantMountPoint
+	}
+	globalMu.Unlock()
+	if store == nil {
+		http.Error(w, "metadata store not initialized", 503)
+		return
+	}
+
+	rel := metaRelPath(userPath, mp)
+	if rel == "" {
+		rel = "." // volume root
+	}
+	bytes, files, ok := store.SubtreeSize(rel)
+	if !ok {
+		http.Error(w, "subtree sizes disabled (JM_SUBTREE_SIZES=0)", 503)
+		return
+	}
+	if rel != "." {
+		entry := store.LookupByPath(rel)
+		if entry == nil {
+			http.Error(w, "path not in metadata mirror", 404)
+			return
+		}
+		if !entry.IsDir {
+			bytes, files = entry.Size, 1 // du on a file: its own size
+		}
+	}
+	writeContractJSON(w, duResponse{Path: userPath, Bytes: bytes, Files: files, Human: duHuman(bytes)})
+}
+
 // derivativesResponse is the GET /derivatives body. Schema:
 // contract/spec/schema/derivatives.schema.json. `derivatives` is always a
 // non-nil slice (serializes as [] not null — the schema requires an array, and
@@ -3467,6 +3775,29 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	// mount (direct JuiceFS — no NFS self-loop). filepath.Clean on the rel path
 	// keeps it inside the inode dir (the farm only ever writes flat names there).
 	blobPath := filepath.Join(farm.DerivBlobDir(mount, inode), filepath.Clean("/"+blobRel))
+
+	// #1 hydration pack: SMALL kinds (everything but proxy) serve LOCAL-FIRST
+	// from the thumb cache, populated by the folder-open warmer or a prior
+	// read-through here. The manifest row above still authorized the kind and
+	// supplied the media type, so the fail-closed 404 semantics are identical
+	// — only the byte source swaps (local SSD instead of a FUSE round-trip).
+	globalMu.Lock()
+	tc := globalThumbCache
+	globalMu.Unlock()
+	smallKind := kind != "proxy"
+	if tc != nil && smallKind {
+		if lp, ok := tc.Path(inode, kind); ok {
+			if lf, lerr := os.Open(lp); lerr == nil {
+				defer lf.Close()
+				if lfi, serr := lf.Stat(); serr == nil {
+					w.Header().Set("Content-Type", mediaType)
+					http.ServeContent(w, r, "", lfi.ModTime(), lf)
+					return
+				}
+			}
+		}
+	}
+
 	f, err := os.Open(blobPath)
 	if err != nil {
 		http.Error(w, "blob unreadable", http.StatusNotFound)
@@ -3477,6 +3808,25 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "blob stat failed", http.StatusInternalServerError)
 		return
+	}
+	// Read-through populate: a small blob served from FUSE lands in the local
+	// cache so the NEXT request (and offline browsing) is 0-RTT. Bounded by
+	// thumbReadThroughCap; the bytes are served from RAM in the same response.
+	if tc != nil && smallKind && fi.Size() <= thumbReadThroughCap {
+		data, rerr := io.ReadAll(io.LimitReader(f, thumbReadThroughCap))
+		if rerr == nil && int64(len(data)) == fi.Size() {
+			if _, perr := tc.Put(inode, kind, bytes.NewReader(data)); perr != nil {
+				jmlog.Debug("thumb read-through populate failed", "inode", inode, "kind", kind, "error", perr.Error())
+			}
+			w.Header().Set("Content-Type", mediaType)
+			http.ServeContent(w, r, fi.Name(), fi.ModTime(), bytes.NewReader(data))
+			return
+		}
+		// Short/failed read: fall back to the plain file path from offset 0.
+		if _, serr := f.Seek(0, io.SeekStart); serr != nil {
+			http.Error(w, "blob read failed", http.StatusInternalServerError)
+			return
+		}
 	}
 	// http.ServeContent sets Content-Type (we pin it from the manifest media_type),
 	// Accept-Ranges: bytes, and the full 200/206 + Content-Range/Content-Length

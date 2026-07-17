@@ -160,6 +160,12 @@ type scheduleStoreImpl struct {
 	dests    *destinationStoreImpl
 	fuseRoot string // for /jfs path rewriting on schedule fire
 	onChange func()
+	// sourceGate confines a schedule's Source.Path to the same roots the
+	// interactive Migrate handler enforces (sourceRoots for In, /jfs for
+	// Out). Injected by the API via SetSourceGate — the store itself has
+	// no access to sourceRoots/destMount. nil (e.g. in unit tests) = no
+	// gate, preserving the prior behavior for callers that don't wire it.
+	sourceGate func(path string, dir Direction) error
 }
 
 // newScheduleStore constructs an empty store and the underlying cron
@@ -185,6 +191,17 @@ func (s *scheduleStoreImpl) SetOnChange(fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onChange = fn
+}
+
+// SetSourceGate wires the source-path confinement check (mirrors the
+// interactive Migrate handler's pathAllowed/jfsPathAllowed gate).
+// Without it a backup schedule could `juicefs sync file:///etc … <remote>`
+// as root and exfiltrate arbitrary host files. Set once during Register,
+// before the server serves requests.
+func (s *scheduleStoreImpl) SetSourceGate(fn func(path string, dir Direction) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sourceGate = fn
 }
 
 // snapshot satisfies the scheduleStore interface — returns the
@@ -341,6 +358,7 @@ func (s *scheduleStoreImpl) fire(name string) {
 	mgr := s.mgr
 	fuseRoot := s.fuseRoot
 	onChange := s.onChange
+	gate := s.sourceGate
 	s.mu.Unlock()
 
 	if r.Paused {
@@ -349,6 +367,25 @@ func (s *scheduleStoreImpl) fire(name string) {
 		// run loop. Treat as a no-op so we don't accidentally submit a
 		// just-paused schedule.
 		return
+	}
+
+	// SECURITY (defense-in-depth): re-check the source gate at fire time
+	// so a row that predates the gate (or a hand-edited state file) can't
+	// exfiltrate an out-of-bounds host path. Records the block in history.
+	if gate != nil {
+		if err := gate(r.Source.Path, r.Source.Direction); err != nil {
+			s.recordHistory(name, scheduleHistoryRow{
+				State:      "error",
+				StartedAt:  now,
+				FinishedAt: time.Now().UnixMilli(),
+				Error:      "source blocked: " + err.Error(),
+			})
+			log.Printf("manager: schedule %q blocked at fire: %v", name, err)
+			if onChange != nil {
+				onChange()
+			}
+			return
+		}
 	}
 
 	source, destURI, env, errMsg := resolveScheduleSpec(r, dests, fuseRoot)
@@ -485,6 +522,15 @@ func (s *scheduleStoreImpl) validateSchedule(sched Schedule) error {
 	}
 	if !strings.HasPrefix(sched.Source.Path, "/") {
 		return errors.New("source.path must be an absolute path")
+	}
+	// SECURITY: confine the source to the permitted roots, exactly like
+	// the interactive Migrate handler. Without this a backup schedule
+	// could sync an arbitrary host path (e.g. /etc, /root) to a remote
+	// destination as root. sourceGate is nil in unit tests (no-op).
+	if s.sourceGate != nil {
+		if err := s.sourceGate(sched.Source.Path, sched.Source.Direction); err != nil {
+			return err
+		}
 	}
 	if sched.Destination.Name == "" {
 		return errors.New("destination.name is required")
@@ -645,7 +691,16 @@ func (s *scheduleStoreImpl) runNow(name string) (string, error) {
 	dests := s.dests
 	mgr := s.mgr
 	fuseRoot := s.fuseRoot
+	gate := s.sourceGate
 	s.mu.RUnlock()
+
+	// SECURITY (defense-in-depth): same source gate as fire(), for the
+	// POST /api/schedules/{name}/run immediate-trigger path.
+	if gate != nil {
+		if err := gate(r.Source.Path, r.Source.Direction); err != nil {
+			return "", err
+		}
+	}
 
 	source, destURI, env, errMsg := resolveScheduleSpec(r, dests, fuseRoot)
 	if errMsg != "" {

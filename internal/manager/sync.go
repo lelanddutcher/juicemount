@@ -111,6 +111,20 @@ type RunSyncSpec struct {
 	FUSEMount string // ModeEmbedded
 	MetaURL   string // ModeStandalone
 	VolName   string // ModeStandalone
+
+	// OwnerUID/OwnerGID: after a successful embedded-mode sync, the
+	// destination tree is chowned to this POSIX owner so the CLIENT that
+	// mounts the volume (a different uid than the root the manager runs as
+	// on the NAS) can WRITE the copied data — not just read it. This closes
+	// the gap the mode-only post-sync chmod (d5f3568) left open: chmod can
+	// never grant write to a client that is neither the owner nor in the
+	// owning group, and `juicefs sync` running as root leaves every migrated
+	// file root:wheel. Only applied when OwnerUID > 0 (a real, non-root
+	// client uid); <= 0 skips the chown and preserves raw sync ownership
+	// (the historical behavior). OwnerGID < 0 leaves the group unchanged.
+	// A future per-user ACL policy supersedes this single-owner model.
+	OwnerUID int
+	OwnerGID int
 }
 
 // RunSync invokes `juicefs sync` against the given source and
@@ -307,33 +321,71 @@ func RunSync(ctx context.Context, juicefsBin string, spec RunSyncSpec, source, d
 	// policy; for now, "every migrated file is read+write in the
 	// mount" is the contract.
 	if spec.Mode == ModeEmbedded && spec.FUSEMount != "" {
-		applyPostSyncChmod(ctx, destination, spec.FUSEMount)
+		applyPostSyncPermissions(ctx, destination, spec.OwnerUID, spec.OwnerGID)
 	}
 	return nil
 }
 
-// applyPostSyncChmod walks the destination tree and ensures every file
-// and directory is at least owner+group rw, world r, dirs +x. Errors
-// are logged but never propagated — the sync itself already succeeded,
-// and a chmod failure on a single file shouldn't reverse the job's
-// success state in the UI.
-func applyPostSyncChmod(ctx context.Context, destination, fuseMount string) {
-	// destination is a juicefs sync URI (file:///<mount>/... or
-	// jfs://<vol>/...). Rewrite to a local FUSE-mount path by stripping
-	// the file:// prefix when present and replacing any /jfs prefix
-	// the user supplied with the on-disk fuseMount.
+// applyPostSyncPermissions makes a freshly-migrated destination tree
+// usable by the mounting client. It does two things, both metadata-only
+// (so even a 14k-file tree completes in seconds):
+//
+//  1. chmod every entry to at least owner+group rw, world r, dirs +x (the
+//     capital X only adds execute on directories / already-executable
+//     files). Idempotent.
+//  2. chown the tree to the client owner (ownerUID:ownerGID) — the piece
+//     the old mode-only fix (d5f3568) was MISSING. `juicefs sync` runs as
+//     root on the NAS, so migrated files land root:wheel; a Mac client at
+//     uid 501 (gid staff) is neither the owner nor in group wheel, so no
+//     chmod can make them writable. Handing the tree to the client owner
+//     is the only thing that makes "migrate, then edit it from the mount"
+//     actually work. Applied only when a real, non-root owner is set
+//     (ownerUID > 0); otherwise skipped, preserving the raw sync ownership.
+//
+// Errors are logged but never propagated — the sync itself already
+// succeeded, and a perms fixup on a single file shouldn't flip the job to
+// failed in the UI.
+func applyPostSyncPermissions(ctx context.Context, destination string, ownerUID, ownerGID int) {
+	// destination is a juicefs sync URI (file:///<mount>/...). Rewrite to a
+	// local path by stripping the file:// prefix.
 	target := strings.TrimPrefix(destination, "file://")
 	target = strings.TrimSuffix(target, "/")
 	if target == "" {
 		return
 	}
+	// (1) mode
 	cmd := exec.CommandContext(ctx, "chmod", "-R", "u+rwX,g+rwX,o+rX", target)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		// Don't tank the job. Log so an operator can diagnose if a
-		// later "I can't write to Resolve project" report comes in.
+	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "manager: post-sync chmod on %q failed (job stays successful): %v\noutput:\n%s\n", target, err, string(out))
 	}
+	// (2) ownership — hand the tree to the mounting client so it can WRITE.
+	if args := chownArgs(ownerUID, ownerGID, target); args != nil {
+		cmd := exec.CommandContext(ctx, "chown", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "manager: post-sync chown %s on %q failed (job stays successful): %v\noutput:\n%s\n", chownSpec(ownerUID, ownerGID), target, err, string(out))
+		}
+	}
+}
+
+// chownSpec renders the "uid[:gid]" argument for chown; gid < 0 leaves the
+// group unchanged.
+func chownSpec(uid, gid int) string {
+	if gid >= 0 {
+		return strconv.Itoa(uid) + ":" + strconv.Itoa(gid)
+	}
+	return strconv.Itoa(uid)
+}
+
+// chownArgs builds the `chown -R <uid[:gid]> <target>` argument vector, or
+// nil when no chown should run — uid <= 0 (unset / root: never a valid
+// client owner, and root-owned is exactly the bug we're fixing) or an empty
+// target. Split out for testability so we can assert the exact argv without
+// spawning chown.
+func chownArgs(uid, gid int, target string) []string {
+	if uid <= 0 || target == "" {
+		return nil
+	}
+	return []string{"-R", chownSpec(uid, gid), target}
 }
 
 // pollJuicefsMetrics scrapes the juicefs sync Prometheus endpoint every

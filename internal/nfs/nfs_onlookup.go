@@ -10,6 +10,7 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
 
 func lookupSuccessResponse(handle []byte, entPath, dirPath []string, fs billy.Filesystem) ([]byte, error) {
@@ -110,15 +111,24 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 	// also avoided an 800ms FUSE Lstat per new file (deep-tree "error 100060").
 	// Filesystems without the cache-only stat keep the FUSE-Lstat path (offline
 	// cache-miss → NXIO via the handle-preservation branch below).
+	// WAVE 0: record the LOOKUP resolve outcome (hit vs noent). QA-35-safe —
+	// a single atomic increment on the existing cache-only resolve, no extra
+	// FUSE syscall (StatCacheOnly is the RAM path; the Lstat fallback below is
+	// only for filesystems without the cache-only stat).
 	if cs, ok := fs.(cacheStater); ok {
 		if _, found := cs.StatCacheOnly(fs.Join(reqPath...)); !found {
+			metrics.Default().IncLookupNoent()
 			return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}
 		}
+		metrics.Default().IncLookupHit()
 	} else if _, err = fs.Lstat(fs.Join(reqPath...)); err != nil {
+		metrics.Default().IncLookupNoent()
 		if pin.IsOfflineNotAvailable(err) {
 			return &NFSStatusError{NFSStatusNXIO, err}
 		}
 		return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}
+	} else {
+		metrics.Default().IncLookupHit()
 	}
 
 	newHandle := userHandle.ToHandle(fs, reqPath)

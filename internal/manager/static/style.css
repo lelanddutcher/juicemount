@@ -985,6 +985,39 @@ main {
   font-size: 0.85rem;
 }
 .maintenance-controls button:hover { filter: brightness(1.1); }
+.maintenance-schedule {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border, rgba(128, 128, 128, 0.2));
+}
+.maintenance-schedule-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.maintenance-schedule-label select {
+  font-size: 0.8rem;
+  padding: 0.15rem 0.35rem;
+}
+.maintenance-schedule-advice {
+  margin: 0.4rem 0 0;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+.maintenance-schedule-warn {
+  margin: 0.3rem 0 0;
+  font-size: 0.72rem;
+  color: var(--warn, #c9922e);
+}
+.maintenance-schedule-flash {
+  display: inline-block;
+  margin-top: 0.3rem;
+  font-size: 0.72rem;
+  color: var(--accent);
+}
 .maintenance-toggle {
   display: inline-flex;
   align-items: center;
@@ -1691,6 +1724,31 @@ footer a:hover { text-decoration: underline; }
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+.farm-jobs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+}
+.farm-jobs-header .farm-jobs-title { margin: 0; }
+.farm-jobs-clear {
+  font-size: 0.72rem;
+  padding: 0.2rem 0.55rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+  border-radius: 4px;
+  cursor: pointer;
+}
+.farm-jobs-clear:hover:not(:disabled) { filter: brightness(1.15); color: var(--text); }
+.farm-jobs-clear:disabled { opacity: 0.5; cursor: default; }
+.farm-jobs-flash {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin: 0 0 0.4rem;
 }
 .farm-jobs-list { list-style: none; margin: 0; padding: 0; }
 .farm-jobs-empty {

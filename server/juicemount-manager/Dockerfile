@@ -57,11 +57,21 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # (e.g. JM_META=redis://<server-ip>:30179/1). To switch to embedded
 # mode, override with `command: ["--fuse-mount=/jfs"]` in compose AND
 # pre-mount the JuiceFS volume at /jfs (cap_add SYS_ADMIN, /dev/fuse).
+#
+# EMBEDDED MODE also needs JM_OVERVIEW_META=redis://redis:6379/1 — in
+# embedded mode --meta must stay empty (mutually exclusive with
+# --fuse-mount), so the Overview tab, Trash retention (juicefs config
+# --trash-days), and the GC/FSCK/compact Maintenance levers all read the
+# volume through --overview-meta. Without it the Overview cards read
+# "metaURL not configured", the Trash retention shows "unknown", and the
+# metadata-side Maintenance buttons 501. Standalone mode leaves it empty
+# (--meta already serves both).
 ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/juicemount-manager \
     --listen=\"$JM_LISTEN\" \
     --dest-mount=\"$JM_DEST_MOUNT\" \
     --source-roots=\"$JM_SOURCE_ROOTS\" \
     --vol-name=\"$JM_VOL_NAME\" \
     --meta=\"${JM_META:-}\" \
+    --overview-meta=\"${JM_OVERVIEW_META:-}\" \
     --admin-key=\"${JM_ADMIN_KEY:-}\" \
     \"$@\"", "--"]

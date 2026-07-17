@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- QuickLook thumbnail appex. Assembled into
+	     Contents/PlugIns/JuiceMountThumbnails.appex by scripts/build-app.sh,
+	     which also stamps CFBundleShortVersionString/CFBundleVersion from the
+	     app's Info.plist so the two can never drift. -->
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>JuiceMount Thumbnails</string>
+	<key>CFBundleExecutable</key>
+	<string>JuiceMountThumbnails</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.juicemount.app.thumbnails</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>JuiceMountThumbnails</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.3.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>3</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.quicklook.thumbnail</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>JuiceMountThumbnails.ThumbnailProvider</string>
+		<key>NSExtensionAttributes</key>
+		<dict>
+			<!-- Broad declaration ladder for the empirical routing-precedence
+			     test: video UTIs the farm renders posters for, plus stills.
+			     If macOS never routes some public types to third-party
+			     providers, declaring them is harmless — the orchestrator
+			     measures actual routing via log stream. -->
+			<key>QLSupportedContentTypes</key>
+			<array>
+				<string>com.apple.quicktime-movie</string>
+				<string>public.mpeg-4</string>
+				<string>public.movie</string>
+				<string>public.avi</string>
+				<string>com.apple.m4v-video</string>
+				<string>public.mpeg-2-video</string>
+				<string>public.jpeg</string>
+				<string>public.png</string>
+				<string>public.heic</string>
+				<string>public.tiff</string>
+				<string>com.adobe.raw-image</string>
+				<string>public.camera-raw-image</string>
+			</array>
+			<key>QLThumbnailMinimumDimension</key>
+			<integer>0</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>

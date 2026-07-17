@@ -5,6 +5,7 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -300,3 +301,37 @@ func TestScheduleResolvesDestination(t *testing.T) {
 	}
 }
 
+
+// TestScheduleSourceGate is the regression test for the schedule source
+// confinement fix. Before it, validateSchedule only required Source.Path
+// to be absolute — so a backup schedule could juicefs-sync an arbitrary
+// host path (e.g. /etc) to a remote destination as root. The injected
+// sourceGate now confines the source; upsert must reject out-of-bounds.
+func TestScheduleSourceGate(t *testing.T) {
+	store := newScheduleStore(nil, nil, "")
+	// Mimic pathAllowed: only paths under /sources are permitted.
+	store.SetSourceGate(func(path string, dir Direction) error {
+		if path == "/sources" || strings.HasPrefix(path, "/sources/") {
+			return nil
+		}
+		return errors.New("source outside permitted source roots")
+	})
+
+	mk := func(src string) Schedule {
+		return Schedule{
+			Name:          "bk",
+			Source:        SourceSpec{Path: src, Direction: DirectionIn},
+			Destination:   DestinationRef{Name: "some-dest"},
+			Options:       DefaultSyncOptions(),
+			Cron:          "0 2 * * *",
+			RetainHistory: 5,
+		}
+	}
+
+	if err := store.upsert(mk("/etc"), false); err == nil {
+		t.Fatal("expected upsert to REJECT out-of-bounds source /etc, got nil")
+	}
+	if err := store.upsert(mk("/sources/foo"), false); err != nil {
+		t.Fatalf("expected upsert to ALLOW /sources/foo, got %v", err)
+	}
+}

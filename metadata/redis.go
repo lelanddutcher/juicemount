@@ -64,6 +64,14 @@ const (
 	// is fresh enough to skip the redundant boot SCAN.
 	metaKeyLastSyncTime = "last_sync_time"
 
+	// [#6/C1] store_meta key under which the keyspace push persists a
+	// once-a-minute "push was alive" heartbeat (unix seconds). Unlike
+	// last_sync_time (stamped only on rare full SCANs once push is engaged),
+	// this bounds the actual DOWNTIME across a restart — the basis for
+	// skipping the boot gap-fill SCAN (shouldSkipBootGapFill, keyspace.go),
+	// which costs 160s+ and real data per boot on a cellular link.
+	metaKeyPushLastAlive = "push_last_alive"
+
 	// defaultBootSyncMaxAge is the freshness window ShouldSkipBootSync uses when
 	// JM_BOOT_SYNC_MAX_AGE_SEC is unset. A persisted last-sync newer than this
 	// (AND keyspace push engaged) is considered fresh — the PSUBSCRIBE gap-fill
@@ -198,6 +206,14 @@ type RedisClient struct {
 	// are actually deleted from SQLite. Guarded by mu.
 	pruneAbsent map[string]int
 
+	// ladderPersisted mirrors the durable prune_ladder table's contents (#10,
+	// task #73 second half): it is the previous-cycle snapshot that
+	// persistPruneLadderDiff diffs pruneAbsent against at each cycle's tail,
+	// so only changed rows are written. Same single-writer discipline as
+	// pruneAbsent (constructors seed it via loadDurablePruneLadder before any
+	// goroutine starts; thereafter only syncMetadata's goroutine touches it).
+	ladderPersisted map[string]int
+
 	// pruneFollowUp marks the next syncNowCh wake as a G5 fast-path
 	// CONTINUATION (a capped mass-delete with confirmed survivors) — it must
 	// bypass the keyspace-push deferral and the flap debounce in
@@ -222,6 +238,16 @@ type RedisClient struct {
 	// they happen on the single reconcile goroutine.
 	mountPoint string
 	fuseRoot   string
+
+	// Unknown-ancestor promotion limiter (see keyspace.go
+	// noteUnknownAncestor): once-per-inode + globally rate-limited full-SCAN
+	// promotion, so scan-filtered namespace churn (farm derivative writes)
+	// can't storm tunnel-priced SCANs. Guarded by unknownAncestorMu — this
+	// path runs per coalescer flush, never per NFS RPC.
+	unknownAncestorMu       sync.Mutex
+	unknownAncestorSeen     map[uint64]struct{}
+	unknownAncestorLastSync time.Time
+	unknownAncestorDrops    uint64
 
 	// spoolPending (QA-30 Layer D, NFSv3 sprint) reports whether a store path
 	// has a LIVE write-spool entry that has not yet drain-succeeded — i.e. the
@@ -248,6 +274,17 @@ type RedisClient struct {
 	// (default).
 	spoolPending atomic.Pointer[spoolGuardFunc]
 
+	// keyspaceRequeue re-enqueues a directory inode into the live push
+	// coalescer. Wired to inodeCoalescer.add while a subscription is up,
+	// nil otherwise (SCAN/pinwarm-driven reconciles don't recurse). This is
+	// the B4' burst-ordering fix: when reconcileDir discovers a child dir
+	// the mirror has never seen (or whose inode changed — a recreate), that
+	// dir's OWN contents were never mirrored and its create-events were
+	// dropped as unknown-ancestor. Requeueing it walks the new subtree
+	// through the same debounced, burst-ceilinged machinery until nothing
+	// new is discovered. Same atomic-pointer idiom as spoolPending.
+	keyspaceRequeue atomic.Pointer[requeueFunc]
+
 	// Test seams for the keyspace-push path. Production leaves these nil and
 	// the real methods run. Tests set them to observe coalescer behavior
 	// (which dirs got reconciled, how many full-SCAN promotions) without a
@@ -259,6 +296,9 @@ type RedisClient struct {
 	// without a live Redis. Production leaves it nil (real HGETALL runs).
 	testChildDirInodes func(uint64) ([]uint64, error)
 }
+
+// requeueFunc re-enqueues a dir inode into the live push coalescer.
+type requeueFunc func(uint64)
 
 // keyspaceReconcileDir dispatches to the test seam when set, else the real
 // single-dir reconcile. Used by the coalescer so tests can count calls.
@@ -522,9 +562,13 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 		syncNowCh:         make(chan struct{}, 1),
 		connected:         true,
 		pruneAbsent:       make(map[string]int),
+		ladderPersisted:   make(map[string]int),
 	}
 	rc.rdb.Store(rdb)
 	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+	// #10 (task #73): resume the durable prune ladder BEFORE any goroutine or
+	// SyncOnce can run a cycle — see the safety analysis on the method.
+	rc.loadDurablePruneLadder()
 	return rc, nil
 }
 
@@ -566,9 +610,15 @@ func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error)
 		connected:         false,
 		lastDisconnect:    time.Now(),
 		pruneAbsent:       make(map[string]int),
+		ladderPersisted:   make(map[string]int),
 	}
 	rc.rdb.Store(rdb) // rdb is atomic.Pointer (see the field doc / Reconnect race)
 	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+	// #10 (task #73): resume the durable prune ladder here too — the
+	// start-while-offline path is exactly a restart-churn scenario (see the
+	// safety analysis on the method; offline cycles are RecentlyDegraded, so
+	// resumed counts sit inert until the first stable SCAN).
+	rc.loadDurablePruneLadder()
 	return rc, nil
 }
 
@@ -795,6 +845,29 @@ func (rc *RedisClient) collectFastPathPrunes(skipIncrement bool) (fastConfirmed 
 		)
 	}
 	return fastConfirmed, capped
+}
+
+// appleDoublePrincipal maps `dir/._name` to its principal `dir/name` —
+// the data file a macOS AppleDouble sidecar belongs to.
+func appleDoublePrincipal(p string) string {
+	dir, base := path.Split(p)
+	return dir + strings.TrimPrefix(base, "._")
+}
+
+// appleDoublePruneEnabled: JM_PRUNE_APPLEDOUBLE=0 restores the pre-2026-07-10
+// blanket refusal to prune `._` mirror rows (the ._-pair rule's kill switch).
+func appleDoublePruneEnabled() bool { return os.Getenv("JM_PRUNE_APPLEDOUBLE") != "0" }
+
+// appleDoubleQualifies is the ._-PAIR RULE's decision: a `._` ladder
+// candidate may proceed to qualification only when the rule is enabled AND
+// its principal has no live mirror row (the data file is gone — the sidecar
+// row is residue). Split out for direct testing; the caller's downstream
+// gates (Layer-A FUSE Lstat, spool, pin, G0) all still apply.
+func appleDoubleQualifies(p string, lookup func(string) *Entry) bool {
+	if !appleDoublePruneEnabled() {
+		return false
+	}
+	return lookup(appleDoublePrincipal(p)) == nil
 }
 
 // TriggerSync signals the reconcile loop to run an immediate sync cycle.
@@ -1912,17 +1985,40 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	if !skipIncrement {
 		for p, count := range rc.pruneAbsent {
 			if count >= PruneThreshold {
-				// `._` AppleDouble guard (symmetric with scopedPrune's `._`-skip):
-				// `._` sidecars are scan-filtered / managed Mac-side via the explicit
-				// Remove path, never the reconcile — their absence from Redis is not a
-				// delete signal. Pruning one whose path-stable Track-B handle the
-				// kernel still holds Forgets it → FromHandle STALE (the `._dirN`
-				// had_shadow STALE the release battery caught). Stop tracking it and
-				// never enqueue it for deletion.
-				if strings.HasPrefix(path.Base(p), "._") {
+				// `._` AppleDouble ._-PAIR RULE (2026-07-10, task #73 completion —
+				// found live: 28,400/28,400 pending_prune rows were `._` sidecars
+				// of long-deleted files, parked FOREVER because every prune layer
+				// blanket-refused `._`, so Finder/rsync saw phantom sidecars and
+				// pending_prune was pinned permanently).
+				//
+				// History of the blanket guard: `._` names are SCAN-filtered
+				// (#78), so a LIVE sidecar is permanently SCAN-absent and the old
+				// unconditional prune STALE'd kernel-held handles mid-copy (#92
+				// class). The refusal was right for LIVE pairs, wrong for DEAD
+				// ones.
+				//
+				// A `._name` candidate may now qualify IFF its PRINCIPAL
+				// (`name` in the same dir) has no live mirror row — the data
+				// file is gone, so the sidecar row is residue. Every remaining
+				// gate still applies downstream, and each closes a specific
+				// hazard:
+				//   - Layer-A per-path FUSE Lstat (verifyPruneCandidates): a
+				//     REAL on-disk `._foo` (user file, or an orphaned sidecar
+				//     that genuinely exists) Lstats present → kept (#97 safe);
+				//   - spool-pending guard: a mid-copy sidecar is in-flight →
+				//     excluded (the #92 fix);
+				//   - pin guard, G0 identity, !RecentlyDegraded as usual.
+				// A LIVE pair (principal present) stays blocked here and keeps
+				// its ladder position wiped, exactly as before.
+				// Kill switch: JM_PRUNE_APPLEDOUBLE=0 restores the blanket
+				// refusal.
+				if strings.HasPrefix(path.Base(p), "._") &&
+					!appleDoubleQualifies(p, rc.store.LookupByPath) {
 					delete(rc.pruneAbsent, p)
 					continue
 				}
+				// A qualified `._` falls through like any candidate
+				// (Layer A / spool / pin / G0 still gate).
 				toDelete = append(toDelete, p)
 				ladderCounts[p] = count
 				delete(rc.pruneAbsent, p)
@@ -2076,6 +2172,17 @@ func (rc *RedisClient) syncMetadata() (err error) {
 			rc.TriggerSync()
 		}
 	}
+
+	// #10 (task #73 second half): persist the ladder's post-cycle state. This
+	// is the SINGLE durable-ladder call site, deliberately placed after every
+	// pruneAbsent mutation this cycle — trackAbsentPaths increments and
+	// reappearance clears, the qualification drain, collectFastPathPrunes
+	// removals, and verifyPruneCandidates deferral re-insertions — so the
+	// snapshot-diff observes only the cycle's final state (correct by
+	// construction against any future mutation site too). Best-effort and
+	// no-op when the diff is empty; see the method for degraded-cycle and
+	// error-exit semantics.
+	rc.persistPruneLadderDiff()
 
 	duration := time.Since(start)
 	syncedAt := time.Now()

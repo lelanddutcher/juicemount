@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -102,6 +103,21 @@ type HealthMonitor struct {
 	remountFn      func() error // optional: called to remount the NFS volume
 	nfsStaleStreak int          // consecutive failed NFS checks
 	lastRemountAt  time.Time    // last successful remount time
+
+	// NFS-layer absent-mount recovery (#93 — see absentremount.go).
+	// Guarded by mu. absentRemountFn is the PROMPT-CAPABLE two-tier mount
+	// (the same machinery boot uses), distinct from remountFn (legacy,
+	// passwordless-sudo-only). absentTicks is the consecutive-tick
+	// threshold resolved at construction (env JM_NFS_AUTOREMOUNT_TICKS).
+	absentState     nfsAbsentState
+	absentRemountFn func() error
+	nfsServerAddr   string
+	absentTicks     int
+
+	// #106: per-component "local-network-permission suspected" latches, so
+	// the guidance WARN fires once per suspicion streak instead of every
+	// 10s tick. Guarded by mu; lazily allocated.
+	localNetSuspected map[string]bool
 
 	// FUSE health debounce (anti-flap). The raw checkFUSE probe flips on
 	// every backend-link blip; reporting that verbatim strobes the menu bar.
@@ -231,7 +247,8 @@ func New(cfg Config) *HealthMonitor {
 		http: &http.Client{
 			Timeout: 5 * time.Second,
 		},
-		done: make(chan struct{}),
+		done:        make(chan struct{}),
+		absentTicks: absentRemountTicksFromEnv(),
 	}
 }
 
@@ -293,6 +310,30 @@ func (m *HealthMonitor) EnableNFSRemount(fn func() error) {
 	m.remountFn = fn
 }
 
+// EnableNFSAbsentRemount registers the mount callback for the NFS-layer
+// absent-mount recovery (#93 — see absentremount.go). fn must be the SAME
+// two-tier mount machinery boot uses (passwordless sudo → bounded admin
+// prompt) — it may block up to that prompt's 180s bound, so the monitor
+// always invokes it on its own goroutine, single-flighted. Pass nil to
+// disable (deliberate Stop paths do, so recovery can't fight an
+// intentional unmount).
+func (m *HealthMonitor) EnableNFSAbsentRemount(fn func() error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.absentRemountFn = fn
+}
+
+// SetNFSServerAddr tells the monitor where the app's own NFS listener
+// lives (e.g. "127.0.0.1:11049") so the absent-mount recovery can verify
+// the server is up before remounting. Empty (never set) keeps the
+// recovery disabled — a remount nobody can serve would only wedge the
+// kernel client.
+func (m *HealthMonitor) SetNFSServerAddr(addr string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nfsServerAddr = addr
+}
+
 // Status returns a snapshot of the current health state.
 func (m *HealthMonitor) Status() HealthStatus {
 	m.mu.RLock()
@@ -318,6 +359,11 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 	fuseStatus := m.checkFUSE()
 	nfsStatus := m.checkNFS()
 
+	// #93: capture the RAW FUSE verdict before the grace-period and
+	// debounce layers soften it — the absent-mount recovery must gate on
+	// honest FUSE health, not the smoothed UI indicator.
+	rawFUSEHealthy := fuseStatus.Healthy
+
 	// During grace period after network change, suppress FUSE failures
 	// since FUSE stat may transiently fail while connections re-establish.
 	if !fuseStatus.Healthy && m.InGracePeriod() {
@@ -331,8 +377,15 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 	// reachability monitor's job; this is purely the reported UI indicator.)
 	fuseStatus = m.debounceFUSE(fuseStatus)
 
+	// #93: NFS-layer absent-mount recovery runs FIRST and, when it claims
+	// the tick (mountpoint genuinely absent + juicefs alive + our listener
+	// up), the legacy handler is fed "healthy" so the two paths can never
+	// double-act on the same condition — no more per-tick "deferring to the
+	// fuse watchdog" spam, no 180s hard remount racing this path.
+	claimed := m.handleNFSAbsentRecovery(nfsStatus, rawFUSEHealthy)
+
 	// Track NFS staleness streaks and trigger auto-remount when needed.
-	m.handleNFSAutoRemount(nfsStatus.Healthy)
+	m.handleNFSAutoRemount(nfsStatus.Healthy || claimed)
 
 	// Derive connection states
 	redisConnState := connStateFor(prev.RedisConnState, prev.Redis.Healthy, redisStatus.Healthy)
@@ -471,6 +524,113 @@ func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
 	jmlog.Info("nfs auto-remount succeeded", "mount_point", mountPoint)
 }
 
+// handleNFSAbsentRecovery is the NFS-layer absent-mount watcher (#93 — the
+// decision logic lives in absentremount.go). Returns true when it CLAIMS
+// the tick: the mountpoint is genuinely absent from the mount table while
+// juicefs is alive and our NFS listener is up (and no guard vetoes) — the
+// exact condition the legacy handler used to log "deferring to the fuse
+// watchdog" on forever. A claimed tick makes runChecks feed the legacy
+// handler "healthy" so only one path acts.
+//
+// The remount itself runs on a dedicated goroutine (single-flighted via
+// absentState.inProgress) because the wired callback may park on the
+// 180s-bounded admin prompt — the 10s check loop must keep ticking.
+func (m *HealthMonitor) handleNFSAbsentRecovery(st ComponentStatus, rawFUSEHealthy bool) bool {
+	m.mu.Lock()
+	fn := m.absentRemountFn
+	mountPoint := m.cfg.NFSMountPoint
+	serverAddr := m.nfsServerAddr
+	threshold := m.absentTicks
+	m.mu.Unlock()
+	if fn == nil || mountPoint == "" {
+		return false
+	}
+	if threshold <= 0 {
+		threshold = absentRemountTicksFromEnv()
+	}
+
+	// "not mounted" is checkNFS's mount-table-verified absence verdict —
+	// the ONLY message that means nothing is mounted (a timeout reports
+	// "unresponsive", a sick-but-present mount "stale: …").
+	absent := !st.Healthy && st.Message == nfsMsgNotMounted
+	in := nfsAbsentInputs{
+		Absent:  absent,
+		Healthy: st.Healthy,
+		Offline: pin.IsOffline(),
+		Enabled: nfsAutoRemountEnabled(),
+		Now:     time.Now(),
+	}
+	// Probe process table + listener only on ticks that could qualify —
+	// never exec pgrep / dial per tick on the happy path.
+	if absent && in.Enabled && !in.Offline {
+		in.JuiceFSAlive = rawFUSEHealthy && isJuiceFSProcessAliveFn()
+		in.ServerUp = serverAddr != "" && nfsServerUpFn(serverAddr)
+	}
+	claimed := absent && in.Enabled && !in.Offline && in.JuiceFSAlive && in.ServerUp
+
+	m.mu.Lock()
+	fire, reason := m.absentState.tick(in, threshold)
+	streak, failures := m.absentState.streak, m.absentState.failures
+	nextAttempt := m.absentState.nextAttempt
+	if fire {
+		m.absentState.inProgress = true
+	}
+	m.mu.Unlock()
+
+	if fire {
+		jmlog.Warn("nfs mount absent while juicefs alive — nfs-layer auto-remount engaging",
+			"mount_point", mountPoint,
+			"consecutive_ticks", streak,
+			"prior_failures", failures,
+			"kill_switch", "JM_NFS_AUTOREMOUNT=0",
+		)
+		go m.runAbsentRemount(fn, mountPoint)
+	} else if absent {
+		// One line per held tick at Debug — the WARN budget is reserved for
+		// the engage/success/failure edges.
+		jmlog.Debug("nfs-layer absent watcher holding",
+			"reason", reason,
+			"streak", streak,
+			"claimed", claimed,
+			"backoff_until", nextAttempt.Format(time.RFC3339),
+		)
+	}
+	return claimed
+}
+
+// runAbsentRemount executes one absent-mount recovery attempt and folds
+// the outcome into the backoff state. Runs on its own goroutine; the
+// inProgress flag it clears is what re-arms the decision path.
+func (m *HealthMonitor) runAbsentRemount(fn func() error, mountPoint string) {
+	err := fn()
+
+	m.mu.Lock()
+	m.absentState.inProgress = false
+	if err == nil {
+		m.absentState.streak, m.absentState.failures = 0, 0
+		m.absentState.nextAttempt = time.Time{}
+		m.mu.Unlock()
+		jmlog.Info("nfs-layer auto-remount succeeded", "mount_point", mountPoint)
+		return
+	}
+	m.absentState.failures++
+	failures := m.absentState.failures
+	backoff := absentBackoff(failures)
+	m.absentState.nextAttempt = time.Now().Add(backoff)
+	m.mu.Unlock()
+
+	retry := backoff.Round(time.Second).String()
+	if isMountBusyError(err) {
+		// The kernel-haunted-mountpoint case: EBUSY with nothing in the
+		// mount table. Must not hot-loop — say so and back off loudly.
+		jmlog.Warn("nfs-layer auto-remount: mountpoint busy, will retry in "+retry,
+			"mount_point", mountPoint, "attempt", failures, "error", err.Error())
+		return
+	}
+	jmlog.Warn("nfs-layer auto-remount failed, will retry in "+retry,
+		"mount_point", mountPoint, "attempt", failures, "error", err.Error())
+}
+
 // forceUnmount runs `umount -f` on the given mount point. Errors here
 // are non-fatal: the subsequent mount attempt is the actual recovery.
 //
@@ -569,8 +729,10 @@ func (m *HealthMonitor) checkRedis(ctx context.Context) ComponentStatus {
 	err := m.rdb.Ping(ctx).Err()
 	if err != nil {
 		jmlog.Debug("redis ping failed", "error", err.Error())
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("ping failed: %v", err)}
+		return m.classifyBackendFailure("redis", m.cfg.RedisURL, err,
+			ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("ping failed: %v", err)})
 	}
+	m.clearLocalNetSuspect("redis")
 	return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 }
 
@@ -583,8 +745,10 @@ func (m *HealthMonitor) checkMinIO() ComponentStatus {
 	resp, err := m.http.Get(url)
 	if err != nil {
 		jmlog.Debug("minio health check failed", "error", err.Error())
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("request failed: %v", err)}
+		return m.classifyBackendFailure("minio", minioHostPort(m.cfg.MinIOURL), err,
+			ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("request failed: %v", err)})
 	}
+	m.clearLocalNetSuspect("minio")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -593,6 +757,60 @@ func (m *HealthMonitor) checkMinIO() ComponentStatus {
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: msg}
 	}
 	return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
+}
+
+// classifyBackendFailure upgrades a generic backend-dial failure to the
+// distinct MsgLocalNetworkPermission status when the failure matches the
+// macOS Local Network permission-denial signature (#106 — see localnet.go
+// for the exact, deliberately conservative conditions). Non-matching
+// failures pass through untouched, so every existing report is preserved.
+// The first tick of a suspicion streak logs a WARN with the remediation.
+func (m *HealthMonitor) classifyBackendFailure(component, targetAddr string, err error, base ComponentStatus) ComponentStatus {
+	if targetAddr == "" || !IsLocalNetPermissionSignature(err, targetAddr, localNetSnapshotFn()) {
+		m.clearLocalNetSuspect(component)
+		return base
+	}
+	base.Message = MsgLocalNetworkPermission
+
+	m.mu.Lock()
+	first := !m.localNetSuspected[component]
+	if first {
+		if m.localNetSuspected == nil {
+			m.localNetSuspected = make(map[string]bool)
+		}
+		m.localNetSuspected[component] = true
+	}
+	m.mu.Unlock()
+	if first {
+		jmlog.Warn("backend dial blocked — macOS Local Network permission likely denied (it silently resets after every rebuild/re-sign/update)",
+			"component", component,
+			"target", targetAddr,
+			"error", err.Error(),
+			"action", "enable JuiceMount in System Settings → Privacy & Security → Local Network, then relaunch",
+		)
+	}
+	return base
+}
+
+// clearLocalNetSuspect drops a component's permission-suspected latch so
+// the next suspicion streak logs its WARN again.
+func (m *HealthMonitor) clearLocalNetSuspect(component string) {
+	m.mu.Lock()
+	if m.localNetSuspected[component] {
+		delete(m.localNetSuspected, component)
+	}
+	m.mu.Unlock()
+}
+
+// minioHostPort extracts "host:port" from the configured MinIO base URL so
+// the #106 classifier can judge the target address. Empty on parse failure
+// (classifier stays silent — conservative).
+func minioHostPort(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
 }
 
 func (m *HealthMonitor) checkFUSE() ComponentStatus {
@@ -754,8 +972,9 @@ func (m *HealthMonitor) checkNFS() ComponentStatus {
 			if os.IsNotExist(err) {
 				// Mount-point directory gone — nothing is mounted there.
 				// Distinct from "stale" so the UI can offer "Mount Now"
-				// (LB-2 state honesty) instead of a generic fault.
-				done <- ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted"}
+				// (LB-2 state honesty) instead of a generic fault, and so
+				// the absent-mount recovery (#93) can key on it.
+				done <- ComponentStatus{Healthy: false, LastCheck: now, Message: nfsMsgNotMounted}
 				return
 			}
 			jmlog.Debug("nfs stat failed", "mount_point", m.cfg.NFSMountPoint, "error", err.Error())
@@ -774,7 +993,7 @@ func (m *HealthMonitor) checkNFS() ComponentStatus {
 			return
 		}
 		if !mounted {
-			done <- ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted"}
+			done <- ComponentStatus{Healthy: false, LastCheck: now, Message: nfsMsgNotMounted}
 			return
 		}
 		done <- ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}

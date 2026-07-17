@@ -150,9 +150,13 @@ func (s *Store) BatchDrainComplete(items []DrainCommitItem) ([]DrainCommitResult
 			continue
 		}
 		if e, ok := s.pathCache[it.NFSPath]; ok {
+			oldSize := e.Size
 			if it.Size > e.Size {
 				e.Size = it.Size
 			}
+			// INSTANT-NAV #2: mirror UpdateSize — an in-place size bump applies
+			// the (new−old) delta to the ancestor subtree aggregates.
+			s.subtreeResizeLocked(e, oldSize)
 			e.Mtime = it.Mtime
 			e.PreSerializedGetAttr = nil
 		}

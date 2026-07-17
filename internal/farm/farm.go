@@ -30,6 +30,14 @@ type Options struct {
 	ProxyVCodec   string // proxy H.264 encoder; "" → "libx264" (GPU: h264_nvenc/qsv/vaapi)
 	ProxyCRF      int    // proxy quality; 0 → 21 (lower = sharper/bigger)
 	ProxyPreset   string // proxy x264 preset; "" → "slow" (faster preset = quicker, larger)
+
+	// MinBlobSizeBytes gates the EXPENSIVE blob generators (poster, filmstrip,
+	// waveform) — a file below it still gets its cheap `tech` probe row (so it
+	// stays discoverable in OpenLoupe), but skips the decode-heavy derivatives
+	// a sub-threshold clip doesn't warrant in a mass sweep (2026-07-14). 0 =
+	// generate blobs for everything (old behavior). Gating blobs (not the whole
+	// asset) keeps metadata coverage while cutting the mass-sweep cost.
+	MinBlobSizeBytes int64
 }
 
 // Result is the per-file outcome (for CLI reporting / JM-15 accounting). Err is a
@@ -118,11 +126,14 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		{Kind: "tech", Status: "ready", Producer: opt.Producer, Version: opt.Version, Hash: &hash},
 	}
 	var blobErrs []error
-	if opt.Blobs && tech.Video != nil {
+	// Blob size gate: a sub-threshold clip keeps its tech row above but skips
+	// the decode-heavy poster/filmstrip/waveform. 0 = generate for everything.
+	blobBigEnough := opt.MinBlobSizeBytes <= 0 || size >= opt.MinBlobSizeBytes
+	if opt.Blobs && tech.Video != nil && blobBigEnough {
 		rel := "poster.jpg"
 		mt := "image/jpeg"
 		out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
-		if err := Thumbnail(opt.FFmpegBin, path, out, opt.ThumbMaxDim); err != nil {
+		if err := Thumbnail(opt.FFmpegBin, path, out, opt.ThumbMaxDim, tech.DurationMS); err != nil {
 			blobErrs = append(blobErrs, fmt.Errorf("thumbnail: %w", err))
 			rows = append(rows, derivatives.DerivRow{
 				Kind: "thumbnail", Status: "failed", Producer: opt.Producer, Version: opt.Version,
@@ -137,7 +148,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		}
 	}
 
-	if opt.Filmstrip && tech.Video != nil {
+	if opt.Filmstrip && tech.Video != nil && blobBigEnough {
 		rel := "strip.jpg"
 		mt := "image/jpeg"
 		out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
@@ -157,7 +168,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		}
 	}
 
-	if opt.Waveform && len(tech.Audio) > 0 {
+	if opt.Waveform && len(tech.Audio) > 0 && blobBigEnough {
 		rel := "waveform.json"
 		mt := "application/json"
 		out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)

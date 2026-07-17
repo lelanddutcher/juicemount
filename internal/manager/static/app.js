@@ -44,6 +44,7 @@
     'destinations',
     'backups',
     'maintenance',
+    'permissions',
     'settings',
   ];
   const DEFAULT_TAB = 'migrations';
@@ -107,6 +108,12 @@
     // GET /api/maintenance/{kind}.
     if (name === 'maintenance') {
       initMaintenanceOnce();
+    }
+    // Permissions tab: lazy-init the handlers once, then refresh the
+    // default-owner field each activation so it reflects any out-of-band change.
+    if (name === 'permissions') {
+      initPermissionsOnce();
+      refreshPermissions();
     }
     // SLICE 4: lazy-init Destinations. Loads the saved-destinations
     // list and wires the kind-picker → dynamic-fields swap. Returning
@@ -895,7 +902,36 @@
       });
     }
     if (btn) btn.addEventListener('click', submitFarmSweep);
+    const clearBtn = $('#farm-jobs-clear');
+    if (clearBtn) clearBtn.addEventListener('click', clearFarmFinishedJobs);
     updateFarmSweepButton();
+  }
+
+  // clearFarmFinishedJobs removes terminal (done/failed) rows from the
+  // Recent-jobs list server-side, then refreshes. Running/queued jobs are
+  // preserved by the backend (POST /api/farm/jobs/clear). A brief inline
+  // flash reports the count.
+  async function clearFarmFinishedJobs() {
+    const btn = $('#farm-jobs-clear');
+    const flash = $('#farm-jobs-clear-flash');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('POST', '/api/farm/jobs/clear');
+      const n = (res && typeof res.cleared === 'number') ? res.cleared : 0;
+      if (flash) {
+        flash.textContent = n === 0 ? 'No finished jobs to clear.' : ('Cleared ' + n + ' finished job' + (n === 1 ? '' : 's') + '.');
+        flash.hidden = false;
+        setTimeout(() => { flash.hidden = true; }, 4000);
+      }
+      await loadFarmJobs();
+    } catch (e) {
+      if (flash) {
+        flash.textContent = 'Clear failed: ' + (e.message || e);
+        flash.hidden = false;
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   // updateFarmSweepButton keeps the Queue button disabled while in-flight or
@@ -981,7 +1017,7 @@
     try { res = await api('GET', '/api/farm/jobs'); } catch (e) { return; }
     if (!res) return;
     renderFarmActiveBanner(!!res.available, res.queue_depth || 0);
-    renderFarmJobsList(Array.isArray(res.jobs) ? res.jobs : []);
+    renderFarmJobsList(Array.isArray(res.jobs) ? res.jobs : [], !!res.available);
   }
 
   // renderFarmActiveBanner shows worker presence: green + "draining the queue"
@@ -1017,7 +1053,7 @@
   // parent dir muted), the kinds, processed/failed counts when present, and a
   // relative enqueue time. Failed rows surface .error. Everything goes through
   // textContent / DOM nodes — no innerHTML on wire values.
-  function renderFarmJobsList(jobs) {
+  function renderFarmJobsList(jobs, workersActive) {
     const list = $('#farm-jobs-list');
     if (!list) return;
     list.innerHTML = '';
@@ -1028,7 +1064,17 @@
       list.appendChild(li);
       return;
     }
-    jobs.forEach((j) => {
+    // Float the running job(s) to the top so the active sweep is always
+    // visible without scrolling. Array.sort is stable (ES2019+), so the
+    // backend's recent-first order is preserved within each group.
+    // Guard: only treat "running" as top-worthy when a worker is actually
+    // alive — a worker that dies mid-job leaves a phantom "running"
+    // record for up to the job TTL, and pinning that at the top forever
+    // would mislead. When no worker is active, keep the plain order.
+    const ordered = workersActive
+      ? [...jobs].sort((a, b) => ((a.status === 'running') ? 0 : 1) - ((b.status === 'running') ? 0 : 1))
+      : jobs;
+    ordered.forEach((j) => {
       const status = j.status || 'queued';
       const li = document.createElement('li');
       li.className = 'farm-job-row';
@@ -2050,11 +2096,16 @@
       if (cfg.error) {
         cur.textContent = `current: (${cfg.error})`;
       } else if (cfg.days < 0) {
-        cur.textContent = 'current: unknown';
+        // metaURL resolved but juicefs config had no readable TrashDays
+        // row — most often retention was never enabled on this volume.
+        // Make it actionable rather than a dead "unknown".
+        cur.textContent = 'current: unknown — retention may be disabled; pick a value below to enable it';
       } else {
-        cur.textContent = `current: ${cfg.days} day(s)`;
-        // Sync the drop-down. If the current value isn't in our
-        // choices list, the select shows blank — fine, the user
+        cur.textContent = cfg.days === 0
+          ? 'current: disabled (0 — deleted files are purged immediately, no trash kept)'
+          : `current: ${cfg.days} day(s)`;
+        // Sync the drop-down to the current value (0 is a valid choice).
+        // If it isn't in the list the select shows blank — fine, the user
         // can still pick a new one.
         const sel = $('#trash-retention-select');
         const match = Array.from(sel.options).find((o) => parseInt(o.value, 10) === cfg.days);
@@ -2127,6 +2178,109 @@
       // case; we swallow it and leave the idle state.
       refreshMaintenanceState(kind).catch(() => {});
     });
+    // Inject per-lever scheduling controls (GC/FSCK/compact-meta).
+    loadMaintenanceSchedules();
+  }
+
+  // ---- per-lever maintenance scheduling ----
+  // Cadence buckets the select offers. Each maps to a cron the backend
+  // accepts; the backend's recommended_cron is matched to a bucket so we
+  // can mark it "(recommended)". These sweeps are optional (JuiceFS
+  // auto-cleans the routine equivalents), so Off is a first-class choice.
+  const MAINT_CADENCES = [
+    { key: 'off', label: 'Off', cron: '' },
+    { key: 'weekly', label: 'Weekly', cron: '0 3 * * 0' },
+    { key: 'monthly', label: 'Monthly', cron: '0 3 1 * *' },
+    { key: 'quarterly', label: 'Quarterly', cron: '0 5 1 1,4,7,10 *' },
+  ];
+  function maintBucketForCron(cron) {
+    const hit = MAINT_CADENCES.find((c) => c.cron && c.cron === cron);
+    return hit ? hit.key : 'custom';
+  }
+  function maintRecommendedBucket(recCron) {
+    if (!recCron) return 'monthly';
+    if (/\b1,4,7,10\b/.test(recCron)) return 'quarterly';
+    if (/\*\s+[0-6]$/.test(recCron)) return 'weekly';
+    return 'monthly';
+  }
+
+  async function loadMaintenanceSchedules() {
+    let res;
+    try { res = await api('GET', '/api/maintenance/schedules'); } catch (e) { return; }
+    const rows = (res && Array.isArray(res.schedules)) ? res.schedules : [];
+    rows.forEach((row) => injectMaintenanceSchedule(row));
+  }
+
+  function injectMaintenanceSchedule(row) {
+    const card = document.querySelector(`.maintenance-card[data-kind="${row.kind}"]`);
+    if (!card) return;
+    const controls = card.querySelector('.maintenance-controls');
+    if (!controls) return;
+    const prior = card.querySelector('.maintenance-schedule');
+    if (prior) prior.remove();
+
+    const box = document.createElement('div');
+    box.className = 'maintenance-schedule';
+    const recBucket = maintRecommendedBucket(row.recommended_cron);
+    const curBucket = row.enabled ? maintBucketForCron(row.cron) : 'off';
+
+    const label = document.createElement('label');
+    label.className = 'maintenance-schedule-label';
+    label.textContent = 'Run automatically: ';
+    const sel = document.createElement('select');
+    MAINT_CADENCES.forEach((c) => {
+      const opt = document.createElement('option');
+      opt.value = c.key;
+      opt.textContent = c.label + (c.key === recBucket ? ' (recommended)' : '');
+      sel.appendChild(opt);
+    });
+    if (curBucket === 'custom') {
+      const opt = document.createElement('option');
+      opt.value = 'custom';
+      opt.textContent = 'Custom (' + row.cron + ')';
+      sel.appendChild(opt);
+    }
+    sel.value = curBucket;
+    label.appendChild(sel);
+    box.appendChild(label);
+
+    const advice = document.createElement('p');
+    advice.className = 'maintenance-schedule-advice';
+    advice.textContent = row.advice || '';
+    box.appendChild(advice);
+
+    if (!row.runnable) {
+      const warn = document.createElement('p');
+      warn.className = 'maintenance-schedule-warn';
+      warn.textContent = 'Scheduling is saved, but this op needs the volume metadata URL to run (embedded mode: set JM_OVERVIEW_META).';
+      box.appendChild(warn);
+    }
+
+    const flash = document.createElement('span');
+    flash.className = 'maintenance-schedule-flash';
+    flash.hidden = true;
+    box.appendChild(flash);
+
+    sel.addEventListener('change', async () => {
+      const key = sel.value;
+      if (key === 'custom') return;
+      const bucket = MAINT_CADENCES.find((c) => c.key === key);
+      const enabled = key !== 'off';
+      // When turning off, keep the last cadence so the row remembers it.
+      const cron = enabled ? bucket.cron : (row.cron || row.recommended_cron);
+      try {
+        await api('PUT', '/api/maintenance/schedules', { kind: row.kind, cron: cron, enabled: enabled });
+        row.enabled = enabled; row.cron = cron;
+        flash.textContent = enabled ? ('Scheduled: ' + bucket.label.toLowerCase()) : 'Schedule off';
+        flash.hidden = false;
+        setTimeout(() => { flash.hidden = true; }, 3500);
+      } catch (e) {
+        flash.textContent = 'Failed: ' + (e.message || e);
+        flash.hidden = false;
+      }
+    });
+
+    controls.insertAdjacentElement('afterend', box);
   }
 
   async function runMaintenance(kind) {
@@ -2997,6 +3151,103 @@
         status.textContent = 'Rotation failed: ' + (err.message || err);
       }
     }
+  }
+
+  // -------- Permissions --------
+  let permissionsInited = false;
+  let lastLoadedDefaultOwner = '';
+
+  function initPermissionsOnce() {
+    if (permissionsInited) return;
+    permissionsInited = true;
+    $('#perm-inspect-btn').addEventListener('click', inspectPermissions);
+    $('#perm-inspect-path').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); inspectPermissions(); }
+    });
+    $('#perm-fix-confirm').addEventListener('input', (e) => {
+      $('#perm-fix-btn').disabled = e.target.value !== 'FIX'; // typed-confirm gate
+    });
+    $('#perm-fix-btn').addEventListener('click', fixPermissions);
+    $('#perm-default-save').addEventListener('click', saveDefaultOwner);
+    $('#perm-default-revert').addEventListener('click', () => {
+      $('#perm-default-owner').value = lastLoadedDefaultOwner;
+    });
+  }
+
+  // Render an owner as "uid[:gid]"; gid < 0 means "group unchanged" (chownSpec).
+  function fmtOwner(uid, gid) {
+    return (gid != null && gid >= 0) ? `${uid}:${gid}` : String(uid);
+  }
+
+  function showPermError(msg) { const el = $('#perm-error'); el.textContent = msg; el.hidden = false; }
+
+  async function refreshPermissions() {
+    try {
+      const d = await api('GET', '/api/permissions/default-owner');
+      lastLoadedDefaultOwner = fmtOwner(d.uid, d.gid);
+      $('#perm-default-owner').value = lastLoadedDefaultOwner;
+      if (d.client_uid != null) $('#perm-client-uid').textContent = String(d.client_uid);
+    } catch (err) { showPermError('Load failed: ' + (err.message || err)); }
+  }
+
+  async function inspectPermissions() {
+    const path = ($('#perm-inspect-path').value || '').trim();
+    if (!path) return;
+    $('#perm-error').hidden = true;
+    try {
+      const r = await api('GET', '/api/permissions/inspect?path=' + encodeURIComponent(path));
+      $('#perm-inspect-result').hidden = false;
+      $('#perm-r-path').textContent = r.path || path;
+      const pill = $('#perm-verdict');
+      pill.classList.remove('ok', 'warn', 'error');
+      if (!r.exists) {
+        $('#perm-r-owner').textContent = '—';
+        $('#perm-r-mode').textContent = '—';
+        $('#perm-r-reason').textContent = 'Path does not exist.';
+        pill.textContent = 'Not found'; pill.classList.add('warn');
+        return;
+      }
+      $('#perm-r-owner').textContent = fmtOwner(r.uid, r.gid) + (r.owner_name ? ` (${r.owner_name})` : '');
+      $('#perm-r-mode').textContent = `${r.mode_octal || ''} ${r.mode || ''}`.trim() || '—';
+      $('#perm-r-reason').textContent = r.reason || '';
+      if (r.writable_by_client) { pill.textContent = 'Writable by client'; pill.classList.add('ok'); }
+      else { pill.textContent = 'Not writable'; pill.classList.add('error'); }
+    } catch (err) { showPermError('Inspect failed: ' + (err.message || err)); }
+  }
+
+  async function fixPermissions() {
+    const path = ($('#perm-fix-path').value || '').trim();
+    const status = $('#perm-fix-status');
+    status.hidden = false; status.className = 'settings-rotate-status';
+    if (!path) { status.classList.add('error'); status.textContent = 'A path to fix is required.'; return; }
+    try {
+      const headers = authHeaders();
+      headers['X-Confirm-Fix'] = 'yes'; // server-side typed-confirm gate
+      const r = await fetch(BASE + '/api/permissions/fix', {
+        method: 'POST', headers,
+        body: JSON.stringify({ path, recursive: $('#perm-fix-recursive').checked }),
+      });
+      if (!r.ok) { const m = await r.text(); throw new Error(m.trim() || `${r.status} ${r.statusText}`); }
+      const data = await r.json();
+      status.classList.add('success');
+      status.textContent = data.note || `Fixed ${data.path}.`;
+      $('#perm-fix-confirm').value = ''; $('#perm-fix-btn').disabled = true; // require a fresh confirm
+    } catch (err) { status.classList.add('error'); status.textContent = 'Fix failed: ' + (err.message || err); }
+  }
+
+  async function saveDefaultOwner() {
+    const raw = ($('#perm-default-owner').value || '').trim();
+    $('#perm-default-saved').hidden = true; $('#perm-error').hidden = true;
+    const parts = raw.split(':');
+    const uid = parseInt(parts[0], 10) || 0;
+    const gid = parts.length > 1 ? (parseInt(parts[1], 10) || 0) : -1; // bare uid → -1 (group unchanged)
+    try {
+      const d = await api('PUT', '/api/permissions/default-owner', { uid, gid });
+      lastLoadedDefaultOwner = fmtOwner(d.uid, d.gid);
+      $('#perm-default-owner').value = lastLoadedDefaultOwner;
+      $('#perm-default-saved').hidden = false;
+      setTimeout(() => { $('#perm-default-saved').hidden = true; }, 2500);
+    } catch (err) { showPermError('Save failed: ' + (err.message || err)); }
   }
 
   // -------- Boot --------

@@ -140,6 +140,28 @@ type FUSEManager struct {
 	cmd    *exec.Cmd
 	stopCh chan struct{}
 	done   chan struct{}
+	// onRemount fires after a successful WATCHDOG remount (#12): pooled
+	// FUSE fds reference the dead mount and must be flushed. Guarded by mu;
+	// invoked without mu held. Set via SetOnRemount (bridge wiring).
+	onRemount func()
+}
+
+// SetOnRemount registers a callback invoked after every successful
+// watchdog-driven remount. Safe to call before or after StartMonitor.
+func (fm *FUSEManager) SetOnRemount(fn func()) {
+	fm.mu.Lock()
+	fm.onRemount = fn
+	fm.mu.Unlock()
+}
+
+// fireOnRemount invokes the registered callback (if any) without holding mu.
+func (fm *FUSEManager) fireOnRemount() {
+	fm.mu.Lock()
+	fn := fm.onRemount
+	fm.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // EffectiveCacheSize returns the cache-size string actually passed to the
@@ -380,17 +402,41 @@ func (fm *FUSEManager) Mount() error {
 	// link so a metered/cellular mount doesn't pull whole files for a 4 KB touch,
 	// while a 10GbE mount keeps blocks in flight. Medium == historical defaults.
 	jfp := fm.linkAwareJuiceFSPolicy()
+	// --buffer-size caps JuiceFS's in-memory DIRTY-data ceiling, which is
+	// exactly what a shutdown/remount FlushAll must push to MinIO before the
+	// mount worker exits (2026-07-10: a 1 GB slow-class buffer = a 4m17s flush
+	// over a cellular tunnel = a ~3-min mount outage on any restart). The class
+	// policy already shrinks it on slow/metered links; JM_JFS_BUFFER_MB is the
+	// absolute field-override (32-8192; set it to the old per-class value to
+	// revert). Writes land on the spool first, so a smaller buffer never risks
+	// durability — it only backpressures the drainer to MinIO throughput.
+	bufMB := jfp.BufferSizeMB
+	if v := os.Getenv("JM_JFS_BUFFER_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 32 && n <= 8192 {
+			bufMB = n
+		}
+	}
 	args = append(args,
 		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
 		"-d", // daemon mode
 		"--no-usage-report",
-		// --buffer-size also backs write-burst absorption, but writes land on the
-		// spool first and durability is independent of it, so scaling it by link
-		// costs only throughput (already upload-bound on a slow link).
-		"--buffer-size", strconv.Itoa(jfp.BufferSizeMB),
+		"--buffer-size", strconv.Itoa(bufMB),
 		"--prefetch", strconv.Itoa(jfp.Prefetch),
 		"-o", "nobrowse", // hide from Finder (MNT_DONTBROWSE flag)
 	)
+	// S1 (WAVE 1, RC-5): cap JuiceFS session readahead on a WAN link only.
+	// juicefs's --max-readahead defaults to 8×BlockSize = 32 MiB, so a single
+	// cold 4 KB preview touch pulls up to 32 MiB extra off the backend across
+	// the tunnel. On the metered/slow class we set --max-readahead 1M to disable
+	// session readahead entirely (~28 MiB less per cold first-touch). Mount-time
+	// flag ONLY — zero NFS hot-path impact. Fast/Medium (10GbE/GbE) are left
+	// UNSET so they keep the JuiceFS 32 MiB default (LAN behavior unchanged).
+	// Kill-switch: JM_JFS_MAX_READAHEAD=0. Auto-reverts on 10GbE by class.
+	if cls := netprofile.Default().Class(); cls == netprofile.ClassMetered || cls == netprofile.ClassSlow {
+		if os.Getenv("JM_JFS_MAX_READAHEAD") != "0" {
+			args = append(args, "--max-readahead", "1M")
+		}
+	}
 	// Bind the Prometheus metrics endpoint EXPLICITLY so the bridge can scrape
 	// `juicefs_blockcache_bytes` (the true on-disk block-cache size) for the
 	// cache_used_bytes field. We do NOT rely on JuiceFS's :9567 default — that
@@ -756,6 +802,22 @@ func (fm *FUSEManager) StartMonitor() {
 func (fm *FUSEManager) Stop() {
 	close(fm.stopCh)
 
+	// Kill juicefs FIRST — lock-free, before the monitor join and before
+	// fm.mu.Lock() below. 2026-07-15 teardown-deadlock fix: the watchdog's
+	// escalation Mount() holds fm.mu across an un-abortable `juicefs mount` +
+	// umount (up to the verify budget, longer on a wedged mount). If the user
+	// hits "Stop everything" during a remount, the ONLY juicefs kill (inside
+	// unmountLocked) sits behind that contended fm.mu.Lock — so the whole
+	// NFSServerShutdown blocked, the daemon stayed alive, and because Swift
+	// flips state=.idle only AFTER this cgo call returns, the UI froze,
+	// couldn't relaunch, and a force-quit orphaned the mount. Killing the
+	// daemon up front makes that in-flight mount/umount return at once, so
+	// Mount() releases fm.mu and the Lock() below can't deadlock behind it —
+	// and juicefs is guaranteed dead even if the steps below stall. A daemon
+	// the watchdog's last tick may re-spawn in the tiny window before it sees
+	// stopCh is caught by unmountLocked's own (idempotent) kill.
+	fm.killJuiceFSProcesses()
+
 	// Bound the wait for monitorLoop to exit. Even with iteration-2's
 	// bounded `mount` syscall (5 s context), one tick can still take that
 	// long if it fires while we're trying to stop. Race the join against
@@ -886,12 +948,26 @@ const fuseConfirmProbeTimeout = 25 * time.Second
 // only after readdir hangs for MINUTES while .config stays live) PLUS a fix for
 // the broken remount — both deferred to the follow-up, not rushed into a release.
 func (fm *FUSEManager) mountResponsiveWithin(timeout time.Duration) bool {
-	done := make(chan bool, 1)
+	// This is the LAST gate before a destructive SIGKILL+remount, so it must
+	// return true on ANY sign of life. Race two liveness signals:
+	//   1. reading .config (the in-memory control file) — content OR a prompt
+	//      error both mean juicefs ANSWERED (alive);
+	//   2. a root readdir succeeding — the DATA path serving.
+	// Either returning ⇒ alive ⇒ do NOT remount. Only a genuine wedge hangs
+	// BOTH past the timeout. 2026-07-15: .config alone false-negatived during
+	// cold-warm churn — juicefs serves the data-path readdir before it serves
+	// the .config control file, so a .config-only probe could hang and greenlight
+	// a SIGKILL of a mount that was listing fine (the remount-thrash trigger on a
+	// large-local-cache box). A serving readdir is definitive proof of life.
+	done := make(chan bool, 2)
 	go func() {
-		// Content OR a prompt error both mean juicefs ANSWERED (alive); only a
-		// genuine session death hangs this read, and then the select times out.
 		_, _ = os.ReadFile(fm.cfg.MountPoint + "/.config")
 		done <- true
+	}()
+	go func() {
+		if _, err := os.ReadDir(fm.cfg.MountPoint); err == nil {
+			done <- true // a successful readdir is unambiguous liveness
+		}
 	}()
 	select {
 	case ok := <-done:
@@ -906,17 +982,38 @@ func (fm *FUSEManager) mountResponsiveWithin(timeout time.Duration) bool {
 // previously called `.Start()` without ever calling `.Wait()` — leaking
 // zombies and silently failing.
 func runBoundedCommand(timeout time.Duration, name string, args ...string) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	if err := exec.CommandContext(ctx, name, args...).Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			jmlog.Warn("bounded command timed out",
-				"cmd", name, "args", strings.Join(args, " "),
-				"timeout_sec", int(timeout.Seconds()))
-		} else {
+	// TRULY bounded (2026-07-10): the old CommandContext(...).Run() killed
+	// the child at the deadline but then BLOCKED waiting to reap it — and a
+	// child parked in an uninterruptible kernel call (diskutil against a
+	// wedged diskarbitrationd, umount of a haunted mountpoint) ignores
+	// SIGKILL until its syscall returns, so the "bounded" call itself hung
+	// (observed live: 30s-bounded diskutils surviving 20+ minutes while the
+	// watchdog's remount crawled at ~65s/attempt). Now: kill at the deadline
+	// and RETURN; a reaper goroutine collects the child whenever the kernel
+	// finally releases it.
+	cmd := exec.Command(name, args...)
+	if err := cmd.Start(); err != nil {
+		jmlog.Debug("bounded command failed to start",
+			"cmd", name, "args", strings.Join(args, " "), "error", err.Error())
+		return
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
 			jmlog.Debug("bounded command failed",
 				"cmd", name, "args", strings.Join(args, " "), "error", err.Error())
 		}
+	case <-timer.C:
+		_ = cmd.Process.Kill()
+		jmlog.Warn("bounded command timed out — killed, not waiting for reap",
+			"cmd", name, "args", strings.Join(args, " "),
+			"timeout_sec", int(timeout.Seconds()))
+		// The Wait goroutine reaps the child when (if) the kernel releases
+		// it; an unkillable D-state child must never pin the caller.
 	}
 }
 
@@ -939,11 +1036,12 @@ func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
 	return fmt.Errorf("mount not ready after %v", timeout)
 }
 
-// unmountLocked forcibly unmounts the FUSE mount. Must be called with fm.mu held.
-// Every shell-out is time-bounded so a wedged kernel state can't pin fm.mu.
-func (fm *FUSEManager) unmountLocked() {
-	// Kill any lingering JuiceFS mount processes for this mount point first.
-	// Killing the process lets the kernel release the mount.
+// killJuiceFSProcesses SIGKILLs every `juicefs mount` process bound to this
+// mountpoint. It takes NO lock and each shell-out is time-bounded, so it is safe
+// to call from Stop() BEFORE fm.mu is held — killing the daemon is what releases
+// the FUSE mount, and doing it lock-free breaks the teardown deadlock (see Stop).
+// Returns the number killed. Idempotent: a second call finds nothing.
+func (fm *FUSEManager) killJuiceFSProcesses() int {
 	pgrepCtx, pgrepCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	procs, _ := exec.CommandContext(pgrepCtx, "pgrep", "-f", "juicefs mount.*"+filepath.Base(fm.cfg.MountPoint)).Output()
 	pgrepCancel()
@@ -964,7 +1062,31 @@ func (fm *FUSEManager) unmountLocked() {
 		jmlog.Warn("unmount: SIGKILL'd juicefs processes for mountpoint",
 			"count", killed, "mountpoint", fm.cfg.MountPoint)
 	}
+	return killed
+}
+
+// unmountLocked forcibly unmounts the FUSE mount. Must be called with fm.mu held.
+// Every shell-out is time-bounded so a wedged kernel state can't pin fm.mu.
+func (fm *FUSEManager) unmountLocked() {
+	// Kill any lingering JuiceFS mount processes for this mount point first.
+	// Killing the process lets the kernel release the mount.
+	fm.killJuiceFSProcesses()
 	time.Sleep(500 * time.Millisecond)
+
+	// FAST PATH (2026-07-10): when the mountpoint is NOT in the kernel mount
+	// table there is nothing to tear down — the diskutil + umount calls were
+	// pure waste that burned their bounds against the (possibly wedged)
+	// diskarbitrationd. This was the dominant cost of the 12:01→12:04 organic
+	// remount (vs 35s when the teardown had real work): juicefs had died, the
+	// mountpoint was already a plain dir, and every ensureUnmounted attempt
+	// still crawled through both commands. The juicefs-process kill above
+	// already ran (ensureUnmountedLocked depends on it even when the table is
+	// clear).
+	if !fm.stillInMountTable() {
+		jmlog.Debug("unmount: mountpoint not in the kernel mount table — teardown skipped",
+			"mountpoint", fm.cfg.MountPoint)
+		return
+	}
 
 	// QA-34 Slice 2 (2026-05-25): umount is now BLOCKING on this
 	// goroutine with a 60s budget. Pre-fix it was fire-and-forget,
@@ -1171,23 +1293,42 @@ func (fm *FUSEManager) confirmProbeTimeout() time.Duration {
 }
 
 // mountVerifyTimeout is the launch-time mount-establish budget (V2.3 U5/K1,
-// field "mount not ready after 15s" churn on slow links). Same class gating
-// and kill switch as confirmProbeTimeout: byte-identical 15s on LAN/medium/
-// fast and whenever JM_FUSE_WATCHDOG_LINKAWARE is off; wider only where a
-// juicefs cold-start legitimately needs longer to answer its first readdir
-// (metadata warm-up over a slow/metered backend link). Note the kext-cant-
-// load shape fails FAST regardless (juicefs's own 10s "mount point is not
-// ready" fatal fires before any of these budgets — see noteMountFailure).
+// field "mount not ready after 15s" churn). Wider only where a juicefs
+// cold-start legitimately needs longer to answer its first readdir.
+//
+// 2026-07-15 field regression (0.4.0 RC, Leland's box): the old 15s LAN/fast
+// base assumed warm-up latency tracks LINK speed. It does NOT — a large LOCAL
+// block cache (here ~100GB, --cache-size 102400) makes juicefs scan/index the
+// cache dir on mount before its FUSE root readdir answers, ~30s on a FAST LAN.
+// The 15s base false-failed ("mount not ready after 15s"); the watchdog then
+// SIGKILL'd a HEALTHY-but-warming juicefs, and — because the NFS server holds
+// the mount open — the follow-up unmount left a ZOMBIE macFUSE entry that made
+// getfsstat (isMountedLocked check 1) hang → perpetual false-"stale" → remount
+// thrash. So the base must cover local cache-warm, not just slow links. A real
+// mount failure still fails FAST regardless (juicefs's own 10s "mount point is
+// not ready" fatal fires from cmd.Run before we ever reach waitForMount — see
+// noteMountFailure), so a generous verify budget only helps the slow-warm case
+// and never delays genuine-failure detection.
+//
+// Env override JM_FUSE_VERIFY_SEC (seconds) for field-tuning without a rebuild.
 func (fm *FUSEManager) mountVerifyTimeout() time.Duration {
-	const base = 15 * time.Second
+	if v := os.Getenv("JM_FUSE_VERIFY_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	// 60s base covers a large-local-cache cold warm-up on any link class; the
+	// slow/metered link classes still widen further (metadata warm-up over the
+	// backend stacks on top of local warm-up).
+	const base = 60 * time.Second
 	if !fuseWatchdogLinkAware {
 		return base
 	}
 	switch netprofile.Default().Class() {
 	case netprofile.ClassMetered:
-		return 90 * time.Second
+		return 120 * time.Second
 	case netprofile.ClassSlow:
-		return 45 * time.Second
+		return 90 * time.Second
 	default:
 		return base
 	}
@@ -1430,6 +1571,9 @@ func (fm *FUSEManager) monitorLoop() {
 			} else {
 				jmlog.Info("fuse remount succeeded", "after_attempts", consecutiveFailures)
 				consecutiveFailures = 0
+				// #12: every pooled fd predating this remount references the
+				// DEAD mount — notify the bridge so the FDPool flushes them.
+				fm.fireOnRemount()
 			}
 		}
 	}

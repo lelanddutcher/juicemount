@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -407,13 +408,16 @@ func TestInfoWithTimeoutCompletes(t *testing.T) {
 	}
 }
 
-// TestColdDirListingBreaksOnWedgedStat: one wedged child must ABANDON the
-// listing pass (break, not continue) — entries behind the wedge are never
-// stat'd — so a U7 worker always returns promptly and its deferred
-// dirRefreshSem/singleflight release runs. The partial toInsert is kept
-// (insert-only; the next readdir re-fires the refresh).
+// TestColdDirListingBreaksOnWedgedStat: with the S4 fan-out DISABLED
+// (JM_COLD_LIST_FANOUT=0 ⇒ K=1, serial), one wedged child must ABANDON the
+// listing pass — entries behind the wedge are never stat'd — so a U7 worker
+// always returns promptly and its deferred dirRefreshSem/singleflight release
+// runs. The partial toInsert is kept (insert-only; the next readdir re-fires
+// the refresh). This is the serial kill-switch contract; the parallel
+// contract is TestColdDirListingParallelWedgeCompletes.
 func TestColdDirListingBreaksOnWedgedStat(t *testing.T) {
 	jfs, _, fuseRoot := newDirRefreshHarness(t)
+	t.Setenv("JM_COLD_LIST_FANOUT", "0") // force serial break semantics
 
 	oldTimeout := fuseStatTimeout
 	fuseStatTimeout = 50 * time.Millisecond
@@ -438,6 +442,149 @@ func TestColdDirListingBreaksOnWedgedStat(t *testing.T) {
 	if len(toInsert) != 1 || toInsert[0].Path != "d/a.txt" {
 		t.Fatalf("toInsert = %d entries, want only d/a.txt (partial insert is safe)", len(toInsert))
 	}
+}
+
+// TestColdDirListingParallelWedgeCompletes: with the S4 fan-out ENABLED, a
+// single wedged child must NOT hang the pass — the pool completes promptly, the
+// wedged child is DROPPED (bounded, its worker parks holding only its own gate
+// slot until the stat returns), and healthy siblings — even ones ordered AFTER
+// the wedge — still resolve (a strictly MORE complete listing than serial). The
+// safety property preserved from the serial version is "always returns
+// promptly," not "never stats past the wedge."
+func TestColdDirListingParallelWedgeCompletes(t *testing.T) {
+	jfs, _, fuseRoot := newDirRefreshHarness(t)
+	// Default class (medium) → fan-out 24; be explicit for clarity.
+	t.Setenv("JM_COLD_LIST_FANOUT", "24")
+
+	oldTimeout := fuseStatTimeout
+	fuseStatTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { fuseStatTimeout = oldTimeout })
+
+	mkFUSEDir(t, fuseRoot, "d", "a.txt", "c.txt")
+	real, err := os.ReadDir(filepath.Join(fuseRoot, "d"))
+	if err != nil || len(real) != 2 {
+		t.Fatalf("ReadDir: %v (%d entries)", err, len(real))
+	}
+	wedged := &blockingDirEntry{name: "b-wedged.mov", release: make(chan struct{})}
+	t.Cleanup(func() { close(wedged.release) })
+	entries := []os.DirEntry{real[0], wedged, real[1]}
+
+	gate := make(chan struct{}, 8)
+	start := time.Now()
+	infos, toInsert := jfs.coldDirListing("d", entries, gate)
+	elapsed := time.Since(start)
+
+	// Must not hang: bounded by ~fuseStatTimeout (50ms) plus scheduling slack.
+	if elapsed > 2*time.Second {
+		t.Fatalf("parallel cold listing took %v — must complete promptly under one wedged child", elapsed)
+	}
+	names := map[string]bool{}
+	for _, fi := range infos {
+		names[fi.Name()] = true
+	}
+	// Both healthy siblings resolve; the wedged one is dropped.
+	if !names["a.txt"] || !names["c.txt"] {
+		t.Fatalf("infos names = %v, want both a.txt AND c.txt (fan-out resolves siblings past the wedge)", names)
+	}
+	if names["b-wedged.mov"] {
+		t.Fatalf("wedged child leaked into the listing: %v", names)
+	}
+	if len(toInsert) != 2 {
+		t.Fatalf("toInsert = %d entries, want 2 (both healthy children)", len(toInsert))
+	}
+}
+
+// TestColdListFanout: the class-scaled fan-out width + kill-switch.
+func TestColdListFanout(t *testing.T) {
+	// Kill-switch forces serial regardless of class.
+	t.Setenv("JM_COLD_LIST_FANOUT", "0")
+	for _, c := range []netprofile.LinkClass{
+		netprofile.ClassMetered, netprofile.ClassSlow,
+		netprofile.ClassMedium, netprofile.ClassFast,
+	} {
+		if got := coldListFanout(c); got != 1 {
+			t.Fatalf("coldListFanout(%v) with kill-switch = %d, want 1", c, got)
+		}
+	}
+
+	// Without the kill-switch: WAN classes gentle (8), LAN classes wide (24).
+	t.Setenv("JM_COLD_LIST_FANOUT", "")
+	cases := []struct {
+		class netprofile.LinkClass
+		want  int
+	}{
+		{netprofile.ClassMetered, 8},
+		{netprofile.ClassSlow, 8},
+		{netprofile.ClassMedium, 24},
+		{netprofile.ClassFast, 24},
+	}
+	for _, tc := range cases {
+		if got := coldListFanout(tc.class); got != tc.want {
+			t.Fatalf("coldListFanout(%v) = %d, want %d", tc.class, got, tc.want)
+		}
+	}
+}
+
+// TestSyncColdPopulateFastLink (S3): on a FAST link with the kill-switch on, a
+// zero-mirror-row readdir returns the FUSE children POPULATED from THIS readdir
+// (not empty-then-pop-in). On a non-fast link OR with the kill-switch off it
+// FALLS THROUGH to the async empty-then-pop-in path (returns empty; the mirror
+// fills in the background).
+func TestSyncColdPopulateFastLink(t *testing.T) {
+	forceClass := func(t *testing.T, c netprofile.LinkClass) {
+		t.Helper()
+		netprofile.Default().ForceClass(&c)
+		t.Cleanup(func() { netprofile.Default().ForceClass(nil) })
+	}
+
+	t.Run("fast link populates synchronously", func(t *testing.T) {
+		jfs, store, fuseRoot := newDirRefreshHarness(t)
+		t.Setenv("JM_SYNC_COLD_POPULATE", "1")
+		forceClass(t, netprofile.ClassFast)
+		mkFUSEDir(t, fuseRoot, "d", "a.txt", "b.txt")
+
+		infos, err := jfs.ReadDir("d")
+		if err != nil {
+			t.Fatalf("ReadDir: %v", err)
+		}
+		if len(infos) != 2 {
+			t.Fatalf("fast-link cold ReadDir = %d entries, want 2 (populated synchronously)", len(infos))
+		}
+		// Mirror populated synchronously — the row exists the moment ReadDir returns.
+		if kids, _ := store.ListChildren("d"); len(kids) != 2 {
+			t.Fatalf("mirror children after sync populate = %d, want 2", len(kids))
+		}
+	})
+
+	t.Run("kill-switch falls through to async empty", func(t *testing.T) {
+		jfs, _, fuseRoot := newDirRefreshHarness(t)
+		t.Setenv("JM_SYNC_COLD_POPULATE", "0")
+		forceClass(t, netprofile.ClassFast)
+		mkFUSEDir(t, fuseRoot, "d", "a.txt", "b.txt")
+
+		infos, err := jfs.ReadDir("d")
+		if err != nil {
+			t.Fatalf("ReadDir: %v", err)
+		}
+		if len(infos) != 0 {
+			t.Fatalf("kill-switch ReadDir = %d entries, want 0 (async empty-then-pop-in)", len(infos))
+		}
+	})
+
+	t.Run("non-fast link falls through to async empty", func(t *testing.T) {
+		jfs, _, fuseRoot := newDirRefreshHarness(t)
+		t.Setenv("JM_SYNC_COLD_POPULATE", "1")
+		forceClass(t, netprofile.ClassSlow)
+		mkFUSEDir(t, fuseRoot, "d", "a.txt", "b.txt")
+
+		infos, err := jfs.ReadDir("d")
+		if err != nil {
+			t.Fatalf("ReadDir: %v", err)
+		}
+		if len(infos) != 0 {
+			t.Fatalf("slow-link ReadDir = %d entries, want 0 (stays async on a non-fast link)", len(infos))
+		}
+	})
 }
 
 // TestReadDirScanFilteredShortCircuit (#2/#4): a zero-row ONLINE readdir of
