@@ -63,6 +63,25 @@
 - **Pinned items can't be evicted.** Hardened the guarantee that pinned files stay
   resident even under cache pressure, with eviction-triggered repair.
 
+### Server & Manager (control-plane container)
+- **Security — trash-restore and scheduled backups are now confined to the volume.**
+  The manager runs as root on the NAS; two path-confinement holes are closed:
+  trash-restore could move a caller-controlled file to any host path (a root
+  code-execution path), and a scheduled backup could read outside its permitted
+  source roots (arbitrary-file exfiltration). Both are now gated exactly like
+  interactive migrations.
+- **Trash retention is readable and settable in embedded mode.** Embedded
+  deployments now surface and change the JuiceFS `--trash-days` setting (set
+  `JM_OVERVIEW_META`); the UI distinguishes "disabled (0)" from "unknown".
+- **Scheduled maintenance (GC / FSCK / compact).** Each maintenance lever can now
+  run on a schedule — off by default, each pre-filled with a conservative
+  recommended cadence and inline guidance. JuiceFS already auto-handles the
+  routine cleanup (trash expiry + slice compaction), so these are opt-in hygiene.
+- **Farm tab — "Clear finished" + running sweep to the top.** Clear terminal jobs
+  from the recent-jobs list; the currently-running sweep floats to the top.
+- **Under the hood.** Fixed a jobs-API data race and an unbounded Redis
+  job-index leak.
+
 ## 0.3.0 — 2026-07-06 — Reliability: no more "connection interrupted", instant saves & exports
 
 ### Fixed
