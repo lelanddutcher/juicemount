@@ -52,6 +52,11 @@ type Stats struct {
 	Misses    uint64 // Path() misses
 	Puts      uint64
 	Evictions uint64
+	// Invalidations counts blobs dropped by Invalidate/InvalidateInode —
+	// correctness evictions (the source changed under an inode-keyed
+	// derivative), distinct from the capacity-driven Evictions above. A
+	// nonzero value here is the C5 stale-derivative gate doing its job.
+	Invalidations uint64
 }
 
 // ckey identifies one cached blob.
@@ -73,15 +78,16 @@ type Cache struct {
 	dir      string
 	maxBytes int64 // immutable after Open
 
-	mu        sync.Mutex
-	closed    bool
-	index     map[ckey]*entry
-	bytes     int64 // sum of indexed blob sizes
-	hits      uint64
-	misses    uint64
-	puts      uint64
-	evictions uint64
-	lastTick  time.Time // last recency timestamp handed out; enforces strict ordering
+	mu            sync.Mutex
+	closed        bool
+	index         map[ckey]*entry
+	bytes         int64 // sum of indexed blob sizes
+	hits          uint64
+	misses        uint64
+	puts          uint64
+	evictions     uint64
+	invalidations uint64
+	lastTick      time.Time // last recency timestamp handed out; enforces strict ordering
 }
 
 // Open opens (creating if missing) the cache rooted at dir, bounded to
@@ -273,18 +279,91 @@ func (c *Cache) Put(inode uint64, kind string, r io.Reader) (int64, error) {
 	return size, nil
 }
 
+// Invalidate drops the cached blob for (inode, kind): the in-RAM index entry is
+// removed AND the on-disk file is deleted. Reports whether an entry was
+// indexed.
+//
+// Deleting the file is the point, not an optimization. This cache is persistent
+// and Open() rebuilds its index by walking the directory, so an index-only drop
+// would resurrect the blob at the next launch. Invalidate is the correctness
+// escape hatch for the cache's inode keying: a derivative is identified by
+// {inode, kind}, but an inode is NOT a content identity — overwrite a file in
+// place (re-export, re-transcode) or let the backend recycle a deleted inode
+// and the blob under that key now depicts bytes that no longer exist. The
+// caller that detects the mismatch (bridge's source_size/source_mtime gate)
+// calls this so the stale blob is never served again, in this process or after
+// a restart.
+//
+// The canonical path for the key is removed even when the index has no entry
+// (and even after Close), so a blob written by an earlier run or landed in a
+// mis-sharded location cannot survive to be re-indexed by the next Open. Safe
+// to call on a miss; idempotent.
+func (c *Cache) Invalidate(inode uint64, kind string) bool {
+	if err := checkKind(kind); err != nil {
+		return false
+	}
+	_, canonical := c.blobPath(inode, kind)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := ckey{inode: inode, kind: kind}
+	e, ok := c.index[k]
+	if ok {
+		delete(c.index, k)
+		c.bytes -= e.size
+		c.invalidations++
+		if e.path != canonical {
+			os.Remove(e.path) // mis-sharded stray; keep disk honest
+		}
+	}
+	// Unconditional: an unindexed blob at the canonical name would be picked up
+	// by the next Open and served as if fresh.
+	os.Remove(canonical)
+	return ok
+}
+
+// InvalidateInode drops every cached kind for one inode — the blunt form of
+// Invalidate for when the source asset itself changed identity (in-place
+// overwrite, inode recycle) and every derivative keyed to it is suspect, not
+// just the one kind a caller happened to ask for. Returns the number of indexed
+// entries removed.
+func (c *Cache) InvalidateInode(inode uint64) int {
+	c.mu.Lock()
+	victims := make([]ckey, 0, 4)
+	for k := range c.index {
+		if k.inode == inode {
+			victims = append(victims, k)
+		}
+	}
+	n := 0
+	for _, k := range victims {
+		e := c.index[k]
+		delete(c.index, k)
+		c.bytes -= e.size
+		c.invalidations++
+		os.Remove(e.path)
+		if _, canonical := c.blobPath(k.inode, k.kind); canonical != e.path {
+			os.Remove(canonical)
+		}
+		n++
+	}
+	c.mu.Unlock()
+	return n
+}
+
 // Stats returns a snapshot of cache counters.
 func (c *Cache) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return Stats{
-		Bytes:     c.bytes,
-		MaxBytes:  c.maxBytes,
-		Files:     len(c.index),
-		Hits:      c.hits,
-		Misses:    c.misses,
-		Puts:      c.puts,
-		Evictions: c.evictions,
+		Bytes:         c.bytes,
+		MaxBytes:      c.maxBytes,
+		Files:         len(c.index),
+		Hits:          c.hits,
+		Misses:        c.misses,
+		Puts:          c.puts,
+		Evictions:     c.evictions,
+		Invalidations: c.invalidations,
 	}
 }
 

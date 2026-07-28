@@ -3730,6 +3730,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	globalMu.Lock()
 	ds := globalDerivStore
+	tc := globalThumbCache
 	mount := globalFUSEPath
 	if mount == "" {
 		mount = globalMountPath
@@ -3753,10 +3754,12 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var blobRel, mediaType string
+	var row derivatives.DerivRow
 	for _, d := range rows {
 		if d.Kind != kind || d.Status != "ready" || d.BlobRelPath == nil || *d.BlobRelPath == "" {
 			continue
 		}
+		row = d
 		blobRel = *d.BlobRelPath
 		if d.MediaType != nil {
 			mediaType = *d.MediaType
@@ -3764,6 +3767,26 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 	if blobRel == "" {
+		http.Error(w, "no ready "+kind+" blob for this inode", http.StatusNotFound)
+		return
+	}
+	// C5 (data integrity): the row is READY, but derivatives are keyed by INODE
+	// and an inode is not a content identity — overwrite this file in place
+	// (re-export, re-transcode) or let JuiceFS recycle a deleted inode, and this
+	// row (and any blob cached under it) now depicts bytes that are gone. Gate on
+	// the row's own vouch, source_size/source_mtime, against the live size/mtime
+	// the in-RAM mirror already holds. This is the SAME comparison the AI
+	// contribute-back POST path enforces above (409 "computed against old bytes")
+	// — it simply was never applied on the way out.
+	//
+	// liveSourceFor is a mirror map read, deliberately NOT a stat of the source:
+	// a stat here would add a full ~500ms cellular round-trip to every thumbnail
+	// and to every byte-range request a player makes while scrubbing a proxy.
+	// A mismatch is treated as a MISS — same 404 an absent derivative gets, so
+	// the caller regenerates — and the persistent thumb-cache copy is dropped so
+	// the stale bytes are not served from local disk after a restart either.
+	if live := liveSourceFor(inode); derivRowStale(row, live) {
+		rejectStaleDeriv(tc, inode, kind, row, live)
 		http.Error(w, "no ready "+kind+" blob for this inode", http.StatusNotFound)
 		return
 	}
@@ -3778,12 +3801,11 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// #1 hydration pack: SMALL kinds (everything but proxy) serve LOCAL-FIRST
 	// from the thumb cache, populated by the folder-open warmer or a prior
-	// read-through here. The manifest row above still authorized the kind and
-	// supplied the media type, so the fail-closed 404 semantics are identical
-	// — only the byte source swaps (local SSD instead of a FUSE round-trip).
-	globalMu.Lock()
-	tc := globalThumbCache
-	globalMu.Unlock()
+	// read-through here. The manifest row above still authorized the kind,
+	// supplied the media type, AND passed the C5 freshness gate, so the
+	// fail-closed 404 semantics are identical and the cached bytes are known to
+	// match the live source — only the byte source swaps (local SSD instead of
+	// a FUSE round-trip). tc was captured with ds above.
 	smallKind := kind != "proxy"
 	if tc != nil && smallKind {
 		if lp, ok := tc.Path(inode, kind); ok {
