@@ -54,6 +54,14 @@ type JuiceMountHandler struct {
 	// closes must not lose the high-water mark).
 	writeSizeMu sync.Mutex
 	writeSizes  map[string]int64
+	// writeSizeAt is the last-touch timestamp for each writeSizes entry, so
+	// evictStaleWriteSizes can age out marks whose path went away without
+	// passing through juiceFS.Remove/Rename (a remote delete, a reconcile
+	// prune, a crashed writer). Kept as a SIDE map rather than widening
+	// writeSizes so every existing reader/writer of writeSizes is untouched.
+	// Guarded by writeSizeMu; lazily allocated (some tests build the handler
+	// as a struct literal).
+	writeSizeAt map[string]time.Time
 
 	// Active writer refcount: path → number of in-flight write handles.
 	// Used by phantom-purge gate to distinguish "active writer right now"
@@ -603,6 +611,19 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		sidecarWarmSem:       make(chan struct{}, 3), // max 3 concurrent dir warm passes
 		sidecarWarmed:        make(map[string]time.Time),
 	}
+	// Subtree-rename → pooled-fd invalidation (serving-path integrity).
+	// metadata/ owns the "a subtree moved" signal but cannot import nfs/, so
+	// RenameSubtree publishes it through this hook and we translate the two
+	// in-mount directory paths into FUSE paths for the pool. juiceFS.Rename
+	// also invalidates both ends directly — this makes RenameSubtree
+	// self-defending for any other caller, and the two are idempotent.
+	if store != nil {
+		store.SetOnSubtreeRenamed(func(oldDir, newDir string) {
+			h.invalidatePooledFDTree(oldDir)
+			h.invalidatePooledFDTree(newDir)
+		})
+	}
+
 	go h.verifierCleanupLoop(60*time.Second, 5*time.Minute)
 	return h
 }
@@ -623,6 +644,14 @@ func (h *JuiceMountHandler) SetCacheReader(cr *cache.Reader) {
 // call it broadly. The inode is resolved from the live metadata cache; if the
 // entry is already evicted (delete/rename source) there is nothing cached to
 // serve under it, so a miss is fine.
+// NOTE (2026-07-28): invalidateReadCaches deliberately does NOT invalidate the
+// FDPool. It is called from writeFile.Close, which the go-nfs fork runs on
+// EVERY WRITE RPC (OpenFile→Write→Close per RPC) — dropping the pooled write fd
+// there would reopen the file on FUSE (~60 ms) once per RPC, which is the exact
+// cost the pool exists to amortize, and would do it for a path whose identity
+// never changed. Pooled-fd invalidation is wired explicitly at the two sites
+// where a path's identity actually changes (juiceFS.Rename and juiceFS.Remove)
+// via invalidatePooledFDs / invalidatePooledFDTree below.
 func (h *JuiceMountHandler) invalidateReadCaches(path string) {
 	if h.memBuf != nil {
 		h.memBuf.Invalidate(path)
@@ -632,6 +661,29 @@ func (h *JuiceMountHandler) invalidateReadCaches(path string) {
 			h.cacheReader.InvalidateSliceCache(e.Inode)
 		}
 	}
+}
+
+// invalidatePooledFDs drops the pooled read AND write fds for one in-mount
+// path, so no later RPC can be served an fd that still points at the PREVIOUS
+// inode behind that name. Takes the in-mount filename (the form the billy
+// layer hands us) and converts to the FUSE path the pool is keyed by.
+// See FDPool.Invalidate for the corruption modes this closes.
+func (h *JuiceMountHandler) invalidatePooledFDs(inMountPath string) {
+	if h == nil || h.fdPool == nil || inMountPath == "" {
+		return
+	}
+	h.fdPool.Invalidate(path.Join(h.fusePath, inMountPath))
+}
+
+// invalidatePooledFDTree is invalidatePooledFDs extended to everything pooled
+// BENEATH the path as well — the directory-rename case, where one syscall
+// re-parents every descendant and thus staleness every descendant's pooled fd
+// at once. Safe (and cheap) to call for a plain file: the subtree is empty.
+func (h *JuiceMountHandler) invalidatePooledFDTree(inMountPath string) {
+	if h == nil || h.fdPool == nil || inMountPath == "" {
+		return
+	}
+	h.fdPool.InvalidateTree(path.Join(h.fusePath, inMountPath))
 }
 
 // SetPinStore attaches the pin registry and the user-facing mount point that
@@ -902,6 +954,30 @@ func (h *JuiceMountHandler) trackWriteSize(path string, size int64) {
 	if cur, ok := h.writeSizes[path]; !ok || size > cur {
 		h.writeSizes[path] = size
 	}
+	h.touchWriteSizeLocked(path)
+	h.writeSizeMu.Unlock()
+}
+
+// touchWriteSizeLocked stamps a writeSizes entry as freshly written so the
+// age-out sweep (evictStaleWriteSizes) measures idleness, not absolute age.
+// Caller holds writeSizeMu. Lazily allocates because struct-literal handlers
+// in tests don't run the NewHandler ctor.
+func (h *JuiceMountHandler) touchWriteSizeLocked(path string) {
+	if h.writeSizeAt == nil {
+		h.writeSizeAt = make(map[string]time.Time)
+	}
+	h.writeSizeAt[path] = time.Now()
+}
+
+// clearWriteSize removes the sticky write-size high-water mark for a path.
+// Called by juiceFS.Remove: the mark is MAX-only, so leaving it behind lets
+// the NEXT (possibly much smaller) file created at the same name inherit the
+// DELETED file's size, and Stat over-reports it → mmap readers get a
+// kernel zero-fill past real EOF (C4 / #104). See the Remove call site.
+func (h *JuiceMountHandler) clearWriteSize(path string) {
+	h.writeSizeMu.Lock()
+	delete(h.writeSizes, path)
+	delete(h.writeSizeAt, path)
 	h.writeSizeMu.Unlock()
 }
 
@@ -915,6 +991,7 @@ func (h *JuiceMountHandler) clampWriteSize(path string, size int64) {
 	h.writeSizeMu.Lock()
 	if cur, ok := h.writeSizes[path]; ok && cur > size {
 		h.writeSizes[path] = size
+		h.touchWriteSizeLocked(path)
 	}
 	h.writeSizeMu.Unlock()
 }
@@ -1210,7 +1287,21 @@ func (h *JuiceMountHandler) publishEvent(evt metadata.MetadataEvent) {
 	}()
 }
 
-// verifierCleanupLoop periodically removes stale verifier and prefetch entries.
+// writeSizeMaxAge bounds how long a sticky writeSizes high-water mark may sit
+// untouched before evictStaleWriteSizes drops it (C4 backstop).
+//
+// The mark exists to bridge the window between "a writer produced bytes" and
+// "the mirror/SQLite size caught up" — milliseconds to seconds in practice
+// (writeFile.Close → store.UpdateSize; spool drain → onSpoolDrained; reconcile
+// → real backend size). 10 minutes is far beyond any legitimate bridging
+// window, so the sweep can only ever hit marks whose path is genuinely gone,
+// while still bounding the C4 stale-HIGH-size exposure for deletions that
+// never pass through juiceFS.Remove (remote delete, reconcile prune, crashed
+// writer). It is idleness, not absolute age: any new write re-stamps the entry.
+const writeSizeMaxAge = 10 * time.Minute
+
+// verifierCleanupLoop periodically removes stale verifier, prefetch and
+// write-size entries.
 func (h *JuiceMountHandler) verifierCleanupLoop(interval, ttl time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -1219,10 +1310,78 @@ func (h *JuiceMountHandler) verifierCleanupLoop(interval, ttl time.Duration) {
 		case <-ticker.C:
 			h.evictStaleVerifiers(ttl)
 			h.evictStalePrefetched(2 * time.Minute)
+			h.evictStaleWriteSizes(writeSizeMaxAge)
 		case <-h.verifierStop:
 			return
 		}
 	}
+}
+
+// evictStaleWriteSizes drops writeSizes marks that have gone untouched for
+// longer than ttl (C4 backstop — see writeSizeMaxAge). Returns the number
+// evicted, for tests.
+//
+// A stale-HIGH mark is a CORRUPTION source, not just clutter: Stat/Lstat serve
+// it whenever it exceeds the mirror size, so an mmap reader faults past real
+// EOF and the kernel zero-fills the gap. juiceFS.Remove now clears the mark
+// directly; this catches the paths that vanish without a Remove RPC.
+//
+// Two guards keep the sweep from ever UNDER-reporting a live file's size:
+//   - an active write handle (a slow/paused ingest can legitimately idle past
+//     ttl mid-file), and
+//   - a spool entry still pending drain (an offline copy can sit for hours),
+//
+// in both of which cases the mark is still the authoritative size.
+//
+// Lock discipline: candidates are snapshotted under writeSizeMu, the guards
+// are evaluated with NO lock held (they take activeWritersMu / the spool's own
+// locks), then the deletes re-take writeSizeMu and re-verify the timestamp
+// hasn't moved. This deliberately avoids nesting writeSizeMu around any other
+// lock.
+func (h *JuiceMountHandler) evictStaleWriteSizes(ttl time.Duration) int {
+	cutoff := time.Now().Add(-ttl)
+
+	h.writeSizeMu.Lock()
+	var candidates []string
+	for k := range h.writeSizes {
+		at, ok := h.writeSizeAt[k]
+		if !ok {
+			// No timestamp (pre-existing entry, or a struct-literal handler):
+			// adopt it NOW rather than evicting on unknown age. It ages out on
+			// a later tick if nothing touches it.
+			h.touchWriteSizeLocked(k)
+			continue
+		}
+		if at.Before(cutoff) {
+			candidates = append(candidates, k)
+		}
+	}
+	h.writeSizeMu.Unlock()
+
+	if len(candidates) == 0 {
+		return 0
+	}
+
+	evicted := 0
+	for _, k := range candidates {
+		if h.hasActiveWriter(k) {
+			continue
+		}
+		if h.spool != nil && h.spool.HasPending(k) {
+			continue
+		}
+		h.writeSizeMu.Lock()
+		if at, ok := h.writeSizeAt[k]; ok && at.Before(cutoff) {
+			delete(h.writeSizes, k)
+			delete(h.writeSizeAt, k)
+			evicted++
+		}
+		h.writeSizeMu.Unlock()
+	}
+	if evicted > 0 {
+		jmlog.Debug("writeSizes: aged out stale high-water marks", "count", evicted)
+	}
+	return evicted
 }
 
 // evictStalePrefetched removes prefetch tracking entries older than ttl.
@@ -3015,6 +3174,27 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	jfs.handler.invalidateReadCaches(oldpath)
 	jfs.handler.invalidateReadCaches(newpath)
 
+	// Drop the POOLED FDs for both ends (C1/C2, 2026-07-28). The FDPool is
+	// keyed by path alone, so after this rename:
+	//
+	//   - oldpath's pooled READ fd still points at the file that just MOVED.
+	//     A new file created at oldpath would be read as the moved file's
+	//     bytes — right length, wrong content, no error (C1).
+	//   - oldpath's pooled WRITE fd is worse: an in-place rewrite of oldpath
+	//     (the legacy non-spool write path — atomic-save "save v1 aside, write
+	//     a fresh original") would land every WriteAt INSIDE the renamed-away
+	//     file, destroying the archive AND never writing the new file (C2).
+	//   - newpath's pooled fds point at whatever POSIX rename just replaced
+	//     (or unlinked) at the destination.
+	//
+	// Tree-scoped, not exact-key: a DIRECTORY rename staleness every
+	// descendant's pooled fd in the same syscall, and doing it off the pool's
+	// own key set (rather than the mirror's descendant list) stays correct even
+	// when the mirror has evicted a descendant. Must run AFTER the os.Rename
+	// above so a concurrent Get can't immediately re-pool the pre-rename inode.
+	jfs.handler.invalidatePooledFDTree(oldpath)
+	jfs.handler.invalidatePooledFDTree(newpath)
+
 	// Carry the in-flight write-size high-water mark across the rename so
 	// (a) Stat at the new path stays accurate for a file still being
 	// written, and (b) a FUTURE file created at the old path doesn't
@@ -3023,8 +3203,10 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	jfs.handler.writeSizeMu.Lock()
 	if sz, ok := jfs.handler.writeSizes[oldpath]; ok {
 		delete(jfs.handler.writeSizes, oldpath)
+		delete(jfs.handler.writeSizeAt, oldpath)
 		if cur, ok := jfs.handler.writeSizes[newpath]; !ok || sz > cur {
 			jfs.handler.writeSizes[newpath] = sz
+			jfs.handler.touchWriteSizeLocked(newpath)
 		}
 	}
 	jfs.handler.writeSizeMu.Unlock()
@@ -3145,6 +3327,25 @@ func (jfs *juiceFS) Remove(filename string) error {
 	// Delete on FUSE synchronously — returning success before the file is
 	// actually removed causes stale-handle confusion on subsequent operations.
 	os.Remove(jfs.fullPath(filename))
+
+	// Drop the POOLED FDs for this path (C3, 2026-07-28). Run AFTER the FUSE
+	// unlink, so a Get racing this Remove can only re-pool an fd for a file
+	// that still exists. Without this, `rm take.mov` → recreate → write took
+	// GetWrite's cached fd to the UNLINKED inode: every byte went to a ghost
+	// the kernel reclaimed on close, the recreated file stayed empty, and no
+	// layer returned an error. The read slot is the same bug in the read
+	// direction (serving the deleted generation's bytes to a recreated name).
+	jfs.handler.invalidatePooledFDs(filename)
+
+	// Drop the sticky write-size high-water mark (C4, 2026-07-28). writeSizes
+	// is MAX-only (trackWriteSize) and Stat/Lstat report it whenever it exceeds
+	// the mirror's size, so a delete that left it behind made the NEXT file at
+	// this name inherit the DELETED file's size: copy a 10 GB file to X.mov →
+	// rm X.mov → create a 100 KB X.mov → stat reports 10 GB → an mmap reader
+	// (every NLE) faults past 100 KB and the kernel ZERO-FILLS to the reported
+	// size. That is the #104 Premiere black-frame signature, reachable today.
+	// Rename already carries/clears the mark (see Rename); Remove never did.
+	jfs.handler.clearWriteSize(filename)
 
 	// Publish delete event
 	if e != nil {
@@ -4020,17 +4221,27 @@ func (f *writeFile) Close() error {
 	//
 	// We also do NOT delete the writeSizes entry on Close — under
 	// concurrent dispatch, another RPC may still be writing past this
-	// one's position. Stale entries are cleaned up lazily by the next
-	// Stat() comparing against SQLite, or could be aged out by a future
-	// sweep. The previous delete-on-close created a window where Stat()
-	// would briefly see no in-flight tracking and fall back to the old
-	// SQLite size.
+	// one's position. The previous delete-on-close created a window where
+	// Stat() would briefly see no in-flight tracking and fall back to the
+	// old SQLite size.
+	//
+	// CORRECTION (2026-07-28): this comment used to claim the leftover entry
+	// was "cleaned up lazily by the next Stat() comparing against SQLite."
+	// That was FALSE — Stat and Lstat only READ writeSizes, they never delete
+	// from it, and there was no TTL and no sweep. The mark was therefore
+	// immortal, and because it is MAX-only it made every LATER file at the
+	// same name inherit this one's size (C4 / #104: delete a 10 GB X.mov,
+	// create a 100 KB X.mov, Stat reports 10 GB, mmap readers get a kernel
+	// zero-fill past real EOF). It is now cleared explicitly by juiceFS.Remove
+	// (clearWriteSize) and aged out by evictStaleWriteSizes in
+	// verifierCleanupLoop; Rename carries/clears it as it always did.
 	f.handler.writeSizeMu.Lock()
 	finalSize, ok := f.handler.writeSizes[f.name]
 	if !ok || f.writtenEnd > finalSize {
 		finalSize = f.writtenEnd
 		f.handler.writeSizes[f.name] = finalSize
 	}
+	f.handler.touchWriteSizeLocked(f.name)
 	f.handler.writeSizeMu.Unlock()
 
 	// Update SQLite with the high-water size. UpdateSize itself uses

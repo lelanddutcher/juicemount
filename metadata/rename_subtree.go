@@ -37,6 +37,21 @@ import (
 //
 // Returns the number of descendants re-keyed (0 for an empty/unknown dir).
 func (s *Store) RenameSubtree(oldDir, newDir string) int {
+	// Serving-path integrity (2026-07-28): tell the NFS layer to drop every
+	// pooled FUSE fd under BOTH ends of this move. The pool is keyed by path
+	// alone, so after the caller's os.Rename each descendant's cached fd still
+	// points at the pre-rename inode — a later read of the same name is served
+	// the OLD file's bytes (right length, wrong content, no error) and a later
+	// in-place write lands inside the moved-away file.
+	//
+	// Deferred so it also fires on the len(oldPaths)==0 early return: the
+	// mirror having no descendants does NOT mean the POOL has none (a mirror
+	// entry can be evicted while its fd is still pooled). Fired outside every
+	// lock this function takes. Ordering is not load-bearing — the caller has
+	// already executed the FUSE rename, so any re-open after this point
+	// resolves the new, correct identity.
+	defer s.fireSubtreeRenamed(oldDir, newDir)
+
 	oldPrefix := oldDir + "/"
 
 	// Snapshot the descendant set under a read lock (keys only — the

@@ -231,6 +231,12 @@ type Store struct {
 	// than run the mark-done unserialized. Read-only after SetSpoolStore.
 	spoolStore *SpoolStore
 
+	// onSubtreeRenamed is fired by RenameSubtree so the NFS layer can drop the
+	// pooled FUSE fds for a moved subtree (they are keyed by path alone and
+	// would otherwise keep serving the pre-rename inodes). Injected via
+	// SetOnSubtreeRenamed; nil when unwired. Guarded by mu.
+	onSubtreeRenamed func(oldDir, newDir string)
+
 	// ftsInitialized is set once the external-content FTS has been built (the
 	// first BulkInsert / initial sync). After that EVERY BulkInsert maintains
 	// FTS incrementally — even a large delta — so it never holds writeMu
@@ -530,6 +536,43 @@ func (s *Store) SetPinChecker(pc PinChecker) {
 // lock is needed (matches the one-shot SetOnBatchDrainComplete wiring).
 func (s *Store) SetSpoolStore(ss *SpoolStore) {
 	s.spoolStore = ss
+}
+
+// SetOnSubtreeRenamed registers the hook RenameSubtree fires when a directory
+// rename re-parents a subtree.
+//
+// WHY (serving-path data integrity, 2026-07-28): the NFS layer pools open FUSE
+// fds keyed by PATH ALONE. A directory rename moves every descendant in one
+// syscall, so every descendant's pooled fd instantly refers to the previous
+// inode behind that name — a later read of `dir/clip.mov` can be served the
+// pre-rename file's bytes, and a later in-place write can land inside it.
+// metadata/ must not import nfs/ (and holds no reference to the FDPool), so
+// the invalidation is injected as a function hook set once at startup, the
+// same idiom as SetClassSignals (keyspace.go) and lstatFnPtr (redis.go).
+//
+// The hook is handed the two DIRECTORY paths, not the descendant list, on
+// purpose: the consumer invalidates off the POOL's own key set, which stays
+// correct for descendants the mirror has evicted or never knew about.
+//
+// Nil-safe; may be called with nil to detach. Concurrency: guarded by s.mu
+// because the bridge wires it on the start path while reconcile goroutines may
+// already be running.
+func (s *Store) SetOnSubtreeRenamed(fn func(oldDir, newDir string)) {
+	s.mu.Lock()
+	s.onSubtreeRenamed = fn
+	s.mu.Unlock()
+}
+
+// fireSubtreeRenamed invokes the registered hook (if any) OUTSIDE s.mu — the
+// consumer takes its own locks (the FDPool mutex) and must never be called
+// with the store's write lock held.
+func (s *Store) fireSubtreeRenamed(oldDir, newDir string) {
+	s.mu.RLock()
+	fn := s.onSubtreeRenamed
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(oldDir, newDir)
+	}
 }
 
 // pinnedSetLocked returns the current pinned-path set under s.mu (caller
