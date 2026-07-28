@@ -234,7 +234,10 @@ func (w *ThumbWarmer) warmDir(dir string) {
 // hydrateOne pulls one thumbnail blob from FUSE into the local cache.
 // Bounded open (a wedged FUSE can't pin a warm worker) + size cap.
 func (w *ThumbWarmer) hydrateOne(inode uint64, blobPath string) (int64, error) {
-	f, err, ok := openFileWithTimeout(blobPath, os.O_RDONLY, 0, fuseStatTimeout)
+	// ATTRIBUTION (measure-only): BACKGROUND hydration, but
+	// openFileWithTimeout draws from the FOREGROUND nfsLstatGate — same
+	// doctrine gap as the sidecar warmer. Label now, re-gate later.
+	f, err, ok := openFileWithTimeout(metrics.FUSESrcThumbWarm, blobPath, os.O_RDONLY, 0, fuseStatTimeout)
 	if !ok {
 		return 0, errFUSETimeout
 	}

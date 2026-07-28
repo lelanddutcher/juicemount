@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -365,7 +366,7 @@ func TestInfoWithTimeoutWedgedStat(t *testing.T) {
 	gate := make(chan struct{}, 1)
 	de := &blockingDirEntry{name: "wedged.mov", release: make(chan struct{})}
 
-	_, _, ok := infoWithTimeout(de, 50*time.Millisecond, gate)
+	_, _, ok := infoWithTimeout(metrics.FUSESrcDirRefresh, de, 50*time.Millisecond, gate)
 	if ok {
 		t.Fatal("wedged Info() must report ok=false")
 	}
@@ -402,7 +403,7 @@ func TestInfoWithTimeoutCompletes(t *testing.T) {
 		t.Fatalf("ReadDir: %v (%d entries)", err, len(ents))
 	}
 	gate := make(chan struct{}, 1)
-	fi, ierr, ok := infoWithTimeout(ents[0], 2*time.Second, gate)
+	fi, ierr, ok := infoWithTimeout(metrics.FUSESrcDirRefresh, ents[0], 2*time.Second, gate)
 	if !ok || ierr != nil || fi == nil || fi.Name() != "a.txt" {
 		t.Fatalf("infoWithTimeout = (%v, %v, ok=%v), want a.txt info", fi, ierr, ok)
 	}
@@ -435,7 +436,7 @@ func TestColdDirListingBreaksOnWedgedStat(t *testing.T) {
 	entries := []os.DirEntry{real[0], wedged, real[1]}
 
 	gate := make(chan struct{}, 4)
-	infos, toInsert := jfs.coldDirListing("d", entries, gate)
+	infos, toInsert := jfs.coldDirListing(metrics.FUSESrcDirRefresh, "d", entries, gate)
 	if len(infos) != 1 || infos[0].Name() != "a.txt" {
 		t.Fatalf("infos = %d entries, want only a.txt (break on wedge — no stats issued past it)", len(infos))
 	}
@@ -471,7 +472,7 @@ func TestColdDirListingParallelWedgeCompletes(t *testing.T) {
 
 	gate := make(chan struct{}, 8)
 	start := time.Now()
-	infos, toInsert := jfs.coldDirListing("d", entries, gate)
+	infos, toInsert := jfs.coldDirListing(metrics.FUSESrcDirRefresh, "d", entries, gate)
 	elapsed := time.Since(start)
 
 	// Must not hang: bounded by ~fuseStatTimeout (50ms) plus scheduling slack.

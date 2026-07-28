@@ -280,12 +280,17 @@ func asyncDirRefreshEnabled() bool {
 
 // statWithTimeout is the os.Stat sibling of lstatWithTimeout. ok=false means
 // the underlying Stat didn't complete within the timeout (FUSE wedged).
-func statWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, err error, ok bool) {
+//
+// src attributes the call to whoever issued it (see nfs/fusemetrics.go). It
+// is instrumentation only — it changes no timeout, gate, retry or error map.
+func statWithTimeout(src metrics.FUSESource, p string, timeout time.Duration) (fi os.FileInfo, err error, ok bool) {
+	start := time.Now()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case nfsLstatGate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(nfsLstatGate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpStat, metrics.FUSEGateNFSLstat,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return nil, nil, false
 	}
 	type result struct {
@@ -300,8 +305,12 @@ func statWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, err error
 	}()
 	select {
 	case r := <-ch:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpStat, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return r.fi, r.err, true
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpStat, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return nil, nil, false
 	}
 }
@@ -322,12 +331,14 @@ func statWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, err error
 // buffered) and releases the gate when the wedged syscall eventually returns.
 
 // symlinkWithTimeout is the bounded os.Symlink sibling. ok=false → FUSE wedged.
-func symlinkWithTimeout(target, p string, timeout time.Duration) (err error, ok bool) {
+func symlinkWithTimeout(src metrics.FUSESource, target, p string, timeout time.Duration) (err error, ok bool) {
+	start := time.Now()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case nfsLstatGate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(nfsLstatGate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpSymlink, metrics.FUSEGateNFSLstat,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return nil, false
 	}
 	ch := make(chan error, 1)
@@ -338,19 +349,25 @@ func symlinkWithTimeout(target, p string, timeout time.Duration) (err error, ok 
 	}()
 	select {
 	case e := <-ch:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpSymlink, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return e, true
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpSymlink, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return nil, false
 	}
 }
 
 // mkdirAllWithTimeout is the bounded os.MkdirAll sibling. ok=false → FUSE wedged.
-func mkdirAllWithTimeout(p string, perm os.FileMode, timeout time.Duration) (err error, ok bool) {
+func mkdirAllWithTimeout(src metrics.FUSESource, p string, perm os.FileMode, timeout time.Duration) (err error, ok bool) {
+	start := time.Now()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case nfsLstatGate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(nfsLstatGate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpMkdirAll, metrics.FUSEGateNFSLstat,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return nil, false
 	}
 	ch := make(chan error, 1)
@@ -361,8 +378,12 @@ func mkdirAllWithTimeout(p string, perm os.FileMode, timeout time.Duration) (err
 	}()
 	select {
 	case e := <-ch:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpMkdirAll, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return e, true
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpMkdirAll, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return nil, false
 	}
 }
@@ -370,12 +391,14 @@ func mkdirAllWithTimeout(p string, perm os.FileMode, timeout time.Duration) (err
 // chmodWithTimeout is the bounded os.Chmod sibling. os.Chmod FOLLOWS symlinks,
 // so a framework's nested links drive it into the most contended JuiceFS
 // resolution — exactly the path that wedged. ok=false → FUSE wedged.
-func chmodWithTimeout(p string, mode os.FileMode, timeout time.Duration) (err error, ok bool) {
+func chmodWithTimeout(src metrics.FUSESource, p string, mode os.FileMode, timeout time.Duration) (err error, ok bool) {
+	start := time.Now()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case nfsLstatGate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(nfsLstatGate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpChmod, metrics.FUSEGateNFSLstat,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return nil, false
 	}
 	ch := make(chan error, 1)
@@ -386,8 +409,12 @@ func chmodWithTimeout(p string, mode os.FileMode, timeout time.Duration) (err er
 	}()
 	select {
 	case e := <-ch:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpChmod, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return e, true
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpChmod, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return nil, false
 	}
 }
@@ -397,12 +424,15 @@ func chmodWithTimeout(p string, mode os.FileMode, timeout time.Duration) (err er
 // nfsLstatGate (the shared hot-path budget); the BACKGROUND prefetcher passes
 // prefetchGate so its FUSE ReadDirs can never consume foreground slots during a
 // spool drain (RC drain-latency fix). See prefetchGate's doc.
-func readDirWithTimeout(p string, timeout time.Duration, gate chan struct{}) (ents []os.DirEntry, err error, ok bool) {
+func readDirWithTimeout(src metrics.FUSESource, p string, timeout time.Duration, gate chan struct{}) (ents []os.DirEntry, err error, ok bool) {
+	start := time.Now()
+	gid := fuseGateID(gate)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case gate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(gate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpReadDir, gid,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return nil, nil, false
 	}
 	type result struct {
@@ -417,8 +447,12 @@ func readDirWithTimeout(p string, timeout time.Duration, gate chan struct{}) (en
 	}()
 	select {
 	case r := <-ch:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpReadDir, gid,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return r.ents, r.err, true
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpReadDir, gid,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return nil, nil, false
 	}
 }
@@ -442,12 +476,15 @@ func readDirWithTimeout(p string, timeout time.Duration, gate chan struct{}) (en
 // refresh) pass prefetchGate so they can never consume foreground slots. On
 // timeout the spawned goroutine still holds its gate slot until the lstat
 // actually returns — the same bounded leak every sibling accepts.
-func infoWithTimeout(de os.DirEntry, timeout time.Duration, gate chan struct{}) (fi os.FileInfo, err error, ok bool) {
+func infoWithTimeout(src metrics.FUSESource, de os.DirEntry, timeout time.Duration, gate chan struct{}) (fi os.FileInfo, err error, ok bool) {
+	start := time.Now()
+	gid := fuseGateID(gate)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case gate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(gate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpDirEntryInfo, gid,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return nil, nil, false
 	}
 	type result struct {
@@ -462,8 +499,12 @@ func infoWithTimeout(de os.DirEntry, timeout time.Duration, gate chan struct{}) 
 	}()
 	select {
 	case r := <-ch:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpDirEntryInfo, gid,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return r.fi, r.err, true
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpDirEntryInfo, gid,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return nil, nil, false
 	}
 }
@@ -471,12 +512,20 @@ func infoWithTimeout(de os.DirEntry, timeout time.Duration, gate chan struct{}) 
 // openFileWithTimeout is the os.OpenFile sibling. ok=false → FUSE wedged.
 // On timeout the leaked goroutine's *os.File (if the open eventually
 // succeeds) is closed so we don't leak an fd.
-func openFileWithTimeout(p string, flag int, perm os.FileMode, timeout time.Duration) (f *os.File, err error, ok bool) {
+// NOTE (attribution): this helper hard-codes nfsLstatGate — the 24-slot
+// FOREGROUND budget — and BOTH background warmers call it (nfs/sidecar.go
+// warmSidecar, up to 48-way; nfs/thumbwarm.go hydrateOne). That is the
+// prefetchGate/fuseFstatGate doctrine violation the attribution counters
+// exist to size. Measure first: the src label makes warmer-vs-foreground
+// consumption of this gate visible in /metrics. Do NOT change the gate here.
+func openFileWithTimeout(src metrics.FUSESource, p string, flag int, perm os.FileMode, timeout time.Duration) (f *os.File, err error, ok bool) {
+	start := time.Now()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case nfsLstatGate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(nfsLstatGate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpOpen, metrics.FUSEGateNFSLstat,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return nil, nil, false
 	}
 	type result struct {
@@ -491,8 +540,12 @@ func openFileWithTimeout(p string, flag int, perm os.FileMode, timeout time.Dura
 	}()
 	select {
 	case r := <-ch:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpOpen, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return r.f, r.err, true
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpOpen, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		// Close the fd if the open completes after we've bailed.
 		go func() {
 			if r := <-ch; r.f != nil {
@@ -503,12 +556,14 @@ func openFileWithTimeout(p string, flag int, perm os.FileMode, timeout time.Dura
 	}
 }
 
-func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok bool) {
+func lstatNotExistWithTimeout(src metrics.FUSESource, p string, timeout time.Duration) (isNotExist, ok bool) {
+	start := time.Now()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case nfsLstatGate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(nfsLstatGate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpLstatNotExist, metrics.FUSEGateNFSLstat,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return false, false
 	}
 	type result struct {
@@ -522,9 +577,13 @@ func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok b
 	}()
 	select {
 	case r := <-ch:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpLstatNotExist, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return os.IsNotExist(r.err), true
 	case <-timer.C:
 		// Worker still holds gate until its Lstat returns; bounded leak.
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpLstatNotExist, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return false, false
 	}
 }
@@ -534,14 +593,16 @@ func lstatNotExistWithTimeout(p string, timeout time.Duration) (isNotExist, ok b
 // complete within the timeout; callers should fall back to a safe default
 // (typically: treat the entry as unknown rather than blocking the request
 // goroutine on a wedged FUSE daemon).
-func lstatWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, ok bool) {
+func lstatWithTimeout(src metrics.FUSESource, p string, timeout time.Duration) (fi os.FileInfo, ok bool) {
+	start := time.Now()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	// QA-30 Layer B HIGH-1: bounded gate so a FUSE wedge can't leak
 	// unbounded goroutines. Shared with lstatNotExistWithTimeout.
-	select {
-	case nfsLstatGate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(nfsLstatGate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpLstat, metrics.FUSEGateNFSLstat,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return nil, false
 	}
 	type result struct {
@@ -556,11 +617,15 @@ func lstatWithTimeout(p string, timeout time.Duration) (fi os.FileInfo, ok bool)
 	}()
 	select {
 	case r := <-ch:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpLstat, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		if r.err != nil {
 			return nil, true // call completed but failed (e.g., ENOENT); caller decides
 		}
 		return r.fi, true
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpLstat, metrics.FUSEGateNFSLstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return nil, false
 	}
 }
@@ -1030,7 +1095,7 @@ func (h *JuiceMountHandler) prefetchChildren(dirname string) {
 	// load these background ReadDirs block on the saturated FUSE daemon, and if
 	// they shared nfsLstatGate they'd starve foreground cache-miss metadata RPCs
 	// and head-of-line-block Finder's NFS connection. See prefetchGate's doc.
-	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout, prefetchGate)
+	dirEntries, err, ok := readDirWithTimeout(metrics.FUSESrcPrefetch, fusePath, fuseStatTimeout, prefetchGate)
 	if !ok {
 		return
 	}
@@ -1260,7 +1325,7 @@ func (h *JuiceMountHandler) asyncConfirmPhantomPurge(filename, fusePath string) 
 			return
 		}
 
-		isNotExist, ok := lstatNotExistWithTimeout(fusePath, fuseStatTimeout)
+		isNotExist, ok := lstatNotExistWithTimeout(metrics.FUSESrcPhantomPurge, fusePath, fuseStatTimeout)
 		if ok && isNotExist {
 			// Confirm the entry is still the same phantom before deleting —
 			// a concurrent recreate/drain could have re-inserted it.
@@ -1515,7 +1580,7 @@ func (h *JuiceMountHandler) ToHandle(f billy.Filesystem, path []string) []byte {
 	// LOOKUP that succeeds.
 	isDir := false
 	// (parameter `path` shadows the package here; use string concat.)
-	if fi, ok := lstatWithTimeout(h.fusePath+"/"+fullPath, 2*time.Second); ok && fi != nil {
+	if fi, ok := lstatWithTimeout(metrics.FUSESrcForeground, h.fusePath+"/"+fullPath, 2*time.Second); ok && fi != nil {
 		isDir = fi.IsDir()
 	}
 	entry := metadata.MakeEntry(fullPath, isDir, 0, time.Now(), inode)
@@ -1727,7 +1792,7 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 
 	// Verify the path actually exists in FUSE before recovering.
 	fusePath := h.fusePath + "/" + strings.TrimLeft(shadow.Path, "/")
-	fi, fok := lstatWithTimeout(fusePath, 2*time.Second)
+	fi, fok := lstatWithTimeout(metrics.FUSESrcForeground, fusePath, 2*time.Second)
 	if !fok {
 		// Lstat timed out — FUSE is degraded. Don't recover, don't
 		// cache negative (might succeed next time).
@@ -2068,7 +2133,7 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 	// mount. statWithTimeout returns ok=false on a wedge so we fail this RPC
 	// fast (errFUSETimeout → JUKEBOX) and free the slot instead of blocking.
 	fusePath := jfs.fullPath(filename)
-	info, err, ok := statWithTimeout(fusePath, fuseStatTimeout)
+	info, err, ok := statWithTimeout(metrics.FUSESrcForeground, fusePath, fuseStatTimeout)
 	if !ok {
 		return nil, errFUSETimeout
 	}
@@ -2176,7 +2241,7 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 	// ModeSymlink entry. Regular files and dirs — and a wedge/ENOENT — fall
 	// through to Stat unchanged, so the regular-file hot path is untouched.
 	fusePath := jfs.fullPath(filename)
-	if fi, ok := lstatWithTimeout(fusePath, fuseStatTimeout); ok && fi != nil && fi.Mode()&os.ModeSymlink != 0 {
+	if fi, ok := lstatWithTimeout(metrics.FUSESrcForeground, fusePath, fuseStatTimeout); ok && fi != nil && fi.Mode()&os.ModeSymlink != 0 {
 		var inode uint64
 		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Ino != 0 {
 			inode = st.Ino
@@ -2361,7 +2426,7 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	// concurrency budget (see statWithTimeout rationale).
 	// Foreground cold READDIR — a genuine cache-miss metadata RPC on Finder's
 	// hot path, so it uses the shared nfsLstatGate (NOT prefetchGate).
-	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout, nfsLstatGate)
+	dirEntries, err, ok := readDirWithTimeout(metrics.FUSESrcForeground, fusePath, fuseStatTimeout, nfsLstatGate)
 	if !ok {
 		return nil, errFUSETimeout
 	}
@@ -2370,7 +2435,7 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	}
 	// Foreground RPC path → per-child stats draw from the shared hot-path
 	// budget (nfsLstatGate), same as the readDirWithTimeout above.
-	infos, toInsert := jfs.coldDirListing(dirname, dirEntries, nfsLstatGate)
+	infos, toInsert := jfs.coldDirListing(metrics.FUSESrcForeground, dirname, dirEntries, nfsLstatGate)
 
 	// Bulk-insert into SQLite synchronously so subsequent Stat() calls
 	// from Finder (which follow immediately after READDIR) hit the cache
@@ -2402,7 +2467,12 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 // budget and anti-flood discipline are preserved; the fan-out only lets up to K
 // of those already-gated lstats be in flight at once. This is the background /
 // non-default-foreground fallback path, NOT the RAM serve.
-func (jfs *juiceFS) coldDirListing(dirname string, dirEntries []os.DirEntry, gate chan struct{}) ([]os.FileInfo, []*metadata.Entry) {
+//
+// src travels WITH gate (they always agree: foreground↔nfsLstatGate,
+// background↔prefetchGate) so the per-child lstats are attributed to whoever
+// actually issued the listing — this function is the one place a single body
+// serves both a blocked client RPC and a background mirror warm.
+func (jfs *juiceFS) coldDirListing(src metrics.FUSESource, dirname string, dirEntries []os.DirEntry, gate chan struct{}) ([]os.FileInfo, []*metadata.Entry) {
 	type result struct {
 		info    os.FileInfo
 		entry   *metadata.Entry // nil when scan-filtered (in listing, not mirrored)
@@ -2433,7 +2503,7 @@ func (jfs *juiceFS) coldDirListing(dirname string, dirEntries []os.DirEntry, gat
 			if wedged.Load() {
 				return
 			}
-			info, err, ok := infoWithTimeout(de, fuseStatTimeout, gate)
+			info, err, ok := infoWithTimeout(src, de, fuseStatTimeout, gate)
 			if !ok {
 				// FUSE wedged/slow mid-listing. Flag it so later workers bail.
 				if wedged.CompareAndSwap(false, true) {
@@ -2532,11 +2602,11 @@ func coldListFanout(class netprofile.LinkClass) int {
 // the shared foreground budget (nfsLstatGate) because it is on the RPC path, and
 // the tight timeout is the guarantee it can't head-of-line-block Finder.
 func (jfs *juiceFS) syncColdPopulateBounded(dirname, fusePath string) ([]os.FileInfo, bool) {
-	dirEntries, err, ok := readDirWithTimeout(fusePath, syncColdPopulateTimeout, nfsLstatGate)
+	dirEntries, err, ok := readDirWithTimeout(metrics.FUSESrcForeground, fusePath, syncColdPopulateTimeout, nfsLstatGate)
 	if !ok || err != nil {
 		return nil, false // FUSE wedged/slow or errored — fall through to async
 	}
-	infos, toInsert := jfs.coldDirListing(dirname, dirEntries, nfsLstatGate)
+	infos, toInsert := jfs.coldDirListing(metrics.FUSESrcForeground, dirname, dirEntries, nfsLstatGate)
 	if len(infos) == 0 {
 		return nil, false // genuinely empty (or all stats shed) — nothing to serve
 	}
@@ -2644,7 +2714,7 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) {
 		return
 	}
 
-	dirEntries, err, ok := readDirWithTimeout(fusePath, fuseStatTimeout, prefetchGate)
+	dirEntries, err, ok := readDirWithTimeout(metrics.FUSESrcDirRefresh, fusePath, fuseStatTimeout, prefetchGate)
 	if !ok {
 		return // FUSE wedged/slow — give up; next readdir re-fires
 	}
@@ -2656,7 +2726,7 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) {
 	// foreground budget); a wedged stat BREAKS the listing pass so this
 	// worker always returns and its deferred sem/key release runs (batch-3
 	// adversarial review #0).
-	_, discovered := jfs.coldDirListing(dirname, dirEntries, prefetchGate)
+	_, discovered := jfs.coldDirListing(metrics.FUSESrcDirRefresh, dirname, dirEntries, prefetchGate)
 
 	// INSERT-only, enforced ATOMICALLY by the store (batch-3 adversarial
 	// review #1): the LookupByPath pre-filter below is only a cheap
@@ -2875,7 +2945,7 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 						"path", filename, "reason", identReason)
 					return nil, err
 				}
-				isNotExist, ok := lstatNotExistWithTimeout(fusePath, 2*time.Second)
+				isNotExist, ok := lstatNotExistWithTimeout(metrics.FUSESrcForeground, fusePath, 2*time.Second)
 				if !ok {
 					jmlog.Debug("open ENOENT but Lstat-verify timed out — NOT purging (FUSE degraded)",
 						"path", filename)
@@ -2987,7 +3057,7 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	}
 
 	// BOUNDED open: a wedged JuiceFS can't hang this OPEN/READ RPC path.
-	f, err, ok := openFileWithTimeout(fullPath, flag, perm, fuseStatTimeout)
+	f, err, ok := openFileWithTimeout(metrics.FUSESrcForeground, fullPath, flag, perm, fuseStatTimeout)
 	if !ok {
 		return nil, errFUSETimeout
 	}
@@ -3371,7 +3441,7 @@ func (jfs *juiceFS) MkdirAll(dirname string, perm os.FileMode) error {
 	if !pin.IsOffline() {
 		// BOUNDED (task #70): unbounded os.MkdirAll on the MKDIR RPC path parks
 		// on a drain-loaded FUSE and stalls the mount; JUKEBOX-retry instead.
-		err, ok := mkdirAllWithTimeout(jfs.fullPath(dirname), perm, fuseStatTimeout)
+		err, ok := mkdirAllWithTimeout(metrics.FUSESrcForeground, jfs.fullPath(dirname), perm, fuseStatTimeout)
 		if !ok {
 			return errFUSETimeout
 		}
@@ -3399,7 +3469,7 @@ func (jfs *juiceFS) MkdirAll(dirname string, perm os.FileMode) error {
 	now := time.Now()
 	inode := uint64(0)
 	if !pin.IsOffline() {
-		if fi, ok := lstatWithTimeout(jfs.fullPath(dirname), fuseStatTimeout); ok && fi != nil {
+		if fi, ok := lstatWithTimeout(metrics.FUSESrcForeground, jfs.fullPath(dirname), fuseStatTimeout); ok && fi != nil {
 			if st, sok := fi.Sys().(*syscall.Stat_t); sok && st.Ino != 0 {
 				inode = st.Ino
 			}
@@ -3467,7 +3537,7 @@ func (jfs *juiceFS) Symlink(target, link string) error {
 	if !offline {
 		// BOUNDED (task #70): unbounded os.Symlink on the SYMLINK RPC path parks
 		// on a drain-loaded FUSE and stalls the mount; JUKEBOX-retry instead.
-		err, ok := symlinkWithTimeout(target, fusePath, fuseStatTimeout)
+		err, ok := symlinkWithTimeout(metrics.FUSESrcForeground, target, fusePath, fuseStatTimeout)
 		if !ok {
 			return errFUSETimeout
 		}
@@ -3614,7 +3684,7 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 		// links drive it into the most contended JuiceFS resolution; unbounded it
 		// parked on a drain-loaded FUSE and stalled the mount. On a wedge degrade
 		// to metadata-only (store.UpdateMode below is the authoritative mode).
-		if err, ok := chmodWithTimeout(fusePath, mode.Perm(), fuseStatTimeout); !ok {
+		if err, ok := chmodWithTimeout(metrics.FUSESrcForeground, fusePath, mode.Perm(), fuseStatTimeout); !ok {
 			jmlog.Debug("Chmod: FUSE chmod timed out (non-fatal, store update is authority)", "path", rel)
 		} else if err != nil && !os.IsNotExist(err) {
 			jmlog.Debug("Chmod: FUSE chmod failed (non-fatal, store update is authority)",
@@ -3793,11 +3863,15 @@ func (f *cachedFile) LiveSize() (int64, bool) {
 	if f.fuseFD == nil {
 		return 0, false
 	}
+	// Attribution: always FOREGROUND — LiveSize is only consulted on the READ
+	// RPC's short-snapshot slow path, so a client read is blocked on it.
+	start := time.Now()
 	timer := time.NewTimer(fuseStatTimeout)
 	defer timer.Stop()
-	select {
-	case fuseFstatGate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(fuseFstatGate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(metrics.FUSESrcForeground, metrics.FUSEOpFstat, metrics.FUSEGateFstat,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return 0, false
 	}
 	type result struct {
@@ -3816,8 +3890,12 @@ func (f *cachedFile) LiveSize() (int64, bool) {
 	}()
 	select {
 	case r := <-ch:
+		metrics.Default().ObserveFUSECall(metrics.FUSESrcForeground, metrics.FUSEOpFstat, metrics.FUSEGateFstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return r.sz, r.ok
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(metrics.FUSESrcForeground, metrics.FUSEOpFstat, metrics.FUSEGateFstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return 0, false
 	}
 }
@@ -4303,11 +4381,14 @@ func (f *billyFile) LiveSize() (int64, bool) {
 	if f.File == nil {
 		return 0, false
 	}
+	// Attribution: FOREGROUND, same as cachedFile.LiveSize — a READ RPC waits.
+	start := time.Now()
 	timer := time.NewTimer(fuseStatTimeout)
 	defer timer.Stop()
-	select {
-	case fuseFstatGate <- struct{}{}:
-	case <-timer.C:
+	gateWait, depth, acquired := acquireFUSEGate(fuseFstatGate, timer)
+	if !acquired {
+		metrics.Default().ObserveFUSECall(metrics.FUSESrcForeground, metrics.FUSEOpFstat, metrics.FUSEGateFstat,
+			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return 0, false
 	}
 	type result struct {
@@ -4326,8 +4407,12 @@ func (f *billyFile) LiveSize() (int64, bool) {
 	}()
 	select {
 	case r := <-ch:
+		metrics.Default().ObserveFUSECall(metrics.FUSESrcForeground, metrics.FUSEOpFstat, metrics.FUSEGateFstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return r.sz, r.ok
 	case <-timer.C:
+		metrics.Default().ObserveFUSECall(metrics.FUSESrcForeground, metrics.FUSEOpFstat, metrics.FUSEGateFstat,
+			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		return 0, false
 	}
 }

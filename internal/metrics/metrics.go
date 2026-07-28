@@ -310,6 +310,13 @@ type Registry struct {
 	// finalize), QA-35-safe.
 	zeroTailSuspect atomic.Uint64
 
+	// FUSE metadata attribution (per-source, per-op counters + gate
+	// saturation). Fixed preallocated arrays of atomics — see fuse_attrib.go
+	// for the rationale and the hot-path cost contract. Embedded rather than
+	// spelled out here so the arrays and their provider hook live next to the
+	// enums that index them.
+	fuseAttribState
+
 	// Health hook — set by main.go so /health can answer accurately.
 	healthMu sync.RWMutex
 	healthFn func() HealthSnapshot
@@ -612,6 +619,11 @@ type Snapshot struct {
 	// hole(s) below their written size (drained full-size with zero tails).
 	ZeroTailSuspect uint64 `json:"zero_tail_suspect_total"`
 
+	// FUSE metadata attribution: WHO issued each bounded FUSE metadata
+	// syscall, what it cost, how much of that was queueing for a gate, and
+	// how saturated the three gates got. See fuse_attrib.go.
+	FUSEAttrib FUSEAttribSnapshot `json:"fuse_attrib"`
+
 	RPCs    map[string]RPCSnapshot `json:"rpcs"`
 	Network *NetworkSnapshot       `json:"network,omitempty"`
 }
@@ -669,6 +681,8 @@ func (r *Registry) Snapshot() Snapshot {
 		ReaddirFsReaddir:     r.readdirFsReaddir.Load(),
 
 		ZeroTailSuspect: r.zeroTailSuspect.Load(),
+
+		FUSEAttrib: r.snapshotFUSEAttrib(),
 
 		RPCs: make(map[string]RPCSnapshot, len(trackedTypes)),
 	}
