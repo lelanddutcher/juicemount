@@ -48,13 +48,21 @@ const thumbKind = "thumbnail"
 // mtime at generation time (internal/farm stampSource), and the AI
 // contribute-back POST path already refuses a row whose vouch disagrees with
 // the live source (409 "AI computed against old bytes", cbridge.go). The gate
-// below applies the same comparison on the way OUT.
+// below applies that comparison on the way OUT — on SIZE only. The POST path
+// compares the vouch against a real os.Stat of the source (backend value vs
+// backend value, so its mtime check is sound); this read path compares against
+// the RAM mirror, whose mtime for a client-written file is local wall-clock
+// time, not the backend's. See derivRowStale.
 // ---------------------------------------------------------------------------
 
 // liveSource is a source asset's CURRENT size + mtime. ok=false means "nobody
 // cheaply knows" — not "the file is gone".
 type liveSource struct {
-	size  int64
+	size int64
+	// mtime is carried for the rejection LOG only — it is deliberately not part
+	// of the staleness decision, because the mirror's mtime and the row's vouched
+	// mtime come from opposite sides of the client/backend boundary and disagree
+	// by construction for any file this client wrote. See derivRowStale.
 	mtime int64 // unix seconds, to match DerivRow.SourceMtime
 	ok    bool
 }
@@ -98,35 +106,48 @@ func mirrorSource(store *metadata.Store, inode uint64) liveSource {
 // source bytes than the ones live now — i.e. whether serving it would show the
 // user the wrong file.
 //
-// Two deliberate "not stale" answers, both chosen because this is a
+// SIZE IS THE ONLY AUTHORITATIVE SIGNAL HERE. MTIME IS NOT COMPARABLE ACROSS THE
+// CLIENT/BACKEND BOUNDARY IN THIS SYSTEM, so an mtime-only disagreement is
+// treated as FRESH:
+//
+//	the row's vouch is stamped from an os.Stat of the file ON THE BACKEND
+//	(internal/farm stampSource), but the mirror's mtime for anything THIS client
+//	wrote is local wall-clock time.Now() — nfs/handler.go onSpoolDrained and
+//	writeFile.Close both publish through metadata.Store.UpdateSize with `now`,
+//	while the drainer deliberately restores the file's REAL mtime onto the
+//	backend inode (#103). The two therefore disagree by construction for every
+//	client-written file until a reconcile heals the mirror.
+//
+// Comparing them made the gate fire on a PERFECTLY VALID derivative in exactly
+// C5's own target workflow — re-export in place → drain → farm re-derives → the
+// FRESH row is judged stale — and rejectStaleDeriv does not merely 404, it
+// DELETES the local blob. The user-visible result is a QuickLook 404, macOS
+// falling back to its own generator, and a full-source read over a 500 ms link:
+// precisely the latency regression the thumbnail plane exists to prevent, in
+// return for catching a re-encode that lands on a byte-identical length.
+//
+// Two further deliberate "not stale" answers, both chosen because this is a
 // wrong-image bug and not a data-loss one, so a false negative (serve a stale
 // poster) is a much better trade than a network stall or a mass cache wipe:
 //
-//   - UNVOUCHED ROW (SourceSize and SourceMtime both nil). Rows written before
-//     the columns existed carry no vouch. There is nothing to compare against,
-//     and treating them as stale would blank every legacy derivative on the
-//     volume. Serve them. The farm stamps both fields on every row it writes
-//     today, so this only shrinks over time. A row with exactly one of the two
-//     is still checked, on whichever field it has.
+//   - UNVOUCHED ROW (no SourceSize). Rows written before the columns existed
+//     carry no vouch. There is nothing to compare against, and treating them as
+//     stale would blank every legacy derivative on the volume. Serve them. The
+//     farm stamps the field on every row it writes today, so this only shrinks
+//     over time.
 //
 //   - MIRROR CAN'T ANSWER (live.ok false: the inode isn't mirrored yet, or the
 //     store is nil). The only way to get an authoritative answer here is a
 //     backend stat, which is exactly the ~500ms round-trip the serve path must
 //     never take. Serve.
 func derivRowStale(d derivatives.DerivRow, live liveSource) bool {
-	if d.SourceSize == nil && d.SourceMtime == nil {
+	if d.SourceSize == nil {
 		return false
 	}
 	if !live.ok {
 		return false
 	}
-	if d.SourceSize != nil && *d.SourceSize != live.size {
-		return true
-	}
-	if d.SourceMtime != nil && *d.SourceMtime != live.mtime {
-		return true
-	}
-	return false
+	return *d.SourceSize != live.size
 }
 
 // rejectStaleDeriv is the shared action on a stale row: drop the persistent
@@ -186,7 +207,12 @@ func freshThumbCachePath(ds *derivatives.Store, tc *thumbcache.Cache, inode uint
 		return p, true // index unreadable — no basis to reject; serve.
 	}
 	for _, d := range rows {
-		if d.Kind != thumbKind {
+		// N1: match resolveThumbBlobPath's READY filter. Judging the first
+		// thumbnail row of ANY status and then breaking meant a PENDING
+		// re-derive row — which already carries the NEW source vouch — read as
+		// fresh, so the OLD cached blob was served as if it had been validated.
+		// Only a ready row vouches for bytes that actually exist.
+		if d.Kind != thumbKind || d.Status != "ready" {
 			continue
 		}
 		live := liveSourceFor(inode)

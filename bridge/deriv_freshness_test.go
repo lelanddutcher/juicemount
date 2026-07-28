@@ -60,6 +60,7 @@ type freshSeed struct {
 
 type freshOpts struct {
 	kind        string     // derivative kind (default "thumbnail")
+	status      string     // row status (default "ready")
 	blobRel     string     // blob file name (default "poster.jpg")
 	mirrorSize  int64      // live size the mirror reports
 	mirrorMtime int64      // live mtime (unix) the mirror reports
@@ -77,6 +78,9 @@ func seedFreshness(t *testing.T, o freshOpts) (*freshSeed, func()) {
 	}
 	if o.blobRel == "" {
 		o.blobRel = "poster.jpg"
+	}
+	if o.status == "" {
+		o.status = "ready"
 	}
 	mount := t.TempDir()
 
@@ -103,7 +107,7 @@ func seedFreshness(t *testing.T, o freshOpts) (*freshSeed, func()) {
 		mt = "video/mp4"
 	}
 	if err := ds.PutDeriv(freshInode, derivatives.DerivRow{
-		Kind: o.kind, Status: "ready", Producer: "linux-farm", Version: 1, Hash: sp("c5hash"),
+		Kind: o.kind, Status: o.status, Producer: "linux-farm", Version: 1, Hash: sp("c5hash"),
 		BlobRelPath: &o.blobRel, MediaType: &mt,
 		SourceSize: o.rowSize, SourceMtime: o.rowMtime,
 	}); err != nil {
@@ -212,28 +216,39 @@ func TestDerivRowStaleDecisions(t *testing.T) {
 		{"size changed is stale",
 			derivatives.DerivRow{SourceSize: i64p(size), SourceMtime: i64p(mtime)},
 			liveSource{size: size + 1, mtime: mtime, ok: true}, true},
-		{"mtime changed at identical size is stale",
-			derivatives.DerivRow{SourceSize: i64p(size), SourceMtime: i64p(mtime)},
-			liveSource{size: size, mtime: mtime + 1, ok: true}, true},
 		{"both changed is stale",
 			derivatives.DerivRow{SourceSize: i64p(size), SourceMtime: i64p(mtime)},
 			liveSource{size: 4096, mtime: mtime + 9999, ok: true}, true},
+		// MTIME IS NOT COMPARABLE ACROSS THE CLIENT/BACKEND BOUNDARY. The row's
+		// vouch comes from an os.Stat on the BACKEND (farm stampSource); the
+		// mirror's mtime for anything THIS client wrote is local wall-clock
+		// time.Now() (onSpoolDrained / writeFile.Close → Store.UpdateSize), while
+		// the drainer restores the file's REAL mtime onto the backend inode
+		// (#103). They disagree BY CONSTRUCTION for every client-written file
+		// until a reconcile heals the mirror — so comparing them condemned
+		// perfectly valid derivatives, and rejection DELETES the local blob.
+		{"mtime differs at identical size is FRESH (client/backend mtime skew)",
+			derivatives.DerivRow{SourceSize: i64p(size), SourceMtime: i64p(mtime)},
+			liveSource{size: size, mtime: mtime + 1, ok: true}, false},
+		{"mtime differs wildly at identical size is still FRESH",
+			derivatives.DerivRow{SourceSize: i64p(size), SourceMtime: i64p(mtime)},
+			liveSource{size: size, mtime: 1, ok: true}, false},
 		// DOCUMENTED BACK-COMPAT: rows written before the columns existed carry
 		// no vouch. Nothing to compare — serve rather than blank every legacy
 		// derivative on the volume.
 		{"unvouched row (both NULL) is served",
 			derivatives.DerivRow{},
 			liveSource{size: 12345, mtime: 999, ok: true}, false},
-		// A half-vouched row is still checked on the field it has.
 		{"size-only vouch, size matches",
 			derivatives.DerivRow{SourceSize: i64p(size)},
 			liveSource{size: size, mtime: 1, ok: true}, false},
 		{"size-only vouch, size differs",
 			derivatives.DerivRow{SourceSize: i64p(size)},
 			liveSource{size: size - 1, mtime: 1, ok: true}, true},
-		{"mtime-only vouch, mtime differs",
+		// A row with ONLY an mtime vouch has nothing comparable at all.
+		{"mtime-only vouch is served whatever the mtime says",
 			derivatives.DerivRow{SourceMtime: i64p(mtime)},
-			liveSource{size: 0, mtime: mtime + 1, ok: true}, true},
+			liveSource{size: 0, mtime: mtime + 1, ok: true}, false},
 		// DOCUMENTED: the mirror is the only cheap oracle. When it has no entry
 		// the alternative is a ~500ms backend stat on the serve path, which is a
 		// worse failure than a stale image — so serve.
@@ -268,9 +283,17 @@ func TestBlobServeStaleSourceSizeIsMiss(t *testing.T) {
 	}
 }
 
-func TestBlobServeStaleSourceMtimeIsMiss(t *testing.T) {
-	// Same byte count, different mtime — a re-transcode that happened to land
-	// on an identical length. Size alone would not catch this.
+// TestBlobServeMtimeOnlyMismatchIsServed is the S4 behavior fix.
+//
+// The gate used to 404 (and DELETE the cached blob) whenever the row's vouched
+// mtime disagreed with the mirror's. But the two mtimes are not comparable: the
+// vouch is an os.Stat of the file ON THE BACKEND (farm stampSource), while the
+// mirror's mtime for any file THIS client wrote is local wall-clock time.Now()
+// — nfs/handler.go onSpoolDrained and writeFile.Close both publish through
+// Store.UpdateSize with `now`, and the drainer separately restores the file's
+// REAL mtime onto the backend inode (#103). So they disagree by construction,
+// and the gate condemned a perfectly good derivative for it.
+func TestBlobServeMtimeOnlyMismatchIsServed(t *testing.T) {
 	_, restore := seedFreshness(t, freshOpts{
 		mirrorSize: 1240000000, mirrorMtime: 1750009999,
 		rowSize: i64p(1240000000), rowMtime: i64p(1750000000),
@@ -278,8 +301,83 @@ func TestBlobServeStaleSourceMtimeIsMiss(t *testing.T) {
 	defer restore()
 
 	rr := getBlob(t, "thumbnail")
-	if rr.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404 (mtime-only change must invalidate); body = %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — an mtime-only disagreement is client/backend skew, not a "+
+			"source change, and rejecting it DELETES a good thumbnail; body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != freshBlobBy {
+		t.Fatalf("body = %q, want %q", rr.Body.String(), freshBlobBy)
+	}
+}
+
+// TestClientWrittenFileMtimeSkewStillServesItsThumbnail is S4's workflow test —
+// the exact sequence C5's own target case runs, end to end:
+//
+//	the user re-exports over clip.mov → the spool drains it, restoring the
+//	client's real mtime onto the backend inode (#103) while publishing the
+//	mirror's mtime as local wall-clock now → the farm re-derives against the
+//	backend and stamps the row with the BACKEND mtime → QuickLook asks for the
+//	poster.
+//
+// The row is FRESH (it was generated from exactly these bytes; the size agrees),
+// but the two mtimes cannot agree until a reconcile heals the mirror. Pre-fix
+// this 404'd AND deleted the cached poster, so macOS fell back to its own
+// generator and read the full source over a 500 ms link — the precise latency
+// regression the thumbnail plane exists to prevent.
+func TestClientWrittenFileMtimeSkewStillServesItsThumbnail(t *testing.T) {
+	const size = int64(1240000000)
+	backendMtime := int64(1750000000) // the real mtime the drainer restored
+	mirrorMtime := time.Now().Unix()  // what UpdateSize published locally
+	if mirrorMtime == backendMtime {  // paranoia; they are ~decades apart
+		t.Fatal("test setup: mtimes must differ")
+	}
+
+	seed, restore := seedFreshness(t, freshOpts{
+		mirrorSize: size, mirrorMtime: mirrorMtime,
+		rowSize: i64p(size), rowMtime: i64p(backendMtime),
+	})
+	defer restore()
+
+	// The poster is already resident locally (warmed on the previous folder visit).
+	if _, err := seed.tc.Put(freshInode, "thumbnail", strings.NewReader("GOOD-POSTER")); err != nil {
+		t.Fatalf("seed thumb cache: %v", err)
+	}
+	cached, _ := seed.tc.Path(freshInode, "thumbnail")
+
+	// /thumb-local's cache-hit path (the QuickLook appex surface).
+	if _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); !ok {
+		t.Fatal("QuickLook 404'd a VALID poster on client/backend mtime skew — macOS now falls back to " +
+			"its own generator and reads the whole source over the link")
+	}
+	if _, err := os.Stat(cached); err != nil {
+		t.Fatalf("the valid cached poster was DELETED by the freshness gate: %v", err)
+	}
+	if n := seed.tc.Stats().Invalidations; n != 0 {
+		t.Errorf("thumbcache Invalidations = %d, want 0 — a good blob was dropped", n)
+	}
+
+	// ...and the manifest resolution + GET /blob agree.
+	if _, ok := resolveThumbBlobPath(freshInode); !ok {
+		t.Error("resolveThumbBlobPath = miss for a client-written file (the folder-open warmer would skip it)")
+	}
+	if rr := getBlob(t, "thumbnail"); rr.Code != http.StatusOK {
+		t.Errorf("GET /blob = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestBlobServeSizeChangeStillRejectsAfterTheMtimeRelaxation is the guard on the
+// OTHER side of S4: size stays authoritative, so the actual C5 bug (an in-place
+// re-export under the same inode) is still caught and the stale blob still
+// dropped.
+func TestBlobServeSizeChangeStillRejectsAfterTheMtimeRelaxation(t *testing.T) {
+	_, restore := seedFreshness(t, freshOpts{
+		mirrorSize: 990000000, mirrorMtime: 1750000000, // same mtime, different size
+		rowSize: i64p(1240000000), rowMtime: i64p(1750000000),
+	})
+	defer restore()
+
+	if rr := getBlob(t, "thumbnail"); rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 — size must remain authoritative; body = %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -601,6 +699,61 @@ func TestFreshThumbCachePathMissSkipsTheGate(t *testing.T) {
 	}
 	if *calls != 0 {
 		t.Errorf("live-source resolutions on a cache miss = %d, want 0", *calls)
+	}
+}
+
+// TestFreshThumbCachePathIgnoresNonReadyRowVouch is N1.
+//
+// freshThumbCachePath judged the FIRST thumbnail row of ANY status and then
+// broke, unlike resolveThumbBlobPath which filters Status == "ready". That is an
+// unsound inference: only a READY row describes bytes that were actually
+// produced, so only a READY row can vouch for what is sitting in the local
+// cache. A failed (or, in future, pending) re-derive row carries the vouch for
+// the CURRENT source, which the old code then used to VALIDATE a blob generated
+// from entirely different bytes — or, when the non-ready row's vouch disagreed,
+// to DELETE a cached poster the row says nothing about.
+//
+// This pins the deletion half, because it is the one that costs the user a full
+// source read over the link. With no ready row the cached blob is unvouched, and
+// unvouched means served — the same documented choice as
+// TestFreshThumbCachePathNoRowIsServed.
+func TestFreshThumbCachePathIgnoresNonReadyRowVouch(t *testing.T) {
+	seed, restore := seedFreshness(t, freshOpts{
+		status:     "failed", // the farm's re-derive attempt did not produce a blob
+		mirrorSize: 111, mirrorMtime: 1750000000,
+		rowSize: i64p(1240000000), rowMtime: i64p(1750000000),
+	})
+	defer restore()
+
+	if _, err := seed.tc.Put(freshInode, "thumbnail", strings.NewReader("CACHED-POSTER")); err != nil {
+		t.Fatalf("seed thumb cache: %v", err)
+	}
+	cached, _ := seed.tc.Path(freshInode, "thumbnail")
+
+	if _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); !ok {
+		t.Fatal("N1: a NON-READY row's vouch was used to judge the cached blob — the row describes a " +
+			"derivation that produced nothing, so it can neither validate nor condemn what is cached")
+	}
+	if _, err := os.Stat(cached); err != nil {
+		t.Fatalf("N1: the cached poster was DELETED on a non-ready row's vouch: %v", err)
+	}
+}
+
+// TestFreshThumbCachePathStillJudgesTheReadyRow is N1's other side: filtering by
+// status must not weaken the gate for the row that DOES vouch for the cached
+// bytes.
+func TestFreshThumbCachePathStillJudgesTheReadyRow(t *testing.T) {
+	seed, restore := seedFreshness(t, freshOpts{
+		mirrorSize: 111, mirrorMtime: 1750000000, // size disagrees with the vouch
+		rowSize: i64p(1240000000), rowMtime: i64p(1750000000),
+	})
+	defer restore()
+
+	if _, err := seed.tc.Put(freshInode, "thumbnail", strings.NewReader("OLD-POSTER")); err != nil {
+		t.Fatalf("seed thumb cache: %v", err)
+	}
+	if _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); ok {
+		t.Fatal("a READY row whose vouched SIZE disagrees must still reject")
 	}
 }
 

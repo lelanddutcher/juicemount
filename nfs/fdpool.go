@@ -59,7 +59,32 @@ type FDPool struct {
 	// Bounded: unclaimed debt is dropped by the evict loop after fdOrphanGrace,
 	// the same window after which the corresponding orphan fd is closed.
 	pendingRefs map[fdKey]pendingRef
-	stopCh      chan struct{}
+	// openInFlight is the set of os.Open/os.OpenFile calls currently running
+	// with p.mu RELEASED (Get/GetWrite drop the lock across the syscall because
+	// a JuiceFS FUSE open costs ~60 ms and holding the pool mutex across it
+	// convoys every other caller — the 2026-06-14 "error 100060" class).
+	//
+	// It exists to close the INVALIDATION-DURING-OPEN hole: an Invalidate that
+	// lands in that window finds NO ENTRY at the key and no-ops, and the open
+	// then pools an fd for the PRE-rename/PRE-delete inode — C1/C2/C3 again,
+	// just narrowed from deterministic to racy. Invalidate/InvalidateTree/
+	// FlushStale POISON the in-flight records they cover; a poisoned open is
+	// still handed to its caller (the fd was valid when it was opened, and the
+	// RPC that asked for it raced the rename) but is pooled as STALE, so no
+	// LATER caller can ever be served that identity.
+	//
+	// Keyed by record pointer for O(1) retire. Bounded by the number of
+	// CONCURRENT opens (dozens), which is also what makes poisoning cheap:
+	// scanning it is orders of magnitude smaller than scanning p.entries.
+	openInFlight map[*openRec]struct{}
+	stopCh       chan struct{}
+}
+
+// openRec is one in-flight open, registered under p.mu before the lock is
+// dropped for the syscall and retired under p.mu after it returns.
+type openRec struct {
+	key      fdKey
+	poisoned bool
 }
 
 type pendingRef struct {
@@ -77,7 +102,7 @@ type poolEntry struct {
 	lastUsed time.Time
 	refCount int
 	// stale marks an fd that must never be re-served because the identity
-	// behind its key changed underneath it. Two producers:
+	// behind its key changed underneath it. Three producers:
 	//
 	//   - FlushStale (#12): the fd predates a FUSE remount and references
 	//     the DEAD mount.
@@ -85,6 +110,9 @@ type poolEntry struct {
 	//     the PATH was renamed or removed, so the fd now references the
 	//     PREVIOUS inode at that name — serving it returns another file's
 	//     bytes (read slot) or writes into another file (write slot).
+	//   - A POISONED in-flight open (openInFlight): one of the above landed
+	//     while Get/GetWrite was inside the open syscall with p.mu released,
+	//     so the fd it is about to pool may already be the previous inode.
 	//
 	// A stale entry is displaced by a fresh open on the next Get/GetWrite
 	// and closed by the evict loop the moment its refs drain.
@@ -117,16 +145,21 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 	} else if ok {
 		p.displaceStaleLocked(k, entry)
 	}
+	rec := p.beginOpenLocked(k)
 	p.mu.Unlock()
 
 	fd, err := os.Open(path)
 	if err != nil {
 		// Any displaced holders' debt stays parked on the key (pendingRefs) and
 		// is absorbed by whichever Get next succeeds in creating an entry.
+		p.mu.Lock()
+		p.endOpenLocked(rec)
+		p.mu.Unlock()
 		return nil, err
 	}
 
 	p.mu.Lock()
+	poisoned := p.endOpenLocked(rec)
 	// Double-check under lock — another goroutine may have inserted
 	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
@@ -142,6 +175,11 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 		fd:       fd,
 		lastUsed: time.Now(),
 		refCount: 1 + p.takePendingLocked(k),
+		// Invalidated while this open was in flight: the fd may reference the
+		// PRE-invalidation inode, so it is pooled DEAD-ON-ARRIVAL — never
+		// re-served, displaced by the next Get, and closed by the evict loop
+		// the moment this caller's ref drains. See openInFlight.
+		stale: poisoned,
 	}
 	p.mu.Unlock()
 	return fd, nil
@@ -162,14 +200,19 @@ func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, er
 	} else if ok {
 		p.displaceStaleLocked(k, entry)
 	}
+	rec := p.beginOpenLocked(k)
 	p.mu.Unlock()
 
 	fd, err := os.OpenFile(path, flag, perm)
 	if err != nil {
+		p.mu.Lock()
+		p.endOpenLocked(rec)
+		p.mu.Unlock()
 		return nil, err
 	}
 
 	p.mu.Lock()
+	poisoned := p.endOpenLocked(rec)
 	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
 		entry.refCount++
@@ -184,9 +227,40 @@ func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, er
 		fd:       fd,
 		lastUsed: time.Now(),
 		refCount: 1 + p.takePendingLocked(k),
+		stale:    poisoned, // invalidated mid-open — see Get
 	}
 	p.mu.Unlock()
 	return fd, nil
+}
+
+// beginOpenLocked registers an open that is about to run with p.mu RELEASED, so
+// a concurrent Invalidate can mark it. Caller holds p.mu and MUST retire the
+// record with endOpenLocked on every return path, error included.
+func (p *FDPool) beginOpenLocked(k fdKey) *openRec {
+	rec := &openRec{key: k}
+	if p.openInFlight == nil {
+		p.openInFlight = make(map[*openRec]struct{})
+	}
+	p.openInFlight[rec] = struct{}{}
+	return rec
+}
+
+// endOpenLocked retires an in-flight open and reports whether its key was
+// invalidated while the open ran. Caller holds p.mu.
+func (p *FDPool) endOpenLocked(rec *openRec) bool {
+	delete(p.openInFlight, rec)
+	return rec.poisoned
+}
+
+// poisonOpensLocked marks every in-flight open whose key `match` selects, so the
+// fd it is about to return is pooled stale instead of being served to later
+// callers. Caller holds p.mu.
+func (p *FDPool) poisonOpensLocked(match func(fdKey) bool) {
+	for rec := range p.openInFlight {
+		if !rec.poisoned && match(rec.key) {
+			rec.poisoned = true
+		}
+	}
 }
 
 // displaceStaleLocked removes a stale entry from the map so a fresh open can
@@ -245,6 +319,10 @@ func (p *FDPool) takePendingLocked(k fdKey) int {
 func (p *FDPool) FlushStale() (closed, marked int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// An open that started BEFORE the remount may have resolved through the DEAD
+	// mount; pooling it would re-create the #12 "stale fd → 0-byte reads" state
+	// this call exists to clear. Same in-flight hole Invalidate has, same fix.
+	p.poisonOpensLocked(func(fdKey) bool { return true })
 	for k, e := range p.entries {
 		if e.refCount <= 0 {
 			e.fd.Close()
@@ -317,6 +395,11 @@ func (p *FDPool) Invalidate(path string) (closed, marked int) {
 		closed += c
 		marked += m
 	}
+	// An entry that does not exist YET is the dangerous case, not a no-op: a
+	// Get/GetWrite that missed and is currently inside os.Open (~60 ms on FUSE)
+	// will insert an fd for the PRE-rename inode the moment it returns, and the
+	// `!ok → continue` above cannot see it. Poison it. See openInFlight.
+	p.poisonOpensLocked(func(k fdKey) bool { return k.path == path })
 	p.mu.Unlock()
 	for _, fd := range toClose {
 		fd.Close()
@@ -353,6 +436,10 @@ func (p *FDPool) InvalidateTree(root string) (closed, marked int) {
 		closed += c
 		marked += m
 	}
+	// Descendant opens already in flight — same hole as Invalidate's.
+	p.poisonOpensLocked(func(k fdKey) bool {
+		return k.path == root || strings.HasPrefix(k.path, prefix)
+	})
 	p.mu.Unlock()
 	for _, fd := range toClose {
 		fd.Close()
@@ -383,23 +470,53 @@ func (p *FDPool) invalidateEntryLocked(k fdKey, e *poolEntry, toClose *[]*os.Fil
 func (p *FDPool) Release(path string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if entry, ok := p.entries[fdKey{path: path, write: false}]; ok && entry.refCount > 0 {
-		// Clamped at 0 as a backstop. After a displacement (FlushStale or
-		// Invalidate) an OLD holder's Release lands here, key-based — that
-		// ref is now accounted for by displaceStaleLocked's CARRY, so the
-		// decrement is correct rather than mis-landed. The clamp remains for
-		// a genuinely double-released or unpaired Release.
-		entry.refCount--
-	}
+	p.releaseLocked(fdKey{path: path, write: false})
 }
 
 // ReleaseWrite decrements the refcount for a path on the WRITE-side slot.
 func (p *FDPool) ReleaseWrite(path string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if entry, ok := p.entries[fdKey{path: path, write: true}]; ok && entry.refCount > 0 {
-		entry.refCount-- // clamped — see Release
+	p.releaseLocked(fdKey{path: path, write: true})
+}
+
+// releaseLocked pays down exactly ONE outstanding ref on a key. Caller holds p.mu.
+//
+// Two places the ref can live, and BOTH must be able to absorb it:
+//
+//   - The entry currently at the key. Clamped at 0 as a backstop. After a
+//     displacement (FlushStale or Invalidate) an OLD holder's Release lands here,
+//     key-based — that ref is accounted for by displaceStaleLocked's CARRY, so
+//     the decrement is correct rather than mis-landed. The clamp remains for a
+//     genuinely double-released or unpaired Release.
+//
+//   - The DEBT parked on the key (pendingRefs) when there is no entry. Dropping
+//     the decrement here (the pre-2026-07-28 behavior) double-counted the ref and
+//     permanently inflated the pool: holder A holds the slot; Invalidate marks it
+//     stale; B's Get displaces it, parking A's ref as debt, and is then inside
+//     os.Open with p.mu released; A's Release arrives in that window, finds NO
+//     entry, and was silently discarded; B's open then folded the still-parked
+//     debt into the new entry, so refCount settled at 1 with ZERO real holders.
+//     From there the entry was un-evictable forever (evictLoop needs refCount<=0),
+//     its fd pinned open for the process lifetime, and HasOpenRefs stayed true —
+//     which permanently disabled the phantom-purge Lstat gate for that path.
+func (p *FDPool) releaseLocked(k fdKey) {
+	if entry, ok := p.entries[k]; ok {
+		if entry.refCount > 0 {
+			entry.refCount--
+		}
+		return
 	}
+	pr, ok := p.pendingRefs[k]
+	if !ok {
+		return
+	}
+	pr.refs--
+	if pr.refs <= 0 {
+		delete(p.pendingRefs, k)
+		return
+	}
+	p.pendingRefs[k] = pr
 }
 
 // HasOpenRefs returns true if there is at least one outstanding Get

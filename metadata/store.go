@@ -237,6 +237,12 @@ type Store struct {
 	// SetOnSubtreeRenamed; nil when unwired. Guarded by mu.
 	onSubtreeRenamed func(oldDir, newDir string)
 
+	// onPathInvalidated is fired when a REMOTE mutation (a peer's, the farm's or
+	// OpenLoupe's delete/rename, applied via RedisClient.applyEvent) changes what
+	// lives at a path, so the NFS layer can drop the pooled FUSE fds for it.
+	// Injected via SetOnPathInvalidated; nil when unwired. Guarded by mu.
+	onPathInvalidated func(path string, isDir bool)
+
 	// ftsInitialized is set once the external-content FTS has been built (the
 	// first BulkInsert / initial sync). After that EVERY BulkInsert maintains
 	// FTS incrementally — even a large delta — so it never holds writeMu
@@ -572,6 +578,51 @@ func (s *Store) fireSubtreeRenamed(oldDir, newDir string) {
 	s.mu.RUnlock()
 	if fn != nil {
 		fn(oldDir, newDir)
+	}
+}
+
+// SetOnPathInvalidated registers the hook the REMOTE-event apply path fires when
+// a peer's delete or rename changes what lives at a path.
+//
+// WHY (serving-path data integrity, 2026-07-28): the local RPC paths
+// (juiceFS.Rename / juiceFS.Remove) drop their pooled FUSE fds directly, but the
+// remote-apply path only ever touched the MIRROR — so in this explicitly
+// multi-writer product (the farm, ClipLogger, a second Mac) the sequence
+//
+//	read X.mov here (fd pooled) → a PEER deletes X.mov → the mirror entry drops
+//	→ someone recreates X.mov and it re-mirrors → OpenFile takes the `e != nil`
+//	branch → fdPool.Get hands back the fd to the DELETED inode
+//
+// is C1/C3 with a remote actor: wrong bytes served, no error at any layer.
+// metadata/ must not import nfs/, so the invalidation is injected as a function
+// hook, exactly like SetOnSubtreeRenamed above.
+//
+// isDir selects the consumer's scope (a directory needs its whole pooled subtree
+// dropped, a file only its own two slots). Nil-safe; may be called with nil to
+// detach. Guarded by s.mu — the bridge wires it on the start path while the
+// subscribe goroutine may already be running.
+func (s *Store) SetOnPathInvalidated(fn func(path string, isDir bool)) {
+	s.mu.Lock()
+	s.onPathInvalidated = fn
+	s.mu.Unlock()
+}
+
+// NotifyPathInvalidated announces that something OUTSIDE this process changed
+// what lives at `path`, and invokes the registered hook (if any) OUTSIDE s.mu —
+// the consumer takes its own locks (the FDPool mutex), so it must never be
+// called with the store's write lock held. Same discipline as
+// fireSubtreeRenamed; exported for the same reason RenameSubtree is, so the
+// announcement has a public trigger the consumer side can be tested against.
+// Nil-safe on an unwired hook; ignores an empty path.
+func (s *Store) NotifyPathInvalidated(p string, isDir bool) {
+	if p == "" {
+		return
+	}
+	s.mu.RLock()
+	fn := s.onPathInvalidated
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(p, isDir)
 	}
 }
 

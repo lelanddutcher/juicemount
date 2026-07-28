@@ -687,6 +687,12 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 			h.invalidatePooledFDTree(oldDir)
 			h.invalidatePooledFDTree(newDir)
 		})
+		// R1: REMOTE mutations (a peer, the farm, OpenLoupe — this is an
+		// explicitly multi-writer product) reached the mirror and stopped there,
+		// so a pooled fd survived a delete/rename it never saw and kept serving
+		// the previous inode behind that name. Same hook idiom, same reason
+		// metadata/ can't do it itself.
+		store.SetOnPathInvalidated(h.onRemotePathInvalidated)
 	}
 
 	go h.verifierCleanupLoop(60*time.Second, 5*time.Minute)
@@ -749,6 +755,27 @@ func (h *JuiceMountHandler) invalidatePooledFDTree(inMountPath string) {
 		return
 	}
 	h.fdPool.InvalidateTree(path.Join(h.fusePath, inMountPath))
+}
+
+// onRemotePathInvalidated is the consumer end of Store.SetOnPathInvalidated
+// (R1): a delete or rename performed by ANOTHER writer — a peer Mac, the farm,
+// OpenLoupe — reached us as a pub/sub event and was applied to the metadata
+// mirror only. The FDPool is keyed by path alone and never saw it, so
+//
+//	read X.mov here (fd pooled) → a peer deletes X.mov → the mirror entry drops
+//	→ someone recreates X.mov and it re-mirrors → OpenFile takes the `e != nil`
+//	branch → fdPool.Get hands back the fd to the DELETED inode
+//
+// served the previous generation's bytes with no error anywhere — C1/C3 with a
+// remote actor. A directory drops its whole pooled subtree; a file takes the
+// exact-key path, because InvalidateTree is an O(len(entries)) scan under the
+// single pool mutex (see juiceFS.Rename for why that matters).
+func (h *JuiceMountHandler) onRemotePathInvalidated(inMountPath string, isDir bool) {
+	if isDir {
+		h.invalidatePooledFDTree(inMountPath)
+		return
+	}
+	h.invalidatePooledFDs(inMountPath)
 }
 
 // SetPinStore attaches the pin registry and the user-facing mount point that
@@ -3257,13 +3284,29 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	//   - newpath's pooled fds point at whatever POSIX rename just replaced
 	//     (or unlinked) at the destination.
 	//
-	// Tree-scoped, not exact-key: a DIRECTORY rename staleness every
+	// Tree-scoped ONLY for a directory: a DIRECTORY rename staleness every
 	// descendant's pooled fd in the same syscall, and doing it off the pool's
 	// own key set (rather than the mirror's descendant list) stays correct even
 	// when the mirror has evicted a descendant. Must run AFTER the os.Rename
 	// above so a concurrent Get can't immediately re-pool the pre-rename inode.
-	jfs.handler.invalidatePooledFDTree(oldpath)
-	jfs.handler.invalidatePooledFDTree(newpath)
+	//
+	// A FILE rename takes the exact-key path instead. InvalidateTree is an
+	// O(len(p.entries)) scan held under the SINGLE pool mutex, and a .app/ditto
+	// bundle copy is a rename PER FILE while p.entries holds thousands of keys
+	// from the copy's own parallel WRITE RPCs — two full scans per rename on the
+	// exact lock that produced the 2026-06-14 convoy (93 goroutines wedged in
+	// GetWrite → "error 100060"; see evictLoop). The type is authoritative for
+	// BOTH ends: POSIX rename cannot change it (file→dir is EISDIR, dir→file is
+	// ENOTDIR), so a successful rename of a file has a file at both names. An
+	// unmirrored source (oldEntry nil) falls back to the tree scan.
+	oldEntry := jfs.handler.store.LookupByPath(oldpath)
+	if oldEntry != nil && !oldEntry.IsDir {
+		jfs.handler.invalidatePooledFDs(oldpath)
+		jfs.handler.invalidatePooledFDs(newpath)
+	} else {
+		jfs.handler.invalidatePooledFDTree(oldpath)
+		jfs.handler.invalidatePooledFDTree(newpath)
+	}
 
 	// Carry the in-flight write-size high-water mark across the rename so
 	// (a) Stat at the new path stays accurate for a file still being
@@ -3284,7 +3327,8 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	// Update in-memory cache FIRST (instant visibility for NFS stats).
 	// SQLite writes happen async — they may be blocked by BulkInsert,
 	// but the in-memory cache ensures NFS LOOKUP/GETATTR work immediately.
-	oldEntry := jfs.handler.store.LookupByPath(oldpath)
+	// oldEntry was resolved above (the pooled-fd invalidation needs its type);
+	// nothing between there and here mutates the mirror.
 	jfs.handler.store.DeleteFromCache(oldpath)
 	if oldEntry != nil {
 		// CLONE the old entry, never MakeEntry a fresh one (#70 tail, 2026-07-10):

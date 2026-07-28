@@ -421,3 +421,193 @@ func TestSubtreeRenameHookInvalidatesPooledFDs(t *testing.T) {
 			"— Store.SetOnSubtreeRenamed is not wired", open)
 	}
 }
+
+// plantSubtreeTripwire inserts a pool entry keyed UNDER `parent` and returns a
+// checker for whether it survived.
+//
+// The key is synthetic on purpose: a regular file has no children, so no real
+// open can ever produce it, and the ONLY thing that can reach it is
+// InvalidateTree's `strings.HasPrefix(k.path, root+"/")` scan. That makes it an
+// exact detector for WHICH invalidator a rename dispatched to — a question with
+// no other observable answer, because for a file both invalidators drop the same
+// two real slots.
+func plantSubtreeTripwire(t *testing.T, p *FDPool, parent string) (key fdKey, survived func() bool) {
+	t.Helper()
+	scratch := filepath.Join(t.TempDir(), "tripwire")
+	if err := os.WriteFile(scratch, []byte("x"), 0o644); err != nil {
+		t.Fatalf("tripwire seed: %v", err)
+	}
+	fd, err := os.Open(scratch)
+	if err != nil {
+		t.Fatalf("tripwire open: %v", err)
+	}
+	t.Cleanup(func() { fd.Close() })
+	k := fdKey{path: parent + "/tripwire", write: false}
+	p.mu.Lock()
+	p.entries[k] = &poolEntry{fd: fd, lastUsed: time.Now()}
+	p.mu.Unlock()
+	return k, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		_, ok := p.entries[k]
+		return ok
+	}
+}
+
+func poolHasKey(p *FDPool, k fdKey) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.entries[k]
+	return ok
+}
+
+// TestFileRenameInvalidatesExactKeyNotTheSubtree is S3.
+//
+// juiceFS.Rename invalidated BOTH ends with the TREE scan unconditionally, even
+// though the mirror entry it already reads tells it the source is a plain file.
+// InvalidateTree is an O(len(p.entries)) walk held under the SINGLE pool mutex,
+// and a .app / ditto bundle copy is a rename PER FILE while p.entries holds
+// thousands of keys from that same copy's parallel WRITE RPCs — so it put two
+// full scans per renamed file on the exact lock that produced the 2026-06-14
+// convoy (93 goroutines wedged in GetWrite behind this mutex → Finder "error
+// 100060"). A file rename must take the exact-key path; the identity guarantee
+// is unchanged because POSIX rename cannot change an entry's type.
+func TestFileRenameInvalidatesExactKeyNotTheSubtree(t *testing.T) {
+	jfs, store, fuseRoot := newIntegrityHarness(t)
+	h := jfs.handler
+
+	seedFile(t, jfs, store, fuseRoot, "reel.mov", []byte("AAAA"))
+	full := filepath.Join(fuseRoot, "reel.mov")
+
+	if _, err := h.fdPool.Get(full); err != nil {
+		t.Fatalf("pool Get: %v", err)
+	}
+	h.fdPool.Release(full)
+	if _, err := h.fdPool.GetWrite(full, os.O_RDWR, 0o644); err != nil {
+		t.Fatalf("pool GetWrite: %v", err)
+	}
+	h.fdPool.ReleaseWrite(full)
+
+	_, tripwireSurvived := plantSubtreeTripwire(t, h.fdPool, full)
+
+	if err := jfs.Rename("reel.mov", "reel_v1.mov"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+
+	// Identity guarantee unchanged: the file's own two slots are gone.
+	if poolHasKey(h.fdPool, fdKey{path: full, write: false}) {
+		t.Error("the renamed file's READ slot survived — C1 is back")
+	}
+	if poolHasKey(h.fdPool, fdKey{path: full, write: true}) {
+		t.Error("the renamed file's WRITE slot survived — C2 is back")
+	}
+	// ...and the subtree namespace was never walked.
+	if !tripwireSurvived() {
+		t.Fatal("S3: a FILE rename took InvalidateTree — an O(len(entries)) scan under the pool mutex, " +
+			"twice per renamed file, for the whole duration of a bundle copy (the 2026-06-14 convoy lock)")
+	}
+}
+
+// TestDirectoryRenameStillScansTheSubtree is S3's other half: the dispatch must
+// still choose the tree scan when the thing being renamed actually HAS a subtree,
+// or every descendant keeps serving its pre-rename inode.
+func TestDirectoryRenameStillScansTheSubtree(t *testing.T) {
+	jfs, store, fuseRoot := newIntegrityHarness(t)
+	h := jfs.handler
+
+	seedFile(t, jfs, store, fuseRoot, "shoot/clip.mov", []byte("AAAA"))
+	mirror(t, store, fuseRoot, "shoot", true)
+
+	child := filepath.Join(fuseRoot, "shoot/clip.mov")
+	if _, err := h.fdPool.Get(child); err != nil {
+		t.Fatalf("pool Get: %v", err)
+	}
+	h.fdPool.Release(child)
+
+	if err := jfs.Rename("shoot", "shoot_old"); err != nil {
+		t.Fatalf("Rename(dir): %v", err)
+	}
+	if poolHasKey(h.fdPool, fdKey{path: child, write: false}) {
+		t.Fatal("a DIRECTORY rename left a descendant's pooled fd behind — every file under the " +
+			"moved folder still serves its pre-rename inode (C1/subtree)")
+	}
+}
+
+// TestUnmirroredRenameFallsBackToTheSubtreeScan pins the conservative direction
+// of the S3 dispatch: when the mirror has no entry for the source, the type is
+// UNKNOWN, and guessing "file" would silently skip a real subtree. Fall back to
+// the scan — a wasted scan costs latency, a missed one costs correctness.
+func TestUnmirroredRenameFallsBackToTheSubtreeScan(t *testing.T) {
+	jfs, _, fuseRoot := newIntegrityHarness(t)
+	h := jfs.handler
+
+	// On FUSE but deliberately NOT mirrored.
+	full := filepath.Join(fuseRoot, "unknown.mov")
+	if err := os.WriteFile(full, []byte("AAAA"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_, tripwireSurvived := plantSubtreeTripwire(t, h.fdPool, full)
+
+	if err := jfs.Rename("unknown.mov", "unknown_v1.mov"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if tripwireSurvived() {
+		t.Fatal("an UNMIRRORED source was treated as a plain file — a directory the mirror has " +
+			"evicted would keep every descendant's pooled fd alive")
+	}
+}
+
+// TestRemotePathInvalidatedHookDropsPooledFDs is R1: the metadata→nfs seam for
+// mutations made by ANOTHER writer.
+//
+// applyEvent (the Redis pub/sub apply path) handled remote deletes and renames
+// by updating the MIRROR and nothing else, so a pooled fd outlived a delete or
+// rename it never saw. In a product with a farm, ClipLogger and a second Mac all
+// writing the same volume, that is C1/C3 with a remote actor: recreate the path
+// and fdPool.Get hands back the fd to the previous inode, no error anywhere.
+//
+// Driving Store.NotifyPathInvalidated DIRECTLY (the public trigger applyEvent
+// fires) proves the hook is wired at handler construction, the same way
+// TestSubtreeRenameHookInvalidatesPooledFDs does for RenameSubtree.
+func TestRemotePathInvalidatedHookDropsPooledFDs(t *testing.T) {
+	jfs, store, fuseRoot := newIntegrityHarness(t)
+	h := jfs.handler
+
+	seedFile(t, jfs, store, fuseRoot, "peer/clip.mov", []byte("AAAA"))
+	mirror(t, store, fuseRoot, "peer", true)
+	child := filepath.Join(fuseRoot, "peer/clip.mov")
+
+	pool := func() {
+		t.Helper()
+		if _, err := h.fdPool.Get(child); err != nil {
+			t.Fatalf("pool Get: %v", err)
+		}
+		h.fdPool.Release(child)
+		if open, _ := h.fdPool.Stats(); open != 1 {
+			t.Fatalf("precondition: pool has %d entries, want 1", open)
+		}
+	}
+
+	// A peer DELETED the file (or renamed it away): the file's own slot goes.
+	pool()
+	store.NotifyPathInvalidated("peer/clip.mov", false)
+	if open, _ := h.fdPool.Stats(); open != 0 {
+		t.Fatalf("a REMOTE delete/rename left %d pooled fd(s) — the recreated file will be served the "+
+			"deleted inode's bytes (Store.SetOnPathInvalidated is not wired)", open)
+	}
+
+	// A peer renamed the DIRECTORY: every descendant's slot goes.
+	pool()
+	store.NotifyPathInvalidated("peer", true)
+	if open, _ := h.fdPool.Stats(); open != 0 {
+		t.Fatalf("a REMOTE directory rename left %d descendant fd(s) pooled", open)
+	}
+
+	// A remote mutation ELSEWHERE must not be collateral damage.
+	pool()
+	store.NotifyPathInvalidated("peerX", true)
+	store.NotifyPathInvalidated("peer/other.mov", false)
+	if open, _ := h.fdPool.Stats(); open != 1 {
+		t.Fatalf("unrelated remote mutations dropped a live pooled fd (pool has %d entries, want 1)", open)
+	}
+}

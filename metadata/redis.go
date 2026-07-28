@@ -1151,10 +1151,24 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 	case "delete":
 		// Deletes are NOT namespace-filtered: removing an internal-namespace
 		// row (if one was seeded by an older build) is convergent.
+		//
+		// R1: resolve the type BEFORE the eviction — the local delete publisher
+		// does not set IsDir, so the mirror is the only thing that knows whether
+		// this path had a pooled SUBTREE behind it.
+		delIsDir := evt.IsDir
+		if e := rc.store.LookupByPath(evt.Path); e != nil && e.IsDir {
+			delIsDir = true
+		}
 		rc.store.DeleteFromCache(evt.Path)
 		if err := rc.store.Delete(evt.Path); err != nil {
 			log.Printf("subscribe apply delete: %v", err)
 		}
+		// R1: the mirror is not the only thing holding this path — the NFS layer
+		// pools open FUSE fds keyed by path alone. Dropping only the mirror row
+		// left a recreated file being served the DELETED inode's bytes (C1/C3
+		// with a remote actor). Fired outside the store lock; see
+		// Store.SetOnPathInvalidated.
+		rc.store.NotifyPathInvalidated(evt.Path, delIsDir)
 
 	case "rename":
 		// The OldPath removal is UNGATED: a rename INTO .trash is JuiceFS's
@@ -1163,6 +1177,12 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 			rc.store.DeleteFromCache(evt.OldPath)
 			rc.store.Delete(evt.OldPath)
 		}
+		// R1: both ends, same reasoning as juiceFS.Rename's local invalidation —
+		// the source name may be recreated and the destination just replaced
+		// whatever POSIX rename unlinked there. evt.IsDir is set by the rename
+		// publisher (it rides along for the symlink/type discriminators).
+		rc.store.NotifyPathInvalidated(evt.OldPath, evt.IsDir)
+		rc.store.NotifyPathInvalidated(evt.Path, evt.IsDir)
 		// Task #78: skip mirroring the DESTINATION when it lands in a
 		// scan-filtered namespace (delete-to-trash). A rename OUT of .trash
 		// (restore) has a non-filtered destination and is mirrored normally.
