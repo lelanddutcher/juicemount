@@ -265,11 +265,12 @@ func (h *JuiceMountHandler) warmSidecar(name, fusePath string) bool {
 	if h.hasActiveWriter(name) {
 		return false
 	}
-	// ATTRIBUTION (measure-only): this is BACKGROUND work — up to
-	// sidecarWarmSem(3) × sidecarWarmParallel(16) = 48 concurrent warms — yet
-	// openFileWithTimeout draws from nfsLstatGate, the 24-slot FOREGROUND
-	// budget. Labeling it lets /metrics size how much of that budget the
-	// warmer actually consumes before anyone re-gates it.
+	// BACKGROUND work — up to sidecarWarmSem(3) × sidecarWarmParallel(16) = 48
+	// concurrent warms. The FUSESrcSidecarWarm label is what routes this to
+	// warmGate instead of the 24-slot FOREGROUND nfsLstatGate
+	// (fuseGateForSource, audit P0): 48-way opportunistic warming could
+	// otherwise hold every foreground slot on a high-latency link, so a user
+	// navigating right then queued behind work nobody was waiting for.
 	f, err, opened := openFileWithTimeout(metrics.FUSESrcSidecarWarm, fusePath, os.O_RDONLY, 0, fuseStatTimeout)
 	if !opened || err != nil {
 		return false

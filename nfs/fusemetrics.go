@@ -62,6 +62,8 @@ func fuseGateID(gate chan struct{}) metrics.FUSEGate {
 		return metrics.FUSEGatePrefetch
 	case fuseFstatGate:
 		return metrics.FUSEGateFstat
+	case warmGate:
+		return metrics.FUSEGateWarm
 	}
 	return metrics.FUSEGateNone
 }
@@ -76,6 +78,7 @@ func init() {
 		out[metrics.FUSEGateNFSLstat] = metrics.FUSEGateLevel{Depth: len(nfsLstatGate), Cap: cap(nfsLstatGate)}
 		out[metrics.FUSEGatePrefetch] = metrics.FUSEGateLevel{Depth: len(prefetchGate), Cap: cap(prefetchGate)}
 		out[metrics.FUSEGateFstat] = metrics.FUSEGateLevel{Depth: len(fuseFstatGate), Cap: cap(fuseFstatGate)}
+		out[metrics.FUSEGateWarm] = metrics.FUSEGateLevel{Depth: len(warmGate), Cap: cap(warmGate)}
 		return out
 	})
 }

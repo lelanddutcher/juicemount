@@ -205,6 +205,55 @@ var prefetchGate = make(chan struct{}, 2)
 // feedback_perf_hot_path.
 var fuseFstatGate = make(chan struct{}, 8)
 
+// warmGate caps concurrent FUSE opens spawned by the OPPORTUNISTIC WARMERS —
+// the `._` AppleDouble sidecar warmer (nfs/sidecar.go) and the farm-thumbnail
+// hydrator (nfs/thumbwarm.go). SEPARATE from nfsLstatGate, for the same reason
+// prefetchGate and fuseFstatGate are (audit P0, 2026-07-28).
+//
+// Both warmers used to draw from nfsLstatGate — the 24-slot FOREGROUND budget,
+// the one an NFS RPC blocks on. The sidecar warmer alone runs effectively
+// 48-way (handler.go dirWarm cap 3 x sidecar.go 16) and can enqueue hundreds of
+// opens for a single directory. On a LAN each open returns in ~1ms and the
+// warmers drain out of the gate faster than a human can notice. On a
+// high-latency link each open costs a full round trip, so the warmers can hold
+// every one of the 24 foreground slots for seconds at a time — and a user
+// navigating at that moment queues BEHIND OPPORTUNISTIC WORK. That inverts the
+// intended priority: warming exists to make navigation feel fast, and instead
+// it was competing with it.
+//
+// The whole point of a warmer is that nobody is waiting on it, so it must never
+// be able to starve something that IS being waited on. 8 (not 2 like
+// prefetchGate) because warming is the mechanism that makes the NEXT navigation
+// cheap — throttle it, don't strangle it. Tunable via JM_WARM_GATE.
+var warmGate = make(chan struct{}, warmGateCap())
+
+func warmGateCap() int {
+	if v := os.Getenv("JM_WARM_GATE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 8
+}
+
+// fuseGateForSource routes a FUSE call to the right concurrency budget from the
+// attribution label the caller already passes. Deriving the gate from the source
+// (rather than each call site naming a gate) means a warmer cannot accidentally
+// land on the foreground budget: labelling it correctly for metrics IS what puts
+// it on the background gate.
+//
+// Only the two warmers are re-routed here. Everything else keeps nfsLstatGate,
+// deliberately — prefetch and dir-refresh have their own tuned paths and moving
+// them is a separate change with its own risk.
+func fuseGateForSource(src metrics.FUSESource) (chan struct{}, metrics.FUSEGate) {
+	switch src {
+	case metrics.FUSESrcSidecarWarm, metrics.FUSESrcThumbWarm:
+		return warmGate, metrics.FUSEGateWarm
+	default:
+		return nfsLstatGate, metrics.FUSEGateNFSLstat
+	}
+}
+
 // errFUSETimeout is returned by the bounded FUSE helpers when a JuiceFS
 // syscall doesn't complete within its deadline (the mount is wedged/slow).
 // It is the shared nfslib.ErrFUSETimeout sentinel so the RPC boundary
@@ -522,9 +571,12 @@ func openFileWithTimeout(src metrics.FUSESource, p string, flag int, perm os.Fil
 	start := time.Now()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	gateWait, depth, acquired := acquireFUSEGate(nfsLstatGate, timer)
+	// Warmers draw from warmGate, not the foreground budget — see
+	// fuseGateForSource / warmGate.
+	gate, gateLabel := fuseGateForSource(src)
+	gateWait, depth, acquired := acquireFUSEGate(gate, timer)
 	if !acquired {
-		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpOpen, metrics.FUSEGateNFSLstat,
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpOpen, gateLabel,
 			0, gateWait, time.Since(start), metrics.FUSEOutcomeGateTimeout)
 		return nil, nil, false
 	}
@@ -536,15 +588,15 @@ func openFileWithTimeout(src metrics.FUSESource, p string, flag int, perm os.Fil
 	go func() {
 		f, err := os.OpenFile(p, flag, perm)
 		ch <- result{f: f, err: err}
-		<-nfsLstatGate
+		<-gate
 	}()
 	select {
 	case r := <-ch:
-		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpOpen, metrics.FUSEGateNFSLstat,
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpOpen, gateLabel,
 			depth, gateWait, time.Since(start), metrics.FUSEOutcomeOK)
 		return r.f, r.err, true
 	case <-timer.C:
-		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpOpen, metrics.FUSEGateNFSLstat,
+		metrics.Default().ObserveFUSECall(src, metrics.FUSEOpOpen, gateLabel,
 			depth, gateWait, time.Since(start), metrics.FUSEOutcomeTimeout)
 		// Close the fd if the open completes after we've bailed.
 		go func() {

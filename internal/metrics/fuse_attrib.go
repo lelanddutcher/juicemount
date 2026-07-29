@@ -149,6 +149,7 @@ const (
 	FUSEGateNFSLstat FUSEGate = iota // nfsLstatGate  — foreground hot-path budget
 	FUSEGatePrefetch                 // prefetchGate  — background readdir budget
 	FUSEGateFstat                    // fuseFstatGate — LiveSize fstat budget
+	FUSEGateWarm                     // warmGate      — sidecar/thumb warmer budget
 
 	// NumFUSEGates is the number of tracked gates.
 	NumFUSEGates
@@ -162,6 +163,7 @@ var fuseGateNames = [NumFUSEGates]string{
 	FUSEGateNFSLstat: "nfs_lstat",
 	FUSEGatePrefetch: "prefetch",
 	FUSEGateFstat:    "fuse_fstat",
+	FUSEGateWarm:     "warm",
 }
 
 // FUSEOutcome is how a bounded call ended.
