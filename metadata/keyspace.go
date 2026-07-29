@@ -13,6 +13,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
 // ============================================================================
@@ -229,6 +230,12 @@ func backstopForClass(c linkClass) time.Duration {
 // unknownAncestorSyncMin is the global floor between full-SCAN promotions
 // from the unknown-ancestor path (reconcileDir). Env override
 // JM_UNKNOWN_ANCESTOR_SYNC_SEC. See noteUnknownAncestor.
+// unknownAncestorScanOnWAN restores the pre-fix behavior: promote a full SCAN
+// for an unknown ancestor even on a high-latency link. Off by default.
+func unknownAncestorScanOnWAN() bool {
+	return os.Getenv("JM_UNKNOWN_ANCESTOR_SCAN_ON_WAN") == "1"
+}
+
 func unknownAncestorSyncMin() time.Duration {
 	if raw := os.Getenv("JM_UNKNOWN_ANCESTOR_SYNC_SEC"); raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
@@ -274,6 +281,34 @@ func (rc *RedisClient) noteUnknownAncestor(dirInode uint64) {
 		rc.unknownAncestorLastSync = now
 	}
 	rc.unknownAncestorMu.Unlock()
+
+	// HIGH-LATENCY LINKS NEVER PAY FOR A PROMOTED SCAN.
+	//
+	// The once-per-inode dedup above bounds REPEATS, not ARRIVALS. The farm
+	// mints a new derivative directory per asset under .juicemount/…, a
+	// namespace the mirror deliberately never holds (#78), so each one is a
+	// brand-new unknown inode and earns its own promotion. Observed on a real
+	// cellular link 2026-07-29: NINE promotions in twelve hours, every one a
+	// different inode — a full-tree SCAN over a phone tunnel, roughly hourly,
+	// which is precisely the "index rebuilding for seemingly no reason" the
+	// user reports. The 10-minute rate limit permits up to six an hour.
+	//
+	// A full SCAN is the most expensive thing this client can do and, for the
+	// filtered namespace that triggers it, it CANNOT establish the ancestor —
+	// the comment at the call site says so. On a far link that is pure cost.
+	// Defer to the class backstop, which already guarantees eventual
+	// convergence for anything deferred here (see keyspaceBackstop). On a
+	// LAN, promotion is cheap and behavior is unchanged.
+	//
+	// Gated on HighLatency() rather than Class() deliberately: what makes a
+	// SCAN ruinous is round trips, and a link can be metered-but-near or
+	// fast-but-far. Kill switch JM_UNKNOWN_ANCESTOR_SCAN_ON_WAN=1 restores
+	// unconditional promotion.
+	if allowed && netprofile.Default().HighLatency() && !unknownAncestorScanOnWAN() {
+		jmlog.Info("metadata keyspace push: unknown ancestor — SKIPPING promoted SCAN on a high-latency link (backstop will converge)",
+			"inode", dirInode)
+		return
+	}
 
 	if allowed {
 		jmlog.Info("metadata keyspace push: unknown ancestor — promoting ONE full SCAN (rate-limited)",
