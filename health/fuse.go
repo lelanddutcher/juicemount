@@ -506,18 +506,55 @@ func (fm *FUSEManager) Mount() error {
 	// update SQLite directly and don't depend on FUSE-cache freshness. 60s is
 	// reserved for WAN to keep the worst-case phantom-linger ≤5s on LAN.
 	// Tunable via JM_META_CACHE_SECS.
-	metaTTL := "5s"
-	if os.Getenv("JM_WAN_MODE") == "1" {
-		metaTTL = "60s"
-	}
-	if v := os.Getenv("JM_META_CACHE_SECS"); v != "" {
-		metaTTL = v
-	}
+	// 2026-07-28 — THE NAVIGATION FIX, and why it is unconditional.
+	//
+	// The 60s branch below used to be gated on JM_WAN_MODE=1. That knob is read
+	// in six production paths and SET IN NOTHING BUT TESTS — no Swift setenv, no
+	// LSEnvironment entry, no shell wrapper. So every shipping build has run
+	// with a 5s TTL on ALL FOUR caches, and the WAN fix written here has never
+	// once been active for a user. On a LAN that is invisible (5s revalidation
+	// costs ~0.4ms). On cellular each revalidation is a ~250ms round trip, which
+	// is exactly the reported symptom: navigating a directory is instant while
+	// OFFLINE (never touches the network) and terrible while ONLINE (re-validates
+	// against Redis every 5 seconds per entry).
+	//
+	// It is unconditional rather than link-conditional because these flags are
+	// fixed AT MOUNT TIME: juicefs cannot be re-tuned when the link changes, so
+	// a class-gated value would just bake in whatever the link looked like at
+	// startup and be wrong after the first WiFi<->cellular switch. Picking one
+	// value that is correct everywhere beats picking the wrong one adaptively.
+	//
+	// SAFETY — unchanged from the 2026-06-08 audit above, which already cleared
+	// the 60s value: JuiceMount serves Stat/ReadDir from its own mirror first and
+	// FUSE is fallback-only, the kernel NFS client already serves attrs up to
+	// actimeo=3600s stale, and the only consumer of FUSE metadata freshness is
+	// the phantom-purge / reconcile-prune Lstat, which a longer cache makes
+	// LAZIER — the strictly-safe direction, and those were over-aggressive bugs
+	// (QA-19/30/32/35), never under-aggressive.
+	//
+	// SPLIT, rather than one scalar for all four (audit P4):
+	//   entry / dir-entry 60s — the navigation win; these are what a directory
+	//     listing revalidates, and staleness here only delays a NEWLY ADDED file
+	//     becoming visible. Leland explicitly accepted that trade for throttled
+	//     links ("compromise of delay before new files show up ... is fine").
+	//   attr 10s — deliberately NOT 60s. attr-cache backs LiveSize(), the
+	//     anti-staleness authority for #85 (OpenLoupe verified-offload reads a
+	//     transient short size after a big write, hashes it, and discards a good
+	//     file). A 60s attr cache widens that window by 6x; 10s still removes
+	//     most revalidation chatter.
+	//   negative 5s — unchanged. A stale NEGATIVE is the one users experience as
+	//     "I just created this file and it isn't there", which is far more
+	//     confusing than a stale positive, and the ._* ENOENT storm this was
+	//     added for is already absorbed at 5s.
+	//
+	// JM_META_CACHE_SECS still overrides ALL FOUR together (documented escape
+	// hatch); the per-cache vars below allow finer tuning without it.
+	attrTTL, entryTTL, dirEntryTTL, negTTL := metaCacheTTLs()
 	args = append(args,
-		"--attr-cache", metaTTL,
-		"--entry-cache", metaTTL,
-		"--dir-entry-cache", metaTTL,
-		"--negative-entry-cache", metaTTL,
+		"--attr-cache", attrTTL,
+		"--entry-cache", entryTTL,
+		"--dir-entry-cache", dirEntryTTL,
+		"--negative-entry-cache", negTTL,
 	)
 	if v := os.Getenv("JM_MAX_UPLOADS"); v != "" {
 		// Direct override wins over WAN mode for operators that want
@@ -1775,4 +1812,33 @@ func volumeTotalBytes(volume string) (int64, error) {
 		return 0, err
 	}
 	return int64(st.Bsize) * int64(st.Blocks), nil
+}
+
+// envOr returns the value of environment variable key, or def when unset/empty.
+// Used for the per-cache FUSE metadata TTL overrides so each knob has a visible
+// default at its call site instead of a bare literal.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// metaCacheTTLs returns the four juicefs FUSE metadata cache TTLs, split by
+// role. Extracted from Mount() purely so the values are unit-testable: the
+// previous incarnation of this policy sat behind JM_WAN_MODE, which nothing in
+// production ever set, so the intended WAN values shipped dead for months with
+// no test to notice. See the commentary at the call site for the full rationale.
+//
+// Returns (attr, entry, dirEntry, negative).
+func metaCacheTTLs() (attr, entry, dirEntry, negative string) {
+	entry = envOr("JM_META_ENTRY_CACHE", "60s")
+	dirEntry = envOr("JM_META_DIR_ENTRY_CACHE", "60s")
+	attr = envOr("JM_META_ATTR_CACHE", "10s")
+	negative = envOr("JM_META_NEGATIVE_CACHE", "5s")
+	// Documented escape hatch: one value for all four.
+	if v := os.Getenv("JM_META_CACHE_SECS"); v != "" {
+		return v, v, v, v
+	}
+	return attr, entry, dirEntry, negative
 }
