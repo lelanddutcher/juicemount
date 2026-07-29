@@ -312,6 +312,29 @@ func (h *JuiceMountHandler) sidecarWarmDirAsync(dir string) {
 	if h == nil || h.sidecar == nil || !h.sidecar.enabled || pin.IsOffline() {
 		return
 	}
+	// FUTILITY BREAKER — stop warming when warming is not working.
+	//
+	// Measured on a real cellular link 2026-07-29, and again with the mount
+	// OFFLINE, where the warmer should have had nothing to reach for:
+	//
+	//	sidecar_warm  calls=264  timeouts=258 (98%)  mean=791ms
+	//	sidecar_warm_populated = 2
+	//
+	// 264 bounded FUSE opens, 258 of them spending the full 800ms
+	// fuseStatTimeout, to populate TWO entries. Each one holds a warmGate slot
+	// and, online, costs a metered round trip. This is the "latency spikes
+	// hidden to the user ... even when offline" in the field report: invisible
+	// work that never completes and never stops trying, because nothing in the
+	// warmer ever consulted its own outcome.
+	//
+	// A warmer exists to make the NEXT access cheap. When it is failing, it is
+	// doing the opposite — burning the very resource it is trying to save. So
+	// give it a memory: after enough consecutive failures, back off for a
+	// cooldown and let the foreground path serve. Any single success resets it,
+	// so a link that recovers resumes warming immediately without a restart.
+	if !h.sidecarWarmAllowed() {
+		return
+	}
 	now := time.Now()
 	h.sidecarWarmMu.Lock()
 	if t, ok := h.sidecarWarmed[dir]; ok && now.Sub(t) < sidecarWarmDedupeTTL {
@@ -404,7 +427,73 @@ func (h *JuiceMountHandler) sidecarWarmDir(dir string) {
 		}()
 	}
 	wg.Wait()
+	// Feed the futility breaker: a pass that ATTEMPTED work and populated
+	// nothing is the signal that warming is currently pointless. See
+	// sidecarWarmDirAsync.
+	h.noteSidecarWarmResult(len(work), int(warmed))
 	if warmed > 0 {
 		jmlog.Debug("sidecar warm: dir warmed", "dir", dir, "sidecars", warmed)
 	}
+}
+
+// Futility breaker state for the `._` sidecar warmer. See sidecarWarmDirAsync.
+const (
+	// sidecarWarmFailStreakMax is how many consecutive failed warm passes trip
+	// the breaker. Small on purpose: at 800ms per timed-out read and up to 512
+	// reads per pass, a handful of failing passes is already minutes of wasted
+	// FUSE work.
+	sidecarWarmFailStreakMax = 3
+	// sidecarWarmCooldown is how long the warmer stays parked once tripped. Long
+	// enough that a genuinely bad link stops paying, short enough that a
+	// recovered one resumes without a restart. Any success resets immediately.
+	sidecarWarmCooldown = 2 * time.Minute
+)
+
+// sidecarWarmAllowed reports whether warming should run right now, and is the
+// breaker's read side.
+func (h *JuiceMountHandler) sidecarWarmAllowed() bool {
+	if sidecarWarmBreakerDisabled() {
+		return true
+	}
+	h.sidecarWarmMu.Lock()
+	defer h.sidecarWarmMu.Unlock()
+	if h.sidecarWarmFailStreak < sidecarWarmFailStreakMax {
+		return true
+	}
+	if time.Since(h.sidecarWarmTrippedAt) < sidecarWarmCooldown {
+		return false
+	}
+	// Cooldown elapsed: allow ONE probe pass through. If it fails the streak is
+	// still at the cap and we park for another cooldown; if it succeeds,
+	// noteSidecarWarmResult clears everything.
+	h.sidecarWarmTrippedAt = time.Now()
+	return true
+}
+
+// noteSidecarWarmResult is the breaker's write side. populated is how many `._`
+// bodies the pass actually landed in the RAM cache; attempted is how many it
+// tried. A pass that populated nothing while attempting work is a failure.
+func (h *JuiceMountHandler) noteSidecarWarmResult(attempted, populated int) {
+	if attempted == 0 {
+		return // nothing to learn from an empty pass
+	}
+	h.sidecarWarmMu.Lock()
+	defer h.sidecarWarmMu.Unlock()
+	if populated > 0 {
+		h.sidecarWarmFailStreak = 0
+		return
+	}
+	h.sidecarWarmFailStreak++
+	if h.sidecarWarmFailStreak == sidecarWarmFailStreakMax {
+		h.sidecarWarmTrippedAt = time.Now()
+		jmlog.Info("sidecar warm: parking — consecutive passes populated nothing",
+			"fail_streak", h.sidecarWarmFailStreak,
+			"cooldown", sidecarWarmCooldown.String(),
+			"note", "warming a link this slow costs more than it saves; foreground still serves")
+	}
+}
+
+// sidecarWarmBreakerDisabled restores the pre-fix always-warm behavior.
+func sidecarWarmBreakerDisabled() bool {
+	return os.Getenv("JM_SIDECAR_WARM_BREAKER") == "0"
 }

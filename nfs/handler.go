@@ -88,6 +88,13 @@ type JuiceMountHandler struct {
 	sidecarWarmMu  sync.Mutex
 	sidecarWarmed  map[string]time.Time // dir → last warm (dedupe)
 
+	// Futility breaker (see sidecarWarmDirAsync). Guarded by sidecarWarmMu.
+	// Measured 2026-07-29 on cellular AND offline: 264 warm reads, 258 of them
+	// burning the full 800ms timeout, 2 entries populated. The warmer never
+	// looked at its own outcome, so it retried forever.
+	sidecarWarmFailStreak int
+	sidecarWarmTrippedAt  time.Time
+
 	// Async phantom-purge dedup (RC drain-latency fix, 2026-06-28). The
 	// Stat hot path no longer FUSE-Lstats inline to confirm a phantom; it
 	// serves the cached FileInfo and confirms in the background. This set
