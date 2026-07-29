@@ -417,7 +417,7 @@ func (fm *FUSEManager) Mount() error {
 		}
 	}
 	args = append(args,
-		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
+		"mount", metaURLForMount(fm.cfg.RedisURL), fm.cfg.MountPoint,
 		"-d", // daemon mode
 		"--no-usage-report",
 		"--buffer-size", strconv.Itoa(bufMB),
@@ -1841,4 +1841,40 @@ func metaCacheTTLs() (attr, entry, dirEntry, negative string) {
 		return v, v, v, v
 	}
 	return attr, entry, dirEntry, negative
+}
+
+// metaURLForMount returns the metadata URL to hand juicefs, applying the
+// JM_DEBUG_META_ADDR development override when set.
+//
+// WHY THIS EXISTS. The reported bug — navigation instant offline, awful on
+// cellular — is only reproducible at high RTT. Every measurement taken on a LAN
+// shows online nav already at parity with offline (3ms/dir vs 6ms/dir at 4.8ms
+// RTT), so a fix cannot be validated where it is being written. Iterating on a
+// cellular problem while measuring on WiFi is how you convince yourself of a fix
+// that does nothing.
+//
+// The latency lives in juicefs's own Redis round trips, not in this process's
+// metadata client, so an in-Go delay would inject latency into the wrong path
+// entirely. Pointing juicefs at a latency-injecting TCP proxy (cmd/jmlatency)
+// reproduces the real thing: the same syscalls, the same FUSE layer, the same
+// gates, with only the metadata round trip slowed.
+//
+// SAFETY. Unset — the overwhelmingly normal case — this is a pure passthrough
+// and the mount is byte-identical to before. It never rewrites the SCHEME, DB
+// index, or credentials, only host:port, and only when the override parses as a
+// URL; anything malformed leaves the original untouched rather than mounting
+// against a half-built address. It is deliberately NOT a persisted setting: an
+// env var dies with the process, so a forgotten debug knob cannot survive a
+// relaunch and silently degrade a user's mount.
+func metaURLForMount(redisURL string) string {
+	addr := os.Getenv("JM_DEBUG_META_ADDR")
+	if addr == "" {
+		return redisURL
+	}
+	u, err := url.Parse(redisURL)
+	if err != nil || u.Host == "" {
+		return redisURL
+	}
+	u.Host = addr
+	return u.String()
 }
