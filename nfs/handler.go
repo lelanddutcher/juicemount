@@ -758,24 +758,52 @@ func (h *JuiceMountHandler) invalidatePooledFDTree(inMountPath string) {
 }
 
 // onRemotePathInvalidated is the consumer end of Store.SetOnPathInvalidated
-// (R1): a delete or rename performed by ANOTHER writer — a peer Mac, the farm,
-// OpenLoupe — reached us as a pub/sub event and was applied to the metadata
-// mirror only. The FDPool is keyed by path alone and never saw it, so
+// (R1): a delete or rename reached us as a metadata pub/sub event and was
+// applied to the mirror only. The FDPool is keyed by path alone and never saw
+// it, so
 //
 //	read X.mov here (fd pooled) → a peer deletes X.mov → the mirror entry drops
 //	→ someone recreates X.mov and it re-mirrors → OpenFile takes the `e != nil`
 //	branch → fdPool.Get hands back the fd to the DELETED inode
 //
 // served the previous generation's bytes with no error anywhere — C1/C3 with a
-// remote actor. A directory drops its whole pooled subtree; a file takes the
-// exact-key path, because InvalidateTree is an O(len(entries)) scan under the
-// single pool mutex (see juiceFS.Rename for why that matters).
+// remote actor.
+//
+// READ SLOTS ONLY — the name is a misnomer inherited from the original patch
+// and the misconception behind it. `juicemount:metadata` is NOT a remote-only
+// channel: it replays this process's own writes, and MetadataEvent carries no
+// origin field, so applyEvent cannot distinguish them. Invalidating the WRITE
+// slot here therefore tore down our own in-flight write — it silently lost
+// xattrs on every copy, because macOS rewrites the ._ AppleDouble sidecar once
+// per xattr and each drain published an event back at us. See
+// FDPool.InvalidateReads for the full trace and the qa-battery evidence.
+//
+// A directory drops its whole pooled read subtree; a file takes the exact-key
+// path, because InvalidateTree is an O(len(entries)) scan under the single pool
+// mutex (see juiceFS.Rename for why that matters).
 func (h *JuiceMountHandler) onRemotePathInvalidated(inMountPath string, isDir bool) {
 	if isDir {
-		h.invalidatePooledFDTree(inMountPath)
+		h.invalidatePooledReadFDTree(inMountPath)
 		return
 	}
-	h.invalidatePooledFDs(inMountPath)
+	h.invalidatePooledReadFDs(inMountPath)
+}
+
+// invalidatePooledReadFDs / invalidatePooledReadFDTree are the read-slot-only
+// counterparts of invalidatePooledFDs / invalidatePooledFDTree, for mutations
+// this process learned about SECOND-HAND rather than performed itself.
+func (h *JuiceMountHandler) invalidatePooledReadFDs(inMountPath string) {
+	if h == nil || h.fdPool == nil || inMountPath == "" {
+		return
+	}
+	h.fdPool.InvalidateReads(path.Join(h.fusePath, inMountPath))
+}
+
+func (h *JuiceMountHandler) invalidatePooledReadFDTree(inMountPath string) {
+	if h == nil || h.fdPool == nil || inMountPath == "" {
+		return
+	}
+	h.fdPool.InvalidateReadsTree(path.Join(h.fusePath, inMountPath))
 }
 
 // SetPinStore attaches the pin registry and the user-facing mount point that

@@ -380,12 +380,51 @@ func (p *FDPool) FlushStale() (closed, marked int) {
 //
 // Returns (closed, marked) for the caller's log line. Nil-safe.
 func (p *FDPool) Invalidate(path string) (closed, marked int) {
+	return p.invalidatePath(path, true)
+}
+
+// InvalidateReads is Invalidate restricted to the READ slot, leaving any pooled
+// WRITE fd for the path untouched.
+//
+// WHY THIS EXISTS (xattr-loss regression, 2026-07-28). R1 wired the metadata
+// pub/sub into Invalidate on the belief that those events describe REMOTE
+// mutations. They do not: `juicemount:metadata` replays THIS process's own
+// writes too — MetadataEvent (metadata/redis.go) carries no origin/writer field
+// at all, so applyEvent structurally cannot tell our write from a peer's. The
+// result was that our own write invalidated its own in-flight pooled write fd:
+//
+//	macOS sets xattrs → ._name AppleDouble sidecar rewritten ~6x in ~70ms →
+//	each drain publishes an event → our own consumer applies it → Invalidate
+//	drops the sidecar's WRITE slot mid-sequence → xattrs (quarantine,
+//	FinderTags, whereFrom, FinderInfo) silently lost on copy.
+//
+// Caught by qa-battery 01-file-types: 2/2 LOST with R1, 2/2 PASS without it,
+// on both 10GbE and WiFi, against a byte-identical battery.
+//
+// The boundary this encodes: a mutation we learn about SECOND-HAND is a reason
+// to distrust a cached READ fd — the path may now be a different inode. It is
+// never a reason to disturb a WRITE fd, because for a path this process is
+// actively writing, this process is the authority; no event can tell us
+// something about our own in-flight write that we do not already know. The
+// LOCAL Rename/Remove RPC path deliberately still calls Invalidate (both
+// slots): there we performed the mutation ourselves, and C2/C3 require the
+// write slot to be dropped.
+func (p *FDPool) InvalidateReads(path string) (closed, marked int) {
+	return p.invalidatePath(path, false)
+}
+
+func (p *FDPool) invalidatePath(path string, includeWrite bool) (closed, marked int) {
 	if p == nil || path == "" {
 		return 0, 0
 	}
+	slots := [2]bool{false, true}
+	n := 2
+	if !includeWrite {
+		n = 1 // read slot only
+	}
 	var toClose []*os.File
 	p.mu.Lock()
-	for _, write := range [2]bool{false, true} {
+	for _, write := range slots[:n] {
 		k := fdKey{path: path, write: write}
 		e, ok := p.entries[k]
 		if !ok {
@@ -399,7 +438,9 @@ func (p *FDPool) Invalidate(path string) (closed, marked int) {
 	// Get/GetWrite that missed and is currently inside os.Open (~60 ms on FUSE)
 	// will insert an fd for the PRE-rename inode the moment it returns, and the
 	// `!ok → continue` above cannot see it. Poison it. See openInFlight.
-	p.poisonOpensLocked(func(k fdKey) bool { return k.path == path })
+	p.poisonOpensLocked(func(k fdKey) bool {
+		return k.path == path && (includeWrite || !k.write)
+	})
 	p.mu.Unlock()
 	for _, fd := range toClose {
 		fd.Close()
@@ -422,14 +463,32 @@ func (p *FDPool) Invalidate(path string) (closed, marked int) {
 //
 // Same close-outside-the-lock and refCount discipline as Invalidate.
 func (p *FDPool) InvalidateTree(root string) (closed, marked int) {
+	return p.invalidateTree(root, true)
+}
+
+// InvalidateReadsTree is InvalidateTree restricted to READ slots. Used for
+// second-hand (pub/sub) directory mutations; see InvalidateReads for why a
+// write slot must never be dropped on an event this process may itself have
+// generated.
+func (p *FDPool) InvalidateReadsTree(root string) (closed, marked int) {
+	return p.invalidateTree(root, false)
+}
+
+func (p *FDPool) invalidateTree(root string, includeWrite bool) (closed, marked int) {
 	if p == nil || root == "" || root == "/" {
 		return 0, 0
 	}
 	prefix := strings.TrimSuffix(root, "/") + "/"
+	inScope := func(k fdKey) bool {
+		if !includeWrite && k.write {
+			return false
+		}
+		return k.path == root || strings.HasPrefix(k.path, prefix)
+	}
 	var toClose []*os.File
 	p.mu.Lock()
 	for k, e := range p.entries {
-		if k.path != root && !strings.HasPrefix(k.path, prefix) {
+		if !inScope(k) {
 			continue
 		}
 		c, m := p.invalidateEntryLocked(k, e, &toClose)
@@ -437,9 +496,7 @@ func (p *FDPool) InvalidateTree(root string) (closed, marked int) {
 		marked += m
 	}
 	// Descendant opens already in flight — same hole as Invalidate's.
-	p.poisonOpensLocked(func(k fdKey) bool {
-		return k.path == root || strings.HasPrefix(k.path, prefix)
-	})
+	p.poisonOpensLocked(inScope)
 	p.mu.Unlock()
 	for _, fd := range toClose {
 		fd.Close()
