@@ -549,6 +549,27 @@ func (fm *FUSEManager) Mount() error {
 	//
 	// JM_META_CACHE_SECS still overrides ALL FOUR together (documented escape
 	// hatch); the per-cache vars below allow finer tuning without it.
+	// --fast-statfs: answer statfs from juicefs's LOCAL counters instead of
+	// querying the metadata service. Default in juicefs is false, and we have
+	// never passed it, so EVERY free-space query has been a Redis round trip.
+	//
+	// That is not a rare call. Profiling one real cellular session measured
+	// StatFS 1,727 times at 230ms average — 397 seconds, 6.6 minutes, spent
+	// reporting how much space is free. Finder polls it while a window is open,
+	// `df` hits it, and the app's own health surface reads it. On a LAN each
+	// call is sub-millisecond and invisible; on cellular it is pure latency
+	// tax on an operation nobody is waiting for the exact answer to.
+	//
+	// SAFETY: the cost is a slightly stale free-space figure. Nothing in
+	// JuiceMount makes a correctness decision from statfs — the pin-store
+	// capacity guard (R-1) measures the LOCAL cache volume with syscall.Statfs
+	// on the Mac's own disk, not the JuiceFS mount, so it is unaffected. A
+	// stale byte count in a Finder window is exactly the class of staleness
+	// already accepted for throttled links. Kill switch JM_FAST_STATFS=0.
+	if os.Getenv("JM_FAST_STATFS") != "0" {
+		args = append(args, "--fast-statfs")
+	}
+
 	attrTTL, entryTTL, dirEntryTTL, negTTL := metaCacheTTLs()
 	args = append(args,
 		"--attr-cache", attrTTL,
