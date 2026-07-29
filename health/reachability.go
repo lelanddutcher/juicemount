@@ -23,6 +23,7 @@ package health
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -382,12 +383,65 @@ func (r *Reachability) probe() bool {
 	if err != nil {
 		return false
 	}
+	defer conn.Close()
 	rtt := time.Since(start)
+
+	// A COMPLETED TCP HANDSHAKE IS NOT PROOF THE BACKEND IS THERE.
+	//
+	// This probe used to return true right here, and that produced the single
+	// worst state this app can be in. Observed live on 2026-07-29 from an
+	// iPhone hotspot, where the NAS (a 192.168.0.x LAN address) is genuinely
+	// unroutable:
+	//
+	//	05:27:03  backend unreachable for sustained window — engaging offline mode
+	//	08:43:15  network path lost … i/o timeout
+	//	08:44:50  reachability transition → REACHABLE "probe succeeded"   <-- FALSE
+	//	08:44:50  network path to backend recovered → SetAutoOffline(false)
+	//
+	// while a real Redis PING to that same address timed out and ping(8) showed
+	// 100% packet loss. Carrier NAT, captive portals and other middleboxes
+	// routinely answer the SYN for an address they cannot actually route to, so
+	// the dial "succeeds" against the middlebox rather than the backend.
+	//
+	// Lifting auto-offline on that false signal leaves the app ONLINE WITH A
+	// DEAD BACKEND — strictly worse than either honest state. Navigation still
+	// feels fine because the mirror serves it (measured 25ms), but the FIRST
+	// open of each file walks the full timeout stack before falling back to
+	// locally cached blocks: measured 1,527ms / 6,250ms / 28,150ms for 32 KB,
+	// against 24-36ms for every subsequent read of the same file. That is
+	// exactly the reported symptom — "offline mode is amazing, but with offline
+	// mode disabled performance is absolute trash and even my pinned files
+	// struggle" — because the bytes ARE local and we pay the network anyway.
+	//
+	// So require a PROTOCOL-LEVEL answer. Any RESP reply proves a real Redis is
+	// on the other end: "+PONG" normally, and "-NOAUTH ..." when the server
+	// wants AUTH — an error reply is still proof of life, and this probe is a
+	// liveness check, not an auth check. A middlebox that accepted the
+	// connection will send nothing and hit the deadline.
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	if _, err := conn.Write([]byte("PING\r\n")); err != nil {
+		return false
+	}
+	var buf [1]byte
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
+		return false
+	}
+	switch buf[0] {
+	case '+', '-', ':', '$', '*': // any RESP type == a real server answered
+	default:
+		return false
+	}
+
+	// RTT is measured across dial+PING now, which is the more honest number:
+	// it is what an actual metadata round trip costs, and it feeds the adaptive
+	// dial timeout and the netprofile RTT estimate.
+	rtt = time.Since(start)
 	r.observeRTT(rtt)
 	if r.rttObserver != nil {
 		r.rttObserver(rtt)
 	}
-	_ = conn.Close()
 	return true
 }
 

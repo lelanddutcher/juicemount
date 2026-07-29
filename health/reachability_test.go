@@ -18,6 +18,9 @@ type fakeDialer struct {
 	mu        sync.Mutex
 	reachable bool
 	attempts  atomic.Int64
+	// silent models a middlebox that accepts the TCP connection but is not
+	// actually the backend — it never sends a RESP reply.
+	silent bool
 }
 
 func (f *fakeDialer) setReachable(v bool) {
@@ -38,9 +41,33 @@ func (f *fakeDialer) DialContext(ctx context.Context, network, address string) (
 		time.Sleep(5 * time.Millisecond)
 		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("no route to host")}
 	}
-	// Return a closeable null conn. Cheap mock.
-	left, _ := net.Pipe()
-	return left, nil
+	// Return a conn that behaves like a LIVE Redis: the probe now requires a
+	// protocol-level answer (any RESP reply), not just a completed handshake,
+	// so a mock that never speaks would be — correctly — "unreachable".
+	return respondingPipe(f.silent), nil
+}
+
+// respondingPipe returns one end of a pipe whose peer answers any request with
+// "+PONG\r\n" (a live Redis). With silent=true the peer accepts the connection
+// and then says NOTHING — modelling the carrier NAT / middlebox that completes
+// a TCP handshake for an address it cannot actually route to. That false
+// "reachable" is what wrongly lifted auto-offline on a hotspot.
+func respondingPipe(silent bool) net.Conn {
+	left, right := net.Pipe()
+	go func() {
+		defer right.Close()
+		buf := make([]byte, 64)
+		if _, err := right.Read(buf); err != nil {
+			return
+		}
+		if silent {
+			// Hold the connection open, answer nothing.
+			time.Sleep(2 * time.Second)
+			return
+		}
+		_, _ = right.Write([]byte("+PONG\r\n"))
+	}()
+	return left
 }
 
 // TestReachability_InitialStateIsReachable verifies the monitor is
@@ -467,4 +494,45 @@ func TestReachability_DrainLivenessKillSwitchByteIdentical(t *testing.T) {
 	if hookCalls.Load() != 0 {
 		t.Errorf("override disabled but liveness hook was consulted %d time(s) — must be byte-identical (never called)", hookCalls.Load())
 	}
+}
+
+// TestReachability_MiddleboxHandshakeIsNotReachable is the regression test for
+// the bug that produced the user-reported symptom.
+//
+// Observed live 2026-07-29 on an iPhone hotspot, where the NAS (192.168.0.x) is
+// genuinely unroutable: the probe's bare TCP dial SUCCEEDED — carrier NAT
+// answered the SYN — so the monitor logged "reachability transition →
+// reachable" and lifted auto-offline, while a real Redis PING to that same
+// address timed out and ping(8) reported 100% packet loss.
+//
+// Lifting auto-offline on that false signal leaves the app ONLINE WITH A DEAD
+// BACKEND, which is worse than either honest state: navigation still feels fine
+// (the mirror serves it, ~25ms) but the FIRST open of every file walks the full
+// timeout stack before falling back to locally cached blocks — measured 1,527ms
+// / 6,250ms / 28,150ms for 32 KB, versus 24-36ms for later reads of the same
+// file. Hence "offline mode is amazing, but with offline mode disabled
+// performance is absolute trash and even my pinned files struggle".
+//
+// A completed handshake must NOT count as reachable.
+func TestReachability_MiddleboxHandshakeIsNotReachable(t *testing.T) {
+	d := &fakeDialer{reachable: true, silent: true} // connects, never answers
+	r := NewReachability("ignored:0",
+		WithBaseInterval(20*time.Millisecond),
+		WithDialTimeout(150*time.Millisecond),
+		WithFailureThreshold(2),
+		withDialer(d),
+	)
+	r.Start()
+	defer r.Stop()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !r.Reachable() {
+			return // correctly refused to call a silent middlebox "reachable"
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("a TCP handshake with no RESP reply was treated as REACHABLE — " +
+		"this lifts auto-offline against a dead backend and reintroduces the " +
+		"multi-second first-open stall on cellular")
 }
