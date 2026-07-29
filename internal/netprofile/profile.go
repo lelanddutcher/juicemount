@@ -150,6 +150,15 @@ var (
 	thrMeteredBps = 3.0 * 1024 * 1024   // < → metered
 	thrSlowBps    = 30.0 * 1024 * 1024  // < → slow
 	thrFastBps    = 200.0 * 1024 * 1024 // >= → fast; between slow & fast → medium
+
+	// Latency thresholds for the high-latency ceiling, with hysteresis so a
+	// jittery link cannot flap the class. Enter at 150ms, leave at 100ms.
+	// Sized from a measured Tailscale-over-cellular link (RTT 105-349ms,
+	// smoothed ~105-156ms): comfortably above good Wi-Fi/WAN (sub-20ms) and
+	// below the cellular band, with a 50ms dead zone wider than the observed
+	// smoothed swing. LAN links (sub-ms) never come near it.
+	rttHighEnter = 150 * time.Millisecond
+	rttHighExit  = 100 * time.Millisecond
 )
 
 // Profile is the concurrency-safe link estimator. The zero value is not usable;
@@ -163,6 +172,14 @@ type Profile struct {
 	haveBW      bool
 	bwSamples   int64
 	forcedClass *LinkClass // operator/OS override (e.g. detected metered link); nil = auto
+
+	// highLatency is the LATENCY dimension of classification, kept separate from
+	// bandwidth because the two are independent and a link can be fast AND far.
+	// Hysteretic: set when smoothed RTT rises above rttHighEnter, cleared only
+	// when it falls back under rttHighExit, so a jittery cellular link cannot
+	// flap the class (measured on a real Tailscale-over-cellular link: RTT
+	// 105-349ms, stddev 86ms — a single threshold would oscillate every probe).
+	highLatency bool
 
 	// Windowed throughput accumulator. Bandwidth is measured as AGGREGATE bytes
 	// over WALL-CLOCK time within an active read window — not per-read bytes/dur,
@@ -256,6 +273,11 @@ func (p *Profile) ObserveRTT(sample time.Duration) {
 		p.rtt = sample
 		p.rttvar = sample / 2
 		p.haveRTT = true
+		// Evaluate the ceiling on the FIRST sample too. Omitting this meant a
+		// link that was already far when the app started never tripped the flag
+		// until a second sample arrived — and on a link whose very first probe
+		// is 156ms, that is precisely the case we care about.
+		p.updateHighLatencyLocked()
 		return
 	}
 	diff := p.rtt - sample
@@ -264,6 +286,31 @@ func (p *Profile) ObserveRTT(sample time.Duration) {
 	}
 	p.rttvar += (diff - p.rttvar) / 4
 	p.rtt += (sample - p.rtt) / 8
+	p.updateHighLatencyLocked()
+}
+
+// updateHighLatencyLocked maintains the hysteretic high-latency flag. Caller
+// holds p.mu for writing.
+func (p *Profile) updateHighLatencyLocked() {
+	if p.highLatency {
+		if p.rtt < rttHighExit {
+			p.highLatency = false
+		}
+		return
+	}
+	if p.rtt >= rttHighEnter {
+		p.highLatency = true
+	}
+}
+
+// HighLatency reports whether the link is currently far, independent of how
+// much bandwidth it has. Consumers that care about ROUND TRIPS rather than
+// throughput (metadata chatter, per-file opens, cold directory populates)
+// should gate on this rather than on Class().
+func (p *Profile) HighLatency() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.highLatency
 }
 
 // minThroughputBytes / minThroughputDur gate which read samples count as a real
@@ -351,16 +398,42 @@ func (p *Profile) classLocked() (LinkClass, bool) {
 	}
 	// Bandwidth is the primary, most trustworthy signal once we have it.
 	if p.haveBW {
+		byBW := ClassFast
 		switch {
 		case p.bwBps < thrMeteredBps:
-			return ClassMetered, false
+			byBW = ClassMetered
 		case p.bwBps < thrSlowBps:
-			return ClassSlow, false
+			byBW = ClassSlow
 		case p.bwBps < thrFastBps:
-			return ClassMedium, false
-		default:
-			return ClassFast, false
+			byBW = ClassMedium
 		}
+		// LATENCY CEILING — bandwidth alone is not the link.
+		//
+		// This branch used to return byBW directly, and RTT was never consulted
+		// again once a single throughput sample existed. Measured live on
+		// 2026-07-29 over Tailscale-on-cellular:
+		//
+		//	route utun9 · real RTT 156ms avg (105-349, stddev 86)
+		//	netprofile: class=fast  bandwidth=518.9 Mbps  rtt_ms=105
+		//
+		// It HELD a 105ms RTT and still said "fast", because a phone tunnel can
+		// carry real throughput while every round trip costs 100ms+. Eight
+		// protections gate on this class, and the synchronous cold-directory
+		// populate is gated to ClassFast specifically — so a link that could not
+		// be less LAN-like was getting the LAN foreground path.
+		//
+		// A far link is capped at ClassSlow no matter how fat the pipe is:
+		// what makes navigation and file opens hurt is ROUND TRIPS, not
+		// megabits, and every consumer of "slow" is doing round-trip-reducing
+		// work. Metered stays metered (it is already stricter). Kill switch
+		// JM_NET_LATENCY_CEILING=0 restores bandwidth-only classification
+		// byte-identically (WAN-tuning revert discipline).
+		// LinkClass is ordered slow→fast (Metered=0 … Fast=3), so "faster than
+		// Slow" is >, and Metered (which is already stricter) is left alone.
+		if p.highLatency && latencyCeilingEnabled() && byBW > ClassSlow {
+			return ClassSlow, false
+		}
+		return byBW, false
 	}
 	// Bootstrap from RTT before any throughput sample. Conservative: a high-RTT
 	// link is assumed slow until bandwidth proves otherwise (safe direction —
@@ -423,4 +496,14 @@ func (p *Profile) Snapshot() Snapshot {
 		ThroughputN:     p.bwSamples,
 		BootstrappedRTT: boot,
 	}
+}
+
+
+// latencyCeilingEnabled reports whether the RTT ceiling may downgrade a
+// bandwidth-derived class. Default ON; JM_NET_LATENCY_CEILING=0 restores
+// bandwidth-only classification byte-identically, per the WAN-tuning revert
+// discipline (a cellular tuning change must always be revertible without a
+// rebuild).
+func latencyCeilingEnabled() bool {
+	return os.Getenv("JM_NET_LATENCY_CEILING") != "0"
 }
