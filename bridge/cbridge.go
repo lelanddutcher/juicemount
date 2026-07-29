@@ -247,6 +247,14 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	globalMetricsAddr = cfg.MetricsAddr
 	globalVolumeName = filepath.Base(cfg.MountPoint)
 	globalInstanceID = cplane.LoadOrMintInstanceID(cfg.DBPath)
+	// JM_DEBUG_META_ADDR (dev): rewrite the metadata endpoint ONCE, here at config
+	// ingest, so every consumer agrees — the Go metadata client, the reachability
+	// probes, AND the juicefs mount args (which are built from this same value).
+	// Rewriting only the juicefs URL left the Go client dialling the real LAN
+	// address: it was blocked by macOS Local Network Privacy, the backend read as
+	// unreachable, and the app took start-while-offline and never mounted FUSE at
+	// all — so the proxy saw zero connections. Unset, this is a pure passthrough.
+	cfg.RedisURL = health.MetaURLForMount(cfg.RedisURL)
 	globalRedisURL = cfg.RedisURL
 
 	// Initialize structured logging early so all subsequent log lines

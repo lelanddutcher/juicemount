@@ -417,7 +417,7 @@ func (fm *FUSEManager) Mount() error {
 		}
 	}
 	args = append(args,
-		"mount", metaURLForMount(fm.cfg.RedisURL), fm.cfg.MountPoint,
+		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
 		"-d", // daemon mode
 		"--no-usage-report",
 		"--buffer-size", strconv.Itoa(bufMB),
@@ -1843,7 +1843,7 @@ func metaCacheTTLs() (attr, entry, dirEntry, negative string) {
 	return attr, entry, dirEntry, negative
 }
 
-// metaURLForMount returns the metadata URL to hand juicefs, applying the
+// MetaURLForMount returns the metadata URL to use, applying the
 // JM_DEBUG_META_ADDR development override when set.
 //
 // WHY THIS EXISTS. The reported bug — navigation instant offline, awful on
@@ -1866,7 +1866,7 @@ func metaCacheTTLs() (attr, entry, dirEntry, negative string) {
 // against a half-built address. It is deliberately NOT a persisted setting: an
 // env var dies with the process, so a forgotten debug knob cannot survive a
 // relaunch and silently degrade a user's mount.
-func metaURLForMount(redisURL string) string {
+func MetaURLForMount(redisURL string) string {
 	addr := os.Getenv("JM_DEBUG_META_ADDR")
 	if addr == "" {
 		return redisURL

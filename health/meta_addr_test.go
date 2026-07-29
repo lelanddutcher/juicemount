@@ -8,7 +8,7 @@ import "testing"
 func TestMetaURLPassthroughWhenUnset(t *testing.T) {
 	t.Setenv("JM_DEBUG_META_ADDR", "")
 	const in = "redis://192.168.0.197:30179/1"
-	if got := metaURLForMount(in); got != in {
+	if got := MetaURLForMount(in); got != in {
 		t.Fatalf("override unset but URL changed: %q -> %q; a debug knob must never "+
 			"alter the production mount", in, got)
 	}
@@ -16,7 +16,7 @@ func TestMetaURLPassthroughWhenUnset(t *testing.T) {
 
 func TestMetaURLRewritesHostOnly(t *testing.T) {
 	t.Setenv("JM_DEBUG_META_ADDR", "127.0.0.1:16379")
-	got := metaURLForMount("redis://192.168.0.197:30179/1")
+	got := MetaURLForMount("redis://192.168.0.197:30179/1")
 	if got != "redis://127.0.0.1:16379/1" {
 		t.Fatalf("got %q, want redis://127.0.0.1:16379/1 — scheme and DB index must survive", got)
 	}
@@ -26,7 +26,7 @@ func TestMetaURLRewritesHostOnly(t *testing.T) {
 // authenticates wrong / lands in the wrong keyspace.
 func TestMetaURLPreservesCredentialsAndDB(t *testing.T) {
 	t.Setenv("JM_DEBUG_META_ADDR", "127.0.0.1:16379")
-	got := metaURLForMount("redis://user:secret@192.168.0.197:30179/3")
+	got := MetaURLForMount("redis://user:secret@192.168.0.197:30179/3")
 	if got != "redis://user:secret@127.0.0.1:16379/3" {
 		t.Fatalf("got %q — credentials or DB index lost in rewrite", got)
 	}
@@ -37,7 +37,7 @@ func TestMetaURLPreservesCredentialsAndDB(t *testing.T) {
 func TestMetaURLLeavesUnparseableAlone(t *testing.T) {
 	t.Setenv("JM_DEBUG_META_ADDR", "127.0.0.1:16379")
 	const junk = "not-a-url"
-	if got := metaURLForMount(junk); got != junk {
+	if got := MetaURLForMount(junk); got != junk {
 		t.Fatalf("unparseable URL was rewritten to %q", got)
 	}
 }
