@@ -271,7 +271,7 @@ func (h *JuiceMountHandler) warmSidecar(name, fusePath string) bool {
 	// (fuseGateForSource, audit P0): 48-way opportunistic warming could
 	// otherwise hold every foreground slot on a high-latency link, so a user
 	// navigating right then queued behind work nobody was waiting for.
-	f, err, opened := openFileWithTimeout(metrics.FUSESrcSidecarWarm, fusePath, os.O_RDONLY, 0, fuseStatTimeout)
+	f, err, opened := openFileWithTimeout(metrics.FUSESrcSidecarWarm, fusePath, os.O_RDONLY, 0, warmOpTimeout())
 	if !opened || err != nil {
 		return false
 	}

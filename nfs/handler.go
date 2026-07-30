@@ -4610,3 +4610,51 @@ func (r *rootDirInfo) Sys() any {
 		Nlink: 2,
 	}
 }
+
+// warmOpTimeout is the per-operation FUSE budget for the OPPORTUNISTIC WARMERS
+// (`._` sidecar warmer, farm-thumbnail hydrator). It is deliberately separate
+// from fuseStatTimeout, which bounds the FOREGROUND hot path.
+//
+// WHY (measured 2026-07-29, real cellular link, and again with the mount
+// OFFLINE):
+//
+//	sidecar_warm  calls=264  timeouts=258 (98%)  mean=791ms  populated=2
+//	foreground    calls=6228 timeouts=10  (0.2%) mean=38.5ms
+//
+// The warmer was not failing because warming is hopeless — it was failing
+// because it was UNDER-BUDGETED BY 23 MILLISECONDS. nfs/sidecar.go's own field
+// note records the measurement: "a single `._` read = 777ms" on cellular, and
+// fuseStatTimeout is 800ms. Every jitter spike blows it. So 258 reads each
+// burned the full 800ms and populated nothing.
+//
+// fuseStatTimeout ALREADY specifies 2s for this case — "On WAN (high-RTT MinIO
+// over Tailscale/cellular) a cold range GET legitimately takes longer, so the
+// default stays 2s there" — gated on JM_WAN_MODE=1, a variable set in nothing
+// but test files. Same dead knob that kept the WAN metadata TTLs from ever
+// shipping. This routes it off the measured link instead.
+//
+// ONLY the warmers get the longer budget, deliberately:
+//   - The foreground path is HEALTHY at 800ms (10 timeouts in 6228 calls).
+//     Raising ITS bound trades a fast failure for a slow one on the RPC a client
+//     is blocked on, and a longer foreground FUSE wait is precisely the JUKEBOX
+//     generator behind "connection interrupted" (see the mount-facts note in
+//     the audit). That is a separate decision with its own evidence bar.
+//   - Warmers already run on their own gate (warmGate) and nobody waits on
+//     them, so a longer bound costs only background time.
+//
+// The futility breaker still wraps this: if warming fails anyway, it parks.
+// Kill switch JM_WARM_OP_TIMEOUT_MS pins an explicit value.
+func warmOpTimeout() time.Duration {
+	if v := os.Getenv("JM_WARM_OP_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	if netprofile.Default().HighLatency() {
+		// The value fuseStatTimeout already documents for WAN, now reachable.
+		if fuseStatTimeout < 2*time.Second {
+			return 2 * time.Second
+		}
+	}
+	return fuseStatTimeout
+}

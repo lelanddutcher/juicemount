@@ -238,7 +238,7 @@ func (w *ThumbWarmer) hydrateOne(inode uint64, blobPath string) (int64, error) {
 	// rather than the FOREGROUND nfsLstatGate (fuseGateForSource, audit P0) —
 	// same reasoning as the sidecar warmer: nobody is waiting on a thumbnail,
 	// so it must not be able to starve someone who IS waiting on navigation.
-	f, err, ok := openFileWithTimeout(metrics.FUSESrcThumbWarm, blobPath, os.O_RDONLY, 0, fuseStatTimeout)
+	f, err, ok := openFileWithTimeout(metrics.FUSESrcThumbWarm, blobPath, os.O_RDONLY, 0, warmOpTimeout())
 	if !ok {
 		return 0, errFUSETimeout
 	}
