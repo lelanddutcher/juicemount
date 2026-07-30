@@ -570,6 +570,46 @@ func (fm *FUSEManager) Mount() error {
 		args = append(args, "--fast-statfs")
 	}
 
+	// --open-cache: reuse an open file WITHOUT re-checking for updates.
+	//
+	// THE PRIZE. Measured on a real cellular link 2026-07-29: the FIRST open of
+	// a file costs 1,226-5,660ms while the SECOND costs 24-36ms — a ~66x gap,
+	// and the cost is per-FILE, not per-byte (5.7 KB costs the same as 4.4 MB;
+	// a directory is 26ms). juicefs defaults this to 0s and we have never
+	// passed it, so every open re-validates against Redis. That re-validation
+	// IS the gap, and it is redundant for us: we already run a coherence engine
+	// (the SQLite/RAM mirror + the Redis keyspace push feed).
+	//
+	// DEFAULT OFF, DELIBERATELY. Two facts make this opt-in rather than on:
+	//
+	//  1. juicefs exposes NO external cache invalidation — checked the whole
+	//     subcommand surface (format/config/quota/destroy/gc/fsck/restore/dump/
+	//     load/status/stats/profile/info/debug/summary/mount/umount/gateway/
+	//     webdav/bench/objbench/warmup/rmr/sync). Our push feed can drop OUR
+	//     pooled fd (R1) but cannot make juicefs re-check inside its window. The
+	//     TTL is therefore a HARD staleness bound with no escape hatch.
+	//  2. The exposure is a stale SLICE MAP — wrong bytes from an existing file,
+	//     not a stale listing. That is the family this codebase has been burned
+	//     by three times (#18 torn reads, #104 zero-tailed black frames, the
+	//     membuf stale-partial image). It is NOT covered by the "delay before
+	//     new files appear" trade that was accepted for throttled links.
+	//
+	// So: build the lever, measure the win on the real link, THEN decide the
+	// default with data — rather than defaulting it on from reasoning, which is
+	// how the metadata-TTL change earned a measurement that showed it did
+	// nothing.
+	//
+	// Sizing when enabled: SHORT. The measured repeat-opens were seconds apart
+	// (a browse-and-preview burst), so 5-10s captures nearly all of the 66x
+	// while keeping the window too short for a farm/ClipLogger write to land
+	// inside it. Do not reach for 30s+ without a multi-writer test.
+	//
+	// JM_OPEN_CACHE="" (unset) = OFF, today's behavior byte-identically.
+	// JM_OPEN_CACHE="5s"       = pass --open-cache 5s.
+	if v := openCacheTTL(); v != "" {
+		args = append(args, "--open-cache", v)
+	}
+
 	attrTTL, entryTTL, dirEntryTTL, negTTL := metaCacheTTLs()
 	args = append(args,
 		"--attr-cache", attrTTL,
@@ -1898,4 +1938,16 @@ func MetaURLForMount(redisURL string) string {
 	}
 	u.Host = addr
 	return u.String()
+}
+
+
+// openCacheTTL returns the --open-cache duration to pass, or "" to omit the
+// flag entirely (juicefs default 0s = disabled = today's behavior). See the
+// call site for why this is opt-in rather than on by default.
+func openCacheTTL() string {
+	v := os.Getenv("JM_OPEN_CACHE")
+	if v == "" || v == "0" || v == "0s" {
+		return ""
+	}
+	return v
 }
