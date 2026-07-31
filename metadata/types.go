@@ -50,13 +50,13 @@ func (e *Entry) FileInfo() *FileInfo {
 }
 
 // Entry returns the underlying metadata Entry.
-func (fi *FileInfo) Entry() *Entry     { return fi.entry }
+func (fi *FileInfo) Entry() *Entry { return fi.entry }
 
-func (fi *FileInfo) Name() string      { return fi.entry.Name }
-func (fi *FileInfo) Size() int64       { return fi.entry.Size }
-func (fi *FileInfo) Mode() fs.FileMode { return fi.entry.Mode }
+func (fi *FileInfo) Name() string       { return fi.entry.Name }
+func (fi *FileInfo) Size() int64        { return fi.entry.Size }
+func (fi *FileInfo) Mode() fs.FileMode  { return fi.entry.Mode }
 func (fi *FileInfo) ModTime() time.Time { return fi.entry.Mtime }
-func (fi *FileInfo) IsDir() bool       { return fi.entry.IsDir }
+func (fi *FileInfo) IsDir() bool        { return fi.entry.IsDir }
 
 // Sys returns a *syscall.Stat_t with the correct UID, GID, and Ino so that
 // the NFS file attribute builder (internal/nfs/file) reports the current

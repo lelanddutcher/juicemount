@@ -1,11 +1,6 @@
 package metadata
 
-import (
-	"testing"
-	"time"
-
-	"github.com/lelanddutcher/juicemount/internal/netprofile"
-)
+import "testing"
 
 // The farm mints a new derivative directory per asset under .juicemount/…, a
 // namespace the mirror deliberately never holds (#78). Each is a brand-new
@@ -20,13 +15,7 @@ func TestUnknownAncestor_NoPromotedScanOnHighLatency(t *testing.T) {
 	t.Setenv("JM_UNKNOWN_ANCESTOR_SCAN_ON_WAN", "")
 	t.Setenv("JM_NET_LATENCY_CEILING", "")
 
-	np := netprofile.Default()
-	for i := 0; i < 6; i++ { // drive the hysteretic flag high
-		np.ObserveRTT(300 * time.Millisecond)
-	}
-	if !np.HighLatency() {
-		t.Fatal("precondition: netprofile did not enter high-latency at 300ms")
-	}
+	driveNetprofileHighLatency(t)
 
 	rc := &RedisClient{}
 	var triggered int
@@ -47,13 +36,7 @@ func TestUnknownAncestor_StillPromotesOnLAN(t *testing.T) {
 	t.Setenv("JM_UNKNOWN_ANCESTOR_SCAN_ON_WAN", "")
 	t.Setenv("JM_NET_LATENCY_CEILING", "")
 
-	np := netprofile.Default()
-	for i := 0; i < 60; i++ { // settle well below the exit threshold
-		np.ObserveRTT(300 * time.Microsecond)
-	}
-	if np.HighLatency() {
-		t.Fatal("precondition: netprofile still high-latency at 0.3ms")
-	}
+	settleNetprofileLAN(t)
 
 	rc := &RedisClient{}
 	var triggered int

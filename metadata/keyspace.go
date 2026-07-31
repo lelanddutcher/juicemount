@@ -740,6 +740,47 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	// re-subscribe runs the full gap-fill exactly as before.
 	if skipBootGapFill {
 		rc.setEngagement(keyspaceEnabled)
+	} else if rc.deferBootGapFillToBackground() {
+		// SLOW LINK: recall the last state NOW, rebuild in the background.
+		//
+		// The freshness skip above is a 15-MINUTE window. A laptop that sleeps
+		// overnight blows it every single morning, and then pays a synchronous
+		// full-tree SCAN over whatever link it woke up on — measured live at
+		// 297k entries / 163s on a tunnel, which is the user-visible
+		// "Rebuilding index" and a metered-link burn for a mirror that is, in
+		// practice, almost entirely still correct.
+		//
+		// The window is the wrong instrument on a far link. What makes the SCAN
+		// affordable is RTT, not recency: on a LAN it is seconds and stays
+		// synchronous exactly as before; on a tunnel it is minutes no matter
+		// how fresh the mirror is.
+		//
+		// So: mark ENABLED against the RECALLED mirror and run the same
+		// authoritative SCAN on a background goroutine. Nothing is skipped —
+		// convergence is deferred, not abandoned, and the periodic backstop is
+		// still there behind it.
+		//
+		// SAFE because the mirror is already the serving authority and is
+		// designed to be imperfect: an entry deleted out-of-band is caught by
+		// the phantom-purge confirmation, an unmirrored directory populates via
+		// the async dir refresh (U7), and push carries live deltas the moment
+		// it engages. The exposure is a bounded window where a change made
+		// elsewhere DURING DOWNTIME is not yet visible — the same staleness
+		// class already accepted for throttled links, and strictly better than
+		// today's alternative of showing nothing while the SCAN runs.
+		//
+		// Kill switch JM_BOOT_SCAN_BACKGROUND=0 restores the synchronous SCAN.
+		jmlog.Info("metadata keyspace push: boot gap-fill SCAN DEFERRED to background (slow link)",
+			"note", "serving the recalled mirror now; SCAN converges behind it")
+		rc.setEngagement(keyspaceEnabled)
+		go func() {
+			if err := rc.SyncOnce(); err != nil {
+				jmlog.Warn("metadata keyspace push: background gap-fill SCAN failed — backstop will retry",
+					"error", err.Error())
+				return
+			}
+			jmlog.Info("metadata keyspace push: background gap-fill SCAN complete")
+		}()
 	} else {
 		if err := rc.SyncOnce(); err != nil {
 			jmlog.Warn("metadata keyspace push: gap-fill SCAN failed, staying DEGRADED",
@@ -1628,4 +1669,20 @@ func (rc *RedisClient) collectSubtree(root string) []string {
 		}
 	}
 	return out
+}
+
+// deferBootGapFillToBackground reports whether the boot gap-fill SCAN should
+// run behind the recalled mirror instead of in front of it.
+//
+// Gated on measured LATENCY, not on the freshness window, because the two
+// answer different questions. The window asks "is the mirror probably still
+// correct?"; this asks "can we AFFORD to find out before serving?". On a LAN
+// the SCAN is seconds and stays synchronous. On a far link it is minutes
+// regardless of how fresh the mirror is, and blocking on it buys accuracy the
+// user cannot use while costing the responsiveness they can.
+func (rc *RedisClient) deferBootGapFillToBackground() bool {
+	if os.Getenv("JM_BOOT_SCAN_BACKGROUND") == "0" {
+		return false
+	}
+	return netprofile.Default().HighLatency()
 }

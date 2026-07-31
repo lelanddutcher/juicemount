@@ -206,7 +206,7 @@ func TestRedisSubscribeRename(t *testing.T) {
 	rc.PublishEvent(ctx, MetadataEvent{
 		Op: "rename", Path: "__test__/after_rename.txt",
 		OldPath: "__test__/before_rename.txt",
-		Size: 100, Mtime: time.Now().Unix(), Inode: 777777,
+		Size:    100, Mtime: time.Now().Unix(), Inode: 777777,
 	})
 	time.Sleep(300 * time.Millisecond)
 
