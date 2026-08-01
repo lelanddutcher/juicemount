@@ -1307,17 +1307,45 @@ func (rc *RedisClient) reconcileLoop() {
 			// if a sync STARTED or COMPLETED within the class-aware debounce window;
 			// the periodic ticker still catches any real drift within the cadence.
 			// LAN (medium/fast) → window 0 → NO debounce, behavior unchanged.
-			if d := flapDebounceInterval(); d > 0 {
+			// The flap debounce alone is NOT enough once syncs are FAILING.
+			//
+			// Measured on Leland's cellular link 2026-07-31 — the log is a
+			// textbook feedback loop:
+			//
+			//	21:24:47 reconciliation failed (attempt 21) ... next_in_sec: 300
+			//	21:24:47 reconciliation triggered by network change   <- immediately
+			//	21:26:07 network path lost   (attempt 22) next_in_sec: 300
+			//	21:26:07 reconciliation triggered by network change   <- again
+			//	... 28 attempts, ending "SCAN budget 5m0s exceeded"
+			//
+			// doReconcile computed a 300s backoff and the flap path walked
+			// straight past it, because the debounce window (60s, class-aware)
+			// is INDEPENDENT of consecutiveFailures. On cellular the link flaps
+			// constantly, so: SCAN starts -> saturates the uplink -> the link
+			// looks changed/degraded -> another flap -> another SCAN. The scan
+			// is its own trigger. Leland's report: "when index rebuilding on
+			// cellular it really hogs all bandwidth and even a simple web
+			// search fails" — a background index task starving the user's
+			// entire uplink, for a SCAN that cannot finish anyway.
+			//
+			// So while we are in failure backoff, the BACKOFF is the floor: a
+			// flap may not retry sooner than the retry we already scheduled.
+			// Zero failures -> backoff is irrelevant and the classic debounce
+			// applies byte-identically (LAN unchanged: window 0, no debounce).
+			suppress := flapSuppressWindow(consecutiveFailures, backoff)
+			if suppress > 0 {
 				rc.mu.RLock()
 				recent := rc.lastSyncStartedAt
 				if rc.lastSyncTime.After(recent) {
 					recent = rc.lastSyncTime
 				}
 				rc.mu.RUnlock()
-				if !recent.IsZero() && time.Since(recent) < d {
-					jmlog.Info("flap-triggered reconcile suppressed (recent sync within debounce window)",
+				if !recent.IsZero() && time.Since(recent) < suppress {
+					jmlog.Info("flap-triggered reconcile suppressed",
 						"since_last_sec", int(time.Since(recent).Seconds()),
-						"debounce_sec", int(d.Seconds()))
+						"window_sec", int(suppress.Seconds()),
+						"consecutive_failures", consecutiveFailures,
+						"reason", map[bool]string{true: "failure backoff", false: "flap debounce"}[consecutiveFailures > 0 && backoff >= flapDebounceInterval()])
 					continue
 				}
 			}
@@ -2410,4 +2438,24 @@ func (rc *RedisClient) verifyPruneCandidates(toDelete []string, fastConfirmed ma
 		return nil, fusePresent
 	}
 	return verified, fusePresent
+}
+
+// flapSuppressWindow is the minimum quiet period a network-change ("flap")
+// trigger must observe before it may start another full SCAN.
+//
+// Extracted from the reconcile loop purely so it is testable — the loop itself
+// is a select over channels. See the call site for the measured feedback loop
+// this closes.
+//
+// Zero consecutive failures: the classic class-aware flap debounce, unchanged
+// (LAN returns 0 = no debounce). While FAILING: the failure backoff becomes the
+// floor, because a retry sooner than the one already scheduled is exactly the
+// storm — 28 attempts on a cellular link, each a full SCAN that saturated the
+// uplink and could not finish.
+func flapSuppressWindow(consecutiveFailures int, backoff time.Duration) time.Duration {
+	d := flapDebounceInterval()
+	if consecutiveFailures > 0 && backoff > d {
+		return backoff
+	}
+	return d
 }
