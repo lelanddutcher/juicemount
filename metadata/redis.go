@@ -139,6 +139,14 @@ type RedisClient struct {
 	lastSyncDuration  time.Duration
 	lastSyncTime      time.Time
 	lastSyncStartedAt time.Time // when the most recent sync BEGAN (for flap debounce)
+
+	// Resumable-SCAN carry-over (2026-08-01). A SCAN that ran out of budget or
+	// lost the connection saves its progress here so the next attempt continues
+	// instead of re-pulling the same prefix. Guarded by mu. See takeScanResume.
+	scanResumeRaws   []scanRawEntry
+	scanResumeRev    map[string][2]string
+	scanResumeCursor string
+	scanResumeAt     time.Time
 	// G7 (task #80): truthful IsSyncing across failed/deferred syncs.
 	// lastSyncEndedAt records when the most recent sync attempt ENDED —
 	// success, failure, OR deferral (set by noteSyncOutcome on every
@@ -1829,16 +1837,24 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	// no single batch (incl. a big dir's HGETALL + per-child attr GETs) keeps
 	// Redis BUSY long enough to starve a concurrent copy.
 	const scanCount = "500"
-	type rawEntry struct {
-		ft          int
-		mtime, size int64
-		inode       uint64
-		parentInode string
-		name        string
-	}
-	var raws []rawEntry
-	rev := make(map[string][2]string) // childInode → {parentInode, name}
-	cursor := "0"
+
+	// RESUMABLE SCAN (2026-08-01). A full SCAN used to be all-or-nothing: on a
+	// budget expiry or a dropped connection the loop returned and the cursor,
+	// plus every entry already pulled, was DISCARDED. The next attempt started
+	// at cursor "0". On a link where the SCAN cannot finish inside its budget
+	// that is not "slow convergence", it is a treadmill — Leland's log shows 28
+	// attempts, none finishing, each re-pulling the same prefix of a ~200k
+	// keyspace over cellular. His words: "it really hogs all bandwidth and even
+	// a simple web search fails".
+	//
+	// The network work is now resumable while RECONSTRUCTION stays atomic. Path
+	// reconstruction walks parentInode → root over a rev map built from the
+	// WHOLE keyspace, so a partial scan genuinely cannot be applied — that part
+	// of the old design was right. What was wasteful was throwing away the
+	// bytes. We now carry (cursor, raws, rev) across attempts and reconstruct
+	// only when the cursor completes, so each attempt advances the scan instead
+	// of repeating it.
+	raws, rev, cursor := rc.takeScanResume()
 	for {
 		res, err := rc.redisDB().Eval(ctx, luaScanBatch, nil, cursor, scanCount).StringSlice()
 		if err != nil {
@@ -1847,6 +1863,10 @@ func (rc *RedisClient) syncMetadata() (err error) {
 			// regardless of how go-redis dressed the expiry (ctx sentinel vs
 			// a net "i/o timeout" from the ctx-derived read deadline) — the
 			// deferred-not-failed classification keys on that sentinel.
+			// Save the progress this attempt made so the next one resumes
+			// instead of re-pulling it. Applies to BOTH exits: a budget expiry
+			// and a dropped connection cost the same wasted bytes.
+			rc.saveScanResume(raws, rev, cursor)
 			if ctx.Err() == context.DeadlineExceeded {
 				return fmt.Errorf("redis SCAN batch: %w (SCAN budget %v exceeded): %w",
 					err, scanBudget, context.DeadlineExceeded)
@@ -1868,7 +1888,7 @@ func (rc *RedisClient) syncMetadata() (err error) {
 			mt, _ := strconv.ParseInt(parts[1], 10, 64)
 			sz, _ := strconv.ParseInt(parts[2], 10, 64)
 			ino, _ := strconv.ParseUint(parts[3], 10, 64)
-			raws = append(raws, rawEntry{ft: ft, mtime: mt, size: sz, inode: ino, parentInode: parts[4], name: parts[5]})
+			raws = append(raws, scanRawEntry{ft: ft, mtime: mt, size: sz, inode: ino, parentInode: parts[4], name: parts[5]})
 			rev[parts[3]] = [2]string{parts[4], parts[5]}
 		}
 		if cursor == "0" {
@@ -2459,3 +2479,77 @@ func flapSuppressWindow(consecutiveFailures int, backoff time.Duration) time.Dur
 	}
 	return d
 }
+
+// ---- resumable SCAN state (2026-08-01) ----
+
+// scanRawEntry is one child row pulled by luaScanBatch, before path
+// reconstruction. Package-scope so a partially completed SCAN can be carried
+// across attempts.
+type scanRawEntry struct {
+	ft          int
+	mtime, size int64
+	inode       uint64
+	parentInode string
+	name        string
+}
+
+// scanResumeMaxAge bounds how long a partially-scanned keyspace may be carried.
+// Entries pulled long ago describe a backend that has since moved on, and
+// reconstruction would mix epochs. Past this the partial is discarded and the
+// next attempt starts clean — correctness over saved bytes.
+const scanResumeMaxAge = 15 * time.Minute
+
+// takeScanResume returns any saved partial scan and CLEARS it, so a resume is
+// consumed exactly once. A partial older than scanResumeMaxAge, or one saved
+// under a different backend generation, is dropped. Returns a fresh empty state
+// when there is nothing usable to resume.
+func (rc *RedisClient) takeScanResume() ([]scanRawEntry, map[string][2]string, string) {
+	fresh := func() ([]scanRawEntry, map[string][2]string, string) {
+		return nil, make(map[string][2]string), "0"
+	}
+	if !scanResumeEnabled() {
+		return fresh()
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.scanResumeCursor == "" || rc.scanResumeCursor == "0" {
+		return fresh()
+	}
+	if time.Since(rc.scanResumeAt) > scanResumeMaxAge {
+		jmlog.Info("metadata sync: discarding stale partial SCAN",
+			"age_sec", int(time.Since(rc.scanResumeAt).Seconds()),
+			"max_age_sec", int(scanResumeMaxAge.Seconds()),
+			"entries", len(rc.scanResumeRaws))
+		rc.scanResumeRaws, rc.scanResumeRev, rc.scanResumeCursor = nil, nil, ""
+		return fresh()
+	}
+	raws, rev, cursor := rc.scanResumeRaws, rc.scanResumeRev, rc.scanResumeCursor
+	rc.scanResumeRaws, rc.scanResumeRev, rc.scanResumeCursor = nil, nil, ""
+	jmlog.Info("metadata sync: resuming partial SCAN",
+		"entries_carried", len(raws), "cursor", cursor,
+		"age_sec", int(time.Since(rc.scanResumeAt).Seconds()))
+	if rev == nil {
+		rev = make(map[string][2]string)
+	}
+	return raws, rev, cursor
+}
+
+// saveScanResume stores the progress of an attempt that did not finish, so the
+// next one continues from here. A completed scan (cursor "0") saves nothing —
+// there is nothing to resume.
+func (rc *RedisClient) saveScanResume(raws []scanRawEntry, rev map[string][2]string, cursor string) {
+	if !scanResumeEnabled() || cursor == "" || cursor == "0" || len(raws) == 0 {
+		return
+	}
+	rc.mu.Lock()
+	rc.scanResumeRaws, rc.scanResumeRev, rc.scanResumeCursor = raws, rev, cursor
+	rc.scanResumeAt = time.Now()
+	rc.mu.Unlock()
+	jmlog.Info("metadata sync: saved partial SCAN for resume",
+		"entries", len(raws), "cursor", cursor,
+		"note", "next attempt continues here instead of re-pulling this prefix")
+}
+
+// scanResumeEnabled — kill switch JM_SCAN_RESUME=0 restores the all-or-nothing
+// SCAN byte-identically.
+func scanResumeEnabled() bool { return os.Getenv("JM_SCAN_RESUME") != "0" }
