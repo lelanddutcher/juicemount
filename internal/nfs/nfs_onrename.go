@@ -3,14 +3,51 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"reflect"
+	"syscall"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
 var doubleWccErrorBody = [16]byte{}
+
+// renameErrStatus maps a Rename failure to its NFS status.
+//
+// A destination collision is NOT an I/O error (2026-08-03). Every other
+// create-shaped op in this package — mkdir, mknod, link, symlink — already maps
+// EEXIST to NFSStatusExist; rename was the sole holdout and fell through to
+// NFSStatusIO. The macOS client surfaces NFS3ERR_IO as ioErr, so Finder aborted
+// a folder move with error -36 instead of treating it as a name collision it
+// can resolve (merge/replace), and left the folder split across source and
+// destination.
+//
+// Measured before the fix: moving a 300-file folder immediately after writing
+// it failed ~50% of the time, on this branch AND on stock 0.4.0. The
+// JM_NFS_TRACE line was:
+//
+//	Rename -> ERR I/O error: rename .../src/big .../dst/big: file exists
+//
+// ENOTEMPTY is reported separately — NFS3ERR_NOTEMPTY is the specific status
+// for "target directory exists and is not empty", and clients distinguish it
+// from a plain EEXIST. It must be checked BEFORE the EEXIST case: on some
+// platforms a non-empty-target rename satisfies both.
+func renameErrStatus(err error) NFSStatus {
+	switch {
+	case os.IsNotExist(err):
+		return NFSStatusNoEnt
+	case os.IsPermission(err):
+		return NFSStatusAccess
+	case errors.Is(err, syscall.ENOTEMPTY):
+		return NFSStatusNotEmpty
+	case errors.Is(err, os.ErrExist), errors.Is(err, syscall.EEXIST):
+		return NFSStatusExist
+	default:
+		return NFSStatusIO
+	}
+}
 
 func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = errFormatterWithBody(doubleWccErrorBody[:])
@@ -78,13 +115,7 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 
 	err = fs.Rename(fromLoc, toLoc)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &NFSStatusError{NFSStatusNoEnt, err}
-		}
-		if os.IsPermission(err) {
-			return &NFSStatusError{NFSStatusAccess, err}
-		}
-		return &NFSStatusError{NFSStatusIO, err}
+		return &NFSStatusError{renameErrStatus(err), err}
 	}
 
 	if err := userHandle.InvalidateHandle(fs, oldHandle); err != nil {

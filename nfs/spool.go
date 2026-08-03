@@ -1062,13 +1062,13 @@ func (s *SpoolStore) CancelForDelete(nfsPath string) {
 // shard is insufficient). Lock order: openShards → meta.writeMu (released) →
 // e.mu → index.mu — same direction as OpenWrite, no cycles. Renames are rare
 // relative to the per-RPC write path, so the full-barrier cost is acceptable.
-func (s *SpoolStore) MigrateForRename(oldPath, newPath string) (int, error) {
+func (s *SpoolStore) MigrateForRename(oldPath, newPath string) (int, bool, error) {
 	s.lockAllShards()
 	defer s.unlockAllShards()
 
 	migs, err := s.meta.MigrateActivePaths(oldPath, newPath)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	requeued := false
 	for _, m := range migs {
@@ -1097,12 +1097,29 @@ func (s *SpoolStore) MigrateForRename(oldPath, newPath string) (int, error) {
 			s.index.DeleteIfMatches(m.NewPath, e)
 		}
 	}
-	if requeued {
-		// A fresh `ready` row exists; wake the drainer for it.
-		s.signalReady()
-	}
-	return len(migs), nil
+	// NOTE (2026-08-03): we deliberately do NOT wake the drainer here, and
+	// return the need-to-signal to the caller instead.
+	//
+	// Waking it inside this call raced the very rename that called us. The
+	// drainer materializes an entry by os.MkdirAll'ing its parent
+	// (drainer.go:699), so a drain of a just-migrated entry CREATES the
+	// destination directory on FUSE — and the caller's os.Rename(old, new)
+	// then fails EEXIST because we created `new` ourselves microseconds
+	// earlier. JuiceFS does not implement the POSIX "rename replaces an
+	// empty target directory" case, so an empty dir is fatal to the rename.
+	//
+	// Symptom: moving a folder in Finder that had just been written failed
+	// ~50% of the time (300-file folder, measured); the folder was left split
+	// across source and destination. Settled folders never failed because
+	// nothing was in the spool to migrate or drain. See JuiceMount task #2.
+	//
+	// The caller signals after its rename completes — see juiceFS.Rename.
+	return len(migs), requeued, nil
 }
+
+// SignalReady wakes the drainer. Exported so a caller that deferred the wake
+// (see MigrateForRename) can perform it once its own FUSE work is done.
+func (s *SpoolStore) SignalReady() { s.signalReady() }
 
 // MarkDrainRetry is the transient-failure path: bumps drain_attempts +
 // last_error and resets the row to ready so the dispatcher picks it up

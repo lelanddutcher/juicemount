@@ -3318,13 +3318,21 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 		// bytes. CancelForDelete is a no-op when nothing exists (same
 		// unconditional pattern as Remove).
 		jfs.handler.spool.CancelForDelete(newpath)
-		n, err := jfs.handler.spool.MigrateForRename(oldpath, newpath)
+		n, needSignal, err := jfs.handler.spool.MigrateForRename(oldpath, newpath)
 		if err != nil {
 			jmlog.Warn("rename: spool migration failed — failing RPC",
 				"old", oldpath, "new", newpath, "error", err.Error())
 			return err
 		}
 		migrated = n
+		if needSignal {
+			// Wake the drainer only AFTER our FUSE rename below. Waking it
+			// here raced us: draining a just-migrated entry MkdirAll's the
+			// destination, and our own os.Rename then failed EEXIST against
+			// the directory we had just caused to exist. See
+			// MigrateForRename's note and JuiceMount task #2.
+			defer jfs.handler.spool.SignalReady()
+		}
 	}
 
 	// Execute on FUSE. A purely-spooled file hasn't been drained yet, so it
@@ -3332,6 +3340,29 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	// spool migration moved entries, not a failure (the drain materializes
 	// the new path). Any other combination keeps the legacy contract:
 	// errors propagate (onRename maps them to NFS statuses).
+	// KNOWN BUG (2026-08-03, JuiceMount task #2): this rename can fail EEXIST
+	// because our OWN drainer materialized the destination. The drainer creates
+	// an entry's parent with os.MkdirAll (drainer.go:699); for a directory
+	// rename we have just re-keyed every entry under oldpath to newpath, so a
+	// drain firing before this line creates newpath and the rename then loses
+	// to it. JuiceFS does not implement the POSIX "rename replaces an empty
+	// target directory" case, so this is fatal rather than replaceable.
+	//
+	// Measured: a 300-file folder moved in Finder immediately after being
+	// written failed ~50% of the time (identically on stock 0.4.0), leaving the
+	// folder split across source and destination. Settled folders never fail —
+	// nothing is in the spool to migrate or drain.
+	//
+	// Two fixes were tried and MEASURED NOT TO WORK; do not retry them:
+	//   1. Deferring the drainer wake out of MigrateForRename (kept anyway as
+	//      correct hardening — we should not kick a drainer into a race we are
+	//      about to lose — but the drainer also ticks on its own schedule).
+	//   2. rmdir-the-destination-and-retry. The destination is NOT empty by the
+	//      time we get here: the drainer has already landed `._` sidecars, so
+	//      os.Remove correctly refuses, and reclaiming it would mean deleting
+	//      drained data. 6/8 still failed (-48/-47).
+	// The real fix is mutual exclusion between a directory rename and drains
+	// targeting that subtree.
 	if err := os.Rename(jfs.fullPath(oldpath), jfs.fullPath(newpath)); err != nil {
 		if !(migrated > 0 && os.IsNotExist(err)) {
 			return err

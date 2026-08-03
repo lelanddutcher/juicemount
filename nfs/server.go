@@ -35,6 +35,10 @@ type Server struct {
 
 // NewServer creates a new NFS server.
 func NewServer(config Config, store *metadata.Store) *Server {
+	// Route the go-nfs library's logger into jmlog before anything can log.
+	// Without this the library writes to a stderr the app does not have.
+	// See nfslog.go.
+	installNFSLogBridge()
 	return &Server{
 		config: config,
 		store:  store,
