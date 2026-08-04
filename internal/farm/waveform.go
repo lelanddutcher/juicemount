@@ -4,11 +4,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"io"
 	"math"
 	"os"
 	"os/exec"
-	"path/filepath"
 )
 
 // WaveformJSON is the de-facto-standard BBC audiowaveform / waveform-data.js
@@ -30,7 +30,7 @@ const waveformSampleRate = 48000
 // Waveform decodes the first audio track to mono PCM and writes an 8-bit peak
 // overview (min,max per pixel-bucket) as a BBC-format JSON blob. Streams the PCM
 // so a feature-length file doesn't buffer in memory. Returns the pixel length.
-func Waveform(ffmpegBin, srcPath, outPath string, samplesPerPixel int) (int, error) {
+func Waveform(ffmpegBin, srcPath string, dir *os.File, outName string, samplesPerPixel int) (int, error) {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -128,10 +128,17 @@ func Waveform(ffmpegBin, srcPath, outPath string, samplesPerPixel int) (int, err
 	if err != nil {
 		return 0, err
 	}
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return 0, err
+	// Written through the DIRECTORY DESCRIPTOR, not the path.
+	//
+	// The staging design's stated limitation is that a SUBPROCESS takes a path
+	// and not a descriptor. That excuse does not cover this write: Waveform's
+	// ffmpeg streams to stdout, and the file write is our own Go code — so it
+	// was path-addressed for no reason, and os.MkdirAll + a path-addressed
+	// atomic write followed a symlinked component straight out of the volume.
+	if dir == nil {
+		return 0, fmt.Errorf("waveform: no safe derivative directory")
 	}
-	if err := atomicWriteFile(outPath, payload, 0o644); err != nil {
+	if err := derivatives.WriteFileAt(dir, outName, payload, 0o644); err != nil {
 		return 0, err
 	}
 	return wf.Length, nil

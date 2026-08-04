@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,9 +42,10 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 	if preset == "" {
 		preset = "slow"
 	}
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return err
-	}
+	// NO MkdirAll here. The caller has already created this directory with a
+	// symlink-checking walk and holds its descriptor, and the output name was
+	// staged inside it — so re-creating the path by name would be both redundant
+	// and the one unanchored step left in this function.
 	// Encode to a temp sibling, then atomically rename onto outPath so a
 	// concurrent OpenLoupe reader never sees a partially-encoded proxy.
 	tmpPath := atomicTempPath(outPath)

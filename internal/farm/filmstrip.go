@@ -5,7 +5,6 @@ import (
 	"math"
 	"os"
 	"os/exec"
-	"path/filepath"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 )
@@ -97,9 +96,10 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 		intervalMS = 1
 	}
 
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return nil, err
-	}
+	// NO MkdirAll here. The caller has already created this directory with a
+	// symlink-checking walk and holds its descriptor, and the output name was
+	// staged inside it — so re-creating the path by name would be both redundant
+	// and the one unanchored step left in this function.
 	// Encode to a temp sibling, then atomically rename onto outPath so a
 	// concurrent OpenLoupe reader never sees a half-written sprite sheet. -f
 	// image2 forces the muxer because the temp path lacks the .jpg extension

@@ -136,32 +136,14 @@ func TestTechVersionClampedNotRejected(t *testing.T) {
 	}
 }
 
-// Clamping an implausible updated_at to 0 would trade a poisoned cursor for
-// permanent churn: PutDeriv stamps now for 0, so an untouched manifest re-emits
-// on every sweep. A row with a usable SourceMtime must settle on a stable value.
-func TestUpdatedAtClampIsStableAcrossSweeps(t *testing.T) {
-	blob := "poster.jpg"
-	mt := nowUnix() - 7200
-	row := derivatives.DerivRow{
-		Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
-		BlobRelPath: &blob, SourceMtime: &mt, SourceSize: i64(1024),
-		UpdatedAt: 1<<63 - 1,
-	}
-	first, ok := sanitizeSidecarRow(row)
-	if !ok {
-		t.Fatal("row dropped")
-	}
-	second, _ := sanitizeSidecarRow(row)
-	if first.UpdatedAt != second.UpdatedAt {
-		t.Errorf("same manifest yielded %d then %d — the changes feed would churn forever",
-			first.UpdatedAt, second.UpdatedAt)
-	}
-	if first.UpdatedAt == 0 {
-		t.Error("clamped to 0, which makes PutDeriv restamp on every sweep")
-	}
-	if first.UpdatedAt != mt {
-		t.Errorf("updated_at = %d, want the asset's own SourceMtime %d", first.UpdatedAt, mt)
-	}
-}
+// This test used to assert that the SANITIZER produced a value stable across
+// sweeps (by falling back to SourceMtime). That was the wrong layer and the
+// wrong property: a stable-but-OLD stamp put skewed farm rows before every
+// consumer's cursor, making them permanently invisible on the changes feed.
+//
+// Stability belongs at INGEST — do not rewrite a row whose content is unchanged
+// — which is what TestUnchangedManifestDoesNotChurnTheFeed now checks end to
+// end. What the sanitizer owes is only that the stamp be plausible and VISIBLE,
+// covered by TestUpdatedAtClampStaysVisibleToTheChangesFeed.
 
 func i64(v int64) *int64 { return &v }

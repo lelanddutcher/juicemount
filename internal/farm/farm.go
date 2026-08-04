@@ -244,15 +244,29 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	if opt.Waveform && len(tech.Audio) > 0 && blobBigEnough {
 		rel := "waveform.json"
 		mt := "application/json"
-		staged, out, stErr := stageUnder(derivDir, rel)
-		err := stErr
+		// No staging for the waveform: it is our own write, so it goes straight
+		// through the descriptor and commits atomically inside WriteFileAt.
+		err := error(nil)
+		if derivDir == nil {
+			err = fmt.Errorf("no safe derivative directory")
+		}
+		wrote := false
 		if err == nil {
-			if _, err = Waveform(opt.FFmpegBin, path, out, opt.WaveformSPP); err == nil {
-				err = commitStaged(derivDir, staged, rel)
+			// Waveform returns (0, nil) when the source has no audio — a success
+			// that writes NOTHING. The enclosing gate uses tech.Audio from an
+			// EARLIER, separate ffprobe, so the two can disagree whenever the
+			// source changes underneath us, which is the normal condition on a
+			// volume a second app writes. Treat "no samples" as no blob.
+			var n int
+			if n, err = Waveform(opt.FFmpegBin, path, derivDir, rel, opt.WaveformSPP); err == nil && n > 0 {
+				wrote = true
 			}
 		}
-		if err != nil {
-			derivatives.DiscardStagedAt(derivDir, staged)
+		if err == nil && !wrote {
+			// No audio after all: publish NO row, exactly as a pre-staging run
+			// would have done. WriteFileAt was never called, so there is nothing
+			// on disk to clean up either.
+		} else if err != nil {
 			blobErrs = append(blobErrs, fmt.Errorf("waveform: %w", err))
 			rows = append(rows, derivatives.DerivRow{
 				Kind: "waveform", Status: "failed", Producer: opt.Producer, Version: opt.Version,

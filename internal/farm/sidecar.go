@@ -57,8 +57,17 @@ type ReconcileResult struct {
 // appear in /derivatives immediately, with no app restart. Idempotent (upserts).
 func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult, error) {
 	var res ReconcileResult
-	base := filepath.Join(mount, ".juicemount", "derivatives")
-	entries, err := os.ReadDir(base)
+	// Enumerated through the anchored walk. Every READ below was already
+	// anchored, so a redirected listing could not smuggle content in — but it
+	// could still send the sweep off to enumerate somebody else's directory and
+	// do a pile of pointless work, and it was the last unanchored access left
+	// under the derivative tree.
+	baseDir, err := derivatives.OpenDirUnder(mount, filepath.Join(".juicemount", "derivatives"))
+	if err != nil {
+		return res, err
+	}
+	entries, err := baseDir.ReadDir(-1)
+	baseDir.Close()
 	if err != nil {
 		return res, err
 	}
@@ -178,18 +187,21 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 	// bytes at all. This is the field the "clamp the informational" sweep
 	// missed. PutDeriv already treats 0 as "stamp now", so 0 is safe to pass.
 	if row.UpdatedAt < 0 || row.UpdatedAt > nowUnix()+updatedAtSkewSlack {
-		// Deliberately NOT 0. PutDeriv treats 0 as "stamp now", so zeroing an
-		// implausible value made the SAME untouched manifest re-emit on every
-		// sweep of the changes feed forever — trading a poisoned cursor for
-		// permanent churn. SourceMtime is a real, already-validated timestamp
-		// tied to the asset, so it is stable across sweeps; falling back to it
-		// keeps the row deterministic. With no vouch either, 0 is correct: the
-		// row genuinely has no trustworthy time and one restamp settles it.
-		if row.SourceMtime != nil && *row.SourceMtime > 0 && *row.SourceMtime <= nowUnix()+updatedAtSkewSlack {
-			row.UpdatedAt = *row.SourceMtime
-		} else {
-			row.UpdatedAt = 0
-		}
+		// Clamp to NOW, not to SourceMtime.
+		//
+		// Falling back to SourceMtime looked better because it is stable across
+		// sweeps — but stable is exactly the problem: a farm host whose clock is
+		// ahead by more than the slack got its rows stamped with the asset's OLD
+		// mtime, landing BEFORE every consumer's cursor. Those derivatives were
+		// then permanently invisible on the changes feed and could never
+		// self-heal. One fast clock was enough; no attacker required.
+		//
+		// `now` is always after a consumer's cursor, so the row is seen. The
+		// churn this was originally dodging is not solved by picking a different
+		// timestamp — it is solved where it belongs, by not REWRITING a row whose
+		// content has not changed (rowContentEqual, at the ingest loop). Choosing
+		// a timestamp to avoid churn was treating the symptom.
+		row.UpdatedAt = nowUnix()
 	}
 	if row.Version < 1 {
 		row.Version = 1
@@ -293,6 +305,50 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 		}
 	}
 	return row, true
+}
+
+// rowContentEqual compares everything that MEANS something to a reader, and
+// deliberately ignores UpdatedAt (it is the thing being decided) and Provenance
+// (set by us, identical for any two sidecar-sourced rows).
+func rowContentEqual(a, b derivatives.DerivRow) bool {
+	eqs := func(x, y *string) bool {
+		if x == nil || y == nil {
+			return x == y
+		}
+		return *x == *y
+	}
+	eqi := func(x, y *int64) bool {
+		if x == nil || y == nil {
+			return x == y
+		}
+		return *x == *y
+	}
+	eqn := func(x, y *int) bool {
+		if x == nil || y == nil {
+			return x == y
+		}
+		return *x == *y
+	}
+	if a.Kind != b.Kind || a.Status != b.Status || a.Producer != b.Producer || a.Version != b.Version {
+		return false
+	}
+	if !eqs(a.Hash, b.Hash) || !eqs(a.BlobRelPath, b.BlobRelPath) || !eqs(a.MediaType, b.MediaType) ||
+		!eqs(a.Model, b.Model) || !eqs(a.Codec, b.Codec) || !eqs(a.CodecString, b.CodecString) {
+		return false
+	}
+	if !eqi(a.SourceSize, b.SourceSize) || !eqi(a.SourceMtime, b.SourceMtime) || !eqi(a.BlobSize, b.BlobSize) {
+		return false
+	}
+	if !eqn(a.Dim, b.Dim) {
+		return false
+	}
+	if (a.Filmstrip == nil) != (b.Filmstrip == nil) {
+		return false
+	}
+	if a.Filmstrip != nil && *a.Filmstrip != *b.Filmstrip {
+		return false
+	}
+	return true
 }
 
 // isHashHex reports whether s looks like a provider-emitted xxh3-64 digest.
@@ -556,6 +612,14 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 			res.Errs++
 		}
 	}
+	// One read of what is already indexed, so an unchanged manifest re-ingests
+	// as a no-op instead of re-emitting every row on the changes feed.
+	existing := map[string]derivatives.DerivRow{}
+	if prior, perr := store.Manifest(sc.Inode); perr == nil {
+		for _, pr := range prior {
+			existing[pr.Kind] = pr
+		}
+	}
 	for _, row := range sc.Derivatives {
 		// A manifest on the volume supplies DATA, never POLICY — re-derive the
 		// trust-bearing fields and drop anything that does not fit the contract.
@@ -569,6 +633,14 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 				"inode", sc.Inode, "kind", row.Kind, "status", row.Status,
 				"blob_rel_path", derefStr(row.BlobRelPath))
 			res.Errs++
+			continue
+		}
+		// Skip a row that is materially identical to the one already indexed.
+		// Every upsert bumps updated_at, and updated_at is the changes-feed
+		// cursor — so re-ingesting an UNCHANGED manifest on every sweep made the
+		// same derivatives re-emit forever. This is the honest place to fix that:
+		// nothing changed, so nothing should be published as changed.
+		if prior, ok := existing[clean.Kind]; ok && rowContentEqual(prior, clean) {
 			continue
 		}
 		if err := store.PutDeriv(sc.Inode, clean); err != nil {

@@ -126,11 +126,32 @@ func StageNameAt(dir *os.File, name string) (stagedName, absPath string, err err
 // CommitStagedAt renames a staged name onto its final name through dir's
 // descriptor, so the COMMIT itself cannot be redirected even though the
 // subprocess wrote by path.
+//
+// IT REFUSES AN EMPTY STAGED FILE, and that check is the point rather than a
+// nicety. StageNameAt creates the output file BEFORE the generator runs, so a
+// generator that returns nil WITHOUT writing anything — Waveform does exactly
+// that when the source turns out to have no audio — would otherwise publish the
+// 0-byte placeholder as a `ready` derivative. That inverts the project's
+// fail-closed rule: a missing blob 404s and the reader regenerates locally,
+// whereas a 0-byte blob is served with 200 and looks like a real answer. A
+// staging design must never be able to commit bytes the generator did not write.
 func CommitStagedAt(dir *os.File, stagedName, finalName string) error {
 	if err := validLeaf(finalName); err != nil {
 		return err
 	}
 	dfd := int(dir.Fd())
+	var st unix.Stat_t
+	if err := unix.Fstatat(dfd, stagedName, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("derivatives: staged %q vanished before commit: %w", stagedName, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		_ = unix.Unlinkat(dfd, stagedName, 0)
+		return fmt.Errorf("derivatives: staged %q is not a regular file", stagedName)
+	}
+	if st.Size == 0 {
+		_ = unix.Unlinkat(dfd, stagedName, 0)
+		return fmt.Errorf("derivatives: refusing to publish an empty %q — the generator wrote nothing", finalName)
+	}
 	if err := unix.Renameat(dfd, stagedName, dfd, finalName); err != nil {
 		_ = unix.Unlinkat(dfd, stagedName, 0)
 		return fmt.Errorf("derivatives: commit %q: %w", finalName, err)

@@ -97,8 +97,14 @@ func TestWaveformFoldsAllStreams(t *testing.T) {
 	if o, err := gen.CombinedOutput(); err != nil {
 		t.Fatalf("generate 2-stream fixture: %v\n%s", err, o)
 	}
+	// Waveform writes through a DIRECTORY DESCRIPTOR now, not a path.
+	outDir, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outDir.Close()
 	out := filepath.Join(dir, "wave.json")
-	n, err := Waveform(ffmpeg, src, out, 1024)
+	n, err := Waveform(ffmpeg, src, outDir, "wave.json", 1024)
 	if err != nil {
 		t.Fatalf("Waveform: %v", err)
 	}
