@@ -129,17 +129,23 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	// Blob size gate: a sub-threshold clip keeps its tech row above but skips
 	// the decode-heavy poster/filmstrip/waveform. 0 = generate for everything.
 	blobBigEnough := opt.MinBlobSizeBytes <= 0 || size >= opt.MinBlobSizeBytes
-	if opt.Blobs && blobBigEnough {
-		// Create the per-inode directory with a symlink-checking walk BEFORE any
-		// generator writes into it. os.MkdirAll (which every generator calls)
-		// FOLLOWS a symlinked component, so a planted
-		// .juicemount/derivatives/<inode> -> /somewhere redirects ffmpeg output
-		// out of the volume — and the farm runs as root. Creating it safely here
-		// means the generators' own MkdirAll finds it already present.
-		if derr := derivatives.EnsureDirUnder(opt.Mount, derivatives.DerivDirRel(inode)); derr != nil {
-			res.Err = fmt.Errorf("derivative dir: %w", derr)
-			return res
-		}
+	// Create the per-inode directory with a symlink-checking walk BEFORE anything
+	// writes into it. os.MkdirAll — which every generator calls — FOLLOWS a
+	// symlinked component, so a planted .juicemount/derivatives/<inode> link
+	// redirects ffmpeg output, the transcript blob and the manifest itself out of
+	// the volume, on a host where the farm runs as root. Creating it safely here
+	// means each generator's own MkdirAll finds it already present.
+	//
+	// UNCONDITIONAL on purpose. Gating this on opt.Blobs left real holes: the
+	// waveform is gated on opt.Waveform, the transcript on its own flag, and the
+	// manifest is written for every asset regardless — so a -blobs=false run
+	// skipped the guard while still writing three kinds of file into that
+	// directory. It also costs nothing: the manifest write creates this directory
+	// for every processed asset anyway, so no empty directory appears that would
+	// not have existed.
+	if derr := derivatives.EnsureDirUnder(opt.Mount, derivatives.DerivDirRel(inode)); derr != nil {
+		res.Err = fmt.Errorf("derivative dir: %w", derr)
+		return res
 	}
 	if opt.Blobs && tech.Video != nil && blobBigEnough {
 		rel := "poster.jpg"

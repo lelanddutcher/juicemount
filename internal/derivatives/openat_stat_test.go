@@ -78,3 +78,30 @@ func TestStatRegularUnderGuarantees(t *testing.T) {
 		}
 	})
 }
+
+// statInfo carries only PERMISSION bits from the raw stat, and Go's convention
+// is that a FileMode with no type bits set means "regular" — so IsRegular() is
+// true by construction rather than by intent. That is correct but accidental,
+// and a caller checking Mode() would be silently wrong if the type bits were
+// ever copied in without ModeType handling. Pinned so it cannot drift.
+func TestStatRegularUnderModeReportsRegular(t *testing.T) {
+	mount := t.TempDir()
+	rel := DerivBlobRel(710009, "poster.jpg")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(mount, rel)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mount, rel), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := StatRegularUnder(mount, rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Errorf("Mode().IsRegular() = false for a regular file (mode %v) — "+
+			"a caller checking it would reject every valid blob", fi.Mode())
+	}
+	if fi.IsDir() {
+		t.Error("IsDir() = true for a regular file")
+	}
+}

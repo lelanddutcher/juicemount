@@ -100,3 +100,35 @@ func TestManifestReadIsGuardedAndBounded(t *testing.T) {
 		}
 	})
 }
+
+// A refused manifest must be REPORTED, not silently indistinguishable from
+// "this inode has no sidecar". A cap that hides what it dropped reads as
+// "covered everything" when it did not.
+func TestRefusedManifestIsCountedNotSilent(t *testing.T) {
+	mount := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "m.json"), []byte(`{"inode":740001}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(mount, derivatives.DerivDirRel(740001))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "m.json"), filepath.Join(dir, "manifest.json")); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := derivatives.Open(":memory:")
+	defer store.Close()
+
+	res := reconcileOneSidecarInto(store, mount, 740001)
+	if res.Errs == 0 {
+		t.Error("a refused manifest was not counted as an error — it is indistinguishable from absent")
+	}
+
+	// An inode with genuinely no sidecar must stay silent (the full walk hits
+	// this constantly; counting it would drown the signal).
+	quiet := reconcileOneSidecarInto(store, mount, 740002)
+	if quiet.Errs != 0 {
+		t.Errorf("absent sidecar counted as an error (Errs=%d) — the walk would be all noise", quiet.Errs)
+	}
+}

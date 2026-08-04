@@ -2,6 +2,7 @@ package farm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -452,7 +453,18 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 	scRel := derivatives.DerivBlobRel(inode, "manifest.json")
 	raw, err := readSidecarBounded(mount, scRel)
 	if err != nil {
-		return res // no sidecar for this inode (blob-only dir / absent)
+		// ABSENT is normal and silent — most inode dirs are blob-only, and the
+		// full walk hits this constantly. REFUSED is not: a manifest rejected for
+		// being a symlink, a non-regular file, or over the size cap means an
+		// asset's derivatives are invisible, and reporting that identically to
+		// "there is no sidecar here" is exactly the silent truncation that makes
+		// a cap read as "covered everything".
+		if !errors.Is(err, os.ErrNotExist) {
+			jmlog.Warn("sidecar reconcile: manifest refused — this asset's derivatives are NOT indexed",
+				"inode", inode, "rel", scRel, "error", err)
+			res.Errs++
+		}
+		return res
 	}
 	res.Sidecars++
 	// A sidecar freshly (re)written server-side can read back torn/partial on
