@@ -176,6 +176,59 @@ func TestAIBlobWriteName_LegacyOnlyStaysLegacy(t *testing.T) {
 	}
 }
 
+// TestSetVersionKeyForBlob_KeyFollowsFilename pins the 2026-08-03 audit finding:
+// a blob still written under the LEGACY filename must keep the LEGACY version
+// key. Emitting logger_version into an ai.loupe.json would silently break every
+// consumer that decodes only loupe_version (shipped ClipLogger v0.9.3), and the
+// consume path swallows the decode error, so it would go dark with no signal.
+func TestSetVersionKeyForBlob_KeyFollowsFilename(t *testing.T) {
+	keys := func(doc *LoupeJSON) map[string]any {
+		b, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+
+	// Legacy filename -> loupe_version ONLY.
+	legacy := &LoupeJSON{LoggerVersion: 1, SchemaVersion: "1.0", IndexedAt: "2026-08-03T00:00:00Z"}
+	legacy.SetVersionKeyForBlob(derivatives.AIBlobNameLegacy)
+	m := keys(legacy)
+	if _, ok := m["loupe_version"]; !ok {
+		t.Errorf("legacy-named blob must carry loupe_version, got %v", m)
+	}
+	if _, bad := m["logger_version"]; bad {
+		t.Errorf("legacy-named blob must NOT carry logger_version, got %v", m)
+	}
+
+	// Post-cutover filename -> logger_version ONLY.
+	modern := &LoupeJSON{LoggerVersion: 1, SchemaVersion: "1.0", IndexedAt: "2026-08-03T00:00:00Z"}
+	modern.SetVersionKeyForBlob(derivatives.AIBlobName)
+	m = keys(modern)
+	if _, ok := m["logger_version"]; !ok {
+		t.Errorf("current-named blob must carry logger_version, got %v", m)
+	}
+	if _, bad := m["loupe_version"]; bad {
+		t.Errorf("current-named blob must NOT carry loupe_version, got %v", m)
+	}
+
+	// A doc decoded FROM legacy (version folded into LoggerVersion) still emits
+	// the legacy key when it is written back to the legacy name.
+	var round LoupeJSON
+	if err := json.Unmarshal([]byte(`{"loupe_version":1,"schema_version":"1.0","indexed_at":"2026-08-03T00:00:00Z"}`), &round); err != nil {
+		t.Fatal(err)
+	}
+	round.SetVersionKeyForBlob(derivatives.AIBlobNameLegacy)
+	m = keys(&round)
+	if v, ok := m["loupe_version"]; !ok || v.(float64) != 1 {
+		t.Errorf("round-tripped legacy blob lost its version: %v", m)
+	}
+}
+
 func TestLoupeJSON_VersionKeyDualReadWriteNew(t *testing.T) {
 	// READ: the legacy key folds into LoggerVersion.
 	var legacy LoupeJSON

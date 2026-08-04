@@ -21,7 +21,7 @@ derivatives** of your media so that client apps never have to compute them on-de
 | **filmstrip** | a contact-sheet of frames for scrubbing | `ffmpeg` |
 | **waveform** | an audio waveform image (per-channel) | `ffmpeg` |
 | **proxy** | a small, seek-friendly H.264/MP4 playback proxy of a heavy original | `ffmpeg` (`libx264`) |
-| **transcript** | a spoken-word transcript (`ai.loupe.json`) | `whisper.cpp` |
+| **transcript** | a spoken-word transcript (`ai.logger.json`) | `whisper.cpp` |
 
 The point: a 4K ProRes camera original is expensive to scrub, preview, or transcode.
 The farm transcodes a lightweight proxy **once, server-side**, and **every** client that
@@ -212,7 +212,7 @@ farm pre-aggregates status to `/state/farm-status.json` and the manager relays i
   Farm tab (read-only).
 - **Earmarked:** atomic blob writes deploy; manager-driven job control + scheduling +
   per-directory opt-in (don't proxy an NLE's own proxies); GPU/ML workers for richer AI
-  (faces / OCR / framing) writing `ai.loupe.json`; locality/residency hints.
+  (faces / OCR / framing) writing `ai.logger.json`; locality/residency hints.
 
 For the wire contract OpenLoupe and JuiceMount share, see the private
 `juicemount-contract` repository (spec + golden fixtures + `PROVIDER_STATUS` /

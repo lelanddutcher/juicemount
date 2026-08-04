@@ -23,8 +23,9 @@ import (
 type LoupeJSON struct {
 	// LoggerVersion is the envelope version. WIRE-TERM CUTOVER (2026-08-03,
 	// CONSUMER_STATUS 07-18 §2, founder-acked): the key on the wire is now
-	// `logger_version`. We WRITE this one.
-	LoggerVersion int `json:"logger_version"`
+	// `logger_version`. omitempty because EXACTLY ONE of the two version keys is
+	// emitted — see SetVersionKeyForBlob.
+	LoggerVersion int `json:"logger_version,omitempty"`
 	// LegacyLoupeVersion carries the pre-cutover `loupe_version` key on READ
 	// only — `omitempty` plus the normalization in UnmarshalJSON means we never
 	// emit it. Kept indefinitely: the old name is still accepted on both sides
@@ -48,9 +49,40 @@ func (l *LoupeJSON) UnmarshalJSON(b []byte) error {
 	if a.LoggerVersion == 0 && a.LegacyLoupeVersion != 0 {
 		a.LoggerVersion = a.LegacyLoupeVersion
 	}
-	a.LegacyLoupeVersion = 0 // never re-emit the legacy key
+	a.LegacyLoupeVersion = 0 // normalize: readers consult LoggerVersion only
 	*l = LoupeJSON(a)
 	return nil
+}
+
+// SetVersionKeyForBlob makes the envelope's version KEY agree with the blob's
+// FILENAME, and must be called immediately before writing.
+//
+// WHY (2026-08-03 audit, HIGH). AIBlobWriteName deliberately keeps writing to a
+// legacy-named `ai.loupe.json` when that is the only blob present, so a
+// pre-cutover reader is not left on a stale file. But the envelope emitted
+// `logger_version` unconditionally, so that write kept the old NAME while
+// flipping the KEY inside — and a consumer that decodes only `loupe_version`
+// (shipped ClipLogger v0.9.3 does exactly that) would stop reading a file it had
+// been reading fine. The consume path wraps the decode in `try?`, so it would
+// have gone dark silently rather than erroring. There are ~2,000 such blobs in
+// the field.
+//
+// Rule: legacy filename => legacy key; post-cutover filename => new key. The
+// schema requires exactly one of the two (anyOf), and both are omitempty, so
+// whichever we zero simply does not appear.
+func (l *LoupeJSON) SetVersionKeyForBlob(blobName string) {
+	v := l.LoggerVersion
+	if v == 0 {
+		v = l.LegacyLoupeVersion
+	}
+	if v == 0 {
+		v = 1
+	}
+	if blobName == derivatives.AIBlobNameLegacy {
+		l.LegacyLoupeVersion, l.LoggerVersion = v, 0
+		return
+	}
+	l.LoggerVersion, l.LegacyLoupeVersion = v, 0
 }
 
 // LoupeMedia is the FULL tech block. Per AI_DELIVERY_SPEC Rule B, OpenLoupe's
@@ -292,6 +324,11 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 		Media:         buildMedia(path, tech, hash), // full block every time (Rule B)
 		AI:            ai,
 	}
+
+	// Keep the version KEY consistent with the blob's NAME. Writing
+	// `logger_version` into a still-legacy-named blob silently breaks a consumer
+	// that decodes only `loupe_version`.
+	doc.SetVersionKeyForBlob(rel)
 
 	if err := writeLoupe(blobPath, doc); err != nil {
 		res.Err = fmt.Errorf("write %s: %w", rel, err)

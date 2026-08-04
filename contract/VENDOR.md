@@ -5,7 +5,7 @@ repo — the language-neutral wire contract between JuiceMount and OpenLoupe.
 
 - **Source:** `github.com/lelanddutcher/juicemount-contract`
 - **Pinned commit:** `09092e3cd18834c662aed5116186fd6abfd0912f`
-- **contract_version:** see [`VERSION`](VERSION) (currently `1`)
+- **contract_version:** see [`VERSION`](VERSION) (currently `2`)
 
 Only `spec/` (schemas) + `fixtures/` (golden responses) + `VERSION` are vendored — the
 files the Go conformance test reads. We vendor a copy rather than a git submodule because
