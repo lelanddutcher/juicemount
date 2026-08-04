@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -3636,6 +3637,10 @@ type registerRequest struct {
 	SourceSize  int64  `json:"source_size"`
 	SourceMtime int64  `json:"source_mtime"`
 	BlobRelPath string `json:"blob_rel_path"`
+	// Codec is REQUIRED for kind=="proxy". derivatives.schema.json says an
+	// absent codec means h264, so an on-device HEVC proxy registered without it
+	// is silently mislabelled to every downstream reader and fails to play.
+	Codec string `json:"codec,omitempty"`
 }
 
 // registerResponse is the 200 body. Schema: contract/spec/schema/register.schema.json.
@@ -3736,9 +3741,15 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	// ORDER MATTERS: this runs AFTER the inode lookup. Placed before it, an
 	// unknown inode reported 409 "blob missing" instead of 404 "inode not
 	// found" — a real regression caught by TestDerivativesRegisterOL1.
-	if _, statErr := os.Stat(filepath.Join(blobDir, rel)); statErr != nil {
+	if li, statErr := os.Lstat(filepath.Join(blobDir, rel)); statErr != nil {
 		http.Error(w, fmt.Sprintf("blob %q not present under the derivative dir — write it (atomically) BEFORE registering: %v",
 			rel, statErr), http.StatusConflict)
+		return
+	} else if !li.Mode().IsRegular() {
+		// Lstat, not Stat: a symlink here would otherwise register cleanly and
+		// then be served by /blob as whatever it points at.
+		http.Error(w, fmt.Sprintf("blob %q must be a regular file, got mode %s", rel, li.Mode()),
+			http.StatusBadRequest)
 		return
 	}
 
@@ -3772,6 +3783,50 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	if req.Model != "" {
 		modelP = &req.Model
 	}
+	// PRODUCER PRECEDENCE (2026-08-04 review, HIGH). PutDeriv is a blind upsert
+	// on (inode,kind), so before this an on-device register silently replaced a
+	// farm-produced row — flipping producer "linux-farm" -> "on-device" and
+	// repointing the row at different bytes, with no admin visibility and no
+	// self-healing resync. The farm is the higher-trust producer (it hashes the
+	// source itself and runs the locked recipe), so a consumer may ADD a kind the
+	// farm has not produced, and may replace its OWN earlier contribution, but may
+	// not overwrite the farm's.
+	if existing, mErr := ds.Manifest(req.Inode); mErr == nil {
+		for _, er := range existing {
+			if er.Kind != req.Kind {
+				continue
+			}
+			if er.Producer == "linux-farm" && req.Producer != "linux-farm" {
+				http.Error(w, fmt.Sprintf(
+					"kind %q for inode %d already has a farm-produced row; a %q contribution may not replace it",
+					req.Kind, req.Inode, req.Producer), http.StatusConflict)
+				return
+			}
+		}
+	}
+
+	// CODEC (2026-08-04 review, MEDIUM + the founder's codec ruling). A
+	// contributed proxy MUST meet the H.264 floor: PROXY_CODEC_SPEC makes H.264
+	// the guaranteed-decodable floor, #50's codec/codec_string exist so richer
+	// codecs ship BESIDE it rather than replacing it, and the manifest PK is
+	// (inode,kind) — ONE proxy slot. An HEVC-only contribution therefore leaves
+	// any reader that cannot decode HEVC with nothing, and the web UI is a stated
+	// consumer. Declare it explicitly so we never infer it from silence.
+	var codecP *string
+	if req.Kind == "proxy" {
+		c := strings.ToLower(strings.TrimSpace(req.Codec))
+		if c == "" {
+			http.Error(w, `kind "proxy" requires an explicit "codec" — an absent codec is read as h264 by every downstream reader`, 400)
+			return
+		}
+		if c != "h264" {
+			http.Error(w, fmt.Sprintf(
+				`contributed proxies must meet the H.264 floor (got %q). Encode H.264/AAC faststart for the contributed copy and keep richer codecs local; multi-rung support needs a manifest shape that does not exist yet`, c), 400)
+			return
+		}
+		codecP = &c
+	}
+
 	var dimP *int
 	if req.Dim > 0 {
 		dimP = &req.Dim
@@ -3786,6 +3841,7 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:   time.Now().Unix(),
 		SourceSize:  &srcSize,
 		SourceMtime: &srcMtime,
+		Codec:       codecP,
 	}
 	if err := ds.PutSource(req.Inode, &hash); err != nil {
 		http.Error(w, "put source: "+err.Error(), 500)
@@ -3799,6 +3855,44 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		"inode", req.Inode, "kind", req.Kind, "blob", rel,
 		"producer", req.Producer, "model", req.Model, "hash", hash)
 	writeContractJSON(w, registerResponse{Inode: req.Inode, Registered: true, Derivative: row})
+}
+
+// openRegularNoSymlink opens a derivative blob, refusing anything that is not a
+// plain regular file.
+//
+// SECURITY (2026-08-04 review, CRITICAL). os.Stat and os.Open both FOLLOW
+// symlinks. The derivative tree is writable by any consumer with mount access —
+// that is the premise of contribute-back — so a symlink planted at a reserved
+// blob name (`proxy.mp4` -> /Users/<you>/.ssh/id_rsa) turned GET /blob into an
+// arbitrary local-file read, streamed with byte-range support and labelled with
+// the row's media type. The control plane binds 127.0.0.1 and is
+// unauthenticated, so any local process could drive it.
+//
+// Checking only at register time is NOT sufficient: the file can be swapped for
+// a symlink after a clean registration. This is therefore enforced at the OPEN,
+// using O_NOFOLLOW so the kernel refuses the final component, plus an Lstat
+// belt-and-braces for the non-regular cases O_NOFOLLOW does not cover (fifos,
+// devices, sockets — a fifo at a blob path would otherwise block the handler).
+func openRegularNoSymlink(path string) (*os.File, error) {
+	if li, lerr := os.Lstat(path); lerr != nil {
+		return nil, lerr
+	} else if !li.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing non-regular blob %q (mode %s)", path, li.Mode())
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	fi, serr := f.Stat()
+	if serr != nil {
+		f.Close()
+		return nil, serr
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("refusing non-regular blob %q (mode %s)", path, fi.Mode())
+	}
+	return f, nil
 }
 
 // handleBlobHTTP serves GET /blob?inode=N&kind=proxy (PROXY-CODEC #50): the
@@ -3900,7 +3994,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	smallKind := kind != "proxy"
 	if tc != nil && smallKind {
 		if lp, ok := tc.Path(inode, kind); ok {
-			if lf, lerr := os.Open(lp); lerr == nil {
+			if lf, lerr := openRegularNoSymlink(lp); lerr == nil {
 				defer lf.Close()
 				if lfi, serr := lf.Stat(); serr == nil {
 					w.Header().Set("Content-Type", mediaType)
@@ -3911,7 +4005,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	f, err := os.Open(blobPath)
+	f, err := openRegularNoSymlink(blobPath)
 	if err != nil {
 		http.Error(w, "blob unreadable", http.StatusNotFound)
 		return

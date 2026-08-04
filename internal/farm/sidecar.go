@@ -95,6 +95,101 @@ func ReconcileOneSidecar(store *derivatives.Store, mount string, inode uint64) (
 	return true, nil
 }
 
+// blobMediaTypes pins the Content-Type served for each blob kind. It is the
+// SINGLE authority: a media type must never come from a file on the volume,
+// because /blob sets its response Content-Type from the row and the derivative
+// tree is writable by any consumer with mount access.
+var blobMediaTypes = map[string]string{
+	"ai":          "application/json",
+	"proxy":       "video/mp4",
+	"audio_proxy": "audio/mp4",
+	"thumbnail":   "image/jpeg",
+	"filmstrip":   "image/jpeg",
+	"waveform":    "application/json",
+}
+
+// sanitizeSidecarRow re-derives every trust-bearing field of a manifest row read
+// off the volume, and reports whether the row may be ingested at all.
+//
+// SECURITY (2026-08-04 review, CRITICAL). reconcileOneSidecarInto used to hand
+// `sc.Derivatives` straight to PutDeriv with NO validation of kind, producer,
+// media_type or blob_rel_path — and the derivatives table has no CHECK
+// constraints either. Since manifest.json lives on a volume any consumer can
+// write, that was a complete bypass of every guard on POST /derivatives/register:
+// write a manifest declaring media_type "text/html" plus an HTML blob, touch
+// /derivatives?inode=N to trigger the on-miss reconcile, and /blob then served
+// attacker HTML with that Content-Type from the control-plane origin.
+//
+// The file may carry DATA (which kinds exist, their hashes and sizes). It may
+// not carry POLICY (what a kind is called, what type it is served as, where its
+// bytes live).
+func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
+	// Status is not free-form, but "failed" is legitimate state the farm writes
+	// (farm.go:139/:159) — it tells readers the artifact will not appear, so
+	// dropping it would make a known failure look like an ungenerated asset.
+	if row.Status != "ready" && row.Status != "failed" {
+		return row, false
+	}
+
+	mt, isBlobKind := blobMediaTypes[row.Kind]
+	if !isBlobKind {
+		// Non-blob kinds (tech/embedding/transcript/ocr/faces) are /metadata
+		// rows. They serve no bytes, so they carry no Content-Type risk — but
+		// they must not smuggle a blob path either.
+		if !nonBlobKinds[row.Kind] {
+			return row, false // unknown kind entirely
+		}
+		row.BlobRelPath, row.MediaType = nil, nil
+		return row, true
+	}
+
+	// Blob kinds: the media type is OURS, always.
+	row.MediaType = &mt
+	// The blob path must be the reserved flat filename for the kind — never a
+	// path, never another kind's artifact, never an arbitrary name. A `failed`
+	// row legitimately has no blob at all.
+	if row.BlobRelPath != nil {
+		want, ok := reservedBlobName(row.Kind)
+		if !ok {
+			return row, false
+		}
+		if *row.BlobRelPath != want {
+			// `ai` has two accepted spellings across the logger/loupe cutover.
+			if !(row.Kind == "ai" && *row.BlobRelPath == derivatives.AIBlobNameLegacy) {
+				return row, false
+			}
+		}
+	}
+	return row, true
+}
+
+// nonBlobKinds are manifest kinds that carry no bytes — they are fetched via
+// /metadata, never /blob, so they need no media type or reserved filename.
+var nonBlobKinds = map[string]bool{
+	"tech": true, "embedding": true, "transcript": true, "ocr": true, "faces": true,
+}
+
+// reservedBlobName is the on-disk filename for a blob kind (spec/WRITE_PLACEMENT
+// §2). ai is special: it has two accepted spellings across the logger/loupe
+// cutover, so the caller compares against whichever is present.
+func reservedBlobName(kind string) (string, bool) {
+	switch kind {
+	case "proxy":
+		return "proxy.mp4", true
+	case "audio_proxy":
+		return "audio_proxy.mp4", true
+	case "thumbnail":
+		return "poster.jpg", true
+	case "filmstrip":
+		return "strip.jpg", true
+	case "waveform":
+		return "waveform.json", true
+	case "ai":
+		return derivatives.AIBlobName, true
+	}
+	return "", false
+}
+
 // reconcileOneSidecarInto reads + ingests <mount>/.juicemount/derivatives/<inode>/
 // manifest.json into the store, returning per-call counts. The shared core of
 // both the full walk (ReconcileSidecars) and the on-miss path (ReconcileOneSidecar).
@@ -152,7 +247,17 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 		_ = store.PutMetadata(sc.Inode, "tech", sc.Tech.Producer, sc.Tech.Version, sc.Tech.Hash, sc.Tech.Payload)
 	}
 	for _, row := range sc.Derivatives {
-		if err := store.PutDeriv(sc.Inode, row); err != nil {
+		// A manifest on the volume supplies DATA, never POLICY — re-derive the
+		// trust-bearing fields and drop anything that does not fit the contract.
+		clean, ok := sanitizeSidecarRow(row)
+		if !ok {
+			jmlog.Warn("sidecar reconcile: dropping row that violates the blob contract",
+				"inode", sc.Inode, "kind", row.Kind, "status", row.Status,
+				"blob_rel_path", derefStr(row.BlobRelPath))
+			res.Errs++
+			continue
+		}
+		if err := store.PutDeriv(sc.Inode, clean); err != nil {
 			res.Errs++
 			return res
 		}
@@ -199,4 +304,12 @@ func WriteManifestSidecar(store *derivatives.Store, mount string, inode uint64) 
 		return err
 	}
 	return atomicWriteFile(path, b, 0o644)
+}
+
+// derefStr is a nil-safe *string for log lines.
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }

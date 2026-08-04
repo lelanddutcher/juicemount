@@ -32,7 +32,7 @@ func TestReconcileOneSidecar(t *testing.T) {
 	}
 
 	// 2. Write a sidecar exactly where the farm would.
-	hash, blob := "abc123", "filmstrip.jpg"
+	hash, blob := "abc123", "strip.jpg" // the farm writes strip.jpg; "filmstrip.jpg" was a wrong fixture
 	sc := ManifestSidecar{
 		Inode:      inode,
 		SourceHash: strptr("src-hash-xyz"),
@@ -149,4 +149,75 @@ func TestReconcileRefusesManifestWhoseInodeDisagreesWithItsDirectory(t *testing.
 	if rows, err := store.Manifest(victimInode); err == nil && len(rows) > 0 {
 		t.Errorf("rows were written for inode %d from a manifest under %d: %+v", victimInode, dirInode, rows)
 	}
+}
+
+// The reviewer's exact attack (2026-08-04, CRITICAL): manifest.json lives on a
+// volume any consumer can write, and reconcile used to hand its rows straight to
+// PutDeriv. A row declaring media_type "text/html" plus an HTML blob therefore
+// made /blob serve attacker HTML with that Content-Type from the control-plane
+// origin — bypassing every guard on POST /derivatives/register.
+func TestSanitizeSidecarRow_RejectsPolicyFromTheVolume(t *testing.T) {
+	str := func(s string) *string { return &s }
+
+	t.Run("attacker media_type is overridden, never honoured", func(t *testing.T) {
+		evil := "text/html"
+		row := derivatives.DerivRow{
+			Kind: "proxy", Status: "ready", Producer: "linux-farm",
+			BlobRelPath: str("proxy.mp4"), MediaType: &evil,
+		}
+		got, ok := sanitizeSidecarRow(row)
+		if !ok {
+			t.Fatal("a well-formed proxy row should be ingestable")
+		}
+		if got.MediaType == nil || *got.MediaType != "video/mp4" {
+			t.Errorf("media type = %v, want the server-pinned video/mp4", got.MediaType)
+		}
+	})
+
+	t.Run("arbitrary blob filename is refused", func(t *testing.T) {
+		row := derivatives.DerivRow{
+			Kind: "proxy", Status: "ready", Producer: "linux-farm",
+			BlobRelPath: str("pwn.html"), MediaType: str("text/html"),
+		}
+		if _, ok := sanitizeSidecarRow(row); ok {
+			t.Error("a row naming a non-reserved blob file must be dropped")
+		}
+	})
+
+	t.Run("unknown kind is refused", func(t *testing.T) {
+		row := derivatives.DerivRow{Kind: "totally-made-up", Status: "ready", Producer: "linux-farm"}
+		if _, ok := sanitizeSidecarRow(row); ok {
+			t.Error("an unknown kind must be dropped")
+		}
+	})
+
+	t.Run("no blob kind may declare a scriptable type", func(t *testing.T) {
+		for kind := range blobMediaTypes {
+			got, ok := sanitizeSidecarRow(derivatives.DerivRow{
+				Kind: kind, Status: "ready", Producer: "linux-farm",
+				MediaType: str("text/html"),
+			})
+			if !ok {
+				continue
+			}
+			switch *got.MediaType {
+			case "text/html", "application/javascript", "image/svg+xml":
+				t.Errorf("kind %q sanitized to scriptable %q", kind, *got.MediaType)
+			}
+		}
+	})
+
+	// Legitimate shapes the farm actually writes must survive.
+	t.Run("farm-written shapes survive", func(t *testing.T) {
+		for _, row := range []derivatives.DerivRow{
+			{Kind: "filmstrip", Status: "ready", Producer: "linux-farm", BlobRelPath: str("strip.jpg")},
+			{Kind: "thumbnail", Status: "failed", Producer: "linux-farm"},
+			{Kind: "tech", Status: "ready", Producer: "linux-farm"},
+			{Kind: "ai", Status: "ready", Producer: "on-device", BlobRelPath: str(derivatives.AIBlobNameLegacy)},
+		} {
+			if _, ok := sanitizeSidecarRow(row); !ok {
+				t.Errorf("legitimate row dropped: kind=%q status=%q", row.Kind, row.Status)
+			}
+		}
+	})
 }
