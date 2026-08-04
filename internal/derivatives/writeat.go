@@ -157,10 +157,26 @@ func CommitStagedAt(dir *os.File, stagedName, finalName string) error {
 	// open was one of the unanchored steps removed with their inner staging, so
 	// the durability it provided moves here, where it can be done on a
 	// descriptor-relative open instead of by name.
-	if sfd, oerr := unix.Openat(dfd, stagedName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0); oerr == nil {
-		sf := os.NewFile(uintptr(sfd), stagedName)
-		_ = sf.Sync()
+	// FAIL-CLOSED. The helper this replaced returned before renaming if the
+	// fsync failed, and the first version here discarded both errors and
+	// published regardless — moving the fsync but not its error handling.
+	// fsync is exactly where deferred writeback errors surface (EIO, or
+	// ENOSPC/EDQUOT under delayed allocation), i.e. the case where the bytes are
+	// NOT on disk. Publishing then is publishing a blob we know may be short.
+	sfd, oerr := unix.Openat(dfd, stagedName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if oerr != nil {
+		_ = unix.Unlinkat(dfd, stagedName, 0)
+		return fmt.Errorf("derivatives: reopen %q to fsync: %w", stagedName, oerr)
+	}
+	sf := os.NewFile(uintptr(sfd), stagedName)
+	if serr := sf.Sync(); serr != nil {
 		_ = sf.Close()
+		_ = unix.Unlinkat(dfd, stagedName, 0)
+		return fmt.Errorf("derivatives: fsync %q before publish: %w", stagedName, serr)
+	}
+	if cerr := sf.Close(); cerr != nil {
+		_ = unix.Unlinkat(dfd, stagedName, 0)
+		return fmt.Errorf("derivatives: close %q before publish: %w", stagedName, cerr)
 	}
 	if err := unix.Renameat(dfd, stagedName, dfd, finalName); err != nil {
 		_ = unix.Unlinkat(dfd, stagedName, 0)

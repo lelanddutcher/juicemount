@@ -580,7 +580,12 @@ func decodeExtra(d *DerivRow, extra sql.NullString) {
 		if d.Kind == "filmstrip" {
 			d.Filmstrip = env.Filmstrip
 		}
-		if d.Kind == "proxy" {
+		// audio_proxy carries the same codec envelope as proxy (A8: a small
+		// streamable stereo-AAC MP4). Re-hydrating for only one of them meant an
+		// audio_proxy row was persisted WITH these fields and read back WITHOUT
+		// them, so it could never round-trip — and the reconcile's unchanged-row
+		// skip therefore re-published it on every sweep, forever.
+		if d.Kind == "proxy" || d.Kind == "audio_proxy" {
 			d.Codec, d.CodecString, d.BlobSize = env.Codec, env.CodecString, env.BlobSize
 		}
 		return

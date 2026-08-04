@@ -69,20 +69,6 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 	return nil
 }
 
-// syncFile fsyncs an already-written file's bytes by path. A read-only open is
-// sufficient for fsync(2) on both Linux and macOS.
-func syncFile(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
-}
-
 // syncDir best-effort fsyncs a directory so a contained rename/create is durable.
 // Directory fsync is advisory on some platforms; failures are non-fatal because
 // the rename itself already gave us atomicity for the reader-visibility guarantee.

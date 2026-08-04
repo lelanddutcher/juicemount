@@ -20,7 +20,7 @@ func TestSanitizedRowSurvivesStoreRoundTrip(t *testing.T) {
 	codec, codecStr := "h264", "avc1.640028"
 	blobSize := int64(4096)
 
-	for _, kind := range []string{"tech", "thumbnail", "filmstrip", "waveform", "proxy", "ai"} {
+	for _, kind := range []string{"tech", "thumbnail", "filmstrip", "waveform", "proxy", "audio_proxy", "ai"} {
 		t.Run(kind, func(t *testing.T) {
 			blob, _ := reservedBlobName(kind)
 			row := derivatives.DerivRow{
