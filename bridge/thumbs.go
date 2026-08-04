@@ -231,7 +231,7 @@ func freshThumbCachePath(ds *derivatives.Store, tc *thumbcache.Cache, inode uint
 // ingested yet (1-2 FUSE round-trips, which is exactly why the warmer
 // budgets calls to this). Globals are read at call time so a mount-path
 // change mid-session can't serve a stale root.
-func resolveThumbBlobPath(inode uint64) (string, bool) {
+func resolveThumbBlobPath(inode uint64) (mountOut, blobRel string, ok bool) {
 	globalMu.Lock()
 	ds := globalDerivStore
 	tc := globalThumbCache
@@ -241,16 +241,16 @@ func resolveThumbBlobPath(inode uint64) (string, bool) {
 	}
 	globalMu.Unlock()
 	if ds == nil || mount == "" {
-		return "", false
+		return "", "", false
 	}
 	if known, _ := ds.Known(inode); !known {
 		if found, ferr := farm.ReconcileOneSidecar(ds, mount, inode); ferr != nil || !found {
-			return "", false
+			return "", "", false
 		}
 	}
 	rows, err := ds.Manifest(inode)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	for _, d := range rows {
 		if d.Kind != thumbKind || d.Status != "ready" || d.BlobRelPath == nil || *d.BlobRelPath == "" {
@@ -264,11 +264,13 @@ func resolveThumbBlobPath(inode uint64) (string, bool) {
 		live := liveSourceFor(inode)
 		if derivRowStale(d, live) {
 			rejectStaleDeriv(tc, inode, thumbKind, d, live)
-			return "", false
+			return "", "", false
 		}
-		return filepath.Join(farm.DerivBlobDir(mount, inode), filepath.Clean("/"+*d.BlobRelPath)), true
+		// Root and relative path stay APART so the open can walk every
+		// component — a joined absolute path can only guard its last one.
+		return mount, derivatives.DerivBlobRel(inode, *d.BlobRelPath), true
 	}
-	return "", false
+	return "", "", false
 }
 
 // thumbLocalDeps is the injected surface of serveThumbLocal — the Wave-3
@@ -357,23 +359,26 @@ func populateThumbFromFUSE(tc *thumbcache.Cache, inode uint64) (string, bool) {
 	if tc == nil {
 		return "", false
 	}
-	src, ok := resolveThumbBlobPath(inode)
+	mount, blobRel, ok := resolveThumbBlobPath(inode)
 	if !ok {
 		return "", false
 	}
-	// Symlink guard (2026-08-04 review, CRITICAL): the derivative tree is
-	// consumer-writable, so a symlink here would copy an arbitrary local file
-	// into the persistent thumb cache — after which the serve path would happily
-	// serve it, because by then it IS a regular file.
-	fi, err := derivatives.StatRegularNoSymlink(src)
-	if err != nil || fi.Size() <= 0 || fi.Size() > thumbReadThroughCap {
-		return "", false
-	}
-	f, err := derivatives.OpenRegularNoSymlink(src)
+	// ANCHORED symlink guard. The derivative tree is consumer-writable, and this
+	// writes into the PERSISTENT thumb cache — after which the serve path hands
+	// the bytes out happily, because by then they really are a regular file. So
+	// poisoning here survives restarts and bypasses /blob's own guard entirely.
+	// Guarding only the filename was not enough: the per-inode DIRECTORY could
+	// be swapped for a symlink. Size is checked on the DESCRIPTOR, not by a
+	// second stat of the name, so there is nothing to swap in between.
+	f, err := derivatives.OpenRegularUnder(mount, blobRel)
 	if err != nil {
 		return "", false
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() <= 0 || fi.Size() > thumbReadThroughCap {
+		return "", false
+	}
 	if _, err := tc.Put(inode, "thumbnail", f); err != nil {
 		return "", false
 	}

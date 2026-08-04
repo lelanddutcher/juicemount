@@ -191,6 +191,28 @@ func (c *Cache) Path(inode uint64, kind string) (string, bool) {
 	return e.path, true
 }
 
+// PathParts is Path split into (root, mount-relative) so callers can open the
+// blob with a component-wise symlink-checking walk instead of a bare open of a
+// joined path. Same LRU touch as Path.
+//
+// This cache is on OUR local disk rather than the shared volume, so it is a
+// weaker threat surface — but it is exactly where a poisoned derivative LANDS
+// (populateThumbFromFUSE writes here, and /blob serves from here BEFORE it
+// reaches its own guard), so it gets the same treatment. Defence in depth here
+// costs nothing and removes the last reason to keep an unanchored open helper
+// around for someone to reach for later.
+func (c *Cache) PathParts(inode uint64, kind string) (root, rel string, ok bool) {
+	full, ok := c.Path(inode, kind)
+	if !ok {
+		return "", "", false
+	}
+	r, err := filepath.Rel(c.dir, full)
+	if err != nil {
+		return "", "", false
+	}
+	return c.dir, r, true
+}
+
 // Put atomically stores a blob (tmp file + rename), evicting LRU entries as
 // needed to stay under MaxBytes. Returns bytes written.
 //

@@ -3,6 +3,7 @@ package farm
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -168,6 +169,16 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 	if row.Hash != nil && !isHashHex(*row.Hash) {
 		row.Hash = nil
 	}
+	// updated_at is NOT informational — it is the cursor of
+	// GET /derivatives/changes?since= and of the farm's published
+	// derivatives-changes.json. A forged MaxInt64 pins every consumer's cursor
+	// past the end of time, so every genuine derivative from then on is
+	// invisible to them, permanently, from one small JSON file with no blob
+	// bytes at all. This is the field the "clamp the informational" sweep
+	// missed. PutDeriv already treats 0 as "stamp now", so 0 is safe to pass.
+	if row.UpdatedAt < 0 || row.UpdatedAt > nowUnix()+updatedAtSkewSlack {
+		row.UpdatedAt = 0
+	}
 	if row.Version < 1 {
 		row.Version = 1
 	} else if row.Version > maxSidecarVersion {
@@ -239,10 +250,21 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 	// asset: a recycled or overwritten inode served the OLD poster or proxy
 	// indefinitely. That is precisely the bug C5 exists to prevent.
 	//
-	// Passing the vouch through is also no worse against a forger: whoever can
-	// forge (size,mtime) here can equally write the blob bytes, so the forgery
-	// buys nothing extra — while a GENUINE vouch is exactly what lets C5 compare
-	// against the live source and withhold a stale derivative.
+	// Pass-through is still the right call, but NOT because it is free: it trades
+	// one failure mode for a lesser one, and the earlier comment here claiming it
+	// was "no worse against a forger" was wrong in the DENY direction.
+	//
+	//   nulled      → the row reads as unvouched, and unvouched means SERVE. A
+	//                 wrong or stale derivative is handed out forever, silently.
+	//   passed thru → a forged size/mtime makes a GENUINE derivative look stale,
+	//                 and rejectStaleDeriv does not merely 404 — it evicts the
+	//                 cached blob. One attacker-written JSON file, zero blob
+	//                 bytes, denies a real thumbnail and forces the full-source
+	//                 read the thumbnail plane exists to avoid.
+	//
+	// Serving wrong bytes silently is worse than denying right ones loudly, so
+	// pass-through wins — but the deny lever is real and should be closed by
+	// authenticating the sidecar, not by re-nulling the vouch.
 	// Geometry is free-form in the file, and readers divide by it: cols==0 is a
 	// divide-by-zero in any `i % cols`, and absurd counts over-allocate in a
 	// scrubber. The schema's minimums are enforced nowhere in Go. VALIDATE
@@ -280,8 +302,13 @@ func sanitizeTechSidecar(t *TechSidecar) (*TechSidecar, bool) {
 	if t.Producer != "linux-farm" && t.Producer != "on-device" && t.Producer != "macos-node" {
 		return nil, false
 	}
-	if t.Version < 1 || t.Version > maxSidecarVersion {
-		return nil, false
+	// Clamped, NOT rejected — matching DerivRow's policy. These were opposite
+	// for no stated reason, and rejecting here silently discards the whole tech
+	// block (and with it /metadata?kind=tech) over a cosmetic integer.
+	if t.Version < 1 {
+		t.Version = 1
+	} else if t.Version > maxSidecarVersion {
+		t.Version = maxSidecarVersion
 	}
 	if t.Hash != nil && !isHashHex(*t.Hash) {
 		return nil, false
@@ -296,6 +323,33 @@ func sanitizeTechSidecar(t *TechSidecar) (*TechSidecar, bool) {
 	if err := json.Unmarshal(t.Payload, &probe); err != nil {
 		return nil, false
 	}
+	// VALIDATE THE VALUE THIS BLOCK IS CITED FOR, not just its envelope.
+	// The reason the tech block matters is that readers fall back to
+	// tech.size_bytes for freshness when a row carries no source_size — so
+	// checking producer/version/hash/shape and then storing the payload verbatim
+	// leaves precisely the field that does the damage unchecked. A negative or
+	// absurd size makes a stale derivative compare "fresh" against any source.
+	if v, present := probe["size_bytes"]; present {
+		n, isNum := v.(float64)
+		if !isNum || n < 0 || n > maxPlausibleSourceBytes {
+			delete(probe, "size_bytes")
+			cleaned, err := json.Marshal(probe)
+			if err != nil {
+				return nil, false
+			}
+			t.Payload = cleaned
+		}
+	}
+	if v, present := probe["duration_ms"]; present {
+		if n, isNum := v.(float64); !isNum || n < 0 {
+			delete(probe, "duration_ms")
+			cleaned, err := json.Marshal(probe)
+			if err != nil {
+				return nil, false
+			}
+			t.Payload = cleaned
+		}
+	}
 	return t, true
 }
 
@@ -307,6 +361,40 @@ func sanitizeTechSidecar(t *TechSidecar) (*TechSidecar, bool) {
 var knownCodecs = map[string]bool{
 	"h264": true, "hevc": true, "av1": true, "aac": true, "opus": true,
 }
+
+// readSidecarBounded reads one manifest.json through the anchored, symlink-
+// checking open and refuses anything larger than a manifest could plausibly be.
+// The cap is enforced while READING, not after, so a file that lies about its
+// size (or reports none) still cannot outrun it.
+func readSidecarBounded(mount, rel string) ([]byte, error) {
+	f, err := derivatives.OpenRegularUnder(mount, rel)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxSidecarBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > maxSidecarBytes {
+		return nil, fmt.Errorf("sidecar %q exceeds %d bytes", rel, maxSidecarBytes)
+	}
+	return raw, nil
+}
+
+// maxSidecarBytes: a manifest lists a handful of rows plus one ffprobe payload.
+// 8 MiB is orders of magnitude more than any real one and still bounded.
+const maxSidecarBytes = int64(8) << 20
+
+// nowUnix is a var so the clamp is testable without waiting on the wall clock.
+var nowUnix = func() int64 { return time.Now().Unix() }
+
+// updatedAtSkewSlack tolerates ordinary clock skew between the farm host and
+// this Mac without letting a forged far-future stamp through.
+const updatedAtSkewSlack = int64(24 * 60 * 60)
+
+// maxPlausibleSourceBytes: 1 PiB. Larger is not a media file, it is a forgery.
+const maxPlausibleSourceBytes = float64(int64(1) << 50)
 
 const (
 	maxSidecarVersion   = 1 << 16
@@ -355,8 +443,14 @@ func reservedBlobName(kind string) (string, bool) {
 // both the full walk (ReconcileSidecars) and the on-miss path (ReconcileOneSidecar).
 func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint64) ReconcileResult {
 	var res ReconcileResult
-	scPath := filepath.Join(DerivBlobDir(mount, inode), "manifest.json")
-	raw, err := os.ReadFile(scPath)
+	// THE FILE EVERY SANITIZER BELOW RUNS ON, read with the same guard as any
+	// other derivative — it was the one thing still opened by bare name.
+	// os.ReadFile followed both the final component and every ancestor, and had
+	// no size cap at all: a symlink to a huge file (or to /dev/zero, which has
+	// no size to check) allocated until the process died, amplified 5x by the
+	// retry loop below. The attacker picked the number.
+	scRel := derivatives.DerivBlobRel(inode, "manifest.json")
+	raw, err := readSidecarBounded(mount, scRel)
 	if err != nil {
 		return res // no sidecar for this inode (blob-only dir / absent)
 	}
@@ -372,7 +466,7 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 			break
 		}
 		time.Sleep(150 * time.Millisecond)
-		if r, e := os.ReadFile(scPath); e == nil {
+		if r, e := readSidecarBounded(mount, scRel); e == nil {
 			raw = r
 		}
 	}
@@ -394,7 +488,7 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 	// to believe.
 	if sc.Inode != inode {
 		jmlog.Warn("sidecar reconcile: manifest inode disagrees with its directory — refusing",
-			"dir_inode", inode, "manifest_inode", sc.Inode, "path", scPath)
+			"dir_inode", inode, "manifest_inode", sc.Inode, "rel", scRel)
 		res.Errs++
 		return res
 	}

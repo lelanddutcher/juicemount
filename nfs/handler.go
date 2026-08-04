@@ -575,6 +575,16 @@ func infoWithTimeout(src metrics.FUSESource, de os.DirEntry, timeout time.Durati
 // exist to size. Measure first: the src label makes warmer-vs-foreground
 // consumption of this gate visible in /metrics. Do NOT change the gate here.
 func openFileWithTimeout(src metrics.FUSESource, p string, flag int, perm os.FileMode, timeout time.Duration) (f *os.File, err error, ok bool) {
+	return openWithTimeout(src, timeout, func() (*os.File, error) {
+		return os.OpenFile(p, flag, perm)
+	})
+}
+
+// openWithTimeout is the gate+timeout core, parameterised by the opener so a
+// caller can supply a HARDENED open (e.g. derivatives.OpenRegularUnder's
+// component-wise walk) and still get the wedged-FUSE bound. Everything about
+// gating, metrics and the bail-out fd close is identical.
+func openWithTimeout(src metrics.FUSESource, timeout time.Duration, open func() (*os.File, error)) (f *os.File, err error, ok bool) {
 	start := time.Now()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -593,7 +603,7 @@ func openFileWithTimeout(src metrics.FUSESource, p string, flag int, perm os.Fil
 	}
 	ch := make(chan result, 1)
 	go func() {
-		f, err := os.OpenFile(p, flag, perm)
+		f, err := open()
 		ch <- result{f: f, err: err}
 		<-gate
 	}()

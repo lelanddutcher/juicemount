@@ -24,7 +24,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -3813,12 +3812,22 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 			// row with a direct PutDeriv, a state production cannot reach.
 			//
 			// So: back to the producer string, which is right for the case that
-			// actually happens (a well-behaved consumer must not silently replace
-			// the farm's work) and honest about the case it cannot cover. A local
-			// process that writes a forged manifest can both impersonate the farm
-			// and 409-lock a slot — but that same process can write the blob bytes
-			// directly, so the guard is not what stands between it and mischief.
-			// Fixing that needs an authenticated sidecar, not a cleverer predicate.
+			// actually happens — a well-behaved consumer must not silently replace
+			// the farm's work.
+			//
+			// The forged-row DoS is NOT excused by "they could write the blob bytes
+			// anyway". That comparison is access-equivalent but outcome-inequivalent,
+			// and the earlier version of this comment had it wrong:
+			//   forged BLOB  → the legitimate producer still registers (200), owns
+			//                  the row, and can re-register later. Recoverable.
+			//   forged ROW   → producer:"linux-farm", status:"failed", NO blob at
+			//                  all. Every register for that (inode,kind) 409s
+			//                  forever, and "failed" is deliberately accepted
+			//                  because it means "this artifact will never appear".
+			//                  There is no API path back; recovery is out-of-band.
+			// So the forgery is strictly MORE durable than the write it is compared
+			// to. Tracked, not dismissed: the fix is an authenticated sidecar, and
+			// until then this guard is coordination rather than a trust boundary.
 			if er.Producer == "linux-farm" && req.Producer != "linux-farm" {
 				http.Error(w, fmt.Sprintf(
 					"kind %q for inode %d already has a farm-produced row; a %q contribution may not replace it",
@@ -3878,44 +3887,6 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		"inode", req.Inode, "kind", req.Kind, "blob", rel,
 		"producer", req.Producer, "model", req.Model, "hash", hash)
 	writeContractJSON(w, registerResponse{Inode: req.Inode, Registered: true, Derivative: row})
-}
-
-// openRegularNoSymlink opens a derivative blob, refusing anything that is not a
-// plain regular file.
-//
-// SECURITY (2026-08-04 review, CRITICAL). os.Stat and os.Open both FOLLOW
-// symlinks. The derivative tree is writable by any consumer with mount access —
-// that is the premise of contribute-back — so a symlink planted at a reserved
-// blob name (`proxy.mp4` -> /Users/<you>/.ssh/id_rsa) turned GET /blob into an
-// arbitrary local-file read, streamed with byte-range support and labelled with
-// the row's media type. The control plane binds 127.0.0.1 and is
-// unauthenticated, so any local process could drive it.
-//
-// Checking only at register time is NOT sufficient: the file can be swapped for
-// a symlink after a clean registration. This is therefore enforced at the OPEN,
-// using O_NOFOLLOW so the kernel refuses the final component, plus an Lstat
-// belt-and-braces for the non-regular cases O_NOFOLLOW does not cover (fifos,
-// devices, sockets — a fifo at a blob path would otherwise block the handler).
-func openRegularNoSymlink(path string) (*os.File, error) {
-	if li, lerr := os.Lstat(path); lerr != nil {
-		return nil, lerr
-	} else if !li.Mode().IsRegular() {
-		return nil, fmt.Errorf("refusing non-regular blob %q (mode %s)", path, li.Mode())
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, err
-	}
-	fi, serr := f.Stat()
-	if serr != nil {
-		f.Close()
-		return nil, serr
-	}
-	if !fi.Mode().IsRegular() {
-		f.Close()
-		return nil, fmt.Errorf("refusing non-regular blob %q (mode %s)", path, fi.Mode())
-	}
-	return f, nil
 }
 
 // handleBlobHTTP serves GET /blob?inode=N&kind=proxy (PROXY-CODEC #50): the
@@ -4005,7 +3976,6 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	// Resolve the blob under the Tier-A per-inode dir and open it through the FUSE
 	// mount (direct JuiceFS — no NFS self-loop). filepath.Clean on the rel path
 	// keeps it inside the inode dir (the farm only ever writes flat names there).
-	blobPath := filepath.Join(farm.DerivBlobDir(mount, inode), filepath.Clean("/"+blobRel))
 
 	// #1 hydration pack: SMALL kinds (everything but proxy) serve LOCAL-FIRST
 	// from the thumb cache, populated by the folder-open warmer or a prior
@@ -4016,8 +3986,11 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	// a FUSE round-trip). tc was captured with ds above.
 	smallKind := kind != "proxy"
 	if tc != nil && smallKind {
-		if lp, ok := tc.Path(inode, kind); ok {
-			if lf, lerr := openRegularNoSymlink(lp); lerr == nil {
+		if croot, crel, ok := tc.PathParts(inode, kind); ok {
+			// Anchored, like the FUSE read below. This branch serves BEFORE the
+			// guarded open further down, so leaving it unguarded made that guard
+			// bypassable through the very cache a poisoned read populates.
+			if lf, lerr := derivatives.OpenRegularUnder(croot, crel); lerr == nil {
 				defer lf.Close()
 				if lfi, serr := lf.Stat(); serr == nil {
 					w.Header().Set("Content-Type", mediaType)
@@ -4036,7 +4009,6 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "blob unreadable", http.StatusNotFound)
 		return
 	}
-	_ = blobPath
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {

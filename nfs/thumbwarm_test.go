@@ -70,17 +70,17 @@ func TestThumbWarmerHydratesDir(t *testing.T) {
 
 	var callsMu sync.Mutex
 	resolveCalls := make(map[uint64]int)
-	resolve := func(inode uint64) (string, bool) {
+	resolve := func(inode uint64) (string, string, bool) {
 		callsMu.Lock()
 		resolveCalls[inode]++
 		callsMu.Unlock()
 		switch inode {
 		case 11:
-			return blobA, true
+			return dir, "a.jpg", true
 		case 12:
-			return blobB, true
+			return dir, "b.jpg", true
 		default:
-			return "", false // inode 13: no derivative
+			return "", "", false // inode 13: no derivative
 		}
 	}
 	resolveCount := func(inode uint64) int {
@@ -129,11 +129,11 @@ func TestThumbWarmerHydratesDir(t *testing.T) {
 func TestThumbWarmerNegativeTTL(t *testing.T) {
 	var calls int
 	var mu sync.Mutex
-	resolve := func(inode uint64) (string, bool) {
+	resolve := func(inode uint64) (string, string, bool) {
 		mu.Lock()
 		calls++
 		mu.Unlock()
-		return "", false
+		return "", "", false
 	}
 	children := func(d string) []ThumbChildRef {
 		return []ThumbChildRef{{Inode: 42, Name: "x.mov"}}
@@ -161,7 +161,7 @@ func TestThumbWarmerOversizedBlobRejected(t *testing.T) {
 	f.Truncate(thumbWarmBlobCap + 1)
 	f.Close()
 
-	resolve := func(inode uint64) (string, bool) { return big, true }
+	resolve := func(inode uint64) (string, string, bool) { return dir, "big.jpg", true }
 	children := func(d string) []ThumbChildRef {
 		return []ThumbChildRef{{Inode: 7, Name: "huge.mov"}}
 	}

@@ -357,7 +357,7 @@ func TestClientWrittenFileMtimeSkewStillServesItsThumbnail(t *testing.T) {
 	}
 
 	// ...and the manifest resolution + GET /blob agree.
-	if _, ok := resolveThumbBlobPath(freshInode); !ok {
+	if _, _, ok := resolveThumbBlobPath(freshInode); !ok {
 		t.Error("resolveThumbBlobPath = miss for a client-written file (the folder-open warmer would skip it)")
 	}
 	if rr := getBlob(t, "thumbnail"); rr.Code != http.StatusOK {
@@ -589,7 +589,7 @@ func TestResolveThumbBlobPathStaleIsMiss(t *testing.T) {
 	})
 	defer restore()
 
-	if p, ok := resolveThumbBlobPath(freshInode); ok {
+	if _, p, ok := resolveThumbBlobPath(freshInode); ok {
 		t.Fatalf("resolveThumbBlobPath = (%q, true) for a stale row, want a miss "+
 			"(otherwise the folder-open warmer re-hydrates the wrong poster)", p)
 	}
@@ -602,13 +602,23 @@ func TestResolveThumbBlobPathFreshResolves(t *testing.T) {
 	})
 	defer restore()
 
-	p, ok := resolveThumbBlobPath(freshInode)
+	gotMount, p, ok := resolveThumbBlobPath(freshInode)
 	if !ok {
 		t.Fatal("resolveThumbBlobPath = miss for an unchanged source")
 	}
-	want := filepath.Join(farm.DerivBlobDir(seed.mount, freshInode), "poster.jpg")
+	// Root and relative path are returned SEPARATELY on purpose: a joined
+	// absolute path can only be opened with O_NOFOLLOW on its last component,
+	// which leaves the per-inode directory swappable for a symlink. Assert the
+	// split survives — collapsing it back into one string is the regression.
+	if gotMount != seed.mount {
+		t.Errorf("mount = %q, want %q", gotMount, seed.mount)
+	}
+	want := derivatives.DerivBlobRel(freshInode, "poster.jpg")
 	if p != want {
-		t.Fatalf("blob path = %q, want %q", p, want)
+		t.Fatalf("blob rel = %q, want %q", p, want)
+	}
+	if filepath.IsAbs(p) {
+		t.Errorf("blob rel %q is absolute — it must stay relative to the mount", p)
 	}
 }
 
@@ -625,7 +635,7 @@ func TestResolveThumbBlobPathStaleInvalidatesCache(t *testing.T) {
 	if _, err := seed.tc.Put(freshInode, "thumbnail", strings.NewReader("OLD-POSTER")); err != nil {
 		t.Fatalf("seed thumb cache: %v", err)
 	}
-	if _, ok := resolveThumbBlobPath(freshInode); ok {
+	if _, _, ok := resolveThumbBlobPath(freshInode); ok {
 		t.Fatal("stale row resolved")
 	}
 	if seed.tc.Has(freshInode, "thumbnail") {
