@@ -69,11 +69,21 @@ const DefaultStuckEscalationWindow = 10 * time.Minute
 // guarded by the entry's own mutex.
 type SpoolStore struct {
 	root     string
-	capacity int64 // 0 means unlimited
+	capacity int64 // 0 means unlimited — the CONFIGURED cap; see effectiveCapacity
 	used     atomic.Int64
 	meta     *metadata.SpoolStore
 	index    *SpoolIndex
 	closed   atomic.Bool
+
+	// Live free-disk sample backing effectiveCapacity. The configured capacity
+	// is clamped to free disk ONCE, in NewSpoolStore — a snapshot that goes
+	// stale the moment anything else consumes the volume (the JuiceFS cache
+	// growing, another app, the user's own downloads). These two make the clamp
+	// continuous. Sampled at most once per diskAvailTTL so the per-write
+	// admission path stays cheap; Statfs here is on the LOCAL spool disk, never
+	// through FUSE.
+	diskAvailBytes atomic.Int64 // last observed bytes available, -1 = never sampled
+	diskAvailAt    atomic.Int64 // UnixNano of that sample
 
 	// lastReleaseNanos is the wall-clock (UnixNano) of the most recent
 	// capacity release — i.e. the last time the drainer (or a write
@@ -262,10 +272,96 @@ func (s *SpoolStore) SetDrainerWake(fn func()) {
 // Root returns the spool root directory.
 func (s *SpoolStore) Root() string { return s.root }
 
-// Capacity returns (used, total) bytes. total=0 means unlimited.
-func (s *SpoolStore) Capacity() (used, total int64) {
-	return s.used.Load(), s.capacity
+// diskAvailTTL bounds how often effectiveCapacity re-samples free disk. Short
+// enough that a filling volume is noticed within a couple of writes, long enough
+// that a burst of small writes doesn't Statfs per write.
+const diskAvailTTL = 1 * time.Second
+
+// cachedDiskAvail returns bytes available on the spool's own volume, resampling
+// at most once per diskAvailTTL. Returns (0,false) when Statfs has never
+// succeeded, so callers can fail OPEN (keep the configured cap) rather than
+// mistaking an unreadable statfs for a full disk.
+func (s *SpoolStore) cachedDiskAvail() (int64, bool) {
+	now := time.Now().UnixNano()
+	if at := s.diskAvailAt.Load(); at != 0 && now-at < int64(diskAvailTTL) {
+		if v := s.diskAvailBytes.Load(); v >= 0 {
+			return v, true
+		}
+		return 0, false
+	}
+	avail, err := spoolDiskAvail(s.root)
+	if err != nil || avail < 0 {
+		s.diskAvailBytes.Store(-1)
+		s.diskAvailAt.Store(now)
+		return 0, false
+	}
+	s.diskAvailBytes.Store(avail)
+	s.diskAvailAt.Store(now)
+	return avail, true
 }
+
+// effectiveCapacity is the cap to enforce RIGHT NOW: the configured capacity,
+// further clamped so the spool can never grow into the free-disk floor.
+//
+// WHY THIS EXISTS (2026-08-03, founder incident: "copying to a JuiceMount volume
+// when local disk is low stalls"). NewSpoolStore clamps the configured capacity
+// to free disk exactly once, at construction. That snapshot is wrong the moment
+// anything else eats the volume — and the thing most likely to eat it is us: the
+// JuiceFS cache grows alongside the spool. Live evidence from the incident: a
+// configured capacity of ~37 GB while only 50 GiB was free, i.e. capacity plus
+// the 20 GiB floor already exceeded the disk.
+//
+// The failure that produces is not a clean ENOSPC. Admission keeps saying yes
+// until `used >= capacity`, but the DISK runs out first, so the write fails
+// underneath the spool and the drainer has nowhere to drain — and because a full
+// spool is designed to STALL (backpressure, so Finder paces itself instead of
+// aborting the copy), the user gets an unbounded hang rather than an error.
+//
+// Clamping continuously converts that into the behaviour the stall was designed
+// for: once free disk reaches the floor, headroom is zero, admission stops, and
+// the existing wedged-drain backstop turns a hopeless stall into a bounded one
+// that surfaces ErrSpoolFull. A copy that cannot succeed now fails honestly
+// instead of hanging.
+//
+// SCOPE LIMIT, deliberate: a configured capacity of 0 stays truly unlimited and
+// is NOT disk-clamped. "total=0 means unlimited" is the documented /spool
+// contract that consumers branch on, and production never runs unlimited —
+// AutoSpoolCapacity always yields a positive cap. Bounding it here would change
+// a public contract to fix an incident that only occurs with a positive cap.
+func (s *SpoolStore) effectiveCapacity() int64 {
+	if s.capacity <= 0 {
+		return s.capacity // unlimited stays unlimited (see SCOPE LIMIT above)
+	}
+	avail, ok := s.cachedDiskAvail()
+	if !ok {
+		return s.capacity // fail open: an unreadable statfs is not a full disk
+	}
+	headroom := avail - SpoolFreeFloorBytes
+	if headroom < 0 {
+		headroom = 0
+	}
+	// The spool's own bytes already sit on this volume, so what it may reach is
+	// what it holds plus whatever remains above the floor.
+	live := s.used.Load() + headroom
+	if s.capacity > 0 && s.capacity < live {
+		return s.capacity
+	}
+	return live
+}
+
+// Capacity returns (used, total) bytes. total=0 means unlimited.
+//
+// total is the EFFECTIVE capacity — the configured cap clamped to current free
+// disk — so /spool and the menu bar show the budget actually being enforced
+// rather than a startup snapshot that may be far larger than the disk allows.
+func (s *SpoolStore) Capacity() (used, total int64) {
+	return s.used.Load(), s.effectiveCapacity()
+}
+
+// ConfiguredCapacity returns the capacity as configured at construction, before
+// the live free-disk clamp. Diagnostics only — admission must use
+// effectiveCapacity.
+func (s *SpoolStore) ConfiguredCapacity() int64 { return s.capacity }
 
 // StallWaiters returns the number of writes currently parked in the capacity
 // stall (spool full, blocking for the drainer to free headroom). Surfaced via
@@ -370,7 +466,7 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 		}
 
 		// No entry for this path — create a fresh one under the path shard.
-		if s.capacity > 0 && s.used.Load() >= s.capacity {
+		if ec := s.effectiveCapacity(); ec > 0 && s.used.Load() >= ec {
 			// Spool full. Release the shard and STALL — block (per
 			// waitForCapacity) for the drainer to free headroom rather than
 			// hard-fail the create, so a large copy paces itself to drain
@@ -1230,7 +1326,7 @@ func (s *SpoolStore) tryReserveCapacity(delta int64) bool {
 	}
 	for {
 		cur := s.used.Load()
-		if s.capacity > 0 && cur+delta > s.capacity {
+		if ec := s.effectiveCapacity(); ec > 0 && cur+delta > ec {
 			return false
 		}
 		if s.used.CompareAndSwap(cur, cur+delta) {
@@ -1358,7 +1454,10 @@ func (s *SpoolStore) reserveCapacityOrWait(delta int64, touch func()) bool {
 // the copy. Returns true once there is headroom, false only on a wedged online
 // drain / store close. Must not be called with a shard held.
 func (s *SpoolStore) waitForHeadroom() bool {
-	return s.waitForCapacity(func() bool { return s.capacity <= 0 || s.used.Load() < s.capacity }, nil)
+	return s.waitForCapacity(func() bool {
+		ec := s.effectiveCapacity()
+		return ec <= 0 || s.used.Load() < ec
+	}, nil)
 }
 
 // releaseCapacity returns reserved bytes to the budget. Used when a
