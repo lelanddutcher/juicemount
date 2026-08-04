@@ -3796,7 +3796,15 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 			if er.Kind != req.Kind {
 				continue
 			}
-			if er.Producer == "linux-farm" && req.Producer != "linux-farm" {
+			// The row must be a farm row we actually MINTED, not one that merely
+			// SAYS it is. manifest.json is on the consumer-writable volume, so a
+			// hand-written sidecar could declare producer:"linux-farm" and — with
+			// this guard keyed on the string — permanently 409 every genuine
+			// register for that (inode,kind), impersonating the farm AND locking
+			// it out with its own protection (2026-08-04 review, CRITICAL).
+			// Provenance is stamped by the ingesting code path, never by the file.
+			if er.Producer == "linux-farm" && er.Provenance != derivatives.ProvenanceSidecar &&
+				req.Producer != "linux-farm" {
 				http.Error(w, fmt.Sprintf(
 					"kind %q for inode %d already has a farm-produced row; a %q contribution may not replace it",
 					req.Kind, req.Inode, req.Producer), http.StatusConflict)

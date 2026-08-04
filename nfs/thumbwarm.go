@@ -9,6 +9,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"syscall"
 )
 
 // ThumbWarmer (#1, INSTANT-NAV — the P2 "hydration pack" substrate consumer).
@@ -238,7 +239,13 @@ func (w *ThumbWarmer) hydrateOne(inode uint64, blobPath string) (int64, error) {
 	// rather than the FOREGROUND nfsLstatGate (fuseGateForSource, audit P0) —
 	// same reasoning as the sidecar warmer: nobody is waiting on a thumbnail,
 	// so it must not be able to starve someone who IS waiting on navigation.
-	f, err, ok := openFileWithTimeout(metrics.FUSESrcThumbWarm, blobPath, os.O_RDONLY, 0, warmOpTimeout())
+	// O_NOFOLLOW (2026-08-04 review, CRITICAL): the derivative tree is
+	// consumer-writable, and this warmer fires off an ordinary Finder directory
+	// listing with NO HTTP request — so an unguarded open copies a symlink
+	// target straight into the local persistent thumb cache, which the serve
+	// path then happily serves because the cached file is regular by then.
+	f, err, ok := openFileWithTimeout(metrics.FUSESrcThumbWarm, blobPath,
+		os.O_RDONLY|syscall.O_NOFOLLOW, 0, warmOpTimeout())
 	if !ok {
 		return 0, errFUSETimeout
 	}

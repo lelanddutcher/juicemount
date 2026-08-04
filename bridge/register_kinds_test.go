@@ -81,29 +81,13 @@ func TestContributableKindsAreValidManifestKinds(t *testing.T) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)
 	}
-	var kindEnum []any
-	var walk func(any)
-	walk = func(n any) {
-		switch v := n.(type) {
-		case map[string]any:
-			if k, ok := v["kind"].(map[string]any); ok {
-				if e, ok := k["enum"].([]any); ok && kindEnum == nil {
-					kindEnum = e
-				}
-			}
-			for _, c := range v {
-				walk(c)
-			}
-		case []any:
-			for _, c := range v {
-				walk(c)
-			}
-		}
-	}
-	walk(doc)
-	if kindEnum == nil {
-		t.Skip("could not locate the manifest kind enum")
-	}
+	// EXACT path, not a search. The first version of this test walked the whole
+	// document for any "kind" with an enum and kept the first hit — but Go map
+	// iteration is RANDOM, and this schema has TWO such nodes: the real kind enum
+	// and a ["proxy","audio_proxy"] enum nested in an allOf/if/not conditional.
+	// So the test's verdict depended on map ordering: same code, either result.
+	// A locator that can resolve to the wrong node is not a locator.
+	kindEnum := digEnum(t, doc, "properties", "derivatives", "items", "properties", "kind")
 	valid := map[string]bool{}
 	for _, k := range kindEnum {
 		if s, ok := k.(string); ok {
@@ -267,4 +251,32 @@ func TestRegisterWidenedKindsEndToEnd(t *testing.T) {
 			t.Errorf("status %d, want 409 — an on-device row must not replace the farm's", rr.Code)
 		}
 	})
+}
+
+// digEnum resolves an exact JSON path and returns the `enum` at its end. It
+// FAILS rather than skips when the path is absent: a silent skip here would let
+// a schema restructure quietly retire the check that keeps our registrable
+// kinds and the manifest schema in agreement.
+func digEnum(t *testing.T, doc any, path ...string) []any {
+	t.Helper()
+	cur := doc
+	for _, seg := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			t.Fatalf("digEnum: %q is not an object while resolving %v", seg, path)
+		}
+		cur, ok = m[seg]
+		if !ok {
+			t.Fatalf("digEnum: no %q while resolving %v — did the schema move?", seg, path)
+		}
+	}
+	m, ok := cur.(map[string]any)
+	if !ok {
+		t.Fatalf("digEnum: %v does not end at an object", path)
+	}
+	e, ok := m["enum"].([]any)
+	if !ok {
+		t.Fatalf("digEnum: %v has no enum", path)
+	}
+	return e
 }

@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"net/http"
-	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -362,11 +361,15 @@ func populateThumbFromFUSE(tc *thumbcache.Cache, inode uint64) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	fi, err := os.Stat(src)
+	// Symlink guard (2026-08-04 review, CRITICAL): the derivative tree is
+	// consumer-writable, so a symlink here would copy an arbitrary local file
+	// into the persistent thumb cache — after which the serve path would happily
+	// serve it, because by then it IS a regular file.
+	fi, err := derivatives.StatRegularNoSymlink(src)
 	if err != nil || fi.Size() <= 0 || fi.Size() > thumbReadThroughCap {
 		return "", false
 	}
-	f, err := os.Open(src)
+	f, err := derivatives.OpenRegularNoSymlink(src)
 	if err != nil {
 		return "", false
 	}

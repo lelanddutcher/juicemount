@@ -152,7 +152,9 @@ func ComputeProxyEconomics(store *derivatives.Store, mount string) (*ProxyEconom
 		}
 		src := *r.SourceSize
 		blob := filepath.Join(DerivBlobDir(mount, r.Inode), "proxy.mp4")
-		fi, err := os.Stat(blob)
+		// Symlink guard: a symlink here would leak an arbitrary local file's SIZE
+		// into the manager's economics rollup (2026-08-04 review, LOW).
+		fi, err := derivatives.StatRegularNoSymlink(blob)
 		if err != nil || fi.Size() <= 0 {
 			continue // blob gone/empty → not measurable
 		}

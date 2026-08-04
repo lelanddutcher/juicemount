@@ -123,10 +123,32 @@ var blobMediaTypes = map[string]string{
 // The file may carry DATA (which kinds exist, their hashes and sizes). It may
 // not carry POLICY (what a kind is called, what type it is served as, where its
 // bytes live).
+// sanitizeSidecarRow constrains one row read out of a manifest.json.
+//
+// There is deliberately NO "trusted" mode. manifest.json lives on the volume,
+// and the volume is writable by every client — including the consumer that
+// contribute-back exists to serve. WHICH BINARY READS THE FILE CONFERS NO TRUST
+// ON IT: `jmfarm reconcile` running on the server reads exactly the same
+// attacker-reachable bytes the Mac app does. Trust here would have been a lie,
+// so the row is always treated as untrusted input and the unforgeable
+// Provenance stamp (set by the caller, never by the file) carries the security.
+//
+// RULE: a file on the volume supplies DATA (which kinds exist, hashes, sizes),
+// never POLICY (what a kind is called, how it is served, where its bytes live).
 func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
-	// Status is not free-form, but "failed" is legitimate state the farm writes
-	// (farm.go:139/:159) — it tells readers the artifact will not appear, so
-	// dropping it would make a known failure look like an ungenerated asset.
+	// Producer is enum-checked but NOT trusted: it is echoed back out of
+	// /metadata, so free-form text here would be attacker-chosen output, while a
+	// forged "linux-farm" must not confer farm authority. Authority now comes
+	// from Provenance (see store.go), so the string may stay as written —
+	// which keeps disaster recovery honest when a GENUINE farm row is rebuilt
+	// from its sidecar after a DB loss.
+	if row.Producer != "linux-farm" && row.Producer != "on-device" && row.Producer != "macos-node" {
+		return row, false
+	}
+
+	// "failed" is legitimate state the farm writes (farm.go:139/:159) — it tells
+	// readers the artifact will never appear, so dropping it would make a known
+	// failure look merely ungenerated.
 	if row.Status != "ready" && row.Status != "failed" {
 		return row, false
 	}
@@ -134,7 +156,7 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 	mt, isBlobKind := blobMediaTypes[row.Kind]
 	if !isBlobKind {
 		// Non-blob kinds (tech/embedding/transcript/ocr/faces) are /metadata
-		// rows. They serve no bytes, so they carry no Content-Type risk — but
+		// rows: they serve no bytes, so they carry no Content-Type risk — but
 		// they must not smuggle a blob path either.
 		if !nonBlobKinds[row.Kind] {
 			return row, false // unknown kind entirely
@@ -143,9 +165,12 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 		return row, true
 	}
 
-	// Blob kinds: the media type is OURS, always.
+	// The media type is OURS, always — /blob pins its response Content-Type from
+	// this field, so a sidecar-supplied one is a sidecar-supplied Content-Type
+	// served from the control-plane origin.
 	row.MediaType = &mt
-	// The blob path must be the reserved flat filename for the kind — never a
+
+	// The blob path must be the reserved flat filename for the kind: never a
 	// path, never another kind's artifact, never an arbitrary name. A `failed`
 	// row legitimately has no blob at all.
 	if row.BlobRelPath != nil {
@@ -160,8 +185,39 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 			}
 		}
 	}
+
+	// Freshness is the read-gate every consumer stat-verifies against, so a
+	// forged (size,mtime) pair pins a stale or wrong derivative as "fresh"
+	// forever. Drop the pair rather than believe it: the row is then re-verified
+	// against the live source, which self-heals. Costs a genuine DR-rebuilt row
+	// one re-verification and nothing else.
+	row.SourceSize, row.SourceMtime = nil, nil
+
+	// Geometry is free-form in the file, and readers divide by it: cols==0 is a
+	// divide-by-zero in any `i % cols`, and absurd counts over-allocate in a
+	// scrubber. The schema's minimums are enforced nowhere in Go. VALIDATE
+	// rather than drop — a filmstrip row without geometry is unusable, so
+	// dropping it would break the farm's own DR for that kind.
+	if row.Filmstrip != nil {
+		g := row.Filmstrip
+		if g.Cols < 1 || g.Rows < 1 || g.FrameCount < 1 || g.CellW < 1 || g.CellH < 1 ||
+			g.IntervalMS < 0 || g.DurationMS < 0 ||
+			g.Cols > maxStripDim || g.Rows > maxStripDim ||
+			g.CellW > maxStripCell || g.CellH > maxStripCell ||
+			g.FrameCount > g.Cols*g.Rows {
+			return row, false
+		}
+	}
 	return row, true
 }
+
+// Bounds for sidecar-declared filmstrip geometry. Generous enough that no real
+// strip the farm produces trips them, tight enough that a reader allocating
+// cols*rows cells cannot be walked into an absurd allocation.
+const (
+	maxStripDim  = 4096
+	maxStripCell = 8192
+)
 
 // nonBlobKinds are manifest kinds that carry no bytes — they are fetched via
 // /metadata, never /blob, so they need no media type or reserved filename.
@@ -250,6 +306,10 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 		// A manifest on the volume supplies DATA, never POLICY — re-derive the
 		// trust-bearing fields and drop anything that does not fit the contract.
 		clean, ok := sanitizeSidecarRow(row)
+		// The stamp is applied HERE, by the ingesting code path — it is not read
+		// from the file and cannot be set by anything on the volume. This is what
+		// makes the precedence guard in cbridge.go unforgeable.
+		clean.Provenance = derivatives.ProvenanceSidecar
 		if !ok {
 			jmlog.Warn("sidecar reconcile: dropping row that violates the blob contract",
 				"inode", sc.Inode, "kind", row.Kind, "status", row.Status,

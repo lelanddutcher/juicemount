@@ -24,6 +24,12 @@ import (
 
 // DerivRow is one derivative's manifest entry. Pointer fields are nullable on
 // the wire (omitted/serialized as null) per derivatives.schema.json.
+// ProvenanceSidecar marks a row reconstructed from a manifest.json on the
+// volume — i.e. from a file ANY volume writer can author. Rows carrying it are
+// still indexed (disaster recovery and thumbnail serving keep working) but are
+// never treated as authoritative about who produced them.
+const ProvenanceSidecar = "sidecar"
+
 type DerivRow struct {
 	Kind        string  `json:"kind"`
 	Status      string  `json:"status"`
@@ -42,6 +48,23 @@ type DerivRow struct {
 	// predate the columns + the closed-key conformance fixtures.
 	SourceSize  *int64 `json:"source_size,omitempty"`
 	SourceMtime *int64 `json:"source_mtime,omitempty"`
+	// Provenance is HOW this row entered the index, which is NOT the same
+	// question as what it CLAIMS about itself (`Producer`). It is local-only
+	// (json:"-") — never on the wire, never in the manifest, so it cannot be
+	// asserted by anyone outside this process.
+	//
+	// 2026-08-04 second adversarial review, CRITICAL: manifest.json lives on a
+	// consumer-writable volume, so `Producer` is attacker-chosen. A hand-written
+	// sidecar declaring producer:"linux-farm" both impersonated the farm and
+	// weaponised the register route's producer-precedence guard — every genuine
+	// on-device register for that (inode,kind) 409'd, locking the real farm out.
+	//
+	// The locator beats the identifier in the payload: security decisions key on
+	// Provenance (unforgeable — set by the code path that ingested the row), while
+	// Producer stays whatever the sidecar said so DR keeps its fidelity.
+	// "" == not from a sidecar, which is correct both for rows written directly by
+	// the farm/register route and for legacy rows predating the column.
+	Provenance string `json:"-"`
 	// Filmstrip is the sprite-sheet geometry (JM-16), present ONLY for
 	// kind=="filmstrip". Persisted in the row's kind-specific `extra` JSON
 	// column. omitempty so every other kind omits it on the wire.
@@ -147,7 +170,7 @@ func Open(dbPath string) (*Store, error) {
 	}
 	// Migration: source_size / source_mtime (consumer read-gate). Same
 	// duplicate-column-is-fine pattern as `extra`.
-	for _, col := range []string{"source_size INTEGER", "source_mtime INTEGER"} {
+	for _, col := range []string{"source_size INTEGER", "source_mtime INTEGER", "provenance TEXT"} {
 		if _, err := db.Exec(`ALTER TABLE derivatives ADD COLUMN ` + col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
 			return nil, fmt.Errorf("derivatives: migrate %s: %w", col, err)
@@ -186,7 +209,7 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
-		SELECT kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime
+		SELECT kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime, provenance
 		FROM derivatives WHERE inode = ? ORDER BY kind`, int64(inode))
 	if err != nil {
 		return nil, err
@@ -195,11 +218,12 @@ func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 	var out []DerivRow
 	for rows.Next() {
 		var d DerivRow
-		var hash, blob, mt, model, extra sql.NullString
+		var hash, blob, mt, model, extra, prov sql.NullString
 		var dim, srcSize, srcMtime sql.NullInt64
-		if err := rows.Scan(&d.Kind, &d.Status, &d.Producer, &d.Version, &hash, &blob, &mt, &model, &dim, &d.UpdatedAt, &extra, &srcSize, &srcMtime); err != nil {
+		if err := rows.Scan(&d.Kind, &d.Status, &d.Producer, &d.Version, &hash, &blob, &mt, &model, &dim, &d.UpdatedAt, &extra, &srcSize, &srcMtime, &prov); err != nil {
 			return nil, err
 		}
+		d.Provenance = prov.String
 		d.Hash = nullStr(hash)
 		d.BlobRelPath = nullStr(blob)
 		d.MediaType = nullStr(mt)
@@ -263,16 +287,16 @@ func (s *Store) PutDeriv(inode uint64, d DerivRow) error {
 		d.UpdatedAt = time.Now().Unix()
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime, provenance)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(inode, kind) DO UPDATE SET
 		    status=excluded.status, producer=excluded.producer, version=excluded.version,
 		    hash=excluded.hash, blob_rel_path=excluded.blob_rel_path, media_type=excluded.media_type,
 		    model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra,
-		    source_size=excluded.source_size, source_mtime=excluded.source_mtime`,
+		    source_size=excluded.source_size, source_mtime=excluded.source_mtime, provenance=excluded.provenance`,
 		int64(inode), d.Kind, d.Status, d.Producer, d.Version, strOrNil(d.Hash),
 		strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), d.UpdatedAt, extraJSON(d),
-		int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime))
+		int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime), d.Provenance)
 	return err
 }
 
@@ -463,16 +487,16 @@ func (s *Store) IngestTech(inode uint64, hash *string, producer string, version 
 		if ts == 0 {
 			ts = now
 		}
-		if _, err := tx.Exec(`INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		if _, err := tx.Exec(`INSERT INTO derivatives (inode, kind, status, producer, version, hash, blob_rel_path, media_type, model, dim, updated_at, extra, source_size, source_mtime, provenance)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(inode, kind) DO UPDATE SET
 				status=excluded.status, producer=excluded.producer, version=excluded.version,
 				hash=excluded.hash, blob_rel_path=excluded.blob_rel_path, media_type=excluded.media_type,
 				model=excluded.model, dim=excluded.dim, updated_at=excluded.updated_at, extra=excluded.extra,
-				source_size=excluded.source_size, source_mtime=excluded.source_mtime`,
+				source_size=excluded.source_size, source_mtime=excluded.source_mtime, provenance=excluded.provenance`,
 			int64(inode), d.Kind, d.Status, d.Producer, d.Version, strOrNil(d.Hash),
 			strOrNil(d.BlobRelPath), strOrNil(d.MediaType), strOrNil(d.Model), intOrNil(d.Dim), ts, extraJSON(d),
-			int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime)); err != nil {
+			int64OrNil(d.SourceSize), int64OrNil(d.SourceMtime), d.Provenance); err != nil {
 			return err
 		}
 	}

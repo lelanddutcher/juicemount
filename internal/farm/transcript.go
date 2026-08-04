@@ -360,6 +360,12 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 // a prior pass) so the new sub-kind merges INTO it — Path A: we always re-write
 // the COMPLETE bundle so the consumer's destructive-replace never drops a kind.
 func loadExistingAI(blobPath string) *LoupeAI {
+	// Symlink guard (2026-08-04 review): this runs server-side on the farm host
+	// against a consumer-writable tree, so an unguarded ReadFile is an arbitrary
+	// local-file read on the farm.
+	if _, gerr := derivatives.StatRegularNoSymlink(blobPath); gerr != nil {
+		return &LoupeAI{}
+	}
 	if raw, err := os.ReadFile(blobPath); err == nil {
 		var d LoupeJSON
 		if json.Unmarshal(raw, &d) == nil && d.AI != nil {
