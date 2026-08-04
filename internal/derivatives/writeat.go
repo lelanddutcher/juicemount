@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -20,6 +21,9 @@ import (
 // So the joined-path primitive is gone too, and writers hold a DESCRIPTOR for
 // the validated directory. openat/renameat against that descriptor cannot be
 // redirected by anything that happens to the path afterwards.
+
+// tmpSeq makes temp/stage names unique within a process.
+var tmpSeq uint64
 
 // OpenDirUnder walks root/rel with O_NOFOLLOW at every component and returns the
 // directory's descriptor. The caller owns it and must Close it.
@@ -53,11 +57,13 @@ func WriteFileAt(dir *os.File, name string, data []byte, perm os.FileMode) error
 		return err
 	}
 	dfd := int(dir.Fd())
-	tmp := ".tmp-" + name
-	// Clear any stale temp from a previous crash; ignore "not there".
-	if err := unix.Unlinkat(dfd, tmp, 0); err != nil && err != unix.ENOENT {
-		return fmt.Errorf("derivatives: clear temp %q: %w", tmp, err)
-	}
+	// UNIQUE per writer. A fixed ".tmp-<name>" let two concurrent writers for the
+	// same asset collide: the second unlinks the first's temp, the first keeps
+	// writing to a now-unlinked inode, and its renameat then fails with ENOENT —
+	// so one writer's update vanishes with only a returned error to show for it.
+	// The farm's three passes are sequential today, but WriteManifestSidecar is
+	// called from all three and correctness here should not rest on that.
+	tmp := fmt.Sprintf(".tmp-%d-%d-%s", os.Getpid(), atomic.AddUint64(&tmpSeq, 1), name)
 	fd, err := unix.Openat(dfd, tmp,
 		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm))
 	if err != nil {
@@ -102,7 +108,9 @@ func StageNameAt(dir *os.File, name string) (stagedName, absPath string, err err
 		return "", "", err
 	}
 	dfd := int(dir.Fd())
-	staged := ".stage-" + name
+	// The staged name keeps the ORIGINAL EXTENSION last, because ffmpeg selects
+	// its muxer from it — ".stage-1234-7-proxy.mp4" still ends in ".mp4".
+	staged := fmt.Sprintf(".stage-%d-%d-%s", os.Getpid(), atomic.AddUint64(&tmpSeq, 1), name)
 	if err := unix.Unlinkat(dfd, staged, 0); err != nil && err != unix.ENOENT {
 		return "", "", fmt.Errorf("derivatives: clear stage %q: %w", staged, err)
 	}
