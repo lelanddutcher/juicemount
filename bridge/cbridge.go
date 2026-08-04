@@ -3752,9 +3752,24 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	// gate — minting a `ready` row that the (correctly anchored) serve path then
 	// permanently 404s, with the slot occupied. Same walk the serve path uses,
 	// so the two cannot disagree about what exists.
-	if _, statErr := derivatives.StatRegularUnder(fusePath, derivatives.DerivBlobRel(req.Inode, rel)); statErr != nil {
+	bfi, statErr := derivatives.StatRegularUnder(fusePath, derivatives.DerivBlobRel(req.Inode, rel))
+	if statErr != nil {
 		http.Error(w, fmt.Sprintf("blob %q not present as a regular file under the derivative dir — write it (atomically) BEFORE registering: %v",
 			rel, statErr), http.StatusConflict)
+		return
+	}
+	// NON-EMPTY, for the same reason CommitStagedAt refuses to publish an empty
+	// staged file: a MISSING blob 404s and the reader regenerates locally, while
+	// a 0-byte blob is served with 200 and looks like a real answer. The farm
+	// side already enforces this; leaving it off the contribute path made the
+	// rule asymmetric, and the consumer is the LESS trusted writer of the two.
+	//
+	// It also catches the honest mistake this was found by: registering straight
+	// after writing, before the bytes are actually visible through the mount.
+	if bfi.Size() == 0 {
+		http.Error(w, fmt.Sprintf("blob %q is 0 bytes — write the bytes and let the write land BEFORE registering; "+
+			"an empty blob would be served as a real answer instead of 404ing so the reader can regenerate", rel),
+			http.StatusConflict)
 		return
 	}
 
