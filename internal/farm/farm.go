@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strconv"
 	"syscall"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
@@ -57,11 +55,45 @@ type Result struct {
 	BlobErr    error
 }
 
-// DerivBlobDir is the Tier-A on-volume location for an asset's blobs:
-// <mount>/.juicemount/derivatives/<inode>/. Inode-addressed so it survives
-// renames/remounts and is shareable across machines; web-servable as-is.
-func DerivBlobDir(mount string, inode uint64) string {
-	return filepath.Join(mount, ".juicemount", "derivatives", strconv.FormatUint(inode, 10))
+// derivDirFor opens (creating if needed) an asset's derivative directory and
+// returns its DESCRIPTOR, symlink-checked at every component.
+//
+// This replaces DerivBlobDir, which returned a joined absolute path. That was
+// the write-side twin of the unanchored open helper deleted in c01a6eb: a path
+// can only be guarded at the moment it is produced, and every caller then
+// re-resolved it by name at write time. Handing out a descriptor instead means
+// the callers physically cannot re-resolve, so the guard cannot be bypassed by
+// a caller that simply forgets — which is what happened at five call sites
+// across five review rounds.
+//
+// Callers must Close the returned directory.
+// stageUnder creates the output name exclusively inside the held directory and
+// returns the path to hand ffmpeg. A nil dir (mount unset, or the directory
+// refused because a component was a symlink) yields an error, which the caller
+// records as a blob error — never as a silent skip.
+func stageUnder(dir *os.File, name string) (staged, absPath string, err error) {
+	if dir == nil {
+		return "", "", fmt.Errorf("no safe derivative directory")
+	}
+	return derivatives.StageNameAt(dir, name)
+}
+
+// commitStaged moves a generated blob onto its final name THROUGH the directory
+// descriptor, so the commit cannot be redirected even though the subprocess
+// wrote by path.
+func commitStaged(dir *os.File, staged, final string) error {
+	if dir == nil {
+		return fmt.Errorf("no safe derivative directory")
+	}
+	return derivatives.CommitStagedAt(dir, staged, final)
+}
+
+func derivDirFor(mount string, inode uint64) (*os.File, error) {
+	rel := derivatives.DerivDirRel(inode)
+	if err := derivatives.EnsureDirUnder(mount, rel); err != nil {
+		return nil, err
+	}
+	return derivatives.OpenDirUnder(mount, rel)
 }
 
 // stampSource records the source file's size + mtime on a derivative row so a
@@ -129,8 +161,9 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	// Blob size gate: a sub-threshold clip keeps its tech row above but skips
 	// the decode-heavy poster/filmstrip/waveform. 0 = generate for everything.
 	blobBigEnough := opt.MinBlobSizeBytes <= 0 || size >= opt.MinBlobSizeBytes
-	// Create the per-inode directory with a symlink-checking walk BEFORE anything
-	// writes into it. os.MkdirAll — which every generator calls — FOLLOWS a
+	// Hold a DESCRIPTOR for the derivative directory for the whole pass. Every
+	// write below goes through it, so nothing re-resolves a path that an
+	// attacker can swap mid-encode. os.MkdirAll — which every generator calls — FOLLOWS a
 	// symlinked component, so a planted .juicemount/derivatives/<inode> link
 	// redirects ffmpeg output, the transcript blob and the manifest itself out of
 	// the volume, on a host where the farm runs as root. Creating it safely here
@@ -138,20 +171,35 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	//
 	// UNCONDITIONAL on purpose. Gating this on opt.Blobs left real holes: the
 	// waveform is gated on opt.Waveform, the transcript on its own flag, and the
-	// manifest is written for every asset regardless — so a -blobs=false run
-	// skipped the guard while still writing three kinds of file into that
-	// directory. It also costs nothing: the manifest write creates this directory
-	// for every processed asset anyway, so no empty directory appears that would
-	// not have existed.
-	if derr := derivatives.EnsureDirUnder(opt.Mount, derivatives.DerivDirRel(inode)); derr != nil {
-		res.Err = fmt.Errorf("derivative dir: %w", derr)
-		return res
+	// manifest is written for every asset regardless.
+	//
+	// NON-FATAL on purpose too. Making it fatal was a regression: Mount=="" is a
+	// supported configuration elsewhere in this same function, and a transient
+	// EROFS/ENOSPC or a mid-sweep unmount would have dropped the whole asset —
+	// including the cheap `tech` row that a -blobs=false run exists to publish.
+	// A directory we cannot safely open means no BLOBS, not no result.
+	var derivDir *os.File
+	if opt.Mount != "" {
+		d, derr := derivDirFor(opt.Mount, inode)
+		if derr != nil {
+			blobErrs = append(blobErrs, fmt.Errorf("derivative dir: %w", derr))
+		} else {
+			derivDir = d
+			defer derivDir.Close()
+		}
 	}
 	if opt.Blobs && tech.Video != nil && blobBigEnough {
 		rel := "poster.jpg"
 		mt := "image/jpeg"
-		out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
-		if err := Thumbnail(opt.FFmpegBin, path, out, opt.ThumbMaxDim, tech.DurationMS); err != nil {
+		staged, out, stErr := stageUnder(derivDir, rel)
+		err := stErr
+		if err == nil {
+			if err = Thumbnail(opt.FFmpegBin, path, out, opt.ThumbMaxDim, tech.DurationMS); err == nil {
+				err = commitStaged(derivDir, staged, rel)
+			}
+		}
+		if err != nil {
+			derivatives.DiscardStagedAt(derivDir, staged)
 			blobErrs = append(blobErrs, fmt.Errorf("thumbnail: %w", err))
 			rows = append(rows, derivatives.DerivRow{
 				Kind: "thumbnail", Status: "failed", Producer: opt.Producer, Version: opt.Version,
@@ -169,9 +217,16 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	if opt.Filmstrip && tech.Video != nil && blobBigEnough {
 		rel := "strip.jpg"
 		mt := "image/jpeg"
-		out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
-		geo, err := Filmstrip(opt.FFmpegBin, path, out, tech.DurationMS, tech.Video.Width, tech.Video.Height, opt.FilmstripCell, tech.Video.FPS)
+		staged, out, stErr := stageUnder(derivDir, rel)
+		var geo *derivatives.FilmstripGeo
+		err := stErr
+		if err == nil {
+			if geo, err = Filmstrip(opt.FFmpegBin, path, out, tech.DurationMS, tech.Video.Width, tech.Video.Height, opt.FilmstripCell, tech.Video.FPS); err == nil {
+				err = commitStaged(derivDir, staged, rel)
+			}
+		}
 		if err != nil {
+			derivatives.DiscardStagedAt(derivDir, staged)
 			blobErrs = append(blobErrs, fmt.Errorf("filmstrip: %w", err))
 			rows = append(rows, derivatives.DerivRow{
 				Kind: "filmstrip", Status: "failed", Producer: opt.Producer, Version: opt.Version,
@@ -189,8 +244,15 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	if opt.Waveform && len(tech.Audio) > 0 && blobBigEnough {
 		rel := "waveform.json"
 		mt := "application/json"
-		out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
-		if _, err := Waveform(opt.FFmpegBin, path, out, opt.WaveformSPP); err != nil {
+		staged, out, stErr := stageUnder(derivDir, rel)
+		err := stErr
+		if err == nil {
+			if _, err = Waveform(opt.FFmpegBin, path, out, opt.WaveformSPP); err == nil {
+				err = commitStaged(derivDir, staged, rel)
+			}
+		}
+		if err != nil {
+			derivatives.DiscardStagedAt(derivDir, staged)
 			blobErrs = append(blobErrs, fmt.Errorf("waveform: %w", err))
 			rows = append(rows, derivatives.DerivRow{
 				Kind: "waveform", Status: "failed", Producer: opt.Producer, Version: opt.Version,

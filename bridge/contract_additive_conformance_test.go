@@ -21,7 +21,6 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/cplane"
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
-	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -68,7 +67,7 @@ func seedAdditive(t *testing.T) (string, func()) {
 	if err := ds.PutSource(inode, sp(srcHash)); err != nil {
 		t.Fatalf("PutSource: %v", err)
 	}
-	blobDir := farm.DerivBlobDir(mount, inode)
+	blobDir := filepath.Join(mount, derivatives.DerivDirRel(inode))
 	if err := os.MkdirAll(blobDir, 0o755); err != nil {
 		t.Fatalf("mkdir blobdir: %v", err)
 	}

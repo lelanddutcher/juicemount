@@ -129,7 +129,7 @@ func TestLoadExistingAIMerged_BothBlobsNoSubKindLost(t *testing.T) {
 	// because the reader is now anchored at the mount so that no component of
 	// that path can be a symlink.
 	const inode = 900001
-	blobDir := DerivBlobDir(dir, inode)
+	blobDir := filepath.Join(dir, derivatives.DerivDirRel(inode))
 	if err := os.MkdirAll(blobDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

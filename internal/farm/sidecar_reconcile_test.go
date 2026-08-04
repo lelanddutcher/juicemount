@@ -42,7 +42,7 @@ func TestReconcileOneSidecar(t *testing.T) {
 		},
 		WrittenAt: 1,
 	}
-	dir := DerivBlobDir(mount, inode)
+	dir := filepath.Join(mount, derivatives.DerivDirRel(inode))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestReconcileSidecarsUsesSharedCore(t *testing.T) {
 
 	for _, inode := range []uint64{111, 222} {
 		sc := ManifestSidecar{Inode: inode, SourceHash: strptr("00112233445566aa"), Derivatives: []derivatives.DerivRow{{Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1}}, WrittenAt: 1}
-		dir := DerivBlobDir(mount, inode)
+		dir := filepath.Join(mount, derivatives.DerivDirRel(inode))
 		_ = os.MkdirAll(dir, 0o755)
 		b, _ := json.MarshalIndent(sc, "", "  ")
 		_ = os.WriteFile(filepath.Join(dir, "manifest.json"), b, 0o644)
@@ -118,7 +118,7 @@ func TestReconcileRefusesManifestWhoseInodeDisagreesWithItsDirectory(t *testing.
 	const dirInode = uint64(123)
 	const victimInode = uint64(456)
 
-	blobDir := DerivBlobDir(dir, dirInode)
+	blobDir := filepath.Join(dir, derivatives.DerivDirRel(dirInode))
 	if err := os.MkdirAll(blobDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

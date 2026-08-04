@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
-	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/internal/thumbcache"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -115,7 +114,7 @@ func seedFreshness(t *testing.T, o freshOpts) (*freshSeed, func()) {
 	}
 
 	// The derivative blob is real; the SOURCE is not (unless asked for).
-	blobDir := farm.DerivBlobDir(mount, freshInode)
+	blobDir := filepath.Join(mount, derivatives.DerivDirRel(freshInode))
 	if err := os.MkdirAll(blobDir, 0o755); err != nil {
 		t.Fatalf("mkdir blobdir: %v", err)
 	}
@@ -345,7 +344,7 @@ func TestClientWrittenFileMtimeSkewStillServesItsThumbnail(t *testing.T) {
 	cached, _ := seed.tc.Path(freshInode, "thumbnail")
 
 	// /thumb-local's cache-hit path (the QuickLook appex surface).
-	if _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); !ok {
+	if _, _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); !ok {
 		t.Fatal("QuickLook 404'd a VALID poster on client/backend mtime skew — macOS now falls back to " +
 			"its own generator and reads the whole source over the link")
 	}
@@ -660,7 +659,7 @@ func TestFreshThumbCachePathStaleIsMiss(t *testing.T) {
 	}
 	cached, _ := seed.tc.Path(freshInode, "thumbnail")
 
-	if p, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); ok {
+	if _, p, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); ok {
 		t.Fatalf("freshThumbCachePath = (%q, true) for a stale row — QuickLook would draw the wrong poster", p)
 	}
 	if seed.tc.Has(freshInode, "thumbnail") {
@@ -681,11 +680,16 @@ func TestFreshThumbCachePathFreshHits(t *testing.T) {
 	if _, err := seed.tc.Put(freshInode, "thumbnail", strings.NewReader("GOOD-POSTER")); err != nil {
 		t.Fatalf("seed thumb cache: %v", err)
 	}
-	p, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode)
+	root, p, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode)
 	if !ok {
 		t.Fatal("freshThumbCachePath = miss for an unchanged source (would blank every thumbnail)")
 	}
-	body, err := os.ReadFile(p)
+	// (root, rel), not a joined path — the serve side opens it with the anchored
+	// walk, so a provider collapsing this back into one string is the regression.
+	if filepath.IsAbs(p) {
+		t.Errorf("cache rel %q is absolute — it must stay relative to the cache root", p)
+	}
+	body, err := os.ReadFile(filepath.Join(root, p))
 	if err != nil || string(body) != "GOOD-POSTER" {
 		t.Fatalf("cached body = %q (err %v), want GOOD-POSTER", body, err)
 	}
@@ -704,7 +708,7 @@ func TestFreshThumbCachePathMissSkipsTheGate(t *testing.T) {
 	calls, unpatch := withLiveSource(t, func(uint64) liveSource { return liveSource{} })
 	defer unpatch()
 
-	if _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); ok {
+	if _, _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); ok {
 		t.Fatal("empty cache reported a hit")
 	}
 	if *calls != 0 {
@@ -740,7 +744,7 @@ func TestFreshThumbCachePathIgnoresNonReadyRowVouch(t *testing.T) {
 	}
 	cached, _ := seed.tc.Path(freshInode, "thumbnail")
 
-	if _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); !ok {
+	if _, _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); !ok {
 		t.Fatal("N1: a NON-READY row's vouch was used to judge the cached blob — the row describes a " +
 			"derivation that produced nothing, so it can neither validate nor condemn what is cached")
 	}
@@ -762,7 +766,7 @@ func TestFreshThumbCachePathStillJudgesTheReadyRow(t *testing.T) {
 	if _, err := seed.tc.Put(freshInode, "thumbnail", strings.NewReader("OLD-POSTER")); err != nil {
 		t.Fatalf("seed thumb cache: %v", err)
 	}
-	if _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); ok {
+	if _, _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); ok {
 		t.Fatal("a READY row whose vouched SIZE disagrees must still reject")
 	}
 }
@@ -781,7 +785,7 @@ func TestFreshThumbCachePathNoRowIsServed(t *testing.T) {
 	if _, err := seed.tc.Put(freshInode, "thumbnail", strings.NewReader("ORPHAN")); err != nil {
 		t.Fatalf("seed thumb cache: %v", err)
 	}
-	if _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); !ok {
+	if _, _, ok := freshThumbCachePath(seed.ds, seed.tc, freshInode); !ok {
 		t.Fatal("cache entry with no matching manifest row was withheld; want served")
 	}
 }

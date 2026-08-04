@@ -164,6 +164,15 @@ func (s *statInfo) Sys() any           { return nil }
 // Each level is created with mkdirat and then re-opened with
 // O_NOFOLLOW|O_DIRECTORY relative to its parent's descriptor, so an existing
 // symlink is refused rather than traversed.
+// trimRel normalises a mount-relative path, refusing escapes.
+func trimRel(rel string) string {
+	return strings.TrimPrefix(filepath.Clean("/"+rel), "/")
+}
+
+func splitRel(clean string) []string {
+	return strings.Split(clean, string(filepath.Separator))
+}
+
 func EnsureDirUnder(root, rel string) error {
 	clean := strings.TrimPrefix(filepath.Clean("/"+rel), "/")
 	if clean == "" || clean == "." {

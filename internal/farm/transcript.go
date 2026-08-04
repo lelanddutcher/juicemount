@@ -309,9 +309,17 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	// across every blob that exists, because reading only one and writing the
 	// result back permanently drops the other's sub-kinds (the manifest row is
 	// repointed at what we write). A fresh blob gets the new name.
-	blobDir := DerivBlobDir(opt.Mount, inode)
-	rel := derivatives.AIBlobWriteName(blobDir)
-	blobPath := filepath.Join(blobDir, rel)
+	// GenerateTranscript is its own mutually-exclusive entry point too, so it
+	// never reached the guard in farm.Process. Hold the descriptor for the whole
+	// write, and pick the blob NAME through it rather than by stat'ing a joined
+	// path — AIBlobWriteName used to resolve through a symlinked <inode>.
+	derivDir, ddErr := derivDirFor(opt.Mount, inode)
+	if ddErr != nil {
+		res.Err = fmt.Errorf("derivative dir: %w", ddErr)
+		return res
+	}
+	defer derivDir.Close()
+	rel := derivatives.AIBlobWriteNameAt(derivDir)
 	ai := loadExistingAIMerged(opt.Mount, inode)
 	ai.Transcript = tr
 	if ai.AIProviderSummary == nil {
@@ -331,7 +339,7 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	// that decodes only `loupe_version`.
 	doc.SetVersionKeyForBlob(rel)
 
-	if err := writeLoupe(blobPath, doc); err != nil {
+	if err := writeLoupeAt(derivDir, rel, doc); err != nil {
 		res.Err = fmt.Errorf("write %s: %w", rel, err)
 		return res
 	}
@@ -461,13 +469,10 @@ func buildMedia(srcPath string, tech *Tech, hash string) LoupeMedia {
 	return m
 }
 
-func writeLoupe(blobPath string, doc *LoupeJSON) error {
-	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
-		return err
-	}
+func writeLoupeAt(dir *os.File, name string, doc *LoupeJSON) error {
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(blobPath, b, 0o644)
+	return derivatives.WriteFileAt(dir, name, b, 0o644)
 }

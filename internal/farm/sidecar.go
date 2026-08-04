@@ -178,7 +178,18 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 	// bytes at all. This is the field the "clamp the informational" sweep
 	// missed. PutDeriv already treats 0 as "stamp now", so 0 is safe to pass.
 	if row.UpdatedAt < 0 || row.UpdatedAt > nowUnix()+updatedAtSkewSlack {
-		row.UpdatedAt = 0
+		// Deliberately NOT 0. PutDeriv treats 0 as "stamp now", so zeroing an
+		// implausible value made the SAME untouched manifest re-emit on every
+		// sweep of the changes feed forever — trading a poisoned cursor for
+		// permanent churn. SourceMtime is a real, already-validated timestamp
+		// tied to the asset, so it is stable across sweeps; falling back to it
+		// keeps the row deterministic. With no vouch either, 0 is correct: the
+		// row genuinely has no trustworthy time and one restamp settles it.
+		if row.SourceMtime != nil && *row.SourceMtime > 0 && *row.SourceMtime <= nowUnix()+updatedAtSkewSlack {
+			row.UpdatedAt = *row.SourceMtime
+		} else {
+			row.UpdatedAt = 0
+		}
 	}
 	if row.Version < 1 {
 		row.Version = 1
@@ -342,7 +353,10 @@ func sanitizeTechSidecar(t *TechSidecar) (*TechSidecar, bool) {
 		}
 	}
 	if v, present := probe["duration_ms"]; present {
-		if n, isNum := v.(float64); !isNum || n < 0 {
+		// BOTH bounds. The first cut checked only n < 0 while size_bytes got a
+		// range — so 1e300 sailed through the field readers use for scrubber
+		// geometry. maxPlausibleDurationMS is ~1000 years.
+		if n, isNum := v.(float64); !isNum || n < 0 || n > maxPlausibleDurationMS {
 			delete(probe, "duration_ms")
 			cleaned, err := json.Marshal(probe)
 			if err != nil {
@@ -392,10 +406,19 @@ var nowUnix = func() int64 { return time.Now().Unix() }
 
 // updatedAtSkewSlack tolerates ordinary clock skew between the farm host and
 // this Mac without letting a forged far-future stamp through.
-const updatedAtSkewSlack = int64(24 * 60 * 60)
+// 5 minutes. 24 h was chosen for "ordinary clock skew" and left a rolling,
+// indefinitely renewable blind spot: now+86400 passed verbatim, so one JSON file
+// with no blob bytes still hid a consumer's changes feed for a full day, and
+// every newly-created inode gets a fresh reconcile to renew it. NTP-synced hosts
+// are within seconds; five minutes is generous for the real condition and
+// useless as an attack window.
+const updatedAtSkewSlack = int64(5 * 60)
 
 // maxPlausibleSourceBytes: 1 PiB. Larger is not a media file, it is a forgery.
 const maxPlausibleSourceBytes = float64(int64(1) << 50)
+
+// maxPlausibleDurationMS: ~1000 years. Longer is not a clip.
+const maxPlausibleDurationMS = float64(1000 * 365 * 24 * 60 * 60 * 1000)
 
 const (
 	maxSidecarVersion   = 1 << 16
@@ -590,11 +613,16 @@ func WriteManifestSidecar(store *derivatives.Store, mount string, inode uint64) 
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(DerivBlobDir(mount, inode), "manifest.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// Written THROUGH the directory descriptor. This runs from all three farm
+	// entry points, and os.MkdirAll + a path-addressed atomic write followed a
+	// symlinked <inode> component straight out of the volume — clobbering
+	// whatever sat at the target, as root.
+	dir, err := derivDirFor(mount, inode)
+	if err != nil {
 		return err
 	}
-	return atomicWriteFile(path, b, 0o644)
+	defer dir.Close()
+	return derivatives.WriteFileAt(dir, "manifest.json", b, 0o644)
 }
 
 // derefStr is a nil-safe *string for log lines.

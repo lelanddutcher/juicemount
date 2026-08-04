@@ -20,6 +20,9 @@ func TestUpdatedAtCannotPoisonTheChangesCursor(t *testing.T) {
 	}{
 		{"max-int64", 1<<63 - 1},
 		{"far-future", nowUnix() + 86400*365*100},
+		// The old 24h slack made this pass VERBATIM — a rolling, indefinitely
+		// renewable blind spot rather than a permanent one.
+		{"just-past-old-24h-slack", nowUnix() + 86400},
 		{"negative", -1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -34,8 +37,11 @@ func TestUpdatedAtCannotPoisonTheChangesCursor(t *testing.T) {
 				t.Errorf("updated_at %d passed through — it is the changes cursor, "+
 					"and a forged value silences the change channel permanently", tc.in)
 			}
-			if got.UpdatedAt != 0 {
-				t.Errorf("updated_at = %d, want 0 (PutDeriv stamps now)", got.UpdatedAt)
+			// Must not be 0 when a usable SourceMtime exists: PutDeriv treats 0
+			// as "stamp now", so zeroing makes the same untouched manifest
+			// re-emit on the changes feed every single sweep, forever.
+			if got.UpdatedAt != 0 && got.UpdatedAt > nowUnix()+updatedAtSkewSlack {
+				t.Errorf("updated_at = %d is still in the future", got.UpdatedAt)
 			}
 		})
 	}
@@ -66,6 +72,11 @@ func TestTechPayloadFreshnessSignalValidated(t *testing.T) {
 		{"absurd size", `{"size_bytes":1e30}`},
 		{"non-numeric size", `{"size_bytes":"lots"}`},
 		{"negative duration", `{"size_bytes":100,"duration_ms":-1}`},
+		// The reviewer's exact case: size_bytes got both bounds while duration_ms
+		// got only n < 0, so 1e300 sailed through the field readers use for
+		// scrubber geometry. Absent until a neuter run proved the upper bound had
+		// no coverage at all.
+		{"absurd duration", `{"size_bytes":100,"duration_ms":1e300}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, ok := sanitizeTechSidecar(&TechSidecar{
@@ -85,7 +96,10 @@ func TestTechPayloadFreshnessSignalValidated(t *testing.T) {
 				}
 			}
 			if v, present := got["duration_ms"]; present {
-				if n, isNum := v.(float64); !isNum || n < 0 {
+				// BOTH bounds. The first version of this assertion checked only
+				// n < 0 — mirroring the bug it was meant to catch — so a neuter
+				// run that removed the upper bound stayed green.
+				if n, isNum := v.(float64); !isNum || n < 0 || n > maxPlausibleDurationMS {
 					t.Errorf("implausible duration_ms %v survived", v)
 				}
 			}
@@ -121,3 +135,33 @@ func TestTechVersionClampedNotRejected(t *testing.T) {
 		t.Errorf("version = %d, want clamped to 1", out.Version)
 	}
 }
+
+// Clamping an implausible updated_at to 0 would trade a poisoned cursor for
+// permanent churn: PutDeriv stamps now for 0, so an untouched manifest re-emits
+// on every sweep. A row with a usable SourceMtime must settle on a stable value.
+func TestUpdatedAtClampIsStableAcrossSweeps(t *testing.T) {
+	blob := "poster.jpg"
+	mt := nowUnix() - 7200
+	row := derivatives.DerivRow{
+		Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
+		BlobRelPath: &blob, SourceMtime: &mt, SourceSize: i64(1024),
+		UpdatedAt: 1<<63 - 1,
+	}
+	first, ok := sanitizeSidecarRow(row)
+	if !ok {
+		t.Fatal("row dropped")
+	}
+	second, _ := sanitizeSidecarRow(row)
+	if first.UpdatedAt != second.UpdatedAt {
+		t.Errorf("same manifest yielded %d then %d — the changes feed would churn forever",
+			first.UpdatedAt, second.UpdatedAt)
+	}
+	if first.UpdatedAt == 0 {
+		t.Error("clamped to 0, which makes PutDeriv restamp on every sweep")
+	}
+	if first.UpdatedAt != mt {
+		t.Errorf("updated_at = %d, want the asset's own SourceMtime %d", first.UpdatedAt, mt)
+	}
+}
+
+func i64(v int64) *int64 { return &v }

@@ -3704,7 +3704,6 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	// to a fixed name would 404 a blob an older consumer had already written
 	// under the other one. An explicit blob_rel_path is honoured as-is; the
 	// register schema accepts both names.
-	blobDir := farm.DerivBlobDir(fusePath, req.Inode)
 	if spec.file != "" {
 		// The reserved name is authoritative. A supplied blob_rel_path is only
 		// accepted when it MATCHES it — the consumer does not get to choose a
@@ -3718,7 +3717,15 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if rel == "" {
 		// kind=="ai" keeps its dual-name resolution (wire-term cutover): the
 		// post-cutover `ai.logger.json` if present, else the legacy name.
-		rel = derivatives.ResolveAIBlobName(blobDir)
+		// Resolved through a DESCRIPTOR, not a joined path: the path form stat'ed
+		// through a consumer-swappable <inode> component, so an ancestor symlink
+		// steered the very choice of filename from outside the volume.
+		if dir, derr := derivatives.OpenDirUnder(fusePath, derivatives.DerivDirRel(req.Inode)); derr == nil {
+			rel = derivatives.AIBlobWriteNameAt(dir)
+			dir.Close()
+		} else {
+			rel = derivatives.AIBlobName
+		}
 	}
 
 	if store == nil || ds == nil {
@@ -3740,15 +3747,14 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	// ORDER MATTERS: this runs AFTER the inode lookup. Placed before it, an
 	// unknown inode reported 409 "blob missing" instead of 404 "inode not
 	// found" — a real regression caught by TestDerivativesRegisterOL1.
-	if li, statErr := os.Lstat(filepath.Join(blobDir, rel)); statErr != nil {
-		http.Error(w, fmt.Sprintf("blob %q not present under the derivative dir — write it (atomically) BEFORE registering: %v",
+	// ANCHORED. Lstat on a joined path guards only the LEAF, so an ancestor
+	// symlink let an out-of-tree file satisfy this "write it BEFORE registering"
+	// gate — minting a `ready` row that the (correctly anchored) serve path then
+	// permanently 404s, with the slot occupied. Same walk the serve path uses,
+	// so the two cannot disagree about what exists.
+	if _, statErr := derivatives.StatRegularUnder(fusePath, derivatives.DerivBlobRel(req.Inode, rel)); statErr != nil {
+		http.Error(w, fmt.Sprintf("blob %q not present as a regular file under the derivative dir — write it (atomically) BEFORE registering: %v",
 			rel, statErr), http.StatusConflict)
-		return
-	} else if !li.Mode().IsRegular() {
-		// Lstat, not Stat: a symlink here would otherwise register cleanly and
-		// then be served by /blob as whatever it points at.
-		http.Error(w, fmt.Sprintf("blob %q must be a regular file, got mode %s", rel, li.Mode()),
-			http.StatusBadRequest)
 		return
 	}
 

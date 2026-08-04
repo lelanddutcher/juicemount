@@ -30,18 +30,20 @@ func fakeThumbDeps(t *testing.T, cachedInode uint64, populateOK bool) (thumbLoca
 			}
 			return 0, false, false
 		},
-		cachePath: func(ino uint64) (string, bool) {
+		// (root, rel): /thumb-local serves through the anchored open now, so the
+		// fake must hand back a split path exactly as the real providers do.
+		cachePath: func(ino uint64) (string, string, bool) {
 			if ino == cachedInode {
-				return blob, true
+				return filepath.Dir(blob), filepath.Base(blob), true
 			}
-			return "", false
+			return "", "", false
 		},
-		populate: func(ino uint64) (string, bool) {
+		populate: func(ino uint64) (string, string, bool) {
 			*populated = append(*populated, ino)
 			if populateOK {
-				return blob, true
+				return filepath.Dir(blob), filepath.Base(blob), true
 			}
-			return "", false
+			return "", "", false
 		},
 		warmDir: func(rel string) { *warmed = append(*warmed, rel) },
 	}, warmed, populated

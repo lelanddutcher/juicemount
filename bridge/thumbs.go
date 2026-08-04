@@ -190,20 +190,20 @@ func derefI64(p *int64) int64 {
 // A cache entry with no thumbnail row in the index is served: the cache
 // outliving its manifest row is a normal state (reconcile pending, index
 // rebuilt), and there is no vouch to judge it by.
-func freshThumbCachePath(ds *derivatives.Store, tc *thumbcache.Cache, inode uint64) (string, bool) {
+func freshThumbCachePath(ds *derivatives.Store, tc *thumbcache.Cache, inode uint64) (root, rel string, ok bool) {
 	if tc == nil {
-		return "", false
+		return "", "", false
 	}
-	p, ok := tc.Path(inode, thumbKind)
+	croot, crel, ok := tc.PathParts(inode, thumbKind)
 	if !ok {
-		return "", false
+		return "", "", false
 	}
 	if ds == nil {
-		return p, true
+		return croot, crel, true
 	}
 	rows, err := ds.Manifest(inode)
 	if err != nil {
-		return p, true // index unreadable — no basis to reject; serve.
+		return croot, crel, true // index unreadable — no basis to reject; serve.
 	}
 	for _, d := range rows {
 		// N1: match resolveThumbBlobPath's READY filter. Judging the first
@@ -217,11 +217,11 @@ func freshThumbCachePath(ds *derivatives.Store, tc *thumbcache.Cache, inode uint
 		live := liveSourceFor(inode)
 		if derivRowStale(d, live) {
 			rejectStaleDeriv(tc, inode, thumbKind, d, live)
-			return "", false
+			return "", "", false
 		}
 		break
 	}
-	return p, true
+	return croot, crel, true
 }
 
 // resolveThumbBlobPath resolves an inode's READY "thumbnail" derivative to
@@ -280,8 +280,8 @@ func resolveThumbBlobPath(inode uint64) (mountOut, blobRel string, ok bool) {
 type thumbLocalDeps struct {
 	mount     string                                          // configured user-facing mount point ("/Volumes/zpool")
 	lookup    func(rel string) (inode uint64, isDir, ok bool) // RAM mirror path→inode
-	cachePath func(inode uint64) (string, bool)               // local thumb-cache blob path
-	populate  func(inode uint64) (string, bool)               // read-through: resolve+cache, return cache path
+	cachePath func(inode uint64) (root, rel string, ok bool)  // local thumb-cache blob (root+rel: anchored serve)
+	populate  func(inode uint64) (root, rel string, ok bool)  // read-through: resolve+cache, then the same
 	warmDir   func(relDir string)                             // async dir warm (TTL-deduped by the warmer)
 }
 
@@ -329,18 +329,34 @@ func serveThumbLocal(w http.ResponseWriter, r *http.Request, d thumbLocalDeps) {
 		http.NotFound(w, r)
 		return
 	}
-	if bp, ok := d.cachePath(inode); ok {
+	// ANCHORED, like /blob's cache branch. These two http.ServeFile calls were
+	// the siblings the previous round's fix did not name: same cache, same
+	// bytes, different endpoint — and ServeFile re-resolves the joined path.
+	serve := func(root, rel, label string) bool {
+		f, err := derivatives.OpenRegularUnder(root, rel)
+		if err != nil {
+			return false
+		}
+		defer f.Close()
+		fi, serr := f.Stat()
+		if serr != nil {
+			return false
+		}
 		w.Header().Set("Content-Type", "image/jpeg")
-		w.Header().Set("X-JM-Thumb", "hit")
-		http.ServeFile(w, r, bp)
-		return
+		w.Header().Set("X-JM-Thumb", label)
+		http.ServeContent(w, r, "", fi.ModTime(), f)
+		return true
+	}
+	if root, rel, ok := d.cachePath(inode); ok {
+		if serve(root, rel, "hit") {
+			return
+		}
 	}
 	if d.populate != nil {
-		if bp, ok := d.populate(inode); ok {
-			w.Header().Set("Content-Type", "image/jpeg")
-			w.Header().Set("X-JM-Thumb", "populated")
-			http.ServeFile(w, r, bp)
-			return
+		if root, rel, ok := d.populate(inode); ok {
+			if serve(root, rel, "populated") {
+				return
+			}
 		}
 	}
 	if d.warmDir != nil {
@@ -355,13 +371,13 @@ func serveThumbLocal(w http.ResponseWriter, r *http.Request, d thumbLocalDeps) {
 // into the local thumb cache (size-capped — the same 2MB bound the warmer
 // uses), and return the CACHE path to serve from. Serving from the cache, not
 // the FUSE path, keeps repeat requests off FUSE entirely.
-func populateThumbFromFUSE(tc *thumbcache.Cache, inode uint64) (string, bool) {
+func populateThumbFromFUSE(tc *thumbcache.Cache, inode uint64) (root, rel string, ok bool) {
 	if tc == nil {
-		return "", false
+		return "", "", false
 	}
 	mount, blobRel, ok := resolveThumbBlobPath(inode)
 	if !ok {
-		return "", false
+		return "", "", false
 	}
 	// ANCHORED symlink guard. The derivative tree is consumer-writable, and this
 	// writes into the PERSISTENT thumb cache — after which the serve path hands
@@ -372,17 +388,17 @@ func populateThumbFromFUSE(tc *thumbcache.Cache, inode uint64) (string, bool) {
 	// second stat of the name, so there is nothing to swap in between.
 	f, err := derivatives.OpenRegularUnder(mount, blobRel)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil || fi.Size() <= 0 || fi.Size() > thumbReadThroughCap {
-		return "", false
+		return "", "", false
 	}
 	if _, err := tc.Put(inode, "thumbnail", f); err != nil {
-		return "", false
+		return "", "", false
 	}
-	return tc.Path(inode, "thumbnail")
+	return tc.PathParts(inode, "thumbnail")
 }
 
 // handleThumbLocalHTTP wires serveThumbLocal to the live bridge globals.
@@ -410,8 +426,8 @@ func handleThumbLocalHTTP(w http.ResponseWriter, r *http.Request) {
 		// C5: cache hits are freshness-gated. This is the surface that reads
 		// the persistent cache BEFORE any manifest lookup, so it is where a
 		// stale poster would otherwise be served straight off local disk.
-		cachePath: func(ino uint64) (string, bool) { return freshThumbCachePath(ds, tc, ino) },
-		populate:  func(ino uint64) (string, bool) { return populateThumbFromFUSE(tc, ino) },
+		cachePath: func(ino uint64) (string, string, bool) { return freshThumbCachePath(ds, tc, ino) },
+		populate:  func(ino uint64) (string, string, bool) { return populateThumbFromFUSE(tc, ino) },
 		warmDir:   func(relDir string) { warmer.WarmDirAsync(relDir) },
 	})
 }

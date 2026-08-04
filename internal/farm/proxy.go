@@ -120,7 +120,21 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 
 	rel := "proxy.mp4"
 	mt := "video/mp4"
-	out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
+	// GenerateProxy is its OWN entry point — cmd/jmfarm runs -proxy as a separate
+	// mutually-exclusive pass that never reaches farm.Process, so the guard added
+	// there did not apply here at all. Hold the descriptor and stage under it.
+	derivDir, ddErr := derivDirFor(opt.Mount, inode)
+	if ddErr != nil {
+		res.Err = fmt.Errorf("derivative dir: %w", ddErr)
+		return res
+	}
+	defer derivDir.Close()
+	staged, out, err := derivatives.StageNameAt(derivDir, rel)
+	stErr := err
+	if stErr != nil {
+		res.Err = fmt.Errorf("stage proxy: %w", stErr)
+		return res
+	}
 	// PROXY-CODEC (#50): stamp which codec THIS blob is + its exact
 	// canPlayType/isTypeSupported token so OL/web can gate without re-probing.
 	// The codec is derived from the configured encoder (libx264 ⇒ h264 floor;
@@ -133,7 +147,12 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		Codec: &codec, CodecString: &codecString,
 	}
 	stampSource(&row, fi)
-	if err := Proxy(opt.FFmpegBin, opt.ProxyVCodec, opt.ProxyCRF, opt.ProxyPreset, path, out); err != nil {
+	err = Proxy(opt.FFmpegBin, opt.ProxyVCodec, opt.ProxyCRF, opt.ProxyPreset, path, out)
+	if err == nil {
+		err = derivatives.CommitStagedAt(derivDir, staged, rel)
+	}
+	if err != nil {
+		derivatives.DiscardStagedAt(derivDir, staged)
 		// Non-fatal: publish a failed row so the consumer regenerates locally.
 		res.Err = err
 		row.Status = "failed"
@@ -143,7 +162,7 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		// blob_size = actual produced bytes (required-intent on a ready proxy).
 		// Best-effort stat; a stat failure leaves blob_size absent (honest — the
 		// schema permits null), it does not fail the row.
-		if bi, serr := os.Stat(out); serr == nil {
+		if bi, serr := derivatives.StatRegularUnder(opt.Mount, derivatives.DerivBlobRel(inode, rel)); serr == nil {
 			sz := bi.Size()
 			row.BlobSize = &sz
 		}

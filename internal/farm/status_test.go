@@ -14,7 +14,7 @@ func i64p(v int64) *int64 { return &v }
 // dir under mount, so ComputeProxyEconomics can os.Stat real bytes.
 func writeProxyBlob(t *testing.T, mount string, inode uint64, n int) {
 	t.Helper()
-	dir := DerivBlobDir(mount, inode)
+	dir := filepath.Join(mount, derivatives.DerivDirRel(inode))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir blob dir: %v", err)
 	}

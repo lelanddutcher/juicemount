@@ -1,6 +1,7 @@
 package derivatives
 
 import (
+	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
 )
@@ -54,6 +55,23 @@ func AIBlobReadPaths(dir string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// AIBlobWriteNameAt is AIBlobWriteName resolved through a DIRECTORY DESCRIPTOR
+// instead of a joined path. The path form stat'ed through a consumer-swappable
+// <inode> component, so the very choice of filename could be steered from
+// outside the volume.
+func AIBlobWriteNameAt(dir *os.File) string {
+	if existsAt(dir, AIBlobNameLegacy) && !existsAt(dir, AIBlobName) {
+		return AIBlobNameLegacy
+	}
+	return AIBlobName
+}
+
+func existsAt(dir *os.File, name string) bool {
+	var st unix.Stat_t
+	return unix.Fstatat(int(dir.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil &&
+		st.Mode&unix.S_IFMT == unix.S_IFREG
 }
 
 // AIBlobWriteName returns the blob filename to WRITE for dir.
