@@ -5,10 +5,23 @@ import (
 	"time"
 )
 
-// seedDiskAvail pins the free-disk sample so the test controls what
-// effectiveCapacity sees. avail < 0 means "Statfs never succeeded".
+// seedDiskAvail pins the sampled ceiling as if free disk were `avail` at this
+// instant, mirroring refreshCeiling exactly. avail < 0 means "Statfs failed".
 func seedDiskAvail(s *SpoolStore, avail int64) {
-	s.diskAvailBytes.Store(avail)
+	if avail < 0 {
+		s.capCeiling.Store(-1)
+		s.diskAvailAt.Store(time.Now().UnixNano())
+		return
+	}
+	headroom := avail - SpoolFreeFloorBytes
+	if headroom < 0 {
+		headroom = 0
+	}
+	ceiling := s.used.Load() + headroom
+	if ceiling < minClampedCeiling {
+		ceiling = minClampedCeiling
+	}
+	s.capCeiling.Store(ceiling)
 	s.diskAvailAt.Store(time.Now().UnixNano())
 }
 
@@ -134,14 +147,15 @@ func TestCapacityReportsEffectiveNotConfigured(t *testing.T) {
 // The sample must be cached: admission runs per write, and Statfs-per-write on a
 // large copy is exactly the kind of syscall amplification this codebase bans on
 // hot paths.
-func TestCachedDiskAvail_IsCachedWithinTTL(t *testing.T) {
+func TestCachedCeiling_IsCachedWithinTTL(t *testing.T) {
 	s := newTestSpoolStore(t, 100*gib)
 
 	seedDiskAvail(s, 42*gib)
 	at := s.diskAvailAt.Load()
+	want := s.capCeiling.Load()
 	for i := 0; i < 50; i++ {
-		if v, ok := s.cachedDiskAvail(); !ok || v != 42*gib {
-			t.Fatalf("call %d: got (%d,%v), want the cached 42 GiB", i, v, ok)
+		if v, ok := s.cachedCeiling(); !ok || v != want {
+			t.Fatalf("call %d: got (%d,%v), want the cached ceiling %d", i, v, ok, want)
 		}
 	}
 	if s.diskAvailAt.Load() != at {
@@ -151,10 +165,88 @@ func TestCachedDiskAvail_IsCachedWithinTTL(t *testing.T) {
 	// Expiring the stamp must allow a real resample (value will be the real
 	// disk, so only assert that the timestamp moved).
 	s.diskAvailAt.Store(time.Now().Add(-2 * diskAvailTTL).UnixNano())
-	if _, ok := s.cachedDiskAvail(); !ok {
+	if _, ok := s.cachedCeiling(); !ok {
 		t.Skip("Statfs unavailable in this environment")
 	}
 	if s.diskAvailAt.Load() == at {
 		t.Error("cache did not resample after the TTL expired")
+	}
+}
+
+// CRITICAL regression (2026-08-03 review, defect 1). The first version derived
+// the ceiling from the LIVE `used` on every check, so `cur+delta > used+headroom`
+// reduced to `delta > headroom` per call and cumulative admission inside one
+// sample window was unbounded. The reviewer's reproduction: six 9 GiB
+// reservations all cleared a 10 GiB headroom, driving used to 54 GiB.
+//
+// The ceiling must be pinned to a `used` snapshot taken with the disk reading,
+// so a window admits at most `headroom` in TOTAL.
+func TestTryReserveCapacity_CumulativeAdmissionIsBoundedWithinOneSample(t *testing.T) {
+	s := newTestSpoolStore(t, 200*gib)
+	s.used.Store(0)
+	seedDiskAvail(s, 30*gib) // headroom = 10 GiB, pinned for this window
+
+	var admitted int64
+	for i := 0; i < 6; i++ {
+		if s.tryReserveCapacity(9 * gib) {
+			admitted += 9 * gib
+		}
+	}
+	if headroom := 30*gib - SpoolFreeFloorBytes; admitted > headroom {
+		t.Errorf("admitted %d GiB against %d GiB of headroom — the ceiling is chasing `used` again",
+			admitted>>30, headroom>>30)
+	}
+	if admitted == 0 {
+		t.Error("admitted nothing; the clamp is now too strict to accept a fitting write")
+	}
+}
+
+// CRITICAL regression (2026-08-03 review, defect 2). Every admission gate spells
+// "unlimited" as `ec <= 0`. A legitimately-computed ceiling of exactly zero —
+// spool EMPTY and disk at/under the floor, the resting state of a chronically
+// low-disk machine — collided with that sentinel and re-opened admission with no
+// cap at all, at the worst possible moment.
+func TestEffectiveCapacity_ZeroCeilingDoesNotReadAsUnlimited(t *testing.T) {
+	s := newTestSpoolStore(t, 100*gib)
+	s.used.Store(0)                       // empty spool
+	seedDiskAvail(s, SpoolFreeFloorBytes) // exactly at the floor -> headroom 0
+
+	ec := s.effectiveCapacity()
+	if ec <= 0 {
+		t.Fatalf("effectiveCapacity()=%d reads as the 'unlimited' sentinel at the floor", ec)
+	}
+	if s.tryReserveCapacity(50 * gib) {
+		t.Error("admitted 50 GiB with an empty spool on a floor-constrained disk — sentinel collision is back")
+	}
+	if !s.DiskConstrained() {
+		t.Error("DiskConstrained() should be true when the disk clamp is what blocks admission")
+	}
+}
+
+// DiskConstrained must distinguish "the configured budget is full" (waiting on
+// the drain can help) from "the volume is full" (it cannot). The offline stall
+// branches on this to avoid parking forever on a hang reconnecting won't fix.
+func TestDiskConstrained_OnlyWhenTheDiskIsTheBlocker(t *testing.T) {
+	s := newTestSpoolStore(t, 8*gib)
+
+	// Budget-full but plenty of disk: NOT disk-constrained.
+	s.used.Store(8 * gib)
+	seedDiskAvail(s, 500*gib)
+	if s.DiskConstrained() {
+		t.Error("budget-full with a roomy disk must not report disk-constrained")
+	}
+
+	// Disk at the floor: constrained.
+	s.used.Store(1 * gib)
+	seedDiskAvail(s, SpoolFreeFloorBytes)
+	if !s.DiskConstrained() {
+		t.Error("disk at the floor must report disk-constrained")
+	}
+
+	// Unlimited config is never disk-constrained (scope limit).
+	u := newTestSpoolStore(t, 0)
+	seedDiskAvail(u, 1*gib)
+	if u.DiskConstrained() {
+		t.Error("unlimited config must never report disk-constrained")
 	}
 }

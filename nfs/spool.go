@@ -82,8 +82,13 @@ type SpoolStore struct {
 	// continuous. Sampled at most once per diskAvailTTL so the per-write
 	// admission path stays cheap; Statfs here is on the LOCAL spool disk, never
 	// through FUSE.
-	diskAvailBytes atomic.Int64 // last observed bytes available, -1 = never sampled
-	diskAvailAt    atomic.Int64 // UnixNano of that sample
+	// capCeiling is the absolute byte ceiling derived at sample time:
+	// usedAtSample + max(0, avail - SpoolFreeFloorBytes). It must be computed
+	// from a `used` SNAPSHOT taken together with the avail reading, and must NOT
+	// be re-derived from the live `used` on each check — see effectiveCapacity.
+	// -1 = never successfully sampled.
+	capCeiling  atomic.Int64
+	diskAvailAt atomic.Int64 // UnixNano of that sample
 
 	// lastReleaseNanos is the wall-clock (UnixNano) of the most recent
 	// capacity release — i.e. the last time the drainer (or a write
@@ -272,32 +277,98 @@ func (s *SpoolStore) SetDrainerWake(fn func()) {
 // Root returns the spool root directory.
 func (s *SpoolStore) Root() string { return s.root }
 
-// diskAvailTTL bounds how often effectiveCapacity re-samples free disk. Short
-// enough that a filling volume is noticed within a couple of writes, long enough
-// that a burst of small writes doesn't Statfs per write.
+// diskAvailTTL bounds how often the disk ceiling is re-sampled. Short enough
+// that a filling volume is noticed within a couple of writes, long enough that a
+// burst of small writes doesn't Statfs per write.
 const diskAvailTTL = 1 * time.Second
 
-// cachedDiskAvail returns bytes available on the spool's own volume, resampling
-// at most once per diskAvailTTL. Returns (0,false) when Statfs has never
-// succeeded, so callers can fail OPEN (keep the configured cap) rather than
-// mistaking an unreadable statfs for a full disk.
-func (s *SpoolStore) cachedDiskAvail() (int64, bool) {
-	now := time.Now().UnixNano()
-	if at := s.diskAvailAt.Load(); at != 0 && now-at < int64(diskAvailTTL) {
-		if v := s.diskAvailBytes.Load(); v >= 0 {
-			return v, true
-		}
-		return 0, false
-	}
+// minClampedCeiling is returned instead of 0 whenever the disk clamp is active
+// and computes a ceiling of zero.
+//
+// WHY (2026-08-03 review, CRITICAL): every admission gate spells "unlimited" as
+// `ec <= 0`. A legitimately-computed ceiling of exactly 0 — which happens when
+// the spool is EMPTY and free disk is at or under the floor, the normal resting
+// state of a chronically low-disk machine between copies — would collide with
+// that sentinel and silently re-open admission with no cap at all, at precisely
+// the moment the disk is most constrained. A ceiling of 1 byte rejects every
+// real reservation while staying safely positive.
+const minClampedCeiling = int64(1)
+
+// refreshCeiling re-samples free disk and recomputes capCeiling.
+//
+// The `used` snapshot MUST be taken here, alongside avail, and the resulting
+// ceiling treated as absolute for the whole TTL window. Deriving the ceiling
+// from the live `used` on every check was the CRITICAL bug found in review:
+// `cur+delta > used+headroom` reduces algebraically to `delta > headroom` PER
+// CALL, so the ceiling chased `used` upward and cumulative admission inside one
+// window was unbounded — six 9 GiB reservations all cleared a 10 GiB headroom.
+// Pinning it to the snapshot makes the window admit at most `headroom` in total,
+// which is the entire point of the clamp.
+func (s *SpoolStore) refreshCeiling(now int64) {
 	avail, err := spoolDiskAvail(s.root)
 	if err != nil || avail < 0 {
-		s.diskAvailBytes.Store(-1)
+		// Silent fail-open was flagged in review as unobservable; log once per
+		// sample so a machine where statfs reliably fails is diagnosable rather
+		// than quietly running unclamped.
+		jmlog.Warn("spool: free-disk sample failed — capacity clamp inactive this window",
+			"root", s.root, "error", fmt.Sprint(err))
+		s.capCeiling.Store(-1)
 		s.diskAvailAt.Store(now)
+		return
+	}
+	headroom := avail - SpoolFreeFloorBytes
+	if headroom < 0 {
+		headroom = 0
+	}
+	ceiling := s.used.Load() + headroom // snapshot, NOT re-read per check
+	if ceiling < minClampedCeiling {
+		ceiling = minClampedCeiling
+	}
+	s.capCeiling.Store(ceiling)
+	s.diskAvailAt.Store(now)
+}
+
+// cachedCeiling returns the sampled absolute ceiling, resampling at most once
+// per diskAvailTTL. ok=false means free disk is unreadable.
+func (s *SpoolStore) cachedCeiling() (int64, bool) {
+	now := time.Now().UnixNano()
+	if at := s.diskAvailAt.Load(); at == 0 || now-at >= int64(diskAvailTTL) {
+		s.refreshCeiling(now)
+	}
+	c := s.capCeiling.Load()
+	if c < 0 {
 		return 0, false
 	}
-	s.diskAvailBytes.Store(avail)
-	s.diskAvailAt.Store(now)
-	return avail, true
+	return c, true
+}
+
+// DiskConstrained reports whether the live free-disk clamp — not the configured
+// budget — is what is currently blocking admission. True means more spool bytes
+// cannot be accepted because the VOLUME is at its floor.
+//
+// Used by the capacity stall to decide whether waiting can ever help: while
+// offline, a stall normally waits forever on the assumption that reconnecting
+// lets the drain free space. That assumption is false when the blocker is local
+// disk consumed by something other than the spool, and waiting forever there is
+// an unbounded Finder hang with no error. See waitForCapacity.
+func (s *SpoolStore) DiskConstrained() bool {
+	if s.capacity <= 0 {
+		return false
+	}
+	ceiling, ok := s.cachedCeiling()
+	if !ok {
+		return false
+	}
+	// The DISK is the blocker only when the clamp is below the configured budget
+	// AND there is effectively no headroom left under it. Compare REMAINING
+	// headroom rather than `used >= ceiling`: at the floor with an empty spool
+	// the ceiling is the 1-byte sentinel, so `0 >= 1` would read as unconstrained
+	// exactly when the volume is fullest.
+	remaining := ceiling - s.used.Load()
+	if remaining < 0 {
+		remaining = 0
+	}
+	return ceiling < s.capacity && remaining <= minClampedCeiling
 }
 
 // effectiveCapacity is the cap to enforce RIGHT NOW: the configured capacity,
@@ -317,36 +388,24 @@ func (s *SpoolStore) cachedDiskAvail() (int64, bool) {
 // spool is designed to STALL (backpressure, so Finder paces itself instead of
 // aborting the copy), the user gets an unbounded hang rather than an error.
 //
-// Clamping continuously converts that into the behaviour the stall was designed
-// for: once free disk reaches the floor, headroom is zero, admission stops, and
-// the existing wedged-drain backstop turns a hopeless stall into a bounded one
-// that surfaces ErrSpoolFull. A copy that cannot succeed now fails honestly
-// instead of hanging.
-//
 // SCOPE LIMIT, deliberate: a configured capacity of 0 stays truly unlimited and
 // is NOT disk-clamped. "total=0 means unlimited" is the documented /spool
 // contract that consumers branch on, and production never runs unlimited —
-// AutoSpoolCapacity always yields a positive cap. Bounding it here would change
-// a public contract to fix an incident that only occurs with a positive cap.
+// AutoSpoolCapacity always yields a positive cap, and both call sites reject a
+// sub-1 GiB configuration. Bounding it here would change a public contract to fix
+// an incident that cannot occur with it.
 func (s *SpoolStore) effectiveCapacity() int64 {
 	if s.capacity <= 0 {
 		return s.capacity // unlimited stays unlimited (see SCOPE LIMIT above)
 	}
-	avail, ok := s.cachedDiskAvail()
+	ceiling, ok := s.cachedCeiling()
 	if !ok {
 		return s.capacity // fail open: an unreadable statfs is not a full disk
 	}
-	headroom := avail - SpoolFreeFloorBytes
-	if headroom < 0 {
-		headroom = 0
-	}
-	// The spool's own bytes already sit on this volume, so what it may reach is
-	// what it holds plus whatever remains above the floor.
-	live := s.used.Load() + headroom
-	if s.capacity > 0 && s.capacity < live {
+	if s.capacity < ceiling {
 		return s.capacity
 	}
-	return live
+	return ceiling
 }
 
 // Capacity returns (used, total) bytes. total=0 means unlimited.
@@ -1420,6 +1479,18 @@ func (s *SpoolStore) waitForCapacity(try func() bool, touch func()) bool {
 			return true
 		}
 		offline := pin.IsOffline()
+		// A stall while OFFLINE normally waits forever, on the premise that
+		// reconnecting lets the drain free space. That premise fails when the
+		// blocker is the LOCAL DISK rather than the link: free space eaten by
+		// the JuiceFS cache, Spotlight, Time Machine or the user's own files is
+		// not released by coming back online, so an offline copy on a low-disk
+		// machine would park indefinitely with no error on a hard mount — the
+		// same unbounded hang this whole change exists to remove, just relocated
+		// (2026-08-03 review, HIGH). Treat disk-constrained as online for
+		// backstop purposes so it times out into an honest ErrSpoolFull.
+		if offline && s.DiskConstrained() {
+			offline = false
+		}
 		// Reset the wedge backstop when the drain freed space (alive & making
 		// progress — lets a slow link stall indefinitely), OR we are offline, OR
 		// we JUST transitioned offline→online (give the reconnected drain a fresh
