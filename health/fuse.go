@@ -324,29 +324,18 @@ func (fm *FUSEManager) Mount() error {
 	//      raised so JuiceFS dynamically keeps ≥10 GiB free at write time (the
 	//      REAL guarantee: it also covers OTHER files filling the disk after
 	//      mount, which a static cap cannot).
-	const cacheFreeFloorBytes = int64(10) << 30 // 10 GiB
+	const cacheFreeFloorBytes = cacheFreeFloorBytesConst
 	if total, err := volumeTotalBytes("/"); err == nil && total > 0 {
 		var configuredMiB int64
 		fmt.Sscanf(fm.cfg.CacheSize, "%d", &configuredMiB)
-		configuredBytes := configuredMiB << 20 // MiB → bytes
 
-		// (1)+(2): respect configured; grow only to fit the pinned set.
-		desired := configuredBytes
-		if fm.cfg.PinnedBytes > desired {
-			desired = fm.cfg.PinnedBytes
-		}
-
-		// (3) clamp: never set cache-size above (disk total − 10 GiB floor).
-		if maxForFloor := total - cacheFreeFloorBytes; maxForFloor > 0 && desired > maxForFloor {
-			desired = maxForFloor
-		}
-
-		if newMiB := desired >> 20; newMiB > 0 && newMiB != configuredMiB {
-			fm.cfg.CacheSize = fmt.Sprintf("%d", newMiB)
+		effectiveMiB, seededBytes := resolveCacheSizeMiB(configuredMiB, fm.cfg.PinnedBytes, total)
+		if effectiveMiB > 0 && effectiveMiB != configuredMiB {
+			fm.cfg.CacheSize = fmt.Sprintf("%d", effectiveMiB)
 			jmlog.Info("cache-size resolved",
-				"configured_gb", configuredBytes>>30,
+				"configured_gb", seededBytes>>30,
 				"pinned_gb", fm.cfg.PinnedBytes>>30,
-				"effective_gb", desired>>30,
+				"effective_gb", (effectiveMiB<<20)>>30,
 				"disk_total_gb", total>>30,
 				"reason", "max(configured, pinned) clamped to keep >=10GiB free")
 		}
