@@ -265,7 +265,7 @@ func main() {
 		filmCell = flag.Int("filmstrip-cell", 160, "filmstrip cell width in px")
 		wave     = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
 		waveSPP  = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
-		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.loupe.json (instead of basic derivatives)")
+		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.logger.json (instead of basic derivatives)")
 		proxyGen = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
 		vcodec   = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
 		pCRF     = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")

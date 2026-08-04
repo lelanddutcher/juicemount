@@ -9,7 +9,7 @@
       "request": {},
       "schema": "whoami.schema.json",
       "http_status": 200,
-      "note": "GUI (cbridge) — full capabilities"
+      "note": "GUI (cbridge) \u2014 full capabilities"
     },
     {
       "file": "whoami/cli.json",
@@ -18,7 +18,7 @@
       "request": {},
       "schema": "whoami.schema.json",
       "http_status": 200,
-      "note": "jm5 CLI — partial capabilities"
+      "note": "jm5 CLI \u2014 partial capabilities"
     },
     {
       "file": "residency/resident.json",
@@ -29,7 +29,7 @@
       },
       "schema": "residency.schema.json",
       "http_status": 200,
-      "note": "all bytes on SSD — only state that lights the green badge"
+      "note": "all bytes on SSD \u2014 only state that lights the green badge"
     },
     {
       "file": "residency/streaming.json",
@@ -51,7 +51,7 @@
       },
       "schema": "residency.schema.json",
       "http_status": 200,
-      "note": "partial — bytes_cached < total"
+      "note": "partial \u2014 bytes_cached < total"
     },
     {
       "file": "residency/uploading.json",
@@ -104,7 +104,7 @@
       },
       "schema": "derivatives.schema.json",
       "http_status": 200,
-      "note": "JM-14 manifest — tech/thumb/strip/wave ready, proxy pending, embedding (model-stamped)"
+      "note": "JM-14 manifest \u2014 tech/thumb/strip/wave ready, proxy pending, embedding (model-stamped)"
     },
     {
       "file": "derivatives/absent.json",
@@ -115,7 +115,7 @@
       },
       "schema": "derivatives.schema.json",
       "http_status": 200,
-      "note": "unknown inode → exists:false, empty derivatives"
+      "note": "unknown inode \u2192 exists:false, empty derivatives"
     },
     {
       "file": "derivatives/proxy-ready.json",
@@ -126,7 +126,7 @@
       },
       "schema": "derivatives.schema.json",
       "http_status": 200,
-      "note": "PROXY-CODEC (schema v2 additive) — a READY proxy row carries codec:h264 (the floor), codec_string (the canPlayType/isTypeSupported token), and blob_size (actual produced bytes). codec absent ⇒ h264 (back-compat)."
+      "note": "PROXY-CODEC (schema v2 additive) \u2014 a READY proxy row carries codec:h264 (the floor), codec_string (the canPlayType/isTypeSupported token), and blob_size (actual produced bytes). codec absent \u21d2 h264 (back-compat)."
     },
     {
       "file": "derivatives/proxy-hevc.json",
@@ -137,7 +137,7 @@
       },
       "schema": "derivatives.schema.json",
       "http_status": 200,
-      "note": "PROXY-CODEC codec-flexibility — a proxy row with codec:hevc + its hvc1 codec_string (smaller blob_size). Documents the wire shape OL must decode; the H.264 floor still governs (farm never emits a non-h264-only asset)."
+      "note": "PROXY-CODEC codec-flexibility \u2014 a proxy row with codec:hevc + its hvc1 codec_string (smaller blob_size). Documents the wire shape OL must decode; the H.264 floor still governs (farm never emits a non-h264-only asset)."
     },
     {
       "file": "blob/proxy-range.json",
@@ -146,11 +146,13 @@
       "request": {
         "inode": "1180621",
         "kind": "proxy",
-        "headers": { "Range": "bytes=0-1" }
+        "headers": {
+          "Range": "bytes=0-1"
+        }
       },
       "schema": "blob-range.schema.json",
       "http_status": 206,
-      "note": "PROXY-CODEC range-serve (correction #2) — the proxy-blob HTTP endpoint answers Range with 206 + Content-Range: bytes 0-1/<size> + Content-Length: 2 + Content-Type: video/mp4 + Accept-Ranges: bytes. An UNRANGED GET returns 200 + Content-Length + Accept-Ranges: bytes. This fixture documents the EXPECTED RESPONSE HEADERS (asserted in bridge/contract_conformance_test.go), not a JSON body — the body is raw blob bytes."
+      "note": "PROXY-CODEC range-serve (correction #2) \u2014 the proxy-blob HTTP endpoint answers Range with 206 + Content-Range: bytes 0-1/<size> + Content-Length: 2 + Content-Type: video/mp4 + Accept-Ranges: bytes. An UNRANGED GET returns 200 + Content-Length + Accept-Ranges: bytes. This fixture documents the EXPECTED RESPONSE HEADERS (asserted in bridge/contract_conformance_test.go), not a JSON body \u2014 the body is raw blob bytes."
     },
     {
       "file": "metadata/tech.json",
@@ -162,7 +164,7 @@
       },
       "schema": "metadata.schema.json",
       "http_status": 200,
-      "note": "JM-14 structured tech/EXIF — OpenLoupe's first consume slice"
+      "note": "JM-14 structured tech/EXIF \u2014 OpenLoupe's first consume slice"
     },
     {
       "file": "metadata/absent.json",
@@ -199,7 +201,7 @@
       "request": {},
       "schema": "cache-status.schema.json",
       "http_status": 200,
-      "note": "snake_case TARGET form — requires JM-3 struct tags"
+      "note": "snake_case TARGET form \u2014 requires JM-3 struct tags"
     },
     {
       "file": "cache-status/idle.json",
@@ -208,7 +210,7 @@
       "request": {},
       "schema": "cache-status.schema.json",
       "http_status": 200,
-      "note": "no pin roots — roots:null, live zeroed"
+      "note": "no pin roots \u2014 roots:null, live zeroed"
     },
     {
       "file": "offline/online.json",
@@ -261,7 +263,7 @@
       "request": {},
       "schema": "activity.schema.json",
       "http_status": 200,
-      "note": "what JuiceMount is doing now — cleanest source for the inspector 'activity' line"
+      "note": "what JuiceMount is doing now \u2014 cleanest source for the inspector 'activity' line"
     },
     {
       "file": "activity/idle.json",
@@ -309,11 +311,22 @@
       "endpoint": "(blob)",
       "method": "GET",
       "request": {
-        "note": "bytes of the `ai` derivative blob (ai.loupe.json) at /.juicemount/derivatives/<inode>/, not a control-plane response"
+        "note": "bytes of the `ai` derivative blob (ai.logger.json; legacy ai.loupe.json still read) at /.juicemount/derivatives/<inode>/, not a control-plane response"
       },
       "schema": "loupe-ai.schema.json",
       "http_status": 200,
-      "note": "JM-17 LoupeJSON ai bundle — transcript-only snapshot (Path A): full media (Rule B), transcript populated, embeddings/faces null"
+      "note": "JM-17 LoupeJSON ai bundle \u2014 transcript-only snapshot (Path A): full media (Rule B), transcript populated, embeddings/faces null LEGACY `loupe_version` form (still read; see transcript-only.logger.json for the post-cutover key)."
+    },
+    {
+      "file": "ai/transcript-only.logger.json",
+      "endpoint": "(blob)",
+      "method": "GET",
+      "request": {
+        "note": "bytes of the `ai` derivative blob (ai.logger.json; legacy ai.loupe.json still read) at /.juicemount/derivatives/<inode>/, not a control-plane response"
+      },
+      "schema": "loupe-ai.schema.json",
+      "http_status": 200,
+      "note": "JM-17 LoupeJSON ai bundle, POST-CUTOVER envelope key `logger_version` \u2014 what a provider advertising wire_terms:\"logger/1\" emits. The sibling transcript-only.loupe.json pins the LEGACY `loupe_version` form, which is still read indefinitely."
     },
     {
       "file": "derivatives/register-ok.json",
@@ -331,7 +344,25 @@
       },
       "schema": "register.schema.json",
       "http_status": 200,
-      "note": "OL-1 on-device AI contribute-back; matching size/mtime → 200 + row. Stale size/mtime → 409 (no fixture body)."
+      "note": "OL-1 on-device AI contribute-back; matching size/mtime \u2192 200 + row. Stale size/mtime \u2192 409 (no fixture body)."
+    },
+    {
+      "file": "derivatives/register-ok-logger.json",
+      "endpoint": "/derivatives/register",
+      "method": "POST",
+      "request": {
+        "inode": 1180417,
+        "kind": "ai",
+        "producer": "on-device",
+        "model": "apple-featureprint-v1",
+        "dim": 768,
+        "source_size": 880000000,
+        "source_mtime": 1700000000,
+        "blob_rel_path": "ai.logger.json"
+      },
+      "schema": "register.schema.json",
+      "http_status": 200,
+      "note": "OL-1 contribute-back with the POST-CUTOVER blob name. Pins that blob_rel_path accepts \"ai.logger.json\"; the sibling register-ok.json pins the legacy \"ai.loupe.json\", which remains accepted indefinitely."
     },
     {
       "file": "derivatives/changes.json",
@@ -342,7 +373,7 @@
       },
       "schema": "derivatives-changes.schema.json",
       "http_status": 200,
-      "note": "since= delta feed — array of changed derivative rows (capability `changes`)"
+      "note": "since= delta feed \u2014 array of changed derivative rows (capability `changes`)"
     },
     {
       "file": "assertions/accept.loupe.json",
@@ -351,7 +382,7 @@
       "request": {},
       "schema": "assertions-sidecar.schema.json",
       "http_status": 0,
-      "note": "ASSERTIONS_SIDECAR — the <media>.loupe.json portable sidecar (source of truth) after a fresh log_profile assertion is accepted. Keyed by content-hash asset_key, NOT inode."
+      "note": "ASSERTIONS_SIDECAR \u2014 the <media>.logger.json portable sidecar (legacy <media>.loupe.json still read) (source of truth) after a fresh log_profile assertion is accepted. Keyed by content-hash asset_key, NOT inode."
     },
     {
       "file": "assertions/reject-stale.loupe.json",
@@ -360,7 +391,7 @@
       "request": {},
       "schema": "assertions-sidecar.schema.json",
       "http_status": 0,
-      "note": "Sidecar UNCHANGED after a stale (older asserted_at) write for the same (asset_key,namespace,key) is rejected — the newer stored value persists (byte-identical to accept)."
+      "note": "Sidecar UNCHANGED after a stale (older asserted_at) write for the same (asset_key,namespace,key) is rejected \u2014 the newer stored value persists (byte-identical to accept)."
     },
     {
       "file": "assertions/retract.loupe.json",
@@ -369,7 +400,7 @@
       "request": {},
       "schema": "assertions-sidecar.schema.json",
       "http_status": 0,
-      "note": "Sidecar after a retract: value:null with a newer asserted_at wins; effective value unset, record retained (§4)."
+      "note": "Sidecar after a retract: value:null with a newer asserted_at wins; effective value unset, record retained (\u00a74)."
     },
     {
       "file": "assertions/no-clobber.loupe.json",
@@ -378,7 +409,7 @@
       "request": {},
       "schema": "assertions-sidecar.schema.json",
       "http_status": 0,
-      "note": "Writing namespace=person leaves the existing namespace=log_profile triple intact — merge, don't clobber the file (§5/§8)."
+      "note": "Writing namespace=person leaves the existing namespace=log_profile triple intact \u2014 merge, don't clobber the file (\u00a75/\u00a78)."
     },
     {
       "file": "assertions/post-accept.json",
@@ -421,7 +452,7 @@
       },
       "schema": "assertions-get.schema.json",
       "http_status": 200,
-      "note": "Read the resolved (LWW) assertions for an asset by its portable content-hash asset_key. inode-free — resolves on any client with no JuiceMount."
+      "note": "Read the resolved (LWW) assertions for an asset by its portable content-hash asset_key. inode-free \u2014 resolves on any client with no JuiceMount."
     },
     {
       "file": "assertions/get-empty.json",

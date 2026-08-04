@@ -97,6 +97,85 @@ func TestResolveAIBlobName_DualRead(t *testing.T) {
 	}
 }
 
+// TestLoadExistingAIMerged_BothBlobsNoSubKindLost pins the fix for the
+// data-loss defect found in the 2026-08-03 audit: when BOTH ai.loupe.json and
+// ai.logger.json exist for one inode, reading only one of them silently dropped
+// the other's sub-kinds. Because the merged doc is written back and the single
+// (inode,"ai") manifest row is repointed at it, the dropped faces/embeddings
+// were gone for good. Both files coexisting is an EXPECTED transitional state —
+// the register schema tells consumers to switch names mid-flight.
+func TestLoadExistingAIMerged_BothBlobsNoSubKindLost(t *testing.T) {
+	dir := t.TempDir()
+	emb := "AAAA"
+
+	// Legacy blob: on-device faces + a global embedding, pushed before cutover.
+	legacy := LoupeJSON{
+		LoggerVersion: 1, SchemaVersion: "1.0", IndexedAt: "2026-08-01T00:00:00Z",
+		AI: &LoupeAI{
+			ImageEmbeddingGlobal: &emb,
+			Faces:                []LoupeFace{{ClusterID: "c1", TMs: 100, Confidence: 0.9}},
+			AIProviderSummary:    map[string]string{"faces": "on-device"},
+		},
+	}
+	// Post-cutover blob: only a transcript. Nothing here knows about the faces.
+	modern := LoupeJSON{
+		LoggerVersion: 1, SchemaVersion: "1.0", IndexedAt: "2026-08-02T00:00:00Z",
+		AI: &LoupeAI{
+			Transcript:        &LoupeTranscript{Language: "en", Model: "whisper.cpp/base.en"},
+			AIProviderSummary: map[string]string{"transcript": "linux-farm"},
+		},
+	}
+	for name, doc := range map[string]LoupeJSON{
+		derivatives.AIBlobNameLegacy: legacy,
+		derivatives.AIBlobName:       modern,
+	} {
+		b, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := loadExistingAIMerged(dir)
+
+	// The legacy-only sub-kinds must survive — this is the regression.
+	if len(got.Faces) != 1 || got.Faces[0].ClusterID != "c1" {
+		t.Errorf("faces from the legacy blob were dropped: %+v", got.Faces)
+	}
+	if got.ImageEmbeddingGlobal == nil || *got.ImageEmbeddingGlobal != emb {
+		t.Errorf("image_embedding_global from the legacy blob was dropped: %+v", got.ImageEmbeddingGlobal)
+	}
+	// The new blob's sub-kinds must be present too.
+	if got.Transcript == nil || got.Transcript.Language != "en" {
+		t.Errorf("transcript from the current blob missing: %+v", got.Transcript)
+	}
+	// Provider summaries union rather than replace.
+	if got.AIProviderSummary["faces"] != "on-device" || got.AIProviderSummary["transcript"] != "linux-farm" {
+		t.Errorf("ai_provider_summary did not union: %+v", got.AIProviderSummary)
+	}
+
+	// And the write target is the post-cutover name when both exist.
+	if w := derivatives.AIBlobWriteName(dir); w != derivatives.AIBlobName {
+		t.Errorf("write target with both present = %q, want %q", w, derivatives.AIBlobName)
+	}
+}
+
+// A legacy-only dir must keep being written in place, not abandoned.
+func TestAIBlobWriteName_LegacyOnlyStaysLegacy(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, derivatives.AIBlobNameLegacy), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if w := derivatives.AIBlobWriteName(dir); w != derivatives.AIBlobNameLegacy {
+		t.Errorf("legacy-only write target = %q, want %q", w, derivatives.AIBlobNameLegacy)
+	}
+	if w := derivatives.AIBlobWriteName(t.TempDir()); w != derivatives.AIBlobName {
+		t.Errorf("empty-dir write target = %q, want %q", w, derivatives.AIBlobName)
+	}
+}
+
 func TestLoupeJSON_VersionKeyDualReadWriteNew(t *testing.T) {
 	// READ: the legacy key folds into LoggerVersion.
 	var legacy LoupeJSON

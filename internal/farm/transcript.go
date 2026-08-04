@@ -270,13 +270,16 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	// Path A (AI_DELIVERY_SPEC Rule A): the consumer's apply is a destructive
 	// replace, so we always re-write the COMPLETE bundle — preserve any prior
 	// sub-kinds (embeddings/faces) and set the transcript into the same bundle.
-	// Dual-read the blob name: an existing bundle may still sit under the
-	// pre-cutover `ai.loupe.json`, and read-merge-write must find it or the
-	// merge silently drops prior sub-kinds. A fresh blob gets the new name.
+	// Dual-read the blob: an existing bundle may sit under the pre-cutover
+	// `ai.loupe.json`, under the post-cutover `ai.logger.json`, or BOTH — the
+	// last being an expected transitional state, not an edge case. We merge
+	// across every blob that exists, because reading only one and writing the
+	// result back permanently drops the other's sub-kinds (the manifest row is
+	// repointed at what we write). A fresh blob gets the new name.
 	blobDir := DerivBlobDir(opt.Mount, inode)
-	rel := derivatives.ResolveAIBlobName(blobDir)
+	rel := derivatives.AIBlobWriteName(blobDir)
 	blobPath := filepath.Join(blobDir, rel)
-	ai := loadExistingAI(blobPath)
+	ai := loadExistingAIMerged(blobDir)
 	ai.Transcript = tr
 	if ai.AIProviderSummary == nil {
 		ai.AIProviderSummary = map[string]string{}
@@ -291,7 +294,7 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	}
 
 	if err := writeLoupe(blobPath, doc); err != nil {
-		res.Err = fmt.Errorf("write ai.loupe.json: %w", err)
+		res.Err = fmt.Errorf("write %s: %w", rel, err)
 		return res
 	}
 
@@ -327,6 +330,55 @@ func loadExistingAI(blobPath string) *LoupeAI {
 		}
 	}
 	return &LoupeAI{}
+}
+
+// loadExistingAIMerged unions the AI blocks of EVERY blob present in blobDir —
+// the pre-cutover `ai.loupe.json`, the post-cutover `ai.logger.json`, or both.
+//
+// WHY THIS EXISTS (2026-08-03). Picking a single blob here was a real data-loss
+// bug: with both files present (an expected transitional state — the register
+// schema tells consumers to switch names once the provider advertises the flag)
+// the unread one's sub-kinds were silently dropped, the poorer merge was written
+// back under Rule A, and the single (inode,"ai") manifest row was repointed at
+// it — so nothing ever looked at the abandoned blob again. Faces and embeddings
+// pushed on-device before the cutover would vanish on the next farm pass.
+//
+// Merge order is legacy-then-current (AIBlobReadPaths), so the newer file wins
+// any sub-kind both define while sub-kinds only the legacy file has survive.
+func loadExistingAIMerged(blobDir string) *LoupeAI {
+	out := &LoupeAI{}
+	for _, p := range derivatives.AIBlobReadPaths(blobDir) {
+		mergeAIInto(out, loadExistingAI(p))
+	}
+	return out
+}
+
+// mergeAIInto unions src into dst. A sub-kind present in src replaces dst's —
+// callers order their sources so the preferred one is applied last. An absent
+// sub-kind (nil pointer / empty slice) never clobbers one already collected,
+// which is what makes the union non-destructive.
+func mergeAIInto(dst, src *LoupeAI) {
+	if dst == nil || src == nil {
+		return
+	}
+	if src.ImageEmbeddingGlobal != nil {
+		dst.ImageEmbeddingGlobal = src.ImageEmbeddingGlobal
+	}
+	if len(src.SceneEmbeddings) > 0 {
+		dst.SceneEmbeddings = src.SceneEmbeddings
+	}
+	if len(src.Faces) > 0 {
+		dst.Faces = src.Faces
+	}
+	if src.Transcript != nil {
+		dst.Transcript = src.Transcript
+	}
+	for k, v := range src.AIProviderSummary {
+		if dst.AIProviderSummary == nil {
+			dst.AIProviderSummary = map[string]string{}
+		}
+		dst.AIProviderSummary[k] = v
+	}
 }
 
 // buildMedia assembles the FULL media block from tech (Rule B). color_space ←

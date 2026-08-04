@@ -20,7 +20,16 @@ import (
 // ContractVersion is this build's wire contract_version. It MUST match the
 // integer in contract/VERSION (the vendored contract). Bumped only on a
 // breaking wire change.
-const ContractVersion = 1
+//
+// 1 -> 2 (2026-08-03): the loupe->logger wire-term cutover. Every SCHEMA change
+// in that step was a widener, so it was tempting to leave this at 1 — but the
+// same step changed the TRAFFIC: /whoami now carries `wire_terms`, and the v1
+// whoami schema is additionalProperties:false, so a consumer still pinned to the
+// previously-vendored v1 rejects every live /whoami with "Additional properties
+// are not allowed ('wire_terms' was unexpected)". Leaving the integer at 1 would
+// have handed them a hard failure with no signal to re-vendor, which is exactly
+// what this field exists to prevent.
+const ContractVersion = 2
 
 // WireTerms advertises that this build completed the coordinated `loupe` ->
 // `logger` wire-term cutover proposed in CONSUMER_STATUS 2026-07-18 §2 and
@@ -43,18 +52,22 @@ const WireTerms = "logger/1"
 // WhoAmI is the GET /whoami response. Schema: contract/spec/schema/whoami.schema.json.
 // Field order/tags match the golden fixtures contract/fixtures/whoami/*.json.
 type WhoAmI struct {
-	App             string   `json:"app"`              // always "JuiceMount"
-	Version         string   `json:"version"`          // public release string (internal/version.Version)
-	ContractVersion int      `json:"contract_version"` // ContractVersion
-	InstanceID      string   `json:"instance_id"`      // stable per-install UUID
-	VolumeName      string   `json:"volume_name"`      // e.g. "zpool"
-	MountPoint      string   `json:"mount_point"`      // e.g. "/Volumes/zpool"
-	NASRoot         string   `json:"nas_root"`         // today == mount_point
-	ControlPlane    string   `json:"control_plane"`    // e.g. "http://127.0.0.1:11050"
-	MetadataDBPath  string   `json:"metadata_db_path,omitempty"`
-	Deployment      string   `json:"deployment"`   // "gui" | "cli"
-	WireTerms       string   `json:"wire_terms"`   // WireTerms — loupe->logger cutover flag
-	Capabilities    []string `json:"capabilities"` // DERIVED, never hardcoded
+	App             string `json:"app"`              // always "JuiceMount"
+	Version         string `json:"version"`          // public release string (internal/version.Version)
+	ContractVersion int    `json:"contract_version"` // ContractVersion
+	InstanceID      string `json:"instance_id"`      // stable per-install UUID
+	VolumeName      string `json:"volume_name"`      // e.g. "zpool"
+	MountPoint      string `json:"mount_point"`      // e.g. "/Volumes/zpool"
+	NASRoot         string `json:"nas_root"`         // today == mount_point
+	ControlPlane    string `json:"control_plane"`    // e.g. "http://127.0.0.1:11050"
+	MetadataDBPath  string `json:"metadata_db_path,omitempty"`
+	Deployment      string `json:"deployment"` // "gui" | "cli"
+	// WireTerms is the loupe->logger cutover flag (see the WireTerms const).
+	// omitempty is load-bearing: a build that leaves it unset must emit NO key —
+	// the documented "absent == pre-cutover" form — rather than "", which the
+	// schema's enum rejects and which would fail-closed for a strict consumer.
+	WireTerms    string   `json:"wire_terms,omitempty"`
+	Capabilities []string `json:"capabilities"` // DERIVED, never hardcoded
 }
 
 // capabilityVocab is the ONLY set of tokens that may appear in capabilities.

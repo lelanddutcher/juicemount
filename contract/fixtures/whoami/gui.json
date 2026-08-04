@@ -1,7 +1,7 @@
 {
   "app": "JuiceMount",
   "version": "0.1.0",
-  "contract_version": 1,
+  "contract_version": 2,
   "instance_id": "5C7E0E2A-9B41-4E6D-8F2A-1A2B3C4D5E6F",
   "volume_name": "zpool",
   "mount_point": "/Volumes/zpool",
