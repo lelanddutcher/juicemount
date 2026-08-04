@@ -3796,15 +3796,30 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 			if er.Kind != req.Kind {
 				continue
 			}
-			// The row must be a farm row we actually MINTED, not one that merely
-			// SAYS it is. manifest.json is on the consumer-writable volume, so a
-			// hand-written sidecar could declare producer:"linux-farm" and — with
-			// this guard keyed on the string — permanently 409 every genuine
-			// register for that (inode,kind), impersonating the farm AND locking
-			// it out with its own protection (2026-08-04 review, CRITICAL).
-			// Provenance is stamped by the ingesting code path, never by the file.
-			if er.Producer == "linux-farm" && er.Provenance != derivatives.ProvenanceSidecar &&
-				req.Producer != "linux-farm" {
+			// COORDINATION, NOT AUTHENTICATION. Read this before "hardening" it.
+			//
+			// On the Mac, EVERY farm row arrives through farm.ReconcileOneSidecar
+			// reading manifest.json off the volume — farm generation itself only
+			// ever runs server-side in cmd/jmfarm. There is no authentication on
+			// that file, so "produced by the farm" is simply NOT an authenticated
+			// property here, and any guard built on it is advisory by nature.
+			//
+			// A previous attempt keyed this on an unforgeable provenance stamp to
+			// stop a forged manifest impersonating the farm. That stamp is applied
+			// to every reconciled row — including genuine farm rows, since they
+			// take the same path — so the predicate was never true in production
+			// and this guard silently became a dead branch, re-opening the very
+			// clobber it exists to prevent. The test that "proved" it seeded the
+			// row with a direct PutDeriv, a state production cannot reach.
+			//
+			// So: back to the producer string, which is right for the case that
+			// actually happens (a well-behaved consumer must not silently replace
+			// the farm's work) and honest about the case it cannot cover. A local
+			// process that writes a forged manifest can both impersonate the farm
+			// and 409-lock a slot — but that same process can write the blob bytes
+			// directly, so the guard is not what stands between it and mischief.
+			// Fixing that needs an authenticated sidecar, not a cleverer predicate.
+			if er.Producer == "linux-farm" && req.Producer != "linux-farm" {
 				http.Error(w, fmt.Sprintf(
 					"kind %q for inode %d already has a farm-produced row; a %q contribution may not replace it",
 					req.Kind, req.Inode, req.Producer), http.StatusConflict)
@@ -4013,11 +4028,15 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	f, err := openRegularNoSymlink(blobPath)
+	// Anchored at the MOUNT, not at the per-inode directory: O_NOFOLLOW binds
+	// only the final component, so guarding just the blob name left the <inode>
+	// directory itself swappable for a symlink to anywhere (round-3 HIGH).
+	f, err := derivatives.OpenRegularUnder(mount, derivatives.DerivBlobRel(inode, blobRel))
 	if err != nil {
 		http.Error(w, "blob unreadable", http.StatusNotFound)
 		return
 	}
+	_ = blobPath
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {

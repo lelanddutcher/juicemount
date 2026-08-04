@@ -134,13 +134,24 @@ func TestSidecarCannotForgeFarmProvenance(t *testing.T) {
 	if got.MediaType == nil || *got.MediaType != "image/jpeg" {
 		t.Errorf("media_type = %v, want image/jpeg (server-assigned, not the sidecar's text/html)", got.MediaType)
 	}
-	if got.SourceSize != nil || got.SourceMtime != nil {
-		t.Errorf("forged freshness survived: size=%v mtime=%v, want both nil", got.SourceSize, got.SourceMtime)
+	// The vouch is passed THROUGH, not dropped: nulling it disabled the C5
+	// stale-derivative gate for every farm-derived asset (see sidecar.go). C5
+	// compares it against the LIVE source, which is what makes a stale row
+	// withhold — so a present-but-wrong vouch is handled, an absent one is not.
+	if got.SourceSize == nil || got.SourceMtime == nil {
+		t.Error("source vouch was dropped — that disables the C5 stale gate permanently")
 	}
 
-	// THE PAYOFF: a genuine on-device contribution for the same (inode,kind)
-	// must still succeed. Before the fix this returned 409 and the real producer
-	// was permanently locked out of its own slot.
+	// KNOWN AND ACCEPTED LIMITATION, asserted so it cannot regress silently.
+	//
+	// A forged manifest CAN still 409-lock this (inode,kind) against a genuine
+	// on-device register, because "produced by the farm" is not an authenticated
+	// property on the Mac — every farm row arrives through this same unsigned
+	// file. An earlier attempt to fix that keyed the guard on provenance and
+	// thereby disabled it for genuine farm rows too, which was strictly worse.
+	// Whoever can forge this manifest can also write the blob bytes, so the guard
+	// is not the thing standing between them and mischief. Closing it for real
+	// requires an authenticated sidecar, not a cleverer predicate.
 	body, _ := json.Marshal(map[string]any{
 		"inode": inode, "kind": "thumbnail", "producer": "on-device",
 		"source_size": liveSize, "source_mtime": liveMtime,
@@ -148,23 +159,11 @@ func TestSidecarCannotForgeFarmProvenance(t *testing.T) {
 	})
 	rr := httptest.NewRecorder()
 	handleDerivativesRegisterHTTP(rr, httptest.NewRequest("POST", "/derivatives/register", bytes.NewReader(body)))
-	if rr.Code != 200 {
-		t.Fatalf("genuine register after forged sidecar: status %d (want 200), body %s",
-			rr.Code, rr.Body.String())
-	}
-
-	// And the genuine row REPLACED the forged one, clearing the sidecar stamp.
-	rows, _ = dstore.Manifest(inode)
-	for _, r := range rows {
-		if r.Kind != "thumbnail" {
-			continue
-		}
-		if r.Producer != "on-device" {
-			t.Errorf("producer = %q, want on-device after genuine register", r.Producer)
-		}
-		if r.Provenance == derivatives.ProvenanceSidecar {
-			t.Error("genuine register left the sidecar provenance stamp in place")
-		}
+	if rr.Code != 409 {
+		t.Fatalf("register over a forged farm row: status %d, want 409 "+
+			"(if this now returns 200 the precedence guard has gone dead — "+
+			"check that it is not keyed on something every reconciled row carries)",
+			rr.Code)
 	}
 }
 
@@ -200,14 +199,23 @@ func TestRealFarmRowStillWins(t *testing.T) {
 	dstore, _ := derivatives.Open(":memory:")
 	defer dstore.Close()
 
-	// A row minted by the farm itself: producer linux-farm, NO sidecar stamp.
+	// SEEDED THE WAY PRODUCTION ACTUALLY DOES IT. The previous version of this
+	// test called dstore.PutDeriv directly — a state the Mac can never reach,
+	// because farm generation runs only in cmd/jmfarm and every farm row arrives
+	// here through ReconcileOneSidecar. That gap is exactly why a change that
+	// made this guard a dead branch in production still passed this test.
 	blob := "poster.jpg"
-	mtype := "image/jpeg"
-	if err := dstore.PutDeriv(inode, derivatives.DerivRow{
+	sz, mtm := fi.Size(), fi.ModTime().Unix()
+	sc := farm.ManifestSidecar{Inode: inode, Derivatives: []derivatives.DerivRow{{
 		Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
-		BlobRelPath: &blob, MediaType: &mtype,
-	}); err != nil {
+		BlobRelPath: &blob, SourceSize: &sz, SourceMtime: &mtm,
+	}}}
+	sb, _ := json.Marshal(sc)
+	if err := os.WriteFile(filepath.Join(derivDir, "manifest.json"), sb, 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if found, err := farm.ReconcileOneSidecar(dstore, tmp, inode); err != nil || !found {
+		t.Fatalf("seed reconcile: found=%v err=%v", found, err)
 	}
 
 	globalMu.Lock()

@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -244,8 +245,17 @@ func (w *ThumbWarmer) hydrateOne(inode uint64, blobPath string) (int64, error) {
 	// listing with NO HTTP request — so an unguarded open copies a symlink
 	// target straight into the local persistent thumb cache, which the serve
 	// path then happily serves because the cached file is regular by then.
+	// O_NONBLOCK matters as much as O_NOFOLLOW here. O_NOFOLLOW rejects a
+	// symlink, but a FIFO planted at a reserved blob name opens *and blocks
+	// forever* with no writer. openFileWithTimeout gives UP on its timer but
+	// only releases its gate slot when the open actually returns, so each such
+	// file permanently burns one of warmGate's 8 slots — 8 of them kill both
+	// warmers for the process lifetime, driven by nothing more than a Finder
+	// directory listing. O_NONBLOCK makes the FIFO open return immediately (and
+	// is a no-op for regular files); the mode check below then rejects it, along
+	// with directories and devices, which O_NOFOLLOW does not cover.
 	f, err, ok := openFileWithTimeout(metrics.FUSESrcThumbWarm, blobPath,
-		os.O_RDONLY|syscall.O_NOFOLLOW, 0, warmOpTimeout())
+		os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0, warmOpTimeout())
 	if !ok {
 		return 0, errFUSETimeout
 	}
@@ -256,6 +266,9 @@ func (w *ThumbWarmer) hydrateOne(inode uint64, blobPath string) (int64, error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return 0, err
+	}
+	if !fi.Mode().IsRegular() {
+		return 0, fmt.Errorf("refusing non-regular derivative %q (mode %s)", blobPath, fi.Mode())
 	}
 	if fi.Size() > thumbWarmBlobCap {
 		return 0, os.ErrInvalid

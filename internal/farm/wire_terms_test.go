@@ -125,6 +125,14 @@ func TestLoadExistingAIMerged_BothBlobsNoSubKindLost(t *testing.T) {
 			AIProviderSummary: map[string]string{"transcript": "linux-farm"},
 		},
 	}
+	// Laid out as production does — <mount>/.juicemount/derivatives/<inode>/ —
+	// because the reader is now anchored at the mount so that no component of
+	// that path can be a symlink.
+	const inode = 900001
+	blobDir := DerivBlobDir(dir, inode)
+	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for name, doc := range map[string]LoupeJSON{
 		derivatives.AIBlobNameLegacy: legacy,
 		derivatives.AIBlobName:       modern,
@@ -133,12 +141,12 @@ func TestLoadExistingAIMerged_BothBlobsNoSubKindLost(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, name), b, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(blobDir, name), b, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	got := loadExistingAIMerged(dir)
+	got := loadExistingAIMerged(dir, inode)
 
 	// The legacy-only sub-kinds must survive — this is the regression.
 	if len(got.Faces) != 1 || got.Faces[0].ClusterID != "c1" {

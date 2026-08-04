@@ -153,6 +153,50 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 		return row, false
 	}
 
+	// FIELDS THAT WERE PASSING THROUGH UNTOUCHED (2026-08-04 round 3).
+	//
+	// Policy, because the first cut of this got it wrong by rejecting whole rows:
+	// a field that is DANGEROUS is neutralised, a field that is merely
+	// INFORMATIONAL is clamped or nulled — dropping the row would discard a real
+	// artifact over a cosmetic value, which is its own kind of data loss.
+	//
+	// `hash` is the dangerous one: it is never re-verified against the blob's
+	// actual bytes on any serve path, and the consumer's documented freshness
+	// check is `hash == source_hash` — both supplied by this same file. Nulling a
+	// malformed hash removes the forgery while keeping the artifact usable; the
+	// shape is the provider's real output format (farm/hash.go emits %016x).
+	if row.Hash != nil && !isHashHex(*row.Hash) {
+		row.Hash = nil
+	}
+	if row.Version < 1 {
+		row.Version = 1
+	} else if row.Version > maxSidecarVersion {
+		row.Version = maxSidecarVersion
+	}
+	if row.Model != nil && len(*row.Model) > maxModelLen {
+		row.Model = nil
+	}
+	if row.Dim != nil && (*row.Dim < 1 || *row.Dim > 1<<16) {
+		row.Dim = nil
+	}
+	if row.CodecString != nil && len(*row.CodecString) > maxCodecStringLen {
+		row.CodecString = nil
+	}
+	if row.BlobSize != nil && (*row.BlobSize < 0 || *row.BlobSize > 1<<42) {
+		row.BlobSize = nil
+	}
+	// Codec is the exception that DOES reject: absent codec is defined to mean
+	// h264, so nulling an unrecognised value would silently relabel an
+	// undecodable proxy as the guaranteed-decodable floor — the round-1 MEDIUM,
+	// reintroduced through this path. There is no safe default, so refuse.
+	if row.Codec != nil {
+		switch *row.Codec {
+		case "h264", "hevc", "av1", "aac":
+		default:
+			return row, false
+		}
+	}
+
 	mt, isBlobKind := blobMediaTypes[row.Kind]
 	if !isBlobKind {
 		// Non-blob kinds (tech/embedding/transcript/ocr/faces) are /metadata
@@ -186,13 +230,23 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 		}
 	}
 
-	// Freshness is the read-gate every consumer stat-verifies against, so a
-	// forged (size,mtime) pair pins a stale or wrong derivative as "fresh"
-	// forever. Drop the pair rather than believe it: the row is then re-verified
-	// against the live source, which self-heals. Costs a genuine DR-rebuilt row
-	// one re-verification and nothing else.
-	row.SourceSize, row.SourceMtime = nil, nil
-
+	// FRESHNESS IS PASSED THROUGH, NOT DROPPED.
+	//
+	// An earlier version nulled these on the theory that a forged pair pins a
+	// stale derivative "fresh" forever, and that dropping them would self-heal
+	// via re-verification. **That was wrong and it disabled a data-integrity
+	// gate.** Nothing on the Mac ever re-stamps a reconciled row (the only
+	// writers are the server-side farm and the register route), and reconcile
+	// runs only when the inode is not already known — so the nil was permanent,
+	// and bridge/thumbs.go treats a nil vouch as "unvouched, therefore serve".
+	// The result was the C5 stale-derivative gate disabled for every farm-derived
+	// asset: a recycled or overwritten inode served the OLD poster or proxy
+	// indefinitely. That is precisely the bug C5 exists to prevent.
+	//
+	// Passing the vouch through is also no worse against a forger: whoever can
+	// forge (size,mtime) here can equally write the blob bytes, so the forgery
+	// buys nothing extra — while a GENUINE vouch is exactly what lets C5 compare
+	// against the live source and withhold a stale derivative.
 	// Geometry is free-form in the file, and readers divide by it: cols==0 is a
 	// divide-by-zero in any `i % cols`, and absurd counts over-allocate in a
 	// scrubber. The schema's minimums are enforced nowhere in Go. VALIDATE
@@ -210,6 +264,51 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 	}
 	return row, true
 }
+
+// isHashHex reports whether s looks like a provider-emitted xxh3-64 digest.
+func isHashHex(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeTechSidecar applies to the `tech` block the same rule the rows get:
+// the file supplies DATA, never POLICY or identity.
+func sanitizeTechSidecar(t *TechSidecar) (*TechSidecar, bool) {
+	if t.Producer != "linux-farm" && t.Producer != "on-device" && t.Producer != "macos-node" {
+		return nil, false
+	}
+	if t.Version < 1 || t.Version > maxSidecarVersion {
+		return nil, false
+	}
+	if t.Hash != nil && !isHashHex(*t.Hash) {
+		return nil, false
+	}
+	if len(t.Payload) > maxTechPayloadBytes {
+		return nil, false
+	}
+	// The payload is stored and handed back out of /metadata, so it must at
+	// least be a well-formed JSON OBJECT — not a bare string, not a scalar, and
+	// not the truncated fragment an interrupted writer leaves behind.
+	var probe map[string]any
+	if err := json.Unmarshal(t.Payload, &probe); err != nil {
+		return nil, false
+	}
+	return t, true
+}
+
+const (
+	maxSidecarVersion   = 1 << 16
+	maxTechPayloadBytes = 4 << 20
+	maxModelLen         = 128
+	maxCodecStringLen   = 256
+)
 
 // Bounds for sidecar-declared filmstrip geometry. Generous enough that no real
 // strip the farm produces trips them, tight enough that a reader allocating
@@ -294,13 +393,34 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 		res.Errs++
 		return res
 	}
+	// source_hash is the value a consumer's documented `hash == source_hash`
+	// freshness check compares against, and it is never re-derived from bytes on
+	// any serve path — so an arbitrary string here is a freshness forgery. Pin
+	// it to the shape the provider actually emits (xxh3-64 hex) or drop it.
+	if sc.SourceHash != nil && !isHashHex(*sc.SourceHash) {
+		sc.SourceHash = nil
+	}
 	if err := store.PutSource(sc.Inode, sc.SourceHash); err != nil {
 		res.Errs++
 		return res
 	}
 	// Repopulate /metadata?kind=tech (D1 consume + AI size-guard fallback).
 	if sc.Tech != nil && len(sc.Tech.Payload) > 0 {
-		_ = store.PutMetadata(sc.Inode, "tech", sc.Tech.Producer, sc.Tech.Version, sc.Tech.Hash, sc.Tech.Payload)
+		// The `tech` block comes out of the SAME attacker-writable file as the
+		// rows above and was going straight to PutMetadata with no checks at all
+		// — while sanitizeSidecarRow's own rationale says producer must be
+		// enum-checked because it is echoed back out of /metadata. That check
+		// existed only for DerivRow. It matters more here, not less: thumbs.go
+		// documents consumers falling back to tech.size_bytes for freshness when
+		// a row's source_size is absent, so an unchecked payload can become the
+		// freshness signal itself.
+		if tech, ok := sanitizeTechSidecar(sc.Tech); ok {
+			_ = store.PutMetadata(sc.Inode, "tech", tech.Producer, tech.Version, tech.Hash, tech.Payload)
+		} else {
+			jmlog.Warn("sidecar reconcile: dropping tech block that violates the contract",
+				"inode", sc.Inode, "producer", sc.Tech.Producer)
+			res.Errs++
+		}
 	}
 	for _, row := range sc.Derivatives {
 		// A manifest on the volume supplies DATA, never POLICY — re-derive the

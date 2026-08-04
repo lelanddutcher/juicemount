@@ -35,7 +35,7 @@ func TestReconcileOneSidecar(t *testing.T) {
 	hash, blob := "abc123", "strip.jpg" // the farm writes strip.jpg; "filmstrip.jpg" was a wrong fixture
 	sc := ManifestSidecar{
 		Inode:      inode,
-		SourceHash: strptr("src-hash-xyz"),
+		SourceHash: strptr("a1b2c3d4e5f60718"),
 		Derivatives: []derivatives.DerivRow{
 			{Kind: "filmstrip", Status: "ready", Producer: "linux-farm", Version: 1, Hash: &hash, BlobRelPath: &blob},
 			{Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1},
@@ -57,7 +57,7 @@ func TestReconcileOneSidecar(t *testing.T) {
 		t.Fatalf("present sidecar: want (true,nil), got (%v,%v)", found, err)
 	}
 	known, srcHash := store.Known(inode)
-	if !known || srcHash == nil || *srcHash != "src-hash-xyz" {
+	if !known || srcHash == nil || *srcHash != "a1b2c3d4e5f60718" {
 		t.Fatalf("after reconcile: known=%v srcHash=%v", known, srcHash)
 	}
 	rows, err := store.Manifest(inode)
@@ -88,7 +88,7 @@ func TestReconcileSidecarsUsesSharedCore(t *testing.T) {
 	defer store.Close()
 
 	for _, inode := range []uint64{111, 222} {
-		sc := ManifestSidecar{Inode: inode, SourceHash: strptr("h"), Derivatives: []derivatives.DerivRow{{Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1}}, WrittenAt: 1}
+		sc := ManifestSidecar{Inode: inode, SourceHash: strptr("00112233445566aa"), Derivatives: []derivatives.DerivRow{{Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1}}, WrittenAt: 1}
 		dir := DerivBlobDir(mount, inode)
 		_ = os.MkdirAll(dir, 0o755)
 		b, _ := json.MarshalIndent(sc, "", "  ")

@@ -3,6 +3,7 @@ package farm
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -311,7 +312,7 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	blobDir := DerivBlobDir(opt.Mount, inode)
 	rel := derivatives.AIBlobWriteName(blobDir)
 	blobPath := filepath.Join(blobDir, rel)
-	ai := loadExistingAIMerged(blobDir)
+	ai := loadExistingAIMerged(opt.Mount, inode)
 	ai.Transcript = tr
 	if ai.AIProviderSummary == nil {
 		ai.AIProviderSummary = map[string]string{}
@@ -359,14 +360,23 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 // loadExistingAI returns the asset's current AI sub-bundle (embeddings/faces from
 // a prior pass) so the new sub-kind merges INTO it — Path A: we always re-write
 // the COMPLETE bundle so the consumer's destructive-replace never drops a kind.
-func loadExistingAI(blobPath string) *LoupeAI {
+// maxAIBlobBytes bounds the AI sidecar read: the file is consumer-writable, so
+// an unbounded ReadFile is an unbounded allocation driven by another app.
+const maxAIBlobBytes = 64 << 20
+
+func loadExistingAI(mount, blobRel string) *LoupeAI {
 	// Symlink guard (2026-08-04 review): this runs server-side on the farm host
 	// against a consumer-writable tree, so an unguarded ReadFile is an arbitrary
 	// local-file read on the farm.
-	if _, gerr := derivatives.StatRegularNoSymlink(blobPath); gerr != nil {
+	// Read from the VALIDATED DESCRIPTOR. Stat-then-ReadFile resolves the name
+	// twice, so the path can be swapped for a symlink in between — the guard
+	// returns an fd precisely so the bytes read are the bytes checked.
+	fh, gerr := derivatives.OpenRegularUnder(mount, blobRel)
+	if gerr != nil {
 		return &LoupeAI{}
 	}
-	if raw, err := os.ReadFile(blobPath); err == nil {
+	defer fh.Close()
+	if raw, err := io.ReadAll(io.LimitReader(fh, maxAIBlobBytes)); err == nil {
 		var d LoupeJSON
 		if json.Unmarshal(raw, &d) == nil && d.AI != nil {
 			return d.AI
@@ -388,10 +398,13 @@ func loadExistingAI(blobPath string) *LoupeAI {
 //
 // Merge order is legacy-then-current (AIBlobReadPaths), so the newer file wins
 // any sub-kind both define while sub-kinds only the legacy file has survive.
-func loadExistingAIMerged(blobDir string) *LoupeAI {
+func loadExistingAIMerged(mount string, inode uint64) *LoupeAI {
 	out := &LoupeAI{}
-	for _, p := range derivatives.AIBlobReadPaths(blobDir) {
-		mergeAIInto(out, loadExistingAI(p))
+	// Anchored at the mount so no component of .juicemount/derivatives/<inode>/
+	// can be a symlink — this runs on the farm host against a tree the consumer
+	// can write. Order stays legacy-then-current so the newer file wins.
+	for _, name := range []string{derivatives.AIBlobNameLegacy, derivatives.AIBlobName} {
+		mergeAIInto(out, loadExistingAI(mount, derivatives.DerivBlobRel(inode, name)))
 	}
 	return out
 }
