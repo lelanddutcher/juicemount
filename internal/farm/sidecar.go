@@ -189,12 +189,8 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 	// h264, so nulling an unrecognised value would silently relabel an
 	// undecodable proxy as the guaranteed-decodable floor — the round-1 MEDIUM,
 	// reintroduced through this path. There is no safe default, so refuse.
-	if row.Codec != nil {
-		switch *row.Codec {
-		case "h264", "hevc", "av1", "aac":
-		default:
-			return row, false
-		}
+	if row.Codec != nil && !knownCodecs[*row.Codec] {
+		return row, false
 	}
 
 	mt, isBlobKind := blobMediaTypes[row.Kind]
@@ -301,6 +297,15 @@ func sanitizeTechSidecar(t *TechSidecar) (*TechSidecar, bool) {
 		return nil, false
 	}
 	return t, true
+}
+
+// knownCodecs mirrors derivatives.schema.json's codec enum. It is asserted
+// against the vendored contract by TestSidecarCodecsMatchContract — the first
+// cut of this list omitted "opus" and would have DROPPED a legitimate farm row,
+// which is the third time a hand-copied vocabulary here has been narrower than
+// what the code on the other side actually emits.
+var knownCodecs = map[string]bool{
+	"h264": true, "hevc": true, "av1": true, "aac": true, "opus": true,
 }
 
 const (
