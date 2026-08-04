@@ -277,6 +277,13 @@ func pinConstrained(t *testing.T, s *SpoolStore) {
 
 // (a) Offline + disk-constrained must TIME OUT. Reconnecting cannot free local
 // disk, so waiting forever is an unbounded Finder hang on a hard mount.
+//
+// HONEST LABEL (2026-08-04 review): this is BRANCH COVERAGE, not a regression
+// guard. It passes against the broken parent too, because a CONSTANT
+// DiskConstrained()==true gave up there as well — the bugs were in the reconnect
+// edge and the flapping case. Kept because the branch had zero coverage; the two
+// tests below are the ones that actually discriminate (verified failing against
+// the parent commit).
 func TestWaitForCapacity_OfflineButDiskConstrainedGivesUp(t *testing.T) {
 	old := capacityWaitDeadline
 	capacityWaitDeadline = 80 * time.Millisecond
@@ -376,5 +383,58 @@ func TestWaitForCapacity_FlappingDiskConstrainedStillTimesOut(t *testing.T) {
 	case <-done: // gave up — correct
 	case <-time.After(3 * time.Second):
 		t.Fatal("flapping DiskConstrained() reset the window forever — the CRITICAL hang is back")
+	}
+}
+
+// The ceiling refresh must NEVER block a caller. statfs has no timeout and this
+// path is reached from tryReserveCapacity/effectiveCapacity, which callers hold
+// a path shard or the per-entry e.mu across — a blocking Lock there serialized
+// unrelated writers and blocked readers of a file still being copied
+// (2026-08-04 review, HIGH). TryLock means a loser uses the current value.
+func TestCachedCeiling_NeverBlocksWhileAnotherGoroutineRefreshes(t *testing.T) {
+	s := newTestSpoolStore(t, 100*gib)
+	seedDiskAvail(s, 80*gib)
+	want := s.capCeiling.Load()
+
+	// Stand in for a refresh stuck in a wedged statfs.
+	s.ceilingMu.Lock()
+	defer s.ceilingMu.Unlock()
+
+	// Force the TTL to look expired so every call takes the refresh branch.
+	s.diskAvailAt.Store(time.Now().Add(-10 * diskAvailTTL).UnixNano())
+
+	done := make(chan int64, 1)
+	go func() {
+		v, _ := s.cachedCeiling()
+		done <- v
+	}()
+	select {
+	case got := <-done:
+		if got != want {
+			t.Errorf("got ceiling %d while a refresh was in flight, want the cached %d", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cachedCeiling BLOCKED behind an in-flight refresh — a wedged statfs would stall writers")
+	}
+
+	// And the admission path built on it must stay responsive too.
+	adm := make(chan bool, 1)
+	go func() { adm <- s.tryReserveCapacity(1) }()
+	select {
+	case <-adm:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tryReserveCapacity blocked behind an in-flight refresh — violates the cheap-and-lock-free rule")
+	}
+}
+
+// A store must never report the "unlimited" sentinel just because its first
+// ceiling sample has not landed. NewSpoolStore seeds it synchronously.
+func TestNewSpoolStore_SeedsCeilingSoItNeverReadsUnlimited(t *testing.T) {
+	s := newTestSpoolStore(t, 64*gib)
+	if s.capCeiling.Load() == 0 {
+		t.Error("capCeiling left at its zero value — that reads as the unlimited sentinel")
+	}
+	if ec := s.effectiveCapacity(); ec <= 0 {
+		t.Errorf("effectiveCapacity()=%d on a fresh store with a positive configured cap", ec)
 	}
 }

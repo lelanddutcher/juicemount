@@ -255,6 +255,14 @@ func NewSpoolStore(root string, capacity int64, meta *metadata.SpoolStore) (*Spo
 		index:         NewSpoolIndex(),
 		escalateAfter: DefaultStuckEscalationWindow,
 	}
+	// Seed the live ceiling synchronously, before anyone can admit a byte.
+	// cachedCeiling's single-flight is non-blocking, so a caller that loses the
+	// TryLock race falls through to whatever capCeiling holds — and the zero
+	// value would read as the "0 == unlimited" sentinel. -1 means "unknown",
+	// which fails OPEN to the configured cap; this first real sample replaces it.
+	s.capCeiling.Store(-1)
+	s.refreshCeiling()
+
 	if mw, err := newManifestWriter(root); err != nil {
 		// Non-fatal — manifest is audit-only. Log and proceed.
 		log.Printf("spool: manifest writer disabled: %v", err)
@@ -305,8 +313,13 @@ const minClampedCeiling = int64(1)
 // window was unbounded — six 9 GiB reservations all cleared a 10 GiB headroom.
 // Pinning it to the snapshot makes the window admit at most `headroom` in total,
 // which is the entire point of the clamp.
-func (s *SpoolStore) refreshCeiling(now int64) {
+func (s *SpoolStore) refreshCeiling() {
 	avail, err := spoolDiskAvail(s.root)
+	// Stamp AFTER the syscall returns, from our own clock. Taking `now` before
+	// the call (and before any lock) meant a slow statfs stored a timestamp that
+	// was already expired, so the very next caller re-refreshed immediately and
+	// the single-flight did nothing (2026-08-04 review, MEDIUM).
+	now := time.Now().UnixNano()
 	if err != nil || avail < 0 {
 		// Silent fail-open was flagged in review as unobservable; log once per
 		// sample so a machine where statfs reliably fails is diagnosable rather
@@ -341,14 +354,28 @@ func (s *SpoolStore) refreshCeiling(now int64) {
 // path takes the mutex, and the re-check inside it means just one of the N
 // actually samples.
 func (s *SpoolStore) cachedCeiling() (int64, bool) {
-	now := time.Now().UnixNano()
-	if at := s.diskAvailAt.Load(); at == 0 || now-at >= int64(diskAvailTTL) {
-		s.ceilingMu.Lock()
-		// Re-check under the lock: a peer may have refreshed while we waited.
-		if at := s.diskAvailAt.Load(); at == 0 || now-at >= int64(diskAvailTTL) {
-			s.refreshCeiling(now)
+	if at := s.diskAvailAt.Load(); at == 0 || time.Now().UnixNano()-at >= int64(diskAvailTTL) {
+		// NON-BLOCKING single-flight. TryLock, never Lock: whoever wins does the
+		// statfs, everyone else keeps the current value and moves on.
+		//
+		// A blocking Lock here was a HIGH defect (2026-08-04 review). statfs has
+		// no timeout and can hang on a wedged volume, and this function is
+		// reached from tryReserveCapacity/effectiveCapacity — which callers
+		// invoke while HOLDING a path shard (OpenWrite) or the per-entry e.mu
+		// (WriteAt, Truncate). One stuck refresh would therefore serialize every
+		// OpenWrite hashing to that shard AND block concurrent readers of a file
+		// still being written (the in-flight read-shadow path), which is exactly
+		// the class of stall the shard split exists to prevent. It also violated
+		// this file's own rule that try() be "cheap and lock-free".
+		//
+		// Using a slightly stale ceiling for one more poll is harmless: the
+		// value is at most one TTL old either way, and the floor absorbs it.
+		if s.ceilingMu.TryLock() {
+			if at := s.diskAvailAt.Load(); at == 0 || time.Now().UnixNano()-at >= int64(diskAvailTTL) {
+				s.refreshCeiling()
+			}
+			s.ceilingMu.Unlock()
 		}
-		s.ceilingMu.Unlock()
 	}
 	c := s.capCeiling.Load()
 	if c < 0 {
