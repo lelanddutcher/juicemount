@@ -81,3 +81,19 @@ window boundaries, the no-tail gap, and the first size where the tail engages. F
 
 An implementation is conformant when it reproduces all eight. **Both sides should run these in CI**;
 a mismatch must fail a test rather than a user's disk.
+
+### 5.1 What these vectors do NOT cover (consumer finding, 2026-08-03)
+
+XXH3 dispatches on input length across six internal branches. Because §3 **always** prepends an
+8-byte length prefix, this recipe can only ever reach three of them — `4to8`, `17to128`, and `long`.
+The `1to3`, `9to16` and `129to240` branches are **unreachable by construction here**, and therefore
+untested by these vectors.
+
+That is correct for this recipe and a trap for the next caller: anyone reusing the same xxh3
+implementation for something that does NOT prepend the prefix is running three untested branches.
+Cover them separately against a reference implementation — the consumer pinned vectors for exactly
+those three from the reference C build (python-xxhash 3.6.0).
+
+Worth recording: that same reference oracle independently reproduces all eight vectors above, so
+this recipe is confirmed to be genuine xxh3-64 with the stated windows rather than merely
+self-consistent with the provider's Go implementation. Two independent authorities agree.
