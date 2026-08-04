@@ -382,7 +382,16 @@
       "request": {},
       "schema": "assertions-sidecar.schema.json",
       "http_status": 0,
-      "note": "ASSERTIONS_SIDECAR \u2014 the <media>.logger.json portable sidecar (legacy <media>.loupe.json still read) (source of truth) after a fresh log_profile assertion is accepted. Keyed by content-hash asset_key, NOT inode."
+      "note": "ASSERTIONS_SIDECAR \u2014 the <media>.logger.json portable sidecar (legacy <media>.loupe.json still read) (source of truth) after a fresh log_profile assertion is accepted. Keyed by content-hash asset_key, NOT inode. LEGACY shape tag (kept in place on existing sidecars; never upgraded in situ)."
+    },
+    {
+      "file": "assertions/accept.logger.json",
+      "endpoint": "<sidecar>",
+      "method": "FILE",
+      "request": {},
+      "schema": "assertions-sidecar.schema.json",
+      "http_status": 0,
+      "note": "ASSERTIONS_SIDECAR with the POST-UNIFICATION shape tag \"logger.assertions/1\" \u2014 what a freshly-created sidecar carries as of contract_version 2. The sibling accept.loupe.json pins the LEGACY tag, which existing sidecars keep and which stays readable indefinitely."
     },
     {
       "file": "assertions/reject-stale.loupe.json",

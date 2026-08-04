@@ -8,8 +8,8 @@
   "required": ["schema", "asset_key", "media_filename", "assertions"],
   "properties": {
     "schema": {
-      "const": "loupe.assertions/1",
-      "description": "Versioned shape tag; bumped only on a breaking change. Forward-compat readers ignore unknown namespaces + unknown top-level keys (hence additionalProperties:true)."
+      "enum": ["logger.assertions/1", "loupe.assertions/1"],
+      "description": "Versioned shape tag; bumped only on a breaking change. Forward-compat readers ignore unknown namespaces + unknown top-level keys (hence additionalProperties:true). WIDENED from const \"loupe.assertions/1\" for the loupe->logger unification shipped with contract_version 2 (2026-08-03): both spellings are ACCEPTED indefinitely and the legacy one is NOT scheduled for removal. WRITE RULE: a freshly-created sidecar carries \"logger.assertions/1\"; an EXISTING sidecar keeps whatever tag it already has. Rewriting the tag inside a file a shipped reader already parses is a silent break, not a migration — so producers must not upgrade the tag in place."
     },
     "asset_key": {
       "type": "string",

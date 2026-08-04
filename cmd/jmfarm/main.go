@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -655,6 +656,16 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 	if cErr != nil {
 		return 0, 0, fmt.Errorf("collect %q: %w", job.Path, cErr)
 	}
+
+	// FARM-3: run the software-only decode classes first (HEVC Rext 4:2:2/4:4:4,
+	// XF-AVC 4K60) — the media where a farm proxy actually changes whether
+	// playback is usable. Only reorders media we have ALREADY probed; the codec
+	// is not knowable from a filesystem walk, and paying an ffprobe per file just
+	// to decide the order would cost more than the ordering saves. See
+	// farm.PrioritizeTargets.
+	targets = farm.PrioritizeTargets(targets, func(p string) *farm.VideoTrack {
+		return knownVideoTrack(store, p)
+	})
 	if len(targets) == 0 {
 		// Not a failure: an empty path OR one whose media is all excluded (a
 		// Proxy/ folder, sub-threshold clips) legitimately has nothing to
@@ -913,4 +924,35 @@ func defaultDBPath() string {
 		return "derivatives.db"
 	}
 	return filepath.Join(home, "Library", "Application Support", "JuiceMount", "derivatives.db")
+}
+
+// knownVideoTrack returns the video track for path from ALREADY-STORED tech, or
+// nil when we have never probed it.
+//
+// Deliberately never probes: this feeds FARM-3's proxy ordering, and probing to
+// decide what to probe would spend the budget the ordering is meant to protect.
+// Unknown media keeps its walk position (PrioritizeTargets treats nil as
+// "normal"), so a first sweep behaves exactly as before and later sweeps get the
+// benefit for free.
+func knownVideoTrack(store *derivatives.Store, path string) *farm.VideoTrack {
+	if store == nil {
+		return nil
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	meta, err := store.Metadata(uint64(st.Ino), "tech")
+	if err != nil || meta == nil || len(meta.Payload) == 0 {
+		return nil
+	}
+	var tech farm.Tech
+	if json.Unmarshal(meta.Payload, &tech) != nil {
+		return nil
+	}
+	return tech.Video
 }

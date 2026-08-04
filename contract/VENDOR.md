@@ -4,7 +4,7 @@ This directory is a **pinned, read-only copy** of the [`juicemount-contract`](ht
 repo — the language-neutral wire contract between JuiceMount and OpenLoupe.
 
 - **Source:** `github.com/lelanddutcher/juicemount-contract`
-- **Pinned commit:** `09092e3cd18834c662aed5116186fd6abfd0912f`
+- **Pinned commit:** `6d700d01c4974879dc504c12d7e894f0b52c68e2`
 - **contract_version:** see [`VERSION`](VERSION) (currently `2`)
 
 Only `spec/` (schemas) + `fixtures/` (golden responses) + `VERSION` are vendored — the

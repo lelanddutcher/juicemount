@@ -25,9 +25,28 @@ import (
 	"strings"
 )
 
-// AssertionSidecarSchema is the versioned shape tag (bumped only on a breaking
-// change). Mirrors assertions-sidecar.schema.json `schema` const.
-const AssertionSidecarSchema = "loupe.assertions/1"
+// The versioned shape tag inside every assertion sidecar. Mirrors the `schema`
+// enum in assertions-sidecar.schema.json.
+//
+// WIRE-TERM CUTOVER, phase 2 (2026-08-03). The consumer initially advised
+// AGAINST renaming this const (high blast radius, no user-visible value), then
+// reversed once contract_version moved to 2: the v2 bump IS the migration
+// window, and doing it in any other release would buy a second one. The schema
+// const was therefore widened to an enum accepting both spellings, and both
+// sides move in lockstep with the legacy tag readable indefinitely.
+//
+// WRITE RULE — deliberately conservative, and NOT simply "always stamp the new
+// tag". An existing sidecar KEEPS whatever tag it already carries; only a
+// freshly-created sidecar gets the new one. Flipping the tag inside a file that
+// a shipped reader is already reading is exactly the failure we hit hours
+// earlier with `logger_version` in a legacy-named blob: the file name stayed
+// familiar, the contents stopped parsing, and the consumer's `try?` swallowed
+// it. Renaming a file and rewriting a tag inside it are two different
+// migrations; this one only ever applies to new files.
+const (
+	AssertionSidecarSchema       = "logger.assertions/1"
+	AssertionSidecarSchemaLegacy = "loupe.assertions/1"
+)
 
 // SidecarAssertion is one triple in the sidecar — the verbatim JM-ASSERT wire
 // shape (assertions-sidecar.schema.json#/$defs/assertion). Value is `any` so it
@@ -95,6 +114,11 @@ func ApplyAssertion(sidecarPath, assetKey, mediaFilename string, incoming Sideca
 			Assertions:    []SidecarAssertion{},
 		}
 	}
+	// Fill ONLY when absent. This is load-bearing since the tag was unified
+	// (2026-08-03): an existing sidecar carrying the legacy
+	// "loupe.assertions/1" keeps it, because rewriting the tag inside a file a
+	// shipped reader already parses is a silent break, not a migration. New
+	// sidecars get the new tag from the literal above.
 	if sc.Schema == "" {
 		sc.Schema = AssertionSidecarSchema
 	}

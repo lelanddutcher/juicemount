@@ -2,6 +2,7 @@ package farm
 
 import (
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -36,6 +37,27 @@ var defaultSkipDirSubstrings = []string{
 	".cache", "peak files",
 }
 
+// appleDoubleHusk matches the orphaned AppleDouble shells macOS leaves beside
+// media when a consumer does an atomic sidecar write over SMB — e.g.
+// `._.C0012.MXF.logger.json.9F3A-...tmp.sb-1a2b3c4d-XyZ`. The consumer reported
+// these on 2026-08-03 (FARM-4), owns the fix, and asked us not to classify them
+// as sidecars or alarm on them meanwhile.
+//
+// Shape: an AppleDouble prefix `._` AND a `.tmp.sb-` marker somewhere after it.
+// Both are required — `._` alone is an ordinary AppleDouble sidecar (which the
+// NFS layer handles and which is NOT a husk), and `.tmp.sb-` alone is a live
+// atomic-write temp we should also leave alone but which is not this class.
+var appleDoubleHusk = regexp.MustCompile(`(^|/)\._.*\.tmp\.sb-`)
+
+// IsAppleDoubleHusk reports whether path is one of those orphaned husks.
+//
+// In practice these are ~4 KB and were already excluded by the size floor, so
+// this rule changes nothing today — it is here so the exclusion is EXPLICIT and
+// survives someone lowering JM_FARM_MIN_SIZE_MB, rather than resting on a
+// coincidence. Safe to garbage-collect on age > 24h, but the farm never deletes:
+// we only decline to derive them.
+func IsAppleDoubleHusk(path string) bool { return appleDoubleHusk.MatchString(path) }
+
 // SkipDirSubstrings is the exported resolver (defaults + JM_FARM_SKIP_DIRS)
 // for callers that pass the list into ExcludeReason.
 func SkipDirSubstrings() []string { return skipDirSubstrings() }
@@ -68,6 +90,9 @@ func pathIsProxy(lowerPath string) bool {
 // minBytes is the size floor (0 = no floor).
 func ExcludeReason(path string, size, minBytes int64, skipSubs []string) string {
 	l := strings.ToLower(path)
+	if IsAppleDoubleHusk(path) {
+		return "appledouble-husk"
+	}
 	if pathIsProxy(l) {
 		return "proxy"
 	}
