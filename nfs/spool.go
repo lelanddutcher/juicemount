@@ -238,13 +238,28 @@ func NewSpoolStore(root string, capacity int64, meta *metadata.SpoolStore) (*Spo
 	if err := os.MkdirAll(filesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("spool: mkdir %s: %w", filesDir, err)
 	}
+	// THE CONFIGURED CAPACITY IS NOT CLAMPED HERE. It used to be, and that made
+	// the clamp a ONE-WAY RATCHET.
+	//
+	// Found live (2026-08-04): the app started with 21 GiB free, so this baked
+	// 1.49 GiB into s.capacity permanently. Disk later recovered to 25.5 GiB —
+	// and the spool was still stuck at 1.49 GiB, because effectiveCapacity only
+	// ever takes min(configured, live ceiling) and can never rise above a
+	// configured value that was itself a startup snapshot. A copy of 2 GiB would
+	// stall with ~5.4 GiB of real headroom sitting there. That is the same
+	// startup-snapshot bug the live clamp was added to fix, just in the other
+	// direction.
+	//
+	// effectiveCapacity already enforces exactly this bound (used + avail -
+	// floor) on every admission and re-samples it once per second, so clamping
+	// here bought nothing except the inability to recover. Logged, not applied.
 	if capacity > 0 {
 		if avail, err := spoolDiskAvail(root); err == nil && avail > 0 {
 			if maxCap := avail - SpoolFreeFloorBytes; maxCap > 0 && capacity > maxCap {
-				jmlog.Warn("spool: capacity clamped to free disk",
-					"requested_gb", capacity>>30, "clamped_gb", maxCap>>30,
+				jmlog.Info("spool: free disk is currently below the configured capacity — "+
+					"admission is clamped live and will recover as disk frees",
+					"configured_gb", capacity>>30, "effective_now_gb", maxCap>>30,
 					"free_gb", avail>>30)
-				capacity = maxCap
 			}
 		}
 	}
