@@ -82,15 +82,26 @@ var capabilityVocab = map[string]bool{
 	// and JM-ASSERT (#51) portable-human-metadata channel (POST/GET /assertions).
 	// Both route paths == their tokens, so no routeCapAlias entry is needed.
 	"blob": true, "assertions": true,
+	// REGISTER-ROUTE (2026-08-04, founder-prioritized): `contribute` has meant
+	// "AI-only contribute-back" since OL-1, and an OLD provider build advertises
+	// that exact string — so it cannot tell a consumer whether non-AI kinds are
+	// registrable. `contribute-derivatives` is the distinct token that says the
+	// widened route is present. Feature-detect on THIS, never on `contribute`.
+	"contribute-derivatives": true,
 }
 
 // routeCapAlias maps a served route (no leading slash) to a capability token when
 // the token differs from the route path. OL-1: the write route is
 // "/derivatives/register" but the capability is `contribute` (a route whose
 // trimmed path isn't itself a vocabulary token).
-var routeCapAlias = map[string]string{
-	"derivatives/register": "contribute",
-	"derivatives/changes":  "changes",
+var routeCapAlias = map[string][]string{
+	// One route may advertise MORE THAN ONE token. /derivatives/register emits
+	// both the historical `contribute` (AI-only, kept so older consumers keep
+	// working unchanged) and `contribute-derivatives` (this build accepts the
+	// widened kind set). A consumer seeing only `contribute` is talking to a
+	// pre-REGISTER-ROUTE provider and must not attempt a non-AI register.
+	"derivatives/register": {"contribute", "contribute-derivatives"},
+	"derivatives/changes":  {"changes"},
 }
 
 // DeriveCapabilities computes the capability list as the intersection of the
@@ -109,8 +120,10 @@ func DeriveCapabilities(servedRoutes []string) []string {
 		token := strings.TrimPrefix(strings.TrimSpace(r), "/")
 		if capabilityVocab[token] {
 			caps[token] = true
-		} else if alias, ok := routeCapAlias[token]; ok {
-			caps[alias] = true
+		} else if aliases, ok := routeCapAlias[token]; ok {
+			for _, a := range aliases {
+				caps[a] = true
+			}
 		}
 	}
 	out := make([]string, 0, len(caps))

@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -3585,9 +3586,47 @@ func overlayLogProfile(ds *derivatives.Store, inode uint64, tech json.RawMessage
 	return out
 }
 
+// contributableKind describes one derivative kind a CONSUMER may register.
+//
+// REGISTER-ROUTE (2026-08-04, founder-prioritized). Before this, the route was
+// pinned to kind=="ai", so Tier 1 contribute-back had no commit path for ANY
+// other kind — a consumer could write proxy.mp4 through the mount and then had
+// no way to make it real, and spec/WRITE_PLACEMENT.md §4 forbids deleting the
+// orphan it just made. This table is the widening, and it is deliberately a
+// TABLE rather than a permissive check:
+//
+//   - `file` pins the reserved filename from WRITE_PLACEMENT §2. A consumer
+//     cannot choose the path, so it cannot write outside the per-key directory
+//     or shadow another kind's artifact.
+//   - `mediaType` is assigned SERVER-SIDE from the kind, never echoed from the
+//     request. /blob pins its response Content-Type from this row field, so a
+//     contributor-supplied media_type would be a contributor-controlled
+//     Content-Type served from the control-plane origin.
+//
+// `filmstrip` is deliberately ABSENT: its reader contract (minimum canvas,
+// zero-gutter cell origin, upright-as-displayed, undefined trailing cells) is
+// still unspecified, so an edge-written strip is not yet safely renderable by
+// another client. See PROVIDER_STATUS 2026-08-04 D.
+type contributableKind struct {
+	file      string
+	mediaType string
+}
+
+var contributableKinds = map[string]contributableKind{
+	"ai":    {file: "", mediaType: "application/json"}, // "" => resolved dual-name (logger/loupe)
+	"proxy": {file: "proxy.mp4", mediaType: "video/mp4"},
+	// NOTE the kind is "thumbnail", not "poster" — `poster.jpg` is the FILE.
+	// Using the filename as the kind was caught by TestContributableKindsAreValidManifestKinds:
+	// the manifest enum has no "poster", so the row would have failed the
+	// consumer's own validation of /derivatives.
+	"thumbnail": {file: "poster.jpg", mediaType: "image/jpeg"},
+	"waveform":  {file: "waveform.json", mediaType: "application/json"},
+}
+
 // registerRequest is the POST /derivatives/register body (OL-1 on-device AI
-// contribute-back). The consumer wrote ai.loupe.json through the mount, then
-// vouches with source_size+source_mtime (it cannot compute the contract xxh3).
+// contribute-back, widened by REGISTER-ROUTE). The consumer wrote the blob
+// through the mount, then vouches with source_size+source_mtime (it cannot
+// compute the contract xxh3).
 type registerRequest struct {
 	Inode       uint64 `json:"inode"`
 	Kind        string `json:"kind"`
@@ -3632,8 +3671,15 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing inode", 400)
 		return
 	}
-	if req.Kind != "ai" {
-		http.Error(w, `OL-1 register is AI-only (kind must be "ai")`, 400)
+	spec, kindOK := contributableKinds[req.Kind]
+	if !kindOK {
+		allowed := make([]string, 0, len(contributableKinds))
+		for k := range contributableKinds {
+			allowed = append(allowed, k)
+		}
+		sort.Strings(allowed)
+		http.Error(w, fmt.Sprintf("kind %q is not consumer-registrable; allowed: %s",
+			req.Kind, strings.Join(allowed, ", ")), 400)
 		return
 	}
 	if req.Producer != "on-device" && req.Producer != "macos-node" {
@@ -3654,8 +3700,21 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	// to a fixed name would 404 a blob an older consumer had already written
 	// under the other one. An explicit blob_rel_path is honoured as-is; the
 	// register schema accepts both names.
-	if rel == "" {
-		rel = derivatives.ResolveAIBlobName(farm.DerivBlobDir(fusePath, req.Inode))
+	blobDir := farm.DerivBlobDir(fusePath, req.Inode)
+	if spec.file != "" {
+		// The reserved name is authoritative. A supplied blob_rel_path is only
+		// accepted when it MATCHES it — the consumer does not get to choose a
+		// path inside our namespace (WRITE_PLACEMENT §2).
+		if rel != "" && rel != spec.file {
+			http.Error(w, fmt.Sprintf("blob_rel_path %q is not the reserved name for kind %q (expected %q)",
+				rel, req.Kind, spec.file), 400)
+			return
+		}
+		rel = spec.file
+	} else if rel == "" {
+		// kind=="ai" keeps its dual-name resolution (wire-term cutover): the
+		// post-cutover `ai.logger.json` if present, else the legacy name.
+		rel = derivatives.ResolveAIBlobName(blobDir)
 	}
 
 	if store == nil || ds == nil {
@@ -3665,6 +3724,21 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	entry := store.LookupByInode(req.Inode)
 	if entry == nil {
 		http.Error(w, "inode not found", 404)
+		return
+	}
+
+	// The manifest row is the commit point (WRITE_PLACEMENT §4), so refuse to
+	// mint a row for a blob that is not on disk — that would be a phantom row
+	// pointing at nothing, and readers fail closed on it rather than
+	// regenerating. Cheap: one stat, and it catches a consumer that registered
+	// before its own atomic rename landed.
+	//
+	// ORDER MATTERS: this runs AFTER the inode lookup. Placed before it, an
+	// unknown inode reported 409 "blob missing" instead of 404 "inode not
+	// found" — a real regression caught by TestDerivativesRegisterOL1.
+	if _, statErr := os.Stat(filepath.Join(blobDir, rel)); statErr != nil {
+		http.Error(w, fmt.Sprintf("blob %q not present under the derivative dir — write it (atomically) BEFORE registering: %v",
+			rel, statErr), http.StatusConflict)
 		return
 	}
 
@@ -3693,7 +3767,7 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mt := "application/json"
+	mt := spec.mediaType // SERVER-assigned from the kind, never from the request
 	var modelP *string
 	if req.Model != "" {
 		modelP = &req.Model
@@ -3707,7 +3781,7 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	srcSize := fi.Size()
 	srcMtime := fi.ModTime().Unix()
 	row := derivatives.DerivRow{
-		Kind: "ai", Status: "ready", Producer: req.Producer, Version: 1,
+		Kind: req.Kind, Status: "ready", Producer: req.Producer, Version: 1,
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mt, Model: modelP, Dim: dimP,
 		UpdatedAt:   time.Now().Unix(),
 		SourceSize:  &srcSize,
@@ -3721,8 +3795,9 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "put deriv: "+err.Error(), 500)
 		return
 	}
-	jmlog.Info("OL-1 AI contribute-back registered",
-		"inode", req.Inode, "producer", req.Producer, "model", req.Model, "hash", hash)
+	jmlog.Info("contribute-back registered",
+		"inode", req.Inode, "kind", req.Kind, "blob", rel,
+		"producer", req.Producer, "model", req.Model, "hash", hash)
 	writeContractJSON(w, registerResponse{Inode: req.Inode, Registered: true, Derivative: row})
 }
 

@@ -36,7 +36,7 @@ negotiation.
 
 | kind | file | notes |
 |---|---|---|
-| `poster` | `poster.jpg` | single frame |
+| `thumbnail` | `poster.jpg` | single frame. **The kind is `thumbnail`; `poster.jpg` is only the FILE.** An earlier revision of this table wrongly listed the kind as `poster`, which is not in the manifest's kind enum — a row written with it would fail the consumer's own validation of `/derivatives`. |
 | `filmstrip` | `strip.jpg` | geometry is on the MANIFEST row, not on disk — see below |
 | `waveform` | `waveform.json` | JM-18 shape |
 | `proxy` | `proxy.mp4` | `PROXY_CODEC_SPEC.md`; H.264/AAC faststart floor |
