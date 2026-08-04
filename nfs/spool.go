@@ -303,6 +303,12 @@ const diskAvailTTL = 1 * time.Second
 // real reservation while staying safely positive.
 const minClampedCeiling = int64(1)
 
+// staleCeilingMax is how old a free-disk sample may get before we stop trusting
+// it entirely. Generous relative to diskAvailTTL so ordinary scheduling jitter
+// never trips it; short enough that a wedged statfs cannot leave admission
+// running on a frozen snapshot indefinitely.
+const staleCeilingMax = 30 * diskAvailTTL
+
 // refreshCeiling re-samples free disk and recomputes capCeiling.
 //
 // The `used` snapshot MUST be taken here, alongside avail, and the resulting
@@ -368,14 +374,32 @@ func (s *SpoolStore) cachedCeiling() (int64, bool) {
 		// the class of stall the shard split exists to prevent. It also violated
 		// this file's own rule that try() be "cheap and lock-free".
 		//
-		// Using a slightly stale ceiling for one more poll is harmless: the
-		// value is at most one TTL old either way, and the floor absorbs it.
+		// A loser using a slightly stale ceiling is normally harmless — one poll
+		// of staleness, absorbed by the floor. But it is NOT bounded to one TTL:
+		// if the WINNER's statfs is the thing that hangs, it holds the slot for
+		// the whole hang and every loser keeps reading the same frozen value.
+		// staleCeilingMax below is the backstop for exactly that.
 		if s.ceilingMu.TryLock() {
 			if at := s.diskAvailAt.Load(); at == 0 || time.Now().UnixNano()-at >= int64(diskAvailTTL) {
 				s.refreshCeiling()
 			}
 			s.ceilingMu.Unlock()
 		}
+	}
+	// Hard staleness backstop. If the sample is far older than the TTL — which
+	// happens when the refresh slot is held by a statfs stuck on a wedged volume
+	// — we can no longer see the disk, so we stop pretending the last reading is
+	// still true. Freeze admission at what is already used rather than keep
+	// filling a volume we cannot measure: admitting blind against a stale-roomy
+	// ceiling is precisely the founder incident this whole change exists to fix.
+	// The resulting stall is bounded by the wedge backstop in waitForCapacity,
+	// so this degrades to an honest ErrSpoolFull rather than a hang.
+	if at := s.diskAvailAt.Load(); at != 0 && time.Now().UnixNano()-at >= int64(staleCeilingMax) {
+		frozen := s.used.Load()
+		if frozen < minClampedCeiling {
+			frozen = minClampedCeiling // never collide with the 0 == unlimited sentinel
+		}
+		return frozen, true
 	}
 	c := s.capCeiling.Load()
 	if c < 0 {

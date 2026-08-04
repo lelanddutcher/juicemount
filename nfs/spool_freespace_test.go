@@ -438,3 +438,39 @@ func TestNewSpoolStore_SeedsCeilingSoItNeverReadsUnlimited(t *testing.T) {
 		t.Errorf("effectiveCapacity()=%d on a fresh store with a positive configured cap", ec)
 	}
 }
+
+// A wedged statfs holding the refresh slot must not leave admission running
+// against a frozen roomy ceiling forever (2026-08-04 review, MEDIUM). Past
+// staleCeilingMax the ceiling collapses to what is already used, so no new bytes
+// are admitted and the wedge backstop turns the stall into an honest ErrSpoolFull.
+func TestCachedCeiling_VeryStaleSampleFreezesAdmission(t *testing.T) {
+	s := newTestSpoolStore(t, 400*gib)
+	s.used.Store(3 * gib)
+	seedDiskAvail(s, 900*gib) // a very roomy ceiling...
+	roomy := s.capCeiling.Load()
+	if roomy <= 3*gib {
+		t.Fatalf("precondition: expected a roomy ceiling, got %d", roomy)
+	}
+
+	// ...that is now far too old to trust. Hold the refresh slot so the TryLock
+	// loses, exactly as a hung statfs would.
+	s.ceilingMu.Lock()
+	defer s.ceilingMu.Unlock()
+	s.diskAvailAt.Store(time.Now().Add(-2 * staleCeilingMax).UnixNano())
+
+	got, ok := s.cachedCeiling()
+	if !ok {
+		t.Fatal("expected a usable (frozen) ceiling, got ok=false")
+	}
+	if got != 3*gib {
+		t.Errorf("stale ceiling = %d, want %d (== used: admission frozen)", got, 3*gib)
+	}
+	if s.tryReserveCapacity(1 * gib) {
+		t.Error("admitted 1 GiB against a sample we can no longer trust")
+	}
+	// And it must never read as the unlimited sentinel, even with an empty spool.
+	s.used.Store(0)
+	if v, _ := s.cachedCeiling(); v <= 0 {
+		t.Errorf("frozen ceiling %d reads as the unlimited sentinel", v)
+	}
+}
