@@ -42,14 +42,18 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 	if preset == "" {
 		preset = "slow"
 	}
-	// NO MkdirAll here. The caller has already created this directory with a
-	// symlink-checking walk and holds its descriptor, and the output name was
-	// staged inside it — so re-creating the path by name would be both redundant
-	// and the one unanchored step left in this function.
-	// Encode to a temp sibling, then atomically rename onto outPath so a
-	// concurrent OpenLoupe reader never sees a partially-encoded proxy.
-	tmpPath := atomicTempPath(outPath)
-	defer os.Remove(tmpPath) // no-op once the commit rename consumes it
+	// WRITES DIRECTLY TO outPath, which the caller already created inside the
+	// derivative directory with O_EXCL|O_NOFOLLOW and will commit onto the real
+	// blob name with renameat through a held descriptor.
+	//
+	// This function used to add its OWN atomic layer — encode to a temp sibling,
+	// then rename by path — which was redundant once the caller had one, and was
+	// the last unanchored surface here: the sibling was NOT created by us, so it
+	// could already BE a planted symlink, and os.Rename/os.Open/syncDir all
+	// resolve by name. On the farm host that is a root-privileged write out of
+	// the volume. Reader visibility is unaffected: the staged name is dot-
+	// prefixed and is never the blob's real name, so a reader only ever sees the
+	// final name appear atomically at the caller's renameat.
 	// -pix_fmt yuv420p forces 8-bit 4:2:0 from any source (10-bit/HDR/422
 	// originals included), the lowest-common-denominator both decoders accept.
 	// crf/preset are the quality knob (size/quality only — interchange-safe).
@@ -62,13 +66,10 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 		// Force the MP4 muxer: the temp path lacks the .mp4 extension ffmpeg
 		// would otherwise infer the container from.
 		"-f", "mp4",
-		tmpPath)
+		outPath)
 	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg proxy %q: %w: %s", srcPath, err, out)
-	}
-	if err := atomicCommitFile(tmpPath, outPath); err != nil {
-		return fmt.Errorf("commit proxy %q: %w", outPath, err)
 	}
 	return nil
 }

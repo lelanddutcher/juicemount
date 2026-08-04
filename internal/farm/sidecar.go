@@ -164,6 +164,24 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 		return row, false
 	}
 
+	// KIND-SCOPED FIELDS ARE CLEARED OFF-KIND (round 7).
+	//
+	// `extra`-backed fields are PERSISTED for any kind but only re-HYDRATED for
+	// the kind they belong to (store.decodeExtra), so a row carrying, say,
+	// blob_size on a thumbnail can never round-trip: the reconcile's
+	// unchanged-row skip compares a stored row that lost the field against a
+	// file row that still has it, decides "changed" every single time, and
+	// re-publishes on every sweep with a fresh updated_at — the exact permanent
+	// changes-feed churn that skip exists to prevent. Clearing them here is also
+	// just the sanitizer's own rule applied properly: the file supplies DATA for
+	// the kind it declares, and geometry on a waveform is not data, it is noise.
+	if row.Kind != "filmstrip" {
+		row.Filmstrip = nil
+	}
+	if row.Kind != "proxy" && row.Kind != "audio_proxy" {
+		row.Codec, row.CodecString, row.BlobSize = nil, nil, nil
+	}
+
 	// FIELDS THAT WERE PASSING THROUGH UNTOUCHED (2026-08-04 round 3).
 	//
 	// Policy, because the first cut of this got it wrong by rejecting whole rows:

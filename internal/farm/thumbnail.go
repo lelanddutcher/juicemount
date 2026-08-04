@@ -2,7 +2,6 @@ package farm
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 )
 
@@ -28,16 +27,18 @@ func Thumbnail(ffmpegBin, srcPath, outPath string, maxDim int, durationMS int64)
 		// next to a locally-generated one in the same hover preview.
 		maxDim = 720
 	}
-	// NO MkdirAll here. The caller has already created this directory with a
-	// symlink-checking walk and holds its descriptor, and the output name was
-	// staged inside it — so re-creating the path by name would be both redundant
-	// and the one unanchored step left in this function.
-	// Encode to a temp sibling, then atomically rename onto outPath so a
-	// concurrent OpenLoupe reader never sees a half-written JPEG. -f image2
-	// forces the muxer because the temp path lacks the .jpg extension ffmpeg
-	// would otherwise infer the format from.
-	tmpPath := atomicTempPath(outPath)
-	defer os.Remove(tmpPath) // no-op once the commit rename consumes it
+	// WRITES DIRECTLY TO outPath, which the caller already created inside the
+	// derivative directory with O_EXCL|O_NOFOLLOW and will commit onto the real
+	// blob name with renameat through a held descriptor.
+	//
+	// This function used to add its OWN atomic layer — encode to a temp sibling,
+	// then rename by path — which was redundant once the caller had one, and was
+	// the last unanchored surface here: the sibling was NOT created by us, so it
+	// could already BE a planted symlink, and os.Rename/os.Open/syncDir all
+	// resolve by name. On the farm host that is a root-privileged write out of
+	// the volume. Reader visibility is unaffected: the staged name is dot-
+	// prefixed and is never the blob's real name, so a reader only ever sees the
+	// final name appear atomically at the caller's renameat.
 	scale := fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=decrease", maxDim, maxDim)
 	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
 	if durationMS > 0 {
@@ -45,19 +46,16 @@ func Thumbnail(ffmpegBin, srcPath, outPath string, maxDim int, durationMS int64)
 		// keyframe. Seek to 10% in (skips leaders/slates).
 		seekSec := float64(durationMS) / 1000.0 / 10.0
 		args = append(args, "-ss", fmt.Sprintf("%.3f", seekSec), "-i", srcPath,
-			"-frames:v", "1", "-vf", scale, "-q:v", "3", "-f", "image2", tmpPath)
+			"-frames:v", "1", "-vf", scale, "-q:v", "3", "-f", "image2", outPath)
 	} else {
 		// Duration unknown: keep the representative-frame scan (decodes ~100
 		// frames from the start) rather than blind-seek into an unknown length.
 		args = append(args, "-i", srcPath, "-vf", "thumbnail,"+scale,
-			"-frames:v", "1", "-q:v", "3", "-f", "image2", tmpPath)
+			"-frames:v", "1", "-q:v", "3", "-f", "image2", outPath)
 	}
 	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg thumbnail %q: %w: %s", srcPath, err, out)
-	}
-	if err := atomicCommitFile(tmpPath, outPath); err != nil {
-		return fmt.Errorf("commit thumbnail %q: %w", outPath, err)
 	}
 	return nil
 }

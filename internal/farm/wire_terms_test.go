@@ -78,21 +78,34 @@ func TestAssertionSidecarPath_PrefersNewButFindsLegacy(t *testing.T) {
 	}
 }
 
+// Re-pointed at the DESCRIPTOR form when the path-form helpers were deleted.
+// The cutover semantics being pinned here are the 2026-08-03 data-loss fix and
+// must not be lost just because the resolution mechanism changed.
+func aiNameAt(t *testing.T, dir string) string {
+	t.Helper()
+	d, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	return derivatives.AIBlobWriteNameAt(d)
+}
+
 func TestResolveAIBlobName_DualRead(t *testing.T) {
 	dir := t.TempDir()
-	if got := derivatives.ResolveAIBlobName(dir); got != derivatives.AIBlobName {
+	if got := aiNameAt(t, dir); got != derivatives.AIBlobName {
 		t.Fatalf("empty dir: got %q, want %q", got, derivatives.AIBlobName)
 	}
 	if err := os.WriteFile(filepath.Join(dir, derivatives.AIBlobNameLegacy), []byte("{}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := derivatives.ResolveAIBlobName(dir); got != derivatives.AIBlobNameLegacy {
+	if got := aiNameAt(t, dir); got != derivatives.AIBlobNameLegacy {
 		t.Fatalf("legacy present: got %q, want %q", got, derivatives.AIBlobNameLegacy)
 	}
 	if err := os.WriteFile(filepath.Join(dir, derivatives.AIBlobName), []byte("{}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := derivatives.ResolveAIBlobName(dir); got != derivatives.AIBlobName {
+	if got := aiNameAt(t, dir); got != derivatives.AIBlobName {
 		t.Fatalf("both present: got %q, want %q", got, derivatives.AIBlobName)
 	}
 }
@@ -165,7 +178,7 @@ func TestLoadExistingAIMerged_BothBlobsNoSubKindLost(t *testing.T) {
 	}
 
 	// And the write target is the post-cutover name when both exist.
-	if w := derivatives.AIBlobWriteName(dir); w != derivatives.AIBlobName {
+	if w := aiNameAt(t, dir); w != derivatives.AIBlobName {
 		t.Errorf("write target with both present = %q, want %q", w, derivatives.AIBlobName)
 	}
 }
@@ -176,10 +189,10 @@ func TestAIBlobWriteName_LegacyOnlyStaysLegacy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, derivatives.AIBlobNameLegacy), []byte(`{}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if w := derivatives.AIBlobWriteName(dir); w != derivatives.AIBlobNameLegacy {
+	if w := aiNameAt(t, dir); w != derivatives.AIBlobNameLegacy {
 		t.Errorf("legacy-only write target = %q, want %q", w, derivatives.AIBlobNameLegacy)
 	}
-	if w := derivatives.AIBlobWriteName(t.TempDir()); w != derivatives.AIBlobName {
+	if w := aiNameAt(t, t.TempDir()); w != derivatives.AIBlobName {
 		t.Errorf("empty-dir write target = %q, want %q", w, derivatives.AIBlobName)
 	}
 }

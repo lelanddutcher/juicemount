@@ -3,7 +3,6 @@ package farm
 import (
 	"fmt"
 	"math"
-	"os"
 	"os/exec"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
@@ -96,16 +95,18 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 		intervalMS = 1
 	}
 
-	// NO MkdirAll here. The caller has already created this directory with a
-	// symlink-checking walk and holds its descriptor, and the output name was
-	// staged inside it — so re-creating the path by name would be both redundant
-	// and the one unanchored step left in this function.
-	// Encode to a temp sibling, then atomically rename onto outPath so a
-	// concurrent OpenLoupe reader never sees a half-written sprite sheet. -f
-	// image2 forces the muxer because the temp path lacks the .jpg extension
-	// ffmpeg would otherwise infer the format from.
-	tmpPath := atomicTempPath(outPath)
-	defer os.Remove(tmpPath) // no-op once the commit rename consumes it
+	// WRITES DIRECTLY TO outPath, which the caller already created inside the
+	// derivative directory with O_EXCL|O_NOFOLLOW and will commit onto the real
+	// blob name with renameat through a held descriptor.
+	//
+	// This function used to add its OWN atomic layer — encode to a temp sibling,
+	// then rename by path — which was redundant once the caller had one, and was
+	// the last unanchored surface here: the sibling was NOT created by us, so it
+	// could already BE a planted symlink, and os.Rename/os.Open/syncDir all
+	// resolve by name. On the farm host that is a root-privileged write out of
+	// the volume. Reader visibility is unaffected: the staged name is dot-
+	// prefixed and is never the blob's real name, so a reader only ever sees the
+	// final name appear atomically at the caller's renameat.
 	vf := fmt.Sprintf("fps=%.6f,scale=%d:%d,tile=%dx%d", fps, cellW, cellH, cols, rows)
 	// -skip_frame nokey (THE farm-throughput fix, 2026-07-14): the fps= filter
 	// sits DOWNSTREAM of the decoder, so without this ffmpeg fully reconstructs
@@ -121,13 +122,10 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 	// -an: never demux/decode the audio track for a video-only sprite.
 	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
 	args = append(args, "-discard", "nokey", "-an", "-i", srcPath,
-		"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", tmpPath)
+		"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", outPath)
 	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("ffmpeg filmstrip %q: %w: %s", srcPath, err, out)
-	}
-	if err := atomicCommitFile(tmpPath, outPath); err != nil {
-		return nil, fmt.Errorf("commit filmstrip %q: %w", outPath, err)
 	}
 
 	return &derivatives.FilmstripGeo{

@@ -152,6 +152,16 @@ func CommitStagedAt(dir *os.File, stagedName, finalName string) error {
 		_ = unix.Unlinkat(dfd, stagedName, 0)
 		return fmt.Errorf("derivatives: refusing to publish an empty %q — the generator wrote nothing", finalName)
 	}
+	// fsync the bytes before they become visible under the real name. The
+	// generators used to do this themselves via a path-addressed open; that
+	// open was one of the unanchored steps removed with their inner staging, so
+	// the durability it provided moves here, where it can be done on a
+	// descriptor-relative open instead of by name.
+	if sfd, oerr := unix.Openat(dfd, stagedName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0); oerr == nil {
+		sf := os.NewFile(uintptr(sfd), stagedName)
+		_ = sf.Sync()
+		_ = sf.Close()
+	}
 	if err := unix.Renameat(dfd, stagedName, dfd, finalName); err != nil {
 		_ = unix.Unlinkat(dfd, stagedName, 0)
 		return fmt.Errorf("derivatives: commit %q: %w", finalName, err)

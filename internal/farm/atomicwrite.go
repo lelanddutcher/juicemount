@@ -1,7 +1,6 @@
 package farm
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -25,7 +24,16 @@ func nextTempSeq() uint64 { return tempSeq.Add(1) }
 //
 // Use this for every in-process derivative-blob write. ffmpeg-produced blobs
 // (proxy/thumbnail/filmstrip) can't hand us their bytes, so they encode to a
-// temp path and finish with atomicCommitFile instead.
+// temp path and finish with a descriptor-relative commit instead.
+//
+// SCOPE: this writes by PATH, so it is only safe for targets OUTSIDE the
+// consumer-writable derivative tree — the changes feed, the farm status file,
+// per-asset assertion sidecars. Anything under .juicemount/derivatives must use
+// internal/derivatives' descriptor-relative helpers. The temp-sibling pair that
+// used to live here (atomicTempPath + atomicCommitFile) was deleted with the
+// ffmpeg generators that called it: the sibling was not created by us, so it
+// could already BE a planted symlink, and rename/open/syncDir all resolve by
+// name — a root-privileged write out of the volume on the farm host.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 	dir := filepath.Dir(path)
 	tmp, terr := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
@@ -61,26 +69,6 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 	return nil
 }
 
-// atomicCommitFile durably and atomically publishes a fully-written temp file
-// onto finalPath: it fsyncs tmpPath's BYTES first (the producer — ffmpeg — has
-// closed it but nothing guarantees writeback yet; renaming before fsync is the
-// classic hole where a crash leaves the final name pointing at truncated data),
-// then os.Renames it into place and fsyncs the parent directory. tmpPath MUST
-// be on the same filesystem as finalPath (callers create it in the same
-// directory) so the rename is atomic. Used by the ffmpeg derivative producers,
-// which encode to tmpPath and then commit, so OpenLoupe never observes a
-// partially-encoded proxy/thumbnail/filmstrip at finalPath.
-func atomicCommitFile(tmpPath, finalPath string) error {
-	if err := syncFile(tmpPath); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		return err
-	}
-	syncDir(filepath.Dir(finalPath))
-	return nil
-}
-
 // syncFile fsyncs an already-written file's bytes by path. A read-only open is
 // sufficient for fsync(2) on both Linux and macOS.
 func syncFile(path string) error {
@@ -93,16 +81,6 @@ func syncFile(path string) error {
 		return err
 	}
 	return f.Close()
-}
-
-// atomicTempPath returns a unique sibling path of finalPath suitable for an
-// ffmpeg output target. It lives in the same directory (same filesystem) so the
-// subsequent atomicCommitFile rename is atomic. The ".tmp-<pid>-<unique>" suffix
-// keeps it out of the way of directory listings that match the blob's real name.
-func atomicTempPath(finalPath string) string {
-	dir := filepath.Dir(finalPath)
-	base := filepath.Base(finalPath)
-	return filepath.Join(dir, fmt.Sprintf(".%s.tmp-%d-%d", base, os.Getpid(), nextTempSeq()))
 }
 
 // syncDir best-effort fsyncs a directory so a contained rename/create is durable.
