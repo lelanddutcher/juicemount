@@ -29,6 +29,22 @@ func seedDiskAvail(s *SpoolStore, avail int64) {
 
 const gib = int64(1) << 30
 
+// newFixedCapSpool builds a store whose CONFIGURED capacity is exactly `cap`,
+// independent of the machine's real free disk.
+//
+// NewSpoolStore clamps the requested capacity against a live statfs at
+// construction, so a test that passes `200*gib` gets whatever the host happens
+// to have free minus the 20 GiB floor. That made these tests
+// environment-dependent: they passed on a roomy machine and FAILED on a
+// nearly-full one — i.e. on exactly the machine the feature exists for. Pin the
+// field directly so the arithmetic under test is the only variable.
+func newFixedCapSpool(t *testing.T, capacity int64) *SpoolStore {
+	t.Helper()
+	s := newTestSpoolStore(t, capacity)
+	s.capacity = capacity
+	return s
+}
+
 // The founder's incident (2026-08-03): copying to the volume while local disk is
 // low stalls instead of failing. Root cause — NewSpoolStore clamps capacity to
 // free disk ONCE, so the budget goes stale as the disk fills underneath it, and
@@ -40,8 +56,12 @@ func TestEffectiveCapacity_TracksFreeDiskAfterConstruction(t *testing.T) {
 	// disk, so read back what it actually stored rather than assuming our
 	// literal survived — the whole point of this fix is that the stored value
 	// is a snapshot.
-	s := newTestSpoolStore(t, 200*gib)
+	const want200 = 200 * gib
+	s := newFixedCapSpool(t, want200)
 	configured := s.ConfiguredCapacity()
+	if configured != want200 {
+		t.Fatalf("configured cap = %d, want the pinned %d", configured, want200)
+	}
 
 	t.Run("plenty of disk keeps the configured cap", func(t *testing.T) {
 		seedDiskAvail(s, 900*gib)
@@ -91,7 +111,7 @@ func TestEffectiveCapacity_TracksFreeDiskAfterConstruction(t *testing.T) {
 // The exact shape measured during the incident: a configured capacity that,
 // added to the free-disk floor, already exceeded the disk.
 func TestEffectiveCapacity_IncidentShape(t *testing.T) {
-	s := newTestSpoolStore(t, 37*gib) // what /spool actually reported
+	s := newFixedCapSpool(t, 37*gib) // what /spool actually reported
 	configured := s.ConfiguredCapacity()
 	s.used.Store(0)
 	seedDiskAvail(s, 50*gib) // what the volume actually had free
@@ -129,7 +149,7 @@ func TestEffectiveCapacity_UnlimitedStaysUnlimited(t *testing.T) {
 // Capacity() must report the enforced budget, not the startup snapshot, so the
 // UI and /spool don't advertise headroom that admission will refuse.
 func TestCapacityReportsEffectiveNotConfigured(t *testing.T) {
-	s := newTestSpoolStore(t, 400*gib)
+	s := newFixedCapSpool(t, 400*gib)
 	configured := s.ConfiguredCapacity()
 	s.used.Store(1 * gib)
 	seedDiskAvail(s, 30*gib)
@@ -184,7 +204,7 @@ func TestCachedCeiling_IsCachedWithinTTL(t *testing.T) {
 // The ceiling must be pinned to a `used` snapshot taken with the disk reading,
 // so a window admits at most `headroom` in TOTAL.
 func TestTryReserveCapacity_CumulativeAdmissionIsBoundedWithinOneSample(t *testing.T) {
-	s := newTestSpoolStore(t, 200*gib)
+	s := newFixedCapSpool(t, 200*gib)
 	s.used.Store(0)
 	seedDiskAvail(s, 30*gib) // headroom = 10 GiB, pinned for this window
 
@@ -209,7 +229,7 @@ func TestTryReserveCapacity_CumulativeAdmissionIsBoundedWithinOneSample(t *testi
 // low-disk machine — collided with that sentinel and re-opened admission with no
 // cap at all, at the worst possible moment.
 func TestEffectiveCapacity_ZeroCeilingDoesNotReadAsUnlimited(t *testing.T) {
-	s := newTestSpoolStore(t, 100*gib)
+	s := newFixedCapSpool(t, 100*gib)
 	s.used.Store(0)                       // empty spool
 	seedDiskAvail(s, SpoolFreeFloorBytes) // exactly at the floor -> headroom 0
 
@@ -229,7 +249,7 @@ func TestEffectiveCapacity_ZeroCeilingDoesNotReadAsUnlimited(t *testing.T) {
 // the drain can help) from "the volume is full" (it cannot). The offline stall
 // branches on this to avoid parking forever on a hang reconnecting won't fix.
 func TestDiskConstrained_OnlyWhenTheDiskIsTheBlocker(t *testing.T) {
-	s := newTestSpoolStore(t, 8*gib)
+	s := newFixedCapSpool(t, 8*gib)
 
 	// Budget-full but plenty of disk: NOT disk-constrained.
 	s.used.Store(8 * gib)
@@ -291,7 +311,7 @@ func TestWaitForCapacity_OfflineButDiskConstrainedGivesUp(t *testing.T) {
 	pin.SetOffline(true)
 	t.Cleanup(func() { pin.SetOffline(false) })
 
-	s := newTestSpoolStore(t, 4*gib)
+	s := newFixedCapSpool(t, 4*gib)
 	s.used.Store(1 * gib)
 	pinConstrained(t, s)
 
@@ -318,7 +338,7 @@ func TestWaitForCapacity_ReconnectStillResetsTheWindow(t *testing.T) {
 	pin.SetOffline(true)
 	t.Cleanup(func() { pin.SetOffline(false) })
 
-	s := newTestSpoolStore(t, 4*gib)
+	s := newFixedCapSpool(t, 4*gib)
 	s.used.Store(1 * gib)
 	pinConstrained(t, s)
 
@@ -353,7 +373,7 @@ func TestWaitForCapacity_FlappingDiskConstrainedStillTimesOut(t *testing.T) {
 	pin.SetOffline(true)
 	t.Cleanup(func() { pin.SetOffline(false) })
 
-	s := newTestSpoolStore(t, 400*gib)
+	s := newFixedCapSpool(t, 400*gib)
 	s.used.Store(1 * gib)
 
 	stop := make(chan struct{})
@@ -392,7 +412,7 @@ func TestWaitForCapacity_FlappingDiskConstrainedStillTimesOut(t *testing.T) {
 // unrelated writers and blocked readers of a file still being copied
 // (2026-08-04 review, HIGH). TryLock means a loser uses the current value.
 func TestCachedCeiling_NeverBlocksWhileAnotherGoroutineRefreshes(t *testing.T) {
-	s := newTestSpoolStore(t, 100*gib)
+	s := newFixedCapSpool(t, 100*gib)
 	seedDiskAvail(s, 80*gib)
 	want := s.capCeiling.Load()
 
@@ -430,7 +450,7 @@ func TestCachedCeiling_NeverBlocksWhileAnotherGoroutineRefreshes(t *testing.T) {
 // A store must never report the "unlimited" sentinel just because its first
 // ceiling sample has not landed. NewSpoolStore seeds it synchronously.
 func TestNewSpoolStore_SeedsCeilingSoItNeverReadsUnlimited(t *testing.T) {
-	s := newTestSpoolStore(t, 64*gib)
+	s := newFixedCapSpool(t, 64*gib)
 	if s.capCeiling.Load() == 0 {
 		t.Error("capCeiling left at its zero value — that reads as the unlimited sentinel")
 	}
