@@ -277,7 +277,10 @@ func TestContractAssertionsConformance(t *testing.T) {
 		t.Errorf("asset_key = %q, want xxh3: content-hash form", assetKey)
 	}
 	// The sidecar is the source of truth — it must exist next to the media + validate.
-	scPath := filepath.Join(mount, "Project_Foo", "clip_205.mov.loupe.json")
+	// Wire-term cutover (2026-08-03): the portable sidecar is written under
+	// `.logger.json`. The legacy `.loupe.json` is still READ — covered by
+	// farm.TestAssertionSidecarPath_PrefersNewButFindsLegacy.
+	scPath := filepath.Join(mount, "Project_Foo", "clip_205.mov.logger.json")
 	scRaw, err := os.ReadFile(scPath)
 	if err != nil {
 		t.Fatalf("sidecar not written: %v", err)

@@ -9,5 +9,11 @@
   "control_plane": "http://127.0.0.1:11050",
   "metadata_db_path": "/Users/leland/.juicemount/metadata.db",
   "deployment": "cli",
-  "capabilities": ["health", "spool", "metrics", "whoami"]
+  "wire_terms": "logger/1",
+  "capabilities": [
+    "health",
+    "spool",
+    "metrics",
+    "whoami"
+  ]
 }

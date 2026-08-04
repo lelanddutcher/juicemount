@@ -395,6 +395,7 @@ func main() {
 			ControlPlane:    "http://" + addr,
 			MetadataDBPath:  *dbPath,
 			Deployment:      "cli",
+			WireTerms:       cplane.WireTerms,
 			Capabilities:    cplane.DeriveCapabilities(served),
 		}
 		w.Header().Set("Content-Type", "application/json")

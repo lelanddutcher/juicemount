@@ -21,11 +21,36 @@ import (
 // (unlike OL-1's on-device push, which uses the size/mtime gate). ---
 
 type LoupeJSON struct {
-	LoupeVersion  int        `json:"loupe_version"`
-	SchemaVersion string     `json:"schema_version"`
-	IndexedAt     string     `json:"indexed_at"` // ISO8601 / RFC3339
-	Media         LoupeMedia `json:"media"`
-	AI            *LoupeAI   `json:"ai,omitempty"`
+	// LoggerVersion is the envelope version. WIRE-TERM CUTOVER (2026-08-03,
+	// CONSUMER_STATUS 07-18 §2, founder-acked): the key on the wire is now
+	// `logger_version`. We WRITE this one.
+	LoggerVersion int `json:"logger_version"`
+	// LegacyLoupeVersion carries the pre-cutover `loupe_version` key on READ
+	// only — `omitempty` plus the normalization in UnmarshalJSON means we never
+	// emit it. Kept indefinitely: the old name is still accepted on both sides
+	// and is not scheduled for removal without a further coordinated step.
+	LegacyLoupeVersion int        `json:"loupe_version,omitempty"`
+	SchemaVersion      string     `json:"schema_version"`
+	IndexedAt          string     `json:"indexed_at"` // ISO8601 / RFC3339
+	Media              LoupeMedia `json:"media"`
+	AI                 *LoupeAI   `json:"ai,omitempty"`
+}
+
+// UnmarshalJSON folds the legacy `loupe_version` key into LoggerVersion so every
+// reader downstream only ever consults LoggerVersion. Exactly one of the two
+// keys is present in practice; if both appear, the new name wins.
+func (l *LoupeJSON) UnmarshalJSON(b []byte) error {
+	type alias LoupeJSON // avoid recursing into this method
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	if a.LoggerVersion == 0 && a.LegacyLoupeVersion != 0 {
+		a.LoggerVersion = a.LegacyLoupeVersion
+	}
+	a.LegacyLoupeVersion = 0 // never re-emit the legacy key
+	*l = LoupeJSON(a)
+	return nil
 }
 
 // LoupeMedia is the FULL tech block. Per AI_DELIVERY_SPEC Rule B, OpenLoupe's
@@ -245,8 +270,12 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	// Path A (AI_DELIVERY_SPEC Rule A): the consumer's apply is a destructive
 	// replace, so we always re-write the COMPLETE bundle — preserve any prior
 	// sub-kinds (embeddings/faces) and set the transcript into the same bundle.
-	rel := "ai.loupe.json"
-	blobPath := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
+	// Dual-read the blob name: an existing bundle may still sit under the
+	// pre-cutover `ai.loupe.json`, and read-merge-write must find it or the
+	// merge silently drops prior sub-kinds. A fresh blob gets the new name.
+	blobDir := DerivBlobDir(opt.Mount, inode)
+	rel := derivatives.ResolveAIBlobName(blobDir)
+	blobPath := filepath.Join(blobDir, rel)
 	ai := loadExistingAI(blobPath)
 	ai.Transcript = tr
 	if ai.AIProviderSummary == nil {
@@ -254,7 +283,7 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	}
 	ai.AIProviderSummary["transcript"] = tr.Model
 	doc := &LoupeJSON{
-		LoupeVersion:  1,
+		LoggerVersion: 1,
 		SchemaVersion: "1.0",
 		IndexedAt:     time.Now().UTC().Format(time.RFC3339),
 		Media:         buildMedia(path, tech, hash), // full block every time (Rule B)

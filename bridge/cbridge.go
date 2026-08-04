@@ -3125,6 +3125,7 @@ func handleWhoamiHTTP(w http.ResponseWriter, r *http.Request) {
 		ControlPlane:    "http://" + addr,
 		MetadataDBPath:  globalDBPath,
 		Deployment:      "gui",
+		WireTerms:       cplane.WireTerms,
 		Capabilities:    append([]string(nil), globalCapabilities...),
 	}
 	globalMu.Unlock()
@@ -3640,15 +3641,22 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rel := req.BlobRelPath
-	if rel == "" {
-		rel = "ai.loupe.json"
-	}
 
 	globalMu.Lock()
 	store := globalStore
 	ds := globalDerivStore
 	fusePath := globalFUSEPath
 	globalMu.Unlock()
+
+	// Wire-term cutover (2026-08-03): when the consumer omits blob_rel_path we
+	// resolve it against what is actually on disk — the post-cutover
+	// `ai.logger.json` if present, else the legacy `ai.loupe.json`. Defaulting
+	// to a fixed name would 404 a blob an older consumer had already written
+	// under the other one. An explicit blob_rel_path is honoured as-is; the
+	// register schema accepts both names.
+	if rel == "" {
+		rel = derivatives.ResolveAIBlobName(farm.DerivBlobDir(fusePath, req.Inode))
+	}
 
 	if store == nil || ds == nil {
 		http.Error(w, "control plane not ready", 503)

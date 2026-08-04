@@ -17,6 +17,7 @@
     "control_plane": { "type": "string", "format": "uri", "description": "Base URL of this control plane, e.g. \"http://127.0.0.1:11050\"." },
     "metadata_db_path": { "type": "string", "description": "Absolute path to metadata.db (optional; for the dev-only direct-DB FTS path)." },
     "deployment": { "enum": ["gui", "cli"], "description": "gui = full cbridge control plane; cli = jm5 (partial: health/spool/metrics only)." },
+    "wire_terms": { "enum": ["logger/1"], "description": "OPTIONAL. Advertises that this provider has completed the coordinated `loupe` -> `logger` wire-term cutover (CONSUMER_STATUS 2026-07-18 §2, acked by the founder 2026-08-03). When present and equal to \"logger/1\", the provider WRITES the new names (`ai.logger.json`, `logger_version`, `<media>.logger.json`) and READS BOTH old and new. When ABSENT, the provider is pre-cutover: it writes the legacy names (`ai.loupe.json`, `loupe_version`, `<media>.loupe.json`). Consumers MUST treat absence as legacy and MUST dual-read during the transition window regardless — the old names are accepted on both sides indefinitely and are NOT scheduled for removal without a further coordinated step. Feature-detect on this field; never infer the cutover from `version` or `contract_version`." },
     "capabilities": {
       "type": "array",
       "items": { "enum": ["health","whoami","residency","lookup","cache-status","offline","spool","activity","pin","unpin","self-test","verify-pins","metrics","derivatives","metadata","contribute","changes","assertions","blob"] },

@@ -5,12 +5,21 @@
   "description": "The BYTES of the `ai` derivative blob the farm writes to /.juicemount/derivatives/<inode>/ai.loupe.json and registers via POST /derivatives/register (OL-1 / JM-17). This is a LoupeJSON document, not a control-plane response. OpenLoupe's D6 consume (applyLoupeJSON) ingests it as a DESTRUCTIVE REPLACE, so two invariants are load-bearing: (Rule A) every delivery is the COMPLETE current bundle — present what's computed, explicit null for the rest, never a per-kind partial; (Rule B) the `media` block carries the FULL tech every time — a sparse media block NULL-binds good tech columns. This schema enforces Rule B by requiring all 10 media fields with additionalProperties:false. Keys are explicit snake_case; embedding vectors are base64 of a packed little-endian Float32 array, L2-normalized; times are integer milliseconds. Authored from internal/farm/transcript.go (LoupeJSON Codable structs) and AI_DELIVERY_SPEC.md.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["loupe_version", "schema_version", "indexed_at", "media"],
+  "required": ["schema_version", "indexed_at", "media"],
+  "anyOf": [
+    { "required": ["logger_version"] },
+    { "required": ["loupe_version"] }
+  ],
   "properties": {
+    "logger_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "LoggerJSON envelope version (the coordinated 2026-08-03 rename of `loupe_version`). Farm stamps 1. EXACTLY ONE of `logger_version` / `loupe_version` is emitted by a given producer; readers MUST accept either and treat them as the same field. A provider advertising `wire_terms:\"logger/1\"` in /whoami emits THIS key."
+    },
     "loupe_version": {
       "type": "integer",
       "minimum": 1,
-      "description": "LoupeJSON envelope version. Farm stamps 1."
+      "description": "LEGACY envelope version key, superseded by `logger_version` (2026-08-03 cutover). Still valid and still read indefinitely; emitted by pre-cutover producers (a provider that does NOT advertise `wire_terms:\"logger/1\"`). Not scheduled for removal without a further coordinated step."
     },
     "schema_version": {
       "type": "string",

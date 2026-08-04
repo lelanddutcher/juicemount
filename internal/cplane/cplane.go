@@ -22,6 +22,24 @@ import (
 // breaking wire change.
 const ContractVersion = 1
 
+// WireTerms advertises that this build completed the coordinated `loupe` ->
+// `logger` wire-term cutover proposed in CONSUMER_STATUS 2026-07-18 §2 and
+// acked by the founder on 2026-08-03.
+//
+// What it promises to a consumer that sees it:
+//   - we WRITE the new names — `ai.logger.json`, `logger_version`,
+//     `<media>.logger.json`;
+//   - we READ BOTH old and new, indefinitely. The legacy names are not
+//     scheduled for removal without a further coordinated step.
+//
+// Absence means pre-cutover (legacy names written). Consumers feature-detect on
+// this field only — never on `version` or `contract_version`.
+//
+// This is deliberately NOT a capability token: `capabilities` is derived from
+// the routes a binary actually serves and validated against a closed vocabulary
+// (see DeriveCapabilities), and a wire-term dialect is not a route.
+const WireTerms = "logger/1"
+
 // WhoAmI is the GET /whoami response. Schema: contract/spec/schema/whoami.schema.json.
 // Field order/tags match the golden fixtures contract/fixtures/whoami/*.json.
 type WhoAmI struct {
@@ -35,6 +53,7 @@ type WhoAmI struct {
 	ControlPlane    string   `json:"control_plane"`    // e.g. "http://127.0.0.1:11050"
 	MetadataDBPath  string   `json:"metadata_db_path,omitempty"`
 	Deployment      string   `json:"deployment"`   // "gui" | "cli"
+	WireTerms       string   `json:"wire_terms"`   // WireTerms — loupe->logger cutover flag
 	Capabilities    []string `json:"capabilities"` // DERIVED, never hardcoded
 }
 

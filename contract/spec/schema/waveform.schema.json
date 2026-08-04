@@ -13,6 +13,8 @@
     "samples_per_pixel": { "type": "integer", "minimum": 1, "description": "Samples summarized per pixel column; spp/sample_rate = seconds per pixel (the time↔pixel mapping)." },
     "bits": { "enum": [8, 16], "description": "Peak resolution. 8 ⇒ values in [-128,127]; 16 ⇒ [-32768,32767]." },
     "length": { "type": "integer", "minimum": 0, "description": "Pixel columns." },
+    "duration_ms": { "type": "integer", "minimum": 0, "description": "A3 (additive; absent on pre-A3 mono blobs): exact clip duration in milliseconds = round(total_samples * 1000 / sample_rate). Preferred over the length*samples_per_pixel/sample_rate estimate, which rounds the final partial pixel column (up to samples_per_pixel/sample_rate s of tail error)." },
+    "total_samples": { "type": "integer", "minimum": 0, "description": "A3 (additive; absent on pre-A3 mono blobs): exact PER-CHANNEL sample (frame) count at sample_rate." },
     "data": {
       "type": "array",
       "items": { "type": "integer" },

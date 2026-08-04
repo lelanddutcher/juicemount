@@ -20,7 +20,7 @@
         "producer": { "enum": ["on-device", "macos-node"], "description": "Who computed it. on-device = Apple frameworks / BYO cloud key on a Mac." },
         "version": { "type": "integer", "minimum": 1 },
         "hash": { "type": ["string", "null"], "description": "The server's canonical xxh3 of the source (== source_hash). On-device consumers verify with size/mtime, not this; an xxh3-capable client/web UI can verify by hash." },
-        "blob_rel_path": { "const": "ai.loupe.json", "description": "Volume-relative under /.juicemount/derivatives/<inode>/. The consumer wrote the bytes; the server only indexes the row." },
+        "blob_rel_path": { "enum": ["ai.logger.json", "ai.loupe.json"], "description": "Volume-relative under /.juicemount/derivatives/<inode>/. The consumer wrote the bytes; the server only indexes the row. WIDENED from const \"ai.loupe.json\" for the coordinated loupe->logger cutover (2026-08-03): both names are ACCEPTED indefinitely. A provider advertising `wire_terms:\"logger/1\"` in /whoami WRITES `ai.logger.json`; it still reads and indexes either. Consumers may send either — prefer `ai.logger.json` once the provider advertises the flag." },
         "media_type": { "const": "application/json" },
         "model": { "type": ["string", "null"], "description": "Embedding model id+version so kNN partitions by space (e.g. apple-featureprint-v1 vs the portable openclip-vit-b32-v1)." },
         "dim": { "type": ["integer", "null"], "description": "Embedding dimensionality." },

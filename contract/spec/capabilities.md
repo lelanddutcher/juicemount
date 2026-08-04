@@ -70,7 +70,7 @@ with `206 Partial Content` (`Content-Range`/`Content-Length`), `Content-Type` fr
 path == the token.)
 
 (`assertions` is the JM-ASSERT portable-human-metadata channel — `POST`/`GET /assertions` (ASSERTIONS_SIDECAR.md).
-GUI-only. POST writes the `<media>.loupe.json` sidecar (the source of truth — atomic, LWW, merge-not-clobber) +
+GUI-only. POST writes the `<media>.logger.json` sidecar (legacy `.loupe.json` still read) (the source of truth — atomic, LWW, merge-not-clobber) +
 upserts JuiceMount's rebuildable, content-hash-`asset_key`-keyed Tier-B index; GET reads the resolved set by
 `asset_key`, or by `inode`/`path` resolved to `asset_key`. The route path == the token.)
 

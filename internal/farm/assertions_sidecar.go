@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"regexp"
+	"strings"
 )
 
 // AssertionSidecarSchema is the versioned shape tag (bumped only on a breaking
@@ -133,8 +135,77 @@ func ApplyAssertion(sidecarPath, assetKey, mediaFilename string, incoming Sideca
 	return ApplyAssertionResult{Accepted: true, WinningAssertedAt: incoming.AssertedAt}, nil
 }
 
-// AssertionSidecarPath returns the sidecar path for a media file: the media path
-// with `.loupe.json` appended (same directory, name = basename + `.loupe.json`).
+// Portable per-file assertion sidecar suffixes.
+//
+// WIRE-TERM CUTOVER (2026-08-03). The consumer renamed the on-share per-file
+// sidecar to `<media>.logger.json` on 2026-07-14 (CONSUMER_STATUS 07-18 §1) and
+// stopped reading `.loupe.json`; the shared spec was not updated at the time, so
+// the farm kept writing the old name and the two sides silently diverged. The
+// founder's 2026-08-03 ruling is to unify on `logger`: we now WRITE
+// AssertionSidecarSuffix and READ BOTH.
+const (
+	AssertionSidecarSuffix       = ".logger.json"
+	AssertionSidecarSuffixLegacy = ".loupe.json"
+)
+
+// AssertionSidecarPath returns the sidecar path to USE for a media file.
+//
+// Dual-read: if a legacy `<media>.loupe.json` exists and the post-cutover
+// `<media>.logger.json` does not, the legacy path is returned so a read-merge-
+// write updates the file that is actually there instead of silently starting an
+// empty one beside it and stranding the user's existing ratings/names. Once the
+// new name exists it always wins. A media file with no sidecar yet gets the new
+// name.
 func AssertionSidecarPath(mediaPath string) string {
-	return mediaPath + ".loupe.json"
+	newPath := mediaPath + AssertionSidecarSuffix
+	if _, err := os.Stat(newPath); err == nil {
+		return newPath
+	}
+	legacy := mediaPath + AssertionSidecarSuffixLegacy
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy
+	}
+	return newPath
+}
+
+// IsAssertionSidecarName reports whether name is a portable assertion sidecar,
+// under either the post-cutover or the legacy suffix.
+//
+// FARM-1 (CONSUMER_STATUS 2026-08-03): sub-clip children are named
+// `<parent>.v-<8hex>.logger.json` and MUST classify as sidecars. Suffix matching
+// handles that natively — there is no assumption about how many `.` precede
+// `logger`. A child is NEVER the parent's whole-clip sidecar: its fields
+// describe a range, so callers pairing a sidecar to media must use
+// AssertionSidecarMedia, which strips the `.v-<hex>` infix.
+func IsAssertionSidecarName(name string) bool {
+	return strings.HasSuffix(name, AssertionSidecarSuffix) ||
+		strings.HasSuffix(name, AssertionSidecarSuffixLegacy)
+}
+
+// subClipInfix matches the sub-clip child marker `.v-<8hex>` immediately before
+// the sidecar suffix.
+var subClipInfix = regexp.MustCompile(`\.v-[0-9a-fA-F]{8}$`)
+
+// AssertionSidecarMedia maps a sidecar filename back to the media filename it
+// belongs to, and reports whether it is a sub-clip child.
+//
+// `C0012.MXF.logger.json`             -> ("C0012.MXF", false)
+// `C0012.MXF.v-a1b2c3d4.logger.json`  -> ("C0012.MXF", true)
+// `C0012.MXF.loupe.json`  (legacy)    -> ("C0012.MXF", false)
+//
+// This is the name-keyed join DB-4 asks for: a `.v-` child belongs to the same
+// media as its parent's sidecar. ok=false when name is not a sidecar at all.
+func AssertionSidecarMedia(name string) (media string, isSubClip, ok bool) {
+	switch {
+	case strings.HasSuffix(name, AssertionSidecarSuffix):
+		media = strings.TrimSuffix(name, AssertionSidecarSuffix)
+	case strings.HasSuffix(name, AssertionSidecarSuffixLegacy):
+		media = strings.TrimSuffix(name, AssertionSidecarSuffixLegacy)
+	default:
+		return "", false, false
+	}
+	if trimmed := subClipInfix.ReplaceAllString(media, ""); trimmed != media {
+		return trimmed, true, true
+	}
+	return media, false, true
 }
