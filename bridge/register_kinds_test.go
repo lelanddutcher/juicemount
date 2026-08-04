@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/derivatives"
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // REGISTER-ROUTE (2026-08-04). The kind table is the security boundary of the
@@ -109,4 +115,156 @@ func TestContributableKindsAreValidManifestKinds(t *testing.T) {
 			t.Errorf("registrable kind %q is not in derivatives.schema.json's kind enum — the row we write would fail the consumer's validation", kind)
 		}
 	}
+}
+
+// End-to-end coverage of the WIDENED route (REGISTER-ROUTE). The reviewer noted
+// that nothing posted a non-ai kind to the actual handler — the table tests above
+// only inspect a map. These drive handleDerivativesRegisterHTTP for real.
+func TestRegisterWidenedKindsEndToEnd(t *testing.T) {
+	tmp := t.TempDir()
+	const inode = 777001
+	const rel = "Shoot/clip.mov"
+	src := filepath.Join(tmp, rel)
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, bytes.Repeat([]byte("src-"), 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mt := time.Unix(1700000000, 0)
+	if err := os.Chtimes(src, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(src)
+	liveSize, liveMtime := fi.Size(), fi.ModTime().Unix()
+
+	blobDir := filepath.Join(tmp, ".juicemount", "derivatives", "777001")
+	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeBlob := func(name string) {
+		if err := os.WriteFile(filepath.Join(blobDir, name), []byte("blob-bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mstore, err := metadata.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mstore.Close()
+	mstore.InsertToCache(&metadata.Entry{Path: rel, Name: "clip.mov", ParentPath: "Shoot", Inode: inode, Size: liveSize, Mtime: mt})
+	dstore, err := derivatives.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dstore.Close()
+
+	globalMu.Lock()
+	oldS, oldD, oldF := globalStore, globalDerivStore, globalFUSEPath
+	globalStore, globalDerivStore, globalFUSEPath = mstore, dstore, tmp
+	globalMu.Unlock()
+	defer func() {
+		globalMu.Lock()
+		globalStore, globalDerivStore, globalFUSEPath = oldS, oldD, oldF
+		globalMu.Unlock()
+	}()
+
+	post := func(body map[string]any) *httptest.ResponseRecorder {
+		b, _ := json.Marshal(body)
+		rr := httptest.NewRecorder()
+		handleDerivativesRegisterHTTP(rr, httptest.NewRequest("POST", "/derivatives/register", bytes.NewReader(b)))
+		return rr
+	}
+	req := func(kind string, extra map[string]any) map[string]any {
+		m := map[string]any{
+			"inode": inode, "kind": kind, "producer": "on-device",
+			"source_size": liveSize, "source_mtime": liveMtime,
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+
+	t.Run("thumbnail and waveform register", func(t *testing.T) {
+		writeBlob("poster.jpg")
+		if rr := post(req("thumbnail", nil)); rr.Code != 200 {
+			t.Errorf("thumbnail: status %d, body %s", rr.Code, rr.Body.String())
+		}
+		writeBlob("waveform.json")
+		if rr := post(req("waveform", nil)); rr.Code != 200 {
+			t.Errorf("waveform: status %d, body %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("proxy requires an explicit h264 codec", func(t *testing.T) {
+		writeBlob("proxy.mp4")
+		if rr := post(req("proxy", nil)); rr.Code != 400 {
+			t.Errorf("proxy with NO codec: status %d, want 400 (absent codec is read as h264 downstream)", rr.Code)
+		}
+		if rr := post(req("proxy", map[string]any{"codec": "hevc"})); rr.Code != 400 {
+			t.Errorf("proxy with hevc: status %d, want 400 (H.264 is the guaranteed-decodable floor)", rr.Code)
+		}
+		if rr := post(req("proxy", map[string]any{"codec": "h264"})); rr.Code != 200 {
+			t.Errorf("proxy with h264: status %d, body %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("a kind outside the table is refused", func(t *testing.T) {
+		if rr := post(req("filmstrip", nil)); rr.Code != 400 {
+			t.Errorf("filmstrip: status %d, want 400 — it is deliberately withheld", rr.Code)
+		}
+		if rr := post(req("tech", nil)); rr.Code != 400 {
+			t.Errorf("tech: status %d, want 400 — server-only kind", rr.Code)
+		}
+	})
+
+	t.Run("a non-reserved blob path is refused", func(t *testing.T) {
+		if rr := post(req("thumbnail", map[string]any{"blob_rel_path": "pwn.html"})); rr.Code != 400 {
+			t.Errorf("status %d, want 400 — the consumer does not choose paths in our namespace", rr.Code)
+		}
+	})
+
+	t.Run("a missing blob is refused, so no phantom row is minted", func(t *testing.T) {
+		_ = os.Remove(filepath.Join(blobDir, "waveform.json"))
+		if rr := post(req("waveform", nil)); rr.Code != 409 {
+			t.Errorf("status %d, want 409 — the manifest row is the commit point", rr.Code)
+		}
+		writeBlob("waveform.json")
+	})
+
+	// The reviewer's CRITICAL: a symlink at the reserved name pointed anywhere
+	// the bridge could read, and /blob then streamed it.
+	t.Run("a symlink at the reserved name is refused", func(t *testing.T) {
+		secret := filepath.Join(tmp, "secret.txt")
+		if err := os.WriteFile(secret, []byte("PRIVATE KEY"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(blobDir, "poster.jpg")
+		_ = os.Remove(link)
+		if err := os.Symlink(secret, link); err != nil {
+			t.Skipf("symlink unsupported here: %v", err)
+		}
+		defer func() { _ = os.Remove(link); writeBlob("poster.jpg") }()
+
+		if rr := post(req("thumbnail", nil)); rr.Code == 200 {
+			t.Error("a symlinked blob registered successfully — /blob would serve the target as its media type")
+		}
+	})
+
+	// A consumer must not silently replace a farm-produced row.
+	t.Run("a farm row is not clobbered by an on-device contribution", func(t *testing.T) {
+		writeBlob("poster.jpg")
+		farmRow := derivatives.DerivRow{
+			Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
+			UpdatedAt: time.Now().Unix(),
+		}
+		if err := dstore.PutDeriv(inode, farmRow); err != nil {
+			t.Fatal(err)
+		}
+		if rr := post(req("thumbnail", nil)); rr.Code != 409 {
+			t.Errorf("status %d, want 409 — an on-device row must not replace the farm's", rr.Code)
+		}
+	})
 }
