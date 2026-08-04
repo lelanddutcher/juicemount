@@ -34,13 +34,29 @@ One artifact per kind per key. These names are **reserved**: a consumer writing 
 exactly `proxy.mp4`, so the next reader — farm, web UI, another client — finds it without
 negotiation.
 
-| kind | file | sidecar | notes |
-|---|---|---|---|
-| `poster` | `poster.jpg` | — | single frame |
-| `filmstrip` | `strip.jpg` | `strip.json` | geometry is **JM-16, still open** — see §6 |
-| `waveform` | `waveform.json` | — | JM-18 shape |
-| `proxy` | `proxy.mp4` | `proxy.json` | `PROXY_CODEC_SPEC.md`; H.264/AAC faststart floor |
-| `ai` | `ai.logger.json` | — | legacy `ai.loupe.json` still READ; see the 08-03 cutover |
+| kind | file | notes |
+|---|---|---|
+| `poster` | `poster.jpg` | single frame |
+| `filmstrip` | `strip.jpg` | geometry is on the MANIFEST row, not on disk — see below |
+| `waveform` | `waveform.json` | JM-18 shape |
+| `proxy` | `proxy.mp4` | `PROXY_CODEC_SPEC.md`; H.264/AAC faststart floor |
+| `ai` | `ai.logger.json` | legacy `ai.loupe.json` still READ; see the 08-03 cutover |
+
+**CORRECTION (2026-08-04): there are no per-blob sidecars.** An earlier revision of this table
+reserved `strip.json` and `proxy.json`. **Neither exists** — VERIFIED, zero non-test references
+anywhere in the provider tree — and neither should, because both would duplicate data the manifest
+row already carries authoritatively:
+
+- filmstrip geometry → the row's **`filmstrip`** object (`frame_count`, `cols`, `rows`, `cell_w`,
+  `cell_h`, `interval_ms`, `duration_ms`), specified in `derivatives.schema.json`;
+- proxy codec info → the row's **`codec`**, **`codec_string`**, **`blob_size`** (PROXY-CODEC #50).
+
+Reserving a name nothing implements is how an implementer builds against something that does not
+exist, and a second on-disk copy of geometry would be a divergence waiting to happen. **Do not write
+`strip.json` or `proxy.json`.** One artifact per kind per key, and its metadata lives on the row.
+
+For the server-less Tier 2 case the equivalent role is played by the directory's own
+`manifest.json`, which mirrors the `/derivatives` row shape — not a per-blob sidecar.
 
 Rules:
 - **Never invent a sixth name.** A kind not in this table is not writable by a consumer yet; propose
@@ -94,10 +110,14 @@ where the key format earns its keep.
 
 ## 6 · What this spec does NOT yet settle
 
-- **JM-16 filmstrip geometry.** `strip.json` is reserved above, but its CONTENTS are still
-  unspecified. A consumer must not write `strip.jpg`/`strip.json` until JM-16 lands: an edge-written
-  strip whose tile geometry nobody can express is unusable, which is the same blocker from the other
-  direction. **`filmstrip` is reserved-but-not-writable.**
+- **Filmstrip contribution.** `filmstrip` remains **reserved-but-NOT-writable**, but the reason has
+  changed and the old one is retired: JM-16 geometry is **CLOSED** — it was already shipped, on the
+  row and in `derivatives.schema.json`, so consuming farm strips needs nothing further. What blocks
+  CONTRIBUTION is the write path itself: `register.schema.json` pins `kind` to `const "ai"` and the
+  handler enforces it, so write-then-register returns 400; and the only ingest path that does work is
+  the `manifest.json` sidecar this spec declares provider-owned. Opening it needs a widened register
+  route plus a distinct capability token (today's `contribute` is derived from the AI-only route, so
+  it cannot be feature-detected). See `PROVIDER_STATUS` 2026-08-04 D for the full constraint list.
 - **Quota / eviction.** Consumer-written blobs consume volume space the consumer does not manage.
   Retention/LRU is the deferred phase 2 of the content-key work. Until it lands, the free-space
   precondition in §7 is the only backstop.
