@@ -3,6 +3,8 @@ package nfs
 import (
 	"testing"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 )
 
 // seedDiskAvail pins the sampled ceiling as if free disk were `avail` at this
@@ -248,5 +250,131 @@ func TestDiskConstrained_OnlyWhenTheDiskIsTheBlocker(t *testing.T) {
 	seedDiskAvail(u, 1*gib)
 	if u.DiskConstrained() {
 		t.Error("unlimited config must never report disk-constrained")
+	}
+}
+
+// --- The offline + disk-constrained stall (2026-08-04 review, defects 1-3) ---
+//
+// This is the riskiest path in the free-space work and it originally shipped with
+// NO test touching it: the existing offline-stall test never seeds a constrained
+// ceiling, so DiskConstrained() reads false throughout and the branch never runs.
+
+// pinConstrained parks the store permanently at the free-disk floor so
+// DiskConstrained() is true and stays true for the length of a test.
+func pinConstrained(t *testing.T, s *SpoolStore) {
+	t.Helper()
+	go func() {
+		for i := 0; i < 4000; i++ { // outlive the test; refreshes every ~1s TTL
+			seedDiskAvail(s, SpoolFreeFloorBytes)
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	seedDiskAvail(s, SpoolFreeFloorBytes)
+	if !s.DiskConstrained() {
+		t.Fatal("precondition: store should be disk-constrained")
+	}
+}
+
+// (a) Offline + disk-constrained must TIME OUT. Reconnecting cannot free local
+// disk, so waiting forever is an unbounded Finder hang on a hard mount.
+func TestWaitForCapacity_OfflineButDiskConstrainedGivesUp(t *testing.T) {
+	old := capacityWaitDeadline
+	capacityWaitDeadline = 80 * time.Millisecond
+	t.Cleanup(func() { capacityWaitDeadline = old })
+	pin.SetOffline(true)
+	t.Cleanup(func() { pin.SetOffline(false) })
+
+	s := newTestSpoolStore(t, 4*gib)
+	s.used.Store(1 * gib)
+	pinConstrained(t, s)
+
+	done := make(chan bool, 1)
+	go func() { done <- s.waitForCapacity(func() bool { return false }, nil) }()
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Error("waitForCapacity reported success though try() never succeeded")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("offline + disk-constrained stalled forever — the unbounded hang is back")
+	}
+}
+
+// (b) A GENUINE reconnect mid-stall must still grant a fresh window. Overwriting
+// the `offline` var poisoned wasOffline, so the offline->online edge went
+// undetected and the reconnect had no effect on the timer at all.
+func TestWaitForCapacity_ReconnectStillResetsTheWindow(t *testing.T) {
+	old := capacityWaitDeadline
+	capacityWaitDeadline = 200 * time.Millisecond
+	t.Cleanup(func() { capacityWaitDeadline = old })
+	pin.SetOffline(true)
+	t.Cleanup(func() { pin.SetOffline(false) })
+
+	s := newTestSpoolStore(t, 4*gib)
+	s.used.Store(1 * gib)
+	pinConstrained(t, s)
+
+	start := time.Now()
+	done := make(chan bool, 1)
+	go func() { done <- s.waitForCapacity(func() bool { return false }, nil) }()
+
+	// Reconnect just before the first window would close. The edge must restart
+	// the clock, so the total must exceed one bare deadline.
+	time.Sleep(150 * time.Millisecond)
+	pin.SetOffline(false)
+
+	select {
+	case <-done:
+		if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
+			t.Errorf("gave up after %v; a reconnect at 150ms must grant a fresh %v window "+
+				"(wasOffline was poisoned, so the edge went undetected)", elapsed, capacityWaitDeadline)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("never returned")
+	}
+}
+
+// (c) A FLAPPING DiskConstrained() while genuinely offline must not defeat the
+// backstop. Resetting the window on STATE rather than PROGRESS meant a value
+// that flaps — and this one is a ~1s statfs sampled right at the floor, so it
+// flaps in normal operation — reset the clock forever.
+func TestWaitForCapacity_FlappingDiskConstrainedStillTimesOut(t *testing.T) {
+	old := capacityWaitDeadline
+	capacityWaitDeadline = 100 * time.Millisecond
+	t.Cleanup(func() { capacityWaitDeadline = old })
+	pin.SetOffline(true)
+	t.Cleanup(func() { pin.SetOffline(false) })
+
+	s := newTestSpoolStore(t, 400*gib)
+	s.used.Store(1 * gib)
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		roomy := true
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if roomy {
+				seedDiskAvail(s, 900*gib) // not constrained
+			} else {
+				seedDiskAvail(s, SpoolFreeFloorBytes) // constrained
+			}
+			roomy = !roomy
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	done := make(chan bool, 1)
+	go func() { done <- s.waitForCapacity(func() bool { return false }, nil) }()
+
+	select {
+	case <-done: // gave up — correct
+	case <-time.After(3 * time.Second):
+		t.Fatal("flapping DiskConstrained() reset the window forever — the CRITICAL hang is back")
 	}
 }

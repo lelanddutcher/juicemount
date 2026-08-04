@@ -89,6 +89,7 @@ type SpoolStore struct {
 	// -1 = never successfully sampled.
 	capCeiling  atomic.Int64
 	diskAvailAt atomic.Int64 // UnixNano of that sample
+	ceilingMu   sync.Mutex   // single-flights the refresh; fast path is lock-free
 
 	// lastReleaseNanos is the wall-clock (UnixNano) of the most recent
 	// capacity release — i.e. the last time the drainer (or a write
@@ -329,11 +330,25 @@ func (s *SpoolStore) refreshCeiling(now int64) {
 }
 
 // cachedCeiling returns the sampled absolute ceiling, resampling at most once
-// per diskAvailTTL. ok=false means free disk is unreadable.
+// per diskAvailTTL PER STORE. ok=false means free disk is unreadable.
+//
+// The refresh is single-flighted under ceilingMu. Without it the TTL check was
+// per-goroutine, not per-store: N waiters parked in waitForCapacity — a parallel
+// Finder copy with several files blocked, i.e. precisely the scenario this
+// feature exists for — would all observe the same expiry and each issue its own
+// statfs, and on failure each emit its own unrate-limited log line
+// (2026-08-04 review, MEDIUM). The fast path stays lock-free; only the expiry
+// path takes the mutex, and the re-check inside it means just one of the N
+// actually samples.
 func (s *SpoolStore) cachedCeiling() (int64, bool) {
 	now := time.Now().UnixNano()
 	if at := s.diskAvailAt.Load(); at == 0 || now-at >= int64(diskAvailTTL) {
-		s.refreshCeiling(now)
+		s.ceilingMu.Lock()
+		// Re-check under the lock: a peer may have refreshed while we waited.
+		if at := s.diskAvailAt.Load(); at == 0 || now-at >= int64(diskAvailTTL) {
+			s.refreshCeiling(now)
+		}
+		s.ceilingMu.Unlock()
 	}
 	c := s.capCeiling.Load()
 	if c < 0 {
@@ -1478,34 +1493,48 @@ func (s *SpoolStore) waitForCapacity(try func() bool, touch func()) bool {
 		if try() {
 			return true
 		}
+		// TWO INDEPENDENT FACTS, never collapsed into one variable.
+		//
+		// `offline` is REAL connectivity and nothing else — the offline→online
+		// edge below is the only correct consumer of it. An earlier version
+		// overwrote this var to force the backstop on, which silently poisoned
+		// `wasOffline`: once disk-pressure had flipped it, a genuine reconnect
+		// was invisible to the edge check and the reconnected drain never got
+		// its fresh window (2026-08-04 review, HIGH — measured: reconnecting
+		// mid-stall changed the give-up time by 3ms, i.e. not at all).
 		offline := pin.IsOffline()
-		// A stall while OFFLINE normally waits forever, on the premise that
-		// reconnecting lets the drain free space. That premise fails when the
-		// blocker is the LOCAL DISK rather than the link: free space eaten by
-		// the JuiceFS cache, Spotlight, Time Machine or the user's own files is
-		// not released by coming back online, so an offline copy on a low-disk
-		// machine would park indefinitely with no error on a hard mount — the
-		// same unbounded hang this whole change exists to remove, just relocated
-		// (2026-08-03 review, HIGH). Treat disk-constrained as online for
-		// backstop purposes so it times out into an honest ErrSpoolFull.
-		if offline && s.DiskConstrained() {
-			offline = false
-		}
-		// Reset the wedge backstop when the drain freed space (alive & making
-		// progress — lets a slow link stall indefinitely), OR we are offline, OR
-		// we JUST transitioned offline→online (give the reconnected drain a fresh
-		// full window instead of failing on a stale offline-poll timestamp if the
-		// goroutine was descheduled across the edge). So the backstop only ever
-		// measures contiguous ONLINE-and-frozen time.
-		if rel := s.lastReleaseNanos.Load(); rel != lastSeen || offline || (wasOffline && !offline) {
+		// `backstopApplies` answers a different question: can waiting EVER help?
+		// Online, yes — the drain may free space. Offline, only if the blocker is
+		// the link; if the blocker is the local disk (JuiceFS cache, Spotlight,
+		// Time Machine, the user's own files) then reconnecting frees nothing and
+		// waiting forever is an unbounded Finder hang on a hard mount.
+		backstopApplies := !offline || s.DiskConstrained()
+
+		// Reset the wedge window ONLY on real progress, or on a real reconnect.
+		//
+		// Deliberately NOT reset merely because we are offline, and NOT on a
+		// backstopApplies rising edge. Both were resets driven by STATE rather
+		// than PROGRESS, and a state that flaps then means the window never
+		// closes: DiskConstrained() is driven by a ~1s statfs sampled right at
+		// the floor boundary — the resting state of a chronically low-disk
+		// machine — so it flaps in normal operation. With a state-driven reset
+		// that flapping made the backstop never fire and restored the exact
+		// unbounded hang this was meant to remove (2026-08-04 review, CRITICAL —
+		// measured: no return within 500ms at 12.5x the deadline).
+		//
+		// Consequence, accepted knowingly: a long purely-offline stall that later
+		// becomes disk-constrained inherits a stale frozenSince and may give up
+		// almost at once. That is the right answer — nothing has drained for the
+		// whole window AND the volume is now full, so a prompt honest ENOSPC
+		// beats another hour of silence.
+		if rel := s.lastReleaseNanos.Load(); rel != lastSeen || (wasOffline && !offline) {
 			lastSeen = rel
 			frozenSince = time.Now()
 		}
-		wasOffline = offline
-		// Online ⇒ give up only if the drain is genuinely wedged (no capacity
-		// freed for the whole backstop window). capacityWaitDeadline <= 0 means
-		// "infinite stall" even online.
-		if !offline && capacityWaitDeadline > 0 && time.Since(frozenSince) >= capacityWaitDeadline {
+		wasOffline = offline // pure connectivity — edge detection stays intact
+		// Give up only where waiting cannot help and nothing has freed capacity
+		// for the whole window. capacityWaitDeadline <= 0 means "stall forever".
+		if backstopApplies && capacityWaitDeadline > 0 && time.Since(frozenSince) >= capacityWaitDeadline {
 			return false
 		}
 	}
