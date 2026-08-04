@@ -102,3 +102,51 @@ func TestReconcileSidecarsUsesSharedCore(t *testing.T) {
 		t.Fatalf("want 2 assets/sidecars, got %+v", res)
 	}
 }
+
+// A manifest must never redirect its writes to another asset. The directory is
+// the authority for which inode we are reconciling; the body's `inode` is
+// untrusted input, authorable by any client with mount write access — which is
+// the premise of Tier 1 contribute-back, not a hypothetical (2026-08-04 review).
+func TestReconcileRefusesManifestWhoseInodeDisagreesWithItsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	store, err := derivatives.Open(filepath.Join(t.TempDir(), "d.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	const dirInode = uint64(123)
+	const victimInode = uint64(456)
+
+	blobDir := DerivBlobDir(dir, dirInode)
+	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hash := "deadbeefdeadbeef"
+	sc := ManifestSidecar{
+		Inode:      victimInode, // lies: this file lives under dirInode
+		SourceHash: &hash,
+		Derivatives: []derivatives.DerivRow{{
+			Kind: "filmstrip", Status: "ready", Producer: "linux-farm", Version: 1,
+		}},
+	}
+	b, mErr := json.Marshal(sc)
+	if mErr != nil {
+		t.Fatal(mErr)
+	}
+	if err := os.WriteFile(filepath.Join(blobDir, "manifest.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := reconcileOneSidecarInto(store, dir, dirInode)
+	if res.Rows != 0 || res.Assets != 0 {
+		t.Errorf("mismatched manifest was ingested: rows=%d assets=%d", res.Rows, res.Assets)
+	}
+	if res.Errs == 0 {
+		t.Error("expected the mismatch to be counted as an error")
+	}
+	// The victim must have no rows written on its behalf.
+	if rows, err := store.Manifest(victimInode); err == nil && len(rows) > 0 {
+		t.Errorf("rows were written for inode %d from a manifest under %d: %+v", victimInode, dirInode, rows)
+	}
+}

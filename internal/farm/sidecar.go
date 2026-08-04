@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
 // ManifestSidecar is the self-describing index the farm writes to the volume next
@@ -121,6 +122,24 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 		}
 	}
 	if !parsed {
+		res.Errs++
+		return res
+	}
+	// CONFUSED-DEPUTY GUARD (2026-08-04). The DIRECTORY is the authority for
+	// which asset we are reconciling — we found this file at
+	// derivatives/<inode>/manifest.json. The body's `inode` is untrusted input
+	// and must never redirect the write: a manifest sitting in dir 123 that
+	// declares "inode": 456 would otherwise rewrite 456's rows, from a file any
+	// client with mount write access can author. That access is not
+	// hypothetical — it is the premise of Tier 1 contribute-back, and this path
+	// runs on any /derivatives or /blob miss.
+	//
+	// A mismatch means the directory was copied/moved or the file was tampered
+	// with; both make the row set wrong, so refuse rather than guess which half
+	// to believe.
+	if sc.Inode != inode {
+		jmlog.Warn("sidecar reconcile: manifest inode disagrees with its directory — refusing",
+			"dir_inode", inode, "manifest_inode", sc.Inode, "path", scPath)
 		res.Errs++
 		return res
 	}
