@@ -18,9 +18,9 @@ type Options struct {
 	Version       int    // producer schema/algo version
 	Mount         string // mount point, for resolving the Tier-A blob dir (only used when Blobs/Filmstrip)
 	Blobs         bool   // also generate poster thumbnails into Tier-A
-	ThumbMaxDim   int    // poster fit box (px); 0 → 640
+	ThumbMaxDim   int    // poster fit box (px); 0 → 720 (D2 density ask, 2026-07-21)
 	Filmstrip     bool   // also generate a filmstrip sprite-sheet (JM-16) into Tier-A
-	FilmstripCell int    // filmstrip cell width (px); 0 → 160
+	FilmstripCell int    // filmstrip cell width (px); 0 → 320 (D5 density ask, 2026-07-21)
 	Waveform      bool   // also generate an audio waveform overview (JM-18) into Tier-A
 	WaveformSPP   int    // waveform samples-per-pixel; 0 → 1024
 	FFprobeBin    string // override; "" → "ffprobe" on PATH
@@ -152,7 +152,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		rel := "strip.jpg"
 		mt := "image/jpeg"
 		out := filepath.Join(DerivBlobDir(opt.Mount, inode), rel)
-		geo, err := Filmstrip(opt.FFmpegBin, path, out, tech.DurationMS, tech.Video.Width, tech.Video.Height, opt.FilmstripCell)
+		geo, err := Filmstrip(opt.FFmpegBin, path, out, tech.DurationMS, tech.Video.Width, tech.Video.Height, opt.FilmstripCell, tech.Video.FPS)
 		if err != nil {
 			blobErrs = append(blobErrs, fmt.Errorf("filmstrip: %w", err))
 			rows = append(rows, derivatives.DerivRow{

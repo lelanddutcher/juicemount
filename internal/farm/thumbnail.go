@@ -24,7 +24,10 @@ func Thumbnail(ffmpegBin, srcPath, outPath string, maxDim int, durationMS int64)
 		ffmpegBin = "ffmpeg"
 	}
 	if maxDim <= 0 {
-		maxDim = 640
+		// D2 density ask (CONSUMER_STATUS 2026-07-21): the consumer raised its
+		// LOCAL poster max to 720, so a farm poster at 640 reads visibly softer
+		// next to a locally-generated one in the same hover preview.
+		maxDim = 720
 	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return err

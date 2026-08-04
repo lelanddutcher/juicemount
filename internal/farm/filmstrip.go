@@ -16,7 +16,42 @@ import (
 // time to a cell with no ambiguity: i = round(t_ms/interval_ms), row = i/cols,
 // col = i%cols. Each cell is cellW × cellH, sized from the source aspect (no
 // distortion). Web-native JPEG so the same sheet serves OpenLoupe and the web UI.
-func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH, cellW int) (*derivatives.FilmstripGeo, error) {
+// frameTarget picks how many distinct frames to sample for a clip.
+//
+// Roughly one per second, then floored and capped. The FLOOR is the short-clip
+// fix (BACKLOG "Ask (optional)", CONSUMER_STATUS 2026-07-21): a flat floor of 12
+// made a short clip repeat each frame 3-6x across a wide strip of narrow
+// vertical cells — visible banding. Raise it toward 32, but never past what the
+// clip actually CONTAINS: a 1s/24fps clip holds ~24 distinct frames and asking
+// for more just duplicates them again, which is the very artefact being fixed.
+//
+// srcFPS <= 0 means "unknown" and keeps the historical flat floor rather than
+// guessing. Exported-for-test via the package-internal call in
+// filmstrip_density_test.go — the test must exercise THIS function, not a copy
+// of its arithmetic, or it stops being a guard.
+func frameTarget(durSec, srcFPS float64) int {
+	floor := 12
+	if srcFPS > 0 && durSec > 0 {
+		if avail := int(math.Ceil(durSec * srcFPS)); avail < 32 {
+			floor = avail
+		} else {
+			floor = 32
+		}
+	}
+	if floor < 12 {
+		floor = 12
+	}
+	target := int(math.Round(durSec))
+	if target < floor {
+		target = floor
+	}
+	if target > 144 {
+		target = 144
+	}
+	return target
+}
+
+func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH, cellW int, srcFPS float64) (*derivatives.FilmstripGeo, error) {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -24,18 +59,16 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 		return nil, fmt.Errorf("filmstrip: need positive duration+dims (dur=%d %dx%d)", durationMS, srcW, srcH)
 	}
 	if cellW <= 0 {
-		cellW = 160
+		// D5 density ask (CONSUMER_STATUS 2026-07-21): the consumer raised its
+		// LOCAL cells to 320x180, so farm strips at 160 stay visibly low-res
+		// beside local ones. cellH still follows the SOURCE aspect below, so a
+		// 16:9 source lands exactly on 320x180 without hardcoding the height.
+		cellW = 320
 	}
 
 	durSec := float64(durationMS) / 1000.0
 	// ~1 frame/sec, clamped, then snapped to a full grid (12 columns).
-	target := int(math.Round(durSec))
-	if target < 12 {
-		target = 12
-	}
-	if target > 144 {
-		target = 144
-	}
+	target := frameTarget(durSec, srcFPS)
 	cols := 12
 	if target < cols {
 		cols = target
