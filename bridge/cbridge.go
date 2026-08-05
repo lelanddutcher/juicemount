@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -3684,6 +3685,28 @@ type registerConflict struct {
 // it stale until reconcile lands — that ENOENT clears itself. EIO/ENOTCONN/ENXIO
 // are transient mount trouble of the same character. A permission or shape error
 // is what genuinely cannot improve on retry.
+// relocateDerivBlob moves a contributed blob from the synthetic inode's
+// derivative directory to the resolved real one, using descriptors on both
+// ends. Returns a wrapped os.ErrNotExist when there is simply nothing to move
+// (the consumer wrote no blob, or already registered), which the caller treats
+// as "nothing to do" rather than as a failure.
+func relocateDerivBlob(fusePath string, synthetic, real uint64, blobName string) error {
+	srcDir, err := derivatives.OpenDirUnder(fusePath, derivatives.DerivDirRel(synthetic))
+	if err != nil {
+		return fmt.Errorf("open synthetic deriv dir: %w", err)
+	}
+	defer srcDir.Close()
+	if err := derivatives.EnsureDirUnder(fusePath, derivatives.DerivDirRel(real)); err != nil {
+		return fmt.Errorf("ensure real deriv dir: %w", err)
+	}
+	dstDir, err := derivatives.OpenDirUnder(fusePath, derivatives.DerivDirRel(real))
+	if err != nil {
+		return fmt.Errorf("open real deriv dir: %w", err)
+	}
+	defer dstDir.Close()
+	return derivatives.MoveBlobBetweenDirs(srcDir, dstDir, blobName)
+}
+
 func statErrRetryable(err error) bool {
 	switch {
 	case errors.Is(err, os.ErrPermission), errors.Is(err, syscall.ENOTDIR),
@@ -3919,6 +3942,41 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 				realInode = e.Inode
 			}
 		}
+		// RESOLVE IT OURSELVES rather than making the consumer do it.
+		//
+		// The consumer reported (contract f6f5a5b) that it has not implemented
+		// the real_inode remedy, so offline-created files — which hold a
+		// synthetic inode INDEFINITELY, not for a drain window — could not
+		// contribute at all. A permanent 409 for a whole class of file is a gap,
+		// not a protocol.
+		//
+		// Handing back real_inode was never sufficient on its own: the blob is
+		// addressed by inode too, so the bytes sit under the synthetic
+		// directory and a re-register against the real inode finds an empty one.
+		// Moving them is the server's job because the derivative namespace is
+		// the server's namespace — the consumer is not allowed to name paths in
+		// it (WRITE_PLACEMENT §2), so it cannot do this itself.
+		//
+		// Rewriting req.Inode is what makes the rest of the handler operate on
+		// the real inode: every downstream step (blob stat, source stat, vouch,
+		// manifest write) is keyed off it, so the row and the bytes land
+		// together under one identifier.
+		if realInode != 0 && spec.file != "" {
+			if err := relocateDerivBlob(fusePath, req.Inode, realInode, spec.file); err == nil {
+				slog.Info("register: resolved synthetic inode and moved blob",
+					"synthetic", req.Inode, "real", realInode, "kind", req.Kind,
+					"blob", spec.file, "path", srcPath)
+				req.Inode = realInode
+				goto resolved
+			} else if !errors.Is(err, os.ErrNotExist) {
+				// A refusal that is NOT "no such file" is a real problem worth
+				// surfacing: a non-regular source, an empty source, or a
+				// destination blob that already backs a row. Fall through to the
+				// 409 so the consumer sees it rather than a silent success.
+				slog.Warn("register: could not move blob to the resolved inode",
+					"synthetic", req.Inode, "real", realInode, "kind", req.Kind, "err", err)
+			}
+		}
 		writeRegisterConflict(w, registerConflict{
 			Code:      "synthetic_inode",
 			Retryable: false,
@@ -3935,6 +3993,7 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+resolved:
 
 	entry := store.LookupByInode(req.Inode)
 	if entry == nil {
