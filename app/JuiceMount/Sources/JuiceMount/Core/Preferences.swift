@@ -70,7 +70,20 @@ public final class Preferences {
     /// immediately, then drain into JuiceFS in the background — making large
     /// copies feel local even over a slow WAN. Sets the `JM_SPOOL_ENABLE`
     /// env var that the Go core reads at server start, so it takes effect on
-    /// the next (re)start. Off by default during rollout.
+    /// the next (re)start.
+    ///
+    /// ON BY DEFAULT since 2026-08-04. It shipped off "during rollout", and that
+    /// left the default install on the IN-PLACE FUSE write path, which has no
+    /// contiguous-prefix guard: a read of a not-yet-written region returns ZEROS
+    /// WITH err=nil, indistinguishable from data (proven in
+    /// nfs/inplace_hole_probe_test.go). The spool read path is the one that
+    /// carries that guard — it holds such a read (JUKEBOX) instead of serving
+    /// zeros — so the protection built for exactly this hazard was inert for
+    /// everyone who never opened Preferences.
+    ///
+    /// An explicit user choice still wins: the loader reads the stored value and
+    /// only falls back to true when the key is ABSENT, so anyone who deliberately
+    /// turned the spool off stays off.
     public var spoolEnabled: Bool {
         didSet { save() }
     }
@@ -107,7 +120,7 @@ public final class Preferences {
         showSearchHotkey: Bool = true,
         offlineNotificationsEnabled: Bool = false,
         s3EndpointOverride: String = "",
-        spoolEnabled: Bool = false,
+        spoolEnabled: Bool = true,
         spoolCapacityGB: Int = 0, // 0 = Auto (size to free disk minus a safety floor)
         hasCompletedOnboarding: Bool = false
     ) {
@@ -226,7 +239,7 @@ public final class Preferences {
             showSearchHotkey:  d.object(forKey: Key.showSearchHotkey.rawValue) as? Bool ?? true,
             offlineNotificationsEnabled: d.bool(forKey: Key.offlineNotificationsEnabled.rawValue),
             s3EndpointOverride: d.string(forKey: Key.s3EndpointOverride.rawValue) ?? "",
-            spoolEnabled:       d.bool(forKey: Key.spoolEnabled.rawValue),
+            spoolEnabled:       d.object(forKey: Key.spoolEnabled.rawValue) as? Bool ?? true,
             spoolCapacityGB:    d.object(forKey: Key.spoolCapacityGB.rawValue) as? Int ?? 0, // 0 = Auto
             hasCompletedOnboarding: d.bool(forKey: Key.hasCompletedOnboarding.rawValue)
         )
