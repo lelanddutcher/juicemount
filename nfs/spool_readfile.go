@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
@@ -241,7 +242,50 @@ func (i *spoolFileInfo) Size() int64        { return i.size }
 func (i *spoolFileInfo) Mode() os.FileMode  { return 0o644 }
 func (i *spoolFileInfo) ModTime() time.Time { return i.mtime }
 func (i *spoolFileInfo) IsDir() bool        { return false }
-func (i *spoolFileInfo) Sys() any           { return nil }
+
+// Sys MUST return a *syscall.Stat_t, not nil.
+//
+// THE BUG THIS FIXES (measured live 2026-08-05). nfslib's ToFileAttribute asks
+// file.GetInfo(info) for the real attributes; that returns nil unless Sys() is a
+// *syscall.Stat_t (internal/nfs/file/file_unix.go), and the nil branch
+// (internal/nfs/file.go:122) FABRICATES the fileid as `fnv.New64(path)` and
+// leaves UID/GID at 0. So for the whole spool window every GETATTR on an
+// in-flight file reported:
+//
+//   - an inode that is a hash of the PATH — no relation to any real inode, and
+//     not a key in any store, so nothing can ever look it up; and
+//   - owner root:wheel, because 0 is the zero value.
+//
+// Both were invisible because READDIR takes a different path
+// (metadata.FileInfo.Sys() does return a Stat_t), so `ls` looked right while
+// `stat` did not. Measured on the live volume: stat said 8983717010171850480
+// (0x7cac9305e1ed6ef0) for a file READDIR correctly reported as 2002031.
+//
+// This is not merely a derivative-registration problem. Any client that uses
+// st_ino for file identity — hardlink detection, backup/rsync change detection,
+// an NLE relinking media — was handed a fabricated value during the window.
+//
+// The inode was already sitting in the struct (spoolFileInfoForEntry sets it);
+// it was simply being thrown away here. It may still be a SYNTHETIC inode when
+// the file was created offline or is not yet reconciled, but a synthetic inode
+// is at least honest and detectable (high bit set) and agrees with READDIR — a
+// path hash is neither.
+func (i *spoolFileInfo) Sys() any {
+	return &syscall.Stat_t{
+		Ino:   i.inode,
+		Nlink: 1,
+		Uid:   spoolOwnerUID,
+		Gid:   spoolOwnerGID,
+	}
+}
+
+// The spool file is written through the mount by the logged-in user, and the
+// mount is single-user, so the process identity is the file's owner. Resolved
+// once: os.Getuid/os.Getgid are syscalls and this sits on the GETATTR hot path.
+var (
+	spoolOwnerUID = uint32(os.Getuid())
+	spoolOwnerGID = uint32(os.Getgid())
+)
 
 // spoolFileInfoForEntry constructs a FileInfo snapshot from a SpoolEntry.
 // Filename is `base` — the trailing component of the NFS path — so
