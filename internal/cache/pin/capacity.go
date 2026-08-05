@@ -29,10 +29,26 @@ import (
 //      skips re-warming while over capacity (PullPending already warmed what
 //      fits; re-warming only thrashes the LRU).
 
-// CacheFreeFloorBytes mirrors health.cacheFreeFloorBytes: JuiceFS keeps at
+// CacheFreeFloorBytes mirrors health.cacheFreeFloorBytesConst: JuiceFS keeps at
 // least this much free on the cache volume at runtime (via --free-space-ratio).
 // The space actually usable BY the cache is therefore
 // (current free) + (bytes the cache already occupies) − floor.
+//
+// KNOWN DIVERGENCE (B-2, 2026-08-04), deliberately not fixed here. JuiceFS's
+// actual runtime floor is no longer 10 GiB: health.resolveFreeSpaceRatio now
+// derives --free-space-ratio so the eviction floor sits ABOVE the write spool's
+// 20 GiB admission floor (30 GiB on a typical disk), because otherwise the spool
+// always blocked first and the cache never yielded its space. This constant was
+// NOT raised to match, so the verdict below OVER-states sustainable capacity by
+// the difference (~20 GiB) and therefore UNDER-warns about an over-capacity pin
+// set — and IsOverCapacity() gates the prefetcher's re-warm, so the futile-churn
+// guard is correspondingly late.
+//
+// The correct fix is to publish the derived floor the way SetCacheBudgetBytes
+// publishes the derived cache budget (health/fuse.go calls it at mount time) and
+// have evaluateCapacity use that instead of this constant. Left out of the B-1/
+// B-2 change because it alters a shipped user-visible verdict (the over-capacity
+// banner) and the prefetcher gate, which want their own tests and a live pass.
 const CacheFreeFloorBytes = int64(10) << 30 // 10 GiB
 
 // capacityFlapMarginBytes is hysteresis so the verdict doesn't toggle on/off as
@@ -61,6 +77,23 @@ type CapacityVerdict struct {
 	// and for debugging the verdict.
 	DiskFreeBytes   int64 `json:"disk_free_bytes"`
 	CacheUsageBytes int64 `json:"cache_usage_bytes"`
+	// BlockCacheBytes is JuiceFS's own `juicefs_blockcache_bytes` gauge — the
+	// AUTHORITATIVE on-disk block-cache size — as of Computed. 0 when the gauge
+	// is unavailable (no metrics addr, daemon not up, never scraped), in which
+	// case CacheUsageBytes (the cache-dir du) is the only figure available.
+	//
+	// Carried here so a consumer that must not perform I/O can read the gauge
+	// from this snapshot. The write spool's admission path is exactly that
+	// consumer: nfs.refreshCeiling runs under a TryLock on the write hot path
+	// and may not scrape, so it reads this field (see nfs/spool_headroom.go).
+	// Before this, the ONLY thing that refreshed the gauge was the /cache-status
+	// poll — i.e. it ticked only while the menu-bar popover was open.
+	//
+	// NOT SERIALIZED, deliberately: contract/spec/schema/cache-status.schema.json
+	// declares the `capacity` object "additionalProperties": false, so adding a
+	// key here would fail wire conformance. Consumers already receive the same
+	// gauge as /cache-status's top-level `cache_used_bytes`.
+	BlockCacheBytes int64 `json:"-"`
 	// CacheBudgetBytes is the USER-CONFIGURED juicefs --cache-size (0 =
 	// unknown/unlimited). When set, it caps sustainable capacity: juicefs
 	// will never hold more than the budget no matter how roomy the disk is,
@@ -147,6 +180,15 @@ func ComputeCapacity(store *Store, cacheBaseDir string) CapacityVerdict {
 	}
 	v.DiskFreeBytes = volumeFreeBytesAt(cacheBaseDir)
 	v.CacheUsageBytes = dirUsageBytes(cacheBaseDir)
+	// Refresh AND record the authoritative block-cache gauge on this same slow
+	// cadence. The scrape is a bounded (3s-timeout) HTTP GET, internally
+	// throttled to once per 2s; running it HERE — beside a full directory walk,
+	// on the 60s CapacityLoop, explicitly off the read hot path — is what lets
+	// the spool's admission path consume the gauge as a plain snapshot read with
+	// no I/O of its own. A miss leaves the field 0 and the consumer falls back.
+	if bc, ok := BlockCacheBytes(); ok {
+		v.BlockCacheBytes = bc
+	}
 
 	evaluateCapacity(&v)
 	setCapacityVerdict(v)

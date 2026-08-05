@@ -206,6 +206,22 @@ func spoolDiskAvail(dir string) (int64, error) {
 // of a fixed 50 GiB that a large SD-card offload (e.g. an 87 GB RAW shoot)
 // would overflow mid-copy. Falls back to 50 GiB if Statfs fails, and never
 // returns below 8 GiB. Callers pass the result as NewSpoolStore's capacity.
+//
+// KNOWN GAP (found while implementing B-1, 2026-08-04). This is still a STARTUP
+// SNAPSHOT of free disk, and effectiveCapacity only ever takes min(configured,
+// live ceiling) — so it caps admission from above no matter how much headroom
+// the live ceiling gains. On the machine where the cache-vs-spool bug was
+// measured (25.8 GiB free) this returns the 8 GiB minimum, and a 40 GB camera
+// file is STILL refused even though refreshCeiling now offers ~104 GiB of
+// headroom from the reclaimable cache. B-1 is necessary but not sufficient on
+// exactly the low-disk machines it targets.
+//
+// Deliberately unchanged here: the spool's total is contract-visible (/spool
+// `total`, consumed by OpenLoupe) and this function runs at boot, before
+// pin.CapacityLoop has published a verdict, so simply routing it through
+// spoolHeadroomBytes would be a no-op at the only moment it is called. The real
+// fix is to stop baking free disk into `capacity` at all — the same one-way
+// ratchet NewSpoolStore's clamp was removed for just above.
 func AutoSpoolCapacity(dir string) int64 {
 	avail, err := spoolDiskAvail(dir)
 	if err != nil || avail <= 0 {
@@ -326,6 +342,14 @@ const staleCeilingMax = 30 * diskAvailTTL
 
 // refreshCeiling re-samples free disk and recomputes capCeiling.
 //
+// The headroom it derives is NOT free disk alone: the JuiceFS block cache shares
+// this SSD and is mostly reclaimable copies of objects already durable in MinIO,
+// so it counts as space the spool may use. See nfs/spool_headroom.go for the
+// formula, the three safety gates (writeback off, never below the pinned set,
+// never any I/O on this path), and why a missing figure degrades to the smaller,
+// historical number. cacheReclaimSnapshot() is a lock-free snapshot read — this
+// function is still just one statfs, exactly as before.
+//
 // The `used` snapshot MUST be taken here, alongside avail, and the resulting
 // ceiling treated as absolute for the whole TTL window. Deriving the ceiling
 // from the live `used` on every check was the CRITICAL bug found in review:
@@ -351,10 +375,7 @@ func (s *SpoolStore) refreshCeiling() {
 		s.diskAvailAt.Store(now)
 		return
 	}
-	headroom := avail - SpoolFreeFloorBytes
-	if headroom < 0 {
-		headroom = 0
-	}
+	headroom := spoolHeadroomBytes(avail, cacheReclaimSnapshot())
 	ceiling := s.used.Load() + headroom // snapshot, NOT re-read per check
 	if ceiling < minClampedCeiling {
 		ceiling = minClampedCeiling

@@ -358,16 +358,21 @@ func (fm *FUSEManager) Mount() error {
 			}
 		}
 
-		// Raise --free-space-ratio so JuiceFS keeps >= 10 GiB free dynamically
-		// (the absolute floor that prevents boot-disk starvation). max() so we
-		// never weaken an already-stricter configured ratio.
-		floorRatio := float64(cacheFreeFloorBytes) / float64(total)
-		var curRatio float64
-		fmt.Sscanf(fm.cfg.FreeSpaceRatio, "%f", &curRatio)
-		if floorRatio > curRatio {
-			fm.cfg.FreeSpaceRatio = fmt.Sprintf("%.4f", floorRatio)
-			jmlog.Info("free-space-ratio raised to enforce 10 GiB free floor",
-				"ratio", fmt.Sprintf("%.4f", floorRatio), "disk_total_gb", total>>30)
+		// Raise --free-space-ratio so JuiceFS's EVICTION floor sits ABOVE the
+		// write spool's ADMISSION floor (B-2 — see resolveFreeSpaceRatio). The
+		// old value was cacheFreeFloorBytes/total, i.e. JuiceFS only started
+		// evicting below 10 GiB free while the spool already stopped admitting
+		// at 20 GiB — so the spool blocked itself first and the cache never gave
+		// the space back. resolveFreeSpaceRatio still guarantees the >= 10 GiB
+		// free floor this line originally existed for. max() so we never weaken
+		// an already-stricter configured ratio.
+		if ratioArg, replace := resolveFreeSpaceRatioArg(fm.cfg.FreeSpaceRatio, total); replace {
+			fm.cfg.FreeSpaceRatio = ratioArg
+			jmlog.Info("free-space-ratio derived to keep the JuiceFS eviction floor above the spool floor",
+				"ratio", ratioArg,
+				"keeps_free_gb", int64(resolveFreeSpaceRatio(total)*float64(total))>>30,
+				"spool_floor_gb", spoolFreeFloorBytesConst>>30,
+				"disk_total_gb", total>>30)
 		}
 	}
 

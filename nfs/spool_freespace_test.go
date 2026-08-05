@@ -8,18 +8,20 @@ import (
 )
 
 // seedDiskAvail pins the sampled ceiling as if free disk were `avail` at this
-// instant, mirroring refreshCeiling exactly. avail < 0 means "Statfs failed".
+// instant. avail < 0 means "Statfs failed".
+//
+// It CALLS refreshCeiling's own headroom function rather than restating the
+// arithmetic (which is how a helper silently stops matching the code it stands
+// in for). The zero-valued cacheReclaimInputs means "nothing known about the
+// JuiceFS cache", which is precisely the historical `avail - floor` — so these
+// tests stay deterministic and independent of the host's real block cache.
 func seedDiskAvail(s *SpoolStore, avail int64) {
 	if avail < 0 {
 		s.capCeiling.Store(-1)
 		s.diskAvailAt.Store(time.Now().UnixNano())
 		return
 	}
-	headroom := avail - SpoolFreeFloorBytes
-	if headroom < 0 {
-		headroom = 0
-	}
-	ceiling := s.used.Load() + headroom
+	ceiling := s.used.Load() + spoolHeadroomBytes(avail, cacheReclaimInputs{})
 	if ceiling < minClampedCeiling {
 		ceiling = minClampedCeiling
 	}
