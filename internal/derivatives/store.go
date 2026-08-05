@@ -81,6 +81,19 @@ type DerivRow struct {
 	Codec       *string `json:"codec,omitempty"`
 	CodecString *string `json:"codec_string,omitempty"`
 	BlobSize    *int64  `json:"blob_size,omitempty"`
+	// ARTIFACT DESCRIPTORS (2026-08-04). Pixel dimensions and bitrate let a
+	// server rank a contributed artifact WITHOUT decoding it, so a cheap one can
+	// be earmarked for upgrade by a more capable node or the farm. Present for
+	// thumbnail/proxy/audio_proxy/filmstrip only; `dim` is embedding
+	// dimensionality and is a different thing entirely.
+	//
+	// Stored in the same kind-scoped `extra` JSON column as Filmstrip/Codec — no
+	// SQL migration. NOTE: anything added here must ALSO be re-hydrated in
+	// decodeExtra for its kinds, or the row cannot round-trip and the reconcile's
+	// unchanged-row skip re-publishes it on every sweep forever.
+	Width      *int   `json:"width,omitempty"`
+	Height     *int   `json:"height,omitempty"`
+	BitrateBPS *int64 `json:"bitrate_bps,omitempty"`
 }
 
 // FilmstripGeo is the sprite-sheet geometry a scrubber needs to map a time to a
@@ -539,7 +552,20 @@ type extraEnvelope struct {
 	Codec       *string       `json:"codec,omitempty"`
 	CodecString *string       `json:"codec_string,omitempty"`
 	BlobSize    *int64        `json:"blob_size,omitempty"`
+	Width       *int          `json:"width,omitempty"`
+	Height      *int          `json:"height,omitempty"`
+	BitrateBPS  *int64        `json:"bitrate_bps,omitempty"`
 }
+
+// dimensionedKinds are the kinds for which pixel width/height are meaningful.
+// decodeExtra MUST re-hydrate for exactly this set — persisting a field for a
+// kind that does not read it back is the never-round-trips bug that made the
+// reconcile re-publish a row on every sweep forever.
+func dimensionedKind(kind string) bool {
+	return kind == "thumbnail" || kind == "proxy" || kind == "audio_proxy" || kind == "filmstrip"
+}
+
+func proxyKind(kind string) bool { return kind == "proxy" || kind == "audio_proxy" }
 
 // extraJSON serializes a row's kind-specific sub-object into the `extra` column.
 // Filmstrip geometry (JM-16) or the proxy-codec triple (#50); nil (NULL column)
@@ -554,6 +580,10 @@ func extraJSON(d DerivRow) any {
 	}
 	if d.Codec != nil || d.CodecString != nil || d.BlobSize != nil {
 		env.Codec, env.CodecString, env.BlobSize = d.Codec, d.CodecString, d.BlobSize
+		has = true
+	}
+	if d.Width != nil || d.Height != nil || d.BitrateBPS != nil {
+		env.Width, env.Height, env.BitrateBPS = d.Width, d.Height, d.BitrateBPS
 		has = true
 	}
 	if !has {
@@ -576,7 +606,8 @@ func decodeExtra(d *DerivRow, extra sql.NullString) {
 	}
 	var env extraEnvelope
 	if json.Unmarshal([]byte(extra.String), &env) == nil &&
-		(env.Filmstrip != nil || env.Codec != nil || env.CodecString != nil || env.BlobSize != nil) {
+		(env.Filmstrip != nil || env.Codec != nil || env.CodecString != nil || env.BlobSize != nil ||
+			env.Width != nil || env.Height != nil || env.BitrateBPS != nil) {
 		if d.Kind == "filmstrip" {
 			d.Filmstrip = env.Filmstrip
 		}
@@ -585,8 +616,12 @@ func decodeExtra(d *DerivRow, extra sql.NullString) {
 		// audio_proxy row was persisted WITH these fields and read back WITHOUT
 		// them, so it could never round-trip — and the reconcile's unchanged-row
 		// skip therefore re-published it on every sweep, forever.
-		if d.Kind == "proxy" || d.Kind == "audio_proxy" {
+		if proxyKind(d.Kind) {
 			d.Codec, d.CodecString, d.BlobSize = env.Codec, env.CodecString, env.BlobSize
+			d.BitrateBPS = env.BitrateBPS
+		}
+		if dimensionedKind(d.Kind) {
+			d.Width, d.Height = env.Width, env.Height
 		}
 		return
 	}

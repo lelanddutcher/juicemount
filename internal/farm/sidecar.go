@@ -179,7 +179,24 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 		row.Filmstrip = nil
 	}
 	if row.Kind != "proxy" && row.Kind != "audio_proxy" {
-		row.Codec, row.CodecString, row.BlobSize = nil, nil, nil
+		row.Codec, row.CodecString, row.BlobSize, row.BitrateBPS = nil, nil, nil, nil
+	}
+	// Pixel dimensions are meaningful only where decodeExtra re-hydrates them.
+	// Persisting a field for a kind that never reads it back is precisely the
+	// never-round-trips bug that made the reconcile re-publish a row forever.
+	if row.Kind != "thumbnail" && row.Kind != "proxy" && row.Kind != "audio_proxy" && row.Kind != "filmstrip" {
+		row.Width, row.Height = nil, nil
+	}
+	// Bounds: these come off a consumer-writable file and a reader may allocate
+	// or divide by them.
+	if row.Width != nil && (*row.Width < 1 || *row.Width > 65535) {
+		row.Width = nil
+	}
+	if row.Height != nil && (*row.Height < 1 || *row.Height > 65535) {
+		row.Height = nil
+	}
+	if row.BitrateBPS != nil && (*row.BitrateBPS < 1 || *row.BitrateBPS > int64(10)<<30) {
+		row.BitrateBPS = nil
 	}
 
 	// FIELDS THAT WERE PASSING THROUGH UNTOUCHED (2026-08-04 round 3).
@@ -357,7 +374,10 @@ func rowContentEqual(a, b derivatives.DerivRow) bool {
 	if !eqi(a.SourceSize, b.SourceSize) || !eqi(a.SourceMtime, b.SourceMtime) || !eqi(a.BlobSize, b.BlobSize) {
 		return false
 	}
-	if !eqn(a.Dim, b.Dim) {
+	if !eqi(a.BitrateBPS, b.BitrateBPS) {
+		return false
+	}
+	if !eqn(a.Dim, b.Dim) || !eqn(a.Width, b.Width) || !eqn(a.Height, b.Height) {
 		return false
 	}
 	if (a.Filmstrip == nil) != (b.Filmstrip == nil) {

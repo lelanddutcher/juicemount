@@ -3636,10 +3636,45 @@ type registerRequest struct {
 	SourceSize  int64  `json:"source_size"`
 	SourceMtime int64  `json:"source_mtime"`
 	BlobRelPath string `json:"blob_rel_path"`
-	// Codec is REQUIRED for kind=="proxy". derivatives.schema.json says an
-	// absent codec means h264, so an on-device HEVC proxy registered without it
-	// is silently mislabelled to every downstream reader and fails to play.
-	Codec string `json:"codec,omitempty"`
+	// Codec is REQUIRED for a proxy kind and DECLARATIVE, not gated on a floor
+	// (founder decision 2026-08-04). derivatives.schema.json reads an ABSENT
+	// codec as h264, so silence would mislabel a richer codec rather than
+	// describe it — which is why it stays required even though no value is
+	// rejected on quality grounds.
+	Codec       string `json:"codec,omitempty"`
+	CodecString string `json:"codec_string,omitempty"`
+	// Width/Height/BitrateBPS let the server rank a contributed artifact WITHOUT
+	// decoding it, so a cheap one can be earmarked for upgrade. A 320px and a
+	// 720px poster are otherwise distinguishable on the wire only by blob_size,
+	// which is a bad quality proxy (a flat LOG-graded 720 frame can encode
+	// smaller than a busy 320).
+	Width      int   `json:"width,omitempty"`
+	Height     int   `json:"height,omitempty"`
+	BitrateBPS int64 `json:"bitrate_bps,omitempty"`
+}
+
+// Bounds for artifact descriptors. Generous enough for 8K-plus, tight enough
+// that a forged value cannot walk a reader into an absurd allocation.
+const (
+	maxArtifactDim     = 65535
+	maxArtifactBitrate = int64(10) << 30 // 10 Gbps
+)
+
+// knownProxyCodecs mirrors derivatives.schema.json's codec enum. Asserted
+// against the vendored contract by a conformance test — a vocabulary narrower
+// than the contract rejects legitimate contributions, and one wider writes rows
+// that fail the consumer's own validation.
+var knownProxyCodecs = map[string]bool{
+	"h264": true, "hevc": true, "av1": true, "aac": true, "opus": true,
+}
+
+func knownProxyCodecList() []string {
+	out := make([]string, 0, len(knownProxyCodecs))
+	for c := range knownProxyCodecs {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // registerResponse is the 200 body. Schema: contract/spec/schema/register.schema.json.
@@ -3858,26 +3893,76 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// CODEC (2026-08-04 review, MEDIUM + the founder's codec ruling). A
-	// contributed proxy MUST meet the H.264 floor: PROXY_CODEC_SPEC makes H.264
-	// the guaranteed-decodable floor, #50's codec/codec_string exist so richer
-	// codecs ship BESIDE it rather than replacing it, and the manifest PK is
-	// (inode,kind) — ONE proxy slot. An HEVC-only contribution therefore leaves
-	// any reader that cannot decode HEVC with nothing, and the web UI is a stated
-	// consumer. Declare it explicitly so we never infer it from silence.
-	var codecP *string
-	if req.Kind == "proxy" {
+	// CODEC IS DECLARED, NOT MANDATED (founder decision, 2026-08-04, superseding
+	// the H.264 floor this route shipped with hours earlier).
+	//
+	// The floor made the LEAST capable node set the ceiling for every node. The
+	// ruling inverts it: a node that cannot do a thing contributes the things it
+	// CAN do, and the fleet's output is the UNION, not the intersection. An older
+	// iMac with no HEVC encoder is not a reason to make every Mac emit H.264 — it
+	// is a node that contributes posters, filmstrips and waveforms while a
+	// capable machine contributes the HEVC proxy.
+	//
+	// So the codec is still REQUIRED — silence is read as h264 by every
+	// downstream reader, and inferring a codec from silence is how an HEVC blob
+	// gets mislabelled — but any codec in the closed vocabulary is accepted, and
+	// the reader checks the row before fetching.
+	var codecP, codecStrP *string
+	if req.Kind == "proxy" || req.Kind == "audio_proxy" {
 		c := strings.ToLower(strings.TrimSpace(req.Codec))
 		if c == "" {
-			http.Error(w, `kind "proxy" requires an explicit "codec" — an absent codec is read as h264 by every downstream reader`, 400)
+			http.Error(w, fmt.Sprintf(
+				`kind %q requires an explicit "codec" — an absent codec is read as h264 by every downstream reader, so silence would mislabel a richer codec rather than describe it`, req.Kind), 400)
 			return
 		}
-		if c != "h264" {
+		if !knownProxyCodecs[c] {
 			http.Error(w, fmt.Sprintf(
-				`contributed proxies must meet the H.264 floor (got %q). Encode H.264/AAC faststart for the contributed copy and keep richer codecs local; multi-rung support needs a manifest shape that does not exist yet`, c), 400)
+				`codec %q is not in the manifest vocabulary %v — a codec a reader cannot recognise is worse than one it cannot decode, because it cannot even choose`, c, knownProxyCodecList()), 400)
 			return
 		}
 		codecP = &c
+		if cs := strings.TrimSpace(req.CodecString); cs != "" {
+			if len(cs) > 256 {
+				http.Error(w, `"codec_string" exceeds 256 bytes`, 400)
+				return
+			}
+			codecStrP = &cs
+		}
+	}
+
+	// ARTIFACT DESCRIPTORS (consumer ask, founder-endorsed 2026-08-04).
+	//
+	// If a node's contribution is a FLOOR rather than a finished artifact, the
+	// server has to be able to tell a cheap artifact from a good one WITHOUT
+	// decoding it, so it can earmark the cheap one for upgrade. Today it cannot:
+	// a 320px poster and a 720px poster differ on the wire only by blob_size,
+	// which is a bad proxy for quality — a flat LOG-graded 720 frame can encode
+	// smaller than a busy 320. `dim` is embedding dimensionality, not image size.
+	var widthP, heightP *int
+	if req.Width != 0 || req.Height != 0 {
+		if req.Kind != "thumbnail" && req.Kind != "proxy" && req.Kind != "audio_proxy" && req.Kind != "filmstrip" {
+			http.Error(w, fmt.Sprintf(`width/height are pixel dimensions and are not meaningful for kind %q`, req.Kind), 400)
+			return
+		}
+		if req.Width <= 0 || req.Height <= 0 || req.Width > maxArtifactDim || req.Height > maxArtifactDim {
+			http.Error(w, fmt.Sprintf(`width/height must both be in 1..%d (got %dx%d)`, maxArtifactDim, req.Width, req.Height), 400)
+			return
+		}
+		w2, h2 := req.Width, req.Height
+		widthP, heightP = &w2, &h2
+	}
+	var bitrateP *int64
+	if req.BitrateBPS != 0 {
+		if req.Kind != "proxy" && req.Kind != "audio_proxy" {
+			http.Error(w, `bitrate_bps is only meaningful for a proxy`, 400)
+			return
+		}
+		if req.BitrateBPS < 0 || req.BitrateBPS > maxArtifactBitrate {
+			http.Error(w, fmt.Sprintf(`bitrate_bps must be in 1..%d`, maxArtifactBitrate), 400)
+			return
+		}
+		b := req.BitrateBPS
+		bitrateP = &b
 	}
 
 	var dimP *int
@@ -3895,6 +3980,10 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		SourceSize:  &srcSize,
 		SourceMtime: &srcMtime,
 		Codec:       codecP,
+		CodecString: codecStrP,
+		Width:       widthP,
+		Height:      heightP,
+		BitrateBPS:  bitrateP,
 	}
 	if err := ds.PutSource(req.Inode, &hash); err != nil {
 		http.Error(w, "put source: "+err.Error(), 500)

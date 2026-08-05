@@ -19,15 +19,23 @@ func TestSanitizedRowSurvivesStoreRoundTrip(t *testing.T) {
 	geo := derivatives.FilmstripGeo{FrameCount: 4, Cols: 2, Rows: 2, CellW: 16, CellH: 9}
 	codec, codecStr := "h264", "avc1.640028"
 	blobSize := int64(4096)
+	w, h := 1920, 1080
+	bitrate := int64(8_000_000)
 
 	for _, kind := range []string{"tech", "thumbnail", "filmstrip", "waveform", "proxy", "audio_proxy", "ai"} {
 		t.Run(kind, func(t *testing.T) {
 			blob, _ := reservedBlobName(kind)
 			row := derivatives.DerivRow{
 				Kind: kind, Status: "ready", Producer: "linux-farm", Version: 1,
-				// Every kind-scoped field set on EVERY kind — what a foreign
-				// producer or an attacker can put in the file.
+				// EVERY kind-scoped field set on EVERY kind — what a foreign
+				// producer or an attacker can put in the file. This list must
+				// cover every `extra`-backed field: a field set here but not
+				// re-hydrated by decodeExtra can never round-trip, and the
+				// reconcile's unchanged-row skip then re-publishes that row on
+				// every sweep forever. Omitting the newest fields is exactly how
+				// audio_proxy slipped through once already.
 				Filmstrip: &geo, Codec: &codec, CodecString: &codecStr, BlobSize: &blobSize,
+				Width: &w, Height: &h, BitrateBPS: &bitrate,
 			}
 			if blob != "" {
 				row.BlobRelPath = &blob

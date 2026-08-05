@@ -182,16 +182,60 @@ func TestRegisterWidenedKindsEndToEnd(t *testing.T) {
 		}
 	})
 
-	t.Run("proxy requires an explicit h264 codec", func(t *testing.T) {
+	// FOUNDER DECISION 2026-08-04, superseding the H.264 floor this route shipped
+	// with hours earlier. A node that cannot do a thing contributes the things it
+	// CAN do; the fleet's output is the UNION, not the intersection. A codec floor
+	// makes the least capable node set the ceiling for every node — strictly worse
+	// on a heterogeneous fleet than letting each node declare what it made.
+	t.Run("proxy codec is DECLARED, not mandated", func(t *testing.T) {
 		writeBlob("proxy.mp4")
+		// Still required: derivatives.schema.json reads an ABSENT codec as h264,
+		// so silence would mislabel a richer codec rather than describe it.
 		if rr := post(req("proxy", nil)); rr.Code != 400 {
 			t.Errorf("proxy with NO codec: status %d, want 400 (absent codec is read as h264 downstream)", rr.Code)
 		}
-		if rr := post(req("proxy", map[string]any{"codec": "hevc"})); rr.Code != 400 {
-			t.Errorf("proxy with hevc: status %d, want 400 (H.264 is the guaranteed-decodable floor)", rr.Code)
+		// HEVC is now ACCEPTED — this is the reversal.
+		if rr := post(req("proxy", map[string]any{"codec": "hevc"})); rr.Code != 200 {
+			t.Errorf("proxy with hevc: status %d, want 200 — the codec floor was overturned; "+
+				"a capable node contributes HEVC and the reader checks the row. body %s",
+				rr.Code, rr.Body.String())
 		}
 		if rr := post(req("proxy", map[string]any{"codec": "h264"})); rr.Code != 200 {
 			t.Errorf("proxy with h264: status %d, body %s", rr.Code, rr.Body.String())
+		}
+		// But a codec no reader can even RECOGNISE is still refused — that is
+		// worse than one it cannot decode, because it cannot choose.
+		if rr := post(req("proxy", map[string]any{"codec": "prores_raw_xyz"})); rr.Code != 400 {
+			t.Errorf("proxy with an unknown codec: status %d, want 400", rr.Code)
+		}
+	})
+
+	// Artifact descriptors: the server must be able to rank a contributed
+	// artifact WITHOUT decoding it, so a cheap one can be earmarked for upgrade.
+	t.Run("width/height/bitrate are accepted and echoed", func(t *testing.T) {
+		writeBlob("poster.jpg")
+		rr := post(req("thumbnail", map[string]any{"width": 1920, "height": 1080}))
+		if rr.Code != 200 {
+			t.Fatalf("thumbnail with dimensions: status %d, body %s", rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		d := resp["derivative"].(map[string]any)
+		if d["width"] != float64(1920) || d["height"] != float64(1080) {
+			t.Errorf("dimensions not echoed on the row: w=%v h=%v — without them a 320px and a "+
+				"720px poster differ on the wire only by blob_size, which is a bad quality proxy",
+				d["width"], d["height"])
+		}
+		// Nonsense dimensions are refused rather than stored.
+		if rr := post(req("thumbnail", map[string]any{"width": 0, "height": 1080})); rr.Code != 400 {
+			t.Errorf("zero width: status %d, want 400", rr.Code)
+		}
+		// Pixel dimensions are not meaningful for a waveform.
+		writeBlob("waveform.json")
+		if rr := post(req("waveform", map[string]any{"width": 100, "height": 100})); rr.Code != 400 {
+			t.Errorf("dimensions on a waveform: status %d, want 400", rr.Code)
 		}
 	})
 

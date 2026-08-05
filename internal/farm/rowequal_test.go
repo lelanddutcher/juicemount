@@ -31,6 +31,9 @@ func TestRowContentEqualComparesEveryMeaningfulField(t *testing.T) {
 		Codec:       sp("h264"),
 		CodecString: sp("avc1.640028"),
 		BlobSize:    i64(4096),
+		Width:       ip(1920),
+		Height:      ip(1080),
+		BitrateBPS:  i64(8_000_000),
 		Provenance:  derivatives.ProvenanceSidecar,
 	}
 
