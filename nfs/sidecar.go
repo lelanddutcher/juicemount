@@ -279,7 +279,18 @@ func (h *JuiceMountHandler) warmSidecar(name, fusePath string) bool {
 	buf := make([]byte, size)
 	total := 0
 	for total < int(size) {
+		// FUSE data ceiling. The warmer runs sidecarWarmSem(3) x
+		// sidecarWarmParallel(16) = 48 concurrent reads — three times the whole
+		// data ceiling, and entirely background work. A background warmer must
+		// never be the reason a foreground read is refused, so it yields
+		// immediately rather than waiting.
+		warmRelease, warmOK := tryAcquireFUSEDataBackground()
+		if !warmOK {
+			noteFUSEDataRefused()
+			return false // ceiling busy: skip the warm, never delay foreground work
+		}
 		n, rerr := f.ReadAt(buf[total:], int64(total))
+		warmRelease()
 		total += n
 		if rerr != nil {
 			break

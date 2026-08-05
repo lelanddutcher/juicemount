@@ -4241,14 +4241,20 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	// held across the syscall only.
 	releaseData, dataOK := acquireFUSEData()
 	if !dataOK {
-		// Gate stayed full: the session is already saturated. Tell the client to
-		// retry rather than adding another concurrent read to it — the opposite
-		// choice is what escalated a wedge into a panic.
+		// At the ceiling: the session is already saturated. Shed immediately so
+		// the rpcSem slot is freed (internal/nfs/errors.go doctrine) and the
+		// client retries via JUKEBOX. Queueing here is what would starve
+		// LOOKUP/GETATTR and make the mount unnavigable.
+		noteFUSEDataRefused()
 		return 0, errFUSETimeout
 	}
-	defer releaseData()
 	readStart := time.Now()
 	n, err := f.fuseFD.ReadAt(p, off)
+	// Release BEFORE any retry sleeping below. A slot must span ONE syscall:
+	// holding it across up to 4 backoff sleeps (500ms) would collapse gate
+	// throughput to ~32 admissions/sec exactly when the retry path is hottest,
+	// i.e. on an already-degraded session.
+	releaseData()
 	// Populate the sidecar cache from a COMPLETE single read of a `._` file
 	// (off==0 and the read returned the whole file) so the next visit — and
 	// every other client's Finder — is RAM-served. Only complete reads cache
@@ -4287,7 +4293,17 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		for attempt := 1; attempt <= fuseReadMaxRetries; attempt++ {
 			time.Sleep(fuseReadRetryBackoff * time.Duration(attempt))
 			metrics.Default().IncReadRetry()
+			// Re-acquire per attempt: the sleep above happens OUTSIDE the gate
+			// so a retrying reader does not hold a slot while idle. Refusal
+			// here just ends the retry loop — the caller still gets whatever
+			// the last attempt produced, exactly as before the gate existed.
+			retryRelease, retryOK := acquireFUSEData()
+			if !retryOK {
+				noteFUSEDataRefused()
+				break
+			}
 			n, err = f.fuseFD.ReadAt(p, off)
+			retryRelease()
 			if n > 0 || err == nil {
 				jmlog.Debug("FUSE read recovered on retry",
 					"path", f.name, "off", off, "attempt", attempt)
