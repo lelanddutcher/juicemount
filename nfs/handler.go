@@ -4235,6 +4235,18 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	// below (a retrying read must not re-queue). Inert on medium/fast.
 	releaseQoS := defaultReadQoS.acquire(off, len(p))
 	defer releaseQoS()
+	// FUSE data ceiling (2026-08-05 double kernel panic). readQoS above is inert
+	// on medium/fast links; this one is not. Ordered AFTER readQoS and released
+	// by defer, so the two are always acquired in the same order and a slot is
+	// held across the syscall only.
+	releaseData, dataOK := acquireFUSEData()
+	if !dataOK {
+		// Gate stayed full: the session is already saturated. Tell the client to
+		// retry rather than adding another concurrent read to it — the opposite
+		// choice is what escalated a wedge into a panic.
+		return 0, errFUSETimeout
+	}
+	defer releaseData()
 	readStart := time.Now()
 	n, err := f.fuseFD.ReadAt(p, off)
 	// Populate the sidecar cache from a COMPLETE single read of a `._` file
@@ -4420,6 +4432,13 @@ func (f *writeFile) Write(p []byte) (int, error) {
 }
 
 func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
+	// FUSE data ceiling. The 12:54 stall that preceded the macFUSE panic was 62
+	// concurrent in-flight NFS writes; nothing bounded them.
+	releaseData, dataOK := acquireFUSEData()
+	if !dataOK {
+		return 0, errFUSETimeout
+	}
+	defer releaseData()
 	n, err := f.File.WriteAt(p, off)
 	if n > 0 {
 		end := off + int64(n)
