@@ -1,6 +1,7 @@
 package health
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,7 +22,35 @@ func TestMonitorStartStop(t *testing.T) {
 	// Reaching here without hanging means start/stop works.
 }
 
+// requireLocalBackends skips a test that needs a LOCAL redis+minio dev stack.
+//
+// These three tests asserted `Healthy == true` against 127.0.0.1:6379 and
+// :9000 unconditionally, so they failed on every machine whose backends live
+// somewhere else — which is the normal case here (ours run on the TrueNAS box).
+// A suite that is red for environmental reasons trains you to skim past red,
+// which is the actual cost. metadata/redis_test.go and keyspace_test.go already
+// skip-if-absent; this brings health/ in line with that convention rather than
+// inventing a new one.
+//
+// Deliberately NOT a mock: the point of these tests is that the real probe
+// reaches a real backend. Skipping when there is none preserves that meaning;
+// mocking would delete it.
+func requireLocalBackends(t *testing.T) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", "127.0.0.1:6379", 500*time.Millisecond)
+	if err != nil {
+		t.Skipf("local Redis not reachable, skipping live health test: %v", err)
+	}
+	c.Close()
+	c, err = net.DialTimeout("tcp", "127.0.0.1:9000", 500*time.Millisecond)
+	if err != nil {
+		t.Skipf("local MinIO not reachable, skipping live health test: %v", err)
+	}
+	c.Close()
+}
+
 func TestRedisHealthCheck(t *testing.T) {
+	requireLocalBackends(t)
 	cfg := Config{
 		RedisURL: "127.0.0.1:6379",
 		MinIOURL: "http://127.0.0.1:9000",
@@ -42,6 +71,7 @@ func TestRedisHealthCheck(t *testing.T) {
 }
 
 func TestMinIOHealthCheck(t *testing.T) {
+	requireLocalBackends(t)
 	cfg := Config{
 		RedisURL: "127.0.0.1:6379",
 		MinIOURL: "http://127.0.0.1:9000",
@@ -155,6 +185,7 @@ func TestFUSEDebounceAlternatingNeverDegrades(t *testing.T) {
 }
 
 func TestStatusReturnsCorrectState(t *testing.T) {
+	requireLocalBackends(t)
 	cfg := Config{
 		RedisURL: "127.0.0.1:6379",
 		MinIOURL: "http://127.0.0.1:9000",
