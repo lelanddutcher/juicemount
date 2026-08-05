@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "register-conflict.schema.json",
+  "title": "POST /derivatives/register — 409 Conflict body",
+  "description": "A discriminated conflict. The route returns 409 for seven distinct conditions whose remedies contradict one another, so the status code alone is not actionable: `code` selects the remedy and `retryable` says whether repeating the IDENTICAL request can succeed. Added at VERSION 3 in answer to the 409-DISCRIMINATOR ask. Additive — the status code is unchanged, and a consumer that reads only the code and logs the body is unaffected.",
+  "type": "object",
+  "required": ["code", "retryable", "message"],
+  "properties": {
+    "code": {
+      "type": "string",
+      "enum": [
+        "synthetic_inode",
+        "blob_not_visible",
+        "blob_not_regular",
+        "blob_empty",
+        "source_unreadable",
+        "source_stale",
+        "producer_conflict"
+      ],
+      "description": "synthetic_inode: the inode is a transient pre-drain identifier (high bit set); re-resolve it, and if real_inode is set rewrite the blob under that inode's directory. blob_not_visible: the blob is not yet stat-able through the mount; the write may still be draining. blob_not_regular: something that is not a regular file occupies the reserved blob name; remove it. blob_empty: the blob is 0 bytes — the drainer creates the destination at its final name and then copies, so this is part of the drain window. source_unreadable: the source could not be stat'd through the mount. source_stale: live size/mtime disagree with the vouched values, so the derivative was computed against old bytes — RECOMPUTE it. producer_conflict: a farm-produced row already holds this kind and wins by precedence."
+    },
+    "retryable": {
+      "type": "boolean",
+      "description": "True only when repeating the IDENTICAL request unchanged may succeed. Conditions that require the consumer to change the request, rewrite the blob, or recompute the derivative are false even though the consumer must act on them. Notably synthetic_inode is FALSE: that branch is a pure function of the inode in the request body, so an unchanged retry can never take a different path."
+    },
+    "message": { "type": "string", "description": "Human-readable detail. Not stable; branch on `code`, never on this." },
+    "inode": { "type": "integer", "minimum": 0, "description": "The inode as supplied in the request." },
+    "real_inode": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "For synthetic_inode: the resolved backend inode, or 0 when the source has not reconciled yet. ALWAYS PRESENT (no omitempty) so a consumer can distinguish 'unresolved' (0) from 'field missing'."
+    },
+    "path": { "type": "string", "description": "Volume-relative source path, when known." }
+  },
+  "additionalProperties": false
+}

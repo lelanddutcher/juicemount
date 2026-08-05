@@ -17,7 +17,7 @@
     },
     "registered": {
       "type": "boolean",
-      "description": "true on a successful register (200). A stale-bytes register returns HTTP 409 with no body validated here."
+      "description": "true on a successful register (200). A conflicting register returns HTTP 409 with a discriminated body — see register-conflict.schema.json (VERSION 3)."
     },
     "derivative": {
       "type": "object",

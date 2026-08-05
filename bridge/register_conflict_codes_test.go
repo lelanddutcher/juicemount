@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -55,7 +58,8 @@ func TestRegisterConflictsCarryCodes(t *testing.T) {
 				writeBlob(t, tmp, ino, "poster.jpg", nil) // 0 bytes
 				return regBody(ino, "thumbnail", 2048, mt)
 			},
-			want: want{"blob_empty", false}, // retrying unchanged republishes 0 bytes
+			want: want{"blob_empty", true}, // the drainer creates at the final name then
+			// copies, so 0 bytes is a real part of the drain window (nfs/drainer.go:729/759)
 		},
 		{
 			name: "source_stale",
@@ -75,7 +79,46 @@ func TestRegisterConflictsCarryCodes(t *testing.T) {
 				writeBlob(t, tmp, ino, "poster.jpg", []byte("JPEG"))
 				return regBody(ino, "thumbnail", 2048, mt)
 			},
-			want: want{"synthetic_inode", true}, // resolves once reconciled
+			want: want{"synthetic_inode", false}, // the branch is a pure function of
+			// req.Inode, so an UNCHANGED retry always lands here; both remedies
+			// change the request. Offline files hold a synthetic inode forever.
+		},
+		{
+			name: "blob_not_regular",
+			setup: func(t *testing.T, tmp string, ms *metadata.Store) map[string]any {
+				ino, mt := seedSource(t, tmp, ms, "A/five.mov", 1_000_005, 2048)
+				d := filepath.Join(tmp, ".juicemount", "derivatives", itoa(ino))
+				if err := os.MkdirAll(filepath.Join(d, "poster.jpg"), 0o755); err != nil {
+					t.Fatal(err) // a DIRECTORY at the reserved blob name
+				}
+				return regBody(ino, "thumbnail", 2048, mt)
+			},
+			want: want{"blob_not_regular", false}, // retrying cannot un-directory it
+		},
+		{
+			name: "source_unreadable",
+			// Mirror row points at a path that is not there — the stale-mirror
+			// shape an out-of-band rename produces. Transient: reconcile fixes it.
+			setup: func(t *testing.T, tmp string, ms *metadata.Store) map[string]any {
+				ino, mt := seedSource(t, tmp, ms, "A/six.mov", 1_000_006, 2048)
+				writeBlob(t, tmp, ino, "poster.jpg", []byte("JPEG"))
+				if err := os.Remove(filepath.Join(tmp, "A/six.mov")); err != nil {
+					t.Fatal(err)
+				}
+				return regBody(ino, "thumbnail", 2048, mt)
+			},
+			want: want{"source_unreadable", true},
+		},
+		{
+			name: "producer_conflict",
+			setup: func(t *testing.T, tmp string, ms *metadata.Store) map[string]any {
+				ino, mt := seedSource(t, tmp, ms, "A/seven.mov", 1_000_007, 2048)
+				writeBlob(t, tmp, ino, "poster.jpg", []byte("JPEG"))
+				b := regBody(ino, "thumbnail", 2048, mt)
+				b["__seedFarmRow"] = true // handled by the runner below
+				return b
+			},
+			want: want{"producer_conflict", false}, // farm wins by precedence, not timing
 		},
 	}
 
@@ -94,6 +137,17 @@ func TestRegisterConflictsCarryCodes(t *testing.T) {
 			defer ds.Close()
 
 			body := tc.setup(t, tmp, ms)
+			if _, ok := body["__seedFarmRow"]; ok {
+				delete(body, "__seedFarmRow")
+				ino := body["inode"].(uint64)
+				blobRel, media := "poster.jpg", "image/jpeg"
+				if err := ds.PutDeriv(ino, derivatives.DerivRow{
+					Kind: "thumbnail", Status: "ready", Producer: "linux-farm",
+					Version: 1, BlobRelPath: &blobRel, MediaType: &media,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
 
 			globalMu.Lock()
 			oldS, oldD, oldF := globalStore, globalDerivStore, globalFUSEPath
@@ -137,20 +191,52 @@ func TestRegisterConflictsCarryCodes(t *testing.T) {
 // `code` would silently fall through to its default branch. Guards against a
 // later conflict being added in the old shape.
 func TestNoBareProse409sRemainInRegister(t *testing.T) {
-	src, err := os.ReadFile("cbridge.go")
+	// PARSE, don't grep. Adversarial review demonstrated with a compiled example
+	// that a substring check for ", http.StatusConflict)" scores ZERO on both of
+	// these, and gofmt keeps them that way:
+	//
+	//	http.Error(w, "long prose that pushes the status onto its own line",
+	//		http.StatusConflict)          // comma and const on different lines
+	//	http.Error(w, "prose", 409)       // numeric literal
+	//
+	// The numeric form is the dominant style in this very handler (400/404/500
+	// are all written as literals), so a maintainer adding a 409 in the local
+	// idiom would slip past a string scan and leave a consumer's switch falling
+	// through to default.
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "cbridge.go", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Discriminate the two shapes precisely:
-	//   http.Error(w, "prose", http.StatusConflict)  -> ", http.StatusConflict)"  BARE
-	//   w.WriteHeader(http.StatusConflict)           -> "(http.StatusConflict)"   fine
-	// The WriteHeader form is what writeRegisterConflict itself uses, and what a
-	// couple of unrelated routes use; only the http.Error tail is the shape that
-	// leaves a consumer switching on `code` with nothing to switch on.
-	if n := bytes.Count(src, []byte(", http.StatusConflict)")); n != 0 {
-		t.Errorf("%d bare-prose 409 site(s) remain (http.Error(..., http.StatusConflict)) — "+
-			"use writeRegisterConflict so the condition carries a code and a retryable flag", n)
+	is409 := func(e ast.Expr) bool {
+		switch v := e.(type) {
+		case *ast.BasicLit:
+			return v.Kind == token.INT && v.Value == "409"
+		case *ast.SelectorExpr:
+			pkg, ok := v.X.(*ast.Ident)
+			return ok && pkg.Name == "http" && v.Sel.Name == "StatusConflict"
+		}
+		return false
 	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) != 3 {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Error" {
+			return true
+		}
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "http" {
+			return true
+		}
+		if is409(call.Args[2]) {
+			t.Errorf("%s: bare-prose 409 via http.Error — use writeRegisterConflict so the "+
+				"condition carries a code and a retryable flag",
+				fset.Position(call.Pos()))
+		}
+		return true
+	})
 }
 
 func seedSource(t *testing.T, tmp string, ms *metadata.Store, rel string, ino uint64, size int) (uint64, int64) {

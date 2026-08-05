@@ -1,6 +1,7 @@
 package derivatives
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,6 +45,16 @@ import (
 //
 // `root` is the trust anchor and is NOT itself walked: pass a path you control
 // (the mount point), not one assembled from request data.
+// ErrNotRegular marks "the path exists but is not a regular file" — a symlink,
+// FIFO, directory or device planted at a reserved blob name.
+//
+// It must be distinguishable from an ordinary stat failure. A stat failure on
+// this path is usually the spool drain not having landed yet and is TRANSIENT;
+// a non-regular file is PERMANENT — retrying cannot change it, the consumer has
+// to remove it and rewrite. Collapsing the two told a consumer to keep retrying
+// against its own symlink until the budget ran out.
+var ErrNotRegular = errors.New("derivative blob is not a regular file")
+
 func OpenRegularUnder(root, rel string) (*os.File, error) {
 	// Clean through an absolute form so "..", ".", and doubled separators cannot
 	// escape upward, then strip the anchor.
@@ -85,7 +96,7 @@ func OpenRegularUnder(root, rel string) (*os.File, error) {
 	}
 	if !fi.Mode().IsRegular() {
 		f.Close()
-		return nil, fmt.Errorf("refusing non-regular derivative %q (mode %s)", clean, fi.Mode())
+		return nil, fmt.Errorf("refusing non-regular derivative %q (mode %s): %w", clean, fi.Mode(), ErrNotRegular)
 	}
 	return f, nil
 }
@@ -131,7 +142,7 @@ func StatRegularUnder(root, rel string) (os.FileInfo, error) {
 	// AT_SYMLINK_NOFOLLOW makes this the LINK's own mode, so a symlink shows up
 	// as a symlink here rather than as whatever it points at.
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil, fmt.Errorf("refusing non-regular derivative %q (mode %#o)", clean, st.Mode&unix.S_IFMT)
+		return nil, fmt.Errorf("refusing non-regular derivative %q (mode %#o): %w", clean, st.Mode&unix.S_IFMT, ErrNotRegular)
 	}
 	return &statInfo{name: leaf, size: st.Size, mode: os.FileMode(st.Mode & 0o777),
 		mtime: time.Unix(st.Mtim.Sec, st.Mtim.Nsec)}, nil

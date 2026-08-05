@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -24,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -3670,8 +3672,26 @@ type registerConflict struct {
 	// RealInode is the resolved backend inode when the server could determine
 	// it, so the consumer can place the blob correctly on the next attempt
 	// rather than re-registering into an empty derivative directory.
-	RealInode uint64 `json:"real_inode,omitempty"`
+	RealInode uint64 `json:"real_inode"`
 	Path      string `json:"path,omitempty"`
+}
+
+// statErrRetryable partitions a source-stat failure into transient vs permanent.
+//
+// Calling EVERY stat failure permanent discards contributions that would have
+// succeeded moments later. entry.Path comes from the RAM mirror with no liveness
+// check, so an out-of-band rename (another client, the web UI, the farm) leaves
+// it stale until reconcile lands — that ENOENT clears itself. EIO/ENOTCONN/ENXIO
+// are transient mount trouble of the same character. A permission or shape error
+// is what genuinely cannot improve on retry.
+func statErrRetryable(err error) bool {
+	switch {
+	case errors.Is(err, os.ErrPermission), errors.Is(err, syscall.ENOTDIR),
+		errors.Is(err, syscall.ENAMETOOLONG), errors.Is(err, syscall.ELOOP):
+		return false
+	default:
+		return true
+	}
 }
 
 func writeRegisterConflict(w http.ResponseWriter, c registerConflict) {
@@ -3901,7 +3921,7 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeRegisterConflict(w, registerConflict{
 			Code:      "synthetic_inode",
-			Retryable: true,
+			Retryable: false,
 			Inode:     req.Inode,
 			RealInode: realInode,
 			Path:      srcPath,
@@ -3938,6 +3958,18 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	// so the two cannot disagree about what exists.
 	bfi, statErr := derivatives.StatRegularUnder(fusePath, derivatives.DerivBlobRel(req.Inode, rel))
 	if statErr != nil {
+		// A non-regular file at a reserved blob name is PERMANENT — retrying cannot
+		// change it; the consumer must remove it and rewrite. Reporting it as
+		// "still draining" made the consumer retry against its own symlink until
+		// the budget ran out.
+		if errors.Is(statErr, derivatives.ErrNotRegular) {
+			writeRegisterConflict(w, registerConflict{
+				Code: "blob_not_regular", Retryable: false, Inode: req.Inode,
+				Message: fmt.Sprintf("blob %q exists but is not a regular file (%v) — remove it and "+
+					"write a regular file; retrying cannot change this", rel, statErr),
+			})
+			return
+		}
 		writeRegisterConflict(w, registerConflict{
 			Code: "blob_not_visible", Retryable: true, Inode: req.Inode,
 			Message: fmt.Sprintf("blob %q not present as a regular file under the derivative dir — "+
@@ -3956,10 +3988,12 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	// after writing, before the bytes are actually visible through the mount.
 	if bfi.Size() == 0 {
 		writeRegisterConflict(w, registerConflict{
-			Code: "blob_empty", Retryable: false, Inode: req.Inode,
+			Code: "blob_empty", Retryable: true, Inode: req.Inode,
 			Message: fmt.Sprintf("blob %q is 0 bytes — an empty blob would be served as a real answer "+
-				"instead of 404ing so the reader can regenerate. NOT retryable as-is: rewrite the "+
-				"bytes, then register again.", rel),
+				"instead of 404ing so the reader can regenerate. RETRYABLE with THIS inode: the "+
+				"drainer creates the destination at its final name and then copies into it, so a blob "+
+				"is legitimately 0 bytes for part of the drain window. Let the write land, then "+
+				"register.", rel),
 		})
 		return
 	}
@@ -3971,7 +4005,8 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	fi, err := os.Stat(src)
 	if err != nil {
 		writeRegisterConflict(w, registerConflict{
-			Code: "source_unreadable", Retryable: false, Inode: req.Inode, Path: entry.Path,
+			Code: "source_unreadable", Retryable: statErrRetryable(err), Inode: req.Inode,
+			Path:    entry.Path,
 			Message: "source unreadable through the mount: " + err.Error(),
 		})
 		return

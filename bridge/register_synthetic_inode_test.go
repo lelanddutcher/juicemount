@@ -116,14 +116,29 @@ func TestRegisterSyntheticInodeNeverMintsARow(t *testing.T) {
 	var c struct {
 		Code      string `json:"code"`
 		Retryable bool   `json:"retryable"`
+		RealInode *int64 `json:"real_inode"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &c); err != nil {
 		t.Fatalf("409 body is not JSON (%v) — with six distinct 409 conditions on this "+
 			"route the consumer cannot pick a remedy without a discriminator; body=%s",
 			err, rr.Body.String())
 	}
-	if c.Code != "synthetic_inode" || !c.Retryable {
-		t.Errorf("409 body = %+v, want code=synthetic_inode retryable=true", c)
+	// retryable=FALSE deliberately. The branch is a pure function of req.Inode,
+	// which comes from the request body, so an UNCHANGED retry lands here every
+	// time — and an offline-created file holds a synthetic inode indefinitely.
+	// Both remedies (re-resolve the inode; move the blob) change the request.
+	// Marking it retryable made the consumer burn its whole budget on a request
+	// whose outcome cannot change, and risked swallowing real_inode — the one
+	// actionable field — inside a body its generic retry loop treats as transient.
+	// real_inode must be PRESENT even when unresolved (0). It is documented to
+	// the consumer as "real_inode":0, and `omitempty` on a uint64 would drop the
+	// key entirely — the consumer already had a near-miss reading this as nil.
+	if c.RealInode == nil {
+		t.Error("real_inode key is absent from the 409 body — it is documented as present " +
+			"with value 0 when unresolved; omitempty would silently drop it")
+	}
+	if c.Code != "synthetic_inode" || c.Retryable {
+		t.Errorf("409 body = %+v, want code=synthetic_inode retryable=false", c)
 	}
 }
 
