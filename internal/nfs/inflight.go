@@ -7,6 +7,7 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,12 +51,64 @@ var inflightDumpAfter = func() time.Duration {
 	return 22 * time.Second
 }()
 
+// inflightDumpDir must OUTLIVE A REBOOT.
+//
+// This defaulted to /tmp/jm_dumps, which macOS clears on boot. The dump is
+// written precisely when the mount is wedging — i.e. in the minutes before the
+// machine may panic or be force-restarted — so the one moment the stack traces
+// matter is the one moment they are guaranteed to be gone.
+//
+// That is not hypothetical: on 2026-08-05 twelve dumps were written while NFS
+// reads sat in-flight for 592s, the box panicked, and every one of them
+// evaporated in the reboot. The stalled-goroutine stacks — the only direct
+// evidence of WHERE the read was blocked — were lost.
+//
+// ~/Library/Logs/JuiceMount sits beside juicemount.log, which is where an
+// operator already looks and which survives a restart.
 var inflightDumpDir = func() string {
 	if d := os.Getenv("JM_INFLIGHT_DUMP_DIR"); d != "" {
 		return d
 	}
-	return "/tmp/jm_dumps"
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, "Library", "Logs", "JuiceMount", "stall-dumps")
+	}
+	return "/tmp/jm_dumps" // last resort: better than not dumping at all
 }()
+
+// pruneStallDumps keeps the dump directory bounded. Persisting dumps across
+// reboots means they accumulate, and an unbounded debug directory on the boot
+// disk is its own failure — this system already fights for free space (the
+// spool and the JuiceFS cache share the SSD). Keeps the newest maxStallDumps.
+const maxStallDumps = 40
+
+func pruneStallDumps(dir string) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type fi struct {
+		name string
+		mod  time.Time
+	}
+	var files []fi
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "inflight_stall_") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fi{e.Name(), info.ModTime()})
+	}
+	if len(files) <= maxStallDumps {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
+	for _, f := range files[maxStallDumps:] {
+		_ = os.Remove(filepath.Join(dir, f.name))
+	}
+}
 
 // inflightRegister records an in-flight RPC and returns its id. The watchdog is
 // started lazily on first use so no explicit wiring is needed.
@@ -173,6 +226,7 @@ func inflightWatchdog() {
 			op, age.Seconds(), count, time.Now().Format(time.RFC3339))
 		_ = pprof.Lookup("goroutine").WriteTo(f, 2)
 		_ = f.Close()
+		pruneStallDumps(inflightDumpDir)
 		Log.Errorf("INFLIGHT-STALL: goroutine dump written to %s", fn)
 	}
 }
