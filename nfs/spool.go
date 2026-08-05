@@ -201,37 +201,39 @@ func spoolDiskAvail(dir string) (int64, error) {
 	}
 }
 
-// AutoSpoolCapacity is the default spool capacity when JM_SPOOL_SIZE_GB is
-// unset: free disk minus the floor, so the spool sizes to the machine instead
-// of a fixed 50 GiB that a large SD-card offload (e.g. an 87 GB RAW shoot)
-// would overflow mid-copy. Falls back to 50 GiB if Statfs fails, and never
-// returns below 8 GiB. Callers pass the result as NewSpoolStore's capacity.
+// AutoSpoolCapacityBudget is the LOGICAL budget used when the user has not set
+// an explicit spool size. It is deliberately far larger than any disk: in Auto
+// mode the real bound is the LIVE ceiling (effectiveCapacity → cachedCeiling →
+// spoolHeadroomBytes), which tracks free disk plus reclaimable JuiceFS cache and
+// moves in BOTH directions.
+const AutoSpoolCapacityBudget = int64(1) << 50 // 1 PiB
+
+// failOpenMaxBytes bounds the fail-open path. `effectiveCapacity` deliberately
+// fails OPEN when free disk is unreadable — an unreadable statfs is not a full
+// disk — but with an Auto budget of 1 PiB, "open" would mean unlimited. When we
+// cannot see the disk we admit a conservative amount instead of everything.
+const failOpenMaxBytes = int64(8) << 30 // 8 GiB
+
+// AutoSpoolCapacity is the default spool capacity when JM_SPOOL_SIZE_GB and the
+// preference are unset.
 //
-// KNOWN GAP (found while implementing B-1, 2026-08-04). This is still a STARTUP
-// SNAPSHOT of free disk, and effectiveCapacity only ever takes min(configured,
-// live ceiling) — so it caps admission from above no matter how much headroom
-// the live ceiling gains. On the machine where the cache-vs-spool bug was
-// measured (25.8 GiB free) this returns the 8 GiB minimum, and a 40 GB camera
-// file is STILL refused even though refreshCeiling now offers ~104 GiB of
-// headroom from the reclaimable cache. B-1 is necessary but not sufficient on
-// exactly the low-disk machines it targets.
+// IT IS NO LONGER A DISK SNAPSHOT (2026-08-04). It used to return
+// max(8 GiB, avail - SpoolFreeFloorBytes) sampled once at boot, and that value
+// became s.capacity for the process lifetime. Because effectiveCapacity is
+// min(capacity, ceiling), a boot on a low-disk machine pinned the budget at the
+// 8 GiB floor — so the reclaimable-cache headroom (spool_headroom.go) could
+// raise the live ceiling to ~100 GiB and a 40 GB camera file would STILL be
+// refused, bounded by a number sampled when the app happened to start.
 //
-// Deliberately unchanged here: the spool's total is contract-visible (/spool
-// `total`, consumed by OpenLoupe) and this function runs at boot, before
-// pin.CapacityLoop has published a verdict, so simply routing it through
-// spoolHeadroomBytes would be a no-op at the only moment it is called. The real
-// fix is to stop baking free disk into `capacity` at all — the same one-way
-// ratchet NewSpoolStore's clamp was removed for just above.
+// That is the same one-way ratchet removed from NewSpoolStore in b77df6c, one
+// level up: a startup snapshot cannot recover, and Auto mode has no business
+// carrying a disk-derived number at all. In Auto the live ceiling IS the policy,
+// so the configured value gets out of its way.
+//
+// An EXPLICIT user budget is still honoured exactly as before — it is a ceiling
+// the user chose, and effectiveCapacity clamps it live on top.
 func AutoSpoolCapacity(dir string) int64 {
-	avail, err := spoolDiskAvail(dir)
-	if err != nil || avail <= 0 {
-		return int64(50) << 30
-	}
-	c := avail - SpoolFreeFloorBytes
-	if c < int64(8)<<30 {
-		c = int64(8) << 30
-	}
-	return c
+	return AutoSpoolCapacityBudget
 }
 
 // NewSpoolStore creates the spool root if it doesn't exist and returns an
@@ -502,7 +504,19 @@ func (s *SpoolStore) effectiveCapacity() int64 {
 	}
 	ceiling, ok := s.cachedCeiling()
 	if !ok {
-		return s.capacity // fail open: an unreadable statfs is not a full disk
+		// Fail OPEN — an unreadable statfs is not a full disk. An EXPLICIT user
+		// budget is returned in full, unchanged: the user chose that number and
+		// losing sight of the disk is not a reason to override them.
+		//
+		// The AUTO budget is the exception, and only because it is a sentinel
+		// rather than a real limit: at 1 PiB an unbounded fail-open would mean
+		// "unlimited" at exactly the moment we cannot see the disk. In Auto the
+		// live ceiling IS the policy, so with no ceiling there is no policy —
+		// admit a conservative amount instead of everything.
+		if s.capacity == AutoSpoolCapacityBudget {
+			return failOpenMaxBytes
+		}
+		return s.capacity
 	}
 	if s.capacity < ceiling {
 		return s.capacity

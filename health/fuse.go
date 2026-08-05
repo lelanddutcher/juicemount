@@ -368,6 +368,13 @@ func (fm *FUSEManager) Mount() error {
 		// an already-stricter configured ratio.
 		if ratioArg, replace := resolveFreeSpaceRatioArg(fm.cfg.FreeSpaceRatio, total); replace {
 			fm.cfg.FreeSpaceRatio = ratioArg
+			// PUBLISH the floor we are actually mounting with. The pin capacity
+			// verdict used to read a hard-coded 10 GiB, so once this ratio moved
+			// the floor to ~30 GiB the verdict OVER-stated sustainable capacity by
+			// the difference — the over-capacity banner under-warned, and
+			// IsOverCapacity() gates the prefetcher re-warm, so the futile-churn
+			// guard released late. Both errors were in the unsafe direction.
+			pin.SetCacheFreeFloorBytes(int64(resolveFreeSpaceRatio(total) * float64(total)))
 			jmlog.Info("free-space-ratio derived to keep the JuiceFS eviction floor above the spool floor",
 				"ratio", ratioArg,
 				"keeps_free_gb", int64(resolveFreeSpaceRatio(total)*float64(total))>>30,
@@ -1933,7 +1940,6 @@ func MetaURLForMount(redisURL string) string {
 	u.Host = addr
 	return u.String()
 }
-
 
 // openCacheTTL returns the --open-cache duration to pass, or "" to omit the
 // flag entirely (juicefs default 0s = disabled = today's behavior). See the

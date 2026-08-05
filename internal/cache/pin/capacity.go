@@ -34,22 +34,40 @@ import (
 // The space actually usable BY the cache is therefore
 // (current free) + (bytes the cache already occupies) − floor.
 //
-// KNOWN DIVERGENCE (B-2, 2026-08-04), deliberately not fixed here. JuiceFS's
-// actual runtime floor is no longer 10 GiB: health.resolveFreeSpaceRatio now
-// derives --free-space-ratio so the eviction floor sits ABOVE the write spool's
-// 20 GiB admission floor (30 GiB on a typical disk), because otherwise the spool
-// always blocked first and the cache never yielded its space. This constant was
-// NOT raised to match, so the verdict below OVER-states sustainable capacity by
-// the difference (~20 GiB) and therefore UNDER-warns about an over-capacity pin
-// set — and IsOverCapacity() gates the prefetcher's re-warm, so the futile-churn
-// guard is correspondingly late.
+// The floor is DERIVED AT MOUNT TIME and published here, because it is no longer
+// a constant: health.resolveFreeSpaceRatio sets --free-space-ratio so JuiceFS's
+// eviction floor sits ABOVE the write spool's 20 GiB admission floor (~30 GiB on
+// a typical disk). Otherwise the spool always blocked first and the cache never
+// yielded a byte — which is the whole premise of counting reclaimable cache as
+// spool headroom.
 //
-// The correct fix is to publish the derived floor the way SetCacheBudgetBytes
-// publishes the derived cache budget (health/fuse.go calls it at mount time) and
-// have evaluateCapacity use that instead of this constant. Left out of the B-1/
-// B-2 change because it alters a shipped user-visible verdict (the over-capacity
-// banner) and the prefetcher gate, which want their own tests and a live pass.
-const CacheFreeFloorBytes = int64(10) << 30 // 10 GiB
+// Reading the stale 10 GiB here OVER-stated sustainable capacity by the
+// difference, so the over-capacity banner UNDER-warned and IsOverCapacity() —
+// which gates the prefetcher's re-warm — released the futile-churn guard late.
+// Both errors were in the unsafe direction.
+const CacheFreeFloorBytesDefault = int64(10) << 30 // 10 GiB, pre-derivation
+
+// cacheFreeFloorBytes is the LIVE floor, published by health at mount time via
+// SetCacheFreeFloorBytes. Zero means "not yet published" and reads fall back to
+// the default, so a verdict computed before the mount is no worse than before.
+var cacheFreeFloorBytes atomic.Int64
+
+// SetCacheFreeFloorBytes publishes the free-space floor JuiceFS was actually
+// mounted with. Mirrors SetCacheBudgetBytes.
+func SetCacheFreeFloorBytes(b int64) {
+	if b < 0 {
+		b = 0
+	}
+	cacheFreeFloorBytes.Store(b)
+}
+
+// CacheFreeFloorBytes returns the live floor, or the default if none published.
+func CacheFreeFloorBytes() int64 {
+	if v := cacheFreeFloorBytes.Load(); v > 0 {
+		return v
+	}
+	return CacheFreeFloorBytesDefault
+}
 
 // capacityFlapMarginBytes is hysteresis so the verdict doesn't toggle on/off as
 // free space jitters by a few hundred MB during normal use. The pinned set must
@@ -203,7 +221,7 @@ func evaluateCapacity(v *CapacityVerdict) {
 	// The cache can sustainably hold what's free now PLUS what it already
 	// occupies (JuiceFS reuses its own blocks via LRU), minus the floor it must
 	// keep free on the volume.
-	capacity := v.DiskFreeBytes + v.CacheUsageBytes - CacheFreeFloorBytes
+	capacity := v.DiskFreeBytes + v.CacheUsageBytes - CacheFreeFloorBytes()
 	if capacity < 0 {
 		capacity = 0
 	}
