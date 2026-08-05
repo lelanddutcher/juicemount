@@ -40,9 +40,16 @@ func TestContributableKindsMatchTheReservedFilenames(t *testing.T) {
 	if ai, ok := contributableKinds["ai"]; !ok || ai.file != "" {
 		t.Errorf(`kind "ai" must keep file=="" so ResolveAIBlobName picks logger/loupe; got %+v`, ai)
 	}
-	// filmstrip stays CLOSED until its reader contract is specified.
-	if _, ok := contributableKinds["filmstrip"]; ok {
-		t.Error("filmstrip must NOT be consumer-registrable — its reader contract (canvas, gutters, orientation) is unspecified")
+	// filmstrip is OPEN as of 2026-08-05 — it was withheld only because its
+	// reader contract was unspecified, and that has now been written down and is
+	// ENFORCED at register (validateFilmstripGeometry). The kind being open is
+	// therefore conditional on the geometry gate existing; see
+	// TestFilmstripRequiresValidGeometry.
+	if fs, ok := contributableKinds["filmstrip"]; !ok || fs.file != "strip.jpg" {
+		t.Errorf(`kind "filmstrip" must be registrable with file "strip.jpg"; got %+v ok=%v`, fs, ok)
+	}
+	if ap, ok := contributableKinds["audio_proxy"]; !ok || ap.file != "audio_proxy.mp4" {
+		t.Errorf(`kind "audio_proxy" must be registrable with file "audio_proxy.mp4"; got %+v ok=%v`, ap, ok)
 	}
 }
 
@@ -239,10 +246,61 @@ func TestRegisterWidenedKindsEndToEnd(t *testing.T) {
 		}
 	})
 
-	t.Run("a kind outside the table is refused", func(t *testing.T) {
+	// A filmstrip is only renderable by another client if its geometry is
+	// present and coherent — which is the whole reason the kind was withheld
+	// until the contract was written. The gate is what makes opening it safe.
+	t.Run("filmstrip requires valid geometry", func(t *testing.T) {
+		writeBlob("strip.jpg")
+		good := map[string]any{"filmstrip": map[string]any{
+			"frame_count": 36, "cols": 12, "rows": 3,
+			"cell_w": 320, "cell_h": 180, "interval_ms": 1000, "duration_ms": 36000}}
+
 		if rr := post(req("filmstrip", nil)); rr.Code != 400 {
-			t.Errorf("filmstrip: status %d, want 400 — it is deliberately withheld", rr.Code)
+			t.Errorf("filmstrip with NO geometry: status %d, want 400 — a strip without it "+
+				"is an image no client can index into", rr.Code)
 		}
+		for name, geo := range map[string]map[string]any{
+			"cols zero (divide-by-zero in i%%cols)": {"frame_count": 4, "cols": 0, "rows": 2, "cell_w": 16, "cell_h": 9, "interval_ms": 1000},
+			"frames exceed the grid":                {"frame_count": 99, "cols": 2, "rows": 2, "cell_w": 16, "cell_h": 9, "interval_ms": 1000},
+			"interval_ms zero":                      {"frame_count": 4, "cols": 2, "rows": 2, "cell_w": 16, "cell_h": 9, "interval_ms": 0},
+			"absurd grid":                           {"frame_count": 1, "cols": 999999, "rows": 999999, "cell_w": 16, "cell_h": 9, "interval_ms": 1000},
+		} {
+			if rr := post(req("filmstrip", map[string]any{"filmstrip": geo})); rr.Code != 400 {
+				t.Errorf("filmstrip with %s: status %d, want 400", name, rr.Code)
+			}
+		}
+		rr := post(req("filmstrip", good))
+		if rr.Code != 200 {
+			t.Fatalf("filmstrip with valid geometry: status %d, body %s", rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+		d := resp["derivative"].(map[string]any)
+		if d["media_type"] != "image/jpeg" {
+			t.Errorf("filmstrip media_type = %v, want image/jpeg (server-assigned)", d["media_type"])
+		}
+		if d["filmstrip"] == nil {
+			t.Error("geometry not echoed on the row — a reader needs it to index cells")
+		}
+	})
+
+	t.Run("audio_proxy is registrable with a declared codec", func(t *testing.T) {
+		writeBlob("audio_proxy.mp4")
+		if rr := post(req("audio_proxy", nil)); rr.Code != 400 {
+			t.Errorf("audio_proxy with no codec: status %d, want 400", rr.Code)
+		}
+		rr := post(req("audio_proxy", map[string]any{"codec": "aac"}))
+		if rr.Code != 200 {
+			t.Fatalf("audio_proxy with aac: status %d, body %s", rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+		if mt := resp["derivative"].(map[string]any)["media_type"]; mt != "audio/mp4" {
+			t.Errorf("audio_proxy media_type = %v, want audio/mp4", mt)
+		}
+	})
+
+	t.Run("a kind outside the table is refused", func(t *testing.T) {
 		if rr := post(req("tech", nil)); rr.Code != 400 {
 			t.Errorf("tech: status %d, want 400 — server-only kind", rr.Code)
 		}

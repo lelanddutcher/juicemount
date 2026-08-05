@@ -5,28 +5,217 @@
   "description": "POST /derivatives/register — the on-device AI contribute-back (OL-1). A consumer that computed expensive, identity-bearing AI on-device (Apple FeaturePrint/Vision embeddings, faces, OCR, Speech transcripts, auto-tags, aesthetics — the LoupeJSON `ai` block) FIRST writes the blob through the mount to <nas_root>/.juicemount/derivatives/<inode>/ai.loupe.json (it has write access), THEN calls this to make the server index it so every other client + the web UI reuses it. SUPERSEDED by REGISTER-ROUTE (2026-08-04): this route is no longer AI-only. A consumer may commit `ai`, `proxy`, `thumbnail` and `waveform` blobs it generated on-device. `tech` remains server-only (it is ffprobe output, not an artifact), and `filmstrip` is withheld until its reader contract is specified. Requires the `contribute-derivatives` capability token. The server is the source-hash authority: the consumer cannot compute the contract xxh3 (it uses xxh64), so it VOUCHES with source_size+source_mtime (the live stat it computed the AI against); the server re-stats and accepts ONLY on a size+mtime match (else 409 — the AI was computed against stale bytes), then stamps the canonical xxh3 itself.\n\nREQUEST body (application/json): { inode:int, kind:\"ai\"|\"proxy\"|\"thumbnail\"|\"waveform\", producer:\"on-device\"|\"macos-node\", model:string, dim:int, source_size:int, source_mtime:int, blob_rel_path:string }. REGISTER-ROUTE (2026-08-04): blob_rel_path MUST equal the reserved filename for the kind (WRITE_PLACEMENT §2) or the request is rejected 400 — the consumer does not choose a path inside the provider namespace; for kind==ai it may be omitted and is resolved to whichever of ai.logger.json / ai.loupe.json is on disk. The blob MUST already exist: the server stats it and returns 409 if absent, so a row is never minted for a blob that is not there (WRITE_PLACEMENT §4 — the row is the commit point). The size/mtime vouch and the server-side re-stat apply to every kind, not just ai.\n\nThis document is the 200 RESPONSE.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["inode", "registered", "derivative"],
+  "required": [
+    "inode",
+    "registered",
+    "derivative"
+  ],
   "properties": {
-    "inode": { "type": "integer", "description": "Echo of the registered asset's JuiceFS inode." },
-    "registered": { "type": "boolean", "description": "true on a successful register (200). A stale-bytes register returns HTTP 409 with no body validated here." },
+    "inode": {
+      "type": "integer",
+      "description": "Echo of the registered asset's JuiceFS inode."
+    },
+    "registered": {
+      "type": "boolean",
+      "description": "true on a successful register (200). A stale-bytes register returns HTTP 409 with no body validated here."
+    },
     "derivative": {
       "type": "object",
       "additionalProperties": false,
       "description": "The manifest row the server wrote — identical shape to a derivatives.schema.json entry. The server stamped source_hash (its own xxh3), updated_at, and status:ready.",
-      "required": ["kind", "status", "producer", "version", "hash", "blob_rel_path", "media_type", "updated_at"],
+      "required": [
+        "kind",
+        "status",
+        "producer",
+        "version",
+        "hash",
+        "blob_rel_path",
+        "media_type",
+        "updated_at"
+      ],
       "properties": {
-        "kind": { "enum": ["ai", "proxy", "thumbnail", "waveform"], "description": "WIDENED by REGISTER-ROUTE (2026-08-04) from const \"ai\". A consumer may now commit a proxy, poster or waveform it generated on-device, not only AI. `filmstrip` is deliberately NOT here: its reader contract (minimum canvas, zero-gutter cell origin, upright-as-displayed, undefined trailing cells) is unspecified, so an edge-written strip is not yet safely renderable by another client. REQUIRES the `contribute-derivatives` capability token — the historical `contribute` token means AI-only and an older provider advertises it identically, so feature-detect on the new one." },
-        "status": { "const": "ready" },
-        "producer": { "enum": ["on-device", "macos-node"], "description": "Who computed it. on-device = Apple frameworks / BYO cloud key on a Mac." },
-        "version": { "type": "integer", "minimum": 1 },
-        "hash": { "type": ["string", "null"], "description": "The server's canonical xxh3 of the source (== source_hash). On-device consumers verify with size/mtime, not this; an xxh3-capable client/web UI can verify by hash." },
-        "blob_rel_path": { "enum": ["ai.logger.json", "ai.loupe.json", "proxy.mp4", "poster.jpg", "waveform.json"], "description": "Volume-relative under /.juicemount/derivatives/<inode>/. The consumer wrote the bytes; the server only indexes the row. WIDENED from const \"ai.loupe.json\" for the coordinated loupe->logger cutover (2026-08-03): both names are ACCEPTED indefinitely. A provider advertising `wire_terms:\"logger/1\"` in /whoami WRITES `ai.logger.json`; it still reads and indexes either. Consumers may send either — prefer `ai.logger.json` once the provider advertises the flag." },
-        "media_type": { "enum": ["application/json", "video/mp4", "image/jpeg"], "description": "WIDENED with REGISTER-ROUTE. ASSIGNED BY THE SERVER FROM `kind`, never echoed from the request — ai/waveform => application/json, proxy => video/mp4, poster => image/jpeg. This is deliberate: /blob pins its response Content-Type from this row field, so a contributor-supplied media_type would be a contributor-controlled Content-Type served from the control-plane origin." },
-        "model": { "type": ["string", "null"], "description": "Embedding model id+version so kNN partitions by space (e.g. apple-featureprint-v1 vs the portable openclip-vit-b32-v1)." },
-        "dim": { "type": ["integer", "null"], "description": "Embedding dimensionality." },
-        "updated_at": { "type": "integer" },
-        "source_size": { "type": ["integer", "null"], "description": "The server's authoritative (re-stat'd) source size in bytes — echoes the vouched value on accept, so any client's read-gate can stat-verify off the manifest." },
-        "source_mtime": { "type": ["integer", "null"], "description": "The server's authoritative (re-stat'd) source mtime (unix seconds)." }
+        "kind": {
+          "enum": [
+            "ai",
+            "proxy",
+            "audio_proxy",
+            "thumbnail",
+            "filmstrip",
+            "waveform"
+          ],
+          "description": "WIDENED AGAIN 2026-08-05: filmstrip and audio_proxy are now registrable, so EVERY blob-bearing kind can be contributed. filmstrip was previously withheld because its reader contract was unspecified; that contract is now written down AND ENFORCED at register (see `filmstrip`), so a strip that reaches the index is renderable by any client by definition. `tech` remains server-only (it is ffprobe output, not an artifact) and `ai` left the derivative store entirely by founder ruling 2026-08-04 — the document belongs in the clip sidecar, which has a real per-field CRDT, not in a namespace whose contract is 'rebuildable, safe to purge'."
+        },
+        "status": {
+          "const": "ready"
+        },
+        "producer": {
+          "enum": [
+            "on-device",
+            "macos-node"
+          ],
+          "description": "Who computed it. on-device = Apple frameworks / BYO cloud key on a Mac."
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The server's canonical xxh3 of the source (== source_hash). On-device consumers verify with size/mtime, not this; an xxh3-capable client/web UI can verify by hash."
+        },
+        "blob_rel_path": {
+          "enum": [
+            "ai.logger.json",
+            "ai.loupe.json",
+            "proxy.mp4",
+            "audio_proxy.mp4",
+            "poster.jpg",
+            "strip.jpg",
+            "waveform.json"
+          ],
+          "description": "Volume-relative under /.juicemount/derivatives/<inode>/. Reserved per kind and NOT chooseable by the contributor — a mismatch is 400."
+        },
+        "media_type": {
+          "enum": [
+            "application/json",
+            "video/mp4",
+            "audio/mp4",
+            "image/jpeg"
+          ],
+          "description": "ASSIGNED BY THE SERVER FROM `kind`, never echoed from the request: /blob pins its response Content-Type from this field, so a contributor-supplied value would be a contributor-controlled Content-Type served from the control-plane origin. ai/waveform => application/json, proxy => video/mp4, audio_proxy => audio/mp4, thumbnail/filmstrip => image/jpeg."
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Embedding model id+version so kNN partitions by space (e.g. apple-featureprint-v1 vs the portable openclip-vit-b32-v1)."
+        },
+        "dim": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Embedding dimensionality."
+        },
+        "updated_at": {
+          "type": "integer"
+        },
+        "source_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "The server's authoritative (re-stat'd) source size in bytes — echoes the vouched value on accept, so any client's read-gate can stat-verify off the manifest."
+        },
+        "source_mtime": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "The server's authoritative (re-stat'd) source mtime (unix seconds)."
+        },
+        "codec": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "h264",
+            "hevc",
+            "av1",
+            "aac",
+            "opus",
+            null
+          ],
+          "description": "REQUIRED on the REQUEST for kind proxy/audio_proxy, and DECLARATIVE rather than gated (founder decision 2026-08-04, superseding the H.264 floor). A node contributes what it CAN do; the fleet's output is the union, not the intersection, and a codec floor lets the least capable node set the ceiling for every node. Any value in this enum is accepted; a value OUTSIDE it is refused, because a codec a reader cannot RECOGNISE is worse than one it cannot decode — it cannot even choose. Still required because an ABSENT codec is defined as h264, so silence mislabels a richer codec rather than describing it."
+        },
+        "codec_string": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256,
+          "description": "Exact MediaSource.isTypeSupported / canPlayType token, e.g. avc1.640028 or hvc1.1.6.L93.B0. Echoed from the request; the reader checks the row before fetching."
+        },
+        "width": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "ARTIFACT DESCRIPTOR (2026-08-04). Pixel width for thumbnail/proxy/audio_proxy/filmstrip. Lets a server rank a contributed artifact WITHOUT decoding it, so a cheap one can be earmarked for upgrade by a more capable node or the farm. Distinct from `dim`, which is embedding dimensionality. Rejected 400 on a kind where pixels are not meaningful."
+        },
+        "height": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Pixel height. See `width`."
+        },
+        "bitrate_bps": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "ARTIFACT DESCRIPTOR. Encoded bitrate for proxy/audio_proxy only. Together with width/height it makes an upgrade policy a comparison rather than a decode — blob_size alone is a bad quality proxy, since a flat LOG-graded 720 frame can encode smaller than a busy 320."
+        },
+        "filmstrip": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "REQUIRED for kind==filmstrip, rejected 400 on any other kind. THE READER CONTRACT, enforced at register: LAYOUT row-major, origin TOP-LEFT, ZERO gutter — cell (r,c) occupies x=[c*cell_w,(c+1)*cell_w), y=[r*cell_h,(r+1)*cell_h). CANVAS exactly cols*cell_w by rows*cell_h, no padding or border, so a cell rect is pure multiplication. ORIENTATION frames are stored UPRIGHT AS DISPLAYED; source rotation is already applied and a reader must NOT re-apply it. FRAME i is at row i/cols, col i%cols, for i in [0,frame_count). TRAILING cols*rows MAY exceed frame_count; cells at index >= frame_count are UNDEFINED and must not be rendered — ignoring this is what silently yields a duplicated or black last frame. TIME frame i covers [i*interval_ms,(i+1)*interval_ms) of a duration_ms source. Bounds: cols/rows 1..4096, cell_w/cell_h 1..8192, interval_ms >= 1, frame_count <= cols*rows.",
+          "properties": {
+            "frame_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "cols": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "cell_w": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8192
+            },
+            "cell_h": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8192
+            },
+            "interval_ms": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "duration_ms": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "frame_count",
+            "cols",
+            "rows",
+            "cell_w",
+            "cell_h",
+            "interval_ms"
+          ]
+        }
       }
     }
   }

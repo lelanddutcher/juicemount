@@ -3621,7 +3621,68 @@ var contributableKinds = map[string]contributableKind{
 	// consumer's own validation of /derivatives.
 	"thumbnail": {file: "poster.jpg", mediaType: "image/jpeg"},
 	"waveform":  {file: "waveform.json", mediaType: "application/json"},
+	// audio_proxy (A8): a small streamable stereo MP4 for audio-only assets, so
+	// a remote resolver can prefer it over a 2 GB original. Distinct from proxy
+	// because the PK is (inode, kind) and an asset may carry both.
+	"audio_proxy": {file: "audio_proxy.mp4", mediaType: "audio/mp4"},
+	// filmstrip: OPENED 2026-08-05. It was withheld because its reader contract
+	// was unspecified — an edge-written strip was not safely renderable by
+	// another client. That was a real gap and the answer is to SPECIFY it, not
+	// to keep the kind shut: see filmstripGeometryContract below, now enforced
+	// here and written into derivatives.schema.json.
+	"filmstrip": {file: "strip.jpg", mediaType: "image/jpeg"},
 }
+
+// filmstripGeometryContract is what a contributed strip must satisfy for any
+// other client to render it. Enforced at register, so a strip that reaches the
+// index is renderable by definition rather than by convention.
+//
+//	LAYOUT     row-major, origin TOP-LEFT, ZERO gutter. Cell (r,c) occupies
+//	           x=[c*cell_w,(c+1)*cell_w), y=[r*cell_h,(r+1)*cell_h).
+//	CANVAS     the image is EXACTLY cols*cell_w by rows*cell_h. No padding, no
+//	           border — a reader computes a cell rect by multiplication alone.
+//	ORIENTATION frames are stored UPRIGHT AS DISPLAYED. Rotation metadata on the
+//	           source has already been applied; a reader must not re-apply it.
+//	FRAME i    is at row i/cols, col i%cols, for i in [0, frame_count).
+//	TRAILING   cols*rows MAY exceed frame_count. Cells at index >= frame_count
+//	           are UNDEFINED and must not be rendered — this is the one that
+//	           silently produces a duplicated or black last frame if ignored.
+//	TIME       frame i covers [i*interval_ms, (i+1)*interval_ms) of a
+//	           duration_ms source. interval_ms > 0.
+func validateFilmstripGeometry(g *derivatives.FilmstripGeo) error {
+	if g == nil {
+		return fmt.Errorf(`kind "filmstrip" requires a "filmstrip" geometry object — ` +
+			`without it a strip is an image no other client can index into`)
+	}
+	switch {
+	case g.Cols < 1 || g.Rows < 1:
+		return fmt.Errorf("filmstrip cols/rows must both be >= 1 (got %dx%d) — cols==0 is a "+
+			"divide-by-zero in any reader's i%%cols", g.Cols, g.Rows)
+	case g.CellW < 1 || g.CellH < 1:
+		return fmt.Errorf("filmstrip cell_w/cell_h must both be >= 1 (got %dx%d)", g.CellW, g.CellH)
+	case g.FrameCount < 1:
+		return fmt.Errorf("filmstrip frame_count must be >= 1 (got %d)", g.FrameCount)
+	case g.FrameCount > g.Cols*g.Rows:
+		return fmt.Errorf("filmstrip frame_count %d exceeds the %dx%d grid (%d cells) — "+
+			"the frames do not fit the canvas the geometry describes",
+			g.FrameCount, g.Cols, g.Rows, g.Cols*g.Rows)
+	case g.Cols > maxStripGridDim || g.Rows > maxStripGridDim:
+		return fmt.Errorf("filmstrip grid %dx%d exceeds %d", g.Cols, g.Rows, maxStripGridDim)
+	case g.CellW > maxStripCellDim || g.CellH > maxStripCellDim:
+		return fmt.Errorf("filmstrip cell %dx%d exceeds %d", g.CellW, g.CellH, maxStripCellDim)
+	case g.IntervalMS < 1:
+		return fmt.Errorf("filmstrip interval_ms must be >= 1 (got %d) — a reader maps time to "+
+			"a cell by dividing by it", g.IntervalMS)
+	case g.DurationMS < 0:
+		return fmt.Errorf("filmstrip duration_ms must be >= 0 (got %d)", g.DurationMS)
+	}
+	return nil
+}
+
+const (
+	maxStripGridDim = 4096
+	maxStripCellDim = 8192
+)
 
 // registerRequest is the POST /derivatives/register body (OL-1 on-device AI
 // contribute-back, widened by REGISTER-ROUTE). The consumer wrote the blob
@@ -3651,6 +3712,10 @@ type registerRequest struct {
 	Width      int   `json:"width,omitempty"`
 	Height     int   `json:"height,omitempty"`
 	BitrateBPS int64 `json:"bitrate_bps,omitempty"`
+	// Filmstrip is REQUIRED for kind=="filmstrip". A sprite sheet without its
+	// geometry is an image no other client can index into — which is exactly why
+	// the kind was withheld until the contract below was written down.
+	Filmstrip *derivatives.FilmstripGeo `json:"filmstrip,omitempty"`
 }
 
 // Bounds for artifact descriptors. Generous enough for 8K-plus, tight enough
@@ -3930,6 +3995,22 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// FILMSTRIP GEOMETRY — required and validated, so a strip that reaches the
+	// index is renderable by any client by definition (see
+	// validateFilmstripGeometry for the contract this enforces).
+	var stripGeo *derivatives.FilmstripGeo
+	if req.Kind == "filmstrip" {
+		if err := validateFilmstripGeometry(req.Filmstrip); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		g := *req.Filmstrip
+		stripGeo = &g
+	} else if req.Filmstrip != nil {
+		http.Error(w, fmt.Sprintf("filmstrip geometry is not meaningful for kind %q", req.Kind), 400)
+		return
+	}
+
 	// ARTIFACT DESCRIPTORS (consumer ask, founder-endorsed 2026-08-04).
 	//
 	// If a node's contribution is a FLOOR rather than a finished artifact, the
@@ -3984,6 +4065,7 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		Width:       widthP,
 		Height:      heightP,
 		BitrateBPS:  bitrateP,
+		Filmstrip:   stripGeo,
 	}
 	if err := ds.PutSource(req.Inode, &hash); err != nil {
 		http.Error(w, "put source: "+err.Error(), 500)
