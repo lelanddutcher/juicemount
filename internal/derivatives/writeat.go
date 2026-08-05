@@ -1,7 +1,6 @@
 package derivatives
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -198,67 +197,6 @@ func validLeaf(name string) error {
 	if name == "" || name == "." || name == ".." ||
 		filepath.Base(name) != name || filepath.IsAbs(name) {
 		return fmt.Errorf("derivatives: %q is not a flat filename", name)
-	}
-	return nil
-}
-
-// MoveBlobBetweenDirs moves a published blob from one derivative directory to
-// another, both held as descriptors.
-//
-// WHY THIS EXISTS. A derivative blob is addressed by inode
-// (.juicemount/derivatives/<inode>/<name>), and a consumer that stats a file
-// before the write has drained sees a SYNTHETIC inode — so it writes its blob
-// under a directory whose name will cease to exist. Files created OFFLINE hold a
-// synthetic inode indefinitely, so for them this was not a race but a permanent
-// wall: the register could never succeed and the whole class of file could not
-// contribute at all. Telling the consumer "re-resolve and retry" does not fix it
-// either, because the bytes are still under the old name — they would re-register
-// against an empty directory.
-//
-// So the server moves them. This is our own namespace; the consumer never gets
-// to name a path inside it, and both endpoints are descriptors, so no ancestor
-// is resolvable by name between the check and the move.
-//
-// FAIL-CLOSED, in the same shape as CommitStagedAt:
-//   - refuses anything that is not a regular file (O_NOFOLLOW semantics via
-//     AT_SYMLINK_NOFOLLOW: a symlink is refused as a symlink, not followed);
-//   - refuses an EMPTY source, because publishing a 0-byte blob under the real
-//     inode would be served with 200 and look like a real answer;
-//   - refuses to CLOBBER an existing destination — a blob already registered
-//     under the real inode wins, and silently overwriting it would destroy a
-//     row's bytes out from under it. The caller decides what that means.
-//
-// Renameat is O(1) and atomic within a filesystem, so a large proxy costs the
-// same as a poster and no reader can observe a partial file at the destination.
-func MoveBlobBetweenDirs(srcDir, dstDir *os.File, name string) error {
-	if err := validLeaf(name); err != nil {
-		return err
-	}
-	sfd, dfd := int(srcDir.Fd()), int(dstDir.Fd())
-
-	var sst unix.Stat_t
-	if err := unix.Fstatat(sfd, name, &sst, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return fmt.Errorf("derivatives: source blob %q: %w", name, err)
-	}
-	if sst.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("derivatives: refusing to move non-regular %q (mode %#o): %w",
-			name, sst.Mode&unix.S_IFMT, ErrNotRegular)
-	}
-	if sst.Size == 0 {
-		return fmt.Errorf("derivatives: refusing to move an empty %q", name)
-	}
-
-	// Never clobber. A destination blob may already be registered.
-	var dst unix.Stat_t
-	if err := unix.Fstatat(dfd, name, &dst, unix.AT_SYMLINK_NOFOLLOW); err == nil {
-		return fmt.Errorf("derivatives: destination %q already exists (%d bytes) — refusing to "+
-			"overwrite a blob that may already back a manifest row", name, dst.Size)
-	} else if !errors.Is(err, unix.ENOENT) {
-		return fmt.Errorf("derivatives: stat destination %q: %w", name, err)
-	}
-
-	if err := unix.Renameat(sfd, name, dfd, name); err != nil {
-		return fmt.Errorf("derivatives: move %q between derivative dirs: %w", name, err)
 	}
 	return nil
 }
