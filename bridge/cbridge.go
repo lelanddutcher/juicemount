@@ -3834,6 +3834,30 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	entry := store.LookupByInode(req.Inode)
 	if entry == nil {
+		// A SYNTHETIC inode (high bit set, nfs/handler.go) is not an unknown
+		// file — it is a real file the consumer stat'd before the write drained,
+		// and it WILL resolve to a backend inode shortly. Both failures land
+		// here identically, and a bare 404 reads as permanent: a consumer that
+		// treats 409 as retryable (the drain window) and 404 as fatal gives up
+		// on a file that was only a few seconds early. That is the whole
+		// contribute-back flow for the common case of processing footage right
+		// after it lands.
+		//
+		// Measured 2026-08-05: for ~10-30s after create, stat and READDIR can
+		// even report DIFFERENT synthetic values for the same file. Worse, the
+		// client can hold a cached synthetic inode INDEFINITELY if it never
+		// re-reads the directory — so the remedy has to name re-listing the
+		// parent, not just "wait and retry", or a patient consumer waits
+		// forever on an attribute cache that is never refreshed.
+		if req.Inode&(1<<63) != 0 {
+			http.Error(w, fmt.Sprintf("inode %d is a transient pre-drain identifier, not a "+
+				"backend inode (high bit set) — the source has not finished draining. "+
+				"RETRYABLE: re-list the parent directory to force a fresh READDIR (a cached "+
+				"stat can hold the synthetic value indefinitely), take the inode again, and "+
+				"re-register. Registering under this value would key the derivative to an "+
+				"identifier that ceases to exist.", req.Inode), http.StatusConflict)
+			return
+		}
 		http.Error(w, "inode not found", 404)
 		return
 	}
