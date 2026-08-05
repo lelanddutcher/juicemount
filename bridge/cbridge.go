@@ -3649,6 +3649,37 @@ var contributableKinds = map[string]contributableKind{
 //	           silently produces a duplicated or black last frame if ignored.
 //	TIME       frame i covers [i*interval_ms, (i+1)*interval_ms) of a
 //	           duration_ms source. interval_ms > 0.
+//
+// registerConflict is the JSON body for a 409 from /derivatives/register.
+//
+// WHY IT EXISTS: the route returns 409 for six distinct conditions whose
+// remedies CONTRADICT each other — "blob not yet visible" means keep retrying
+// with this inode, "synthetic inode" means STOP using this inode, "source
+// stale" means recompute the derivative, "farm row wins" is permanent. Every
+// one was a bare prose string, so a consumer could only apply one uniform
+// retry, which silently masks the stale-source case (the safety-relevant one)
+// and burns its whole budget on the permanent ones.
+//
+// Additive and backward-compatible: the status code is unchanged and a consumer
+// that only reads the code and logs the body is unaffected.
+type registerConflict struct {
+	Code      string `json:"code"`
+	Retryable bool   `json:"retryable"`
+	Message   string `json:"message"`
+	Inode     uint64 `json:"inode,omitempty"`
+	// RealInode is the resolved backend inode when the server could determine
+	// it, so the consumer can place the blob correctly on the next attempt
+	// rather than re-registering into an empty derivative directory.
+	RealInode uint64 `json:"real_inode,omitempty"`
+	Path      string `json:"path,omitempty"`
+}
+
+func writeRegisterConflict(w http.ResponseWriter, c registerConflict) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(c)
+}
+
 func validateFilmstripGeometry(g *derivatives.FilmstripGeo) error {
 	if g == nil {
 		return fmt.Errorf(`kind "filmstrip" requires a "filmstrip" geometry object — ` +
@@ -3832,32 +3863,61 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "control plane not ready", 503)
 		return
 	}
+	// SYNTHETIC INODES ARE REFUSED BEFORE THE LOOKUP, NOT AFTER IT.
+	//
+	// This check MUST precede LookupByInode. A synthetic inode is not merely an
+	// inode that fails to resolve — juiceFS.Create mints one via
+	// nextSyntheticInode() and then InsertToCache's it (nfs/handler.go:3247),
+	// so it is a LIVE CACHE KEY and the lookup SUCCEEDS. Placing the guard in
+	// the `entry == nil` branch therefore left the actual failure wide open: the
+	// register returned 200 and committed a manifest row keyed to an identifier
+	// that ceases to exist once Redis reconcile assigns the real inode. The blob
+	// then lives forever at .juicemount/derivatives/<vanished>/ with nothing
+	// pointing at it, and no GC exists for derivative rows. Silent data loss,
+	// with a success code — caught by adversarial review, which reproduced it by
+	// seeding through the production InsertToCache path.
+	//
+	// Exposure is widest for files created OFFLINE, which hold a synthetic inode
+	// indefinitely rather than for the drain window.
+	if req.Inode&(1<<63) != 0 {
+		// Resolve to the real inode when we can, so the consumer gets an
+		// actionable answer in ONE round trip. It cannot be resolved from the
+		// inode alone: the derivative BLOB is addressed by inode too
+		// (DerivBlobRel), so a consumer told merely to "retry with the right
+		// inode" would re-register against an empty derivative dir and get a
+		// second, indistinguishable 409. Handing back real_inode lets it place
+		// the blob correctly the first time.
+		srcPath, _ := store.SyntheticHandlePath(req.Inode)
+		if srcPath == "" {
+			if e := store.LookupByInode(req.Inode); e != nil {
+				srcPath = e.Path
+			}
+		}
+		var realInode uint64
+		if srcPath != "" {
+			if e := store.LookupByPath(srcPath); e != nil && e.Inode&(1<<63) == 0 {
+				realInode = e.Inode
+			}
+		}
+		writeRegisterConflict(w, registerConflict{
+			Code:      "synthetic_inode",
+			Retryable: true,
+			Inode:     req.Inode,
+			RealInode: realInode,
+			Path:      srcPath,
+			Message: "inode is a transient pre-drain identifier, not a backend inode " +
+				"(high bit set). Registering under it would key the derivative to an " +
+				"identifier that ceases to exist. If real_inode is set, rewrite the blob " +
+				"under that inode's derivative directory and register with it. If it is " +
+				"absent the source has not reconciled yet: re-list the parent directory " +
+				"to force a fresh READDIR — a cached stat can hold a stale identifier " +
+				"indefinitely — then take the inode again.",
+		})
+		return
+	}
+
 	entry := store.LookupByInode(req.Inode)
 	if entry == nil {
-		// A SYNTHETIC inode (high bit set, nfs/handler.go) is not an unknown
-		// file — it is a real file the consumer stat'd before the write drained,
-		// and it WILL resolve to a backend inode shortly. Both failures land
-		// here identically, and a bare 404 reads as permanent: a consumer that
-		// treats 409 as retryable (the drain window) and 404 as fatal gives up
-		// on a file that was only a few seconds early. That is the whole
-		// contribute-back flow for the common case of processing footage right
-		// after it lands.
-		//
-		// Measured 2026-08-05: for ~10-30s after create, stat and READDIR can
-		// even report DIFFERENT synthetic values for the same file. Worse, the
-		// client can hold a cached synthetic inode INDEFINITELY if it never
-		// re-reads the directory — so the remedy has to name re-listing the
-		// parent, not just "wait and retry", or a patient consumer waits
-		// forever on an attribute cache that is never refreshed.
-		if req.Inode&(1<<63) != 0 {
-			http.Error(w, fmt.Sprintf("inode %d is a transient pre-drain identifier, not a "+
-				"backend inode (high bit set) — the source has not finished draining. "+
-				"RETRYABLE: re-list the parent directory to force a fresh READDIR (a cached "+
-				"stat can hold the synthetic value indefinitely), take the inode again, and "+
-				"re-register. Registering under this value would key the derivative to an "+
-				"identifier that ceases to exist.", req.Inode), http.StatusConflict)
-			return
-		}
 		http.Error(w, "inode not found", 404)
 		return
 	}
