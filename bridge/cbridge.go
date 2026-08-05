@@ -1263,7 +1263,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// exist + their integrity hash). /metadata?inode=N&kind=tech:
 			// structured ffprobe tech/EXIF. Keyed by durable inode (from
 			// /lookup); read-only + fail-closed.
-			"/derivatives":         handleDerivativesHTTP,
+			"/derivatives":         countingManifestHandler(handleDerivativesHTTP),
 			"/derivatives/changes": handleDerivativesChangesHTTP,
 			"/metadata":            handleMetadataHTTP,
 			// PROXY-CODEC (#50) byte-range blob delivery. GET /blob?inode=N&kind=proxy
@@ -1272,7 +1272,8 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// Content-Type from the manifest media_type, and 200 + Content-Length
 			// unranged — what a browser <video> / remote AVPlayer need to seek over
 			// HTTP. Capability token `blob` (route path == token).
-			"/blob": handleBlobHTTP,
+			"/blob":        countingBlobHandler(handleBlobHTTP),
+			"/deriv-reads": handleDerivReadsHTTP,
 			// #1 hydration pack observability: local thumb-cache stats
 			// (bytes/files/hits/misses/puts/evictions). Read-only.
 			"/thumbs": handleThumbsHTTP,
