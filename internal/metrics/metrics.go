@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -740,7 +741,11 @@ type Server struct {
 	registry *Registry
 	addr     string
 	listener net.Listener
-	httpSrv  *http.Server
+	// listener6 is the companion ::1 listener. See Start: a client resolving
+	// "localhost" gets ::1 FIRST on macOS, so an IPv4-only bind is refused for
+	// any client that does not fall back.
+	listener6 net.Listener
+	httpSrv   *http.Server
 
 	// ExtraRoutes lets callers (e.g. cbridge) register additional handlers
 	// on the same listener — Pin/Unpin/CacheStatus/Offline endpoints live
@@ -791,13 +796,56 @@ func (s *Server) Start() error {
 	go func() {
 		_ = s.httpSrv.Serve(l)
 	}()
+
+	// ALSO BIND IPv6 LOOPBACK.
+	//
+	// macOS resolves "localhost" to ::1 BEFORE 127.0.0.1. This server bound
+	// IPv4 only, so a client that connects to the first resolved address and
+	// does not fall back gets ECONNREFUSED and concludes the control plane is
+	// down — while curl, which does fall back, reports it perfectly healthy.
+	// Measured 2026-08-04: http://[::1]:11050 refused, http://127.0.0.1:11050
+	// 200, and that is the shape of a consumer reporting "no success" against a
+	// control plane that answers fine from a shell.
+	//
+	// Loopback ONLY, deliberately: this is a second loopback family, NOT a
+	// widening of exposure. The control plane is unauthenticated and must never
+	// be reachable off-box.
+	//
+	// Best-effort: a machine with IPv6 disabled must still start. The IPv4
+	// listener above remains the one whose failure is fatal.
+	// Port comes from the BOUND listener, not from s.addr: with an ephemeral
+	// ":0" the configured port is 0, so deriving from s.addr would put the ::1
+	// listener on a DIFFERENT random port than the IPv4 one — the companion
+	// would exist and still not answer where the client is looking.
+	if host, _, perr := net.SplitHostPort(s.addr); perr == nil && isLoopbackHost(host) {
+		boundPort := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+		if l6, e6 := net.Listen("tcp6", net.JoinHostPort("::1", boundPort)); e6 == nil {
+			s.listener6 = l6
+			go func() {
+				_ = s.httpSrv.Serve(l6)
+			}()
+		}
+	}
 	return nil
+}
+
+// isLoopbackHost reports whether a bind host is loopback, so the ::1 companion
+// is added ONLY when we are already loopback-bound — never for a wider bind.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Stop closes the HTTP server and listener.
 func (s *Server) Stop() {
 	if s.httpSrv != nil {
-		_ = s.httpSrv.Close()
+		_ = s.httpSrv.Close() // closes every listener it is serving, incl. ::1
+	}
+	if s.listener6 != nil {
+		_ = s.listener6.Close()
 	}
 }
 
