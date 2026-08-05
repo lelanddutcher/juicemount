@@ -3938,8 +3938,12 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	// so the two cannot disagree about what exists.
 	bfi, statErr := derivatives.StatRegularUnder(fusePath, derivatives.DerivBlobRel(req.Inode, rel))
 	if statErr != nil {
-		http.Error(w, fmt.Sprintf("blob %q not present as a regular file under the derivative dir — write it (atomically) BEFORE registering: %v",
-			rel, statErr), http.StatusConflict)
+		writeRegisterConflict(w, registerConflict{
+			Code: "blob_not_visible", Retryable: true, Inode: req.Inode,
+			Message: fmt.Sprintf("blob %q not present as a regular file under the derivative dir — "+
+				"write it (atomically) BEFORE registering. RETRYABLE with THIS inode: the write may "+
+				"still be draining through the spool (~6s). %v", rel, statErr),
+		})
 		return
 	}
 	// NON-EMPTY, for the same reason CommitStagedAt refuses to publish an empty
@@ -3951,9 +3955,12 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	// It also catches the honest mistake this was found by: registering straight
 	// after writing, before the bytes are actually visible through the mount.
 	if bfi.Size() == 0 {
-		http.Error(w, fmt.Sprintf("blob %q is 0 bytes — write the bytes and let the write land BEFORE registering; "+
-			"an empty blob would be served as a real answer instead of 404ing so the reader can regenerate", rel),
-			http.StatusConflict)
+		writeRegisterConflict(w, registerConflict{
+			Code: "blob_empty", Retryable: false, Inode: req.Inode,
+			Message: fmt.Sprintf("blob %q is 0 bytes — an empty blob would be served as a real answer "+
+				"instead of 404ing so the reader can regenerate. NOT retryable as-is: rewrite the "+
+				"bytes, then register again.", rel),
+		})
 		return
 	}
 
@@ -3963,12 +3970,20 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	src := filepath.Join(fusePath, entry.Path)
 	fi, err := os.Stat(src)
 	if err != nil {
-		http.Error(w, "source unreadable: "+err.Error(), http.StatusConflict)
+		writeRegisterConflict(w, registerConflict{
+			Code: "source_unreadable", Retryable: false, Inode: req.Inode, Path: entry.Path,
+			Message: "source unreadable through the mount: " + err.Error(),
+		})
 		return
 	}
 	if fi.Size() != req.SourceSize || fi.ModTime().Unix() != req.SourceMtime {
-		http.Error(w, fmt.Sprintf("stale: live size/mtime (%d/%d) != vouched (%d/%d) — AI computed against old bytes",
-			fi.Size(), fi.ModTime().Unix(), req.SourceSize, req.SourceMtime), http.StatusConflict)
+		writeRegisterConflict(w, registerConflict{
+			Code: "source_stale", Retryable: false, Inode: req.Inode, Path: entry.Path,
+			Message: fmt.Sprintf("live size/mtime (%d/%d) != vouched (%d/%d) — the derivative was "+
+				"computed against OLD bytes. NOT retryable: recompute it against the current source, "+
+				"then register. Retrying unchanged would publish a derivative that does not describe "+
+				"the file.", fi.Size(), fi.ModTime().Unix(), req.SourceSize, req.SourceMtime),
+		})
 		return
 	}
 
@@ -4034,9 +4049,12 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 			// to. Tracked, not dismissed: the fix is an authenticated sidecar, and
 			// until then this guard is coordination rather than a trust boundary.
 			if er.Producer == "linux-farm" && req.Producer != "linux-farm" {
-				http.Error(w, fmt.Sprintf(
-					"kind %q for inode %d already has a farm-produced row; a %q contribution may not replace it",
-					req.Kind, req.Inode, req.Producer), http.StatusConflict)
+				writeRegisterConflict(w, registerConflict{
+					Code: "producer_conflict", Retryable: false, Inode: req.Inode,
+					Message: fmt.Sprintf("kind %q for inode %d already has a farm-produced row; a %q "+
+						"contribution may not replace it. PERMANENT — do not retry; the farm row wins "+
+						"by precedence, not by timing.", req.Kind, req.Inode, req.Producer),
+				})
 				return
 			}
 		}
