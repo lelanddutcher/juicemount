@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lelanddutcher/juicemount/metadata"
 	_ "modernc.org/sqlite"
@@ -41,6 +42,21 @@ func newTestSpoolStoreTB(tb testing.TB, capacity int64) *SpoolStore {
 	if err != nil {
 		tb.Fatalf("new spool store: %v", err)
 	}
+	// PIN THE LIVE DISK CEILING so capacity behaviour is a property of the
+	// CONFIGURED capacity under test, not of whatever the developer's disk
+	// happens to hold today.
+	//
+	// effectiveCapacity is min(configured, live ceiling), and the live ceiling
+	// is derived from real free disk minus SpoolFreeFloorBytes (20 GiB). On a
+	// machine that dips below that floor — which happened here, a JuiceFS cache
+	// at 100 GB with 19 GiB free — the ceiling clamps to ~1 byte and EVERY
+	// capacity test fails, including ones using a 100-BYTE cap. That looks
+	// exactly like a regression in the code under test and is not one; it cost a
+	// full diagnostic detour to establish that, twice.
+	//
+	// Tests that mean to exercise the ceiling seed it explicitly (seedDiskAvail).
+	store.capCeiling.Store(int64(1) << 50)
+	store.diskAvailAt.Store(time.Now().UnixNano())
 	return store
 }
 
