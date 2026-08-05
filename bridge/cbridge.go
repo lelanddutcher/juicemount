@@ -3900,9 +3900,6 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 	//
 	// Exposure is widest for files created OFFLINE, which hold a synthetic inode
 	// indefinitely rather than for the drain window.
-	// blobInode is where the consumer's BYTES are; req.Inode is what the ROW is
-	// keyed to. They differ only while resolving a synthetic inode.
-	blobInode := req.Inode
 	if req.Inode&(1<<63) != 0 {
 		// Resolve to the real inode when we can, so the consumer gets an
 		// actionable answer in ONE round trip. It cannot be resolved from the
@@ -3923,53 +3920,6 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 				realInode = e.Inode
 			}
 		}
-		// RESOLVE AND CONTINUE, rather than bouncing it back.
-		//
-		// Offline-created files hold a synthetic inode INDEFINITELY, so a
-		// permanent 409 here is not a retry hint — it is a whole class of file
-		// that can never contribute. The consumer cannot fix it either: the blob
-		// is addressed by inode, and WRITE_PLACEMENT §2 forbids it naming paths
-		// inside our namespace, so it cannot move its own bytes.
-		//
-		// blobInode stays SYNTHETIC — that is where the consumer's bytes are,
-		// and they stay there, untouched, until a row is committed. Only the ROW
-		// is keyed to the real inode. The relocation happens after every gate
-		// has passed (see the commit block below), which is what the reverted
-		// first attempt got wrong.
-		//
-		// CONSISTENCY CHECK — and an HONEST note about what it does NOT cover.
-		//
-		// It catches one divergence: the mirror resolving this path to an inode
-		// whose own entry records a different path.
-		//
-		// It does NOT close the identity hole adversarial review found, and I do
-		// not want this to read as though it does. The attack is: the synthetic
-		// handle remembers PATH P (pinned at mint, never invalidated by a
-		// rename); the file at P is later replaced by a different file; we
-		// resolve P to the new file's inode, whose entry legitimately records P,
-		// so this check PASSES. The vouch is then compared against the new file,
-		// and a replacement with identical size+mtime (cp -p, rsync -a, a
-		// duplicated card offload) satisfies it.
-		//
-		// Registering against a REAL inode does not have this exposure: a
-		// replaced file has a different inode, so the register simply misses.
-		// Resolving through a path is what gives it up, and no server-side check
-		// recovers it — the consumer cannot vouch a content hash (it computes
-		// xxh64, the contract is xxh3), so there is nothing to bind the
-		// derivative to the bytes it was actually computed from.
-		//
-		// The residual window is narrow (same path, different file, identical
-		// size AND mtime, between the consumer computing and registering) but it
-		// is real, and it is the price of letting offline-created files
-		// contribute at all. Tracked, not dismissed.
-		if realInode != 0 {
-			if e := store.LookupByInode(realInode); e != nil && e.Path == srcPath {
-				blobInode = req.Inode
-				req.Inode = realInode
-				goto resolved
-			}
-			realInode = 0 // resolved to a different file — refuse, do not guess
-		}
 		writeRegisterConflict(w, registerConflict{
 			Code:      "synthetic_inode",
 			Retryable: false,
@@ -3986,7 +3936,6 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-resolved:
 
 	entry := store.LookupByInode(req.Inode)
 	if entry == nil {
@@ -4008,7 +3957,7 @@ resolved:
 	// gate — minting a `ready` row that the (correctly anchored) serve path then
 	// permanently 404s, with the slot occupied. Same walk the serve path uses,
 	// so the two cannot disagree about what exists.
-	bfi, statErr := derivatives.StatRegularUnder(fusePath, derivatives.DerivBlobRel(blobInode, rel))
+	bfi, statErr := derivatives.StatRegularUnder(fusePath, derivatives.DerivBlobRel(req.Inode, rel))
 	if statErr != nil {
 		// A non-regular file at a reserved blob name is PERMANENT — retrying cannot
 		// change it; the consumer must remove it and rewrite. Reporting it as
@@ -4256,71 +4205,13 @@ resolved:
 		BitrateBPS:  bitrateP,
 		Filmstrip:   stripGeo,
 	}
-	// RELOCATION, only now that every gate has passed.
-	//
-	// When we resolved a synthetic inode, the bytes are still under blobInode —
-	// exactly where the consumer wrote them — and the row is about to be keyed
-	// to req.Inode. LINK first: the blob then exists under both names, same
-	// inode, no extra space, and the consumer's copy is untouched. If anything
-	// below fails we unlink only the link we made, and the consumer can retry
-	// against a blob that never moved.
-	//
-	// The reverted first attempt renamed here-ish but BEFORE the gates, so any
-	// later rejection stranded the bytes and made its own remedy impossible to
-	// follow. Link-then-commit-then-unlink has no such window.
-	linked := false
-	if blobInode != req.Inode {
-		if err := linkDerivBlob(fusePath, blobInode, req.Inode, rel); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				// Something is already published there. Only a row can say
-				// whether it is live; if one is, the farm/precedence rules own
-				// it and we must not touch it.
-				if rows, mErr := ds.Manifest(req.Inode); mErr == nil && hasKind(rows, req.Kind) {
-					writeRegisterConflict(w, registerConflict{
-						Code: "producer_conflict", Retryable: false, Inode: req.Inode,
-						Message: fmt.Sprintf("a %q blob is already published under the resolved "+
-							"inode %d and backed by a row; refusing to replace it", req.Kind, req.Inode),
-					})
-					return
-				}
-				// Orphaned leftover with no row — replace it.
-				_ = unlinkDerivBlob(fusePath, req.Inode, rel)
-				if err2 := linkDerivBlob(fusePath, blobInode, req.Inode, rel); err2 != nil {
-					http.Error(w, "relocate blob: "+err2.Error(), 500)
-					return
-				}
-			} else {
-				http.Error(w, "relocate blob: "+err.Error(), 500)
-				return
-			}
-		}
-		linked = true
-	}
-	rollback := func() {
-		if linked {
-			_ = unlinkDerivBlob(fusePath, req.Inode, rel)
-		}
-	}
 	if err := ds.PutSource(req.Inode, &hash); err != nil {
-		rollback()
 		http.Error(w, "put source: "+err.Error(), 500)
 		return
 	}
 	if err := ds.PutDeriv(req.Inode, row); err != nil {
-		rollback()
 		http.Error(w, "put deriv: "+err.Error(), 500)
 		return
-	}
-	if linked {
-		// The row exists now, so the consumer's copy is redundant. Failing to
-		// drop it is harmless — a hard link costs no space and the row points at
-		// the surviving name — so this never fails the request.
-		if err := unlinkDerivBlob(fusePath, blobInode, rel); err != nil {
-			jmlog.Warn("contribute-back: could not drop the pre-resolution copy",
-				"synthetic", blobInode, "real", req.Inode, "blob", rel, "err", err)
-		}
-		jmlog.Info("contribute-back: resolved a synthetic inode",
-			"synthetic", blobInode, "real", req.Inode, "kind", req.Kind, "blob", rel)
 	}
 	jmlog.Info("contribute-back registered",
 		"inode", req.Inode, "kind", req.Kind, "blob", rel,
@@ -5962,44 +5853,3 @@ func handleSelfTestHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {} // required for c-archive build
-
-// linkDerivBlob / unlinkDerivBlob are the descriptor-anchored halves of moving a
-// contributed blob from a synthetic inode's derivative directory to the resolved
-// real one. Split so the commit path can link, then unlink only after the row is
-// durable — the consumer's bytes are never absent from where it put them until a
-// row exists to point at the new location.
-func linkDerivBlob(fusePath string, from, to uint64, name string) error {
-	src, err := derivatives.OpenDirUnder(fusePath, derivatives.DerivDirRel(from))
-	if err != nil {
-		return fmt.Errorf("open source deriv dir: %w", err)
-	}
-	defer src.Close()
-	if err := derivatives.EnsureDirUnder(fusePath, derivatives.DerivDirRel(to)); err != nil {
-		return fmt.Errorf("ensure destination deriv dir: %w", err)
-	}
-	dst, err := derivatives.OpenDirUnder(fusePath, derivatives.DerivDirRel(to))
-	if err != nil {
-		return fmt.Errorf("open destination deriv dir: %w", err)
-	}
-	defer dst.Close()
-	return derivatives.LinkBlobInto(src, dst, name)
-}
-
-func unlinkDerivBlob(fusePath string, inode uint64, name string) error {
-	d, err := derivatives.OpenDirUnder(fusePath, derivatives.DerivDirRel(inode))
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return derivatives.UnlinkBlob(d, name)
-}
-
-// hasKind reports whether a manifest already carries a row of this kind.
-func hasKind(rows []derivatives.DerivRow, kind string) bool {
-	for _, r := range rows {
-		if r.Kind == kind {
-			return true
-		}
-	}
-	return false
-}

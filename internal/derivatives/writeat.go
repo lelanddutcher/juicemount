@@ -1,7 +1,6 @@
 package derivatives
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -200,68 +199,4 @@ func validLeaf(name string) error {
 		return fmt.Errorf("derivatives: %q is not a flat filename", name)
 	}
 	return nil
-}
-
-// LinkBlobInto hard-links a published blob from one derivative directory into
-// another, both held as descriptors. It does NOT remove the source.
-//
-// WHY LINK AND NOT RENAME. A synthetic (pre-drain / offline) inode means the
-// consumer wrote its blob under a directory name that will cease to exist, and
-// the server has to move it. The obvious implementation — rename it up front —
-// was written, reviewed, and REVERTED, because rename makes the bytes vanish
-// from where the consumer put them BEFORE the request has finished validating.
-// Every later rejection (missing codec, bad filmstrip geometry, stale source,
-// producer conflict, a failed DB write) then stranded the blob with no row, and
-// the consumer could not comply with the remedy it was handed: "recompute and
-// register again" is impossible once its file has been moved out from under it.
-//
-// A hard link has no such window. The bytes exist under BOTH names, cost no
-// extra space, and are the same inode — so:
-//
-//	link now  ->  commit the row  ->  unlink the source
-//
-// leaves the consumer's copy untouched until a row exists, and a failure at any
-// step is recoverable by unlinking the link we just made. Nothing is ever in a
-// state where the artifact exists nowhere.
-//
-// Refuses a non-regular or empty source, and refuses to clobber — the caller
-// decides what an existing destination means, since only it can tell whether a
-// row already backs it.
-func LinkBlobInto(srcDir, dstDir *os.File, name string) error {
-	if err := validLeaf(name); err != nil {
-		return err
-	}
-	sfd, dfd := int(srcDir.Fd()), int(dstDir.Fd())
-
-	var st unix.Stat_t
-	if err := unix.Fstatat(sfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return fmt.Errorf("derivatives: source blob %q: %w", name, err)
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("derivatives: refusing to link non-regular %q (mode %#o): %w",
-			name, st.Mode&unix.S_IFMT, ErrNotRegular)
-	}
-	if st.Size == 0 {
-		return fmt.Errorf("derivatives: refusing to link an empty %q", name)
-	}
-	// AT_SYMLINK_FOLLOW is deliberately NOT set: we linked what we just
-	// fstatat'd with NOFOLLOW, so a symlink swapped in here fails rather than
-	// being followed out of the namespace.
-	if err := unix.Linkat(sfd, name, dfd, name, 0); err != nil {
-		if errors.Is(err, unix.EEXIST) {
-			return fmt.Errorf("derivatives: destination %q already exists: %w", name, os.ErrExist)
-		}
-		return fmt.Errorf("derivatives: link %q between derivative dirs: %w", name, err)
-	}
-	return nil
-}
-
-// UnlinkBlob removes a blob from a derivative directory held as a descriptor.
-// Used to drop the consumer's copy once the row is committed under the real
-// inode, and to roll back a link if the commit fails.
-func UnlinkBlob(dir *os.File, name string) error {
-	if err := validLeaf(name); err != nil {
-		return err
-	}
-	return unix.Unlinkat(int(dir.Fd()), name, 0)
 }
