@@ -83,7 +83,7 @@ func TestAdvanceStreamOrdersSyncPublishPunchRelease(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 128<<10)
+	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, 128<<10)
 	if err != nil {
 		t.Fatalf("advanceStream: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestAdvanceStreamPublishesNothingWhenSyncFails(t *testing.T) {
 	}
 	rel := &recordingReleaser{events: events}
 
-	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 128<<10)
+	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, 128<<10)
 	if err == nil {
 		t.Fatal("advanceStream succeeded despite an fsync failure")
 	}
@@ -158,7 +158,7 @@ func TestAdvanceStreamLeavesPrefixIntactWhenWriteFails(t *testing.T) {
 	}
 	rel := &recordingReleaser{events: events}
 
-	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 128<<10); err == nil {
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, 128<<10); err == nil {
 		t.Fatal("advanceStream succeeded despite a dest write failure")
 	}
 	if got := e.PunchedEnd(); got != 0 {
@@ -183,7 +183,7 @@ func TestAdvanceStreamReleasesOnlyWhatWasActuallyPunched(t *testing.T) {
 
 	// A deliberately unaligned sealed end: only whole blocks are punchable.
 	const sealed = 100<<10 + 777
-	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, sealed)
+	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, sealed)
 	if err != nil {
 		t.Fatalf("advanceStream: %v", err)
 	}
@@ -204,14 +204,14 @@ func TestAdvanceStreamNoOpWhenNothingNewIsSealed(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 64<<10); err != nil {
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, 64<<10); err != nil {
 		t.Fatal(err)
 	}
 	before := e.PunchedEnd()
 
 	// Same sealed end again, and a retreated one.
 	for _, sealed := range []int64{64 << 10, 32 << 10, 0} {
-		n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, sealed)
+		n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, sealed)
 		if err != nil {
 			t.Errorf("advanceStream(sealed=%d) errored: %v", sealed, err)
 		}
@@ -253,7 +253,7 @@ func TestAdvanceStreamCopiesTheCorrectBytesToTheCorrectOffset(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 64<<10); err != nil {
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, 64<<10); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := dest.data[0]
@@ -304,7 +304,7 @@ func TestAdvanceStreamRejectsAReadOnlySpoolHandle(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	n, err := advanceStream(e, ro, dest, rel, &fakeDurability{}, 64<<10)
+	n, err := advanceStream(e, ro, dest, rel, &fakeDurability{}, nil, 64<<10)
 	if err == nil {
 		t.Fatal("advanceStream succeeded with a READ-ONLY spool handle — punching " +
 			"cannot have happened, so capacity would be released for space the " +
@@ -351,7 +351,7 @@ func TestAdvanceStreamPublishesBeforeItPunches(t *testing.T) {
 
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
-	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, sealed); err != nil {
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, sealed); err != nil {
 		t.Fatalf("advanceStream: %v", err)
 	}
 
@@ -400,7 +400,7 @@ func TestAdvanceStreamRefusesWithoutDurability(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	n, err := advanceStream(e, src, dest, rel, nil, 64<<10)
+	n, err := advanceStream(e, src, dest, rel, nil, nil, 64<<10)
 	if err == nil {
 		t.Fatal("advanceStream punched without a durability hook — after a crash, " +
 			"boot recovery will upload the punched prefix as zeros over the real data")
@@ -432,7 +432,7 @@ func TestAdvanceStreamPersistsBeforeItPunches(t *testing.T) {
 
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
-	if _, err := advanceStream(e, src, dest, rel, dur, 64<<10); err != nil {
+	if _, err := advanceStream(e, src, dest, rel, dur, nil, 64<<10); err != nil {
 		t.Fatalf("advanceStream: %v", err)
 	}
 	if !persistedWhenPunched {
@@ -455,7 +455,7 @@ func TestAdvanceStreamAbortsWhenPersistFails(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	if _, err := advanceStream(e, src, dest, rel, dur, 64<<10); err == nil {
+	if _, err := advanceStream(e, src, dest, rel, dur, nil, 64<<10); err == nil {
 		t.Fatal("advanceStream succeeded despite a failed persist")
 	}
 	if got := e.PunchedEnd(); got != 0 {
@@ -471,5 +471,110 @@ func TestAdvanceStreamAbortsWhenPersistFails(t *testing.T) {
 	}
 	if buf[1] != 1 {
 		t.Errorf("spool prefix was punched despite the persist failing (byte1=%d)", buf[1])
+	}
+}
+
+// recordingVerifier observes the destination readback and can fail it.
+type recordingVerifier struct {
+	fail        error
+	sawOffsets  []int64
+	punchedWhen *int64 // punchedEnd sampled at verify time
+	entry       *SpoolEntry
+}
+
+func (v *recordingVerifier) verifyChunk(off int64, want []byte) error {
+	v.sawOffsets = append(v.sawOffsets, off)
+	if v.entry != nil && v.punchedWhen != nil {
+		*v.punchedWhen = v.entry.PunchedEnd()
+	}
+	return v.fail
+}
+
+// A CORRUPT CHUNK MUST STAY RECOVERABLE.
+//
+// The whole-file drain treats a FUSE at-rest mismatch as TRANSIENT and keeps the
+// spool file — "spool good, re-draining". Streaming would turn that into
+// unrecoverable loss if the punch happened first, because there would be no
+// spool copy left. Verifying before the punch restores the retry exactly.
+func TestAdvanceStreamLeavesPrefixRecoverableWhenVerifyFails(t *testing.T) {
+	e, _, events := streamFixture(t, 256<<10)
+	src, err := os.OpenFile(e.SpoolFilePath(), os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+
+	dest := &recordingDest{data: map[int64][]byte{}, events: events}
+	rel := &recordingReleaser{events: events}
+	ver := &recordingVerifier{fail: errors.New("simulated at-rest corruption")}
+
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, ver, 64<<10); err == nil {
+		t.Fatal("advanceStream succeeded despite a failed at-rest verify")
+	}
+	if got := e.PunchedEnd(); got != 0 {
+		t.Errorf("punchedEnd advanced to %d after a failed verify", got)
+	}
+	if rel.total != 0 {
+		t.Errorf("released %d bytes after a failed verify", rel.total)
+	}
+	// THE POINT: the spool bytes must still be there, so a retry can re-send them.
+	buf := make([]byte, 4096)
+	if _, err := src.ReadAt(buf, 0); err != nil {
+		t.Fatalf("spool prefix unreadable after a failed verify: %v", err)
+	}
+	if buf[1] != 1 {
+		t.Errorf("spool prefix was PUNCHED despite the verify failing (byte1=%d) — "+
+			"the corruption is now unrecoverable; the whole-file drain would have "+
+			"retried this from the spool", buf[1])
+	}
+}
+
+// The verify must run BEFORE the punch, not after. Sampled inside the verifier:
+// if punchedEnd has already advanced, the spool prefix is gone and the check is
+// worthless as a recovery gate.
+func TestAdvanceStreamVerifiesBeforeItPunches(t *testing.T) {
+	e, _, events := streamFixture(t, 256<<10)
+	src, err := os.OpenFile(e.SpoolFilePath(), os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+
+	var punchedAtVerify int64 = -1
+	ver := &recordingVerifier{entry: e, punchedWhen: &punchedAtVerify}
+	dest := &recordingDest{data: map[int64][]byte{}, events: events}
+	rel := &recordingReleaser{events: events}
+
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, ver, 64<<10); err != nil {
+		t.Fatalf("advanceStream: %v", err)
+	}
+	if punchedAtVerify != 0 {
+		t.Errorf("punchedEnd was %d when the verify ran, want 0 — verifying after "+
+			"the punch cannot gate recovery, because the spool copy is already gone",
+			punchedAtVerify)
+	}
+	if len(ver.sawOffsets) != 1 || ver.sawOffsets[0] != 0 {
+		t.Errorf("verifier saw offsets %v, want exactly [0]", ver.sawOffsets)
+	}
+}
+
+// A nil verifier must be allowed. The whole-file drain's at-rest check is itself
+// gated (d.atRestVerify), so streaming must run in the same configuration rather
+// than inventing a stricter policy of its own.
+func TestAdvanceStreamAllowsANilVerifier(t *testing.T) {
+	e, _, events := streamFixture(t, 256<<10)
+	src, err := os.OpenFile(e.SpoolFilePath(), os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+
+	dest := &recordingDest{data: map[int64][]byte{}, events: events}
+	rel := &recordingReleaser{events: events}
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, 64<<10); err != nil {
+		t.Fatalf("advanceStream with a nil verifier: %v", err)
+	}
+	if e.PunchedEnd() == 0 {
+		t.Error("nothing advanced with a nil verifier")
 	}
 }

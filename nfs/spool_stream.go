@@ -19,10 +19,11 @@ import (
 //
 //	1. write prefix to dest
 //	2. fsync dest                  <- before 3, or a crash loses bytes we then punch
-//	3. PERSIST punchedEnd          <- before 5, or the next boot uploads zeros over good data
-//	4. publish punchedEnd          <- before 5, or a reader hits a hole and gets zeros
-//	5. punch the spool prefix      <- before 6, or capacity is freed that the disk still holds
-//	6. release capacity
+//	3. VERIFY the chunk at rest    <- before 6, or a corrupt chunk becomes unrecoverable
+//	4. PERSIST punchedEnd          <- before 6, or the next boot uploads zeros over good data
+//	5. publish punchedEnd          <- before 6, or a reader hits a hole and gets zeros
+//	6. punch the spool prefix      <- before 7, or capacity is freed that the disk still holds
+//	7. release capacity
 //
 // Getting 2 and 3 backwards loses data on a crash. Getting 3 and 4 backwards
 // serves silent zeros to a live reader. Neither is recoverable, and neither
@@ -46,6 +47,46 @@ type streamDest interface {
 // streamCapacityReleaser frees reclaimed spool bytes from the capacity budget.
 type streamCapacityReleaser interface {
 	releaseCapacity(delta int64)
+}
+
+// streamVerifier re-reads a just-written chunk from the DESTINATION and reports
+// whether it matches what we sent.
+//
+// ── WHY THE VERIFY MUST HAPPEN BEFORE THE PUNCH ─────────────────────────────
+//
+// The existing whole-file drain runs two SHA checks, and their RECOVERY
+// strategies are different:
+//
+//	spool-side  — bytes read from the spool vs the hash recorded at write time.
+//	              Detects a bit flip on the spool SSD. On mismatch: QUARANTINE,
+//	              because there is no good copy anywhere.
+//	FUSE at-rest— the destination re-read through FUSE vs the same hash.
+//	              Detects writeback/in-flight corruption. On mismatch:
+//	              failTransient and KEEP THE SPOOL FILE, because "spool good,
+//	              re-draining" — a retry fixes it.
+//
+// Streaming does NOT weaken the DETECTION. Both checks still work: the chunk is
+// hashed as it is read from the spool, and re-read from the destination. What
+// streaming destroys is the second check's RECOVERY — once the prefix is punched
+// there is no spool copy left to re-drain from, so an at-rest mismatch would go
+// from a retryable blip to unrecoverable loss of that range.
+//
+// Verifying BEFORE the punch restores it exactly. At that moment the spool still
+// holds the bytes, so a mismatch is retryable in precisely the way the
+// whole-file path is: abandon the advance, leave the prefix intact, try again.
+//
+// COST, stated honestly: this reads every chunk back. That is one extra read per
+// chunk, and the drainer's own note calls the equivalent whole-file readback
+// "negligible on a video-editor machine" — it lands in the JuiceFS block cache
+// it was just written through, so it is usually local rather than a backend GET.
+// If that turns out to be false on a slow link, the lever is chunk size, not
+// removing the check: the alternative is silently trading irreplaceable footage
+// for throughput.
+type streamVerifier interface {
+	// verifyChunk reports nil when the destination range [off,off+len(want))
+	// matches want. A non-nil error aborts the advance with the spool prefix
+	// still intact.
+	verifyChunk(off int64, want []byte) error
 }
 
 // streamDurability persists the punched boundary so it survives a crash.
@@ -138,6 +179,7 @@ func advanceStream(
 	dest streamDest,
 	rel streamCapacityReleaser,
 	dur streamDurability,
+	ver streamVerifier,
 	sealed int64,
 ) (int64, error) {
 	if entry == nil || src == nil || dest == nil {
@@ -186,7 +228,21 @@ func advanceStream(
 		return 0, fmt.Errorf("stream: sync dest at %d: %w", sealed, err)
 	}
 
-	// STEP 3 — PERSIST the boundary before anything destroys the spool bytes.
+	// STEP 3 — VERIFY AT REST, while the spool still holds a good copy.
+	//
+	// This is the step that keeps an at-rest mismatch RETRYABLE. After the punch
+	// the same failure is unrecoverable. See streamVerifier.
+	//
+	// nil verifier is allowed: the whole-file drain's at-rest check is itself
+	// gated (d.atRestVerify), so streaming must be able to run in the same
+	// configuration rather than inventing a stricter policy of its own.
+	if ver != nil {
+		if err := ver.verifyChunk(start, buf); err != nil {
+			return 0, fmt.Errorf("stream: verify dest [%d,%d): %w", start, sealed, err)
+		}
+	}
+
+	// STEP 4 — PERSIST the boundary before anything destroys the spool bytes.
 	//
 	// Asymmetric on purpose: persisted-but-not-punched costs a redundant re-copy
 	// on the next boot; punched-but-not-persisted overwrites the destination with
@@ -195,7 +251,7 @@ func advanceStream(
 		return 0, fmt.Errorf("stream: persist punchedEnd %d: %w", sealed, err)
 	}
 
-	// STEP 4 — publish, THEN punch. Never the reverse.
+	// STEP 5 — publish, THEN punch. Never the reverse.
 	//
 	// Publishing first routes readers at the destination while the spool bytes
 	// are still present, which is harmless — they simply read the same data from
@@ -204,7 +260,7 @@ func advanceStream(
 	// zeros with no error.
 	entry.publishPunchedEnd(sealed)
 
-	// STEP 5 — reclaim the space.
+	// STEP 6 — reclaim the space.
 	//
 	// A punch failure is NOT fatal and must not roll back the published boundary:
 	// the bytes are durable at the destination and readers are already correctly
@@ -215,7 +271,7 @@ func advanceStream(
 		return 0, fmt.Errorf("stream: punch [%d,%d): %w", start, sealed, err)
 	}
 
-	// STEP 6 — release only what the filesystem actually gave back.
+	// STEP 7 — release only what the filesystem actually gave back.
 	//
 	// punchRange aligns inward, so it commonly reclaims slightly less than the
 	// range. Releasing the requested amount instead of the punched amount would
