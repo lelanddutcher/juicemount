@@ -337,6 +337,37 @@ type Registry struct {
 	// already imports metrics — the reverse would be a cycle).
 	dataGateMu sync.RWMutex
 	dataGateFn func() *FUSEDataGateSnapshot
+
+	// FD-pool hook — set by package nfs so /metrics can report descriptor and
+	// memory-buffer occupancy. Same provider rationale as the data gate: the
+	// pool is per-handler, so it cannot be a package-level counter, and reading
+	// it once per scrape costs nothing on the serving path.
+	fdPoolMu sync.RWMutex
+	fdPoolFn func() *FDPoolSnapshot
+}
+
+// FDPoolSnapshot reports file-descriptor and memory-buffer occupancy.
+//
+// WHY: FDPool.Stats() and MemoryBuffer.Stats() both existed and were never
+// called, and health.MemoryStats was built to carry these numbers but its
+// SetStatsProvider had no caller — so the process ran with zero fd visibility.
+// The 2026-07-28 audit measured ~1 orphaned fd per invalidation under a rename
+// storm, and there is no Setrlimit in the repo, so an fd leak would surface as
+// an unexplained abort with nothing to point at.
+//
+// Absent (nil) when no mount is up, so "not running" is never misread as
+// "running with an empty pool".
+type FDPoolSnapshot struct {
+	// Open is every pooled descriptor; Active is the subset with refCount > 0.
+	// Open climbing while Active stays flat is the orphan-leak signature.
+	Open   int `json:"open"`
+	Active int `json:"active"`
+
+	MemBufEntries int     `json:"membuf_entries"`
+	MemBufMB      float64 `json:"membuf_mb"`
+	MemBufHits    int64   `json:"membuf_hits"`
+	MemBufMisses  int64   `json:"membuf_misses"`
+	MemBufEvicts  int64   `json:"membuf_evicts"`
 }
 
 // NetworkSnapshot mirrors the netprofile link estimate for /metrics.
@@ -431,6 +462,14 @@ func (r *Registry) SetFUSEDataGateProvider(fn func() *FUSEDataGateSnapshot) {
 	r.dataGateMu.Lock()
 	defer r.dataGateMu.Unlock()
 	r.dataGateFn = fn
+}
+
+// SetFDPoolProvider registers a callback used by /metrics to report descriptor
+// and memory-buffer occupancy. Safe to leave unset (the field is then omitted).
+func (r *Registry) SetFDPoolProvider(fn func() *FDPoolSnapshot) {
+	r.fdPoolMu.Lock()
+	defer r.fdPoolMu.Unlock()
+	r.fdPoolFn = fn
 }
 
 // histFor returns (and lazily creates) the histogram for an RPC type.
@@ -678,6 +717,9 @@ type Snapshot struct {
 	// FUSEDataGate reports the post-panic concurrency ceiling. See
 	// FUSEDataGateSnapshot.
 	FUSEDataGate *FUSEDataGateSnapshot `json:"fuse_data_gate,omitempty"`
+
+	// FDPool reports descriptor + memory-buffer occupancy. See FDPoolSnapshot.
+	FDPool *FDPoolSnapshot `json:"fd_pool,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -751,6 +793,13 @@ func (r *Registry) Snapshot() Snapshot {
 	r.dataGateMu.RUnlock()
 	if dataGateFn != nil {
 		out.FUSEDataGate = dataGateFn()
+	}
+
+	r.fdPoolMu.RLock()
+	fdPoolFn := r.fdPoolFn
+	r.fdPoolMu.RUnlock()
+	if fdPoolFn != nil {
+		out.FDPool = fdPoolFn()
 	}
 
 	r.histsMu.RLock()
