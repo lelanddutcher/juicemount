@@ -2182,23 +2182,36 @@ func (e *SpoolEntry) ReadableBounds() (cend, wend int64) {
 // below a PERFORMANCE heuristic (keep the common rewrite off the slow FUSE path),
 // not a safety boundary. Read that again before "optimising" either constant to
 // zero: doing so is legal, merely slower.
-const (
-	// spoolSealMargin holds back bytes just under contiguousEnd. A writer that
-	// seeks back a little (chunk retry, small fixup) then stays on the fast
-	// spool path instead of being redirected through FUSE.
-	spoolSealMargin = 64 << 20 // 64 MiB
+const ()
 
-	// spoolSealHeadReserve keeps the head of the file unsealed until the entry
-	// closes. Header/index rewrite-at-close is overwhelmingly at offset 0
-	// (Premiere, Resolve, QuickTime moov), so reserving it converts the single
-	// most likely rewrite from a FUSE redirect into a plain spool write.
-	spoolSealHeadReserve = 64 << 20 // 64 MiB
+// spoolSealMargin holds back bytes just under contiguousEnd. A writer that seeks
+// back a little (chunk retry, small fixup) then stays on the fast spool path
+// instead of being redirected through FUSE.
+//
+// TOGETHER WITH spoolSealHeadReserve THIS SETS THE REAL FLOOR for streaming: a
+// file must exceed head-reserve + margin before a single byte is sealable, which
+// is a much higher bar than spoolStreamMinSize alone. The gate test caught that
+// the hard way — lowering only the threshold left the margins larger than the
+// whole fixture, nothing ever sealed, and peak spool occupancy was 100% of the
+// file while every unit test still passed.
+//
+// Var (not const) so tests can scale it alongside the threshold.
+var spoolSealMargin int64 = 64 << 20 // 64 MiB
 
-	// spoolStreamMinSize is the size below which streaming is not worth its
-	// complexity: such a file cannot exhaust the disk on its own, and the whole
-	// -file drain already verifies it with an at-rest SHA re-read.
-	spoolStreamMinSize = 1 << 30 // 1 GiB
-)
+// spoolSealHeadReserve keeps the head of the file unsealed until the entry
+// closes. Header/index rewrite-at-close is overwhelmingly at offset 0 (Premiere,
+// Resolve, QuickTime moov), so reserving it converts the single most likely
+// rewrite from a FUSE redirect into a plain spool write.
+var spoolSealHeadReserve int64 = 64 << 20 // 64 MiB
+
+// spoolStreamMinSize is the size below which streaming is not worth its
+// complexity: such a file cannot exhaust the disk on its own, and the whole-file
+// drain already verifies it with an at-rest SHA re-read.
+//
+// Var (not const) so a test can lower it and exercise real multi-chunk streaming
+// without a multi-gigabyte fixture — the same idiom as cacheMutationChunk in
+// metadata/store.go. Production never changes it.
+var spoolStreamMinSize int64 = 1 << 30 // 1 GiB
 
 // sealedEndLocked computes the sealed prefix. Caller holds e.mu (R or W).
 //
