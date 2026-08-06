@@ -1057,7 +1057,14 @@ func (rc *RedisClient) PublishEvent(ctx context.Context, evt MetadataEvent) erro
 	if err != nil {
 		return err
 	}
-	return rc.redisDB().Publish(ctx, SubscribeChannel, string(data)).Err()
+	if err := rc.redisDB().Publish(ctx, SubscribeChannel, string(data)).Err(); err != nil {
+		return err
+	}
+	// Validity denominator for KeyspaceStatus: our own writes are replayed back
+	// to us (the publisher carries no origin field), so "published N, received
+	// zero" is a genuine push failure rather than an absence of traffic.
+	noteKeyspacePublished()
+	return nil
 }
 
 // subscribeLoop listens for real-time metadata events via Redis SUBSCRIBE.
@@ -1112,6 +1119,12 @@ func (rc *RedisClient) runSubscribe() {
 // Updates the in-memory cache immediately (never blocked), then writes to
 // SQLite with retry (may be briefly blocked by BulkInsert transactions).
 func (rc *RedisClient) applyEvent(evt MetadataEvent) {
+	// Counted here rather than at the subscription read, and BEFORE any
+	// namespace filtering below: the question this answers is "did push deliver
+	// to us at all", which a filtered-out event answers just as well as an
+	// applied one. Counting only post-filter events would report a healthy
+	// pipeline as broken whenever the only traffic was internal-namespace churn.
+	noteKeyspaceEventApplied()
 	// Classify mode from the event's type discriminators. IsSymlink takes
 	// precedence so a create/update/rename of a symlink keeps os.ModeSymlink
 	// (and never downgrades the locally-minted ModeSymlink cache Entry) instead
