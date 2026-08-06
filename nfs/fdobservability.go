@@ -45,6 +45,24 @@ func publishFDStatsSource(pool *FDPool, memBuf *MemoryBuffer) {
 	currentFDStats.Store(&fdStatsSource{pool: pool, memBuf: memBuf})
 }
 
+// LiveFDStats reports the current pool and buffer occupancy for consumers
+// outside this package, ok=false when no mount is up.
+//
+// Exists because health.MemoryStats needs the same numbers /metrics reports, and
+// health cannot import nfs. Returning ok rather than zeros keeps "no mount" and
+// "empty pool" distinguishable at every consumer, not just in the JSON.
+func LiveFDStats() (open, active, memBufEntries int, memBufMB float64, ok bool) {
+	src := currentFDStats.Load()
+	if src == nil || src.pool == nil {
+		return 0, 0, 0, 0, false
+	}
+	open, active = src.pool.Stats()
+	if src.memBuf != nil {
+		memBufEntries, memBufMB, _, _, _ = src.memBuf.Stats()
+	}
+	return open, active, memBufEntries, memBufMB, true
+}
+
 func init() {
 	metrics.Default().SetFDPoolProvider(func() *metrics.FDPoolSnapshot {
 		src := currentFDStats.Load()

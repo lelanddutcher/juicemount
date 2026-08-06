@@ -40,6 +40,27 @@ func TestAppWiresNetWatcherIntoHealthMonitor(t *testing.T) {
 	}
 }
 
+// The health monitor's application stats provider must be wired too.
+//
+// Found by the dead-wiring sweep AFTER the /metrics half of this chain was
+// fixed: health.MemoryStats, its FDPoolOpen/MemBuf* fields, and the copy at
+// health/monitor.go:425 all existed, and SetStatsProvider had no caller — so
+// /health reported hard zeros for every application-level number. The two
+// halves of one chain were separately dead, which is the argument for sweeping
+// rather than fixing these one at a time.
+func TestAppWiresStatsProviderIntoHealthMonitor(t *testing.T) {
+	src, err := os.ReadFile("cbridge.go")
+	if err != nil {
+		t.Fatalf("read cbridge.go: %v", err)
+	}
+	call := regexp.MustCompile(`globalMonitor\s*\.\s*SetStatsProvider\s*\(`)
+	if !call.Match(src) {
+		t.Error("cbridge.go never calls globalMonitor.SetStatsProvider — /health will " +
+			"report PathCacheSize/FDPoolOpen/MemBuf* as hard zeros regardless of " +
+			"actual occupancy, which reads as 'healthy and idle' during an fd leak")
+	}
+}
+
 // The watcher passed in must be a real one, not a nil literal. A nil argument
 // compiles, satisfies the call-site check above, and restores exactly the broken
 // behaviour — so the call alone is not sufficient evidence the fix is live.

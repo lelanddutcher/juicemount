@@ -1459,6 +1459,30 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if globalKeyspaceNetWatcher != nil {
 		globalMonitor.SetNetWatcher(globalKeyspaceNetWatcher)
 	}
+	// L5b (2026-08-06): SetStatsProvider had no caller either, so /health
+	// reported PathCacheSize/FDPoolOpen/MemBuf* as hard zeros while the fields,
+	// the struct and the copy at health/monitor.go:425 all existed. Found by the
+	// dead-wiring sweep AFTER the /metrics half was fixed — the two halves of
+	// this chain were separately dead, which is exactly why a sweep beats
+	// finding them one at a time.
+	//
+	// Zeros are reported when no mount is up (LiveFDStats ok=false). That is
+	// honest here: /health describes a running server, and its consumer is a
+	// status indicator rather than an fd investigation. The absent-vs-empty
+	// distinction that matters for leak-hunting is preserved in /metrics, which
+	// omits the section entirely.
+	globalMonitor.SetStatsProvider(func() health.MemoryStats {
+		open, active, mbEntries, mbMB, ok := jmnfs.LiveFDStats()
+		if !ok {
+			return health.MemoryStats{}
+		}
+		return health.MemoryStats{
+			FDPoolOpen:    open,
+			FDPoolActive:  active,
+			MemBufEntries: mbEntries,
+			MemBufSizeMB:  mbMB,
+		}
+	})
 	// #89 online busy-suppression: give the health monitor a lock-free view of
 	// the drainer's live ingest state so a stat/readdir TIMEOUT during a
 	// legitimate high-concurrency ingest is reported as "busy (heavy ingest)"
