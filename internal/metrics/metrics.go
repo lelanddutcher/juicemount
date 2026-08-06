@@ -344,6 +344,36 @@ type Registry struct {
 	// it once per scrape costs nothing on the serving path.
 	fdPoolMu sync.RWMutex
 	fdPoolFn func() *FDPoolSnapshot
+
+	// Keyspace-push hook — set by package metadata so /metrics can answer "is
+	// push actually delivering". Provider rather than pushed counters because
+	// the verdict is computed, and because metadata must not depend on when a
+	// scrape happens.
+	keyspaceMu sync.RWMutex
+	keyspaceFn func() *KeyspaceSnapshot
+}
+
+// KeyspaceSnapshot reports whether Redis keyspace push is delivering.
+//
+// WHY THIS IS HERE AT ALL: the question was unanswerable from the running
+// process. rc.engaged recorded the state the code INTENDED to be in; nothing
+// counted whether a single event ever arrived, so the 2026-07-10 incident
+// (notify-keyspace-events unset on the NAS, push unable to engage, a permanent
+// 30s SCAN over the tunnel) had to be diagnosed from logs.
+//
+// VERDICT CARRIES A REFUSAL. "unknown" is neither pass nor fail — it means
+// nothing was published and nothing arrived, so there was nothing to observe.
+// Reporting "working" there would be a verdict from no measurement, which is the
+// harness failure this project has been burned by repeatedly.
+type KeyspaceSnapshot struct {
+	// Verdict is working | broken | unknown | unreachable.
+	Verdict string `json:"verdict"`
+	Reason  string `json:"reason"`
+	// EventsApplied counts keyspace events delivered to this process.
+	EventsApplied int64 `json:"events_applied"`
+	// PublishedMutations is the validity DENOMINATOR: our own writes are
+	// replayed back to us, so published>0 with events==0 is conclusive.
+	PublishedMutations int64 `json:"published_mutations"`
 }
 
 // FDPoolSnapshot reports file-descriptor and memory-buffer occupancy.
@@ -462,6 +492,14 @@ func (r *Registry) SetFUSEDataGateProvider(fn func() *FUSEDataGateSnapshot) {
 	r.dataGateMu.Lock()
 	defer r.dataGateMu.Unlock()
 	r.dataGateFn = fn
+}
+
+// SetKeyspaceProvider registers a callback used by /metrics to report keyspace
+// push health. Safe to leave unset (the field is then omitted).
+func (r *Registry) SetKeyspaceProvider(fn func() *KeyspaceSnapshot) {
+	r.keyspaceMu.Lock()
+	defer r.keyspaceMu.Unlock()
+	r.keyspaceFn = fn
 }
 
 // SetFDPoolProvider registers a callback used by /metrics to report descriptor
@@ -720,6 +758,10 @@ type Snapshot struct {
 
 	// FDPool reports descriptor + memory-buffer occupancy. See FDPoolSnapshot.
 	FDPool *FDPoolSnapshot `json:"fd_pool,omitempty"`
+
+	// Keyspace reports whether Redis keyspace push is delivering. See
+	// KeyspaceSnapshot.
+	Keyspace *KeyspaceSnapshot `json:"keyspace,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -800,6 +842,13 @@ func (r *Registry) Snapshot() Snapshot {
 	r.fdPoolMu.RUnlock()
 	if fdPoolFn != nil {
 		out.FDPool = fdPoolFn()
+	}
+
+	r.keyspaceMu.RLock()
+	keyspaceFn := r.keyspaceFn
+	r.keyspaceMu.RUnlock()
+	if keyspaceFn != nil {
+		out.Keyspace = keyspaceFn()
 	}
 
 	r.histsMu.RLock()

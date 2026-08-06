@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync/atomic"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
 
 // KEYSPACE PUSH: IS IT ACTUALLY WORKING?
@@ -157,4 +159,28 @@ func keyspaceVerdictFor(eventsApplied, published int64, configReadable bool) Key
 			"to observe. This is NOT a pass: write a file and re-check."
 	}
 	return st
+}
+
+// Register the keyspace verdict with /metrics at package init.
+//
+// From an init() rather than a wiring site, for the reason this sprint has kept
+// re-learning: a status that nothing calls is indistinguishable from no status
+// at all, and every forgotten Set*Provider found here was a mechanism that was
+// correct and unreachable. An init cannot be forgotten.
+//
+// Reports the COUNTER-DERIVED verdict only — no Redis round trip on a scrape.
+// The config-flag half needs a live client and is answered by
+// RedisClient.KeyspaceStatus; the counters alone already separate "delivering"
+// from "silent while we published", which is the question Leland actually asked.
+func init() {
+	metrics.Default().SetKeyspaceProvider(func() *metrics.KeyspaceSnapshot {
+		applied, published := KeyspaceCounters()
+		v := keyspaceVerdictFor(applied, published, true)
+		return &metrics.KeyspaceSnapshot{
+			Verdict:            string(v.Verdict),
+			Reason:             v.Reason,
+			EventsApplied:      applied,
+			PublishedMutations: published,
+		}
+	})
 }

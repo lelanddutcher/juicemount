@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
 
 func resetKeyspaceCounters(t *testing.T) {
@@ -175,4 +177,40 @@ func TestPublishEventIsWiredToTheValidityCounter(t *testing.T) {
 func readSourceFile(name string) (string, error) {
 	b, err := os.ReadFile(name)
 	return string(b), err
+}
+
+// KeyspaceStatus must be REACHABLE from /metrics.
+//
+// A status nothing calls is indistinguishable from no status at all, and that is
+// the single most common defect shape found this sprint — the FUSE ceiling with
+// zero readers, the network grace period, the fd stats, SetStatsProvider,
+// finishStream, the boot sweep. Registering from an init means this one cannot
+// join them.
+func TestKeyspaceVerdictIsReportedInMetrics(t *testing.T) {
+	resetKeyspaceCounters(t)
+
+	snap := metrics.Default().Snapshot()
+	if snap.Keyspace == nil {
+		t.Fatal("metrics snapshot has no keyspace section — push health is invisible " +
+			"in /metrics; is the init() provider registration still there?")
+	}
+	// With nothing observed the verdict must be the REFUSAL, not a pass.
+	if snap.Keyspace.Verdict != string(KeyspaceUnknown) {
+		t.Errorf("verdict %q with nothing observed, want %q — a pass here would be a "+
+			"number from no measurement", snap.Keyspace.Verdict, KeyspaceUnknown)
+	}
+
+	// And the counters must be LIVE, not a constant zero: a snapshot that never
+	// moves satisfies the nil-check above while reporting nothing.
+	noteKeyspaceEventApplied()
+	noteKeyspaceEventApplied()
+	live := metrics.Default().Snapshot()
+	if live.Keyspace.EventsApplied != 2 {
+		t.Errorf("events_applied = %d after two events, want 2 — the gauge is "+
+			"constant, so it can never show push failing", live.Keyspace.EventsApplied)
+	}
+	if live.Keyspace.Verdict != string(KeyspaceWorking) {
+		t.Errorf("verdict %q with events observed, want %q",
+			live.Keyspace.Verdict, KeyspaceWorking)
+	}
 }
