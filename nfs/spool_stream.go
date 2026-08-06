@@ -17,9 +17,10 @@ import (
 //
 //	1. write prefix to dest
 //	2. fsync dest                  <- before 3, or a crash loses bytes we then punch
-//	3. publish punchedEnd          <- before 4, or a reader hits a hole and gets zeros
-//	4. punch the spool prefix      <- before 5, or capacity is freed that the disk still holds
-//	5. release capacity
+//	3. PERSIST punchedEnd          <- before 5, or the next boot uploads zeros over good data
+//	4. publish punchedEnd          <- before 5, or a reader hits a hole and gets zeros
+//	5. punch the spool prefix      <- before 6, or capacity is freed that the disk still holds
+//	6. release capacity
 //
 // Getting 2 and 3 backwards loses data on a crash. Getting 3 and 4 backwards
 // serves silent zeros to a live reader. Neither is recoverable, and neither
@@ -43,6 +44,44 @@ type streamDest interface {
 // streamCapacityReleaser frees reclaimed spool bytes from the capacity budget.
 type streamCapacityReleaser interface {
 	releaseCapacity(delta int64)
+}
+
+// streamDurability persists the punched boundary so it survives a crash.
+//
+// ── THIS IS NOT OPTIONAL, AND HERE IS THE FAILURE IT PREVENTS ────────────────
+//
+// punchedEnd started life as an in-memory field. `spool_entries` has no column
+// for it. Meanwhile the boot recovery scrubber decides whether a spool file is
+// intact by comparing sizes (nfs/spool.go, the failed→ready branch):
+//
+//	case r.Size > 0 && diskSize == r.Size:  // "the full copy survived"
+//
+// A punched file passes that test EXACTLY, because F_PUNCHHOLE leaves the
+// logical size untouched — that property is why punching is usable at all, and
+// it is also what makes this lethal. So a crash midway through a streamed copy
+// would look, on the next boot, like a complete spool file. Recovery resets it
+// to `ready`, the drainer copies the WHOLE file to the backend, and the punched
+// prefix — zeros — overwrites the real bytes already durably written there.
+//
+// Silent, total loss of the streamed prefix. No error at any layer. It is the
+// same class as the incident documented at that very branch, where recovery
+// "silently destroyed an intact photo on the next boot".
+//
+// THE ORDERING THAT FIXES IT is asymmetric, and the asymmetry is the point:
+//
+//	persisted but not punched -> recovery skips a prefix that is still present.
+//	                             Wasteful (we re-copy it), completely safe.
+//	punched but not persisted -> recovery uploads zeros over good data.
+//	                             Unrecoverable.
+//
+// So the persist happens BEFORE the punch, always, and a persist failure aborts
+// the advance. advanceStream REFUSES to run without a durability hook rather
+// than defaulting to nil, because the whole bug is that this step is easy to
+// forget — a fix for a forgotten step must not itself be forgettable.
+type streamDurability interface {
+	// persistPunchedEnd must be durable before it returns. A non-nil error
+	// aborts the advance with nothing published and nothing punched.
+	persistPunchedEnd(entryID int64, end int64) error
 }
 
 // punchRangeFn is a test seam for the punch step.
@@ -96,10 +135,19 @@ func advanceStream(
 	src *os.File,
 	dest streamDest,
 	rel streamCapacityReleaser,
+	dur streamDurability,
 	sealed int64,
 ) (int64, error) {
 	if entry == nil || src == nil || dest == nil {
 		return 0, nil
+	}
+	// FAIL CLOSED without durability. See streamDurability: punching without a
+	// persisted boundary makes the next boot upload zeros over good data, and a
+	// nil default would make that the easy mistake rather than an impossible one.
+	if dur == nil {
+		return 0, fmt.Errorf("stream: refusing to punch without a durability hook: " +
+			"an unpersisted punchedEnd makes boot recovery overwrite the destination " +
+			"with the zeros of the punched prefix")
 	}
 
 	start := entry.PunchedEnd()
@@ -136,7 +184,16 @@ func advanceStream(
 		return 0, fmt.Errorf("stream: sync dest at %d: %w", sealed, err)
 	}
 
-	// STEP 3 — publish, THEN punch. Never the reverse.
+	// STEP 3 — PERSIST the boundary before anything destroys the spool bytes.
+	//
+	// Asymmetric on purpose: persisted-but-not-punched costs a redundant re-copy
+	// on the next boot; punched-but-not-persisted overwrites the destination with
+	// zeros. Only one of those is recoverable.
+	if err := dur.persistPunchedEnd(entry.id, sealed); err != nil {
+		return 0, fmt.Errorf("stream: persist punchedEnd %d: %w", sealed, err)
+	}
+
+	// STEP 4 — publish, THEN punch. Never the reverse.
 	//
 	// Publishing first routes readers at the destination while the spool bytes
 	// are still present, which is harmless — they simply read the same data from
@@ -145,7 +202,7 @@ func advanceStream(
 	// zeros with no error.
 	entry.publishPunchedEnd(sealed)
 
-	// STEP 4 — reclaim the space.
+	// STEP 5 — reclaim the space.
 	//
 	// A punch failure is NOT fatal and must not roll back the published boundary:
 	// the bytes are durable at the destination and readers are already correctly
@@ -156,7 +213,7 @@ func advanceStream(
 		return 0, fmt.Errorf("stream: punch [%d,%d): %w", start, sealed, err)
 	}
 
-	// STEP 5 — release only what the filesystem actually gave back.
+	// STEP 6 — release only what the filesystem actually gave back.
 	//
 	// punchRange aligns inward, so it commonly reclaims slightly less than the
 	// range. Releasing the requested amount instead of the punched amount would

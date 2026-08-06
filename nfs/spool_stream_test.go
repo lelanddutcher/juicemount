@@ -83,7 +83,7 @@ func TestAdvanceStreamOrdersSyncPublishPunchRelease(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	n, err := advanceStream(e, src, dest, rel, 128<<10)
+	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 128<<10)
 	if err != nil {
 		t.Fatalf("advanceStream: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestAdvanceStreamPublishesNothingWhenSyncFails(t *testing.T) {
 	}
 	rel := &recordingReleaser{events: events}
 
-	n, err := advanceStream(e, src, dest, rel, 128<<10)
+	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 128<<10)
 	if err == nil {
 		t.Fatal("advanceStream succeeded despite an fsync failure")
 	}
@@ -158,7 +158,7 @@ func TestAdvanceStreamLeavesPrefixIntactWhenWriteFails(t *testing.T) {
 	}
 	rel := &recordingReleaser{events: events}
 
-	if _, err := advanceStream(e, src, dest, rel, 128<<10); err == nil {
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 128<<10); err == nil {
 		t.Fatal("advanceStream succeeded despite a dest write failure")
 	}
 	if got := e.PunchedEnd(); got != 0 {
@@ -183,7 +183,7 @@ func TestAdvanceStreamReleasesOnlyWhatWasActuallyPunched(t *testing.T) {
 
 	// A deliberately unaligned sealed end: only whole blocks are punchable.
 	const sealed = 100<<10 + 777
-	n, err := advanceStream(e, src, dest, rel, sealed)
+	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, sealed)
 	if err != nil {
 		t.Fatalf("advanceStream: %v", err)
 	}
@@ -204,14 +204,14 @@ func TestAdvanceStreamNoOpWhenNothingNewIsSealed(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	if _, err := advanceStream(e, src, dest, rel, 64<<10); err != nil {
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 64<<10); err != nil {
 		t.Fatal(err)
 	}
 	before := e.PunchedEnd()
 
 	// Same sealed end again, and a retreated one.
 	for _, sealed := range []int64{64 << 10, 32 << 10, 0} {
-		n, err := advanceStream(e, src, dest, rel, sealed)
+		n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, sealed)
 		if err != nil {
 			t.Errorf("advanceStream(sealed=%d) errored: %v", sealed, err)
 		}
@@ -253,7 +253,7 @@ func TestAdvanceStreamCopiesTheCorrectBytesToTheCorrectOffset(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	if _, err := advanceStream(e, src, dest, rel, 64<<10); err != nil {
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, 64<<10); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := dest.data[0]
@@ -304,7 +304,7 @@ func TestAdvanceStreamRejectsAReadOnlySpoolHandle(t *testing.T) {
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
 
-	n, err := advanceStream(e, ro, dest, rel, 64<<10)
+	n, err := advanceStream(e, ro, dest, rel, &fakeDurability{}, 64<<10)
 	if err == nil {
 		t.Fatal("advanceStream succeeded with a READ-ONLY spool handle — punching " +
 			"cannot have happened, so capacity would be released for space the " +
@@ -351,7 +351,7 @@ func TestAdvanceStreamPublishesBeforeItPunches(t *testing.T) {
 
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
-	if _, err := advanceStream(e, src, dest, rel, sealed); err != nil {
+	if _, err := advanceStream(e, src, dest, rel, &fakeDurability{}, sealed); err != nil {
 		t.Fatalf("advanceStream: %v", err)
 	}
 
@@ -360,5 +360,116 @@ func TestAdvanceStreamPublishesBeforeItPunches(t *testing.T) {
 			"overtook the publish, so between those two statements a reader is "+
 			"routed at the spool for a range that is already a hole and gets zeros "+
 			"with no error", punchedEndAtPunchTime, sealed)
+	}
+}
+
+// fakeDurability records persisted boundaries and can be made to fail.
+type fakeDurability struct {
+	persisted []int64
+	fail      error
+	at        func() // called during persist, to observe ordering
+}
+
+func (f *fakeDurability) persistPunchedEnd(entryID int64, end int64) error {
+	if f.at != nil {
+		f.at()
+	}
+	if f.fail != nil {
+		return f.fail
+	}
+	f.persisted = append(f.persisted, end)
+	return nil
+}
+
+// Streaming MUST refuse to run without a durability hook.
+//
+// spool_entries has no punched_end column, and boot recovery decides a spool
+// file is intact by comparing sizes — which a punched file passes exactly,
+// because punching leaves the logical size untouched. So an unpersisted
+// punchedEnd means the next boot re-uploads the WHOLE spool file, punched prefix
+// and all, overwriting good destination bytes with zeros. Defaulting the hook to
+// nil would make that the easy mistake; refusing makes it impossible.
+func TestAdvanceStreamRefusesWithoutDurability(t *testing.T) {
+	e, _, events := streamFixture(t, 256<<10)
+	src, err := os.OpenFile(e.SpoolFilePath(), os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+
+	dest := &recordingDest{data: map[int64][]byte{}, events: events}
+	rel := &recordingReleaser{events: events}
+
+	n, err := advanceStream(e, src, dest, rel, nil, 64<<10)
+	if err == nil {
+		t.Fatal("advanceStream punched without a durability hook — after a crash, " +
+			"boot recovery will upload the punched prefix as zeros over the real data")
+	}
+	if n != 0 || e.PunchedEnd() != 0 {
+		t.Errorf("state moved despite refusing: reclaimed=%d punchedEnd=%d", n, e.PunchedEnd())
+	}
+}
+
+// The boundary must be DURABLE before the punch destroys the spool bytes.
+// Sampled inside the punch, the only point where the ordering is observable —
+// the same seam the publish/punch neuter needed.
+func TestAdvanceStreamPersistsBeforeItPunches(t *testing.T) {
+	e, _, events := streamFixture(t, 256<<10)
+	src, err := os.OpenFile(e.SpoolFilePath(), os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+
+	dur := &fakeDurability{}
+	persistedWhenPunched := false
+	orig := punchRangeFn
+	t.Cleanup(func() { punchRangeFn = orig })
+	punchRangeFn = func(f *os.File, off, end int64) (int64, error) {
+		persistedWhenPunched = len(dur.persisted) > 0
+		return orig(f, off, end)
+	}
+
+	dest := &recordingDest{data: map[int64][]byte{}, events: events}
+	rel := &recordingReleaser{events: events}
+	if _, err := advanceStream(e, src, dest, rel, dur, 64<<10); err != nil {
+		t.Fatalf("advanceStream: %v", err)
+	}
+	if !persistedWhenPunched {
+		t.Fatal("the spool prefix was punched BEFORE the boundary was persisted — a " +
+			"crash in that window leaves a holey spool file that boot recovery " +
+			"cannot distinguish from an intact one, and it uploads the zeros")
+	}
+}
+
+// A persist failure must abort with nothing published and nothing punched.
+func TestAdvanceStreamAbortsWhenPersistFails(t *testing.T) {
+	e, _, events := streamFixture(t, 256<<10)
+	src, err := os.OpenFile(e.SpoolFilePath(), os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+
+	dur := &fakeDurability{fail: errors.New("simulated sqlite failure")}
+	dest := &recordingDest{data: map[int64][]byte{}, events: events}
+	rel := &recordingReleaser{events: events}
+
+	if _, err := advanceStream(e, src, dest, rel, dur, 64<<10); err == nil {
+		t.Fatal("advanceStream succeeded despite a failed persist")
+	}
+	if got := e.PunchedEnd(); got != 0 {
+		t.Errorf("punchedEnd published as %d without a durable record", got)
+	}
+	if rel.total != 0 {
+		t.Errorf("released %d bytes after a failed persist", rel.total)
+	}
+	// The prefix must still be real data, not a hole.
+	buf := make([]byte, 4096)
+	if _, err := src.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read prefix: %v", err)
+	}
+	if buf[1] != 1 {
+		t.Errorf("spool prefix was punched despite the persist failing (byte1=%d)", buf[1])
 	}
 }
