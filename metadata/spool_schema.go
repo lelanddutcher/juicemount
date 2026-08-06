@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS spool_entries (
     drain_attempts  INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
     suspect_zero_tail TEXT,
+    punched_end     INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -98,6 +99,27 @@ func InitSpoolSchema(db *sql.DB) error {
 	if _, err := db.Exec(`ALTER TABLE spool_entries ADD COLUMN suspect_zero_tail TEXT`); err != nil &&
 		!strings.Contains(err.Error(), "duplicate column") {
 		return fmt.Errorf("init spool schema (suspect_zero_tail migration): %w", err)
+	}
+	// punched_end (streaming drain): the end of the prefix that has been copied
+	// to the backend AND punched out of the spool file. 0 for every row written
+	// by a non-streaming build, which is exactly the right default — it means
+	// "nothing punched", i.e. the historical assumption.
+	//
+	// THIS COLUMN IS A DATA-SAFETY REQUIREMENT, NOT BOOKKEEPING. F_PUNCHHOLE
+	// leaves a file's LOGICAL size unchanged, and boot recovery decides a spool
+	// file is intact by comparing sizes (nfs/spool.go, the failed→ready branch:
+	// `r.Size > 0 && diskSize == r.Size`). A half-punched file passes that test
+	// exactly. Without this column, a crash midway through a streamed copy looks
+	// like a complete spool file on the next boot: recovery resets it to ready,
+	// the drainer uploads the WHOLE file, and the punched prefix — zeros —
+	// overwrites real bytes already durably written to the backend. Silent, total
+	// loss of that prefix, with no error at any layer.
+	//
+	// Recovery must therefore treat punched_end > 0 as "this spool file is NOT
+	// self-sufficient" and refuse to re-drain it from disk.
+	if _, err := db.Exec(`ALTER TABLE spool_entries ADD COLUMN punched_end INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("init spool schema (punched_end migration): %w", err)
 	}
 	if _, err := db.Exec(pendingSymlinkSchema); err != nil {
 		return fmt.Errorf("init pending-symlink schema: %w", err)

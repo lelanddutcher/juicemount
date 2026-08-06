@@ -38,8 +38,19 @@ type SpoolRow struct {
 	// download signature — the file drains FULL-SIZE with a zero tail).
 	// Surfacing only: nothing gates a drain on this field.
 	SuspectZeroTail string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// PunchedEnd is the end of the prefix the streaming drain has copied to the
+	// backend AND punched out of the spool file. Zero on every row a
+	// non-streaming build ever wrote, which is the correct default: nothing
+	// punched.
+	//
+	// A NON-ZERO VALUE MEANS THE SPOOL FILE IS NOT SELF-SUFFICIENT. Its first
+	// PunchedEnd bytes read as zeros, and because F_PUNCHHOLE leaves the logical
+	// size untouched, nothing about the file on disk reveals that. Recovery MUST
+	// consult this before treating a size match as proof the copy survived — see
+	// SetPunchedEnd and nfs/spool.go's failed→ready branch.
+	PunchedEnd int64
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // SpoolStore is the SQLite-backed CRUD layer for spool_entries.
@@ -135,6 +146,52 @@ func (s *SpoolStore) MarkDraining(id int64) (bool, error) {
 // cancels in-flight spool entries (QA-37, DeleteActiveByPath), and the drainer
 // uses a false return to know it must UNDO its FUSE write rather than
 // resurrect a file the user already deleted.
+// SetPunchedEnd durably records how much of a spool file has been drained to the
+// backend and punched away.
+//
+// THIS MUST COMMIT BEFORE THE CORRESPONDING PUNCH. F_PUNCHHOLE leaves the file's
+// logical size unchanged, so a half-punched spool file is indistinguishable on
+// disk from a complete one — and boot recovery decides intactness by comparing
+// sizes. Punch first and crash, and the next boot re-drains the holey file,
+// uploading its zero prefix over real bytes already durable at the backend:
+// silent, total loss of that prefix.
+//
+// The two failure directions are deliberately asymmetric. Persisted-but-not-
+// punched costs a redundant re-copy on the next boot and is completely safe;
+// punched-but-not-persisted is unrecoverable. So this is ordered first, and its
+// failure aborts the advance.
+//
+// MONOTONIC via MAX: punching cannot be undone, so a lower value must never
+// overwrite a higher one. A retry that recomputes a smaller boundary (or an
+// out-of-order write under concurrency) would otherwise re-expose a range that
+// is already a hole. Same reasoning as UpdateSize's MAX, and unlike that case
+// there is no legitimate shrink at all.
+func (s *SpoolStore) SetPunchedEnd(id int64, end int64) error {
+	if end < 0 {
+		return fmt.Errorf("spool set punched_end %d: negative end %d", id, end)
+	}
+	now := time.Now().Unix()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.db.Exec(
+		`UPDATE spool_entries SET punched_end=MAX(punched_end, ?), updated_at=? WHERE id=?`,
+		end, now, id,
+	); err != nil {
+		return fmt.Errorf("spool set punched_end %d=%d: %w", id, end, err)
+	}
+	return nil
+}
+
+// PunchedEnd reads the persisted punched boundary for one row.
+func (s *SpoolStore) PunchedEnd(id int64) (int64, error) {
+	var end int64
+	err := s.db.QueryRow(`SELECT punched_end FROM spool_entries WHERE id=?`, id).Scan(&end)
+	if err != nil {
+		return 0, fmt.Errorf("spool get punched_end %d: %w", id, err)
+	}
+	return end, nil
+}
+
 func (s *SpoolStore) MarkDone(id int64) (bool, error) {
 	now := time.Now().Unix()
 	s.writeMu.Lock()

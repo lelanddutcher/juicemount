@@ -594,3 +594,79 @@ func TestRecoverOnBootIdempotent(t *testing.T) {
 		t.Errorf("used2=%d, want 500 (no double-counting)", used2)
 	}
 }
+
+// A STREAMED (punched) spool file must NEVER be resumed from disk.
+//
+// This is the data-loss case that motivated the punched_end column. The streaming
+// drain punches drained prefixes out of the spool file, and F_PUNCHHOLE leaves
+// the LOGICAL size unchanged — so a half-punched file passes the
+// `diskSize == r.Size` intactness check EXACTLY while its first punchedEnd bytes
+// read as zeros.
+//
+// Resuming it would copy the whole file to the backend and overwrite real,
+// already-durable bytes with those zeros: silent, total loss of the streamed
+// prefix, with no error at any layer. Same class as the incident that made this
+// branch preserve rather than delete in the first place.
+//
+// The fixture deliberately makes the size match, so nothing but punched_end can
+// distinguish this row from an ordinary resumable one.
+func TestRecoverOnBootNeverResumesAPunchedSpoolFile(t *testing.T) {
+	s, root, _ := newSpoolStoreForRecovery(t)
+
+	content := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+	f := dropFile(t, root, "streamed-failed", content)
+	id, _ := s.Meta().Insert("/DCIM/BIG.MOV", f)
+	// Row size EQUALS the on-disk size — the intactness test passes.
+	if err := s.Meta().MarkReady(id, int64(len(content)), []byte("sha")); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if _, err := s.Meta().MarkFailed(id, "crashed mid-stream"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	// ...but a prefix was already drained to the backend and punched away.
+	if err := s.Meta().SetPunchedEnd(id, 16); err != nil {
+		t.Fatalf("set punched_end: %v", err)
+	}
+
+	report, err := s.RecoverOnBoot(context.Background())
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if report.FailedResumed != 0 {
+		t.Errorf("FailedResumed=%d, want 0 — resuming a punched file uploads its "+
+			"zero prefix over real backend bytes", report.FailedResumed)
+	}
+	row, _ := s.Meta().Get(id)
+	if row.DrainState != metadata.DrainFailed {
+		t.Errorf("row state=%q, want failed — a streamed row must be preserved for "+
+			"the operator, never re-driven from a holey spool file", row.DrainState)
+	}
+	if _, err := os.Stat(f); err != nil {
+		t.Errorf("streamed spool file must be preserved, not deleted: %v", err)
+	}
+}
+
+// The guard must be NARROW: an ordinary un-punched failed row still resumes.
+// A guard that preserved everything would silently stop all failed-row recovery.
+func TestRecoverOnBootStillResumesUnpunchedFailedRows(t *testing.T) {
+	s, root, _ := newSpoolStoreForRecovery(t)
+
+	content := []byte("intact and never streamed")
+	f := dropFile(t, root, "plain-failed", content)
+	id, _ := s.Meta().Insert("/DCIM/PLAIN.MOV", f)
+	if err := s.Meta().MarkReady(id, int64(len(content)), []byte("sha")); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if _, err := s.Meta().MarkFailed(id, "transient backend outage"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	report, err := s.RecoverOnBoot(context.Background())
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if report.FailedResumed != 1 {
+		t.Errorf("FailedResumed=%d, want 1 — the punched_end guard must not stop "+
+			"ordinary failed-row recovery", report.FailedResumed)
+	}
+}

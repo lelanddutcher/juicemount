@@ -3,6 +3,8 @@ package nfs
 import (
 	"fmt"
 	"os"
+
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // STREAMING DRAIN — the ordered advance (S2).
@@ -223,4 +225,19 @@ func advanceStream(
 		rel.releaseCapacity(punched)
 	}
 	return punched, nil
+}
+
+// spoolMetaDurability is the production streamDurability: it persists the
+// punched boundary into the spool row via SQLite.
+//
+// Wrapping the metadata store rather than passing it directly keeps the
+// dependency of advanceStream narrow (one method), which is what let the whole
+// ordering be tested against a fake.
+type spoolMetaDurability struct{ meta *metadata.SpoolStore }
+
+func (d spoolMetaDurability) persistPunchedEnd(entryID int64, end int64) error {
+	if d.meta == nil {
+		return fmt.Errorf("stream: no spool metadata store to persist punchedEnd")
+	}
+	return d.meta.SetPunchedEnd(entryID, end)
 }

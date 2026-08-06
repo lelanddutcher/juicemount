@@ -1140,7 +1140,37 @@ func (s *SpoolStore) RecoverOnBoot(ctx context.Context) (RecoveryReport, error) 
 			if statErr == nil {
 				diskSize = fi.Size()
 			}
+			// A SIZE MATCH NO LONGER PROVES THE FILE IS INTACT.
+			//
+			// The streaming drain punches drained prefixes out of the spool file,
+			// and F_PUNCHHOLE leaves the LOGICAL size unchanged — so a half-punched
+			// file passes `diskSize == r.Size` exactly while its first punchedEnd
+			// bytes read as zeros. Resuming it would copy the WHOLE file to the
+			// backend and overwrite real, already-durable bytes with those zeros:
+			// silent, total loss of the streamed prefix.
+			//
+			// Reading punched_end per row here (rather than widening the four shared
+			// row SELECTs) keeps this narrow: it runs once per failed row on boot,
+			// not on any hot path. A query error is treated as "possibly punched" —
+			// the conservative direction, since preserving a file for the operator
+			// costs disk while resuming a punched one costs footage.
+			punchedEnd, peErr := s.meta.PunchedEnd(r.ID)
+			if peErr != nil {
+				log.Printf("spool recover: cannot read punched_end for %d (%v) — "+
+					"PRESERVING %s rather than risk re-draining a punched file",
+					r.ID, peErr, r.SpoolFile)
+				break
+			}
+
 			switch {
+			case punchedEnd > 0:
+				// Streamed and partly reclaimed. The backend already holds
+				// [0,punchedEnd) durably; the spool file cannot reconstruct it.
+				// Preserve for the operator rather than destroy or re-drain.
+				log.Printf("spool recover: row %d was streamed (punched_end=%d) — "+
+					"NOT resuming from the spool file, whose first %d bytes are holes. "+
+					"The backend holds that prefix; preserving %s",
+					r.ID, punchedEnd, punchedEnd, r.SpoolFile)
 			case r.Size > 0 && diskSize == r.Size:
 				if ok, rErr := s.meta.ResetForRetry(r.ID); rErr != nil {
 					log.Printf("spool recover: failed→ready reset %d: %v", r.ID, rErr)
