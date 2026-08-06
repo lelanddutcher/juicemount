@@ -2,6 +2,7 @@ package farm
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -88,10 +89,36 @@ func pathIsProxy(lowerPath string) bool {
 // "" to process it. size<0 means "size unknown" (the size rule is not applied).
 // skipSubs is the resolved skip-dir substring list (pass skipDirSubstrings());
 // minBytes is the size floor (0 = no floor).
+// streamPartialPrefix marks an in-flight streamed destination. MUST match
+// nfs.streamTempPrefix and metadata.streamPartialPrefix exactly — the farm is a
+// separate server-side binary and cannot import either, so the constant is
+// duplicated deliberately and pinned by test.
+const streamPartialPrefix = ".juicemount-streaming-"
+
 func ExcludeReason(path string, size, minBytes int64, skipSubs []string) string {
 	l := strings.ToLower(path)
 	if IsAppleDoubleHusk(path) {
 		return "appledouble-husk"
+	}
+	// An in-flight STREAMED destination is incomplete by construction.
+	//
+	// The streaming spool drain writes a large file to a hidden sibling of its
+	// destination and renames it into place only when complete. While that copy
+	// is in flight — hours for a multi-hundred-GB file — the partial is a real,
+	// walkable file of substantial size sitting next to real footage.
+	//
+	// collectTargets does NOT otherwise catch it: its dot-prefix rule is inside
+	// `if info.IsDir()` and so skips dot-DIRECTORIES only, the only file-name
+	// rule is the "._" AppleDouble prefix, and a partial is far too large to be
+	// excluded by min-size. So without this the farm enqueues it and generates a
+	// proxy or thumbnail from truncated bytes — the black-frame class of failure,
+	// arriving through the farm rather than through a read.
+	//
+	// Checked on the BASE NAME, since the partial is a sibling and can appear at
+	// any depth. Kept in lockstep with nfs.streamTempPrefix and
+	// metadata.StreamPartialName by TestStreamPartialPrefixIsConsistent.
+	if strings.HasPrefix(filepath.Base(path), streamPartialPrefix) {
+		return "streaming-partial"
 	}
 	if pathIsProxy(l) {
 		return "proxy"
