@@ -1439,6 +1439,50 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		FUSEPath:      cfg.FUSEPath,
 		NFSMountPoint: cfg.MountPoint,
 	})
+	// L1 (2026-08-06): the network-change grace period had NEVER FIRED in the
+	// shipping app.
+	//
+	// health/monitor.go:369 suppresses a transient FUSE failure while the
+	// network is re-establishing, gated on InGracePeriod(). That returns false
+	// unconditionally when netWatcher is nil (monitor.go:347) — and the ONLY
+	// caller of SetNetWatcher anywhere was cmd/jm5 (the dev CLI). Both objects
+	// have existed in this file all along and were simply never connected, so
+	// every WiFi<->cellular flip reported FUSE unhealthy immediately instead of
+	// riding out the reconnect.
+	//
+	// Reuse the watcher the keyspace consumer already runs rather than starting
+	// a second one: it is created above (globalKeyspaceNetWatcher) and polls the
+	// active interface every 1s, which is exactly the signal the grace period
+	// needs. Nil-guarded because that watcher is created conditionally — a nil
+	// here would merely restore the old behaviour, but being explicit keeps the
+	// dependency visible to the next reader.
+	if globalKeyspaceNetWatcher != nil {
+		globalMonitor.SetNetWatcher(globalKeyspaceNetWatcher)
+	}
+	// L5b (2026-08-06): SetStatsProvider had no caller either, so /health
+	// reported PathCacheSize/FDPoolOpen/MemBuf* as hard zeros while the fields,
+	// the struct and the copy at health/monitor.go:425 all existed. Found by the
+	// dead-wiring sweep AFTER the /metrics half was fixed — the two halves of
+	// this chain were separately dead, which is exactly why a sweep beats
+	// finding them one at a time.
+	//
+	// Zeros are reported when no mount is up (LiveFDStats ok=false). That is
+	// honest here: /health describes a running server, and its consumer is a
+	// status indicator rather than an fd investigation. The absent-vs-empty
+	// distinction that matters for leak-hunting is preserved in /metrics, which
+	// omits the section entirely.
+	globalMonitor.SetStatsProvider(func() health.MemoryStats {
+		open, active, mbEntries, mbMB, ok := jmnfs.LiveFDStats()
+		if !ok {
+			return health.MemoryStats{}
+		}
+		return health.MemoryStats{
+			FDPoolOpen:    open,
+			FDPoolActive:  active,
+			MemBufEntries: mbEntries,
+			MemBufSizeMB:  mbMB,
+		}
+	})
 	// #89 online busy-suppression: give the health monitor a lock-free view of
 	// the drainer's live ingest state so a stat/readdir TIMEOUT during a
 	// legitimate high-concurrency ingest is reported as "busy (heavy ingest)"
@@ -2214,9 +2258,15 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 // NFS server listening on `port`.
 //
 // Timeout policy. Tuned for a localhost NFS server (us). The kernel
-// client's timeo is in 0.1-second units, so timeo=200 means 20 s
-// initial timeout; retrans=2 means at most 2 retries before returning
-// EIO to the calling syscall. Worst-case dead-server detection: ~60 s.
+// client's timeo is in 0.1-second units. CURRENT VALUE IS timeo=400
+// (40 s initial timeout, ~120 s worst-case dead-server detection) — set
+// by QA-36 below. retrans=2 means at most 2 retries before returning EIO
+// to the calling syscall.
+//
+// The historical notes below are kept for the reasoning, but they quote
+// the values that were current when written (timeo=100, then 200). Read
+// the format string at the bottom for what is actually passed; that
+// drift cost a re-read on 2026-08-06.
 //
 // QA-29 (2026-05-21): bumped from timeo=100 (10 s) to timeo=200 (20 s).
 // Under heavy folder-copy load (Editor Resource Vault with thousands
@@ -2325,8 +2375,20 @@ func nfsMountOpts(port string) string {
 	if os.Getenv("JM_NFS_LEGACY_ACTIMEO") == "1" {
 		acOpts = "actimeo=3600"
 	}
+	// mutejukebox (L3, 2026-08-06). NFS3ERR_JUKEBOX is the documented trigger for
+	// macOS declaring a volume unresponsive — `man mount_nfs`: mutejukebox
+	// suppresses the "server is not responding" alert for jukebox replies. We
+	// RETURN JUKEBOX BY DESIGN on several paths: the FUSE stat budget
+	// (errFUSETimeout), the FUSE data ceiling shedding at its ceiling, and the
+	// spool in-flight hole hold (spoolReadFile.ReadAt) all surface as a jukebox
+	// retry rather than an error, because retrying is correct and failing is not.
+	//
+	// So every one of those deliberate holds also pops "connection interrupted"
+	// at the user — the symptom chased in [[project_lookup_flicker_rootcause]]
+	// and [[project_slow_copy_fsetxattr]]. The retry semantics are what we want;
+	// only the alert is wrong. This mutes the alert and changes nothing else.
 	return fmt.Sprintf(
-		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,%s,vers=3,tcp",
+		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,mutejukebox,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,%s,vers=3,tcp",
 		port, port, ra, acOpts)
 }
 

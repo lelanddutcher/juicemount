@@ -764,6 +764,13 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		store.SetOnPathInvalidated(h.onRemotePathInvalidated)
 	}
 
+	// L5 (2026-08-06): publish the fd pool + memory buffer so /metrics can
+	// report descriptor occupancy. Both Stats() accessors already existed and
+	// neither had a caller, so the process ran with zero fd visibility — see
+	// fdobservability.go for why that matters (orphaned-fd leak path, no
+	// Setrlimit anywhere in the repo).
+	publishFDStatsSource(fdPool, h.memBuf)
+
 	go h.verifierCleanupLoop(60*time.Second, 5*time.Minute)
 	return h
 }
