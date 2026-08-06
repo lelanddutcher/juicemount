@@ -184,3 +184,16 @@ func init() {
 		}
 	})
 }
+
+// keyspaceShrinkReconciled counts events that would have SHRUNK a cached entry
+// and were sent for reconcile instead of applied.
+//
+// Worth counting because the failure it guards is invisible: applying a
+// reordered shrink produces short reads with no error anywhere. A rising count
+// means push is delivering out of order often enough to matter.
+var keyspaceShrinkReconciled atomic.Int64
+
+func noteKeyspaceShrinkReconciled() { keyspaceShrinkReconciled.Add(1) }
+
+// KeyspaceShrinkReconciles reports the count (metrics, tests).
+func KeyspaceShrinkReconciles() int64 { return keyspaceShrinkReconciled.Load() }

@@ -10,7 +10,7 @@ import (
 // Streaming must be OFF unless explicitly enabled. It changes the write path's
 // durability story and cannot ship dark-by-accident.
 func TestStreamIneligibleWhenDisabled(t *testing.T) {
-	t.Setenv("JM_SPOOL_STREAM_DRAIN", "")
+	t.Setenv("JM_SPOOL_STREAM_DRAIN", "0")
 	e, _, _ := streamFixture(t, 8<<10)
 	if got := streamIneligible(e); !strings.Contains(got, "disabled") {
 		t.Errorf("streamIneligible = %q with the flag unset, want a 'disabled' reason", got)
@@ -53,7 +53,7 @@ func TestStreamIneligibleForAnOutOfOrderWriter(t *testing.T) {
 // A step on an ineligible entry must be a silent no-op, never an error: most
 // polls of most entries land here.
 func TestStreamStepIsANoOpWhenIneligible(t *testing.T) {
-	t.Setenv("JM_SPOOL_STREAM_DRAIN", "")
+	t.Setenv("JM_SPOOL_STREAM_DRAIN", "0")
 	e, _, events := streamFixture(t, 8<<10)
 	src, err := os.OpenFile(e.SpoolFilePath(), os.O_RDWR, 0o644)
 	if err != nil {

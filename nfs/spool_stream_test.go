@@ -225,23 +225,29 @@ func TestAdvanceStreamNoOpWhenNothingNewIsSealed(t *testing.T) {
 	}
 }
 
-// The feature must be OFF by default. Streaming changes the write path's
-// durability story, and it stays dark until the oversized-file gate test has
-// actually run on a machine with room to run it.
-func TestStreamDrainIsDisabledByDefault(t *testing.T) {
+// Streaming is ON by default as of 2026-08-06, with an explicit "0" kill switch.
+//
+// The kill switch matters more than the default: streaming changes the write
+// path's durability story, and if it misbehaves in the field the recovery is
+// setting one variable — not shipping a build. So "0" must disable it and
+// NOTHING ELSE may, or the escape hatch is unreliable exactly when it is needed.
+func TestStreamDrainIsEnabledByDefaultWithAKillSwitch(t *testing.T) {
 	t.Setenv("JM_SPOOL_STREAM_DRAIN", "")
-	if streamDrainEnabled() {
-		t.Error("streaming drain is ON with the env unset — it must be opt-in until " +
-			"the oversized-file gate test has run")
-	}
-	t.Setenv("JM_SPOOL_STREAM_DRAIN", "1")
 	if !streamDrainEnabled() {
-		t.Error("JM_SPOOL_STREAM_DRAIN=1 did not enable streaming")
+		t.Error("streaming is OFF with the env unset — it is default-ON now that the " +
+			"gate test passed and jmfarm carries the partial exclusion")
 	}
-	for _, v := range []string{"0", "true", "yes", "on"} {
+	t.Setenv("JM_SPOOL_STREAM_DRAIN", "0")
+	if streamDrainEnabled() {
+		t.Error("JM_SPOOL_STREAM_DRAIN=0 did NOT disable streaming — the kill switch " +
+			"is the field recovery for a write-path problem and must be reliable")
+	}
+	// Everything else enables. Anyone reaching for the switch types "0"; a typo
+	// must not silently leave the feature disabled either.
+	for _, v := range []string{"1", "true", "yes", "on", "off", "disabled"} {
 		t.Setenv("JM_SPOOL_STREAM_DRAIN", v)
-		if streamDrainEnabled() {
-			t.Errorf("%q enabled streaming; only an explicit \"1\" may", v)
+		if !streamDrainEnabled() {
+			t.Errorf("%q disabled streaming; only an explicit \"0\" may", v)
 		}
 	}
 }

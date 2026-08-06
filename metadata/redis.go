@@ -1118,6 +1118,47 @@ func (rc *RedisClient) runSubscribe() {
 // applyEvent applies a single real-time metadata event to the local store.
 // Updates the in-memory cache immediately (never blocked), then writes to
 // SQLite with retry (may be briefly blocked by BulkInsert transactions).
+// reconcileShrunkEntry handles a keyspace event that would shrink a cached
+// entry: drop the event and ask the backend instead of believing it.
+//
+// Reuses the EXISTING reconcile path rather than inventing a per-path lookup —
+// requeueing the parent directory makes the normal reconcileDir sweep re-read
+// authoritative sizes for every child, which is machinery already proven in the
+// newly-discovered-dirs path. Requeue rather than a direct call because this
+// runs on the subscribe goroutine, and a blocking backend read here would stall
+// every subsequent event behind one shrink.
+//
+// The requeue is what makes this NOT the C4 bug. Simply refusing to shrink would
+// be MAX() by another name and would make a legitimate remote truncate
+// permanently invisible; the reconcile lets the real size land, downward or not,
+// on the authority's word rather than on an event that carries no ordering.
+//
+// With no requeue wired (tests, or before the consumer starts) the event is
+// dropped and logged. A stale-large size costs a read that returns short and
+// re-stats; a wrongly-small one truncates the file for every reader. Those are
+// not symmetric, so uncertainty takes the recoverable side.
+func (rc *RedisClient) reconcileShrunkEntry(evt MetadataEvent, cachedSize int64) {
+	noteKeyspaceShrinkReconciled()
+
+	parent := path.Dir(evt.Path)
+	pe := rc.store.LookupByPath(parent)
+	if pe == nil || pe.Inode == 0 {
+		jmlog.Debug("keyspace: dropped a shrinking event; parent not mirrored so it "+
+			"cannot be reconciled", "path", evt.Path,
+			"event_size", evt.Size, "cached_size", cachedSize)
+		return
+	}
+	if fnp := rc.keyspaceRequeue.Load(); fnp != nil {
+		(*fnp)(pe.Inode)
+		jmlog.Debug("keyspace: shrinking event dropped, parent requeued for reconcile",
+			"path", evt.Path, "event_size", evt.Size, "cached_size", cachedSize,
+			"parent_inode", pe.Inode)
+		return
+	}
+	jmlog.Debug("keyspace: dropped a shrinking event with no reconcile consumer wired",
+		"path", evt.Path, "event_size", evt.Size, "cached_size", cachedSize)
+}
+
 func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 	// Counted here rather than at the subscription read, and BEFORE any
 	// namespace filtering below: the question this answers is "did push deliver
@@ -1150,6 +1191,32 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		// filtered here (they are SCAN-visible once drained).
 		if scanFilteredPath(evt.Path) {
 			noteScanFilteredSkip("applyEvent", evt.Path, 1)
+			return
+		}
+		// L6 — A SHRINKING EVENT IS NOT TRUSTED, IT IS RECONCILED.
+		//
+		// THE BUG: applyEvent wrote evt.Size unconditionally. Keyspace events
+		// carry no sequence or version, and delivery is not ordered, so a
+		// REORDERED event could lower a cached size below the truth and every
+		// subsequent read would be short. Reachable rather than theoretical:
+		// juicemount:metadata replays this client's OWN writes back to it (the
+		// publisher has no origin field), so ordinary local activity generates
+		// the racing events.
+		//
+		// WHY NOT MAX(). That is the obvious fix and it is wrong here. It is the
+		// C4 shape: a sticky high-water mark with no way down. UpdateSize CAN use
+		// MAX because its comment establishes that truncation reaches the store
+		// by a different path — "Truncate(2) does not go through this code path".
+		// applyEvent has no such luxury: it handles create/update from REMOTE
+		// actors, so a legitimate remote truncate arrives here and only here. MAX
+		// would make every remote shrink permanently invisible.
+		//
+		// So a shrink is treated as a signal that we may be behind, not as data:
+		// re-read the authoritative value and let the backend decide. Costs one
+		// round trip, and only on the rare shrink — an append-only write stream
+		// (the common case) never takes this path at all.
+		if cur := rc.store.LookupByPath(evt.Path); cur != nil && !evt.IsDir && evt.Size < cur.Size {
+			rc.reconcileShrunkEntry(evt, cur.Size)
 			return
 		}
 		e := &Entry{

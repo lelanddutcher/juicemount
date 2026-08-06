@@ -16,7 +16,7 @@ import (
 // goroutine. A ticker that wakes only to decide it has no work is the idle churn
 // this codebase has had to hunt down before.
 func TestStreamerDoesNotStartWhenDisabled(t *testing.T) {
-	t.Setenv("JM_SPOOL_STREAM_DRAIN", "")
+	t.Setenv("JM_SPOOL_STREAM_DRAIN", "0")
 	d := &Drainer{}
 	stop := d.StartStreamer(10 * time.Millisecond)
 	defer stop()

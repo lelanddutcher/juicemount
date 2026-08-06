@@ -141,15 +141,28 @@ type streamDurability interface {
 // protects exists only between those two statements.
 var punchRangeFn = punchRange
 
-// streamDrainEnabled gates the whole feature. DEFAULT OFF.
+// streamDrainEnabled gates the whole feature. DEFAULT ON as of 2026-08-06.
 //
-// Off is byte-identical to the pre-streaming behaviour: punchedEnd never moves,
-// so the read routing resolves exactly as before and the drainer takes its
-// existing whole-file path. This stays off until the oversized-file gate test
-// has actually run — a test that is currently deferred because the machine it
-// would run on is below the spool floor.
+// Flipped on Leland's instruction once its two preconditions were actually met,
+// not merely argued:
+//
+//  1. The gate test PASSED — a 48 MiB file copied through a 4.0 MiB peak spool
+//     window (8%), byte-identical. The single-file size cap is removed at the
+//     pipeline level, measured rather than asserted.
+//  2. jmfarm was REDEPLOYED to the NAS carrying the streamed-partial exclusion
+//     (image juicefarm:stream-exclusion). Without that the farm would generate
+//     proxies from half-written files and cache them permanently — black frames
+//     arriving through derivative generation.
+//
+// JM_SPOOL_STREAM_DRAIN=0 is the kill switch and disables the feature
+// byte-identically to the pre-streaming behaviour: punchedEnd never moves, so
+// read routing resolves exactly as before and the drainer takes its existing
+// whole-file path. Any OTHER value (including unset) enables it.
+//
+// STILL NOT VALIDATED AGAINST A LIVE MOUNT. The gate test proves the pipeline
+// moves bytes correctly; it does not prove Finder does. Leland is testing.
 func streamDrainEnabled() bool {
-	return os.Getenv("JM_SPOOL_STREAM_DRAIN") == "1"
+	return os.Getenv("JM_SPOOL_STREAM_DRAIN") != "0"
 }
 
 // streamChunkSize bounds one advance. Small enough that a failure wastes little
