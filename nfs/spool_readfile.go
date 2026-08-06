@@ -33,9 +33,13 @@ type spoolReadFile struct {
 	// JUKEBOX-holds an in-flight hole (see ReadAt / IncompleteAt, #100).
 	isAppleDouble bool
 
-	mu  sync.Mutex
-	fd  *os.File // lazily opened on first Read/ReadAt
-	pos int64
+	mu sync.Mutex
+	fd *os.File // lazily opened on first Read/ReadAt
+	// destFD is the in-flight backend copy, opened lazily the first time a read
+	// lands below punchedEnd (see readFromStreamDestLocked). Nil for the
+	// overwhelming majority of handles, which never touch a punched range.
+	destFD *os.File
+	pos    int64
 }
 
 // Name returns the in-mount path.
@@ -114,7 +118,7 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 	// so an NLE reading a still-copying clip renders black frames / corrupt
 	// RAW. Clamp every read to the contiguous-written prefix and classify a
 	// past-prefix offset against a CONSISTENT (cend,wend) snapshot.
-	cend, wend, punched := f.entry.readableBoundsWithPunched()
+	cend, wend, punched, streamDest := f.entry.readRouting()
 	// Route BEFORE touching the spool file. planReadAt puts the punched check
 	// ahead of every other classification for the reason documented there: a
 	// punched range is below contiguousEnd by construction, so any path that
@@ -130,13 +134,28 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 		isAppleDouble: f.isAppleDouble,
 	}) {
 	case planDest:
-		// FAIL CLOSED. The destination read path does not exist yet, and the one
-		// thing that must never happen is falling through to the spool for a
-		// punched range. Unreachable while punchedEnd is 0 — which it always is
-		// until the copier lands — so this firing means streaming was enabled
-		// before its reader was built. Loud beats silent.
-		return 0, fmt.Errorf("spool: read at %d is below punchedEnd %d but no "+
-			"destination reader is wired: refusing to serve a punched range", off, punched)
+		// These bytes were drained to the backend and punched out of the spool.
+		// Serve them from the destination copy.
+		//
+		// READ COHERENCE IS ALREADY GUARANTEED BY THE WRITE ORDERING, and that is
+		// not an accident. advanceStream fsyncs the destination BEFORE it
+		// publishes punchedEnd, so any offset that can reach this branch has been
+		// fsynced. That matters because a plain read-after-write against JuiceFS
+		// is NOT reliable: the drainer's own note records ~0.3% of files in a
+		// 2000-file storm returning inconsistent bytes on an unsynced readback,
+		// which its SHA check then mis-diagnosed as a bit flip. If anyone moves
+		// that fsync after the publish, they break read coherence as well as
+		// crash durability.
+		//
+		// Still fails closed when the path is unset: a punched range with no
+		// destination is unservable, and falling through to the spool would
+		// return zeros as file content.
+		if streamDest == "" {
+			return 0, fmt.Errorf("spool: read at %d is below punchedEnd %d but the "+
+				"entry has no stream destination: refusing to serve a punched range",
+				off, punched)
+		}
+		return f.readFromStreamDestLocked(p, off, streamDest)
 	case planHold:
 		// Diagnostic (throttled): a real (non-._) file JUKEBOX-held because the
 		// read offset is past the contiguous prefix but below the high-water.
@@ -177,6 +196,26 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 	// the reported size already keeps reads within the readable prefix — it no
 	// longer does.
 	return n, err
+}
+
+// readFromStreamDestLocked serves a punched range from the in-flight backend
+// copy. Caller holds f.mu.
+//
+// The fd is opened lazily and kept for the handle's lifetime, mirroring the
+// spool fd: a punched read is most often a Finder thumbnail probe walking the
+// head of a file, so reopening per RPC would pay a FUSE open (~60ms) for every
+// one of them.
+func (f *spoolReadFile) readFromStreamDestLocked(p []byte, off int64, destPath string) (int, error) {
+	if f.destFD == nil {
+		fd, err := os.Open(destPath)
+		if err != nil {
+			// No fallback to the spool here — those bytes are holes. An error is
+			// the honest answer; the client retries or reopens.
+			return 0, fmt.Errorf("spool: open stream destination %q: %w", destPath, err)
+		}
+		f.destFD = fd
+	}
+	return f.destFD.ReadAt(p, off)
 }
 
 // IncompleteAt implements the internal/nfs incompleteReader gate. It reports
@@ -224,12 +263,27 @@ func (f *spoolReadFile) Seek(offset int64, whence int) (int64, error) {
 func (f *spoolReadFile) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.fd == nil {
-		return nil
+	// Release BOTH descriptors unconditionally. The previous early return on
+	// `f.fd == nil` would have leaked destFD; that is unreachable today only
+	// because ReadAt opens fd before it can ever open destFD, which is an
+	// ordering coincidence rather than a guarantee. An fd leak here is
+	// particularly bad: destFD is a FUSE handle, the repo has no Setrlimit
+	// anywhere, and the audit already measured orphaned fds accumulating under
+	// rename storms.
+	var firstErr error
+	if f.fd != nil {
+		if err := f.fd.Close(); err != nil {
+			firstErr = err
+		}
+		f.fd = nil
 	}
-	err := f.fd.Close()
-	f.fd = nil
-	return err
+	if f.destFD != nil {
+		if err := f.destFD.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		f.destFD = nil
+	}
+	return firstErr
 }
 
 // spoolFileInfo is the os.FileInfo returned by Stat/Lstat for a path

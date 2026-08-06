@@ -1,6 +1,10 @@
 package nfs
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // THE INVARIANT THAT MATTERS MOST.
 //
@@ -188,5 +192,93 @@ func TestLiveReadPathRefusesAPunchedRange(t *testing.T) {
 	if n, err := rf.ReadAt(buf, 32<<10); err != nil || n != len(buf) {
 		t.Errorf("read AT punchedEnd failed (n=%d err=%v); the punched range is "+
 			"half-open and this offset is still in the spool", n, err)
+	}
+}
+
+// A punched range must be SERVED from the destination, with the right bytes.
+//
+// The previous test only proved the read was refused. This proves the reader
+// exists and returns destination content — and it is built so a regression to
+// "read the spool anyway" cannot pass: the spool file holds 0xC3 in that range
+// while the destination holds 0xD4, so serving from the wrong source returns
+// the wrong byte rather than an error.
+func TestPunchedRangeIsServedFromTheStreamDestination(t *testing.T) {
+	s := newTestSpoolStore(t, 64<<20)
+	e, err := s.OpenWrite("/clip.mov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolBytes := make([]byte, 64<<10)
+	for i := range spoolBytes {
+		spoolBytes[i] = 0xC3
+	}
+	if _, err := e.WriteAt(spoolBytes, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// The destination copy, deliberately DIFFERENT content at the same offsets.
+	destPath := filepath.Join(t.TempDir(), ".juicemount-streaming-1-clip.mov")
+	destBytes := make([]byte, 64<<10)
+	for i := range destBytes {
+		destBytes[i] = 0xD4
+	}
+	if err := os.WriteFile(destPath, destBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e.SetStreamDest(destPath)
+	e.mu.Lock()
+	e.punchedEnd = 32 << 10
+	e.mu.Unlock()
+
+	rf := &spoolReadFile{name: "/clip.mov", entry: e}
+	defer rf.Close()
+
+	buf := make([]byte, 4096)
+	n, err := rf.ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("read below punchedEnd failed: %v — the destination reader must "+
+			"serve it", err)
+	}
+	if n != len(buf) {
+		t.Errorf("short read %d of %d", n, len(buf))
+	}
+	if buf[0] != 0xD4 {
+		t.Fatalf("read returned 0x%02X, want 0xD4 — served from the SPOOL, not the "+
+			"destination; once those bytes are really punched this is zeros",
+			buf[0])
+	}
+
+	// Above punchedEnd must still come from the spool.
+	if _, err := rf.ReadAt(buf, 32<<10); err != nil {
+		t.Fatalf("read at punchedEnd failed: %v", err)
+	}
+	if buf[0] != 0xC3 {
+		t.Errorf("read AT punchedEnd returned 0x%02X, want 0xC3 — the spool still "+
+			"owns everything from punchedEnd upward", buf[0])
+	}
+}
+
+// A punched range with no destination path must fail closed, never fall through
+// to the spool — those bytes are holes.
+func TestPunchedRangeWithoutADestinationFailsClosed(t *testing.T) {
+	s := newTestSpoolStore(t, 64<<20)
+	e, err := s.OpenWrite("/clip.mov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.WriteAt(make([]byte, 64<<10), 0); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	e.punchedEnd = 32 << 10
+	e.mu.Unlock()
+	// SetStreamDest deliberately NOT called.
+
+	rf := &spoolReadFile{name: "/clip.mov", entry: e}
+	defer rf.Close()
+	if _, err := rf.ReadAt(make([]byte, 4096), 0); err == nil {
+		t.Error("a punched read with no destination succeeded — it must fail closed " +
+			"rather than serve the spool's holes as content")
 	}
 }

@@ -1941,6 +1941,16 @@ type SpoolEntry struct {
 	// NLE reading a still-copying clip would get black frames / corrupt RAW),
 	// so the read shadow clamps to contiguousEnd. Monotonic; guarded by mu.
 	contiguousEnd int64
+	// streamDest is the path the streaming drain is writing this entry's backend
+	// copy to — the hidden sibling from streamTempPath, before the rename into
+	// place. Empty unless streaming is active.
+	//
+	// The read shadow needs it: everything below punchedEnd has been punched out
+	// of the spool file and must be served from here instead (planDest). Guarded
+	// by mu and read on the read path, so it is taken in the same snapshot as the
+	// boundaries it goes with.
+	streamDest string
+
 	// punchedEnd is the end of the prefix the streaming drain has copied to the
 	// backend AND punched out of this spool file. Monotonic; guarded by mu.
 	//
@@ -2065,6 +2075,24 @@ func (e *SpoolEntry) PunchedEnd() int64 {
 	return n
 }
 
+// SetStreamDest records where the streaming drain is writing this entry's
+// backend copy. Must be set BEFORE the first punch, or the read shadow will have
+// nowhere to route a punched read.
+func (e *SpoolEntry) SetStreamDest(path string) {
+	e.mu.Lock()
+	e.streamDest = path
+	e.mu.Unlock()
+}
+
+// StreamDestPath returns the in-flight backend copy's path, empty if this entry
+// is not being streamed.
+func (e *SpoolEntry) StreamDestPath() string {
+	e.mu.RLock()
+	p := e.streamDest
+	e.mu.RUnlock()
+	return p
+}
+
 // publishPunchedEnd advances the punched boundary. Monotonic — a lower value is
 // ignored rather than applied, because punching cannot be undone and readers are
 // already routed at the destination for everything below the current value.
@@ -2094,6 +2122,20 @@ func (e *SpoolEntry) readableBoundsWithPunched() (cend, wend, punched int64) {
 	cend = e.contiguousEnd
 	wend = e.writtenEnd
 	punched = e.punchedEnd
+	e.mu.RUnlock()
+	return
+}
+
+// readRouting returns the boundaries AND the destination path in one lock, so a
+// read classified as planDest resolves the path from the same snapshot that
+// classified it. Splitting them would let the dest be cleared (rename, rollback)
+// between the decision and the open, leaving a punched read with nowhere to go.
+func (e *SpoolEntry) readRouting() (cend, wend, punched int64, dest string) {
+	e.mu.RLock()
+	cend = e.contiguousEnd
+	wend = e.writtenEnd
+	punched = e.punchedEnd
+	dest = e.streamDest
 	e.mu.RUnlock()
 	return
 }
