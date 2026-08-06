@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -72,5 +73,39 @@ func TestNetWatcherWiringDoesNotPassNil(t *testing.T) {
 	nilCall := regexp.MustCompile(`globalMonitor\s*\.\s*SetNetWatcher\s*\(\s*nil\s*\)`)
 	if nilCall.Match(src) {
 		t.Error("globalMonitor.SetNetWatcher(nil) is the same as not calling it at all")
+	}
+}
+
+// The streamed-partial boot sweep must be WIRED, and wired AFTER recovery.
+//
+// SweepStreamPartials was the last known correct-but-uncalled mechanism in the
+// streaming path. Nothing else can ever reclaim an orphaned partial: it is
+// filtered out of the metadata mirror, skipped by the farm, and dot-hidden from
+// the user. Each of those is correct alone; together they mean an interrupted
+// streamed copy holds hundreds of gigabytes of backend space forever.
+//
+// ORDER MATTERS. The sweep only deletes partials belonging to not-yet-done rows,
+// and RecoverOnBoot is what settles which rows are live. Sweeping first would
+// consult pre-recovery state.
+func TestAppSweepsStreamPartialsAfterBootRecovery(t *testing.T) {
+	src, err := os.ReadFile("cbridge.go")
+	if err != nil {
+		t.Fatalf("read cbridge.go: %v", err)
+	}
+	s := string(src)
+
+	sweep := strings.Index(s, "SweepStreamPartials()")
+	if sweep < 0 {
+		t.Fatal("cbridge.go never calls SweepStreamPartials — an interrupted streamed " +
+			"copy leaves a partial that NOTHING can reclaim: filtered from the mirror, " +
+			"skipped by the farm, hidden from the user")
+	}
+	recover := strings.Index(s, "spool.RecoverOnBoot(")
+	if recover < 0 {
+		t.Fatal("could not locate RecoverOnBoot to check ordering")
+	}
+	if sweep < recover {
+		t.Error("SweepStreamPartials runs BEFORE RecoverOnBoot — the sweep decides what " +
+			"to delete from row state that recovery has not settled yet")
 	}
 }

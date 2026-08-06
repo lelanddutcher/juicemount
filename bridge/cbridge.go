@@ -1198,6 +1198,23 @@ func NFSServerStart(configJSON *C.char) *C.char {
 							"ready_resumed", recReport.ReadyResumed)
 					}
 
+					// Reclaim streamed partials orphaned by a crash. MUST run
+					// AFTER RecoverOnBoot, which settles which rows are still
+					// live — the sweep only deletes partials belonging to
+					// not-yet-done rows, so running it first would consult
+					// pre-recovery state.
+					//
+					// Nothing else can ever clean these up: a partial is filtered
+					// out of the mirror, skipped by the farm, and dot-hidden from
+					// the user. Each of those is correct in isolation and together
+					// they mean an interrupted streamed copy would hold hundreds
+					// of gigabytes of backend space indefinitely. A no-op unless
+					// streaming has actually run.
+					if err := drainer.SweepStreamPartials(); err != nil {
+						jmlog.Warn("stream partial sweep failed (proceeding anyway)",
+							"error", err.Error())
+					}
+
 					globalSpool = spool
 					globalDrainer = drainer
 					globalDrainerAtomic.Store(drainer)
