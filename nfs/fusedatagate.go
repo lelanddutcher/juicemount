@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
@@ -165,6 +166,29 @@ func noteFUSEDataRefused() { fuseDataGateRefusals.Add(1) }
 func FUSEDataGateStats() (inUse, width int, refusals int64) {
 	i, w := fuseDataGateDepth()
 	return i, w, fuseDataGateRefusals.Load()
+}
+
+// Wire the gate into /metrics at package init.
+//
+// FUSEDataGateStats shipped on 2026-08-05 with ZERO callers: the ceiling added
+// after two kernel panics could not be observed in the field at all. Registering
+// from an init() rather than from a wiring site is deliberate — the failure mode
+// being fixed is precisely an accessor nobody remembered to call, and this is the
+// same class as JM_WAN_MODE (read in six paths, set by nothing). See
+// [[project_fuse_concurrency_panics]] and the "dead knobs" doctrine.
+//
+// Cost is one closure call per /metrics scrape. Nothing is added to admit or
+// release, so the data hot path is byte-for-byte unchanged.
+func init() {
+	metrics.Default().SetFUSEDataGateProvider(func() *metrics.FUSEDataGateSnapshot {
+		inUse, width, refusals := FUSEDataGateStats()
+		return &metrics.FUSEDataGateSnapshot{
+			Enabled:  fuseDataGateEnabled,
+			InUse:    inUse,
+			Width:    width,
+			Refusals: refusals,
+		}
+	})
 }
 
 // tryAcquireFUSEDataBackground admits a BACKGROUND FUSE data syscall without

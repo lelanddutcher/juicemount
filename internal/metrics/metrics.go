@@ -327,6 +327,16 @@ type Registry struct {
 	// via a provider so this package needn't import netprofile.
 	netMu sync.RWMutex
 	netFn func() *NetworkSnapshot
+
+	// FUSE data-gate hook — set by package nfs so /metrics can report the
+	// concurrency ceiling added after the 2026-08-05 double kernel panic.
+	// A provider (not counters pushed from the gate) because occupancy is a
+	// GAUGE read once per scrape: pushing it would add an atomic store to
+	// every admit/release on the FUSE data hot path, which the gate exists to
+	// keep cheap. Decoupled this way so metrics needn't import nfs (nfs
+	// already imports metrics — the reverse would be a cycle).
+	dataGateMu sync.RWMutex
+	dataGateFn func() *FUSEDataGateSnapshot
 }
 
 // NetworkSnapshot mirrors the netprofile link estimate for /metrics.
@@ -343,6 +353,32 @@ type NetworkSnapshot struct {
 	ReadaheadSeq     int  `json:"readahead_seq_threshold"`
 	ReadaheadBlocks  int  `json:"readahead_blocks_ahead"`
 	ReadaheadWorkers int  `json:"readahead_workers"`
+}
+
+// FUSEDataGateSnapshot mirrors the FUSE data-syscall concurrency ceiling for
+// /metrics (nfs/fusedatagate.go).
+//
+// WHY THIS IS REPORTED AT ALL: the ceiling shipped in response to two kernel
+// panics on 2026-08-05, and until this hook existed it had ZERO readers — the
+// protection was unobservable in the field, so "is it engaging?", "is it
+// shedding real work?" and "is the kill switch set?" were all unanswerable
+// after an incident. A guard nobody can measure is a guard nobody can trust.
+//
+// Width is the CURRENT ceiling, not the configured one: the gate lowers itself
+// on slow/metered links, so width moving is expected and is itself the signal
+// that class-based narrowing engaged.
+type FUSEDataGateSnapshot struct {
+	// Enabled is false when JM_FUSE_DATA_GATE=0 disabled the ceiling. Reported
+	// explicitly so a zero InUse/Width is never mistaken for an idle gate.
+	Enabled bool `json:"enabled"`
+	// InUse is the number of FUSE data syscalls admitted and not yet released.
+	InUse int `json:"in_use"`
+	// Width is the ceiling in force right now (class-dependent).
+	Width int `json:"width"`
+	// Refusals counts admissions denied since boot. A rising count means the
+	// session is saturated and work is being shed — the intended behaviour,
+	// but also the number that should correlate with any user-visible stall.
+	Refusals int64 `json:"refusals"`
 }
 
 // HealthSnapshot is the JSON-friendly payload returned by /health.
@@ -384,6 +420,17 @@ func (r *Registry) SetNetworkProvider(fn func() *NetworkSnapshot) {
 	r.netMu.Lock()
 	defer r.netMu.Unlock()
 	r.netFn = fn
+}
+
+// SetFUSEDataGateProvider registers a callback used by /metrics to report the
+// FUSE data-syscall ceiling. Safe to leave unset (the field is then omitted).
+// package nfs registers this from an init() deliberately: the defect being
+// fixed here is an accessor that existed with no callers, and an init() cannot
+// be forgotten at a wiring site the way an explicit Set* call can.
+func (r *Registry) SetFUSEDataGateProvider(fn func() *FUSEDataGateSnapshot) {
+	r.dataGateMu.Lock()
+	defer r.dataGateMu.Unlock()
+	r.dataGateFn = fn
 }
 
 // histFor returns (and lazily creates) the histogram for an RPC type.
@@ -627,6 +674,10 @@ type Snapshot struct {
 
 	RPCs    map[string]RPCSnapshot `json:"rpcs"`
 	Network *NetworkSnapshot       `json:"network,omitempty"`
+
+	// FUSEDataGate reports the post-panic concurrency ceiling. See
+	// FUSEDataGateSnapshot.
+	FUSEDataGate *FUSEDataGateSnapshot `json:"fuse_data_gate,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -693,6 +744,13 @@ func (r *Registry) Snapshot() Snapshot {
 	r.netMu.RUnlock()
 	if netFn != nil {
 		out.Network = netFn()
+	}
+
+	r.dataGateMu.RLock()
+	dataGateFn := r.dataGateFn
+	r.dataGateMu.RUnlock()
+	if dataGateFn != nil {
+		out.FUSEDataGate = dataGateFn()
 	}
 
 	r.histsMu.RLock()

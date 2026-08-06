@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
@@ -212,5 +213,41 @@ func TestFUSEDataGateCountsRefusals(t *testing.T) {
 	_, _, after := FUSEDataGateStats()
 	if after != before+1 {
 		t.Errorf("refusal counter went %d -> %d, want +1", before, after)
+	}
+}
+
+// The gate must be VISIBLE in /metrics, not merely countable in-process.
+//
+// FUSEDataGateStats shipped with zero callers, so the ceiling added after two
+// kernel panics reported nothing in the field: after an incident there was no
+// way to answer "did it engage?", "did it shed real work?" or "was the kill
+// switch set?". This test guards the WIRING (the init() registration), which is
+// the part that was missing — not the accessor, which already existed and
+// already worked. Same class as JM_WAN_MODE: a mechanism that is correct and
+// unreachable.
+func TestFUSEDataGateIsReportedInMetrics(t *testing.T) {
+	snap := metrics.Default().Snapshot()
+	if snap.FUSEDataGate == nil {
+		t.Fatal("metrics snapshot has no fuse_data_gate section — the gate is " +
+			"invisible in the field; is the init() provider registration still there?")
+	}
+	if snap.FUSEDataGate.Enabled != fuseDataGateEnabled {
+		t.Errorf("reported Enabled=%v, gate is %v", snap.FUSEDataGate.Enabled, fuseDataGateEnabled)
+	}
+
+	// Width must be the LIVE ceiling, not a constant: the gate narrows itself on
+	// slow/metered links, and a snapshot that always reported the configured
+	// width would hide exactly the narrowing we would need to see.
+	_, wantWidth := fuseDataGateDepth()
+	if snap.FUSEDataGate.Width != wantWidth {
+		t.Errorf("reported width %d, gate width %d", snap.FUSEDataGate.Width, wantWidth)
+	}
+
+	// Refusals must track the live counter, so a rising field number can be
+	// correlated with a user-visible stall.
+	noteFUSEDataRefused()
+	_, _, wantRefusals := FUSEDataGateStats()
+	if got := metrics.Default().Snapshot().FUSEDataGate.Refusals; got != wantRefusals {
+		t.Errorf("reported refusals %d, gate refusals %d", got, wantRefusals)
 	}
 }
