@@ -137,3 +137,49 @@ func noteScanFilteredSkip(source, sample string, n int) {
 	jmlog.Debug("metadata: skipped push-driven mirror writes in scan-filtered namespace",
 		"source", source, "sample", sample, "count", count)
 }
+
+// ============================================================================
+// Streamed-partial name filter.
+//
+// The streaming spool drain writes a large file to a HIDDEN SIBLING of its
+// destination and renames it into place only when complete (nfs/spool_streampath.go).
+// While that copy is in flight — potentially hours for a multi-hundred-GB file —
+// the partial is a REAL JuiceFS file: it has a root-resolvable dentry, so unlike
+// the .trash and .juicemount namespaces above it IS returned by the authoritative
+// SCAN and IS reported by keyspace push.
+//
+// That makes it structurally different from everything scanFilteredPath handles.
+// Those are volume-root-level namespaces the SCAN can never yield; this is an
+// ordinary file at an ordinary path whose NAME is the only thing marking it as
+// not-yet-content. So the filter is name-level, not path-prefix-level, and
+// scanFilteredPath deliberately does NOT cover it (".juicemount-streaming-…"
+// does not match the ".juicemount" namespace either — that matcher requires the
+// next character to be '/' or end-of-string).
+//
+// WHAT GOES WRONG WITHOUT THIS: the partial is mirrored, so it appears in Finder
+// listings as a real file, its half-written size is published as authoritative,
+// and a derivative generator could key a thumbnail off half a clip. Filtering at
+// mirror entry is the single choke point that covers SCAN, push and reconcile at
+// once — nothing that never enters the mirror can be served by a readdir, which
+// is mirror-served.
+//
+// KEPT IN SYNC BY NAME, NOT BY IMPORT: nfs cannot import metadata's internals
+// and metadata must not import nfs, so the prefix is duplicated deliberately.
+// The two are pinned together by TestStreamTempPrefixMatchesMetadataFilter in
+// package nfs, which fails if either side changes alone.
+// ============================================================================
+
+// streamPartialPrefix marks an in-progress streamed destination. MUST match
+// nfs.streamTempPrefix exactly.
+const streamPartialPrefix = ".juicemount-streaming-"
+
+// StreamPartialName reports whether a directory-entry NAME is an in-flight
+// streamed partial that must never be exposed as content.
+//
+// Takes a base name rather than a path: the partial is a sibling of its
+// destination, so it can appear at any depth, and matching on the full path
+// would need every caller to split it identically.
+func StreamPartialName(name string) bool {
+	return len(name) > len(streamPartialPrefix) &&
+		name[:len(streamPartialPrefix)] == streamPartialPrefix
+}

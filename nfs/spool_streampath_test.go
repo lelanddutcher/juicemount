@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // A streamed partial must NEVER occupy the real path.
@@ -99,5 +101,33 @@ func TestIsStreamTempNameDoesNotMatchUserFiles(t *testing.T) {
 			t.Errorf("isStreamTempName(%q) = true — a user file classified as a "+
 				"partial would be hidden from listings and the mirror", name)
 		}
+	}
+}
+
+// The two prefixes MUST stay identical.
+//
+// nfs owns the temp-path naming; metadata owns the mirror filter that keeps
+// those partials out of listings. metadata must not import nfs (nfs already
+// imports metadata — the reverse is a cycle), so the prefix is duplicated
+// deliberately.
+//
+// A silent divergence is the worst possible outcome: nfs would keep writing
+// partials, metadata would stop recognising them, and every in-flight streamed
+// file would start appearing in Finder as a real half-written file with an
+// authoritative-looking size. Nothing else in either package would fail. This
+// test is the only thing that couples them.
+func TestStreamTempPrefixMatchesMetadataFilter(t *testing.T) {
+	sample := streamTempPrefix + "42-clip.mov"
+	if !metadata.StreamPartialName(sample) {
+		t.Fatalf("metadata.StreamPartialName(%q) = false — the nfs temp prefix and "+
+			"the metadata mirror filter have DIVERGED. Streamed partials will be "+
+			"written by nfs and then mirrored as real content: they will list in "+
+			"Finder mid-copy with a half-written size. Change both or neither.",
+			sample)
+	}
+	// And the coupling must be tight, not merely permissive: a name that nfs
+	// would NOT produce must not be filtered either.
+	if metadata.StreamPartialName("clip.mov") {
+		t.Error("metadata.StreamPartialName matches an ordinary file name")
 	}
 }

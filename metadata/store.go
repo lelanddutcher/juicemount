@@ -931,6 +931,10 @@ func (s *Store) DB() *sql.DB { return s.db }
 
 // Insert adds or replaces an entry in the store.
 func (s *Store) Insert(e *Entry) error {
+	// Streamed partials must never enter the mirror — see InsertToCache.
+	if StreamPartialName(e.Name) {
+		return nil
+	}
 	s.writeMu.Lock()
 	// entries + external-content FTS updated atomically so search stays in sync
 	// without a periodic full rebuild (QA-40). The inode int64 cast for
@@ -1062,6 +1066,17 @@ func (s *Store) Delete(entryPath string) error {
 // This makes the entry immediately visible to NFS LOOKUP/GETATTR while the
 // SQLite write may be blocked by a concurrent BulkInsert transaction.
 func (s *Store) InsertToCache(e *Entry) {
+	// Streamed partials must never enter the mirror. See StreamPartialName: an
+	// in-flight streamed destination is a REAL, root-resolvable JuiceFS file, so
+	// the SCAN returns it and keyspace push reports it — but it is a half-written
+	// file whose name is the only thing marking it as not-yet-content. Mirrored,
+	// it would list in Finder as real and publish its partial size as
+	// authoritative. This is the single choke point that covers SCAN, push and
+	// reconcile at once; readdir is mirror-served, so what never enters here can
+	// never be served.
+	if StreamPartialName(e.Name) {
+		return
+	}
 	s.mu.Lock()
 	old := s.pathCache[e.Path]
 	if old != nil {
