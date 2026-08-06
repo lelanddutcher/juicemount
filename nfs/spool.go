@@ -2035,6 +2035,21 @@ func (e *SpoolEntry) PunchedEnd() int64 {
 	return n
 }
 
+// publishPunchedEnd advances the punched boundary. Monotonic — a lower value is
+// ignored rather than applied, because punching cannot be undone and readers are
+// already routed at the destination for everything below the current value.
+//
+// MUST be called BEFORE the corresponding punchRange. See advanceStream: publish
+// first and a reader briefly reads still-present spool bytes (harmless); punch
+// first and a reader is routed at a hole and served zeros with no error.
+func (e *SpoolEntry) publishPunchedEnd(end int64) {
+	e.mu.Lock()
+	if end > e.punchedEnd {
+		e.punchedEnd = end
+	}
+	e.mu.Unlock()
+}
+
 // readableBoundsWithPunched returns all three read-routing boundaries under ONE
 // lock.
 //
