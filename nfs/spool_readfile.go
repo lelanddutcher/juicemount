@@ -209,8 +209,20 @@ func (f *spoolReadFile) readFromStreamDestLocked(p []byte, off int64, destPath s
 	if f.destFD == nil {
 		fd, err := os.Open(destPath)
 		if err != nil {
-			// No fallback to the spool here — those bytes are holes. An error is
-			// the honest answer; the client retries or reopens.
+			// The rename window: finishStream has published the file at its real
+			// path and the temp name is gone, but we read streamDest a moment
+			// before it was re-pointed. Deliberately not closed by holding e.mu
+			// across the rename — that would put an unbounded FUSE syscall under a
+			// hot lock (the cachedCeiling mistake, 2026-08-04 HIGH).
+			//
+			// ErrSpoolDrained makes the client REOPEN onto the real file, which is
+			// exactly the recovery the drain-evict race (GAP A) already uses. The
+			// bytes are whole and present; only this handle is stale.
+			if os.IsNotExist(err) {
+				return 0, pin.ErrSpoolDrained
+			}
+			// Anything else is a real failure. No fallback to the spool — those
+			// bytes are holes, and serving them would be silent corruption.
 			return 0, fmt.Errorf("spool: open stream destination %q: %w", destPath, err)
 		}
 		f.destFD = fd
