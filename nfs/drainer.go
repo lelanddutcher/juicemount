@@ -146,6 +146,11 @@ type Drainer struct {
 	// happens-before. nil ⇒ the batcher falls back to per-file completion
 	// (defensive; production always wires it when the flag is on).
 	onBatchDrainComplete func([]metadata.DrainCommitItem) ([]metadata.DrainCommitResult, error)
+
+	// streamer holds live streaming-copy sessions. Nil unless StartStreamer ran,
+	// which only happens when JM_SPOOL_STREAM_DRAIN=1 — a disabled feature
+	// allocates nothing and starts no goroutine.
+	streamer *streamer
 }
 
 // DrainerConfig controls drainer behavior. Zero values fall back to
