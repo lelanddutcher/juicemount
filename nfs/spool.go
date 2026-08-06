@@ -2093,6 +2093,62 @@ func (e *SpoolEntry) StreamDestPath() string {
 	return p
 }
 
+// writeBelowPunchedLocked routes a write that lands in (or straddles) the
+// punched prefix. Caller holds e.mu.
+//
+// The part below punchedEnd goes to the destination, which is the only place
+// those bytes exist. Any part at or above it falls through to the normal spool
+// path, so a straddling write is split rather than rejected — a writer has no
+// idea where our punch boundary is and must not be penalised for crossing it.
+//
+// Refuses when there is no destination: that combination (punched bytes, nowhere
+// to write them) means the stream was abandoned, and silently writing into a
+// hole would be worse than an error the client can retry.
+func (e *SpoolEntry) writeBelowPunchedLocked(p []byte, off int64) (int, error) {
+	if e.streamDest == "" {
+		return 0, fmt.Errorf("spool: write at %d is below punchedEnd %d but the entry "+
+			"has no stream destination: refusing to write into a punched hole",
+			off, e.punchedEnd)
+	}
+	end := off + int64(len(p))
+	belowLen := e.punchedEnd - off
+	if belowLen > int64(len(p)) {
+		belowLen = int64(len(p))
+	}
+
+	f, err := os.OpenFile(e.streamDest, os.O_WRONLY, 0o644)
+	if err != nil {
+		return 0, fmt.Errorf("spool: open stream destination for a below-punch write: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(p[:belowLen], off); err != nil {
+		return 0, fmt.Errorf("spool: write [%d,%d) to stream destination: %w",
+			off, off+belowLen, err)
+	}
+	// Durable before returning. The spool no longer holds these bytes, so an
+	// unsynced write here is the only copy sitting in a page cache.
+	if err := f.Sync(); err != nil {
+		return 0, fmt.Errorf("spool: sync stream destination after a below-punch write: %w", err)
+	}
+
+	if belowLen == int64(len(p)) {
+		return len(p), nil
+	}
+	// Straddling: the remainder is above the punch and belongs in the spool.
+	// Released and re-acquired deliberately — writeAtLocked is not re-entrant and
+	// the recursion below re-takes the lock.
+	rest := p[belowLen:]
+	restOff := off + belowLen
+	e.mu.Unlock()
+	n, err := e.WriteAt(rest, restOff)
+	e.mu.Lock()
+	if err != nil {
+		return int(belowLen), err
+	}
+	_ = end
+	return int(belowLen) + n, nil
+}
+
 // publishPunchedEnd advances the punched boundary. Monotonic — a lower value is
 // ignored rather than applied, because punching cannot be undone and readers are
 // already routed at the destination for everything below the current value.
@@ -2520,6 +2576,26 @@ func (e *SpoolEntry) WriteAt(p []byte, off int64) (int, error) {
 	if e.closed || e.file == nil {
 		e.mu.Unlock()
 		return 0, fmt.Errorf("spool: write to closed entry")
+	}
+	// A WRITE BELOW punchedEnd MUST NOT GO TO THE SPOOL FILE.
+	//
+	// Those bytes were drained to the backend and punched away, and reads of that
+	// range are routed to the DESTINATION. Writing them here would put the new
+	// data in a hole in the spool file that nothing ever reads, while every
+	// reader keeps getting the OLD bytes from the destination — a silently lost
+	// write, and a final file with stale content in that range. It would also
+	// re-allocate blocks we just reclaimed.
+	//
+	// This was named in the streaming design from the start ("writes landing
+	// below sealedEnd are redirected to the destination") and was missing from
+	// the implementation until 2026-08-06. spoolSealHeadReserve keeps the first
+	// 64 MiB unpunched, which covers the COMMON rewrite (an NLE rewriting a
+	// header/moov at offset 0) — but correctness must not depend on predicting
+	// where a writer seeks, so the general case is handled here.
+	if e.punchedEnd > 0 && off < e.punchedEnd {
+		n, err := e.writeBelowPunchedLocked(p, off)
+		e.mu.Unlock()
+		return n, err
 	}
 	newEnd := off + int64(len(p))
 	var reserved int64
