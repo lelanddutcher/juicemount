@@ -4650,7 +4650,22 @@ func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 	// the same two-lane gate as cachedFile.ReadAt. Inert on medium/fast.
 	releaseQoS := defaultReadQoS.acquire(off, len(p))
 	defer releaseQoS()
+	// FUSE data ceiling (2026-08-05 double kernel panic). This was the largest
+	// remaining ungated FUSE data path: readQoS above is explicitly "inert on
+	// medium/fast", so on the 10GbE LAN where the panics actually happened this
+	// read was bounded only by rpcSem (128) — eight times the fatal
+	// concurrency. Ordered AFTER readQoS to match cachedFile.ReadAt, so the two
+	// gates are always taken in the same order and cannot deadlock against it.
+	releaseData, dataOK := acquireFUSEData()
+	if !dataOK {
+		noteFUSEDataRefused()
+		return 0, errFUSETimeout
+	}
 	n, err := f.File.ReadAt(p, off)
+	// Release BEFORE classifyBlipError: a slot must span ONE syscall, and the
+	// #9 blip path is free to grow a park later without silently turning this
+	// into a long slot hold.
+	releaseData()
 	return n, f.handler.classifyBlipError(err) // #9 blip park
 }
 

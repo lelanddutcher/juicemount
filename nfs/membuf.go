@@ -246,7 +246,25 @@ func (mb *MemoryBuffer) loadFile(path, fusePath string, fileSize int64, entry *m
 		default:
 		}
 
+		// FUSE data ceiling (2026-08-05 double kernel panic). This loop pulls a
+		// WHOLE file through FUSE in the background, so it is exactly the kind
+		// of bulk work that must yield to a user's read. Non-blocking acquire
+		// for the same reason as readahead: speculative work never waits in the
+		// admission window ahead of foreground.
+		//
+		// On refusal ABANDON the load rather than skipping the block. This loop
+		// cannot tolerate a gap — the torn-read guard below rejects any short
+		// load precisely because publishing data[:totalRead] would serve a
+		// partial file as complete (the 2026-06-15 black-frame bug). Failing the
+		// whole load is the safe outcome: membuf is a cache, and a miss costs a
+		// re-read, while a hole costs corrupt bytes.
+		gateRelease, gateOK := tryAcquireFUSEDataBackground()
+		if !gateOK {
+			mb.removeStaleEntry(path, entry)
+			return
+		}
 		n, err := fd.ReadAt(data[totalRead:], int64(totalRead))
+		gateRelease()
 		totalRead += n
 		if err == io.EOF {
 			break

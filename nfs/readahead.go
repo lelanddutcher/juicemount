@@ -288,8 +288,22 @@ func (rm *ReadaheadManager) prefetch(filePath string, start, end int64, maxWorke
 		default:
 		}
 
+		// FUSE data ceiling (2026-08-05 double kernel panic). Prefetch adds up
+		// to 8 concurrent readers on a fast link — a third of the 16-wide
+		// ceiling — spent entirely on work nobody asked for yet. Use the
+		// NON-BLOCKING background acquire: a foreground acquireFUSEData would
+		// let speculative reads sit in the 250ms admission window ahead of a
+		// user's actual read, inverting the priority this prefetcher exists to
+		// serve. If there is no room, drop the block; the next real read will
+		// fetch it.
+		gateRelease, gateOK := tryAcquireFUSEDataBackground()
+		if !gateOK {
+			metrics.Default().IncReadQoSPrefetchShed()
+			continue
+		}
 		t0 := time.Now()
 		n, err := fd.ReadAt(buf, off)
+		gateRelease()
 		if n > 0 {
 			rm.statsMu.Lock()
 			rm.prefetched++
