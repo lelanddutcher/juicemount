@@ -2027,6 +2027,91 @@ func (e *SpoolEntry) ReadableBounds() (cend, wend int64) {
 	return
 }
 
+// ── STREAMING DRAIN: the sealed prefix (S1) ─────────────────────────────────
+//
+// WHY THIS EXISTS. A single file copied into JuiceMount is hard-capped at local
+// free disk, because peak spool usage is 100% of the file: the drainer only
+// takes FINALIZED rows (drainer.go ListReady) and capacity is released only at
+// MarkDrainComplete. spool_headroom.go states the consequence outright — "a
+// camera file is 20-100 GB and CANNOT free headroom for itself — a spool entry
+// only drains at close — so a single such file could never be copied at all".
+// For object-backed storage that is backwards.
+//
+// NEGATIVE RESULT worth keeping: releasing capacity as the DRAINER copies is a
+// no-op. Peak usage is reached before the drain starts. The cap only moves if
+// bytes are drained and freed WHILE the file is still being written, which is
+// what the sealed prefix is for.
+//
+// sealedEnd is the boundary below which bytes may be copied to the backend and
+// then punched out of the spool file (F_PUNCHHOLE returns real blocks on APFS —
+// measured, 256 MiB punched = 256 MiB physical freed, logical size unchanged).
+//
+// CORRECTNESS DOES NOT DEPEND ON THIS PREDICTION. There is no way to know that a
+// writer will not seek back and rewrite below the seal — NLEs rewrite headers
+// and moov atoms at close. So the streaming path REDIRECTS a write landing below
+// sealedEnd to the destination fd rather than the spool. That makes the margins
+// below a PERFORMANCE heuristic (keep the common rewrite off the slow FUSE path),
+// not a safety boundary. Read that again before "optimising" either constant to
+// zero: doing so is legal, merely slower.
+const (
+	// spoolSealMargin holds back bytes just under contiguousEnd. A writer that
+	// seeks back a little (chunk retry, small fixup) then stays on the fast
+	// spool path instead of being redirected through FUSE.
+	spoolSealMargin = 64 << 20 // 64 MiB
+
+	// spoolSealHeadReserve keeps the head of the file unsealed until the entry
+	// closes. Header/index rewrite-at-close is overwhelmingly at offset 0
+	// (Premiere, Resolve, QuickTime moov), so reserving it converts the single
+	// most likely rewrite from a FUSE redirect into a plain spool write.
+	spoolSealHeadReserve = 64 << 20 // 64 MiB
+
+	// spoolStreamMinSize is the size below which streaming is not worth its
+	// complexity: such a file cannot exhaust the disk on its own, and the whole
+	// -file drain already verifies it with an at-rest SHA re-read.
+	spoolStreamMinSize = 1 << 30 // 1 GiB
+)
+
+// sealedEndLocked computes the sealed prefix. Caller holds e.mu (R or W).
+//
+// Returns 0 when nothing is sealable, which is the correct answer for every
+// small or early file — callers treat 0 as "nothing to stream yet", never as an
+// error.
+func (e *SpoolEntry) sealedEndLocked() int64 {
+	// Only stream files large enough to be the problem.
+	if e.writtenEnd < spoolStreamMinSize {
+		return 0
+	}
+	// Never seal past real data. contiguousEnd already guarantees [0,cend) holds
+	// written bytes and never spans a hole; anchoring here inherits that
+	// invariant rather than re-deriving it.
+	sealed := e.contiguousEnd - spoolSealMargin
+	if sealed > e.writtenEnd-spoolSealMargin {
+		sealed = e.writtenEnd - spoolSealMargin
+	}
+	// Hold back the head until close.
+	if sealed <= spoolSealHeadReserve {
+		return 0
+	}
+	if sealed < 0 {
+		return 0
+	}
+	return sealed
+}
+
+// SealedEnd returns the end of the prefix that may be drained and punched while
+// the writer is still active. See sealedEndLocked.
+//
+// NOT monotonic by construction — contiguousEnd is monotonic, so this only
+// retreats if writtenEnd does, which Truncate can cause. Callers must therefore
+// track what they have ALREADY punched separately and never re-punch or
+// un-punch from this value alone.
+func (e *SpoolEntry) SealedEnd() int64 {
+	e.mu.RLock()
+	n := e.sealedEndLocked()
+	e.mu.RUnlock()
+	return n
+}
+
 // Sync fsyncs the spool file to stable storage WITHOUT finalizing the entry —
 // the writer may continue. This is the NFS COMMIT / FILE_SYNC durability
 // barrier: it makes the data written so far survive a power loss (a plain
