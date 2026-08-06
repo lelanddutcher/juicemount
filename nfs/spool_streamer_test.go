@@ -130,3 +130,115 @@ func TestStreamerWritesToTheHiddenSiblingNotTheRealPath(t *testing.T) {
 		t.Errorf("hidden partial not created: %v", err)
 	}
 }
+
+// A FINALIZED STREAMED FILE MUST BE PUBLISHED.
+//
+// finishStream had NO CALLER until this wiring: a streamed file would copy,
+// punch, and then sit as a hidden partial forever — invisible to the mirror, the
+// farm and the user, with the real path never appearing at all. Found by
+// auditing the design doc against the code.
+func TestStreamerPublishesAFinalizedEntry(t *testing.T) {
+	t.Setenv("JM_SPOOL_STREAM_DRAIN", "1")
+	origMin, origMargin, origHead := spoolStreamMinSize, spoolSealMargin, spoolSealHeadReserve
+	spoolStreamMinSize = 8 << 20
+	spoolSealMargin = 512 << 10
+	spoolSealHeadReserve = 512 << 10
+	t.Cleanup(func() {
+		spoolStreamMinSize, spoolSealMargin, spoolSealHeadReserve = origMin, origMargin, origHead
+	})
+
+	s := newTestSpoolStore(t, 1<<30)
+	e, err := s.OpenWrite("/DCIM/BIG.MOV")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 32<<20)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	if _, err := e.WriteAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	d := &Drainer{spool: s, fuseRoot: root, streamer: &streamer{sessions: map[int64]*streamSession{}}}
+
+	// Stream a few chunks, then finalize and let the loop publish.
+	for i := 0; i < 8; i++ {
+		d.streamOnce()
+	}
+	if e.PunchedEnd() == 0 {
+		t.Fatalf("nothing streamed (%q); the publish assertion would prove nothing",
+			streamIneligible(e))
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	d.streamOnce() // sees closed + session -> publishes
+
+	realPath := filepath.Join(root, "DCIM", "BIG.MOV")
+	got, err := os.ReadFile(realPath)
+	if err != nil {
+		t.Fatalf("finalized streamed file was never published at %s: %v — it would "+
+			"remain a hidden partial forever, invisible to the mirror, the farm and "+
+			"the user", realPath, err)
+	}
+	if len(got) != len(payload) {
+		t.Fatalf("published %d bytes, want %d", len(got), len(payload))
+	}
+	for i := range payload {
+		if got[i] != payload[i] {
+			t.Fatalf("published file differs at offset %d", i)
+		}
+	}
+}
+
+// LOSING ELIGIBILITY MID-STREAM must freeze the session, not keep streaming
+// against a hash it can no longer trust — and must NOT clear punchedEnd, or boot
+// recovery would re-drain a holey spool file and upload zeros over good data.
+func TestStreamerFreezesWhenEligibilityIsLostMidStream(t *testing.T) {
+	t.Setenv("JM_SPOOL_STREAM_DRAIN", "1")
+	origMin, origMargin, origHead := spoolStreamMinSize, spoolSealMargin, spoolSealHeadReserve
+	spoolStreamMinSize = 8 << 20
+	spoolSealMargin = 512 << 10
+	spoolSealHeadReserve = 512 << 10
+	t.Cleanup(func() {
+		spoolStreamMinSize, spoolSealMargin, spoolSealHeadReserve = origMin, origMargin, origHead
+	})
+
+	s := newTestSpoolStore(t, 1<<30)
+	e, err := s.OpenWrite("/DCIM/BIG.MOV")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.WriteAt(make([]byte, 32<<20), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Drainer{spool: s, fuseRoot: t.TempDir(), streamer: &streamer{sessions: map[int64]*streamSession{}}}
+	d.streamOnce()
+	punchedBefore := e.PunchedEnd()
+	if punchedBefore == 0 {
+		t.Fatal("nothing streamed; cannot test eligibility loss")
+	}
+
+	// A below-punch rewrite invalidates the streaming hash — the real trigger.
+	if _, err := e.WriteAt([]byte("REWRITE!"), 1024); err != nil {
+		t.Fatalf("below-punch rewrite: %v", err)
+	}
+	if e.StreamingHashValid() {
+		t.Fatal("the rewrite did not invalidate the hash; this test would prove nothing")
+	}
+
+	d.streamOnce() // sees ineligible + session -> freezes
+
+	if d.existingSession(e.ID()) != nil {
+		t.Error("session still live after eligibility was lost — it would keep " +
+			"streaming against a hash it cannot trust")
+	}
+	if e.PunchedEnd() != punchedBefore {
+		t.Errorf("punchedEnd changed %d -> %d on freeze — it MUST persist, or boot "+
+			"recovery re-drains the holey spool file and uploads zeros over good "+
+			"backend bytes", punchedBefore, e.PunchedEnd())
+	}
+}

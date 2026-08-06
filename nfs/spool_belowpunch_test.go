@@ -141,3 +141,45 @@ func TestWriteAtOrAbovePunchedEndStillUsesTheSpool(t *testing.T) {
 			"half-open, so this offset still belongs to the spool", got, payload)
 	}
 }
+
+// A BELOW-PUNCH WRITE MUST INVALIDATE THE STREAMING HASH.
+//
+// It is a seek-back by definition. The normal WriteAt path sets hashValid=false
+// on `off < writtenEnd`; the redirect returns before reaching that, so without
+// this the drainer would trust a SHA that no longer describes the file — and the
+// spool-side check would QUARANTINE an intact file on the mismatch.
+//
+// This bug was introduced BY the redirect and caught by auditing the design doc
+// against the code, which is the same habit that found the redirect gap itself.
+func TestWriteBelowPunchedEndInvalidatesTheStreamingHash(t *testing.T) {
+	e, _ := belowPunchFixture(t)
+	if !e.StreamingHashValid() {
+		t.Fatal("fixture already had an invalid hash; the assertion below would " +
+			"prove nothing")
+	}
+	if _, err := e.WriteAt([]byte("NEWDATA!"), 4096); err != nil {
+		t.Fatal(err)
+	}
+	if e.StreamingHashValid() {
+		t.Error("hashValid stayed TRUE after a below-punch write — the streaming SHA " +
+			"no longer describes the file, and the drainer would quarantine an " +
+			"intact file on the resulting mismatch")
+	}
+}
+
+// It must also count as writer activity. The idle sweeper finalizes quiet
+// entries; a writer actively rewriting below the punch is not quiet, and
+// finalizing under it would end the file mid-rewrite.
+func TestWriteBelowPunchedEndCountsAsWriterActivity(t *testing.T) {
+	e, _ := belowPunchFixture(t)
+	e.lastWrite.Store(0)
+
+	if _, err := e.WriteAt([]byte("NEWDATA!"), 4096); err != nil {
+		t.Fatal(err)
+	}
+	if e.lastWrite.Load() == 0 {
+		t.Error("a below-punch write did not stamp lastWrite — the idle sweeper " +
+			"would treat an actively-rewriting entry as quiescent and finalize it " +
+			"mid-rewrite")
+	}
+}

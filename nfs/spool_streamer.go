@@ -98,13 +98,33 @@ func (d *Drainer) streamEntryOnce(e *SpoolEntry) {
 	if e == nil {
 		return
 	}
+	// FINISHED vs MERELY PAUSED. NFS does OpenFile->WriteAt->Close on every WRITE
+	// RPC, so refcount hitting zero says nothing about completion — that trap is
+	// documented on SpoolEntry.refcount and is why finalize runs off the idle
+	// sweeper. `closed` is the real signal: the sweeper has finalized the entry
+	// and no further writes will arrive.
+	if ss := d.existingSession(e.ID()); ss != nil && e.IsClosed() {
+		d.finishStreamSession(e, ss)
+		return
+	}
+
 	if reason := streamIneligible(e); reason != "" {
-		// An entry that never became eligible has no session to tear down. One
-		// that HAD a session and lost eligibility is a different case and is not
-		// handled here — losing eligibility mid-stream (hashValid flipping on a
-		// late out-of-order write) needs the whole stream abandoned via
-		// rollbackStream, and doing that correctly requires knowing the entry is
-		// finished rather than merely paused. Left explicit rather than guessed.
+		// A session that exists but has become ineligible has LOST eligibility
+		// mid-stream — in practice a late out-of-order write flipping hashValid,
+		// which is exactly what a below-punch rewrite now does deliberately.
+		//
+		// The stream cannot simply stop: a prefix is already punched, so the spool
+		// file can no longer reconstruct the file on its own and the whole-file
+		// drain is not a fallback. But it also must not keep streaming against a
+		// hash it can no longer trust. Freeze it: close the handles, leave the
+		// partial and punchedEnd alone, and let finalize resolve it. punchedEnd
+		// stays set so boot recovery still refuses to re-drain the holey spool
+		// file — clearing it here would re-arm the zeros-over-good-data hazard.
+		if ss := d.existingSession(e.ID()); ss != nil {
+			jmlog.Warn("stream: entry lost eligibility mid-stream, freezing the session",
+				"path", e.NFSPath(), "reason", reason, "punched_end", e.PunchedEnd())
+			d.dropSession(e.ID())
+		}
 		return
 	}
 
@@ -127,6 +147,63 @@ func (d *Drainer) streamEntryOnce(e *SpoolEntry) {
 		jmlog.Debug("stream: reclaimed spool bytes",
 			"path", e.NFSPath(), "bytes", moved, "punched_end", e.PunchedEnd())
 	}
+}
+
+// existingSession returns the live session for an entry, or nil.
+func (d *Drainer) existingSession(id int64) *streamSession {
+	d.streamer.mu.Lock()
+	defer d.streamer.mu.Unlock()
+	return d.streamer.sessions[id]
+}
+
+// dropSession closes and forgets a session WITHOUT touching the partial or
+// punchedEnd. Used when a stream is frozen rather than completed.
+func (d *Drainer) dropSession(id int64) {
+	d.streamer.mu.Lock()
+	ss := d.streamer.sessions[id]
+	delete(d.streamer.sessions, id)
+	d.streamer.mu.Unlock()
+	if ss != nil {
+		ss.close()
+	}
+}
+
+// finishStreamSession copies whatever the streamer never sealed and publishes
+// the file at its real path.
+//
+// The unsealed tail is the deliberate cost of the seal margins: they hold back
+// the last chunk and the head reserve precisely so a late rewrite stays on the
+// fast spool path. At finalize there is no more rewriting to fear, so the
+// remainder is copied straight across.
+func (d *Drainer) finishStreamSession(e *SpoolEntry, ss *streamSession) {
+	defer d.dropSession(e.ID())
+
+	start := e.PunchedEnd()
+	end := e.WrittenEnd()
+	if end > start {
+		buf := make([]byte, end-start)
+		if _, err := ss.src.ReadAt(buf, start); err != nil {
+			jmlog.Warn("stream: cannot read the unsealed tail; leaving the partial for "+
+				"the boot sweep", "path", e.NFSPath(), "error", err.Error())
+			return
+		}
+		if _, err := ss.dest.WriteAt(buf, start); err != nil {
+			jmlog.Warn("stream: cannot write the unsealed tail", "path", e.NFSPath(),
+				"error", err.Error())
+			return
+		}
+		if err := ss.dest.Sync(); err != nil {
+			jmlog.Warn("stream: cannot sync before publish", "path", e.NFSPath(),
+				"error", err.Error())
+			return
+		}
+	}
+	if err := finishStream(e, ss.tempPath, ss.realPath); err != nil {
+		jmlog.Warn("stream: publish failed; the partial remains for the boot sweep",
+			"path", e.NFSPath(), "error", err.Error())
+		return
+	}
+	jmlog.Info("stream: published a streamed file", "path", e.NFSPath(), "bytes", end)
 }
 
 // sessionFor returns the live session for an entry, creating it on first use.

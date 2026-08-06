@@ -2110,6 +2110,25 @@ func (e *SpoolEntry) writeBelowPunchedLocked(p []byte, off int64) (int, error) {
 			"has no stream destination: refusing to write into a punched hole",
 			off, e.punchedEnd)
 	}
+	// A BELOW-PUNCH WRITE IS AN OUT-OF-ORDER WRITE, and the normal path's
+	// bookkeeping must not be skipped just because the bytes go elsewhere.
+	//
+	// hashValid: the streaming SHA hashes bytes in write order. A seek-back
+	// invalidates it — the normal path sets this on `off < writtenEnd`, and this
+	// branch returns before reaching that. Leaving it true would hand the drainer
+	// a hash that no longer describes the file, and the spool-side SHA check
+	// would then QUARANTINE an intact file on the mismatch. (Bug introduced with
+	// the redirect itself, caught by auditing the design doc against the code.)
+	//
+	// lastWrite: the idle sweeper finalizes entries that have gone quiet. A
+	// writer that is actively rewriting below the punch is NOT quiet, and
+	// finalizing under it would end the file mid-rewrite.
+	//
+	// writtenEnd / contiguousEnd are deliberately NOT touched: they describe the
+	// SPOOL file's extent, and these bytes are not going there.
+	e.hashValid = false
+	e.lastWrite.Store(time.Now().UnixNano())
+
 	end := off + int64(len(p))
 	belowLen := e.punchedEnd - off
 	if belowLen > int64(len(p)) {
@@ -2147,6 +2166,18 @@ func (e *SpoolEntry) writeBelowPunchedLocked(p []byte, off int64) (int, error) {
 	}
 	_ = end
 	return int(belowLen) + n, nil
+}
+
+// IsClosed reports whether the entry has been finalized — no further writes will
+// arrive. The streaming session uses it to decide that a copy is FINISHED rather
+// than merely paused between WRITE RPCs, which matters because NFS does
+// OpenFile->WriteAt->Close on every RPC and refcount therefore says nothing
+// about completion.
+func (e *SpoolEntry) IsClosed() bool {
+	e.mu.RLock()
+	c := e.closed
+	e.mu.RUnlock()
+	return c
 }
 
 // publishPunchedEnd advances the punched boundary. Monotonic — a lower value is
