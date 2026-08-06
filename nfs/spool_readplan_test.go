@@ -136,3 +136,57 @@ func TestPunchSafeCeilingNeverRetreatsBelowPublished(t *testing.T) {
 		}
 	}
 }
+
+// The LIVE read path must consult punchedEnd, not just the pure function.
+//
+// planReadAt being correct proves nothing if spoolReadFile.ReadAt does not call
+// it. This drives a real spool entry, publishes a punchedEnd, and asserts the
+// read refuses rather than serving the (still-intact) spool bytes underneath —
+// which is what would happen if the routing were bypassed.
+func TestLiveReadPathRefusesAPunchedRange(t *testing.T) {
+	s := newTestSpoolStore(t, 64<<20)
+	e, err := s.OpenWrite("/clip.mov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 64<<10)
+	for i := range payload {
+		payload[i] = 0xC3
+	}
+	if _, err := e.WriteAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	rf := &spoolReadFile{name: "/clip.mov", entry: e}
+	buf := make([]byte, 4096)
+
+	// Baseline: with nothing punched the read succeeds and returns real bytes.
+	n, err := rf.ReadAt(buf, 0)
+	if err != nil || n != len(buf) {
+		t.Fatalf("baseline read failed (n=%d err=%v) — fixture is wrong, so the "+
+			"refusal below would prove nothing", n, err)
+	}
+	if buf[0] != 0xC3 {
+		t.Fatalf("baseline read returned 0x%02X, want 0xC3", buf[0])
+	}
+
+	// Publish a punched prefix. The spool bytes are deliberately left INTACT, so
+	// a routing bypass would succeed and return 0xC3 — the test only passes if
+	// the read is actually routed on punchedEnd.
+	e.mu.Lock()
+	e.punchedEnd = 32 << 10
+	e.mu.Unlock()
+
+	n, err = rf.ReadAt(buf, 0)
+	if err == nil {
+		t.Fatalf("read below punchedEnd SUCCEEDED (n=%d, first byte 0x%02X) — the "+
+			"live path is not consulting punchedEnd; once the bytes are really "+
+			"punched this returns zeros as file content", n, buf[0])
+	}
+
+	// At/above punchedEnd must still be served normally.
+	if n, err := rf.ReadAt(buf, 32<<10); err != nil || n != len(buf) {
+		t.Errorf("read AT punchedEnd failed (n=%d err=%v); the punched range is "+
+			"half-open and this offset is still in the spool", n, err)
+	}
+}

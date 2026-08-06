@@ -114,49 +114,55 @@ func (f *spoolReadFile) ReadAt(p []byte, off int64) (int, error) {
 	// so an NLE reading a still-copying clip renders black frames / corrupt
 	// RAW. Clamp every read to the contiguous-written prefix and classify a
 	// past-prefix offset against a CONSISTENT (cend,wend) snapshot.
-	cend, wend := f.entry.ReadableBounds()
-	// #100 — ._ AppleDouble sidecars must NEVER JUKEBOX-hold an in-flight hole.
-	// A large xattr (e.g. a camera's com.blackmagicdesign.thumbnail, ~20KB) makes
-	// copyfile write the ._ sidecar with SEEKS — header at 0, FinderInfo at 0x20,
-	// the resource fork far later — so the spool file has a sparse hole BELOW
-	// writtenEnd. During that same fsetxattr the macOS Quarantine kext reads
-	// com.apple.quarantine from the very ._ being written (qtn_track_vnode_if_
-	// needed → mac_vnop_getxattr). If that read lands in the hole we return
-	// ErrSpoolIncomplete → NFS3ERR_JUKEBOX → the client retries to its ~40s
-	// soft-mount timeout → the notorious ~73s-per-file "copies take forever"
-	// hang (a plain-disk NFS server has no such window and copies the identical
-	// file in ~1s). ._ sidecars are tiny SAME-CLIENT metadata — never the NLE
-	// torn-read / black-frame concern #65's JUKEBOX guards — so serve them exactly
-	// like a plain server: straight from the (sparse) spool file up to writtenEnd,
-	// real bytes where written and zeros in holes, with NO hold. The concurrent
-	// xattr WRITES still land fully in the spool and drain intact, so the final ._
-	// content is unaffected; only the racing quarantine READ sees a transient
-	// zero-hole, which is harmless (it just reads quarantine as absent).
+	cend, wend, punched := f.entry.readableBoundsWithPunched()
+	// Route BEFORE touching the spool file. planReadAt puts the punched check
+	// ahead of every other classification for the reason documented there: a
+	// punched range is below contiguousEnd by construction, so any path that
+	// consults the prefix first serves zeros as file content.
+	//
+	// punched is 0 unless the streaming drain is running, so with streaming off
+	// every branch below resolves exactly as it did before this routing existed.
+	switch planReadAt(off, readPlanInputs{
+		punchedEnd:    punched,
+		contiguousEnd: cend,
+		writtenEnd:    wend,
+		writerActive:  time.Since(f.entry.LastWrite()) < pin.SpoolIncompleteStallWindow,
+		isAppleDouble: f.isAppleDouble,
+	}) {
+	case planDest:
+		// FAIL CLOSED. The destination read path does not exist yet, and the one
+		// thing that must never happen is falling through to the spool for a
+		// punched range. Unreachable while punchedEnd is 0 — which it always is
+		// until the copier lands — so this firing means streaming was enabled
+		// before its reader was built. Loud beats silent.
+		return 0, fmt.Errorf("spool: read at %d is below punchedEnd %d but no "+
+			"destination reader is wired: refusing to serve a punched range", off, punched)
+	case planHold:
+		// Diagnostic (throttled): a real (non-._) file JUKEBOX-held because the
+		// read offset is past the contiguous prefix but below the high-water.
+		// Post-coalesce-fix this should be rare (a genuine not-yet-arrived hole);
+		// a burst keyed to an export path at its end is the "connection
+		// interrupted" smoking gun.
+		f.entry.logInflightJukebox(f.name, off, cend, wend)
+		return 0, pin.ErrSpoolIncomplete
+	case planEOF:
+		return 0, io.EOF
+	}
+	// planSpool: the bytes are present and safe to read.
+	//
+	// GAP B (task #65) — the at/past-prefix classification that used to live here
+	// (hold vs EOF) and the #100 ._ sidecar exemption both moved into planReadAt,
+	// which decides them from the same (cend, wend, punched) snapshot. The
+	// rationale for each lives there; see #100 in particular before changing the
+	// sidecar branch, because that exemption is what fixed the ~73s-per-file copy
+	// stall and it is not an optimisation.
+	//
+	// readEnd is recomputed here only to CLAMP the buffer. It must mirror
+	// planReadAt's readEnd exactly — if the two ever disagree, a read classified
+	// as planSpool could still be clamped against the wrong boundary.
 	readEnd := cend
 	if f.isAppleDouble {
 		readEnd = wend
-	}
-	if off >= readEnd {
-		// GAP B (task #65): at/past the readable prefix. If there are still-
-		// expected bytes below the high-water (a not-yet-filled in-flight hole)
-		// and the writer is still active, HOLD (JUKEBOX via the sentinel) — a
-		// short/EOF read here would let the client treat a partially-arrived file
-		// as COMPLETE (silent truncation). A genuine past-end (off>=wend, the file
-		// merely appears to grow) — or a writer gone silent past the stall window
-		// (wedged/abandoned, the partial is the best available) — reports io.EOF
-		// as before, so the client re-stats and reissues / accepts the partial.
-		// ._ sidecars skip the hold entirely (readEnd==wend already, so off>=wend
-		// here → plain EOF, matching a durable local server).
-		if !f.isAppleDouble && off < wend && time.Since(f.entry.LastWrite()) < pin.SpoolIncompleteStallWindow {
-			// Diagnostic (throttled): a real (non-._) file JUKEBOX-held because
-			// the read offset is past the contiguous prefix but below the
-			// high-water. Post-coalesce-fix this should be rare (a genuine
-			// not-yet-arrived hole); a burst keyed to an export path at its end
-			// is the "connection interrupted" smoking gun.
-			f.entry.logInflightJukebox(f.name, off, cend, wend)
-			return 0, pin.ErrSpoolIncomplete
-		}
-		return 0, io.EOF
 	}
 	if int64(len(p)) > readEnd-off {
 		p = p[:readEnd-off]

@@ -1911,6 +1911,19 @@ type SpoolEntry struct {
 	// NLE reading a still-copying clip would get black frames / corrupt RAW),
 	// so the read shadow clamps to contiguousEnd. Monotonic; guarded by mu.
 	contiguousEnd int64
+	// punchedEnd is the end of the prefix the streaming drain has copied to the
+	// backend AND punched out of this spool file. Monotonic; guarded by mu.
+	//
+	// Zero unless streaming is active, which keeps every read path byte-identical
+	// to the pre-streaming behaviour until the copier actually runs.
+	//
+	// ORDERING CONTRACT, and it is not negotiable: this value is PUBLISHED before
+	// the punch, never after. Readers route on it, so publishing first sends them
+	// to the destination while the spool bytes are still intact (harmless);
+	// publishing second would leave a window where a reader is routed at a hole
+	// and served zeros with no error.
+	punchedEnd int64
+
 	// writtenExtents tracks already-written regions that lie ABOVE
 	// contiguousEnd — the out-of-order writes macOS's parallel WRITE dispatch
 	// produces (each WRITE RPC runs on its own goroutine over one TCP conn, so
@@ -2009,6 +2022,35 @@ func (e *SpoolEntry) ContiguousEnd() int64 {
 	n := e.contiguousEnd
 	e.mu.RUnlock()
 	return n
+}
+
+// PunchedEnd returns the end of the prefix that has been drained to the backend
+// AND punched out of the spool file. Everything below it reads as ZEROS from the
+// spool (measured; punch_darwin.go) and must be served from the destination.
+// Monotonic — punching cannot be undone.
+func (e *SpoolEntry) PunchedEnd() int64 {
+	e.mu.RLock()
+	n := e.punchedEnd
+	e.mu.RUnlock()
+	return n
+}
+
+// readableBoundsWithPunched returns all three read-routing boundaries under ONE
+// lock.
+//
+// Same reason ReadableBounds takes cend and wend together (task #65): a decision
+// assembled from two separate snapshots can classify an offset against a state
+// that never existed. Adding punchedEnd as a third independently-read value would
+// reintroduce exactly that hazard, and here the consequence is worse than a
+// mis-classified hole — it is a read routed at punched bytes, which returns zeros
+// with no error.
+func (e *SpoolEntry) readableBoundsWithPunched() (cend, wend, punched int64) {
+	e.mu.RLock()
+	cend = e.contiguousEnd
+	wend = e.writtenEnd
+	punched = e.punchedEnd
+	e.mu.RUnlock()
+	return
 }
 
 // ReadableBounds returns the contiguous-written prefix end (cend — the readable
