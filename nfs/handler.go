@@ -4206,8 +4206,19 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		if f.pinned {
 			bound = offlinePinnedReadTimeout
 		}
-		tmp := make([]byte, len(p))
+		// The private buffer is REQUIRED (see above) but need not be fresh:
+		// `make([]byte, len(p))` here cost a zeroed 1 MiB allocation per read on
+		// the path that is supposed to run at disk speed. Measured at 1 MiB,
+		// n=3: 205us/read allocating vs 63us pooled, against 57us for the plain
+		// online read — i.e. the allocation, not the disk, was most of the
+		// offline penalty. Garbage per read drops 1,049,042 B -> 478 B.
+		//
+		// releaseOfflineReadBuf recycles ONLY when done==true. A bound-exceeded
+		// read leaves its goroutine still writing into this buffer, so that one
+		// is abandoned to the GC rather than handed to another reader.
+		tmp := offlineReadBuf(len(p))
 		bn, berr, done := readAtBounded(f.fuseFD, tmp, off, bound)
+		defer releaseOfflineReadBuf(tmp, done)
 		if !done || (berr != nil && bn == 0 && !errors.Is(berr, io.EOF)) {
 			return 0, pin.ErrOfflineNotAvailable
 		}
