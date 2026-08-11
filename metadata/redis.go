@@ -1423,10 +1423,7 @@ func (rc *RedisClient) reconcileLoop() {
 			suppress := flapSuppressWindow(consecutiveFailures, backoff)
 			if suppress > 0 {
 				rc.mu.RLock()
-				recent := rc.lastSyncStartedAt
-				if rc.lastSyncTime.After(recent) {
-					recent = rc.lastSyncTime
-				}
+				recent := mostRecentSyncMark(rc.lastSyncStartedAt, rc.lastSyncTime, rc.lastSyncEndedAt)
 				rc.mu.RUnlock()
 				if !recent.IsZero() && time.Since(recent) < suppress {
 					jmlog.Info("flap-triggered reconcile suppressed",
@@ -1598,6 +1595,34 @@ func (rc *RedisClient) isDeferredSyncErr(err error) bool {
 // after a failed/deferred attempt (the link was just saturated for the full
 // budget). The deferral Warn logs ONCE per streak, not per attempt — on a
 // cellular relay the streak can run for hours at the backstop cadence.
+// mostRecentSyncMark is the anchor for the flap-suppression window: the latest
+// of when a sync STARTED, when one last SUCCEEDED, and when one last ENDED.
+//
+// endedAt is the one that was missing, and it is the one that matters on a
+// tunnel. lastSyncTime is stamped only on SUCCESS; lastSyncEndedAt is stamped
+// on every exit including FAILURE and DEFERRAL — and on a slow link the
+// common outcome is deferral ("SCAN budget exceeded"). With endedAt excluded,
+// the window was anchored to the START of the failed attempt, and since the
+// tunnel SCAN budget (300s) equals the maximum suppress window (maxBackoff,
+// 300s), time.Since(start) >= suppress the instant the attempt gave up. The
+// next flap therefore launched another full-budget SCAN immediately: the
+// ~100%-duty-cycle loop where the SCAN saturates the uplink, the saturated
+// uplink looks like a link change, and the link change triggers the SCAN.
+//
+// noteSyncOutcome documents this exact intent ("must keep suppressing
+// flap-triggered SCANs right after a failed/deferred attempt — the link was
+// just saturated for the full budget"). It was reading the wrong field.
+func mostRecentSyncMark(startedAt, syncedAt, endedAt time.Time) time.Time {
+	recent := startedAt
+	if syncedAt.After(recent) {
+		recent = syncedAt
+	}
+	if endedAt.After(recent) {
+		recent = endedAt
+	}
+	return recent
+}
+
 func (rc *RedisClient) noteSyncOutcome(err error) {
 	deferred := rc.isDeferredSyncErr(err)
 	now := time.Now()
