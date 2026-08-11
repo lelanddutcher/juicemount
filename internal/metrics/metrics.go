@@ -338,6 +338,13 @@ type Registry struct {
 	dataGateMu sync.RWMutex
 	dataGateFn func() *FUSEDataGateSnapshot
 
+	// Stall hook — set by package internal/nfs so /metrics can report live
+	// in-flight RPCs and per-op JUKEBOX totals. Same provider rationale as the
+	// data gate: the state is package-private to internal/nfs, and metrics
+	// cannot import it (internal/nfs already imports metrics).
+	stallMu sync.RWMutex
+	stallFn func() *StallSnapshot
+
 	// FD-pool hook — set by package nfs so /metrics can report descriptor and
 	// memory-buffer occupancy. Same provider rationale as the data gate: the
 	// pool is per-handler, so it cannot be a package-level counter, and reading
@@ -409,11 +416,53 @@ type NetworkSnapshot struct {
 	HaveBandwidth   bool    `json:"have_bandwidth"`
 	ThroughputN     int64   `json:"throughput_samples"`
 	BootstrappedRTT bool    `json:"bootstrapped_from_rtt"`
+	// HighLatency is the HYSTERETIC far-link flag, which is NOT derivable from
+	// Class or RTTMs above: it latches on at a higher RTT than it releases at,
+	// so a link oscillating around the boundary reports one stable answer. It
+	// is what actually selects warmOpTimeout, so a cellular run that behaves
+	// differently from its measured RTT is explained by this field and by
+	// nothing else in this struct.
+	HighLatency bool `json:"high_latency"`
 	// Live readahead policy derived from the class.
 	ReadaheadEnabled bool `json:"readahead_enabled"`
 	ReadaheadSeq     int  `json:"readahead_seq_threshold"`
 	ReadaheadBlocks  int  `json:"readahead_blocks_ahead"`
 	ReadaheadWorkers int  `json:"readahead_workers"`
+}
+
+// StallSnapshot reports live head-of-line blocking: how many NFS RPCs are in
+// flight right now, how old the oldest is, and how many JUKEBOX replies each op
+// has sent.
+//
+// WHY THIS IS REPORTED AT ALL: both numbers were already collected and neither
+// could be read. InflightStats' own doc comment claimed it was "exposed for the
+// metrics endpoint" — it was not; its only caller was the watchdog, which
+// speaks at >=22s. snapshotJukebox had exactly one caller too, a ~15s watchdog
+// log line, and this mount runs `mutejukebox`, so a JUKEBOX storm was invisible
+// to the user AND to /metrics.
+//
+// That is precisely backwards for the case it matters in. A JUKEBOX storm is
+// the mechanism behind Finder "error 100060": the client retries one logical op
+// until its ~40s soft-mount timeout. On a fast link the storm is over before a
+// 22s watchdog looks. On cellular the operator needs to see OldestAgeMs
+// climbing toward the client timeout WHILE it climbs, not in a log after the
+// user has already given up.
+//
+// Cost is one map copy plus one mutex acquisition per /metrics scrape. Nothing
+// is added to the RPC hot path.
+type StallSnapshot struct {
+	// Inflight is the number of NFS RPCs currently being served.
+	Inflight int `json:"inflight"`
+	// OldestOp / OldestAgeMs describe the longest-running one. An age that
+	// climbs monotonically past ~10s is the signature of the 2026-08-05
+	// watchdog panic (three reads hung ~10 min while WindowServer starved).
+	OldestOp    string `json:"oldest_op,omitempty"`
+	OldestAgeMs int64  `json:"oldest_age_ms"`
+	// JukeboxByOp counts JUKEBOX replies per op since start. The completed-RPC
+	// metrics count JUKEBOX as a SUCCESS (it is a valid NFS status, not an
+	// rpc_error), so these counters are the only place a storm is visible.
+	JukeboxByOp  map[string]int64 `json:"jukebox_by_op,omitempty"`
+	JukeboxTotal int64            `json:"jukebox_total"`
 }
 
 // FUSEDataGateSnapshot mirrors the FUSE data-syscall concurrency ceiling for
@@ -492,6 +541,17 @@ func (r *Registry) SetFUSEDataGateProvider(fn func() *FUSEDataGateSnapshot) {
 	r.dataGateMu.Lock()
 	defer r.dataGateMu.Unlock()
 	r.dataGateFn = fn
+}
+
+// SetStallProvider registers a callback used by /metrics to report live
+// in-flight RPCs and JUKEBOX totals. Safe to leave unset (the field is then
+// omitted). package internal/nfs registers this from an init() for the same
+// reason the data gate does: the defect being fixed is an accessor that existed
+// with no callers, and an init() cannot be forgotten at a wiring site.
+func (r *Registry) SetStallProvider(fn func() *StallSnapshot) {
+	r.stallMu.Lock()
+	defer r.stallMu.Unlock()
+	r.stallFn = fn
 }
 
 // SetKeyspaceProvider registers a callback used by /metrics to report keyspace
@@ -762,6 +822,9 @@ type Snapshot struct {
 	// Keyspace reports whether Redis keyspace push is delivering. See
 	// KeyspaceSnapshot.
 	Keyspace *KeyspaceSnapshot `json:"keyspace,omitempty"`
+
+	// Stall reports live head-of-line blocking. See StallSnapshot.
+	Stall *StallSnapshot `json:"stall,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -835,6 +898,13 @@ func (r *Registry) Snapshot() Snapshot {
 	r.dataGateMu.RUnlock()
 	if dataGateFn != nil {
 		out.FUSEDataGate = dataGateFn()
+	}
+
+	r.stallMu.RLock()
+	stallFn := r.stallFn
+	r.stallMu.RUnlock()
+	if stallFn != nil {
+		out.Stall = stallFn()
 	}
 
 	r.fdPoolMu.RLock()

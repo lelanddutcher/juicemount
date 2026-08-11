@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
 
 // In-flight RPC tracking. The completed-RPC latency metrics (max_us per op)
@@ -241,4 +243,37 @@ func inflightOpName(r *request) string {
 	default:
 		return fmt.Sprintf("%d.%d", r.Header.Prog, r.Header.Proc)
 	}
+}
+
+// Wire live stall telemetry into /metrics at package init.
+//
+// InflightStats' doc comment above says it is "Exposed for the metrics
+// endpoint so external monitors can watch for a hang live". That was false
+// until this init() existed: its only caller was inflightWatchdog, which does
+// not speak until >=22s. snapshotJukebox was in the same state — one caller, a
+// ~15s watchdog log line — and this mount runs with jukebox logging muted, so
+// a JUKEBOX storm reached neither the user nor /metrics.
+//
+// Registering from init() rather than a wiring site is deliberate: the failure
+// mode being fixed IS the forgotten wiring site. See nfs/fusedatagate.go for
+// the same reasoning and [[feedback_architect_role]] "dead knobs".
+func init() {
+	metrics.Default().SetStallProvider(func() *metrics.StallSnapshot {
+		count, oldestOp, oldestAge := InflightStats()
+		jb := snapshotJukebox()
+		var total int64
+		for _, v := range jb {
+			total += v
+		}
+		if len(jb) == 0 {
+			jb = nil // omitempty: an empty map is noise, not a reading
+		}
+		return &metrics.StallSnapshot{
+			Inflight:     count,
+			OldestOp:     oldestOp,
+			OldestAgeMs:  oldestAge.Milliseconds(),
+			JukeboxByOp:  jb,
+			JukeboxTotal: total,
+		}
+	})
 }
