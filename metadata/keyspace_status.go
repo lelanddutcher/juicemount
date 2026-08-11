@@ -84,7 +84,34 @@ var (
 	keyspaceEventsApplied  atomic.Int64
 	keyspacePublished      atomic.Int64
 	keyspaceLastEventNanos atomic.Int64
+	// keyspacePushDelivered counts notifications that arrived on the ACTUAL
+	// keyspace push feed (PSUBSCRIBE __keyspace@N__:d*).
+	//
+	// It exists because keyspaceEventsApplied does NOT measure that feed. Its
+	// only increment site is applyEvent, which is reached from runSubscribe on
+	// SubscribeChannel = "juicemount:metadata" — the SELF-WRITE pub/sub, a
+	// different subscription that works whether or not notify-keyspace-events
+	// is set on the server. So the verdict flipped to "working" as soon as the
+	// user saved one file, with keyspace push completely dead and the client
+	// doing a full-tree SCAN over the tunnel every cycle.
+	//
+	// That is a structural false green in the one file whose whole purpose is
+	// refusing to report a number it did not measure, and it is the exact
+	// metric an operator checks to answer "is the cheap path carrying the load
+	// on this link, or am I re-pulling 297k entries?".
+	//
+	// The two feeds are genuinely distinct — see [[feedback_selfwrite_pubsub_trap]],
+	// where assuming juicemount:metadata carried only REMOTE writes cost an
+	// xattr-loss regression. Both counters are kept and reported separately.
+	keyspacePushDelivered atomic.Int64
 )
+
+// noteKeyspacePushDelivered records one notification from the real keyspace
+// push feed. Called from the PSUBSCRIBE pump in keyspace.go.
+func noteKeyspacePushDelivered() {
+	keyspacePushDelivered.Add(1)
+	keyspaceLastEventNanos.Store(time.Now().UnixNano())
+}
 
 // noteKeyspaceEventApplied records one event applied to the mirror.
 func noteKeyspaceEventApplied() {
@@ -101,11 +128,15 @@ func KeyspaceCounters() (applied, published int64) {
 	return keyspaceEventsApplied.Load(), keyspacePublished.Load()
 }
 
+// KeyspacePushDelivered is the count from the REAL push feed. This, not
+// KeyspaceCounters' applied, is what the verdict keys on.
+func KeyspacePushDelivered() int64 { return keyspacePushDelivered.Load() }
+
 // Status answers whether keyspace push is delivering, and REFUSES to answer when
 // it has not measured anything.
 func (rc *RedisClient) KeyspaceStatus(ctx context.Context) KeyspaceStatus {
 	st := KeyspaceStatus{
-		EventsApplied:         keyspaceEventsApplied.Load(),
+		EventsApplied:         keyspacePushDelivered.Load(),
 		PublishedMutations:    keyspacePublished.Load(),
 		SecondsSinceLastEvent: -1,
 	}
@@ -118,7 +149,7 @@ func (rc *RedisClient) KeyspaceStatus(ctx context.Context) KeyspaceStatus {
 	st.ConfigFlags = flags
 	st.ConfigSufficient = sufficient
 
-	v := keyspaceVerdictFor(st.EventsApplied, st.PublishedMutations, !(flags == "" && !sufficient))
+	v := keyspaceVerdictFor(keyspacePushDelivered.Load(), st.PublishedMutations, !(flags == "" && !sufficient))
 	st.Verdict, st.Reason = v.Verdict, v.Reason
 	if st.Verdict == KeyspaceWorking {
 		st.Reason = fmt.Sprintf("%d events applied; last %.1fs ago",
@@ -130,7 +161,12 @@ func (rc *RedisClient) KeyspaceStatus(ctx context.Context) KeyspaceStatus {
 // keyspaceVerdictFor is the decision, split out so the validity gate is testable
 // without a live Redis — the gate is the part that must not silently regress
 // into reporting a pass it did not earn.
-func keyspaceVerdictFor(eventsApplied, published int64, configReadable bool) KeyspaceStatus {
+//
+// pushDelivered MUST come from the __keyspace@ feed, not from the self-write
+// pub/sub: see keyspacePushDelivered's comment. A verdict keyed on the wrong
+// feed reports "working" while push is dead.
+func keyspaceVerdictFor(pushDelivered, published int64, configReadable bool) KeyspaceStatus {
+	eventsApplied := pushDelivered
 	st := KeyspaceStatus{EventsApplied: eventsApplied, PublishedMutations: published}
 	switch {
 	case !configReadable:
@@ -147,9 +183,10 @@ func keyspaceVerdictFor(eventsApplied, published int64, configReadable bool) Key
 		// We changed things and heard nothing back. Our own writes are replayed
 		// to us, so this IS a failure rather than an absence of traffic.
 		st.Verdict = KeyspaceBroken
-		st.Reason = fmt.Sprintf("published %d mutations and received ZERO events — "+
-			"this client's own writes are replayed to it, so silence here means push "+
-			"is not delivering", published)
+		st.Reason = fmt.Sprintf("published %d mutations and received ZERO keyspace "+
+			"notifications — our own writes are replayed to us, so silence on the "+
+			"__keyspace@ feed means push is not delivering and every reconcile is a "+
+			"full-tree SCAN", published)
 	default:
 		// THE REFUSAL. Nothing was published and nothing arrived, so there was
 		// nothing to observe. Reporting "working" here would be a number from no
@@ -174,12 +211,14 @@ func keyspaceVerdictFor(eventsApplied, published int64, configReadable bool) Key
 // from "silent while we published", which is the question Leland actually asked.
 func init() {
 	metrics.Default().SetKeyspaceProvider(func() *metrics.KeyspaceSnapshot {
-		applied, published := KeyspaceCounters()
-		v := keyspaceVerdictFor(applied, published, true)
+		selfWrite, published := KeyspaceCounters()
+		delivered := KeyspacePushDelivered()
+		v := keyspaceVerdictFor(delivered, published, true)
 		return &metrics.KeyspaceSnapshot{
 			Verdict:            string(v.Verdict),
 			Reason:             v.Reason,
-			EventsApplied:      applied,
+			EventsApplied:      delivered,
+			SelfWriteEvents:    selfWrite,
 			PublishedMutations: published,
 		}
 	})

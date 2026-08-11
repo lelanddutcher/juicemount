@@ -682,6 +682,7 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 				if !ok {
 					continue
 				}
+				noteKeyspacePushDelivered()
 				co.add(inode)
 			}
 		}

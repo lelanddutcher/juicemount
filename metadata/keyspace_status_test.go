@@ -13,10 +13,12 @@ func resetKeyspaceCounters(t *testing.T) {
 	keyspaceEventsApplied.Store(0)
 	keyspacePublished.Store(0)
 	keyspaceLastEventNanos.Store(0)
+	keyspacePushDelivered.Store(0)
 	t.Cleanup(func() {
 		keyspaceEventsApplied.Store(0)
 		keyspacePublished.Store(0)
 		keyspaceLastEventNanos.Store(0)
+		keyspacePushDelivered.Store(0)
 	})
 }
 
@@ -202,15 +204,55 @@ func TestKeyspaceVerdictIsReportedInMetrics(t *testing.T) {
 
 	// And the counters must be LIVE, not a constant zero: a snapshot that never
 	// moves satisfies the nil-check above while reporting nothing.
-	noteKeyspaceEventApplied()
-	noteKeyspaceEventApplied()
+	noteKeyspacePushDelivered()
+	noteKeyspacePushDelivered()
 	live := metrics.Default().Snapshot()
 	if live.Keyspace.EventsApplied != 2 {
-		t.Errorf("events_applied = %d after two events, want 2 — the gauge is "+
-			"constant, so it can never show push failing", live.Keyspace.EventsApplied)
+		t.Errorf("events_applied = %d after two push notifications, want 2 — the "+
+			"gauge is constant, so it can never show push failing", live.Keyspace.EventsApplied)
 	}
 	if live.Keyspace.Verdict != string(KeyspaceWorking) {
-		t.Errorf("verdict %q with events observed, want %q",
+		t.Errorf("verdict %q with push notifications observed, want %q",
 			live.Keyspace.Verdict, KeyspaceWorking)
+	}
+}
+
+// THE FALSE GREEN. Before this fix the verdict was keyed on
+// keyspaceEventsApplied, whose only increment site is applyEvent — reached from
+// runSubscribe on "juicemount:metadata", the SELF-WRITE pub/sub. That channel
+// replays this client's own writes and works whether or not
+// notify-keyspace-events is set on the server. So saving a single file flipped
+// the verdict to "working" while keyspace push was completely dead and every
+// reconcile was a full-tree SCAN over the tunnel.
+//
+// The verdict must therefore be UNCHANGED by self-write traffic.
+func TestSelfWritePubSubTrafficDoesNotFakeAWorkingVerdict(t *testing.T) {
+	resetKeyspaceCounters(t)
+
+	// The user saves a file: our own write is published and replayed to us on
+	// the self-write channel. Push itself delivers nothing.
+	noteKeyspacePublished()
+	for i := 0; i < 50; i++ {
+		noteKeyspaceEventApplied()
+	}
+
+	snap := metrics.Default().Snapshot()
+	if snap.Keyspace.Verdict == string(KeyspaceWorking) {
+		t.Fatalf("verdict = working from %d SELF-WRITE events with ZERO keyspace "+
+			"push notifications. An operator would read this as 'the cheap path is "+
+			"carrying the load' while the client re-pulls the whole tree every cycle",
+			snap.Keyspace.SelfWriteEvents)
+	}
+	if snap.Keyspace.Verdict != string(KeyspaceBroken) {
+		t.Errorf("verdict = %q, want %q: we published a mutation and heard nothing "+
+			"on the push feed, which is conclusive", snap.Keyspace.Verdict, KeyspaceBroken)
+	}
+	// Both feeds must be visible, so the fingerprint is readable at a glance.
+	if snap.Keyspace.EventsApplied != 0 {
+		t.Errorf("events_applied = %d, want 0 (nothing arrived on the push feed)",
+			snap.Keyspace.EventsApplied)
+	}
+	if snap.Keyspace.SelfWriteEvents != 50 {
+		t.Errorf("self_write_events = %d, want 50", snap.Keyspace.SelfWriteEvents)
 	}
 }

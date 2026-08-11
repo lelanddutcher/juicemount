@@ -382,8 +382,15 @@ type KeyspaceSnapshot struct {
 	// Verdict is working | broken | unknown | unreachable.
 	Verdict string `json:"verdict"`
 	Reason  string `json:"reason"`
-	// EventsApplied counts keyspace events delivered to this process.
+	// EventsApplied counts notifications from the REAL keyspace push feed
+	// (PSUBSCRIBE __keyspace@N__:d*). This is what the verdict keys on.
 	EventsApplied int64 `json:"events_applied"`
+	// SelfWriteEvents counts messages on the separate juicemount:metadata
+	// pub/sub channel, which replays THIS client's own writes. Reported
+	// alongside because the verdict used to key on it by mistake, and it works
+	// whether or not notify-keyspace-events is set — so events_applied == 0
+	// with self_write_events > 0 is the exact fingerprint of dead push.
+	SelfWriteEvents int64 `json:"self_write_events"`
 	// PublishedMutations is the validity DENOMINATOR: our own writes are
 	// replayed back to us, so published>0 with events==0 is conclusive.
 	PublishedMutations int64 `json:"published_mutations"`
