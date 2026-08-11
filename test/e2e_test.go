@@ -21,9 +21,15 @@ import (
 
 const (
 	redisURL  = "redis://127.0.0.1:6379/1"
-	fusePath  = "/Users/USER/.juicemount/fuse-internal"
 	mountBase = "/tmp/jm5-e2e"
 )
+
+// fusePath is the JuiceFS FUSE mount for the CURRENT user. It was the literal
+// "/Users/USER/.juicemount/fuse-internal" — a path no machine has — and it is
+// passed straight into ServerConfig.FUSEPath at two sites below, so this E2E
+// stack was configured against a directory that could never exist. A var, not
+// a const, because it must be resolved at run time.
+var fusePath = fuseInternalPath()
 
 // e2eEnv holds the full stack for E2E testing.
 type e2eEnv struct {

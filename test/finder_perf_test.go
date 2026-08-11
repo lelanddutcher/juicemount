@@ -21,7 +21,44 @@ import (
 //
 // For each, we compare NFS (our server) vs direct FUSE (JuiceFS mount).
 
-const fuseMountPath = "/Users/USER/.juicemount/fuse-internal"
+// fuseMountPath is resolved at run time; see fuseInternalPath below.
+var fuseMountPath = fuseInternalPath()
+
+// fuseInternalPath resolves the JuiceFS FUSE mount for the CURRENT user.
+//
+// This was the literal string "/Users/USER/.juicemount/fuse-internal" — a
+// placeholder that no machine has. Every NFS-vs-FUSE comparison in this file
+// therefore compared our server against a directory that does not exist, at 20
+// call sites, and reported the result as a measurement. That is the exact
+// failure the "harnesses must refuse to report" rule exists for: a number
+// produced from no data is worse than silence.
+//
+// Resolving from os.UserHomeDir also means the comparison arm now works in a
+// worktree and on any machine, instead of only on the one whose path was
+// hardcoded.
+func fuseInternalPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".juicemount", "fuse-internal")
+}
+
+// requireFUSEMount skips (never fails) when the FUSE mount is absent, and
+// REFUSES to let a caller benchmark a path that isn't there.
+func requireFUSEMount(t *testing.T) string {
+	t.Helper()
+	p := fuseInternalPath()
+	if p == "" {
+		t.Skip("cannot resolve home dir; FUSE comparison arm unavailable")
+	}
+	st, err := os.Stat(p)
+	if err != nil || !st.IsDir() {
+		t.Skipf("FUSE mount %s not present — skipping the FUSE comparison arm "+
+			"rather than timing a directory that does not exist", p)
+	}
+	return p
+}
 
 // findDirWithNEntries finds a directory with approximately n entries.
 func findDirWithNEntries(root string, target int, tolerance float64) (string, int) {
@@ -75,11 +112,16 @@ func benchmarkReadDir(t *testing.T, label, dirPath string, iterations int) time.
 		entryCount = len(entries)
 	}
 
-	avg := totalDur / time.Duration(iterations)
-	perEntry := time.Duration(0)
-	if entryCount > 0 {
-		perEntry = avg / time.Duration(entryCount)
+	// VALIDITY GATE. A ReadDir over an empty (or nonexistent-but-readable)
+	// directory returns instantly, and without this the harness printed that
+	// instant as a great result. No entries walked = no measurement.
+	if entryCount == 0 {
+		t.Fatalf("%s: ReadDir(%s) returned 0 entries — refusing to report a "+
+			"latency for a walk that covered nothing", label, dirPath)
 	}
+
+	avg := totalDur / time.Duration(iterations)
+	perEntry := avg / time.Duration(entryCount)
 	t.Logf("  %s: %d entries, avg %v total, %v/entry (%d iterations)",
 		label, entryCount, avg, perEntry, iterations)
 	return avg
@@ -121,6 +163,16 @@ func benchmarkStat(t *testing.T, label, dirPath string, iterations int) time.Dur
 			totalDur += dur
 			statCount++
 		}
+	}
+
+	// VALIDITY GATE. This was `totalDur / time.Duration(statCount)` with
+	// statCount possibly 0 — a divide-by-zero PANIC when every stat errored
+	// (each error hits `continue`). The empty-dir guard above does not cover
+	// it: the directory can be non-empty and every stat still fail, which is
+	// exactly what a wedged mount looks like.
+	if statCount == 0 {
+		t.Fatalf("%s: all %d stats failed in %s — refusing to report an average "+
+			"over zero samples", label, limit*iterations, dirPath)
 	}
 
 	avg := totalDur / time.Duration(statCount)
@@ -424,8 +476,14 @@ func TestFinderPerf_TreeWalk(t *testing.T) {
 	nfsStart := time.Now()
 	var nfsFiles, nfsDirs int
 	filepath.Walk(filepath.Join(nfsMount, testDir), func(path string, info os.FileInfo, err error) error {
-		if err != nil { return nil }
-		if info.IsDir() { nfsDirs++ } else { nfsFiles++ }
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			nfsDirs++
+		} else {
+			nfsFiles++
+		}
 		return nil
 	})
 	nfsDur := time.Since(nfsStart)
@@ -436,8 +494,14 @@ func TestFinderPerf_TreeWalk(t *testing.T) {
 	fuseStart := time.Now()
 	var fuseFiles, fuseDirs int
 	filepath.Walk(filepath.Join(fuseMountPath, testDir), func(path string, info os.FileInfo, err error) error {
-		if err != nil { return nil }
-		if info.IsDir() { fuseDirs++ } else { fuseFiles++ }
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			fuseDirs++
+		} else {
+			fuseFiles++
+		}
 		return nil
 	})
 	fuseDur := time.Since(fuseStart)

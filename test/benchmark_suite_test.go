@@ -20,13 +20,16 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	nfsMount  = "/Volumes/zpool"
-	fuseMount = "/Users/USER/.juicemount/fuse-internal"
+	nfsMount = "/Volumes/zpool"
+	// fuseMount was the literal "/Users/USER/.juicemount/fuse-internal" and is
+	// referenced nowhere in this file — a dead placeholder. Kept only so the
+	// name resolves if a FUSE arm is added back; see fuseInternalPath().
+	fuseMount = ""
 	smbMount  = "/Volumes/zSSD" // optional
 
 	// Known directories of various sizes on the NFS mount
-	dirSmall = "Film Projects/GMTM/Coaches and FO3 Ads"                // ~9 entries
-	dirLarge = "Video Editing Assets/SFX Organized/Impacts & Hits"     // ~1788 entries
+	dirSmall = "Film Projects/GMTM/Coaches and FO3 Ads"            // ~9 entries
+	dirLarge = "Video Editing Assets/SFX Organized/Impacts & Hits" // ~1788 entries
 
 	// Known large file for sequential / random read benchmarks (~136 MB)
 	largeFile = "Film Projects/GMTM/Athlete Success Stories final/lauren.mov"
@@ -111,13 +114,13 @@ func loadBaselines(t *testing.T) baselines {
 // ---------------------------------------------------------------------------
 
 type benchResult struct {
-	Name       string
-	Value      float64 // measured value (ms, MB/s, etc.)
-	Unit       string
-	Baseline   float64
-	Regressed  bool
-	Ratio      float64 // measured / baseline (>1 = slower for latency)
-	LowerBetter bool   // true for latency (ms), false for throughput (MB/s)
+	Name        string
+	Value       float64 // measured value (ms, MB/s, etc.)
+	Unit        string
+	Baseline    float64
+	Regressed   bool
+	Ratio       float64 // measured / baseline (>1 = slower for latency)
+	LowerBetter bool    // true for latency (ms), false for throughput (MB/s)
 }
 
 type benchSuite struct {
@@ -635,7 +638,7 @@ func benchWriteLarge(t *testing.T, suite *benchSuite) {
 	defer os.Remove(tmpFile)
 
 	const totalSize = 10 * 1024 * 1024 // 10 MB
-	const chunkSize = 256 * 1024        // 256KB writes
+	const chunkSize = 256 * 1024       // 256KB writes
 
 	chunk := make([]byte, chunkSize)
 	for i := range chunk {
@@ -925,7 +928,7 @@ func TestBenchmarkSuite_UpdateBaselines(t *testing.T) {
 		DeepTreeWalkMS:     99999,
 		ConcurrentReads4MS: 99999,
 		ColdRunMS:          99999,
-		WarmRunMS:           99999,
+		WarmRunMS:          99999,
 	}
 
 	t.Run("1_FinderDirectoryOpen", func(t *testing.T) { benchFinderDirOpen(t, suite) })
@@ -941,8 +944,8 @@ func TestBenchmarkSuite_UpdateBaselines(t *testing.T) {
 
 	// Build new baselines from measured values
 	newBL := map[string]interface{}{
-		"_comment":              "Baseline timings. Updated by TestBenchmarkSuite_UpdateBaselines.",
-		"_updated":              time.Now().Format("2006-01-02"),
+		"_comment": "Baseline timings. Updated by TestBenchmarkSuite_UpdateBaselines.",
+		"_updated": time.Now().Format("2006-01-02"),
 	}
 
 	for _, r := range suite.results {
