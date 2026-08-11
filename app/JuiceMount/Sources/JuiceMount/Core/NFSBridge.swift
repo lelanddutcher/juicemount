@@ -40,6 +40,18 @@ public enum NFSBridge {
         public var memoryBufferMB: Int
         public var memBufFileLimitMB: Int
         public var reconcileSeconds: Int
+        /// juicefs `--open-cache` duration, e.g. "5s". "" = off (every open
+        /// re-validates against Redis, today's behavior).
+        ///
+        /// This is a MEASUREMENT LEVER, not a shipping feature, and it is
+        /// deliberately absent from the Preferences UI. On a real cellular link
+        /// on 2026-07-29 the first open of a file cost 1226-5660 ms and the
+        /// second cost 24-36 ms — a ~66x difference that is per-FILE, not
+        /// per-byte. The reason it is off by default is that juicefs offers no
+        /// external cache invalidation, so the exposure is a stale slice map:
+        /// WRONG BYTES from a file that still exists. Set it only for a
+        /// measured test, on a volume whose files nobody else is rewriting.
+        public var openCacheTTL: String
 
         enum CodingKeys: String, CodingKey {
             case redisURL = "redis_url"
@@ -57,6 +69,7 @@ public enum NFSBridge {
             case memoryBufferMB = "memory_buffer_mb"
             case memBufFileLimitMB = "membuf_file_limit_mb"
             case reconcileSeconds = "reconcile_seconds"
+            case openCacheTTL = "open_cache_ttl"
         }
 
         public init(
@@ -74,7 +87,8 @@ public enum NFSBridge {
             spoolSizeGB: Int = 0, // 0 = Auto (Go core sizes to free disk minus floor)
             memoryBufferMB: Int = 0,
             memBufFileLimitMB: Int = 0,
-            reconcileSeconds: Int = 0
+            reconcileSeconds: Int = 0,
+            openCacheTTL: String = ""
         ) {
             self.redisURL = redisURL
             self.fusePath = fusePath
@@ -91,6 +105,7 @@ public enum NFSBridge {
             self.memoryBufferMB = memoryBufferMB
             self.memBufFileLimitMB = memBufFileLimitMB
             self.reconcileSeconds = reconcileSeconds
+            self.openCacheTTL = openCacheTTL
         }
     }
 

@@ -172,6 +172,31 @@ public final class Preferences {
         return logsDir.appendingPathComponent("juicemount.log").path
     }
 
+    /// juicefs `--open-cache` TTL, read straight from UserDefaults at
+    /// server-start time. Read-only and NOT persisted by `save()` on purpose:
+    /// a stored property would be loaded once at launch and then written back
+    /// by any unrelated preference change, silently clobbering a value the
+    /// tester had just set from the command line.
+    ///
+    /// This is the cellular-test lever. It has no Settings control — see the
+    /// stale-slice-map warning on `NFSBridge.ServerConfig.openCacheTTL`. To arm
+    /// it for a measured run:
+    ///
+    ///     defaults write com.juicemount.app openCacheTTL -string 5s
+    ///
+    /// then restart the server (the flag is only read when the FUSE mount is
+    /// built). To disarm: `defaults delete com.juicemount.app openCacheTTL`.
+    ///
+    /// It rides the CONFIG rather than the environment because the environment
+    /// cannot reach a shipped app at all: Go snapshots os.Environ at c-archive
+    /// init, so a Swift setenv() afterwards is invisible to os.Getenv. That is
+    /// exactly how JM_WAN_MODE spent every shipped build doing nothing.
+    public var openCacheTTL: String {
+        let raw = (Self.defaults.string(forKey: Key.openCacheTTL.rawValue) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (raw == "0" || raw == "0s") ? "" : raw
+    }
+
     public func toServerConfig() -> NFSBridge.ServerConfig {
         NFSBridge.ServerConfig(
             redisURL: redisURL,
@@ -190,7 +215,8 @@ public final class Preferences {
             // side (membuf construction + reconcile loop) at server start.
             memoryBufferMB: memoryBufferMB,
             memBufFileLimitMB: memBufFileLimitMB,
-            reconcileSeconds: reconcileSeconds
+            reconcileSeconds: reconcileSeconds,
+            openCacheTTL: openCacheTTL
         )
     }
 
@@ -207,6 +233,7 @@ public final class Preferences {
         case s3EndpointOverride
         case spoolEnabled, spoolCapacityGB
         case hasCompletedOnboarding
+        case openCacheTTL
     }
 
     public static func load() -> Preferences {

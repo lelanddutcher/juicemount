@@ -188,6 +188,23 @@ type ServerConfig struct {
 	// it's in the startup snapshot. SpoolSizeGB < 1 means "use default".
 	SpoolEnable bool `json:"spool_enable"`
 	SpoolSizeGB int  `json:"spool_size_gb"`
+	// OpenCacheTTL is the juicefs --open-cache duration, e.g. "5s". Empty = OFF
+	// (today's behaviour: every open re-validates against Redis).
+	//
+	// It rides the config for the same reason SpoolEnable does — os.Getenv
+	// cannot see a Swift setenv() after c-archive init — but the stakes are
+	// higher here. Every other cellular lever in health/fuse.go defaults to the
+	// behaviour we want, so being env-only merely made them untunable. This one
+	// defaults OFF, so being env-only made the largest measured win on a real
+	// cellular link (66x: first open 1226-5660ms, second 24-36ms, 2026-07-29)
+	// impossible to switch on in the build under test.
+	//
+	// Deliberately NOT surfaced in the Settings UI: the exposure is a stale
+	// slice map — WRONG BYTES from an existing file — which is the family behind
+	// #18 torn reads, #104 black frames and the membuf stale-partial image.
+	// Set it for a measured test with:
+	//     defaults write com.juicemount.app openCacheTTL -string 5s
+	OpenCacheTTL string `json:"open_cache_ttl"`
 	// LB-4 (Phase 3b): tuning knobs that previously existed in the app's
 	// preferences UI but were consumed by nothing. All three are optional —
 	// 0 (or absent, for config JSON written by older app builds) preserves
@@ -480,6 +497,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			BucketOverride:  cfg.BucketOverride,
 			PinnedBytes:     pinnedBytes,
 			FUSEMetricsAddr: health.DefaultFUSEMetricsAddr,
+			OpenCacheTTL:    cfg.OpenCacheTTL,
 		})
 		// Pin-capacity baseline (audit fix v2, 2026-07-14): record the
 		// CONFIGURED budget before any mount attempt so the capacity
@@ -1603,6 +1621,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			HaveBandwidth:    s.HaveBW,
 			ThroughputN:      s.ThroughputN,
 			BootstrappedRTT:  s.BootstrappedRTT,
+			HighLatency:      netprofile.Default().HighLatency(),
 			ReadaheadEnabled: ra.Enabled,
 			ReadaheadSeq:     ra.SeqThreshold,
 			ReadaheadBlocks:  ra.Blocks,

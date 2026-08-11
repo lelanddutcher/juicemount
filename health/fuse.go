@@ -92,6 +92,20 @@ type FUSEConfig struct {
 	// Empty = pass nothing (JuiceFS default applies). "0.01" = keep 1% free.
 	FreeSpaceRatio string
 
+	// OpenCacheTTL is the --open-cache duration, e.g. "5s". Empty = omit the
+	// flag (juicefs default 0s = every open re-validates against Redis).
+	//
+	// THIS TRAVELS IN THE CONFIG, NOT THE ENVIRONMENT, and that is the whole
+	// point. Go snapshots os.Environ at c-archive init, so a host-side setenv()
+	// from Swift is invisible to os.Getenv (see ServerController.start). Every
+	// JM_* knob in this file is therefore UNREACHABLE from a shipped app — only
+	// its default ships. That is harmless for the knobs whose default is the
+	// wanted behaviour, and fatal for this one, whose default is OFF: the
+	// measured 66x open win (2026-07-29 cellular: first open 1226-5660ms,
+	// second 24-36ms) could not be switched on by the person running the test.
+	// JM_WAN_MODE died exactly this way — read in six paths, set by nothing.
+	OpenCacheTTL string
+
 	// BucketOverride is the S3 endpoint URL the Mac juicefs daemon should
 	// use, overriding whatever bucket URL was stored in Redis at format
 	// time. Empty = no override; juicefs reads the URL from Redis.
@@ -607,7 +621,7 @@ func (fm *FUSEManager) Mount() error {
 	//
 	// JM_OPEN_CACHE="" (unset) = OFF, today's behavior byte-identically.
 	// JM_OPEN_CACHE="5s"       = pass --open-cache 5s.
-	if v := openCacheTTL(); v != "" {
+	if v := fm.openCacheTTL(); v != "" {
 		args = append(args, "--open-cache", v)
 	}
 
@@ -1944,8 +1958,19 @@ func MetaURLForMount(redisURL string) string {
 // openCacheTTL returns the --open-cache duration to pass, or "" to omit the
 // flag entirely (juicefs default 0s = disabled = today's behavior). See the
 // call site for why this is opt-in rather than on by default.
-func openCacheTTL() string {
-	v := os.Getenv("JM_OPEN_CACHE")
+// Config wins over the environment: the config is the only channel that can
+// reach a shipped app (see FUSEConfig.OpenCacheTTL). The env var is retained so
+// a CLI/test run can still set it without building a config.
+func (fm *FUSEManager) openCacheTTL() string {
+	if v := normalizeOpenCacheTTL(fm.cfg.OpenCacheTTL); v != "" {
+		return v
+	}
+	return normalizeOpenCacheTTL(os.Getenv("JM_OPEN_CACHE"))
+}
+
+// normalizeOpenCacheTTL treats empty/0/0s as "omit the flag" so an explicitly
+// zeroed config reads as OFF rather than as unset.
+func normalizeOpenCacheTTL(v string) string {
 	if v == "" || v == "0" || v == "0s" {
 		return ""
 	}
