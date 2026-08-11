@@ -14,9 +14,15 @@ package nfs
 // of an unwritten region returns on that path, and A/B's it against the spool
 // path driven through the identical RPC call shapes.
 //
-// These are CHARACTERIZATION assertions: they pin the behavior that ships today.
-// If the in-place path ever grows a hole guard, arm A/B here will fail — that is
-// the intent. Invert the assertion at that point.
+// HISTORY: these began as CHARACTERIZATION assertions pinning the unguarded
+// behavior, with the instruction "if the in-place path ever grows a hole guard,
+// arm A/B here will fail — invert the assertion at that point". The guard
+// landed (nfs/inplace_contig.go, task #6), all three in-place arms failed with
+// exactly the intended error, and they are now inverted. They are REGRESSION
+// tests: each asserts the hole is refused, so removing the guard fails them.
+//
+// ARM C (the spool control) is unchanged and still passes — proof the shared
+// coalescer refactor did not disturb the path that was already correct.
 
 import (
 	"bytes"
@@ -131,23 +137,19 @@ func TestInPlaceFUSEOutOfOrderExtendServesHoleAsZeros(t *testing.T) {
 	t.Logf("ARM A  handle=%T implements incompleteReader=%v  ReadAt(off=%d,len=%d) => n=%d err=%v allZero=%v",
 		handle, guarded, holeOff, readSize, got, rerr, allZero(buf[:got]))
 
-	if guarded {
-		t.Fatalf("ARM A: the in-place read handle %T now implements the hole guard — "+
-			"behavior changed; re-evaluate this probe", handle)
+	if !guarded {
+		t.Fatalf("ARM A: the in-place read handle %T lost its hole guard — onRead's "+
+			"size-clamp branch can no longer tell genuine EOF from not-yet-arrived", handle)
 	}
-	if rerr != nil {
-		t.Fatalf("ARM A: hole read returned err=%v — a guard appeared; re-evaluate this probe", rerr)
+	if !pin.IsSpoolIncomplete(rerr) {
+		t.Fatalf("ARM A REGRESSION: in-place path served the hole instead of holding it: "+
+			"n=%d err=%v allZero=%v. An NLE reading a still-copying clip gets black frames "+
+			"(want pin.ErrSpoolIncomplete -> NFS3ERR_JUKEBOX)", got, rerr, allZero(buf[:got]))
 	}
-	if got != readSize {
-		t.Fatalf("ARM A: hole read returned a short count n=%d (want %d) — behavior changed", got, readSize)
+	if got != 0 {
+		t.Errorf("ARM A: held read returned n=%d, want 0 — no bytes may escape a hold", got)
 	}
-	if !allZero(buf) {
-		t.Fatalf("ARM A: hole read returned non-zero bytes; behavior changed")
-	}
-	// Reaching here IS the finding: full count, nil error, all zeros, inside a
-	// size the client was told is real file content.
-	t.Logf("ARM A RESULT: in-place FUSE path served %d bytes of ZEROS with err=nil "+
-		"for a region the client believes is real data. No guard exists on this path.", got)
+	t.Logf("ARM A RESULT: in-place FUSE path refused the hole with %v.", rerr)
 }
 
 // TestInPlaceFUSEPreallocateServesHoleAsZeros is ARM B: the same question via
@@ -201,35 +203,35 @@ func TestInPlaceFUSEPreallocateServesHoleAsZeros(t *testing.T) {
 	t.Logf("ARM B  handle=%T implements incompleteReader=%v  ReadAt(off=%d,len=%d) => n=%d err=%v allZero=%v",
 		handle, guarded, holeOff, readSize, got, rerr, allZero(buf[:got]))
 
-	if guarded {
-		t.Fatalf("ARM B: read handle %T now implements the hole guard — behavior changed", handle)
+	if !guarded {
+		t.Fatalf("ARM B: read handle %T lost its hole guard", handle)
 	}
-	if rerr != nil || got != readSize || !allZero(buf) {
-		t.Fatalf("ARM B: preallocated-hole read => n=%d err=%v allZero=%v; behavior changed",
-			got, rerr, allZero(buf[:got]))
+	if !pin.IsSpoolIncomplete(rerr) {
+		t.Fatalf("ARM B REGRESSION: preallocated hole served instead of held => n=%d err=%v "+
+			"allZero=%v. This hole needs no write race — it persists for as long as the app "+
+			"takes to fill it", got, rerr, allZero(buf[:got]))
 	}
-	t.Logf("ARM B RESULT: preallocated hole served as %d bytes of ZEROS with err=nil.", got)
+	t.Logf("ARM B RESULT: preallocated hole refused with %v.", rerr)
 }
 
 // TestSpoolDisabledNewFileCopyServesHoleAsZeros is ARM D — the one that decides
 // whether this is an edge case or the default.
 //
-// The shipping app defaults the write spool OFF
-// (app/JuiceMount/Sources/JuiceMount/Core/Preferences.swift:110
-// `spoolEnabled: Bool = false`, "Off by default during rollout"; loaded via
-// `d.bool(forKey:)` at :229, which yields false when the key is unset, and there
-// is no registerDefaults override). With the spool off, juiceFS.Create takes the
-// legacy branch (nfs/handler.go:3272 `os.Create(fullPath)`) and every WRITE RPC
-// takes the in-place fdPool branch — so a PLAIN NEW-FILE Finder copy, the single
-// most common operation this product performs, runs entirely on the unguarded
-// path. No in-place-modify, no drain-evict reopen, no preallocate required.
+// The spool is NOW on by default (Preferences.swift `spoolEnabled: Bool = true`),
+// which closed the worst of the reachability — but this arm still matters,
+// because the in-place path remains reachable with the spool on: an in-place
+// modify of an existing file, a drain-evict reopen, a SETATTR{size}
+// preallocate, and any install where the user turned the spool off. This arm
+// covers the last of those, which is also the simplest: with the spool off,
+// juiceFS.Create takes the legacy branch and every WRITE RPC takes the in-place
+// fdPool branch, so a PLAIN NEW-FILE copy runs entirely on this path.
 //
 // The out-of-order tail write is not hypothetical: this codebase's contiguousEnd
 // machinery exists specifically because macOS dispatches WRITE RPCs on parallel
 // goroutines and the high-offset RPC routinely lands first (nfs/spool.go:1880-1888,
 // :2313-2315; :2600 records contiguousEnd observed stuck at 6 MiB during a 1 GiB cp).
 func TestSpoolDisabledNewFileCopyServesHoleAsZeros(t *testing.T) {
-	jfs, _, _ := newIntegrityHarness(t) // spool OFF — the SHIPPING DEFAULT
+	jfs, _, _ := newIntegrityHarness(t) // spool OFF
 
 	const (
 		tailOff  = 1 << 20
@@ -273,13 +275,15 @@ func TestSpoolDisabledNewFileCopyServesHoleAsZeros(t *testing.T) {
 	t.Logf("ARM D  handle=%T implements incompleteReader=%v  GETATTR size=%d  ReadAt(off=%d,len=%d) => n=%d err=%v allZero=%v",
 		handle, guarded, fi.Size(), holeOff, readSize, got, rerr, allZero(buf[:got]))
 
-	if guarded || rerr != nil || got != readSize || !allZero(buf) {
-		t.Fatalf("ARM D: behavior changed — guarded=%v n=%d err=%v allZero=%v",
-			guarded, got, rerr, allZero(buf[:got]))
+	if !guarded {
+		t.Fatalf("ARM D: read handle %T lost its hole guard", handle)
 	}
-	t.Logf("ARM D RESULT: with the SHIPPING DEFAULT config (spool off), a plain new-file " +
-		"copy serves a not-yet-written region as zeros with err=nil, inside a size the " +
-		"client was told is real data.")
+	if !pin.IsSpoolIncomplete(rerr) {
+		t.Fatalf("ARM D REGRESSION: with the spool off, a plain new-file copy served a "+
+			"not-yet-written region instead of holding it => n=%d err=%v allZero=%v",
+			got, rerr, allZero(buf[:got]))
+	}
+	t.Logf("ARM D RESULT: spool-off new-file copy refused the hole with %v.", rerr)
 }
 
 // TestSpoolPathGuardsTheSameHole is ARM C, the control. Identical RPC shapes,

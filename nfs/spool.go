@@ -2439,30 +2439,12 @@ type spoolExtent struct{ start, end int64 }
 // that were actually written (this range, or a previously-recorded extent),
 // never across a still-unwritten gap.
 func (e *SpoolEntry) advanceContiguousLocked(off, end int64) {
-	if end <= e.contiguousEnd {
-		// Entirely within the readable prefix — an in-place overwrite of
-		// already-contiguous bytes. Nothing to advance.
-		return
-	}
-	if off <= e.contiguousEnd {
-		// Touches/extends the prefix. Absorb it, then pull in every recorded
-		// extent now contiguous with the grown prefix.
-		e.contiguousEnd = end
-		for len(e.writtenExtents) > 0 && e.writtenExtents[0].start <= e.contiguousEnd {
-			if e.writtenExtents[0].end > e.contiguousEnd {
-				e.contiguousEnd = e.writtenExtents[0].end
-			}
-			e.writtenExtents = e.writtenExtents[1:]
-		}
-		if len(e.writtenExtents) == 0 {
-			e.writtenExtents = nil // reclaim the backing array
-		}
-		return
-	}
-	// Starts strictly above the prefix: an out-of-order write leaving a hole
-	// below it. Remember it (coalesced); it advances contiguousEnd once the gap
-	// below fills.
-	e.writtenExtents = insertExtent(e.writtenExtents, off, end)
+	// Delegates to the shared implementation so the spool path and the in-place
+	// FUSE path can never disagree about what is readable. See advanceContig in
+	// inplace_contig.go — the last time this logic was wrong (contiguousEnd not
+	// coalescing out-of-order writes) it produced the #107 end-of-export
+	// interrupt, and a second copy is how that comes back.
+	e.contiguousEnd, e.writtenExtents = advanceContig(e.contiguousEnd, e.writtenExtents, off, end)
 }
 
 // insertExtent inserts [s,e) into a start-sorted, coalesced extent slice,

@@ -103,6 +103,11 @@ type JuiceMountHandler struct {
 	// confirmation goroutine + ONE FUSE Lstat per path in flight, instead
 	// of N. Keyed by in-mount filename; entry cleared when the goroutine
 	// finishes. See asyncConfirmPhantomPurge + QA-35 / feedback_perf_hot_path.
+	// inPlaceHoles guards the IN-PLACE FUSE write path against serving an
+	// unwritten region as zeros (task #6). Its read side is one atomic load
+	// when no hole exists anywhere — see inplace_contig.go.
+	inPlaceHoles inPlaceTracker
+
 	phantomPurgeMu       sync.Mutex
 	phantomPurgeInFlight map[string]struct{}
 
@@ -1507,6 +1512,11 @@ func (h *JuiceMountHandler) verifierCleanupLoop(interval, ttl time.Duration) {
 			h.evictStaleVerifiers(ttl)
 			h.evictStalePrefetched(2 * time.Minute)
 			h.evictStaleWriteSizes(writeSizeMaxAge)
+			// A writer that died mid-hole would otherwise leak its record
+			// forever, keeping the in-place gate non-zero and taxing every read
+			// in the process with a map lookup. Dropping it costs no safety:
+			// planReadAt already stops holding once the writer goes quiet.
+			h.inPlaceHoles.evictStale(writeSizeMaxAge)
 		case <-h.verifierStop:
 			return
 		}
@@ -3177,6 +3187,14 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 		// with decActiveWriter in writeFile.Close so the phantom-purge
 		// gate in Stat() can see this writer is in flight.
 		jfs.handler.incActiveWriter(filename)
+		// baseSize is the contiguous prefix this writer starts from: the file's
+		// existing content is all valid, so a hole only begins above it. Taken
+		// from the mirror entry already in hand — no syscall. e == nil means a
+		// brand-new file, whose valid prefix is genuinely 0.
+		var baseSize int64
+		if e != nil {
+			baseSize = e.Size
+		}
 		return &writeFile{
 			File:     fd,
 			name:     filename,
@@ -3184,6 +3202,7 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			entry:    entry,
 			fdPool:   jfs.handler.fdPool,
 			fusePath: fullPath,
+			baseSize: baseSize,
 		}, nil
 	}
 
@@ -3595,6 +3614,7 @@ func (jfs *juiceFS) Remove(filename string) error {
 	// size. That is the #104 Premiere black-frame signature, reachable today.
 	// Rename already carries/clears the mark (see Rename); Remove never did.
 	jfs.handler.clearWriteSize(filename)
+	jfs.handler.inPlaceHoles.forget(filename)
 
 	// Publish delete event
 	if e != nil {
@@ -4134,7 +4154,42 @@ var memBufServeEnabled = os.Getenv("JM_ENABLE_MEMBUF_SERVE") == "1"
 // it adds NO syscall and NO lock, just one atomic increment.
 const coldSubreadDur = 3 * time.Millisecond
 
+// IncompleteAt implements internal/nfs.incompleteReader so onRead's size-clamp
+// branch (nfs_onread.go, the off >= size case) can tell "genuine EOF" from "the
+// bytes have not arrived yet".
+//
+// Without this, a client whose GETATTR raced ahead of the writes reads past the
+// size it was told, gets Count=0, and treats a partially-arrived file as
+// COMPLETE. ReadAt above covers off < size; this covers off >= size. The spool
+// path carries both halves for the same reason.
+func (f *cachedFile) IncompleteAt(off int64) bool {
+	if f.handler == nil {
+		return false
+	}
+	plan, tracked := f.handler.inPlaceHoles.inPlaceReadPlan(f.name, off)
+	return tracked && plan == planHold
+}
+
 func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
+	// Priority 0: NEVER serve an unwritten region of an in-flight file.
+	//
+	// This is FIRST, ahead of every serving priority below, for the same reason
+	// planReadAt puts its punched check first: a hole is below every cache's
+	// notion of valid content, so any path that consults a cache before the
+	// hole check serves zeros as file content. See inplace_contig.go for the
+	// defect and the two traps.
+	//
+	// Cost when no file anywhere has a hole — which is the normal state, and
+	// includes every ordinary sequential copy — is one atomic load.
+	if f.handler != nil {
+		if plan, tracked := f.handler.inPlaceHoles.inPlaceReadPlan(f.name, off); tracked && plan == planHold {
+			// JUKEBOX: the client retries until the bytes land. Bounded by
+			// writer liveness inside planReadAt, so a dead writer releases it
+			// rather than stalling the read forever (#100).
+			return 0, pin.ErrSpoolIncomplete
+		}
+	}
+
 	// Priority 1: Memory buffer (zero-syscall, for small files like .prproj, LUTs)
 	if memBufServeEnabled && f.memBuf != nil {
 		n, hit := f.memBuf.ReadAt(f.name, p, off, f.fileSize, f.fusePath)
@@ -4433,6 +4488,13 @@ type writeFile struct {
 	writtenEnd int64 // highest byte position written
 	fdPool     *FDPool
 	fusePath   string
+	// baseSize is the file's size when this writer opened it — the prefix of
+	// pre-existing, valid content. A hole can only begin ABOVE it, so seeding
+	// the tracker from anything lower would claim real bytes are a hole.
+	// go-nfs calls OpenFile+Write+Close per WRITE RPC, so this is re-derived
+	// per RPC from the mirror entry (no syscall) and the durable state lives
+	// on the handler.
+	baseSize int64
 }
 
 func (f *writeFile) Name() string  { return f.name }
@@ -4449,6 +4511,10 @@ func (f *writeFile) Unlock() error { return nil }
 // smaller file). Subsequent writes past the new size re-raise the mark normally.
 func (f *writeFile) Truncate(size int64) error {
 	f.handler.clampWriteSize(f.name, size)
+	// ftruncate-to-grow (how a SETATTR{size} / F_PREALLOCATE arrives) creates a
+	// hole with no write in it, and it persists for as long as the app takes to
+	// fill it — probe ARM B.
+	f.handler.inPlaceHoles.noteTruncate(f.name, f.baseSize, size)
 	return f.File.Truncate(size)
 }
 
@@ -4460,9 +4526,16 @@ func (f *writeFile) Write(p []byte) (int, error) {
 			f.writtenEnd = pos
 			f.handler.trackWriteSize(f.name, pos)
 		}
+		f.noteHole(pos-int64(n), pos)
 		metrics.Default().AddBytesWritten(int64(n))
 	}
 	return n, f.handler.classifyBlipError(err) // #9 blip park
+}
+
+// noteHole records this write against the in-place hole tracker. Split out so
+// Write, WriteAt and Truncate cannot drift apart on which one remembers to do it.
+func (f *writeFile) noteHole(off, end int64) {
+	f.handler.inPlaceHoles.noteWrite(f.name, f.baseSize, off, end)
 }
 
 func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
@@ -4480,6 +4553,9 @@ func (f *writeFile) WriteAt(p []byte, off int64) (int, error) {
 			f.writtenEnd = end
 			f.handler.trackWriteSize(f.name, end)
 		}
+		// This is the RPC shape that creates holes: macOS dispatches WRITE RPCs
+		// in parallel and the high-offset one routinely lands first.
+		f.noteHole(off, end)
 		metrics.Default().AddBytesWritten(int64(n))
 	}
 	return n, f.handler.classifyBlipError(err) // #9 blip park
