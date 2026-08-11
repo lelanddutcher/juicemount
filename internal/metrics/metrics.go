@@ -345,6 +345,12 @@ type Registry struct {
 	stallMu sync.RWMutex
 	stallFn func() *StallSnapshot
 
+	// Backend hook — set by the bridge so /metrics can report backend-vs-cache
+	// bytes from the JuiceFS daemon's own endpoint. Scrape is lazy and
+	// throttled inside the provider; never called per-RPC.
+	backendMu sync.RWMutex
+	backendFn func() *BackendSnapshot
+
 	// FD-pool hook — set by package nfs so /metrics can report descriptor and
 	// memory-buffer occupancy. Same provider rationale as the data gate: the
 	// pool is per-handler, so it cannot be a package-level counter, and reading
@@ -428,6 +434,31 @@ type NetworkSnapshot struct {
 	ReadaheadSeq     int  `json:"readahead_seq_threshold"`
 	ReadaheadBlocks  int  `json:"readahead_blocks_ahead"`
 	ReadaheadWorkers int  `json:"readahead_workers"`
+}
+
+// BackendSnapshot reports how much of a session actually crossed the link,
+// scraped from the JuiceFS mount daemon's own Prometheus endpoint.
+//
+// Our bytes_read counts bytes SERVED TO THE NFS CLIENT and cannot tell a byte
+// off the local SSD from a byte dragged over a cellular uplink. These counters
+// can. All are cumulative since the juicefs daemon started, so a measurement is
+// a DIFFERENCE across the window under test.
+//
+// The field is ABSENT (nil) when the daemon has not been scraped successfully.
+// It never reports zeros from a failed scrape: "0 bytes from the backend"
+// reads as a perfect cache-hit session, which is the most flattering possible
+// way to be wrong.
+type BackendSnapshot struct {
+	CacheHits      int64 `json:"cache_hits"`
+	CacheMiss      int64 `json:"cache_miss"`
+	CacheHitBytes  int64 `json:"cache_hit_bytes"`
+	CacheMissBytes int64 `json:"cache_miss_bytes"`
+	// ObjectGetBytes vs CacheMissBytes: the excess is read amplification.
+	ObjectGetBytes int64 `json:"object_get_bytes"`
+	ObjectPutBytes int64 `json:"object_put_bytes"`
+	// MetaOps counts Redis round trips — the per-FILE cost that dominates a
+	// high-RTT link, and what --open-cache exists to avoid.
+	MetaOps int64 `json:"meta_ops"`
 }
 
 // StallSnapshot reports live head-of-line blocking: how many NFS RPCs are in
@@ -541,6 +572,14 @@ func (r *Registry) SetFUSEDataGateProvider(fn func() *FUSEDataGateSnapshot) {
 	r.dataGateMu.Lock()
 	defer r.dataGateMu.Unlock()
 	r.dataGateFn = fn
+}
+
+// SetBackendProvider registers a callback used by /metrics to report
+// backend-vs-cache byte accounting. Safe to leave unset (the field is omitted).
+func (r *Registry) SetBackendProvider(fn func() *BackendSnapshot) {
+	r.backendMu.Lock()
+	defer r.backendMu.Unlock()
+	r.backendFn = fn
 }
 
 // SetStallProvider registers a callback used by /metrics to report live
@@ -825,6 +864,10 @@ type Snapshot struct {
 
 	// Stall reports live head-of-line blocking. See StallSnapshot.
 	Stall *StallSnapshot `json:"stall,omitempty"`
+
+	// Backend reports bytes that actually crossed to the object store, versus
+	// bytes served from the local block cache. See BackendSnapshot.
+	Backend *BackendSnapshot `json:"backend,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -898,6 +941,13 @@ func (r *Registry) Snapshot() Snapshot {
 	r.dataGateMu.RUnlock()
 	if dataGateFn != nil {
 		out.FUSEDataGate = dataGateFn()
+	}
+
+	r.backendMu.RLock()
+	backendFn := r.backendFn
+	r.backendMu.RUnlock()
+	if backendFn != nil {
+		out.Backend = backendFn()
 	}
 
 	r.stallMu.RLock()

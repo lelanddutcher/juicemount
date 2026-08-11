@@ -1609,6 +1609,27 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		}
 	})
 
+	// Expose backend-vs-cache byte accounting on /metrics. This is the only
+	// place a cellular run can learn whether an open was served from the local
+	// SSD or pulled over the link — our own bytes_read cannot distinguish them.
+	// Returns nil (field omitted) until the juicefs daemon has been scraped
+	// successfully, so a failed scrape never reports as a zero-backend session.
+	metrics.Default().SetBackendProvider(func() *metrics.BackendSnapshot {
+		bs, ok := pin.BackendStatsSnapshot()
+		if !ok {
+			return nil
+		}
+		return &metrics.BackendSnapshot{
+			CacheHits:      bs.CacheHits,
+			CacheMiss:      bs.CacheMiss,
+			CacheHitBytes:  bs.CacheHitBytes,
+			CacheMissBytes: bs.CacheMissBytes,
+			ObjectGetBytes: bs.ObjectGetBytes,
+			ObjectPutBytes: bs.ObjectPutBytes,
+			MetaOps:        bs.MetaOps,
+		}
+	})
+
 	// Expose the adaptive link estimate on /metrics for observability + tuning.
 	metrics.Default().SetNetworkProvider(func() *metrics.NetworkSnapshot {
 		s := netprofile.Default().Snapshot()
