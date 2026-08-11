@@ -79,8 +79,16 @@ def L(p):
     try: return json.load(open(p))
     except Exception: return {}
 a,b=L(sys.argv[1]),L(sys.argv[2]); ra,rb=a.get("rpcs",{}),b.get("rpcs",{})
-print("  rpc_total: %s -> %s (delta %s)"%(a.get("rpc_total",0),b.get("rpc_total",0),
-      b.get("rpc_total",0)-a.get("rpc_total",0)))
+delta=b.get("rpc_total",0)-a.get("rpc_total",0)
+# VALIDITY GATE — see metrics_delta.py. A per-RPC table printed from a window
+# in which the server did nothing is a fabricated measurement, not a fast one.
+if delta<=0:
+    print("  INVALID: rpc_total did not move (%s -> %s) — the server did no work"
+          %(a.get("rpc_total",0),b.get("rpc_total",0)))
+    print("  The client almost certainly served this from its own attr cache.")
+    print("  Re-run via server_lookup_latency.sh to force genuine server LOOKUPs.")
+    sys.exit(3)
+print("  rpc_total: %s -> %s (delta %s)"%(a.get("rpc_total",0),b.get("rpc_total",0),delta))
 print("  %-12s %8s %8s   %10s %10s"%("RPC","cnt_bef","cnt_aft","p50_us_aft","p99_us_aft"))
 for k in ["LOOKUP","GETATTR","ACCESS","READDIR","READDIRPLUS","FSSTAT"]:
     x,y=ra.get(k,{}),rb.get(k,{})
