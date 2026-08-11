@@ -964,8 +964,9 @@ func (c *inodeCoalescer) flush() {
 	c.mu.Unlock()
 
 	if len(batch) > tuning.burstCeiling {
+		noteKeyspaceScanPromotion()
 		jmlog.Info("metadata keyspace push: burst over ceiling, promoting to full SCAN",
-			"dirs", len(batch), "ceiling", tuning.burstCeiling)
+			"dirs", len(batch), "ceiling", tuning.burstCeiling, "class", currentLinkClass())
 		c.rc.keyspaceTriggerSync()
 		return
 	}
@@ -1011,6 +1012,7 @@ func (c *inodeCoalescer) flushOnStop() {
 		return
 	}
 	if len(batch) > tuning.burstCeiling {
+		noteKeyspaceScanPromotion()
 		c.rc.keyspaceTriggerSync()
 		return
 	}

@@ -394,6 +394,10 @@ type KeyspaceSnapshot struct {
 	// PublishedMutations is the validity DENOMINATOR: our own writes are
 	// replayed back to us, so published>0 with events==0 is conclusive.
 	PublishedMutations int64 `json:"published_mutations"`
+	// ScanPromotions counts push batches abandoned for one full-tree SCAN
+	// because the batch exceeded the burst ceiling. Non-zero on a metered link
+	// means the cheap path stopped being used at the worst possible moment.
+	ScanPromotions int64 `json:"scan_promotions"`
 }
 
 // FDPoolSnapshot reports file-descriptor and memory-buffer occupancy.

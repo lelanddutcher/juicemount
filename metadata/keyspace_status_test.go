@@ -14,11 +14,13 @@ func resetKeyspaceCounters(t *testing.T) {
 	keyspacePublished.Store(0)
 	keyspaceLastEventNanos.Store(0)
 	keyspacePushDelivered.Store(0)
+	keyspaceScanPromotions.Store(0)
 	t.Cleanup(func() {
 		keyspaceEventsApplied.Store(0)
 		keyspacePublished.Store(0)
 		keyspaceLastEventNanos.Store(0)
 		keyspacePushDelivered.Store(0)
+		keyspaceScanPromotions.Store(0)
 	})
 }
 
@@ -254,5 +256,28 @@ func TestSelfWritePubSubTrafficDoesNotFakeAWorkingVerdict(t *testing.T) {
 	}
 	if snap.Keyspace.SelfWriteEvents != 50 {
 		t.Errorf("self_write_events = %d, want 50", snap.Keyspace.SelfWriteEvents)
+	}
+}
+
+// The promotion counter is the number that settles whether burstCeiling=200 is
+// right on a tunnel. It must reach /metrics, or the cellular run cannot answer
+// the question it exists for.
+func TestScanPromotionsReachMetrics(t *testing.T) {
+	resetKeyspaceCounters(t)
+
+	before := metrics.Default().Snapshot()
+	if before.Keyspace == nil {
+		t.Fatal("no keyspace section in /metrics")
+	}
+	start := before.Keyspace.ScanPromotions
+
+	noteKeyspaceScanPromotion()
+	noteKeyspaceScanPromotion()
+	noteKeyspaceScanPromotion()
+
+	after := metrics.Default().Snapshot()
+	if got := after.Keyspace.ScanPromotions - start; got != 3 {
+		t.Errorf("scan_promotions delta = %d, want 3 — a push batch abandoned for a "+
+			"full-tree SCAN on a metered link would be invisible", got)
 	}
 }

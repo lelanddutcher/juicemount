@@ -104,7 +104,32 @@ var (
 	// where assuming juicemount:metadata carried only REMOTE writes cost an
 	// xattr-loss regression. Both counters are kept and reported separately.
 	keyspacePushDelivered atomic.Int64
+	// keyspaceScanPromotions counts times a push batch was ABANDONED in favour
+	// of one full-tree SCAN, because the batch exceeded burstCeiling.
+	//
+	// This is the number that decides whether the cheap path is actually cheap
+	// on a given link. burstCeiling is 200 for LAN, WiFi AND tunnel — the one
+	// coalescer parameter that does NOT vary by class, even though the function
+	// around it exists to be "looser on tunnel/cellular to spare the metered
+	// link" (debounce and maxWait do vary: 200/400/1500ms, 2/3/5s). So 201
+	// changed directories promote to a full ~297k-entry SCAN on exactly the link
+	// where that costs the most.
+	//
+	// Whether 200 is the RIGHT crossover on a tunnel is genuinely unclear and
+	// must not be guessed: 200 dirs is roughly 400 serial round trips (~120s at
+	// 300ms RTT) against a measured 163s full SCAN. Those are close enough that
+	// the answer depends on RTT and tree size. So this counter exists to SETTLE
+	// it from a cellular run rather than to justify changing the constant from
+	// reasoning — the metadata-TTL change was the elegant hypothesis and
+	// measured exactly zero.
+	keyspaceScanPromotions atomic.Int64
 )
+
+// noteKeyspaceScanPromotion records one push batch abandoned for a full SCAN.
+func noteKeyspaceScanPromotion() { keyspaceScanPromotions.Add(1) }
+
+// KeyspaceScanPromotions exposes the promotion count (metrics, tests).
+func KeyspaceScanPromotions() int64 { return keyspaceScanPromotions.Load() }
 
 // noteKeyspacePushDelivered records one notification from the real keyspace
 // push feed. Called from the PSUBSCRIBE pump in keyspace.go.
@@ -220,6 +245,7 @@ func init() {
 			EventsApplied:      delivered,
 			SelfWriteEvents:    selfWrite,
 			PublishedMutations: published,
+			ScanPromotions:     KeyspaceScanPromotions(),
 		}
 	})
 }
