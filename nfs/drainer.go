@@ -731,6 +731,16 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		spoolMtime = si.ModTime()
 	}
 
+	// Never let a contribution silently replace another producer's derivative.
+	// This sits BEFORE the create because os.Create truncates: by the time it
+	// returns, the existing blob is already gone. See deriv_clobber_guard.go —
+	// on 2026-08-11 this was 14 uploads that would each have replaced a
+	// full-resolution farm waveform with a 2,000-pixel preview.
+	if cerr := checkDerivClobber(row.NFSPath, dest, row.Size); cerr != nil {
+		d.failPermanent(row, cerr.Error())
+		return
+	}
+
 	dst, err := os.Create(dest)
 	if err != nil {
 		d.failTransient(row, fmt.Errorf("create dest: %w", err))

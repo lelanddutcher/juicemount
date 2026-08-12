@@ -196,8 +196,12 @@ func EnsureDirUnder(root, rel string) error {
 	defer func() { unix.Close(fd) }()
 
 	for _, part := range strings.Split(clean, string(filepath.Separator)) {
-		if err := unix.Mkdirat(fd, part, 0o755); err != nil && err != unix.EEXIST {
-			return fmt.Errorf("derivatives: mkdir %q under %q: %w", clean, root, err)
+		created := true
+		if err := unix.Mkdirat(fd, part, 0o755); err != nil {
+			if err != unix.EEXIST {
+				return fmt.Errorf("derivatives: mkdir %q under %q: %w", clean, root, err)
+			}
+			created = false
 		}
 		next, oerr := unix.Openat(fd, part,
 			unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
@@ -206,10 +210,49 @@ func EnsureDirUnder(root, rel string) error {
 			// a file) — exactly the case MkdirAll would have followed.
 			return fmt.Errorf("derivatives: %q under %q is not a real directory: %w", part, root, oerr)
 		}
+		if created {
+			inheritDirOwnership(fd, next)
+		}
 		unix.Close(fd)
 		fd = next
 	}
 	return nil
+}
+
+// inheritDirOwnership makes a directory we just created as accessible as its
+// parent — same mode, same owner and group — instead of a hardcoded 0755 owned
+// by whoever happened to run first.
+//
+// THE BUG THIS FIXES (live, 2026-08-11). The derivatives tree has TWO writers:
+// the farm, which runs as root in a container on the NAS, and the Mac client,
+// which runs as the logged-in user. Both reach this function. With a hardcoded
+// 0755, whichever one creates `.juicemount/derivatives/<inode>/` first LOCKS
+// THE OTHER OUT of it forever.
+//
+// On the volume where this was found the split was 12,016 root-owned
+// directories against 2,780 client-owned ones, and 14 ClipLogger derivative
+// uploads were stuck retrying `permission denied` against dirs the farm had
+// made. The parent `.juicemount/derivatives/` was 501:20 drwxrwxr-x the whole
+// time — the tree was writable, only the new children were not.
+//
+// Copying the parent's mode is deliberately EXACT rather than "add group
+// write": it makes a child no more permissive than the tree it lives in, so
+// this can never widen access to a volume whose derivatives dir is locked down.
+//
+// Best-effort by design. fchown fails with EPERM for a non-root process when
+// the parent belongs to somebody else, and that is fine: the caller either
+// already owns the directory it just made, or is about to get a clear EACCES
+// from the write itself. Failing the mkdir here would turn a permissions
+// nuisance into an outage.
+func inheritDirOwnership(parentFd, childFd int) {
+	var st unix.Stat_t
+	if err := unix.Fstat(parentFd, &st); err != nil {
+		return
+	}
+	// Mode first: it is the half that works without privilege whenever we own
+	// the new directory, which is the common client-side case.
+	_ = unix.Fchmod(childFd, uint32(st.Mode&0o7777))
+	_ = unix.Fchown(childFd, int(st.Uid), int(st.Gid))
 }
 
 // DerivDirRel is the mount-relative directory holding one asset's derivatives.
