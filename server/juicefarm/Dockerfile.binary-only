@@ -1,0 +1,20 @@
+# Rebuild ONLY the Go binary and layer it over the proven runtime image.
+# The full juicefarm image compiles whisper.cpp from source; nothing in this
+# change touches whisper, ffmpeg or juicefs, so re-running that would be a long
+# build with a large blast radius for a one-file Go fix.
+#
+# Build flags are copied verbatim from server/juicefarm/Dockerfile stage 1 —
+# static CGO in particular, because the juicedata/mount runtime ships an older
+# glibc than the bookworm builder and a dynamically-linked binary will not run.
+FROM golang:1.26-bookworm AS gobuild
+WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
+    && rm -rf /var/lib/apt/lists/*
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux go build -tags sqlite_omit_load_extension \
+      -ldflags="-s -w -linkmode external -extldflags '-static'" -o /out/jmfarm ./cmd/jmfarm
+
+FROM juicefarm:stream-exclusion
+COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
