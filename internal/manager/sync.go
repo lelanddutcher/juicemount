@@ -34,6 +34,15 @@ import (
 // all, so parseJuicefsMetrics produced a zero event, the zero event matched
 // the previous zero event, and the poller emitted nothing for the entire run.
 // The UI showed 0 files / 0 bytes / 0% while a 210 GB copy ran at ~475 MB/s.
+//
+// PRECISELY WHAT BREAKS, since the distinction matters when reading a job
+// record: the FINAL counts still land. parseSyncProgress picks juicefs's
+// end-of-run summary off stderr, so a completed job ends up with a populated
+// `last` and a non-zero updated_at, and looks fine in the API afterwards. It
+// is the LIVE updates that never arrive. Observed directly mid-run on
+// 2026-08-13: `last` was {files:0, bytes:0, updated_at:0} while 2.85 GB
+// landed on disk in a 6-second sample. So a job history full of healthy-looking
+// final counts is not evidence this ever worked — only a mid-run poll is.
 // The old comment even predicted the symptom — "without it the UI shows
 // '0 files' for the duration of any non-trivial copy" — without noticing it
 // was describing the shipped behaviour.
