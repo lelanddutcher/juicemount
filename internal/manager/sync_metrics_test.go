@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The live failure this reproduces (2026-08-13): a 210 GB migration ran at
@@ -139,5 +140,32 @@ func TestFreeMetricsAddrAvoidsAPortInUse(t *testing.T) {
 		if got := freeMetricsAddr(); got == taken {
 			t.Fatalf("freeMetricsAddr handed out %s while it was held open", taken)
 		}
+	}
+}
+
+// Throughput is derived from consecutive scrapes because juicefs's sync
+// metrics carry cumulative counters and no rate. Before this the metrics path
+// set Files, Bytes and Errors and never touched BPS, so the UI's rate and ETA
+// read zero even once the counters were flowing.
+func TestBPSIsDerivedFromScrapeDeltas(t *testing.T) {
+	// 100 MB across 2 seconds = 50 MB/s.
+	got := deriveBPS(0, 100<<20, 2*time.Second)
+	if want := float64(100<<20) / 2; got != want {
+		t.Errorf("BPS = %v, want %v", got, want)
+	}
+}
+
+// The three cases that must report NO rate rather than a wrong one.
+func TestBPSRefusesToInventARate(t *testing.T) {
+	if got := deriveBPS(0, 1<<20, 0); got != 0 {
+		t.Errorf("zero interval produced BPS=%v; that is a divide-by-zero waiting to happen", got)
+	}
+	if got := deriveBPS(0, 1<<20, -time.Second); got != 0 {
+		t.Errorf("negative interval produced BPS=%v", got)
+	}
+	// A counter that went BACKWARDS means juicefs restarted and reset it, not
+	// that the copy ran in reverse.
+	if got := deriveBPS(500<<20, 1<<20, time.Second); got != 0 {
+		t.Errorf("counter reset produced BPS=%v; a negative rate would be shown to the user", got)
 	}
 }

@@ -470,6 +470,13 @@ func pollJuicefsMetrics(ctx context.Context, addr string, progress chan<- Progre
 	scrapesOK := 0
 	sawAnySync := false
 	warned := false
+	// Throughput has to be DERIVED. juicefs's sync metrics expose cumulative
+	// counters (copied, copied_bytes, failed) and no rate, so without this the
+	// UI's rate and ETA sit at zero even once the counters are flowing — which
+	// is the state this file shipped in: the metrics path set Files, Bytes and
+	// Errors and never touched BPS or ETASec at all.
+	var prevBytes int64
+	var prevAt time.Time
 	scrape := func() {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
@@ -503,7 +510,17 @@ func pollJuicefsMetrics(ctx context.Context, addr string, progress chan<- Progre
 		if ev.Files == last.Files && ev.Bytes == last.Bytes && ev.Errors == last.Errors {
 			return
 		}
-		ev.UpdatedAt = time.Now().UnixMilli()
+		now := time.Now()
+		// Rate over the interval between scrapes. Guarded three ways: a first
+		// sample has nothing to difference against, a non-positive interval
+		// would divide by zero, and a NEGATIVE byte delta means the counter
+		// reset under us (juicefs restarted) rather than that the copy ran
+		// backwards — in all three cases report no rate rather than a wrong one.
+		if !prevAt.IsZero() {
+			ev.BPS = deriveBPS(prevBytes, ev.Bytes, now.Sub(prevAt))
+		}
+		prevBytes, prevAt = ev.Bytes, now
+		ev.UpdatedAt = now.UnixMilli()
 		select {
 		case progress <- ev:
 			last = ev
@@ -539,6 +556,18 @@ var metricLineRegex = regexp.MustCompile(`^(juicefs_sync_[a-z_]+)\{[^}]*\}\s+([0
 // /metrics scrape body. Unrecognized counters are ignored. Bytes are
 // rounded down (juicefs reports bytes as float64; we keep int64 for the
 // SSE wire format consistency with the regex-parser path).
+// deriveBPS is the rate between two cumulative byte readings, or 0 when the
+// pair cannot yield an honest one: a non-positive interval (divide by zero) or
+// a counter that moved BACKWARDS, which means juicefs restarted and reset it
+// rather than that the copy ran in reverse. Reporting no rate beats reporting
+// a wrong or negative one.
+func deriveBPS(prevBytes, curBytes int64, elapsed time.Duration) float64 {
+	if elapsed <= 0 || curBytes < prevBytes {
+		return 0
+	}
+	return float64(curBytes-prevBytes) / elapsed.Seconds()
+}
+
 // parseJuicefsMetrics extracts sync counters from a Prometheus scrape and
 // reports whether the body contained ANY juicefs_sync_* series at all.
 //
