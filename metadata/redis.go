@@ -555,6 +555,7 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 		WriteTimeout: 10 * time.Second,
 		DialTimeout:  10 * time.Second,
 	})
+	instrumentRedis(rdb) // count metadata round trips — see redishook.go
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -609,6 +610,7 @@ func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error)
 		WriteTimeout: 10 * time.Second,
 		DialTimeout:  10 * time.Second,
 	})
+	instrumentRedis(rdb) // count metadata round trips — see redishook.go
 	rc := &RedisClient{
 		redisURL:          redisURL,
 		store:             store,
@@ -729,6 +731,7 @@ func (rc *RedisClient) Reconnect() error {
 		WriteTimeout: 10 * time.Second,
 		DialTimeout:  10 * time.Second,
 	})
+	instrumentRedis(rdb) // count metadata round trips — see redishook.go
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

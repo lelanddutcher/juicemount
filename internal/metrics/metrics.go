@@ -351,6 +351,10 @@ type Registry struct {
 	backendMu sync.RWMutex
 	backendFn func() *BackendSnapshot
 
+	// Redis round-trip hook — set by package metadata.
+	redisMu sync.RWMutex
+	redisFn func() *RedisSnapshot
+
 	// FD-pool hook — set by package nfs so /metrics can report descriptor and
 	// memory-buffer occupancy. Same provider rationale as the data gate: the
 	// pool is per-handler, so it cannot be a package-level counter, and reading
@@ -472,6 +476,25 @@ type BackendSnapshot struct {
 	MetaOps int64 `json:"meta_ops"`
 }
 
+// RedisSnapshot reports metadata ROUND TRIPS — the cellular cost unit.
+//
+// Not bytes: go-redis hooks see commands rather than the wire, so any byte
+// figure would be an estimate presented as a measurement. Round trips are
+// exact and are what actually costs on a high-RTT link — a 2026-07-29 session
+// at ~500ms RTT spent 67 minutes of cumulative metadata wait against only 77
+// object GETs, all of it round trips.
+type RedisSnapshot struct {
+	Commands          int64 `json:"commands"`
+	Pipelines         int64 `json:"pipelines"`
+	PipelinedCommands int64 `json:"pipelined_commands"`
+	Dials             int64 `json:"dials"`
+	Errors            int64 `json:"errors"`
+	// RoundTrips = commands + pipelines + dials. Pipelined commands are NOT
+	// added: N commands in one pipeline cost ONE trip, and counting them
+	// individually would make pipelining look expensive when it is the fix.
+	RoundTrips int64 `json:"round_trips"`
+}
+
 // StallSnapshot reports live head-of-line blocking: how many NFS RPCs are in
 // flight right now, how old the oldest is, and how many JUKEBOX replies each op
 // has sent.
@@ -583,6 +606,14 @@ func (r *Registry) SetFUSEDataGateProvider(fn func() *FUSEDataGateSnapshot) {
 	r.dataGateMu.Lock()
 	defer r.dataGateMu.Unlock()
 	r.dataGateFn = fn
+}
+
+// SetRedisProvider registers a callback used by /metrics to report Redis
+// round trips. Safe to leave unset (the field is then omitted).
+func (r *Registry) SetRedisProvider(fn func() *RedisSnapshot) {
+	r.redisMu.Lock()
+	defer r.redisMu.Unlock()
+	r.redisFn = fn
 }
 
 // SetBackendProvider registers a callback used by /metrics to report
@@ -879,6 +910,9 @@ type Snapshot struct {
 	// Backend reports bytes that actually crossed to the object store, versus
 	// bytes served from the local block cache. See BackendSnapshot.
 	Backend *BackendSnapshot `json:"backend,omitempty"`
+
+	// Redis reports metadata round trips. See RedisSnapshot.
+	Redis *RedisSnapshot `json:"redis,omitempty"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -952,6 +986,13 @@ func (r *Registry) Snapshot() Snapshot {
 	r.dataGateMu.RUnlock()
 	if dataGateFn != nil {
 		out.FUSEDataGate = dataGateFn()
+	}
+
+	r.redisMu.RLock()
+	redisFn := r.redisFn
+	r.redisMu.RUnlock()
+	if redisFn != nil {
+		out.Redis = redisFn()
 	}
 
 	r.backendMu.RLock()
