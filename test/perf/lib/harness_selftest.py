@@ -60,6 +60,31 @@ def main():
           H.compare(doc(six, "fast", True), doc(six, "fast", False))["verdict"],
           H.INCOMPARABLE)
 
+    # ...unless the class IS the experiment. Pinning JM_NET_FORCE_CLASS to
+    # measure what the cellular mitigation buys is a DECLARED cross-class A/B,
+    # and refusing to judge it would make the product's whole answer to
+    # "be efficient on cellular" permanently unmeasurable.
+    check("declared link_class treatment -> judged, not refused",
+          H.compare(doc(six, "fast"), doc([2, 2.1, 1.9, 2.2, 1.8, 2.0], "metered"),
+                    treatment="link_class")["verdict"], H.PASS)
+
+    # The declaration must not become a blanket escape hatch: it waives the
+    # class-EQUALITY guard only. An unmeasured class is still an assumption, and
+    # an assumption is still incomparable.
+    check("treatment does NOT waive the class-measured guard",
+          H.compare(doc(six, "fast", True), doc(six, "metered", False),
+                    treatment="link_class")["verdict"], H.INCOMPARABLE)
+
+    # And it must not waive the sample-count floor either.
+    check("treatment does NOT waive n>=6",
+          H.compare(doc([1, 2, 3], "fast"), doc(six, "metered"),
+                    treatment="link_class")["verdict"], H.INVALID)
+
+    # A treatment nobody declared is still the trap.
+    check("unrecognised treatment name -> still INCOMPARABLE",
+          H.compare(doc(six, "fast"), doc(six, "metered"),
+                    treatment="something_else")["verdict"], H.INCOMPARABLE)
+
     # Same class, same measured-ness, identical data: the trivial pass.
     check("identical runs -> PASS",
           H.compare(doc(six), doc(six))["verdict"], H.PASS)

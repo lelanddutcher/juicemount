@@ -124,8 +124,21 @@ INVALID = "INVALID"
 MIN_N = 6
 
 
-def compare(baseline, current, lower_is_better=True, min_n=MIN_N):
+def compare(baseline, current, lower_is_better=True, min_n=MIN_N, treatment=None):
     """Verdict for `current` against `baseline`.
+
+    `treatment` names the independent variable when the experiment DELIBERATELY
+    changes something this function otherwise refuses to compare across. Pass
+    treatment="link_class" for an A/B whose whole point is the link class — e.g.
+    measuring what the class-gated cellular mitigation buys, by pinning
+    JM_NET_FORCE_CLASS on one arm. Without it such a run is reported
+    INCOMPARABLE, which is right for an ACCIDENTAL class difference (a baseline
+    taken on 10GbE and a current taken on cellular really is meaningless) and
+    wrong for a declared one.
+
+    It must be DECLARED, never inferred. Auto-detecting "the classes differ so
+    they must have meant it" would silently reclassify the exact mistake the
+    guard exists to catch as an intentional experiment.
 
     INVALID   — not enough samples on either side to say anything. The gate did
                 not measure enough to have an opinion; that is not a pass.
@@ -153,10 +166,12 @@ def compare(baseline, current, lower_is_better=True, min_n=MIN_N):
                           "before it has samples, so the class is an assumption"
                           % (bl.get("class"), bl.get("class_measured"),
                              cl.get("class"), cl.get("class_measured"))}
-    if bl.get("class") != cl.get("class"):
+    if bl.get("class") != cl.get("class") and treatment != "link_class":
         return {"verdict": INCOMPARABLE,
                 "reason": "baseline was taken on '%s', current on '%s' — a "
-                          "cross-class comparison yields a number with no meaning"
+                          "cross-class comparison yields a number with no meaning "
+                          "(pass treatment=\"link_class\" if the class IS the "
+                          "experiment)"
                           % (bl.get("class"), cl.get("class"))}
 
     overlap = not (cs["min"] > bs["max"] or bs["min"] > cs["max"])
