@@ -1,0 +1,66 @@
+{
+  "name": "cellular_efficiency",
+  "unit": "redis_round_trips_per_op",
+  "envelope": {
+    "schema": 1,
+    "ts": 1786913233,
+    "iso": "2026-08-16T16:47:13-0400",
+    "build_sha": "684be51",
+    "branch": "feat/spool-streaming-drain",
+    "dirty": true,
+    "host": "Leland-Mac.localdomain",
+    "corpus": "40d/25f",
+    "note": "",
+    "link": {
+      "class": "fast",
+      "rtt_ms": 15.286,
+      "bandwidth_mbps": 1217.704790508981,
+      "high_latency": false,
+      "have_rtt": true,
+      "have_bandwidth": true,
+      "class_measured": true
+    },
+    "control_plane_reachable": true
+  },
+  "stats": {
+    "n": 2,
+    "median": 0.0,
+    "min": 0.0,
+    "max": 0.0,
+    "mean": 0.0
+  },
+  "samples": [
+    0.0,
+    0.0
+  ],
+  "extra": {
+    "ops": [
+      {
+        "op": "warm_dir_open",
+        "valid": true,
+        "count": 40,
+        "wall_ms": 13.145417004125193,
+        "server_ops": 42,
+        "round_trips_total": 0,
+        "round_trips_per_op": 0.0,
+        "object_get_bytes_total": 0,
+        "object_get_bytes_per_op": 0.0,
+        "meta_ops_total": 4548,
+        "cache_miss": 0
+      },
+      {
+        "op": "cold_file_open",
+        "valid": true,
+        "count": 25,
+        "wall_ms": 350.0750419916585,
+        "server_ops": 176,
+        "round_trips_total": 0,
+        "round_trips_per_op": 0.0,
+        "object_get_bytes_total": 109182976,
+        "object_get_bytes_per_op": 4367319.04,
+        "meta_ops_total": 1398,
+        "cache_miss": 33
+      }
+    ]
+  }
+}

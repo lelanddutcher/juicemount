@@ -76,6 +76,18 @@ def delta(a, b):
 # the client's cache rather than JuiceMount.
 CLIENT_DIR_CACHE_S = 16
 
+# FILES are different, and it changes what is measurable. The same mount uses
+# acregmin=acregmax=3600 — a full HOUR of client-side attribute caching for
+# regular files. So a warm file re-read is answered entirely by macOS and never
+# reaches JuiceMount at all. That is not a harness limitation and it is not a
+# problem: it means a warm re-read costs the product literally nothing.
+#
+# It does mean "warm file preview" is UNMEASURABLE server-side without waiting
+# an hour, so measuring it would only ever produce a zero from no coverage. The
+# meaningful file number is the COLD open — the first touch, which is where the
+# 66x cellular penalty lives (1,226-5,660 ms first open vs 24-36 ms second, all
+# of it per-FILE rather than per-byte). That is what this measures instead.
+
 
 def op_dirs(root, n):
     dirs = []
@@ -145,6 +157,10 @@ def main():
     ap.add_argument("--root", default="/Volumes/zpool/oldzpool/ARCHIVE")
     ap.add_argument("--dirs", type=int, default=40)
     ap.add_argument("--files", type=int, default=25)
+    ap.add_argument("--read-bytes", type=int, default=65536,
+                    help="bytes requested per file; the denominator of amplification")
+    ap.add_argument("--max-amplification", type=float, default=0,
+                    help="fail if pulled/requested exceeds this (0 = report only)")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
@@ -174,9 +190,21 @@ def main():
     print("warming…")
     walk(); preview(); walk(); preview()
 
+    # Cold files: never touched this session, so the open genuinely reaches us.
+    cold = [f for f in op_files(a.root, a.files * 12) if f not in set(files)][-a.files:]
+
+    def preview_cold():
+        for f in cold:
+            try:
+                with open(f, "rb") as fh:
+                    fh.read(a.read_bytes)
+            except Exception:
+                pass
+
     results = [
         measure("warm_dir_open", walk, len(dirs)),
-        measure("warm_file_preview", preview, len(files)),
+        measure("cold_file_open", preview_cold, len(cold)) if cold else
+        {"op": "cold_file_open", "valid": False, "reason": "no untouched files found"},
     ]
 
     print()
@@ -189,6 +217,28 @@ def main():
               % (r["op"], r["round_trips_per_op"],
                  ("%.0f" % ob) if ob is not None else "n/a",
                  r["server_ops"], r["wall_ms"]))
+
+    # --- READ AMPLIFICATION: bytes pulled per byte actually asked for.
+    # This is the cellular headline. Measured on class=fast: 1.56 MiB requested
+    # pulled 785 MiB, 503x. Readahead is class-gated (blocks_ahead/workers narrow
+    # on a metered link), so this number is the LAN figure — re-run under a
+    # metered class to learn the cellular one.
+    print("\n  READ AMPLIFICATION — bytes pulled per byte requested")
+    amp_bad = []
+    for r in results:
+        if not r.get("valid") or r["op"] != "cold_file_open":
+            continue
+        pulled = r.get("object_get_bytes_per_op")
+        if pulled is None:
+            print("    object_get_bytes unavailable — cannot judge")
+            continue
+        amp = pulled / a.read_bytes if a.read_bytes else 0
+        print("    requested %.2f MiB, pulled %.1f MiB  ->  %.0fx"
+              % (r["count"] * a.read_bytes / 1048576.0,
+                 r["count"] * pulled / 1048576.0, amp))
+        if a.max_amplification and amp > a.max_amplification:
+            amp_bad.append(amp)
+            print("    EXCEEDS the %.0fx budget" % a.max_amplification)
 
     print("\n  PASS BAR — warm operations cost ~0 metadata round trips")
     bad = []
@@ -212,7 +262,7 @@ def main():
     if a.out:
         json.dump(doc, open(a.out, "w"), indent=2)
         print("  wrote %s" % a.out)
-    return 1 if bad else 0
+    return 1 if (bad or amp_bad) else 0
 
 
 if __name__ == "__main__":
