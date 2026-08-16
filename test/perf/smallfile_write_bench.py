@@ -93,13 +93,23 @@ def build_corpus(path, count, size_kb):
 
 class SpoolSampler(threading.Thread):
     """Samples spool depth + CPU during the run. This is where the semaphore
-    signature shows up, so it must be observed live rather than reconstructed."""
+    signature shows up, so it must be observed live rather than reconstructed.
 
-    def __init__(self, pid, interval=0.5):
+    ALSO times a foreground directory listing on every sample, because raising
+    drain concurrency trades against exactly that. The drain shares FUSE with
+    the user's Finder window, and the reason the worker count is 4 is an
+    incident: a 16-way Finder copy on 2026-06-14 saturated JuiceFS's buffer, the
+    mount went readdir-unresponsive, and the watchdog SIGKILLed it. So "faster
+    files/sec" is only half a result — if nav latency degrades WHILE the drain
+    runs, the change is a regression no matter what the throughput says. Measured
+    during the drain, which is the only time it can be observed."""
+
+    def __init__(self, pid, nav_dir=None, interval=0.5):
         super().__init__(daemon=True)
-        self.pid, self.interval = pid, interval
+        self.pid, self.interval, self.nav_dir = pid, interval, nav_dir
         self.stop_flag = threading.Event()
         self.samples = []
+        self.nav_ms = []
 
     def run(self):
         while not self.stop_flag.is_set():
@@ -111,6 +121,13 @@ class SpoolSampler(threading.Thread):
                     "in_progress": s.get("in_progress") or 0,
                     "cpu": _cpu(self.pid),
                 })
+            if self.nav_dir:
+                t0 = time.perf_counter()
+                try:
+                    os.listdir(self.nav_dir)
+                    self.nav_ms.append((time.perf_counter() - t0) * 1000.0)
+                except OSError:
+                    pass
             self.stop_flag.wait(self.interval)
 
     def summary(self):
@@ -136,6 +153,11 @@ class SpoolSampler(threading.Thread):
             "pinned_while_pending_grew": pinned,
             "cpu_peak": max(cpus) if cpus else None,
             "cpu_median": statistics.median(cpus) if cpus else None,
+            # Foreground nav DURING the drain — the must-not-regress side.
+            "nav_ms_median": statistics.median(self.nav_ms) if self.nav_ms else None,
+            "nav_ms_p95": (sorted(self.nav_ms)[int(len(self.nav_ms) * 0.95)]
+                           if len(self.nav_ms) > 3 else None),
+            "nav_samples": len(self.nav_ms),
         }
 
 
@@ -156,6 +178,7 @@ def one_run(corpus, dest, threads):
 
     times, lock = [], threading.Lock()
     idx = [0]
+    failures = []
 
     def worker():
         while True:
@@ -166,7 +189,18 @@ def one_run(corpus, dest, threads):
                 return
             s, d = files[i]
             t0 = time.perf_counter()
-            shutil.copyfile(s, d)
+            # A worker that dies takes its share of the work with it while the
+            # file COUNT stays 2000, so the rate is computed from work that
+            # never happened. Observed live: one run reported 281 files/s in
+            # 7.1s against a 46 files/s baseline because a thread threw
+            # FileNotFoundError and the remaining files were silently skipped.
+            # Failures are collected and invalidate the run.
+            try:
+                shutil.copyfile(s, d)
+            except OSError as e:
+                with lock:
+                    failures.append("%s: %s" % (d, e))
+                continue
             dt = time.perf_counter() - t0
             with lock:
                 times.append(dt)
@@ -178,7 +212,8 @@ def one_run(corpus, dest, threads):
     for w in ws:
         w.join()
     wall = time.perf_counter() - t0
-    return times, wall, len(files)
+    # len(times), not len(files): the denominator must be work that COMPLETED.
+    return times, wall, len(times), failures
 
 
 def main():
@@ -192,6 +227,9 @@ def main():
     ap.add_argument("--corpus", default=os.path.expanduser("~/.jm-smallfile-corpus"))
     ap.add_argument("--out", default="")
     ap.add_argument("--keep", action="store_true", help="do not delete the written files")
+    ap.add_argument("--nav-dir", default="/Volumes/zpool/oldzpool/ARCHIVE",
+                    help="directory listed repeatedly during the drain to measure "
+                         "foreground nav latency under load")
     a = ap.parse_args()
 
     if build_corpus(a.corpus, a.count, a.size_kb):
@@ -204,23 +242,35 @@ def main():
     rates, spools = [], []
 
     for r in range(a.runs):
-        samp = SpoolSampler(pid)
+        samp = SpoolSampler(pid, nav_dir=a.nav_dir)
         samp.start()
-        times, wall, n = one_run(a.corpus, dest_root, a.threads)
+        times, wall, n, failures = one_run(a.corpus, dest_root, a.threads)
         samp.stop_flag.set()
         samp.join(timeout=5)
         rate = n / wall if wall else 0
+        if failures:
+            print("  run %d/%d  INVALID — %d of %d copies failed (first: %s). A rate "
+                  "from a partial copy is a number from work that did not happen."
+                  % (r + 1, a.runs, len(failures), len(failures) + n, failures[0]))
+            spools.append(samp.summary())
+            # Let the spool drain before the next run: tearing down the dest
+            # tree while the drainer still holds the previous run's rows is the
+            # most likely source of these failures.
+            time.sleep(20)
+            continue
         rates.append(rate)
         spools.append(samp.summary())
         ts = sorted(times)
         p50 = statistics.median(ts) if ts else 0
         p99 = ts[int(len(ts) * 0.99)] if len(ts) > 2 else 0
         sp = spools[-1]
+        nm = sp.get("nav_ms_median")
         print("  run %d/%d  %6.1f files/s  wall %5.1fs  p50 %5.1fms p99 %6.1fms  "
-              "in_progress peak=%s pinned=%s  cpu_peak=%s"
+              "in_progress peak=%s pinned=%s  cpu_peak=%s  nav_p50=%s"
               % (r + 1, a.runs, rate, wall, p50 * 1000, p99 * 1000,
                  sp.get("in_progress_peak"), sp.get("pinned_while_pending_grew"),
-                 sp.get("cpu_peak")))
+                 sp.get("cpu_peak"),
+                 ("%.1fms" % nm) if nm is not None else "n/a"))
 
     if not a.keep:
         shutil.rmtree(dest_root, ignore_errors=True)
@@ -243,6 +293,17 @@ def main():
         if max(peaks) == 0:
             print("  NOTE: spool never showed depth — writes may not be routing "
                   "through the spool at all. That is a finding, not a pass.")
+
+    navs = [s["nav_ms_median"] for s in spools
+            if s.get("valid") and s.get("nav_ms_median") is not None]
+    if navs:
+        ns = harness.stats(navs)
+        print("  nav-during-drain p50: median %.1f ms  range %.1f-%.1f  (n=%d)"
+              % (ns["median"], ns["min"], ns["max"], ns["n"]))
+        doc["extra"]["nav_during_drain_ms"] = ns
+    else:
+        print("  nav-during-drain: NO SAMPLES — the must-not-regress side was not "
+              "measured, so a throughput win here is unproven, not proven.")
 
     if a.out:
         json.dump(doc, open(a.out, "w"), indent=2)
