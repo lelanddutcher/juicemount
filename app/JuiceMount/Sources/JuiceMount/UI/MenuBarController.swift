@@ -452,14 +452,21 @@ final class MenuBarController: NSObject {
         }
         let view = PreferencesWindowView(preferences: server.preferences, server: server)
         let hosting = NSHostingController(rootView: view)
-        // Phase 3b: track the SwiftUI ideal size so the window hugs each
-        // tab's content (the view declares a fixed 600 pt width and a
-        // per-tab height). No manual setContentSize — that fought the
-        // content and left either clipped controls or dead space.
+        // Track the SwiftUI ideal size so the window hugs each tab's content.
+        // No manual setContentSize — that fought the content and left either
+        // clipped controls or dead space.
+        //
+        // This is only safe because the view no longer declares its own
+        // CHANGING height. When it did, the two sizing authorities chased each
+        // other until AppKit hit its 141-iteration display-cycle limit and
+        // aborted the process — see the comment on PreferencesWindowView.body.
         hosting.sizingOptions = .preferredContentSize
         let window = NSWindow(contentViewController: hosting)
         window.title = "JuiceMount Preferences"
-        window.styleMask = [.titled, .closable]
+        // .resizable is a safety valve, not a feature: if a future tab (or a
+        // localized build with wrapped footers) reports a natural height taller
+        // than the screen, a fixed-size window would clip it with no way out.
+        window.styleMask = [.titled, .closable, .resizable]
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self
