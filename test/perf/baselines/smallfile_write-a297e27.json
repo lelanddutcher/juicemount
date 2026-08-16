@@ -1,0 +1,104 @@
+{
+  "name": "smallfile_write",
+  "unit": "files_per_sec",
+  "envelope": {
+    "schema": 1,
+    "ts": 1786907291,
+    "iso": "2026-08-16T15:08:11-0400",
+    "build_sha": "a297e27",
+    "branch": "feat/spool-streaming-drain",
+    "dirty": true,
+    "host": "Leland-Mac.localdomain",
+    "corpus": "2000x32KB",
+    "note": "threads=8",
+    "link": {
+      "class": "fast",
+      "rtt_ms": 1.11,
+      "bandwidth_mbps": 956.8726421389542,
+      "high_latency": false,
+      "have_rtt": true,
+      "have_bandwidth": true,
+      "class_measured": true
+    },
+    "control_plane_reachable": true
+  },
+  "stats": {
+    "n": 6,
+    "median": 41.836127497123286,
+    "min": 38.69349885566636,
+    "max": 45.006871226473095,
+    "mean": 41.7852270874781
+  },
+  "samples": [
+    42.105662533209376,
+    38.69349885566636,
+    39.480060078160605,
+    41.5665924610372,
+    45.006871226473095,
+    43.858677370321935
+  ],
+  "extra": {
+    "spool": [
+      {
+        "valid": true,
+        "samples": 88,
+        "in_progress_peak": 4,
+        "in_progress_median": 4.0,
+        "pending_peak": 3320,
+        "pinned_while_pending_grew": 54,
+        "cpu_peak": 152.9,
+        "cpu_median": 40.7
+      },
+      {
+        "valid": true,
+        "samples": 174,
+        "in_progress_peak": 4,
+        "in_progress_median": 4.0,
+        "pending_peak": 3326,
+        "pinned_while_pending_grew": 60,
+        "cpu_peak": 181.9,
+        "cpu_median": 44.05
+      },
+      {
+        "valid": true,
+        "samples": 152,
+        "in_progress_peak": 4,
+        "in_progress_median": 4.0,
+        "pending_peak": 3133,
+        "pinned_while_pending_grew": 53,
+        "cpu_peak": 159.5,
+        "cpu_median": 42.0
+      },
+      {
+        "valid": true,
+        "samples": 146,
+        "in_progress_peak": 4,
+        "in_progress_median": 4.0,
+        "pending_peak": 3304,
+        "pinned_while_pending_grew": 54,
+        "cpu_peak": 162.3,
+        "cpu_median": 43.85
+      },
+      {
+        "valid": true,
+        "samples": 139,
+        "in_progress_peak": 4,
+        "in_progress_median": 4,
+        "pending_peak": 3303,
+        "pinned_while_pending_grew": 50,
+        "cpu_peak": 162.7,
+        "cpu_median": 44.6
+      },
+      {
+        "valid": true,
+        "samples": 141,
+        "in_progress_peak": 4,
+        "in_progress_median": 4,
+        "pending_peak": 3257,
+        "pinned_while_pending_grew": 58,
+        "cpu_peak": 255.3,
+        "cpu_median": 49.2
+      }
+    ]
+  }
+}
