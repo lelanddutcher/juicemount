@@ -1453,6 +1453,41 @@ func (rc *RedisClient) currentBackstop() time.Duration {
 	return time.Duration(n)
 }
 
+// adaptReconcileInterval returns how long to wait before the next periodic
+// full reconcile: the backstop the engagement logic chose, stretched when the
+// last SCAN was expensive, and NEVER shorter than that backstop.
+//
+// THE BUG THIS FIXES. The ceiling used to be applied AFTER the floor, so it
+// undercut the floor and a mechanism documented to make the interval LONGER
+// made it SHORTER instead. Live numbers, 2026-08-16, push ENABLED on a LAN:
+//
+//	base   = 900s          the 15-minute backstop, correctly chosen
+//	scaled = 26.2s x 30    = 787s
+//	floor  -> 900s
+//	ceiling-> 300s         the backstop truncated to a third of itself
+//
+// The user-visible result was a full 420,699-entry SCAN every ~5 minutes that
+// upserted NOTHING, on a client whose Redis keyspace push was working
+// perfectly — read as "the index keeps rebuilding for no reason".
+//
+// maxBackoff is the FAILURE-retry cap (see doReconcile, where it bounds the
+// 30s x 2^n escalation). Reusing it as a ceiling on the HEALTHY cadence is what
+// let a retry constant govern a success path. It still bounds the stretch, but
+// the backstop is now the floor and wins.
+func adaptReconcileInterval(base, lastSync, maxBackoff time.Duration) time.Duration {
+	if lastSync <= reconcileAdaptiveThreshold {
+		return base
+	}
+	scaled := lastSync * reconcileDutyDivisor
+	if scaled > maxBackoff {
+		scaled = maxBackoff
+	}
+	if scaled < base {
+		scaled = base
+	}
+	return scaled
+}
+
 func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Duration, maxBackoff time.Duration, ticker *time.Ticker) {
 	// Backoff is computed off DefaultReconcileInterval, NOT the (possibly
 	// minutes/hours-long) backstop interval — a failure streak must drive
@@ -1540,17 +1575,7 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 		// ENABLED the backstop is already long, so the stretch rarely engages;
 		// with push DISABLED the backstop is 30s and the stretch behaves as before.
 		base := rc.currentBackstop()
-		next := base
-		if lastSync > reconcileAdaptiveThreshold {
-			scaled := lastSync * reconcileDutyDivisor
-			if scaled < base {
-				scaled = base
-			}
-			if scaled > maxBackoff {
-				scaled = maxBackoff
-			}
-			next = scaled
-		}
+		next := adaptReconcileInterval(base, lastSync, maxBackoff)
 		if next != *backoff {
 			if next > base {
 				jmlog.Info("reconcile cadence adapted to sync cost",
