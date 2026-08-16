@@ -1,0 +1,101 @@
+{
+  "name": "nav_parity",
+  "unit": "ms_per_dir_open",
+  "envelope": {
+    "schema": 1,
+    "ts": 1786909704,
+    "iso": "2026-08-16T15:48:24-0400",
+    "build_sha": "3ba307e",
+    "branch": "feat/spool-streaming-drain",
+    "dirty": true,
+    "host": "Leland-Mac.localdomain",
+    "corpus": "40 dirs",
+    "note": "",
+    "link": {
+      "class": "fast",
+      "rtt_ms": 1.678,
+      "bandwidth_mbps": 560.9937577997766,
+      "high_latency": false,
+      "have_rtt": true,
+      "have_bandwidth": true,
+      "class_measured": true
+    },
+    "control_plane_reachable": true
+  },
+  "stats": {
+    "n": 3,
+    "median": 0.5579585122177377,
+    "min": 0.34915599826490507,
+    "max": 0.5742917492170818,
+    "mean": 0.49380208656657487
+  },
+  "samples": [
+    0.5579585122177377,
+    0.34915599826490507,
+    0.5742917492170818
+  ],
+  "extra": {
+    "arms": [
+      {
+        "arm": "lan",
+        "dir_open_ms": {
+          "n": 6,
+          "median": 0.5579585122177377,
+          "min": 0.37060450995340943,
+          "max": 0.7419169996865094,
+          "mean": 0.5571321720102181
+        },
+        "backend_cost_median": {
+          "meta_ops": 0.0,
+          "object_get_bytes": 0.0,
+          "cache_miss": 0.0,
+          "readdir_ops": 42.0,
+          "lookup": 0.0
+        },
+        "runs": 6,
+        "readdir_ops_total": 252,
+        "valid": true
+      },
+      {
+        "arm": "shaped",
+        "dir_open_ms": {
+          "n": 6,
+          "median": 0.34915599826490507,
+          "min": 0.30793801124673337,
+          "max": 0.4988120053894818,
+          "mean": 0.3728506684031648
+        },
+        "backend_cost_median": {
+          "meta_ops": 0.0,
+          "object_get_bytes": 0.0,
+          "cache_miss": 0.0,
+          "readdir_ops": 42.0,
+          "lookup": 0.0
+        },
+        "runs": 6,
+        "readdir_ops_total": 252,
+        "valid": true
+      },
+      {
+        "arm": "offline",
+        "dir_open_ms": {
+          "n": 6,
+          "median": 0.5742917492170818,
+          "min": 0.40781250572763383,
+          "max": 0.6555205036420375,
+          "mean": 0.5517325795760067
+        },
+        "backend_cost_median": {
+          "meta_ops": 0.0,
+          "object_get_bytes": 0.0,
+          "cache_miss": 0.0,
+          "readdir_ops": 42.0,
+          "lookup": 0.0
+        },
+        "runs": 6,
+        "readdir_ops_total": 252,
+        "valid": true
+      }
+    ]
+  }
+}
