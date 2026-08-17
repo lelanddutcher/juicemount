@@ -4167,7 +4167,11 @@ func (f *cachedFile) IncompleteAt(off int64) bool {
 		return false
 	}
 	plan, tracked := f.handler.inPlaceHoles.inPlaceReadPlan(f.name, off)
-	return tracked && plan == planHold
+	held := tracked && plan == planHold
+	if held {
+		f.handler.inPlaceHoles.logHold(f.name, off)
+	}
+	return held
 }
 
 func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
@@ -4186,6 +4190,13 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 			// JUKEBOX: the client retries until the bytes land. Bounded by
 			// writer liveness inside planReadAt, so a dead writer releases it
 			// rather than stalling the read forever (#100).
+			//
+			// Logged (throttled ~1/2s per path) because this hold was
+			// previously INVISIBLE: the spool path has carried a diagnostic
+			// since 57d320a and this twin had none, so live JUKEBOX storms of
+			// up to 90 nfs.Read per 15s during Premiere exports produced no
+			// line saying which file or offset.
+			f.handler.inPlaceHoles.logHold(f.name, off)
 			return 0, pin.ErrSpoolIncomplete
 		}
 	}

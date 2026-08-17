@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 )
 
 // inplace_contig.go — never serve a hole on the IN-PLACE FUSE write path.
@@ -99,6 +100,18 @@ type inPlaceHole struct {
 	writtenEnd    int64
 	extents       []spoolExtent
 	lastWrite     time.Time
+
+	// lastLog throttles the JUKEBOX-hold diagnostic (see logHold).
+	lastLog time.Time
+	// fromTruncate records that this hole was opened by a GROW (F_PREALLOCATE /
+	// ftruncate-to-grow) rather than by an out-of-order write. The two look
+	// identical in every other field and want opposite responses: an
+	// out-of-order-write hole fills in milliseconds as the neighbouring writes
+	// land, while a preallocation hole persists for as long as the app takes to
+	// fill it — for a video export, the whole encode. Without this field the
+	// log cannot tell "the writer is mid-burst" from "the app reserved 40 GB and
+	// is 3% of the way through it", which are very different bugs.
+	fromTruncate bool
 }
 
 // inPlaceTracker holds every path that currently has a hole.
@@ -131,6 +144,8 @@ func (t *inPlaceTracker) noteWrite(path string, base, off, end int64) {
 		if off <= base {
 			return
 		}
+		// fromTruncate stays false here: this hole was opened by an
+		// OUT-OF-ORDER WRITE, not by a preallocation.
 		h = &inPlaceHole{contiguousEnd: base, writtenEnd: base}
 		if t.m == nil {
 			t.m = make(map[string]*inPlaceHole)
@@ -168,7 +183,7 @@ func (t *inPlaceTracker) noteTruncate(path string, base, size int64) {
 			// are not tracking cannot expose unwritten bytes.)
 			return
 		}
-		h = &inPlaceHole{contiguousEnd: base, writtenEnd: base}
+		h = &inPlaceHole{contiguousEnd: base, writtenEnd: base, fromTruncate: true}
 		if t.m == nil {
 			t.m = make(map[string]*inPlaceHole)
 		}
@@ -177,6 +192,10 @@ func (t *inPlaceTracker) noteTruncate(path string, base, size int64) {
 	}
 
 	if size > h.writtenEnd {
+		// A GROW opened (or widened) this hole. Record that even when the entry
+		// already existed from an out-of-order write: for the diagnostic, "a
+		// preallocation is involved" is the fact that changes the diagnosis.
+		h.fromTruncate = true
 		h.writtenEnd = size
 	} else {
 		// Shrink: nothing above the new size remains, so drop any extent and
@@ -229,6 +248,49 @@ func (t *inPlaceTracker) routing(path string) (cend, wend int64, writerActive, o
 		return 0, 0, false, false
 	}
 	return h.contiguousEnd, h.writtenEnd, time.Since(h.lastWrite) < pin.SpoolIncompleteStallWindow, true
+}
+
+// logHold emits a throttled diagnostic for an in-flight-hole JUKEBOX on the
+// IN-PLACE FUSE path.
+//
+// WHY THIS EXISTS. The SPOOL path has had this diagnostic since 57d320a
+// (SpoolEntry.logInflightJukebox) and its in-place twin had none — so a read
+// held here produced a JUKEBOX with no path, no offset, and no hole geometry.
+// Measured 2026-08-17: the live log carried JUKEBOX-RATE storms of up to 90
+// nfs.Read per 15s during real Premiere exports, and ZERO diagnostic lines to
+// say which file or which offset, because every one of them came through this
+// path. An instrument that does not cover the path that storms is the same
+// defect class this codebase keeps paying for.
+//
+// Throttled ~1 line / 2s per PATH, matching the spool twin, so a retrying
+// client cannot flood the log (the JM_LOOKUP_TRACE lesson). Only ever called
+// when a read is actually being held, which is rare.
+func (t *inPlaceTracker) logHold(path string, off int64) {
+	if t.holes.Load() == 0 {
+		return
+	}
+	t.mu.Lock()
+	h, ok := t.m[path]
+	if !ok {
+		t.mu.Unlock()
+		return
+	}
+	now := time.Now()
+	if now.Sub(h.lastLog) < 2*time.Second {
+		t.mu.Unlock()
+		return
+	}
+	h.lastLog = now
+	cend, wend, lw, ft, ext := h.contiguousEnd, h.writtenEnd, h.lastWrite, h.fromTruncate, len(h.extents)
+	t.mu.Unlock()
+
+	jmlog.Warn("nfs: in-place read JUKEBOX-held (offset past contiguous prefix)",
+		"path", path, "off", off,
+		"contiguous_end", cend, "written_end", wend, "gap", wend-cend,
+		"since_last_write_ms", time.Since(lw).Milliseconds(),
+		// The discriminator: a preallocation hole persists for the whole
+		// encode, an out-of-order-write hole fills in milliseconds.
+		"from_preallocate", ft, "extents", ext)
 }
 
 // forget drops a path's record (file closed, deleted, renamed, or aged out).
