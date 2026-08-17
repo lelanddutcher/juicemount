@@ -50,6 +50,32 @@ type Drainer struct {
 	pollFallback time.Duration
 
 	sem chan struct{}
+
+	// smallSem is a SEPARATE admission lane for tiny rows (<= smallBytes).
+	//
+	// WHY A SECOND LANE RATHER THAN A BIGGER FIRST ONE. `sem` counts FILES, but
+	// the incident it exists to prevent is about BYTES: on 2026-06-14 sixteen
+	// concurrent ~66 MB Finder copies piled that many in-flight whole-file
+	// writes into juicefs's --buffer-size, the mount went readdir-unresponsive,
+	// and the watchdog SIGKILLed and remounted it. Counting files gets that
+	// wrong in one specific, measured way: a 4 KiB `._` AppleDouble sidecar
+	// takes a whole slot and blocks on a real MinIO PUT exactly like a camera
+	// master. Sidecars are 50% of all write operations (CREATE/WRITE/COMMIT are
+	// 2.00 per real file, measured 2026-08-16) and 0.0054% of the bytes beside a
+	// 72 MiB master — so half the media lane serves a rounding error.
+	//
+	// The obvious alternative — just raise Workers — is MEASURED HARMFUL and was
+	// tried: 4 -> 16 took small-file throughput from 46.0 to 40.4 files/s and p99
+	// from 328-364 ms to 372-715 ms. Widening the media lane is not the fix; it
+	// re-exposes the 2026-06-14 byte envelope for no gain.
+	//
+	// So the media lane keeps its width of 4 and its byte envelope untouched,
+	// and tiny rows stop competing for it. This is a fairness fix, not a
+	// throughput fix — F2 established that the ~50 files/s ceiling is serialized
+	// per-file work in the WRITE path, not drain width, so do not expect a large
+	// files/sec change from this.
+	smallSem   chan struct{}
+	smallBytes int64
 	// slowGate serializes drains on slow/metered links (cap 1). [cellular
 	// drain saturation 2026-07-10] 4 concurrent whole-file copies + blocking
 	// Sync saturated a cellular tunnel's uplink: FUSE fsyncs stretched past
@@ -160,6 +186,16 @@ type DrainerConfig struct {
 	// Drained files land at FuseRoot/<nfs_path>.
 	FuseRoot string
 
+	// SmallWorkers caps the SEPARATE small-row lane (see Drainer.smallSem).
+	// 0 → the default of 4; NEGATIVE disables the lane so every row uses the
+	// media semaphore, which is byte-for-byte the pre-lane behaviour.
+	//
+	// Total concurrent drains is therefore Workers + SmallWorkers, bounded in
+	// BYTES by (Workers x whatever media sizes) + (SmallWorkers x smallBytes) —
+	// the second term is at most 4 MiB by default and is why the lane does not
+	// re-open the 2026-06-14 buffer-saturation envelope.
+	SmallWorkers int
+
 	// Workers caps concurrent in-flight drains. 0 → 4.
 	Workers int
 
@@ -215,6 +251,38 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 			}
 		}
 	}
+	// Small-file lane. 8 concurrent tiny rows adds negligible byte pressure
+	// (8 x 1 MiB worst case = 8 MiB, against a media lane of 4 x 66 MB = 264 MB
+	// that the 2026-06-14 envelope already tolerated) while keeping ._ sidecars
+	// out of the media lane entirely. JM_DRAIN_SMALL_WORKERS=0 disables the lane
+	// and routes everything back through `sem` — byte-for-byte the old behaviour.
+	// Width 4, the SAME as the media lane, not wider. F2 measured that widening
+	// drain concurrency hurts: 4 -> 16 took small-file throughput from 46.0 to
+	// 40.4 files/s and p99 from 328-364 ms to 372-715 ms. So the small lane is
+	// not a speed-up, and sizing it above the width already proven good would be
+	// re-running an experiment that already failed. It exists so that a workload
+	// of media + sidecars stops spending half the media lane on 4 KiB files; a
+	// PURE small-file workload sees the same width of 4 it always had.
+	//
+	// cfg.SmallWorkers overrides: 0 means "use this default", negative disables
+	// the lane entirely (everything back through sem, byte-for-byte the old
+	// behaviour). JM_DRAIN_SMALL_WORKERS=0 also disables, for the field.
+	smallWorkers := 4
+	if cfg.SmallWorkers != 0 {
+		smallWorkers = cfg.SmallWorkers
+	}
+	if v := os.Getenv("JM_DRAIN_SMALL_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			smallWorkers = n
+		}
+	}
+	smallBytes := int64(1 << 20)
+	if v := os.Getenv("JM_DRAIN_SMALL_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			smallBytes = n
+		}
+	}
+
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 5
 	}
@@ -234,6 +302,13 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		atRestVerify: os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
 		batchInsert:  os.Getenv("JM_DRAIN_BATCH_INSERT") == "1",
 		sem:          make(chan struct{}, cfg.Workers),
+		smallSem: func() chan struct{} {
+			if smallWorkers <= 0 {
+				return nil // lane disabled; everything uses sem
+			}
+			return make(chan struct{}, smallWorkers)
+		}(),
+		smallBytes: smallBytes,
 		slowGate:     make(chan struct{}, 1),
 		notify:       make(chan struct{}, 1),
 		stop:         make(chan struct{}),
@@ -634,17 +709,24 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 	// for the UI, not "claimed but slot-blocked" count.
 	d.inFlight.Add(1)
 
+	// Lane selection. Tiny rows (._ sidecars, .prproj saves, LUTs) take the
+	// small lane so they never occupy a media slot; everything else keeps the
+	// media lane and its measured byte envelope. Chosen from the POST-CLAIM
+	// re-read row, so a rename/resize in the dispatch window cannot put a large
+	// file in the small lane.
+	lane := d.laneFor(row.Size)
+
 	select {
 	case <-d.stop:
 		d.inFlight.Done()
 		_ = d.spool.Meta().ResetToReady(row.ID)
 		return false
-	case d.sem <- struct{}{}:
+	case lane <- struct{}{}:
 	}
 
 	go func(r *metadata.SpoolRow) {
 		defer func() {
-			<-d.sem
+			<-lane
 			d.inFlight.Done()
 		}()
 		// Slow/metered link: serialize (see slowGate doc). Acquired BEFORE
@@ -665,6 +747,20 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 		d.drainOne(r)
 	}(row)
 	return true
+}
+
+// laneFor picks the admission semaphore for a row of `size` bytes.
+//
+// A row of size 0 or unknown takes the MEDIA lane. That is deliberate: the
+// small lane's whole safety argument is that its members contribute negligible
+// bytes, and a row whose size we do not trust cannot make that promise. Erring
+// toward the media lane costs a slot; erring the other way would let an
+// unbounded file into a lane sized on the assumption that nothing in it is big.
+func (d *Drainer) laneFor(size int64) chan struct{} {
+	if d.smallSem != nil && size > 0 && size <= d.smallBytes {
+		return d.smallSem
+	}
+	return d.sem
 }
 
 // drainClassGateEnabled: JM_DRAIN_CLASS_GATE=0 disables the slow-link

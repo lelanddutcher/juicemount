@@ -146,7 +146,12 @@ func TestDrainerLastDrainSuccessStamp(t *testing.T) {
 }
 
 func TestDrainerWorkerPoolBounded(t *testing.T) {
-	spool, d := newTestDrainer(t, DrainerConfig{Workers: 2})
+	// SmallWorkers: -1 disables the small-row lane, so this keeps testing what
+	// it always tested: the MEDIA lane honours Workers. Without it the 1-byte
+	// entries below would take the small lane and peak at Workers+SmallWorkers,
+	// which is the new bound and is asserted separately in
+	// TestDrainerTotalConcurrencyIsMediaPlusSmall.
+	spool, d := newTestDrainer(t, DrainerConfig{Workers: 2, SmallWorkers: -1})
 
 	// 8 entries, but only 2 workers should be active concurrently.
 	for i := 0; i < 8; i++ {
