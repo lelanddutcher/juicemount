@@ -47,13 +47,35 @@ func (fm *FUSEManager) linkAwareJuiceFSPolicy() netprofile.JuiceFSPolicy {
 			rtt := time.Since(start)
 			_ = conn.Close()
 			netprofile.Default().ObserveRTT(rtt)
-			jmlog.Info("link-aware mount probe",
-				"backend", u.Host,
-				"rtt_ms", rtt.Milliseconds(),
-				"class", netprofile.Default().Class().String())
 		}
 	}
-	return netprofile.Default().JuiceFS()
+	pol := netprofile.Default().JuiceFS()
+	snap := netprofile.Default().Snapshot()
+
+	// Log the DECISION, not just the probe. These flags are mount-time only and
+	// never re-track the class afterwards, so this line is the sole record of
+	// what the mount actually got and how much the estimator knew when it chose.
+	//
+	// class_measured matters more than class here. At mount the profile has just
+	// been restarted, so it usually has an RTT bootstrap and NO bandwidth
+	// sample, and class is BW-driven once samples exist. Measured 2026-08-16
+	// across six runs on one 10GbE link: three recorded bandwidth=0 with
+	// class_measured=false, and the observed class swung medium/fast (and the
+	// bandwidth estimate 0 -> 26 -> 1098 -> 1650 MB/s) while the mount flags
+	// stayed frozen at whatever this moment decided. A mount that came up
+	// `medium` and a runtime that reports `fast` is not a bug by itself — but it
+	// is indistinguishable from one without this line.
+	jmlog.Info("link-aware mount policy chosen",
+		"class", snap.Class.String(),
+		"class_measured", snap.HaveRTT && snap.HaveBW,
+		"have_rtt", snap.HaveRTT, "have_bandwidth", snap.HaveBW,
+		"rtt_ms", snap.RTT.Milliseconds(),
+		"bandwidth_mbps", snap.BytesPerSec/(1024*1024),
+		"bootstrapped_from_rtt", snap.BootstrappedRTT,
+		"buffer_size_mb", pol.BufferSizeMB,
+		"prefetch", pol.Prefetch,
+		"nfs_readahead", netprofile.Default().NFSReadahead())
+	return pol
 }
 
 // redactURLCreds returns a copy of `raw` with any user:password component
