@@ -202,11 +202,46 @@ func init() {
 // could otherwise hold every foreground slot... a user navigating right then
 // queued behind work nobody was waiting for"). So a background caller takes a
 // slot if one is free and otherwise gives up immediately, skipping the warm.
+// BUT "gives up immediately" IS NOT ENOUGH, and the measurement says so. Giving
+// up without waiting stops background work from QUEUING ahead of foreground; it
+// does nothing to stop background work from having already TAKEN every slot.
+// Admitting against the full width means the warmer can hold the entire gate
+// and a foreground read then spins out its 250ms and is shed as JUKEBOX.
+//
+// Measured live 2026-08-17 on WiFi, with the class narrowing the gate to 4:
+// in_use 4/4, 565 refusals and climbing, and the gate timeouts concentrated in
+// the background source — sidecar_warm 93 timeouts / 46 gate_timeouts against
+// foreground's 0 gate_timeouts across 82,842 calls. The reads that DID reach
+// FUSE then timed out (foreground 31), which conn.go turns into JUKEBOX. That
+// is the retry storm behind the stalled export and the lag before playback
+// starts.
+//
+// So background is capped at HALF the current ceiling, leaving the other half
+// permanently available to foreground. Half rather than a fixed reserve because
+// the ceiling itself moves with the link class: a fixed reserve that is
+// comfortable at width 16 leaves nothing at width 4, which is exactly the case
+// that broke. The warmer is opportunistic by construction and simply skips a
+// warm it cannot get a slot for.
+func backgroundFUSEDataWidth() int64 {
+	w := effectiveFUSEDataWidth()
+	if w < 2 {
+		// A ceiling this narrow is entirely reserved for foreground. On a
+		// metered link that is the right answer anyway: opportunistic warming
+		// is not what the user is waiting for.
+		return 0
+	}
+	return w / 2
+}
+
 func tryAcquireFUSEDataBackground() (release func(), ok bool) {
 	if !fuseDataGateEnabled {
 		return func() {}, true
 	}
-	if tryAdmitFUSEData(effectiveFUSEDataWidth()) {
+	bg := backgroundFUSEDataWidth()
+	if bg <= 0 {
+		return func() {}, false
+	}
+	if tryAdmitFUSEData(bg) {
 		return releaseFUSEData, true
 	}
 	return func() {}, false
