@@ -3523,8 +3523,27 @@ func handleDerivativesHTTP(w http.ResponseWriter, r *http.Request) {
 		// inode's sidecar on the fly so navigating to a farm-derived asset surfaces
 		// it without a manual `jmfarm -reconcile`. Best-effort + bounded (one inode,
 		// only on a miss; ingested rows are cached, so the next query hits the DB).
+		//
+		// READ VIA FUSE, NOT VIA THE NFS MOUNT. The sidecars live under
+		// .juicemount/derivatives, an INTERNAL namespace that is scan-filtered
+		// out of the metadata mirror — and the NFS server serves from that
+		// mirror. So over /Volumes/zpool the directory is empty while the same
+		// path under the FUSE mount has every manifest. Measured 2026-08-17
+		// after backfilling 26,447 sidecars: 0 derivative dirs visible via NFS,
+		// 37,255 via FUSE.
+		//
+		// This handler was the ONLY one of the three ReconcileOneSidecar call
+		// sites reading globalMountPath; bridge/thumbs.go and the manifest
+		// handler below already prefer globalFUSEPath. The failure was silent
+		// in the worst way: a sidecar that cannot be seen returns
+		// (found=false, err=nil), so there was no error to log and no warning
+		// to find — /derivatives simply answered exists:false forever and the
+		// consumer concluded the farm had produced nothing.
 		globalMu.Lock()
-		mount := globalMountPath
+		mount := globalFUSEPath
+		if mount == "" {
+			mount = globalMountPath
+		}
 		globalMu.Unlock()
 		if mount != "" {
 			if found, ferr := farm.ReconcileOneSidecar(ds, mount, inode); ferr != nil {
