@@ -76,6 +76,9 @@ type passOpts struct {
 func runPasses(po passOpts, targets []string) (processed, failed int) {
 	start := time.Now()
 	var ok, fail, thumbs, strips, waves, speech, proxies int64
+	// skippedFresh counts assets whose derivatives already matched byte-identical
+	// source — a moved or re-enqueued file that cost no re-encode.
+	var skippedFresh, sidecarsRepaired int64
 	var mu sync.Mutex
 	var firstErrs []string
 
@@ -195,6 +198,22 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 				return
 			}
 			atomic.AddInt64(&ok, 1)
+			// A move must be VISIBLE as a move. Without its own counter a skipped
+			// asset is indistinguishable from one that generated nothing, and the
+			// whole point of the freshness gate is being able to tell that a
+			// reorganised folder cost no compute.
+			if r.SkippedFresh {
+				atomic.AddInt64(&skippedFresh, 1)
+				if r.SidecarRepaired {
+					atomic.AddInt64(&sidecarsRepaired, 1)
+				}
+				if po.verbose {
+					fmt.Printf("  [skip] %-50s inode=%d unchanged (moved or re-enqueued); no re-encode%s\n",
+						filepath.Base(p), r.Inode,
+						map[bool]string{true: ", manifest repaired"}[r.SidecarRepaired])
+				}
+				return
+			}
 			if r.ThumbWrote {
 				atomic.AddInt64(&thumbs, 1)
 			}
@@ -227,8 +246,10 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d proxies — %d total\n",
 			time.Since(start).Round(time.Millisecond), ok, fail, proxies, len(targets))
 	} else {
-		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails, %d filmstrips, %d waveforms — %d total\n",
-			time.Since(start).Round(time.Millisecond), ok, fail, thumbs, strips, waves, len(targets))
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails, %d filmstrips, %d waveforms, "+
+			"%d skipped-unchanged (%d manifests repaired) — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, fail, thumbs, strips, waves,
+			skippedFresh, sidecarsRepaired, len(targets))
 	}
 	if len(firstErrs) > 0 {
 		fmt.Printf("first errors (%d shown):\n", len(firstErrs))

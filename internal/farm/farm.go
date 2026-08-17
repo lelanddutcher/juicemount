@@ -36,6 +36,24 @@ type Options struct {
 	// generate blobs for everything (old behavior). Gating blobs (not the whole
 	// asset) keeps metadata coverage while cutting the mass-sweep cost.
 	MinBlobSizeBytes int64
+
+	// RegenerateFresh forces work on an asset whose derivatives are already
+	// present and whose source is byte-identical. Default false = SKIP it.
+	//
+	// WHY THE DEFAULT IS SKIP. A job targets a DIRECTORY, and the watcher
+	// enqueues a directory whenever media settles in it — including when a
+	// folder is merely MOVED or reorganised. Without this gate Process
+	// re-encodes the poster, filmstrip and waveform for every already-derived
+	// file in that folder, every time, for content that has not changed a byte.
+	// On a shoot folder of camera masters that is minutes of CPU to reproduce
+	// artifacts that already exist.
+	//
+	// A MOVE within the volume preserves the JuiceFS inode, the size and the
+	// content, so it lands here as "known, same hash, same size" and costs one
+	// stat plus one sampled hash. A real EDIT changes the content, so the hash
+	// moves and the asset regenerates. That is the whole discriminator, and the
+	// data it needs was already being stamped on every row by stampSource.
+	RegenerateFresh bool
 }
 
 // Result is the per-file outcome (for CLI reporting / JM-15 accounting). Err is a
@@ -53,6 +71,15 @@ type Result struct {
 	WaveWrote  bool
 	Err        error
 	BlobErr    error
+
+	// SkippedFresh reports that the asset already had derivatives for
+	// byte-identical source, so nothing was re-encoded. Surfaced so a move can
+	// be SEEN as a move rather than inferred from an absence of log lines.
+	SkippedFresh bool
+	// SidecarRepaired reports that the skip still wrote a missing manifest.json.
+	// A skip must not leave an asset unindexed just because its blobs predate
+	// the sidecar emit.
+	SidecarRepaired bool
 }
 
 // derivDirFor opens (creating if needed) an asset's derivative directory and
@@ -106,6 +133,56 @@ func stampSource(row *derivatives.DerivRow, fi os.FileInfo) {
 	row.SourceMtime = &mt
 }
 
+// skipIfFresh reports whether an asset already has usable derivatives for
+// byte-identical source, and repairs a missing manifest while it is there.
+//
+// It requires ALL of:
+//   - the store knows this inode and has a recorded source hash
+//   - that hash equals the one just sampled  (content unchanged)
+//   - at least one ready derivative row, stamped with this exact source size
+//
+// Anything less regenerates. Being wrong in the SKIP direction leaves a stale
+// derivative serving fresh content, so every uncertainty resolves to "do the
+// work": an unknown inode, a missing hash, no ready rows, or a size that does
+// not match all fall through.
+//
+// The sidecar repair matters as much as the skip. An asset generated before the
+// JM-15 emit worked has blobs and rows but no manifest.json, so the consumer
+// refuses it as "not indexed". Skipping without writing that manifest would
+// leave it invisible forever, since the skip means the generate path — the only
+// other place the manifest is written — never runs again.
+func skipIfFresh(store *derivatives.Store, path string, inode uint64, hash string, size int64, opt Options) (fresh, repaired bool) {
+	known, srcHash := store.Known(inode)
+	if !known || srcHash == nil || *srcHash != hash {
+		return false, false
+	}
+	rows, err := store.Manifest(inode)
+	if err != nil || len(rows) == 0 {
+		return false, false
+	}
+	ready := 0
+	for _, r := range rows {
+		if r.Status != "ready" {
+			continue
+		}
+		// A row with no stamped size predates the read-gate and cannot vouch
+		// for the source it was made from.
+		if r.SourceSize == nil || *r.SourceSize != size {
+			return false, false
+		}
+		ready++
+	}
+	if ready == 0 {
+		return false, false
+	}
+	if opt.Mount != "" {
+		if err := WriteManifestSidecar(store, opt.Mount, inode); err == nil {
+			repaired = true
+		}
+	}
+	return true, repaired
+}
+
 // Process derives all artifacts for one file and writes them through the store:
 // source_assets (inode+hash), metadata(kind=tech), a tech manifest row, and —
 // when Options.Blobs — a poster thumbnail blob + its manifest row. Idempotent
@@ -135,6 +212,28 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		return res
 	}
 	res.Hash = hash
+
+	// FRESHNESS GATE — the move-vs-edit discriminator.
+	//
+	// Placed AFTER the sampled hash (cheap: a stat plus a few reads) and BEFORE
+	// ffprobe and every decode-heavy generator, because those are the cost. A
+	// folder that was merely MOVED re-enqueues its whole directory, and without
+	// this every already-derived file in it is re-postered, re-filmstripped and
+	// re-waveformed for content that has not changed a byte.
+	//
+	// Identical content is the test, not an identical path: a move preserves the
+	// JuiceFS inode, the size and the bytes, so it matches here; an edit changes
+	// the bytes, so the sampled hash moves and the asset regenerates. Size is
+	// checked alongside the hash because a sampled hash reads a few windows
+	// rather than the whole file — two files can share sampled windows and
+	// differ in length, and the pair is far stronger than either alone.
+	if !opt.RegenerateFresh {
+		if fresh, repaired := skipIfFresh(store, path, inode, hash, size, opt); fresh {
+			res.SkippedFresh = true
+			res.SidecarRepaired = repaired
+			return res
+		}
+	}
 
 	tech, err := Probe(opt.FFprobeBin, path, size)
 	if err != nil {
