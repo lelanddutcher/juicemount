@@ -217,6 +217,38 @@ func (s *Store) Known(inode uint64) (bool, *string) {
 	return true, nil
 }
 
+// ListKnownInodes returns every inode the store has a source row for, ascending.
+//
+// For the JM-15 sidecar BACKFILL: assets generated before the sidecar emit
+// worked have blobs on the volume and rows in this store, but no
+// manifest.json — so the consumer's reconcile refuses them as "not indexed"
+// and the whole existing corpus is invisible to it. Re-emitting a manifest is
+// a pure store-to-JSON write; it re-encodes nothing, which is what makes a
+// backfill of the entire volume cheap enough to just run.
+//
+// Returns the full set rather than a page: the corpus is tens of thousands of
+// rows, not millions, and a caller that wants to bound the work can slice it.
+func (s *Store) ListKnownInodes() ([]uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`SELECT inode FROM source_assets ORDER BY inode`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []uint64
+	for rows.Next() {
+		var ino int64
+		if err := rows.Scan(&ino); err != nil {
+			return nil, err
+		}
+		if ino > 0 {
+			out = append(out, uint64(ino))
+		}
+	}
+	return out, rows.Err()
+}
+
 // Manifest returns the derivative rows for an asset (nil slice if none).
 func (s *Store) Manifest(inode uint64) ([]DerivRow, error) {
 	s.mu.RLock()

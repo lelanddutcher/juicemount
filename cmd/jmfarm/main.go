@@ -306,6 +306,7 @@ func main() {
 		verbose   = flag.Bool("verbose", false, "per-file logging")
 		status    = flag.String("status", "", "after the sweep, write a rollup status JSON here (manager Farm tab)")
 		reconcile = flag.Bool("reconcile", false, "JM-15: ingest volume manifest.json sidecars into -db (no media processing); closes the farm→client discovery loop")
+		emitSide  = flag.Bool("emit-sidecars", false, "JM-15 BACKFILL: re-emit manifest.json for every asset already in -db (no media processing). The inverse of -reconcile: store → volume.")
 		queue     = flag.Bool("queue", false, "JM-16: standing worker — drain the shared juicefarm: queue (-meta) instead of a one-shot -root sweep")
 		meta      = flag.String("meta", "", "redis:// URL for the queue (required with -queue; the same JM_META the volume uses)")
 		// Informational governor knobs: the entrypoint actually APPLIES these via
@@ -319,6 +320,63 @@ func main() {
 
 	// JM-15 reconcile mode: walk the volume sidecars → local db, then exit. The
 	// running app serves the same db (WAL), so reconciled rows appear live.
+	// JM-15 BACKFILL. Assets generated before the sidecar emit worked have blobs
+	// on the volume and rows in the store, but no manifest.json — so the
+	// consumer's reconcile refuses them as "not indexed" and the ENTIRE existing
+	// corpus is invisible to it. Measured 2026-08-17: 26,447 known assets,
+	// 98,824 derivative rows, and ZERO manifests anywhere on the volume.
+	//
+	// This re-encodes NOTHING. WriteManifestSidecar reads the committed rows and
+	// writes one small JSON per asset, which is why backfilling the whole volume
+	// is cheap enough to simply run rather than schedule.
+	if *emitSide {
+		if *mount == "" {
+			fmt.Fprintln(os.Stderr, "jmfarm: -emit-sidecars requires -mount <volume>")
+			os.Exit(2)
+		}
+		store, err := derivatives.Open(*dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm: open %s: %v\n", *dbPath, err)
+			os.Exit(1)
+		}
+		defer store.Close()
+		inodes, err := store.ListKnownInodes()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm: list inodes: %v\n", err)
+			os.Exit(1)
+		}
+		var wrote, skipped, errs int
+		for i, ino := range inodes {
+			if *limit > 0 && wrote >= *limit {
+				break
+			}
+			// Known()==false means no source row — WriteManifestSidecar returns
+			// nil silently in that case, so count it rather than calling it and
+			// reporting a write that never happened.
+			if known, _ := store.Known(ino); !known {
+				skipped++
+				continue
+			}
+			if err := farm.WriteManifestSidecar(store, *mount, ino); err != nil {
+				errs++
+				if *verbose || errs <= 5 {
+					fmt.Fprintf(os.Stderr, "  inode %d: %v\n", ino, err)
+				}
+				continue
+			}
+			wrote++
+			if *verbose || (i%2000 == 0 && i > 0) {
+				fmt.Printf("  ... %d/%d\n", i, len(inodes))
+			}
+		}
+		fmt.Printf("jmfarm emit-sidecars: %d written, %d skipped (no source row), %d errors, of %d known assets (mount=%s db=%s)\n",
+			wrote, skipped, errs, len(inodes), *mount, *dbPath)
+		if errs > 0 {
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *reconcile {
 		if *mount == "" {
 			fmt.Fprintln(os.Stderr, "jmfarm: -reconcile requires -mount <volume>")
