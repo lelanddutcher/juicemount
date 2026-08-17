@@ -32,8 +32,15 @@ type SpoolStatusResponse struct {
 	// OldestPendingAgeSec is the age of the oldest writing/ready/
 	// draining row, so the UI can say "queued · 2h" without timestamp
 	// math. All three are LB-5 stuck-spool affordance signals.
-	StalledFiles        int   `json:"stalled_files"`
+	StalledFiles int `json:"stalled_files"`
+	// FailedFiles counts only rows that failed for a REASON WE SHOULD FIX.
+	// DeclinedFiles counts terminal rows that are a policy decision — today the
+	// derivative clobber guard preserving another producer's blob. Both are
+	// drain_state=failed underneath; splitting them is the whole point, because
+	// lumping them together made "the guard is working" look identical to "your
+	// uploads are broken" (measured: failed_files=111, every one a decline).
 	FailedFiles         int   `json:"failed_files"`
+	DeclinedFiles       int   `json:"declined_files"`
 	OldestPendingAgeSec int64 `json:"oldest_pending_age_sec"`
 	// SuspectZeroTail counts listed entries flagged suspect_zero_tail (#104):
 	// the entry finalized with unwritten hole(s) below its written size — the
@@ -257,7 +264,11 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 				fileExists = statErr == nil
 			}
 			if fileExists || now.Sub(r.UpdatedAt) <= SpoolStatusFailedRetention {
-				resp.FailedFiles++
+				if isDeclinedReason(r.LastError) {
+					resp.DeclinedFiles++
+				} else {
+					resp.FailedFiles++
+				}
 				countIfSuspect(v)
 				views = append(views, v)
 			}

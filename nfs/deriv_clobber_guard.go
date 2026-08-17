@@ -79,8 +79,36 @@ type errDerivClobber struct {
 	newSize   int64
 }
 
+// DeclinedPrefix marks a terminal disposition that is a POLICY DECISION rather
+// than a failure, so the control plane can report it as such.
+//
+// WHY THIS EXISTS. A clobber refusal is the guard working: it preserved a farm
+// artifact instead of letting a client preview replace it. But it takes the
+// same failPermanent path as a genuine error, so it lands in `failed` and
+// `failed_files` and is indistinguishable from breakage. Measured 2026-08-17:
+// after the legacy directory-ownership repair removed the permission barrier,
+// the guard became the visible one and the spool reported failed=333 /
+// failed_files=111 — every one of them a deliberate "kept the farm's 171 KB
+// waveform rather than the client's preview". The founder reasonably read that
+// as uploads still failing.
+//
+// A PREFIX on the reason rather than a new drain_state: the schema pins
+// drain_state with a CHECK constraint (spool_schema.go) and several queries
+// filter on the state set, so adding one is a migration plus an audit of every
+// filter. The disposition, retry behaviour and capacity accounting are all
+// already correct — only the REPORTING is wrong, so only the reporting changes.
+const DeclinedPrefix = "declined: "
+
+// isDeclinedReason reports whether a terminal drain reason is a POLICY DECISION
+// rather than a failure. Extracted so the classification is testable on its own:
+// inline in the status walk it had no coverage, and an attempt to neuter it
+// there broke the build instead of the assertion — an inconclusive check.
+func isDeclinedReason(reason string) bool {
+	return strings.HasPrefix(reason, DeclinedPrefix)
+}
+
 func (e *errDerivClobber) Error() string {
-	return fmt.Sprintf("refusing to overwrite %s: it belongs to uid %d (%d bytes) and this "+
+	return DeclinedPrefix + fmt.Sprintf("refusing to overwrite %s: it belongs to uid %d (%d bytes) and this "+
 		"contribution is from uid %d (%d bytes). Two producers write this tree and a "+
 		"derivative of the same kind is not necessarily the same artifact — the farm's "+
 		"waveform is full resolution where a client's is a preview. Preserving the "+
