@@ -4366,6 +4366,27 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 // an unranged GET gets 200 + Content-Length, both with Accept-Ranges: bytes.
 // That is exactly what a browser <video> and a remote AVPlayer need to seek over
 // HTTP, identical for h264/hevc/av1.
+
+// blobVouchHeaders publishes the row's own vouch on a successful /blob response.
+//
+// The consumer's D3 trust gate compares the manifest's source_size against a
+// live stat before applying identity-bearing state (embeddings, transcripts).
+// Without these it must fetch /derivatives as well as /blob for every asset —
+// two round trips to answer one question, on a link where round trips are the
+// cost model. Same values the manifest carries; no new source of truth.
+func blobVouchHeaders(w http.ResponseWriter, kind string, row derivatives.DerivRow) {
+	w.Header().Set("X-JM-Kind", kind)
+	if row.Hash != nil {
+		w.Header().Set("X-JM-Hash", *row.Hash)
+	}
+	if row.SourceSize != nil {
+		w.Header().Set("X-JM-Source-Size", strconv.FormatInt(*row.SourceSize, 10))
+	}
+	if row.SourceMtime != nil {
+		w.Header().Set("X-JM-Source-Mtime", strconv.FormatInt(*row.SourceMtime, 10))
+	}
+}
+
 func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	inode, ok := parseInodeQuery(w, r)
 	if !ok {
@@ -4414,6 +4435,15 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 	if blobRel == "" {
+		// WHY A REASON HEADER. Every miss here is a 404 with a prose body, and a
+		// consumer cannot tell "you do not serve this kind" from "the row exists
+		// but its bytes are gone" — which are opposite problems: the first is an
+		// integration bug on their side, the second is a data gap on ours.
+		// Measured 2026-08-18: 214 of 400 sampled ready rows point at a
+		// blob_rel_path with no file on the volume, so the second case is the
+		// COMMON one and was indistinguishable. The status stays 404; only the
+		// diagnosis is added.
+		w.Header().Set("X-JM-Blob-Miss", "no-ready-row")
 		http.Error(w, "no ready "+kind+" blob for this inode", http.StatusNotFound)
 		return
 	}
@@ -4434,6 +4464,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	// the stale bytes are not served from local disk after a restart either.
 	if live := liveSourceFor(inode); derivRowStale(row, live) {
 		rejectStaleDeriv(tc, inode, kind, row, live)
+		w.Header().Set("X-JM-Blob-Miss", "stale-source")
 		http.Error(w, "no ready "+kind+" blob for this inode", http.StatusNotFound)
 		return
 	}
@@ -4461,6 +4492,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 			if lf, lerr := derivatives.OpenRegularUnder(croot, crel); lerr == nil {
 				defer lf.Close()
 				if lfi, serr := lf.Stat(); serr == nil {
+					blobVouchHeaders(w, kind, row)
 					w.Header().Set("Content-Type", mediaType)
 					http.ServeContent(w, r, "", lfi.ModTime(), lf)
 					return
@@ -4474,6 +4506,10 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	// directory itself swappable for a symlink to anywhere (round-3 HIGH).
 	f, err := derivatives.OpenRegularUnder(mount, derivatives.DerivBlobRel(inode, blobRel))
 	if err != nil {
+		// The row promised this file and it is not there. Distinct from
+		// no-ready-row: the manifest ADVERTISED it, so a consumer that gated on
+		// isReadyAndFresh did everything right and still got nothing.
+		w.Header().Set("X-JM-Blob-Miss", "blob-absent")
 		http.Error(w, "blob unreadable", http.StatusNotFound)
 		return
 	}
@@ -4492,6 +4528,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 			if _, perr := tc.Put(inode, kind, bytes.NewReader(data)); perr != nil {
 				jmlog.Debug("thumb read-through populate failed", "inode", inode, "kind", kind, "error", perr.Error())
 			}
+			blobVouchHeaders(w, kind, row)
 			w.Header().Set("Content-Type", mediaType)
 			http.ServeContent(w, r, fi.Name(), fi.ModTime(), bytes.NewReader(data))
 			return
@@ -4505,6 +4542,7 @@ func handleBlobHTTP(w http.ResponseWriter, r *http.Request) {
 	// http.ServeContent sets Content-Type (we pin it from the manifest media_type),
 	// Accept-Ranges: bytes, and the full 200/206 + Content-Range/Content-Length
 	// Range machinery. modtime drives caching validators; the blob's mtime is fine.
+	blobVouchHeaders(w, kind, row)
 	w.Header().Set("Content-Type", mediaType)
 	http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
 }
