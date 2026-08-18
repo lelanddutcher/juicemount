@@ -1,0 +1,51 @@
+{
+  "name": "fuse_warm_read",
+  "unit": "MB_per_s",
+  "envelope": {
+    "schema": 1,
+    "ts": 1787083703,
+    "iso": "2026-08-18T16:08:23-0400",
+    "build_sha": "f384718",
+    "branch": "feat/spool-streaming-drain",
+    "dirty": true,
+    "host": "Leland-Mac.local",
+    "corpus": "44MiB single file",
+    "note": "macfuse=5.3.3; page cache bypassed (F_NOCACHE); read direct from FUSE, NFS server not involved",
+    "link": {
+      "class": "fast",
+      "rtt_ms": 29.44,
+      "bandwidth_mbps": 497.06790519151934,
+      "high_latency": false,
+      "have_rtt": true,
+      "have_bandwidth": true,
+      "class_measured": true
+    },
+    "control_plane_reachable": true
+  },
+  "stats": {
+    "n": 8,
+    "median": 1265.7775642952167,
+    "min": 1206.9381007294448,
+    "max": 2334.4007738589253,
+    "mean": 1394.6724934358308
+  },
+  "samples": [
+    1291.476468288501,
+    1314.3084284719093,
+    2334.4007738589253,
+    1232.919052725315,
+    1240.0786603019324,
+    1220.0655552400367,
+    1206.9381007294448,
+    1317.1929078705828
+  ],
+  "extra": {
+    "target": "Video Editing Assets/Editor Resource Vault/02-video-footage/internet-archive-prelinger/AboutBan1935 - AboutBan1935_512kb.mp4",
+    "size_bytes": 45941165,
+    "macfuse": "5.3.3",
+    "fuse_ops_delta": 2880.0,
+    "backend_get_bytes_delta": 0.0,
+    "short_reads": 0,
+    "buf_kb": 1024
+  }
+}
