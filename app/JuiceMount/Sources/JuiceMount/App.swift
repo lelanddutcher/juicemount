@@ -6,8 +6,15 @@ struct JuiceMountApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        // We're a menu bar app — no Settings scene needed (we have a custom Preferences window)
-        // Use a hidden Settings to satisfy SwiftUI's App protocol
+        // SwiftUI's App protocol requires a Scene, and a menu bar app has no
+        // main window to give it. This empty Settings scene satisfies that —
+        // but it also puts a real "Settings…" item in the app menu, and until
+        // 2026-08-18 that item opened this EmptyView: a blank 900x450 window
+        // with nothing in it. The app's actual settings live in the custom
+        // Preferences window the popover opens.
+        //
+        // AppDelegate retargets the menu item at that window on launch (see
+        // retargetSettingsMenuItem), so both routes reach the same place.
         Settings {
             EmptyView()
         }
@@ -32,6 +39,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let server = ServerController()
         self.server = server
         menuBarController = MenuBarController(server: server)
+
+        // The app menu's "Settings…" item is created by SwiftUI's Settings
+        // scene and points at an empty view. Point it at the real Preferences
+        // window instead. Done after the menu exists, on the next runloop turn,
+        // because SwiftUI installs the item during launch.
+        DispatchQueue.main.async { [weak self] in
+            self?.retargetSettingsMenuItem()
+        }
 
         // Register for hotkey if enabled. Use [weak self] to avoid pinning
         // the AppDelegate (and everything it owns) for the process lifetime.
@@ -189,6 +204,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spoolQuitWaitPanel?.orderOut(nil)
         spoolQuitWaitPanel = nil
         NSApp.reply(toApplicationShouldTerminate: quit)
+    }
+
+    /// Repoints the app menu's "Settings…" item from SwiftUI's placeholder
+    /// EmptyView scene to the real Preferences window.
+    ///
+    /// Matched by BOTH selector name and title, because neither alone is
+    /// reliable: SwiftUI does not document the selector it installs (it is not
+    /// showPreferences: on macOS 26), and the title is localized. Retried a few
+    /// times because SwiftUI installs the item during launch, after
+    /// applicationDidFinishLaunching runs.
+    private func retargetSettingsMenuItem(attempt: Int = 0) {
+        // Scan every top-level menu rather than indexing one. NSApp.mainMenu's
+        // item 0 IS the app menu -- the Apple menu appears only in the
+        // accessibility tree, not in mainMenu -- and indexing 1 quietly
+        // searched Edit instead, which is why the first attempt at this silently
+        // did nothing.
+        guard let menus = NSApp.mainMenu?.items.compactMap({ $0.submenu }), !menus.isEmpty else {
+            scheduleSettingsRetarget(attempt: attempt)
+            return
+        }
+        for item in menus.flatMap(\.items) where item.target !== self {
+            let selectorName = item.action.map(NSStringFromSelector) ?? ""
+            let title = item.title
+            let looksRight =
+                selectorName.localizedCaseInsensitiveContains("settings")
+                || selectorName.localizedCaseInsensitiveContains("preference")
+                || title.hasPrefix("Settings")
+                || title.hasPrefix("Preferences")
+            guard looksRight else { continue }
+            item.target = self
+            item.action = #selector(openPreferencesFromMenu(_:))
+            item.keyEquivalent = ","
+            item.keyEquivalentModifierMask = [.command]
+            return
+        }
+        scheduleSettingsRetarget(attempt: attempt)
+    }
+
+    private func scheduleSettingsRetarget(attempt: Int) {
+        guard attempt < 10 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.retargetSettingsMenuItem(attempt: attempt + 1)
+        }
+    }
+
+    @objc private func openPreferencesFromMenu(_ sender: Any?) {
+        menuBarController.openPreferencesWindow()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

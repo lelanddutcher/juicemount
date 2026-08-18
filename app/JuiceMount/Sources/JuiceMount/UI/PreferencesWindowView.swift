@@ -55,35 +55,27 @@ struct PreferencesWindowView: View {
                 .tabItem { Label("Maintenance", systemImage: "wrench.and.screwdriver") }
                 .tag(Tab.maintenance)
         }
-        // WIDTH ONLY. Do NOT reintroduce a height here.
+        // NO fixed size here, in EITHER axis, and do not add one back.
         //
-        // This used to be `.frame(width: 600, height: idealHeight)`, where
-        // idealHeight was a hand-maintained table that changed with the
-        // DisclosureGroup state (545 -> 615 -> 660). Paired with the window's
-        // `sizingOptions = .preferredContentSize`, that created a layout
-        // feedback loop: the frame height changed -> the hosting view's
-        // preferred size changed -> AppKit resized the window -> the hosting
-        // view re-laid-out -> SwiftUI invalidated and marked the window as
-        // needing constraint updates again -> round and round.
-        //
-        // AppKit kills the process at 141 iterations of that within one
-        // display cycle. Its own instrumentation named it exactly:
+        // The window owns its size now (see openPreferencesWindow). The content
+        // fills whatever it is given and each tab's grouped Form scrolls if it
+        // needs more room. That is deliberate: while this view declared its own
+        // size AND the window derived its size from this view, the two chased
+        // each other through SwiftUI's preferredContentSize getter until AppKit
+        // hit its 141-iteration display-cycle limit and aborted the process.
         //
         //   Marking window as needing Update Constraints in Window
         //   for identifier 2702 (limit: 141, count: 143)
         //
-        // followed by an NSException out of _postWindowNeedsUpdateConstraints
-        // and SIGABRT. Clicking either disclosure caret in Settings crashed
-        // the app every time (four crashes in eleven minutes on 2026-08-16),
-        // and because the app relaunches and re-runs a full metadata sync
-        // before the NFS server starts listening, each crash cost minutes of
-        // an unusable mount.
+        // Clicking either disclosure caret below did it every time (four
+        // crashes in eleven minutes on 2026-08-16), and it recurred on
+        // 2026-08-18 through the same getter after only the changing HEIGHT had
+        // been removed. Each crash costs minutes of unusable mount, because the
+        // app relaunches and re-runs a full metadata sync before the NFS server
+        // starts listening.
         //
-        // The cure is one authority for the height instead of two. The content
-        // reports its natural height, `.preferredContentSize` sizes the window
-        // to it once, and nothing feeds back. The width is constant, so it
-        // never participated in the loop and stays pinned.
-        .frame(width: 600)
+        // A size here would restore the second authority and with it the loop.
+        .frame(minWidth: 560, minHeight: 420)
     }
 
     // MARK: - General

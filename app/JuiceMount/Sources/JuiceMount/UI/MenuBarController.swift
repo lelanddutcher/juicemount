@@ -431,10 +431,27 @@ final class MenuBarController: NSObject {
                 break // already starting/running — nothing to do
             }
         }
-        let hosting = NSHostingController(rootView: view)
-        let window = NSWindow(contentViewController: hosting)
+        // Same shape as the Preferences window, for the same reason: a window
+        // whose size is derived from an NSHostingController re-enters SwiftUI's
+        // preferredContentSize getter during AppKit's constraint pass, and any
+        // content whose ideal height moves can then trip the 141-iteration
+        // display-cycle limit and abort the process. This window's height DOES
+        // move -- the preflight rows change as each check resolves. Converted
+        // pre-emptively on 2026-08-18 alongside the Preferences fix rather than
+        // waiting for it to crash in front of a first-run user, which is the
+        // worst possible audience for it.
+        let hosting = NSHostingView(rootView: view)
+        let contentRect = NSRect(x: 0, y: 0, width: 620, height: 600)
+        hosting.frame = contentRect
+        let window = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
         window.title = "JuiceMount Setup"
-        window.styleMask = [.titled, .closable]
+        window.minSize = NSSize(width: 560, height: 420)
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -451,22 +468,57 @@ final class MenuBarController: NSObject {
             return
         }
         let view = PreferencesWindowView(preferences: server.preferences, server: server)
-        let hosting = NSHostingController(rootView: view)
-        // Track the SwiftUI ideal size so the window hugs each tab's content.
-        // No manual setContentSize — that fought the content and left either
-        // clipped controls or dead space.
+
+        // NSHostingView, NOT NSHostingController — and the window is built
+        // from a contentRect rather than from a view controller. That is the
+        // whole fix; it is not a style preference.
         //
-        // This is only safe because the view no longer declares its own
-        // CHANGING height. When it did, the two sizing authorities chased each
-        // other until AppKit hit its 141-iteration display-cycle limit and
-        // aborted the process — see the comment on PreferencesWindowView.body.
-        hosting.sizingOptions = .preferredContentSize
-        let window = NSWindow(contentViewController: hosting)
+        // AppKit's own -[NSViewController updateViewConstraints] reads the
+        // controller's preferredContentSize while it is updating constraints.
+        // On NSHostingController that getter is not a passive read: it runs
+        // SwiftUI's sizeThatFits, which calls ViewGraph.setProposedSize, which
+        // calls graphDidChange, which calls setNeedsUpdateConstraints: on the
+        // hosting view -- back into the pass that is already running:
+        //
+        //   -[NSViewController updateViewConstraints]
+        //     -> NSHostingController.preferredContentSize.getter
+        //       -> ViewGraph.setProposedSize -> graphDidChange
+        //         -> NSHostingView.setNeedsUpdateConstraints:
+        //           -> -[NSWindow _postWindowNeedsUpdateConstraints] -> throw
+        //
+        // AppKit allows 141 of those per display cycle and then raises, which
+        // +[NSApplication _crashOnException:] turns into SIGTRAP. It killed the
+        // app again on 2026-08-18 at 10:36:56 in a build that ALREADY had the
+        // earlier fix (ea1c473) -- because that fix removed one DRIVER (a
+        // hand-maintained height that changed with the disclosure carets) while
+        // leaving the reentrant path itself in place. Anything that still moves
+        // the content's ideal height re-arms it, and two things do: the
+        // "Advanced addresses" and "Use a custom location instead" disclosure
+        // groups, and the polled spool counters whose footer text reflows.
+        //
+        // Dropping sizingOptions is NOT sufficient, because the getter is
+        // called by AppKit whether or not we opted into content sizing. With no
+        // view controller in the window there is no updateViewConstraints to
+        // call it from, so the cycle cannot start. The window owns its size;
+        // the content fills it. One authority, no feedback edge.
+        //
+        // Each tab is a .formStyle(.grouped) Form, which scrolls on macOS, so a
+        // tab taller than the window scrolls instead of clipping -- which is
+        // what made a fixed size unacceptable before.
+        let hosting = NSHostingView(rootView: view)
+        let contentRect = NSRect(x: 0, y: 0, width: 620, height: 640)
+        hosting.frame = contentRect
+        let window = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
         window.title = "JuiceMount Preferences"
-        // .resizable is a safety valve, not a feature: if a future tab (or a
-        // localized build with wrapped footers) reports a natural height taller
-        // than the screen, a fixed-size window would clip it with no way out.
-        window.styleMask = [.titled, .closable, .resizable]
+        // A floor, so the grouped forms never get squeezed to the point their
+        // labels truncate; the ceiling is the screen.
+        window.minSize = NSSize(width: 560, height: 420)
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self
