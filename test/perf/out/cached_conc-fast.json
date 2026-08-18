@@ -1,0 +1,48 @@
+{
+  "name": "cached_read_class",
+  "unit": "ms_per_full_read",
+  "envelope": {
+    "schema": 1,
+    "ts": 1787089177,
+    "iso": "2026-08-18T17:39:37-0400",
+    "build_sha": "2135b45",
+    "branch": "feat/spool-streaming-drain",
+    "dirty": true,
+    "host": "Leland-Mac.local",
+    "corpus": "44MiB cached, via NFS, concurrency=8",
+    "note": "class forced to fast; F_NOCACHE; backend GET delta 0.00 MiB (cached)",
+    "link": {
+      "class": "fast",
+      "rtt_ms": 7.387,
+      "bandwidth_mbps": 303.6862919535893,
+      "high_latency": false,
+      "have_rtt": true,
+      "have_bandwidth": true,
+      "class_measured": true
+    },
+    "control_plane_reachable": true
+  },
+  "stats": {
+    "n": 6,
+    "median": 98.63516650057136,
+    "min": 90.54283399927954,
+    "max": 130.55104200066125,
+    "mean": 104.3142638336576
+  },
+  "samples": [
+    115.89045800064923,
+    105.24250000162283,
+    130.55104200066125,
+    90.54283399927954,
+    92.02783299951989,
+    91.63091600021289
+  ],
+  "extra": {
+    "forced_class": "fast",
+    "observed_class": "fast",
+    "backend_get_bytes_delta": 0.0,
+    "size_bytes": 45941165,
+    "file": "Video Editing Assets/Editor Resource Vault/02-video-footage/internet-archive-prelinger/AboutBan1935 - AboutBan1935_512kb.mp4",
+    "concurrency": 8
+  }
+}
