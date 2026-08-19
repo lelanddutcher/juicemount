@@ -1300,7 +1300,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// /lookup); read-only + fail-closed.
 			"/derivatives":         countingManifestHandler(handleDerivativesHTTP),
 			"/derivatives/changes": handleDerivativesChangesHTTP,
-			"/metadata":            handleMetadataHTTP,
+			// JM-22 bulk manifest query: POST /derivatives/batch answers
+			// "which of these inodes do you have?" for up to 1000 inodes in one
+			// round trip. NO on-miss reconcile (unlike /derivatives) — that is
+			// what makes it cheap.
+			"/derivatives/batch": handleDerivativesBatchHTTP,
+			"/metadata":          handleMetadataHTTP,
 			// PROXY-CODEC (#50) byte-range blob delivery. GET /blob?inode=N&kind=proxy
 			// streams a derivative blob (proxy.mp4 etc.) with Accept-Ranges: bytes,
 			// answers Range with 206 + Content-Range/Content-Length, serves the
@@ -3575,6 +3580,109 @@ func handleDerivativesHTTP(w http.ResponseWriter, r *http.Request) {
 	writeContractJSON(w, resp)
 }
 
+// derivativesBatchMaxInodes caps one POST /derivatives/batch request. The
+// consumer reconciles tens of thousands of assets; 1000 keeps a single request
+// bounded (one indexed point query per inode against a local SQLite DB, no
+// filesystem work at all) while cutting the round trips by three orders of
+// magnitude.
+const derivativesBatchMaxInodes = 1000
+
+// derivativesBatchRequest is the POST /derivatives/batch body (contract JM-22).
+type derivativesBatchRequest struct {
+	Inodes []uint64 `json:"inodes"`
+}
+
+// derivativesBatchEntry is one value in the batch response map, keyed by the
+// decimal inode. ready_kinds is ALWAYS a non-nil slice (serializes as [] not
+// null) so a consumer can range over it without a nil check; source_hash is
+// null for an unknown asset and for a known one whose hash the farm has not
+// computed yet.
+//
+// ready_kinds answers "do we have a READY ROW", NOT "are the bytes on the
+// volume" — measured 2026-08-18, 214 of 400 sampled ready rows had no blob.
+// The consumer still fails open on X-JM-Blob-Miss: blob-absent at fetch time.
+// Contract (AO) Q3 option (a), chosen as the default; the ?verify=1 stat-each-
+// blob variant (option (b)) is NOT implemented.
+type derivativesBatchEntry struct {
+	ReadyKinds []string `json:"ready_kinds"`
+	SourceHash *string  `json:"source_hash"`
+}
+
+// handleDerivativesBatchHTTP serves POST /derivatives/batch (contract JM-22):
+// the bulk form of GET /derivatives?inode=N, for a consumer reconciling
+// thousands of inodes at once ("which of these does the farm already have?").
+//
+//	POST {"inodes":[48899,48908]}
+//	200  {"48899":{"ready_kinds":["poster","proxy"],"source_hash":"7f3197..."},
+//	      "48908":{"ready_kinds":[],"source_hash":null}}
+//
+// An inode the index has never heard of is reported as ready_kinds:[] — absence
+// is an answer, not an error, so one unknown asset never fails the whole batch.
+//
+// THIS ROUTE DOES NO ON-MISS RECONCILE. DO NOT ADD ONE. The single-inode route
+// deliberately runs farm.ReconcileOneSidecar on a miss (an on-the-fly read of
+// <mount>/.juicemount/derivatives/<inode>/manifest.json through FUSE) so that
+// navigating to a farm-derived asset surfaces it without a manual sweep. That
+// is right for ONE interactive lookup and catastrophic 1000 times: it would
+// turn a single indexed query into 1000 filesystem reads through the mount,
+// which is the exact cost this route exists to remove. A consumer that needs
+// the reconciling behaviour for a specific inode uses GET /derivatives?inode=N
+// for that one. Agreed with the consumer in PROVIDER_STATUS (AO) Q3.
+func handleDerivativesBatchHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req derivativesBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json body", 400)
+		return
+	}
+	// REJECT, never truncate. A silently dropped tail comes back as an ABSENT
+	// key, which a reconciling consumer reads as "the farm has nothing for
+	// these" — it would then regenerate thousands of derivatives that already
+	// exist, and nothing anywhere would report an error.
+	if len(req.Inodes) > derivativesBatchMaxInodes {
+		http.Error(w, fmt.Sprintf("too many inodes: %d (max %d per request) — page the "+
+			"reconcile. Truncating silently would answer the dropped tail as absent, "+
+			"which is indistinguishable from \"no derivatives exist\".",
+			len(req.Inodes), derivativesBatchMaxInodes), 400)
+		return
+	}
+
+	globalMu.Lock()
+	ds := globalDerivStore
+	globalMu.Unlock()
+
+	out := make(map[string]derivativesBatchEntry, len(req.Inodes))
+	for _, inode := range req.Inodes {
+		key := strconv.FormatUint(inode, 10)
+		if _, dup := out[key]; dup {
+			continue // a repeated inode costs one query, not two
+		}
+		entry := derivativesBatchEntry{ReadyKinds: []string{}}
+		// ds == nil is pre-Start / post-Stop / open-failed ⇒ fail closed with
+		// the same empty shape an unknown inode gets, never a guess or a 500.
+		if ds != nil {
+			if known, srcHash := ds.Known(inode); known {
+				entry.SourceHash = srcHash
+				rows, err := ds.Manifest(inode)
+				if err != nil {
+					jmlog.Warn("derivatives batch manifest query failed",
+						"inode", inode, "error", err.Error())
+				}
+				for _, row := range rows {
+					if row.Status == "ready" {
+						entry.ReadyKinds = append(entry.ReadyKinds, row.Kind)
+					}
+				}
+			}
+		}
+		out[key] = entry
+	}
+	writeContractJSON(w, out)
+}
+
 // handleDerivativesChangesHTTP serves GET /derivatives/changes?since=<unix> — the
 // poll-based delta feed: a JSON array [{inode,kind,status,hash,updated_at}] of
 // derivative rows with updated_at > since, ascending. OpenLoupe polls this on its
@@ -3887,6 +3995,17 @@ type registerRequest struct {
 	SourceSize  int64  `json:"source_size"`
 	SourceMtime int64  `json:"source_mtime"`
 	BlobRelPath string `json:"blob_rel_path"`
+	// BlobSize is OPTIONAL and closes the truncated-blob hole (contract (AO)
+	// Q1.2). register never reads the consumer's blob bytes — deliberately, on
+	// the reasoning that a phantom row degrades gracefully because a failed blob
+	// read makes the reader regenerate. That reasoning does not cover a blob
+	// truncated at a plausible NON-ZERO length: it passes the exists/regular/
+	// non-empty checks and mints a `ready` row over partial data, and nothing
+	// downstream detects it. We stat the blob anyway, so comparing the size the
+	// consumer vouched is free. A pointer, not an int64: absent must behave
+	// EXACTLY as it did before (no check), and 0 is a value a caller could
+	// legitimately send by accident — it must not read as "not supplied".
+	BlobSize *int64 `json:"blob_size,omitempty"`
 	// Codec is REQUIRED for a proxy kind and DECLARATIVE, not gated on a floor
 	// (founder decision 2026-08-04). derivatives.schema.json reads an ABSENT
 	// codec as h264, so silence would mislabel a richer codec rather than
@@ -4133,6 +4252,27 @@ func handleDerivativesRegisterHTTP(w http.ResponseWriter, r *http.Request) {
 				"drainer creates the destination at its final name and then copies into it, so a blob "+
 				"is legitimately 0 bytes for part of the drain window. Let the write land, then "+
 				"register.", rel),
+		})
+		return
+	}
+
+	// OPTIONAL blob-size vouch (contract (AO) Q1.2). Only when the consumer
+	// supplied one: omitting blob_size behaves exactly as before this existed.
+	//
+	// NOT RETRYABLE. A size mismatch means the bytes on the volume are not the
+	// bytes the consumer thinks it wrote — a short write, an interrupted copy,
+	// or a register that raced its own non-atomic write. Retrying the SAME
+	// request cannot change either number; the consumer must rewrite the blob
+	// (atomically: temp name + rename) and register again. Marking it retryable
+	// would burn the whole retry budget and then publish nothing.
+	if req.BlobSize != nil && *req.BlobSize != bfi.Size() {
+		writeRegisterConflict(w, registerConflict{
+			Code: "blob_truncated", Retryable: false, Inode: req.Inode,
+			Message: fmt.Sprintf("blob %q is %d bytes on disk but you vouched %d — the row would "+
+				"be published over partial data, which no reader can detect. NOT retryable: "+
+				"rewrite the blob (write to a temp name and rename() into the reserved name so "+
+				"a partial file never appears at a name we stat), then register again.",
+				rel, bfi.Size(), *req.BlobSize),
 		})
 		return
 	}
