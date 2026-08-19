@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -833,10 +834,28 @@ func (p *drainPhases) report(path string, size int64) {
 		return
 	}
 	ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
-	log.Printf("drain-phase size=%d dispatchwait=%.1f open=%.1f create=%.1f ident=%.1f "+
-		"copy=%.1f sync=%.1f close=%.1f spoolsha=%.1f atrest=%.1f chtimes=%.1f mark=%.1f path=%s",
-		size, ms(p.dispatchWait), ms(p.openSrc), ms(p.create), ms(p.identity), ms(p.copy),
-		ms(p.sync_), ms(p.close_), ms(p.spoolSHA), ms(p.atRest), ms(p.chtimes), ms(p.mark), path)
+	// jmlog, NOT the standard library's log. This report went to log.Printf,
+	// which writes to the process's stderr — and a GUI app launched by macOS has
+	// no stderr to speak of: the lines reached neither the app's own log file
+	// (which only receives jmlog) nor the unified log. So JM_DRAIN_PHASE_LOG=1
+	// ran the timing code and threw every measurement away, which is how the
+	// drain's phase breakdown stayed unmeasurable in a shipped build while the
+	// knob looked available. Same shape as the mutex profiler that was routed
+	// but never enabled, and RegenerateFresh that was read but never set.
+	jmlog.Info("drain-phase",
+		"size", size,
+		"dispatchwait_ms", ms(p.dispatchWait),
+		"open_ms", ms(p.openSrc),
+		"create_ms", ms(p.create),
+		"ident_ms", ms(p.identity),
+		"copy_ms", ms(p.copy),
+		"sync_ms", ms(p.sync_),
+		"close_ms", ms(p.close_),
+		"spoolsha_ms", ms(p.spoolSHA),
+		"atrest_ms", ms(p.atRest),
+		"chtimes_ms", ms(p.chtimes),
+		"mark_ms", ms(p.mark),
+		"path", path)
 }
 
 func drainLinkIsSlow() bool {
