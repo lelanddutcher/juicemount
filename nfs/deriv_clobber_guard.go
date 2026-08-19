@@ -116,6 +116,46 @@ func (e *errDerivClobber) Error() string {
 		e.path, e.existing, e.existSize, e.incoming, e.newSize)
 }
 
+// prepareDerivOverwrite clears the way for an overwrite the guard has ALLOWED.
+//
+// Permission to replace a directory ENTRY is not permission to write into the
+// file it names. The derivatives tree root and every directory under it are
+// owned by the desktop user, so uid 501 may create, rename and unlink there —
+// but the farm's blobs inside are root-owned mode 0644, and os.Create truncates
+// IN PLACE, which needs write permission on the FILE. So a contribution the
+// guard had just approved still died with `permission denied`: 84 of them on
+// 2026-08-19, after the resolution comparison started allowing them through.
+//
+// Unlinking first turns an in-place truncate into a directory-entry replacement,
+// which is exactly the permission the tree grants.
+//
+// The cost is a window in which neither blob exists. That is acceptable here and
+// only here: the guard has already judged the existing blob the WORSE of the
+// two, the drain recreates the destination immediately, and the farm can
+// regenerate its own artifact at any time. A crash in that window loses a blob
+// that was about to be replaced by a better one.
+//
+// Scoped tightly — derivatives tree only, existing file only, foreign owner
+// only. Our own blob does not need this (we can already write it), and nothing
+// outside the tree is touched.
+func prepareDerivOverwrite(nfsPath, dest string) error {
+	if !isDerivativeBlobPath(nfsPath) {
+		return nil
+	}
+	fi, err := os.Lstat(dest)
+	if err != nil || fi.IsDir() {
+		return nil
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || int(st.Uid) == derivClobberEUID() {
+		return nil
+	}
+	if err := os.Remove(dest); err != nil {
+		return fmt.Errorf("clearing %s for an approved overwrite: %w", nfsPath, err)
+	}
+	return nil
+}
+
 // checkDerivClobber reports an error when writing dest would replace an
 // existing derivative blob owned by someone else.
 //

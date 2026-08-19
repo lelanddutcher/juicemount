@@ -138,3 +138,61 @@ func TestDirectoryAtTheDestIsNotAClobber(t *testing.T) {
 		t.Errorf("a directory at the destination was reported as a clobber: %v", err)
 	}
 }
+
+// An APPROVED overwrite of another producer's blob must clear the path first.
+// Owning the directory is not the same as owning the file: os.Create truncates
+// in place and needs write permission on the FILE, which we do not have on a
+// root-owned 0644 blob. 84 approved contributions died on exactly this.
+func TestPrepareDerivOverwriteUnlinksAForeignBlob(t *testing.T) {
+	orig := derivClobberEUID
+	derivClobberEUID = func() int { return os.Geteuid() + 1 } // pretend it is theirs
+	defer func() { derivClobberEUID = orig }()
+
+	d := t.TempDir()
+	dest := filepath.Join(d, "waveform.json")
+	if err := os.WriteFile(dest, []byte("theirs"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rel := ".juicemount/derivatives/1/waveform.json"
+	if err := prepareDerivOverwrite(rel, dest); err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Error("the foreign blob was not cleared, so os.Create will still hit EACCES")
+	}
+}
+
+// Our OWN blob is left alone — we can already write it, and unlinking would
+// widen a window for no reason.
+func TestPrepareDerivOverwriteLeavesOurOwnBlob(t *testing.T) {
+	d := t.TempDir()
+	dest := filepath.Join(d, "waveform.json")
+	if err := os.WriteFile(dest, []byte("ours"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareDerivOverwrite(".juicemount/derivatives/1/waveform.json", dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dest); err != nil {
+		t.Error("our own blob was unlinked; only a foreign-owned one needs clearing")
+	}
+}
+
+// Nothing outside the derivatives tree is touched, whoever owns it.
+func TestPrepareDerivOverwriteIgnoresPathsOutsideTheTree(t *testing.T) {
+	orig := derivClobberEUID
+	derivClobberEUID = func() int { return os.Geteuid() + 1 }
+	defer func() { derivClobberEUID = orig }()
+
+	d := t.TempDir()
+	dest := filepath.Join(d, "ordinary.mov")
+	if err := os.WriteFile(dest, []byte("footage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareDerivOverwrite("Film Projects/ordinary.mov", dest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dest); err != nil {
+		t.Error("an ordinary file outside the derivatives tree was unlinked")
+	}
+}

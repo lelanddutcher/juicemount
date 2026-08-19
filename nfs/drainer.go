@@ -938,6 +938,14 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		return
 	}
 
+	// The guard approved this write. If the blob being replaced belongs to the
+	// other producer we must UNLINK it first: os.Create truncates in place and
+	// needs write permission on the file, which we do not have on a root-owned
+	// 0644 blob even though we own the directory.
+	if err := prepareDerivOverwrite(row.NFSPath, dest); err != nil {
+		d.failTransient(row, err)
+		return
+	}
 	dst, err := os.Create(dest)
 	if err != nil {
 		d.failTransient(row, fmt.Errorf("create dest: %w", err))
