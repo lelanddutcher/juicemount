@@ -1,6 +1,7 @@
 package farm
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -117,5 +118,96 @@ func TestSkipRepairsAMissingManifest(t *testing.T) {
 	if !repaired {
 		t.Error("the skip did not write a manifest — the asset stays 'NOT indexed' " +
 			"and the consumer never sees it, permanently")
+	}
+}
+
+// The rows are not the data.
+//
+// skipIfFresh answered from the database alone until 2026-08-18. When the
+// /jfs/.juicemount tree was wiped out of band on 2026-08-05 while the row
+// database survived (it lives outside the volume), that made a one-off loss
+// permanent: hash and size still matched, a row still said ready, so every
+// wiped asset was skipped forever — and the manifest repair inside the skip
+// then published a manifest advertising blobs that were gone. 35,623 of 67,970
+// ready rows were affected.
+func TestAbsentBlobIsNotFresh(t *testing.T) {
+	s := freshStore(t)
+	mount := t.TempDir()
+	h := "abc123"
+	if err := s.PutSource(4242, &h); err != nil {
+		t.Fatal(err)
+	}
+	rel := "poster.jpg"
+	sz := int64(1000)
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &h, SourceSize: &sz, BlobRelPath: &rel,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The row is immaculate. The blob is simply not on the volume.
+	fresh, repaired := skipIfFresh(s, "/jfs/clip.mov", 4242, h, sz, Options{Mount: mount})
+	if fresh {
+		t.Error("an asset whose blob is ABSENT was reported fresh — generation is " +
+			"skipped, and the skip then publishes a manifest for bytes that do not " +
+			"exist, which is exactly the 52% of ready rows measured on 2026-08-18")
+	}
+	if repaired {
+		t.Error("a manifest was written for an asset with no blob — that is how " +
+			"inode 48899 ended up holding nothing but a manifest.json")
+	}
+}
+
+// G2 must still hold: a MOVE changes the path, not the bytes. The blob is
+// present, so the asset is fresh and must not be re-encoded.
+func TestMovedFileWithBlobPresentStillSkips(t *testing.T) {
+	s := freshStore(t)
+	mount := t.TempDir()
+	h := "abc123"
+	if err := s.PutSource(4242, &h); err != nil {
+		t.Fatal(err)
+	}
+	rel := "poster.jpg"
+	sz := int64(1000)
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &h, SourceSize: &sz, BlobRelPath: &rel,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Materialise the blob where the row says it lives.
+	dir := filepath.Join(mount, ".juicemount", "derivatives", "4242")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, rel), []byte("jpegbytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fresh, _ := skipIfFresh(s, "/jfs/NEW/LOCATION/clip.mov", 4242, h, sz, Options{Mount: mount})
+	if !fresh {
+		t.Error("a MOVED file whose blob is present was re-encoded — the blob check " +
+			"has broken the very case G2 exists to prevent")
+	}
+}
+
+// Metadata-only rows carry no blob_rel_path. There is nothing to verify, and
+// requiring a blob for them would re-derive every asset that has one.
+func TestRowWithoutBlobPathDoesNotBlockFreshness(t *testing.T) {
+	s := freshStore(t)
+	mount := t.TempDir()
+	h := "abc123"
+	if err := s.PutSource(777, &h); err != nil {
+		t.Fatal(err)
+	}
+	sz := int64(10)
+	if err := s.PutDeriv(777, derivatives.DerivRow{
+		Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &h, SourceSize: &sz, // no BlobRelPath
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fresh, _ := skipIfFresh(s, "/jfs/x.mov", 777, h, sz, Options{Mount: mount}); !fresh {
+		t.Error("a metadata-only row (no blob_rel_path) was treated as a missing " +
+			"blob, which would re-derive every asset that has one")
 	}
 }

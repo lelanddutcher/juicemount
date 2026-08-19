@@ -175,12 +175,63 @@ func skipIfFresh(store *derivatives.Store, path string, inode uint64, hash strin
 	if ready == 0 {
 		return false, false
 	}
+	// THE ROWS ARE NOT THE DATA. Everything above proves the DATABASE believes
+	// this asset is derived; none of it proves the bytes are on the volume.
+	//
+	// On 2026-08-05 06:41:34 the whole /jfs/.juicemount tree was destroyed and
+	// re-created out of band, while the row database — which lives at
+	// /state/derivatives.db, OUTSIDE the JuiceFS volume — survived intact. The
+	// index outlived the data it indexes. A complete inventory on 2026-08-18
+	// found 35,623 of 67,970 ready rows (52.4%) pointing at a blob that is not
+	// there; proxy was 98.6% gone and ai 100%.
+	//
+	// Without this check that loss is PERMANENT and self-inflicted: hash and
+	// size still match, a row still says ready, so we skip generation — and then
+	// the manifest repair below MkdirAll's the asset directory and publishes a
+	// manifest advertising blobs that do not exist. That is exactly why inode
+	// 48899's directory contains nothing but a manifest.json dated twelve days
+	// after the wipe, and why ClipLogger's freshness gate passes and their fetch
+	// then 404s.
+	//
+	// This function was written for G2 — "a moved file must not be re-derived" —
+	// and it is still right about that: a move changes the path, not the bytes,
+	// so hash and size match and we skip. An ABSENT BLOB is the opposite case
+	// and must NOT skip.
+	if opt.Mount != "" && !blobsPresent(opt.Mount, inode, rows) {
+		return false, false
+	}
 	if opt.Mount != "" {
 		if err := WriteManifestSidecar(store, opt.Mount, inode); err == nil {
 			repaired = true
 		}
 	}
 	return true, repaired
+}
+
+// blobsPresent reports whether every ready row that CLAIMS a blob actually has
+// one on the volume.
+//
+// A stat per ready row is a real cost on a sweep (~5 rows per asset), but it is
+// the cheap side of the trade: the alternative is either re-deriving assets that
+// are genuinely fine, or — as happened — never re-deriving assets that are
+// genuinely gone. Rows with no blob_rel_path are metadata-only and are skipped;
+// there is nothing to verify.
+//
+// Fails CLOSED: any stat error, including a permission error or a wedged mount,
+// reports "not present" so the asset is regenerated rather than silently
+// published over missing bytes. Regenerating something that existed is wasted
+// compute; publishing a manifest for bytes that are gone is a lie the consumer
+// cannot detect.
+func blobsPresent(mount string, inode uint64, rows []derivatives.DerivRow) bool {
+	for _, r := range rows {
+		if r.Status != "ready" || r.BlobRelPath == nil || *r.BlobRelPath == "" {
+			continue
+		}
+		if _, err := derivatives.StatRegularUnder(mount, derivatives.DerivBlobRel(inode, *r.BlobRelPath)); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // Process derives all artifacts for one file and writes them through the store:
