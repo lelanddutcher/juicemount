@@ -22,22 +22,68 @@ func ffprobeBinFor(ffmpegBin string) string {
 	return filepath.Join(filepath.Dir(ffmpegBin), probe)
 }
 
-// audioStreamCount returns how many audio streams srcPath has (0 = no audio).
-func audioStreamCount(ffmpegBin, srcPath string) (int, error) {
+// decodableAudioOrdinals returns the `0:a:N` ordinals of the audio streams this
+// ffmpeg build can actually DECODE.
+//
+// Counting streams is not enough, and the difference is a whole class of files
+// silently losing their waveform. An iPhone .MOV recorded with spatial audio
+// carries two audio streams: an ordinary AAC mix, and a second in Apple's APAC
+// (tag `apac`), whose decoder landed in ffmpeg 7.1. On ffmpeg 7.0.2 the fold
+// filter graph names BOTH streams, the APAC leg cannot be opened —
+//
+//	Decoding requested, but no decoder found for: none
+//	Error initializing a simple filtergraph
+//
+// — and the whole command exits non-zero, so an asset with a perfectly good AAC
+// track produces no waveform at all. On 2026-08-19 that was the true cause of
+// the farm's missing waveforms, NOT the `ipcm` decode the ffmpeg 7.0.2 upgrade
+// was meant to fix.
+//
+// ffprobe reports an undecodable stream's codec_name as "none" — ffmpeg's own
+// signal that it has no decoder for it — so that is the discriminator, and it
+// keeps working when the build later gains the codec: the stream simply stops
+// being reported as "none" and rejoins the fold.
+//
+// Returning ORDINALS, not a count, is what makes skipping possible: `0:a:N`
+// addresses the Nth AUDIO stream, so dropping the second of three shifts
+// nothing — the survivors keep the ordinals ffmpeg knows them by.
+func decodableAudioOrdinals(ffmpegBin, srcPath string) ([]int, error) {
 	cmd := exec.Command(ffprobeBinFor(ffmpegBin), "-v", "error",
-		"-select_streams", "a", "-show_entries", "stream=index",
+		"-select_streams", "a", "-show_entries", "stream=codec_name",
 		"-of", "csv=p=0", srcPath)
 	out, err := cmd.Output()
 	if err != nil {
-		return 0, fmt.Errorf("ffprobe audio streams %q: %w", srcPath, err)
+		return nil, fmt.Errorf("ffprobe audio streams %q: %w", srcPath, err)
 	}
-	n := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if strings.TrimSpace(line) != "" {
-			n++
+	return parseDecodableOrdinals(string(out)), nil
+}
+
+// parseDecodableOrdinals turns ffprobe's one-codec_name-per-audio-stream CSV
+// into the ordinals of the streams that have a decoder.
+//
+// Split out from the shell-out because the shell-out is not the logic, and the
+// logic cannot otherwise be tested: synthesising a file with an audio stream
+// that the LOCAL ffmpeg cannot decode is not something a test can do with that
+// same ffmpeg, so a test built on a generated fixture silently proves nothing.
+// (It did: the first version of this check passed with the filter removed.)
+//
+// The ordinal counter advances for EVERY audio stream, decodable or not,
+// because `0:a:N` numbers all of them — skipping the increment would address
+// the wrong streams.
+func parseDecodableOrdinals(probeOut string) []int {
+	var ords []int
+	ordinal := 0
+	for _, line := range strings.Split(strings.TrimSpace(probeOut), "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" {
+			continue
 		}
+		if name != "none" && name != "unknown" {
+			ords = append(ords, ordinal)
+		}
+		ordinal++
 	}
-	return n, nil
+	return ords
 }
 
 // audioFoldArgs builds the ffmpeg arguments (everything between `-i <src>` and the
@@ -63,29 +109,43 @@ func audioStreamCount(ffmpegBin, srcPath string) (int, error) {
 // superset, not a rewrite. Persisting per-stream tech (probe.go tech.Audio[]) lets
 // the producer choose fold-vs-discrete per asset later.
 func audioFoldArgs(ffmpegBin, srcPath string, sampleRate int) (args []string, ok bool, err error) {
-	n, err := audioStreamCount(ffmpegBin, srcPath)
+	ords, err := decodableAudioOrdinals(ffmpegBin, srcPath)
 	if err != nil {
 		return nil, false, err
 	}
-	args, ok = foldArgsForCount(n, sampleRate)
+	args, ok = foldArgsForOrdinals(ords, sampleRate)
 	return args, ok, nil
 }
 
 // foldArgsForCount is the pure (no-I/O) arg builder, split out so the
 // stream-count → ffmpeg-args mapping is unit-testable without a media file.
 func foldArgsForCount(n, sampleRate int) (args []string, ok bool) {
-	if n <= 0 {
+	ords := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		ords = append(ords, i)
+	}
+	return foldArgsForOrdinals(ords, sampleRate)
+}
+
+// foldArgsForOrdinals folds the named audio stream ordinals into one mono track.
+//
+// It takes ordinals rather than a count so that undecodable streams can be left
+// out of the graph entirely (see decodableAudioOrdinals). An empty list means
+// there is nothing this build can decode, which is reported the same way as no
+// audio at all: ok=false.
+func foldArgsForOrdinals(ords []int, sampleRate int) (args []string, ok bool) {
+	if len(ords) == 0 {
 		return nil, false
 	}
 	ar := strconv.Itoa(sampleRate)
-	if n == 1 {
-		return []string{"-map", "0:a:0", "-ac", "1", "-ar", ar}, true
+	if len(ords) == 1 {
+		return []string{"-map", fmt.Sprintf("0:a:%d", ords[0]), "-ac", "1", "-ar", ar}, true
 	}
 	var legs, labels strings.Builder
-	for i := 0; i < n; i++ {
-		fmt.Fprintf(&legs, "[0:a:%d]aformat=channel_layouts=mono[a%d];", i, i)
+	for i, o := range ords {
+		fmt.Fprintf(&legs, "[0:a:%d]aformat=channel_layouts=mono[a%d];", o, i)
 		fmt.Fprintf(&labels, "[a%d]", i)
 	}
-	filter := legs.String() + labels.String() + fmt.Sprintf("amerge=inputs=%d[m]", n)
+	filter := legs.String() + labels.String() + fmt.Sprintf("amerge=inputs=%d[m]", len(ords))
 	return []string{"-filter_complex", filter, "-map", "[m]", "-ac", "1", "-ar", ar}, true
 }

@@ -145,3 +145,67 @@ func meanVolumeDB(t *testing.T, ffmpeg, path string) float64 {
 	}
 	return v
 }
+
+// AN UNDECODABLE STREAM MUST NOT COST THE WHOLE WAVEFORM.
+//
+// An iPhone .MOV shot with spatial audio carries an ordinary AAC mix plus a
+// second stream in Apple's APAC, whose decoder arrived in ffmpeg 7.1. Naming
+// both in the fold graph makes ffmpeg 7.0.2 abort the entire command — "no
+// decoder found for: none" — so an asset with a perfectly good AAC track
+// produced no waveform at all. Fold what CAN be decoded.
+func TestFoldArgsSkipUndecodableOrdinals(t *testing.T) {
+	if _, ok := foldArgsForOrdinals(nil, 16000); ok {
+		t.Fatal("no decodable stream must be ok=false, the same as no audio")
+	}
+	// Stream 1 is undecodable: the survivors are ordinals 0 and 2, and they must
+	// be addressed by THEIR OWN ordinals — renumbering them 0 and 1 would fold
+	// the undecodable stream straight back in.
+	args, ok := foldArgsForOrdinals([]int{0, 2}, 48000)
+	if !ok {
+		t.Fatal("two decodable streams must be ok")
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "[0:a:0]aformat=channel_layouts=mono[a0]") ||
+		!strings.Contains(joined, "[0:a:2]aformat=channel_layouts=mono[a1]") {
+		t.Fatalf("survivors not addressed by their own ordinals: %s", joined)
+	}
+	if strings.Contains(joined, "0:a:1") {
+		t.Fatalf("the undecodable stream is still in the graph: %s", joined)
+	}
+	if !strings.Contains(joined, "amerge=inputs=2[m]") {
+		t.Fatalf("merge must count only the survivors: %s", joined)
+	}
+	// A lone survivor takes the simple -map path, still by its own ordinal.
+	solo, ok := foldArgsForOrdinals([]int{1}, 16000)
+	if !ok || strings.Join(solo, " ") != "-map 0:a:1 -ac 1 -ar 16000" {
+		t.Fatalf("lone survivor args wrong: %v", solo)
+	}
+}
+
+// The discriminator is ffprobe's own codec_name: a stream it reports as "none"
+// is one this build has no decoder for.
+//
+// Tested on the PARSE, not on a generated file. A fixture built with the same
+// ffmpeg that then reads it can never contain a stream that ffmpeg cannot
+// decode, so a fixture-based version of this test passes whether or not the
+// filter exists — which is exactly what happened to its first draft.
+func TestParseDecodableOrdinals(t *testing.T) {
+	// The real shape of the iPhone spatial-audio case: AAC first, APAC second,
+	// reported by ffprobe 7.0.2 as having no decoder.
+	got := parseDecodableOrdinals("aac\nnone\n")
+	if len(got) != 1 || got[0] != 0 {
+		t.Fatalf("the undecodable APAC stream must be dropped and the AAC kept, got %v", got)
+	}
+	// The ordinal counter must advance across the skipped stream, or the
+	// survivors are addressed by numbers that belong to other streams.
+	got = parseDecodableOrdinals("none\npcm_s24le\nnone\npcm_s24le\n")
+	if len(got) != 2 || got[0] != 1 || got[1] != 3 {
+		t.Fatalf("survivors must keep their own ordinals, got %v", got)
+	}
+	if len(parseDecodableOrdinals("none\nnone\n")) != 0 {
+		t.Fatal("a file whose every audio stream is undecodable has no fold at all")
+	}
+	if len(parseDecodableOrdinals("")) != 0 {
+		t.Fatal("no audio streams must yield no ordinals")
+	}
+}
