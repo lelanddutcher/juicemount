@@ -1228,10 +1228,34 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					// they mean an interrupted streamed copy would hold hundreds
 					// of gigabytes of backend space indefinitely. A no-op unless
 					// streaming has actually run.
-					if err := drainer.SweepStreamPartials(); err != nil {
-						jmlog.Warn("stream partial sweep failed (proceeding anyway)",
-							"error", err.Error())
-					}
+					// OFF THE STARTUP CRITICAL PATH (2026-08-19, live incident).
+					// The sweep stats EVERY not-done spool row against the FUSE
+					// mount, serialized. That is O(pending rows) metadata round
+					// trips, and metadata is this system's slowest resource
+					// (~15 ops/s per directory). It used to run inline here —
+					// which is ~180 lines BEFORE the control plane binds — so a
+					// 16,150-row backlog from an ordinary Finder copy stopped
+					// JuiceMount from finishing startup at all: juicefs mounted,
+					// NFS listened on :11049, and :11050 never opened. The app
+					// looked hung; it was counting.
+					//
+					// The sweep must precede the DRAINER (a concurrent drain
+					// would re-create a temp this is about to delete), not the
+					// control plane. So it keeps its ordering guarantee against
+					// the drainer and gives up the one it never needed.
+					//
+					// drainer.Start() therefore moves INTO this goroutine. Stop()
+					// is safe against a drainer that was never started — its
+					// `started` flag gates the wait on d.done — so a shutdown
+					// racing a long sweep cannot hang.
+					go func() {
+						if err := drainer.SweepStreamPartials(); err != nil {
+							jmlog.Warn("stream partial sweep failed (proceeding anyway)",
+								"error", err.Error())
+						}
+						drainer.Start()
+						jmlog.Info("stream partial sweep complete — drainer started")
+					}()
 
 					globalSpool = spool
 					globalDrainer = drainer
@@ -1246,7 +1270,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					// above; safe because no prune can fire before the first
 					// keyspace/SCAN reconcile and the spool index is live now.
 					rc.SetSpoolGuard(spool.HasPending)
-					drainer.Start()
+					// drainer.Start() is deliberately NOT here — it runs in the
+					// sweep goroutine above, so the drain cannot begin until the
+					// sweep that protects it has finished.
 					used, total := spool.Capacity()
 					jmlog.Info("spool ready",
 						"dir", spoolDir,
