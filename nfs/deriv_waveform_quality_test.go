@@ -222,3 +222,47 @@ func TestMissingSampleRateFailsClosed(t *testing.T) {
 		t.Error("a document with no sample_rate was treated as comparable")
 	}
 }
+
+// A PERCENTAGE IS THE WRONG SHAPE AT SHORT DURATIONS.
+//
+// The two contributions the relative-only tolerance still refused, measured off
+// the live spool on 2026-08-19: 2.11 s against 2.00 s (5.3%) and 1.34 s against
+// 1.25 s (7.0%). Both are the same clip; the absolute disagreement is 0.11 s and
+// 0.09 s. The client just reports a coarser duration, and at one or two seconds
+// a tenth of a second is a large percentage of nothing.
+func TestShortClipsAreComparableDespiteTheRelativeTolerance(t *testing.T) {
+	d := t.TempDir()
+	for _, tc := range []struct {
+		name                 string
+		exRate, exSpp, exLen int
+		inRate, inSpp, inLen int
+	}{
+		// 2.11 s @ 99 px  vs  2.00 s @ 2,000 px  — 5.3% apart, 0.11 s
+		{"1596899", 48000, 1024, 99, 8000, 8, 2000},
+		// 1.34 s @ 63 px  vs  1.25 s @ 2,000 px  — 7.0% apart, 0.09 s
+		{"1596967", 48000, 1024, 63, 8000, 5, 2000},
+	} {
+		ex := wfRate(t, d, tc.name+"-farm.json", tc.exRate, tc.exSpp, tc.exLen)
+		in := wfRate(t, d, tc.name+"-client.json", tc.inRate, tc.inSpp, tc.inLen)
+		finer, ok := waveformIsFiner(in, ex)
+		if !ok {
+			t.Errorf("%s: judged incomparable — a tenth of a second on a ~2 s clip is not "+
+				"a different recording", tc.name)
+			continue
+		}
+		if !finer {
+			t.Errorf("%s: %d pixels lost to %d", tc.name, tc.inLen, tc.exLen)
+		}
+	}
+}
+
+// The absolute floor must not swallow the relative test on long clips: a quarter
+// second is nothing there, so genuinely different audio is still refused.
+func TestTheAbsoluteFloorDoesNotWeakenLongClips(t *testing.T) {
+	d := t.TempDir()
+	hour := wfRate(t, d, "hour.json", 48000, 1024, 149166) // ~53 min
+	clip := wfRate(t, d, "clip.json", 8000, 31, 2000)      // ~7.8 s
+	if _, ok := waveformIsFiner(clip, hour); ok {
+		t.Error("a 7.8 s waveform was compared against a 53 minute one")
+	}
+}

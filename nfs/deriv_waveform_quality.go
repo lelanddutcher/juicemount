@@ -51,6 +51,20 @@ const maxWaveformBytes = 8 << 20
 // pixel counts are then not comparable at all.
 const waveformDurationTolerance = 0.05
 
+// waveformDurationFloorSeconds is an ABSOLUTE tolerance that applies alongside
+// the relative one, because a percentage is the wrong shape at short durations.
+//
+// Measured 2026-08-19 on the two contributions the relative test alone still
+// refused: 2.11 s against 2.00 s (5.3%) and 1.34 s against 1.25 s (7.0%). Both
+// are the same clip — the absolute disagreement is 0.11 s and 0.09 s, and the
+// client simply reports a coarser duration. On a 45 s clip that same tenth of a
+// second is 0.2% and the relative test passes it without help; only short clips
+// need this, which is exactly where a percentage stops being meaningful.
+//
+// It cannot let genuinely different audio through: two waveforms whose
+// durations agree to within a quarter second are not different recordings.
+const waveformDurationFloorSeconds = 0.25
+
 // isWaveformBlob reports whether a derivative path names a waveform blob.
 func isWaveformBlob(nfsPath string) bool { return path.Base(nfsPath) == "waveform.json" }
 
@@ -118,7 +132,10 @@ func waveformIsFiner(incomingPath, existingPath string) (finer, ok bool) {
 	if a <= 0 || b <= 0 {
 		return false, false
 	}
-	if math.Abs(a-b)/math.Max(a, b) > waveformDurationTolerance {
+	// Comparable when EITHER tolerance is satisfied: the relative one carries
+	// long clips, the absolute floor carries short ones.
+	absDelta := math.Abs(a - b)
+	if absDelta/math.Max(a, b) > waveformDurationTolerance && absDelta > waveformDurationFloorSeconds {
 		return false, false // not the same audio; pixel counts are not comparable
 	}
 	return in.Length > ex.Length, true
