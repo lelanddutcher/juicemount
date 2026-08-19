@@ -127,11 +127,24 @@ func TestAppleDoubleFailsClosedOnDamage(t *testing.T) {
 	mut("entry offset past EOF", func(b []byte) { b[32] = 0xFF }) // Finder info offset high byte
 }
 
-// TestAppleDoubleKillSwitch: the env gate defaults ON and "0" turns it off.
+// TestAppleDoubleKillSwitch: the env gate defaults OFF and "1" opts in.
+//
+// The default was ON until 2026-08-19 and this test asserted that. It was
+// changed because MEASUREMENT showed the elision is counter-productive: it
+// removes the sidecar's mirror entry, the macOS NFS client then finds the ._
+// missing on its next LOOKUP and writes it again, so the sidecar is spooled and
+// drained a median of THREE times and still lands on the backend (10 files
+// copied, 11 elisions, 10 backend sidecars). The mechanism and its
+// neuter-verified predicate tests are kept; only the default moved.
 func TestAppleDoubleKillSwitch(t *testing.T) {
 	t.Setenv("JM_DRAIN_SKIP_EMPTY_SIDECARS", "")
+	if drainSkipEmptySidecarsEnabled() {
+		t.Fatal("elision must default OFF when the env var is unset — it triples " +
+			"sidecar spool work and still leaves the file on the backend")
+	}
+	t.Setenv("JM_DRAIN_SKIP_EMPTY_SIDECARS", "1")
 	if !drainSkipEmptySidecarsEnabled() {
-		t.Fatal("elision must default ON when the env var is unset")
+		t.Fatal("JM_DRAIN_SKIP_EMPTY_SIDECARS=1 must opt in to the elision")
 	}
 	t.Setenv("JM_DRAIN_SKIP_EMPTY_SIDECARS", "0")
 	if drainSkipEmptySidecarsEnabled() {
@@ -160,7 +173,10 @@ func TestSidecarNameClassificationIsShared(t *testing.T) {
 // `._` row is completed WITHOUT a backend file, and its mirror entry is handed
 // to the skip hook so the path reads as absent.
 func TestDrainerElidesEmptySidecar(t *testing.T) {
-	t.Setenv("JM_DRAIN_SKIP_EMPTY_SIDECARS", "")
+	// Pin the feature ON: this test exercises the MECHANISM, which must keep
+	// working for anyone who opts in, and must not silently pass or fail with
+	// the default.
+	t.Setenv("JM_DRAIN_SKIP_EMPTY_SIDECARS", "1")
 	spool, d := newTestDrainer(t, DrainerConfig{})
 	d.skipEmptySidecars = drainSkipEmptySidecarsEnabled()
 

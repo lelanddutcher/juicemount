@@ -718,11 +718,33 @@ func be32(b []byte) uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
-// drainSkipEmptySidecarsEnabled gates the elision. DEFAULTS ON; set
-// JM_DRAIN_SKIP_EMPTY_SIDECARS=0 to restore the old always-materialise
-// behaviour in the field without a rebuild.
+// drainSkipEmptySidecarsEnabled gates the elision. DEFAULTS **OFF** as of
+// 2026-08-19, because measurement showed it costs work and saves none.
+//
+// WHAT WAS MEASURED. With the elision ON, copying real files onto the volume:
+//
+//	10 real files copied
+//	11 sidecars elided (sidecars_skipped delta)
+//	backend afterwards: 10 real files AND 10 ._ sidecars — every one present
+//	spool COMMITs per sidecar: median 3, max 3 (n=11)
+//
+// Eliding a sidecar removes its mirror entry, so the macOS NFS client's next
+// LOOKUP finds the ._ missing and writes it AGAIN. The sidecar is spooled and
+// drained roughly three times instead of once and still lands on the backend.
+// The create is not eliminated, or even displaced — it is multiplied.
+//
+// WHY THIS WAS NOT CAUGHT EARLIER. The first test used dd-created files whose
+// sidecars carry a 286-byte resource fork, so appleDoubleIsDefaultEmpty
+// correctly REFUSED them and the elision never fired at all. A test in which
+// the feature does not run cannot show what the feature does. It also could not
+// be seen from outside the process: SidecarsSkipped was incremented and never
+// surfaced until cebcbf5 — which is what made this measurable at all.
+//
+// The predicate, the AppleDouble parser and their neuter-verified tests are kept
+// (they are correct, and the parser is reusable); only the default changes. Set
+// JM_DRAIN_SKIP_EMPTY_SIDECARS=1 to re-enable for further investigation.
 func drainSkipEmptySidecarsEnabled() bool {
-	return os.Getenv("JM_DRAIN_SKIP_EMPTY_SIDECARS") != "0"
+	return os.Getenv("JM_DRAIN_SKIP_EMPTY_SIDECARS") == "1"
 }
 
 // onSidecarSkipped is the drainer's handler-side hook for a `._` row that is
