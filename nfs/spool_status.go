@@ -15,16 +15,28 @@ import (
 // by the menu bar app + Manager UI. Exported so the Swift JSON decoder
 // can reference the same key names via tags here.
 type SpoolStatusResponse struct {
-	Enabled       bool   `json:"enabled"`
-	Error         string `json:"error,omitempty"`
-	PendingFiles  int    `json:"pending_files"`
-	PendingBytes  int64  `json:"pending_bytes"`
-	InProgress    int64  `json:"in_progress"`
-	Succeeded     int64  `json:"succeeded"`
-	Failed        int64  `json:"failed"`
-	Quarantined   int64  `json:"quarantined"`
-	CapacityUsed  int64  `json:"capacity_used"`
-	CapacityTotal int64  `json:"capacity_total"`
+	Enabled      bool   `json:"enabled"`
+	Error        string `json:"error,omitempty"`
+	PendingFiles int    `json:"pending_files"`
+	PendingBytes int64  `json:"pending_bytes"`
+	InProgress   int64  `json:"in_progress"`
+	Succeeded    int64  `json:"succeeded"`
+	Failed       int64  `json:"failed"`
+	Quarantined  int64  `json:"quarantined"`
+	// SidecarsSkipped counts ._ AppleDouble rows completed WITHOUT writing a
+	// backend file (the empty-sidecar elision, JM_DRAIN_SKIP_EMPTY_SIDECARS).
+	//
+	// Exposed because the elision was previously UNOBSERVABLE: the counter was
+	// incremented and never surfaced, so "is it firing at all, and how often?"
+	// could not be answered from outside the process. That cost a whole
+	// investigation on 2026-08-19 — sidecars kept appearing on the backend and
+	// the reasonable-sounding conclusion was that something re-created them.
+	// It had simply never fired: those sidecars carried a 286-byte resource
+	// fork, so the predicate correctly refused them. A counter you cannot read
+	// invites exactly that kind of confident wrong answer.
+	SidecarsSkipped int64 `json:"sidecars_skipped"`
+	CapacityUsed    int64 `json:"capacity_used"`
+	CapacityTotal   int64 `json:"capacity_total"`
 	// StalledFiles counts listed entries flagged Stalled (see
 	// SpoolEntryView.Stalled). FailedFiles counts the listed failed
 	// rows — i.e. failed rows still relevant to the user (recoverable
@@ -307,6 +319,7 @@ func BuildSpoolStatus(spool *SpoolStore, drainer *Drainer) (SpoolStatusResponse,
 		resp.Succeeded = m.DrainsSucceeded.Load()
 		resp.Failed = m.DrainsFailed.Load()
 		resp.Quarantined = m.Quarantined.Load()
+		resp.SidecarsSkipped = m.SidecarsSkipped.Load()
 	}
 
 	return resp, listErr

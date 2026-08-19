@@ -159,3 +159,28 @@ func TestBuildSpoolStatusWithDrainerCounters(t *testing.T) {
 		t.Errorf("InProgress=%d, want 2", resp.InProgress)
 	}
 }
+
+// The empty-sidecar elision must be OBSERVABLE from outside the process.
+//
+// It was not: SidecarsSkipped was incremented and never surfaced, so the only
+// way to answer "is it firing?" was to read the source. On 2026-08-19 that cost
+// a whole investigation — sidecars kept appearing on the backend and the
+// reasonable-sounding conclusion was that something re-created them. It had
+// simply never fired (those sidecars carried a 286-byte resource fork, so the
+// predicate correctly refused them). A counter nobody can read invites exactly
+// that kind of confident wrong answer.
+func TestSpoolStatusSurfacesSidecarsSkipped(t *testing.T) {
+	s := newTestSpoolStore(t, 0)
+	d := &Drainer{spool: s}
+	d.metrics.SidecarsSkipped.Store(7)
+
+	resp, err := BuildSpoolStatus(s, d)
+	if err != nil {
+		t.Fatalf("BuildSpoolStatus: %v", err)
+	}
+	if resp.SidecarsSkipped != 7 {
+		t.Errorf("SidecarsSkipped surfaced as %d, want 7 — the elision is "+
+			"unobservable from /spool and its real-world hit rate cannot be "+
+			"measured", resp.SidecarsSkipped)
+	}
+}
