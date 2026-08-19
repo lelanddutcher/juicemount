@@ -890,8 +890,11 @@ type Snapshot struct {
 	// how saturated the three gates got. See fuse_attrib.go.
 	FUSEAttrib FUSEAttribSnapshot `json:"fuse_attrib"`
 
-	RPCs    map[string]RPCSnapshot `json:"rpcs"`
-	Network *NetworkSnapshot       `json:"network,omitempty"`
+	RPCs map[string]RPCSnapshot `json:"rpcs"`
+	// RPCBucketBoundsUs are the upper bounds, in microseconds, of every
+	// RPCSnapshot.Buckets array. Emitted once, not per RPC type.
+	RPCBucketBoundsUs []float64        `json:"rpc_bucket_bounds_us,omitempty"`
+	Network           *NetworkSnapshot `json:"network,omitempty"`
 
 	// FUSEDataGate reports the post-panic concurrency ceiling. See
 	// FUSEDataGateSnapshot.
@@ -923,6 +926,21 @@ type RPCSnapshot struct {
 	P50Us  float64 `json:"p50_us"`
 	P95Us  float64 `json:"p95_us"`
 	P99Us  float64 `json:"p99_us"`
+
+	// Buckets is the raw latency histogram, counts per bucket, with bounds in
+	// the snapshot's RPCBucketBoundsUs. It is here so a caller can SUBTRACT two
+	// snapshots and get percentiles over just the interval between them.
+	//
+	// Every other field here is cumulative over process lifetime, which makes
+	// them unusable for measuring a change: once a process has served tens of
+	// thousands of RPCs a lifetime mean or percentile barely moves, and that
+	// inertia reads as stability. On 2026-08-19 a comparison of candidate
+	// instruments scored lifetime p95 as the steadiest of all, 1.03x spread
+	// across eight runs — which was not stability. Nearly every sample sat
+	// inside the single 20ms–50ms bucket, so p95 was reporting an interpolated
+	// bucket boundary that could not move. Deltas of these counts have no such
+	// inertia, and are exact rather than interpolated.
+	Buckets []uint64 `json:"buckets,omitempty"`
 }
 
 // Snapshot builds a self-contained metrics view.
@@ -971,7 +989,8 @@ func (r *Registry) Snapshot() Snapshot {
 
 		FUSEAttrib: r.snapshotFUSEAttrib(),
 
-		RPCs: make(map[string]RPCSnapshot, len(trackedTypes)),
+		RPCs:              make(map[string]RPCSnapshot, len(trackedTypes)),
+		RPCBucketBoundsUs: append([]float64(nil), histBuckets[:]...),
 	}
 
 	r.netMu.RLock()
@@ -1055,12 +1074,13 @@ func makeRPCSnapshot(s histogramSnapshot) RPCSnapshot {
 	}
 	mean := float64(s.SumUs) / float64(s.Count)
 	return RPCSnapshot{
-		Count:  s.Count,
-		MeanUs: mean,
-		MaxUs:  s.MaxUs,
-		P50Us:  s.percentileUs(0.50),
-		P95Us:  s.percentileUs(0.95),
-		P99Us:  s.percentileUs(0.99),
+		Count:   s.Count,
+		MeanUs:  mean,
+		MaxUs:   s.MaxUs,
+		P50Us:   s.percentileUs(0.50),
+		P95Us:   s.percentileUs(0.95),
+		P99Us:   s.percentileUs(0.99),
+		Buckets: append([]uint64(nil), s.Buckets[:]...),
 	}
 }
 
