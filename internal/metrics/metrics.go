@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -173,399 +172,35 @@ type Registry struct {
 	hists   map[RPCType]*histogram
 
 	// Global counters
-	rpcTotal   atomic.Uint64
-	rpcErrors  atomic.Uint64
-	bytesRead  atomic.Uint64
-	bytesWrite atomic.Uint64
-
-	// Read-path resilience counters. A cold JuiceFS/MinIO chunk fetch under
-	// heavy concurrent read load can return a TRANSIENT EIO that the read
-	// path now retries (cachedFile.ReadAt) instead of surfacing as NFS3ERR_IO
-	// — which the kernel turns into EIO for read() consumers and SIGBUS for
-	// mmap consumers (many NLEs mmap media → crash), with no data lost.
-	// readRetries counts retried subreads; readFails counts the ones that
-	// still failed after exhausting retries (the genuinely-bad case worth an
-	// alert). Both were SILENT before (rpc_errors stayed 0), which made the
-	// concurrent-readback SIGBUS hard to diagnose (2026-06-14).
-	readRetries atomic.Uint64
-	readFails   atomic.Uint64
-
-	// Nav-latency observability counters (WAVE 0). These are QA-35-safe:
-	// each is a single atomic.Uint64 increment on an EXISTING fork point in
-	// the readdir / lookup / read / readahead paths — never a per-RPC FUSE
-	// syscall or a hot-path lock. They exist so every nav-latency fix is
-	// gradeable by a /metrics diff instead of an external fs_usage/accesslog
-	// session (see NAV_LATENCY_DOSSIER §5).
+	rpcTotal atomic.Uint64
+	// rpcInFlight is the number of RPCs dispatched and not yet finished, and
+	// rpcInFlightMax its high-water mark.
 	//
-	// readdirMirrorHit  — a warm READDIR served from the RAM mirror fast path.
-	// readdirEmptyRefill— a zero-row (unmirrored) dir returned EMPTY + kicked
-	//                     an async refresh (the empty-then-pop-in case).
-	// readdirColdShed   — an async dir-refresh SHED because all refresh workers
-	//                     were busy (previously SILENT; grades the S3/S4 fixes).
-	readdirMirrorHit   atomic.Uint64
-	readdirEmptyRefill atomic.Uint64
-	readdirColdShed    atomic.Uint64
-
-	// lookupHit / lookupNoent — the LOOKUP resolve outcome (name resolved from
-	// the cache vs returned NoEnt). One inc per LOOKUP that reaches the
-	// child-resolution branch.
-	lookupHit   atomic.Uint64
-	lookupNoent atomic.Uint64
-
-	// readColdSubread / readWarmSubread — THE KEY grader (RC-1/RC-3). Split off
-	// the EXISTING warm/cold discriminator on the FUSE read path: a subread
-	// whose wall-clock duration crosses the same threshold ObserveThroughput
-	// uses to treat a sample as a real backend transfer (a cold MinIO GET over
-	// the link) is counted cold; a sub-threshold subread (SSD block-cache hit)
-	// is counted warm. No new syscall — the read latency is already measured
-	// for ObserveThroughput. The cold ratio is the grader for whether preview
-	// READs hit MinIO or the local SSD cache.
-	readColdSubread atomic.Uint64
-	readWarmSubread atomic.Uint64
-
-	// readQoS* — grades #4 (INSTANT-NAV read-QoS, slow/metered links only).
-	// queued = a read hit a full lane and waited; failOpen = a wait crossed
-	// its bound and proceeded ungated; prefetchShed = a readahead round was
-	// dropped because the bulk lane was contended.
-	readQoSQueued       atomic.Uint64
-	readQoSFailOpen     atomic.Uint64
-	readQoSPrefetchShed atomic.Uint64
-
-	// thumbWarm* — grades #1 (hydration pack). hydrated = posters pulled
-	// into the local thumb cache; negative = inodes with no ready thumbnail
-	// (TTL'd, not re-probed per browse); shed = a warm pass abandoned at the
-	// QoS bulk lane (interactive traffic had priority).
-	thumbWarmHydrated atomic.Uint64
-	thumbWarmNegative atomic.Uint64
-	thumbWarmShed     atomic.Uint64
-
-	// backendBlipParked — grades #9: data-plane ops re-mapped to JUKEBOX
-	// during a backend blip window instead of failing hard.
-	backendBlipParked atomic.Uint64
-
-	// sidecar* — grades the `._` AppleDouble body cache (nav crux). hit/miss on
-	// the read path; warmPopulated = sidecars pre-read by the readdir warmer.
-	sidecarCacheHit      atomic.Uint64
-	sidecarCacheMiss     atomic.Uint64
-	sidecarCachePut      atomic.Uint64
-	sidecarWarmPopulated atomic.Uint64
-
-	// readaheadTriggered / readaheadPrefetchedBlocks — grades S2. One inc per
-	// readahead schedule (SeqThreshold trip); prefetched-blocks accumulates the
-	// block count actually pulled by the background prefetch.
-	// readaheadSuppressed — one inc per SeqThreshold trip that the S2 short-run
-	// guard capped (a preview probe that would have escalated to the 64MB window
-	// but was skipped). Rising counter = the guard is doing its job.
-	readaheadTriggered        atomic.Uint64
-	readaheadPrefetchedBlocks atomic.Uint64
-	readaheadSuppressed       atomic.Uint64
-
-	// H2 stale-recovery graders (S6). FromHandle's evicted-inode recovery path
-	// (nfs/handler.go tryRecoverEvicted). Warm-mount expectation is a FLAT ~0 on
-	// all three; a spike localizes a FromHandle stale-storm. QA-35-safe — each is
-	// a single atomic increment on an EXISTING FromHandle fork point, never a new
-	// FUSE syscall or a hot-path lock.
-	//
-	// recoverLstat   — a FromHandle inode-cache MISS entered the evicted-recovery
-	//                  branch (tryRecoverEvicted): the cache-miss that may fall to
-	//                  a FUSE Lstat. The attempt/denominator counter.
-	// recoverStale   — the had-shadow STALE outcome: both recovery paths failed
-	//                  but a Layer-B shadow still existed within ShadowTTL (a
-	//                  prune/rename orphan whose handle the client still holds).
-	// recoverSuccess — the ms-cost success: an evicted inode re-confirmed via the
-	//                  FUSE Lstat and promoted back to the live cache.
-	recoverLstat   atomic.Uint64
-	recoverStale   atomic.Uint64
-	recoverSuccess atomic.Uint64
-
-	// H1 read-admission head-of-line grader (S6). The per-connection serve loop
-	// blocks acquiring the shared rpcSem before dispatching a non-WRITE RPC
-	// (internal/nfs/conn.go). When the semaphore is saturated the reader parks,
-	// head-of-line-blocking every following LOOKUP/GETATTR/READ on that mount.
-	// Graded WITHOUT a lock or a histogram: a monotonic CAS-max gauge (µs) plus
-	// two bucketed atomic counters. The admission FAST path (a free slot) records
-	// NOTHING — no time.Now(), no atomic — so the warm expectation is a literal 0
-	// and the counter adds zero measurable cost to the uncontended per-RPC path
-	// (QA-35). A fat tail here PROVES admission HOL before any readSem surgery.
-	//
-	// rpcAdmitWaitMaxUs    — monotonic max admission wait seen, µs (CAS-max gauge).
-	// rpcAdmitWaitOver1ms  — count of admissions that blocked ≥ 1ms.
-	// rpcAdmitWaitOver10ms — count of admissions that blocked ≥ 10ms.
-	rpcAdmitWaitMaxUs    atomic.Uint64
-	rpcAdmitWaitOver1ms  atomic.Uint64
-	rpcAdmitWaitOver10ms atomic.Uint64
-
-	// readdirVerifierHit / readdirFsReaddir — grades whether a paged
-	// READDIR(PLUS) scroll was served from the verifier/cookie cache
-	// (DataForVerifier hit → no ReadDir ran) or fell to a full fs.ReadDir
-	// (internal/nfs/nfs_onreaddir.go). A high fs-readdir share during a scroll =
-	// the verifier cache is missing paged reads.
-	readdirVerifierHit atomic.Uint64
-	readdirFsReaddir   atomic.Uint64
-
-	// zeroTailSuspect (#104) — a spool entry finalized with unwritten hole(s)
-	// below its written size (interrupted preallocate-then-write download: the
-	// file drains FULL-SIZE with a zero tail; Premiere black-frames it).
-	// Detection-only: the drain proceeds unchanged; this counter + the /spool
-	// per-entry flag are the surfacing. Cold-path increment (once per suspect
-	// finalize), QA-35-safe.
-	zeroTailSuspect atomic.Uint64
-
-	// FUSE metadata attribution (per-source, per-op counters + gate
-	// saturation). Fixed preallocated arrays of atomics — see fuse_attrib.go
-	// for the rationale and the hot-path cost contract. Embedded rather than
-	// spelled out here so the arrays and their provider hook live next to the
-	// enums that index them.
-	fuseAttribState
+	// Without these, "is the client pipelining?" can only be INFERRED from
+	// throughput arithmetic, and the arithmetic is ambiguous: handler p50 plus
+	// socket-write time happens to equal the observed per-RPC cost whether the
+	// two overlap or not. Measured on 2026-08-19, when a cached read saturated
+	// at 2,083 MB/s against a loopback TCP ceiling of 6,949 MB/s and there was
+	// no way to tell a shallow client queue from a serialized server.
+	rpcInFlight    atomic.Int64
+	rpcInFlightMax atomic.Int64
+	// inFlightProvider is supplied by whoever wires the NFS server, so this
+	// package does not have to import internal/nfs (which does not import this
+	// one either — the coupling runs through hooks in both directions).
+	inFlightProvider atomic.Value // func() (int64, int64)
+	rpcErrors        atomic.Uint64
+	bytesRead        atomic.Uint64
+	bytesWrite       atomic.Uint64
 
 	// Health hook — set by main.go so /health can answer accurately.
 	healthMu sync.RWMutex
 	healthFn func() HealthSnapshot
-
-	// Network hook — set by the bridge so /metrics can report the adaptive
-	// link estimate (class, RTT, bandwidth, live readahead policy). Decoupled
-	// via a provider so this package needn't import netprofile.
-	netMu sync.RWMutex
-	netFn func() *NetworkSnapshot
-
-	// FUSE data-gate hook — set by package nfs so /metrics can report the
-	// concurrency ceiling added after the 2026-08-05 double kernel panic.
-	// A provider (not counters pushed from the gate) because occupancy is a
-	// GAUGE read once per scrape: pushing it would add an atomic store to
-	// every admit/release on the FUSE data hot path, which the gate exists to
-	// keep cheap. Decoupled this way so metrics needn't import nfs (nfs
-	// already imports metrics — the reverse would be a cycle).
-	dataGateMu sync.RWMutex
-	dataGateFn func() *FUSEDataGateSnapshot
-
-	// Stall hook — set by package internal/nfs so /metrics can report live
-	// in-flight RPCs and per-op JUKEBOX totals. Same provider rationale as the
-	// data gate: the state is package-private to internal/nfs, and metrics
-	// cannot import it (internal/nfs already imports metrics).
-	stallMu sync.RWMutex
-	stallFn func() *StallSnapshot
-
-	// Backend hook — set by the bridge so /metrics can report backend-vs-cache
-	// bytes from the JuiceFS daemon's own endpoint. Scrape is lazy and
-	// throttled inside the provider; never called per-RPC.
-	backendMu sync.RWMutex
-	backendFn func() *BackendSnapshot
-
-	// Redis round-trip hook — set by package metadata.
-	redisMu sync.RWMutex
-	redisFn func() *RedisSnapshot
-
-	// FD-pool hook — set by package nfs so /metrics can report descriptor and
-	// memory-buffer occupancy. Same provider rationale as the data gate: the
-	// pool is per-handler, so it cannot be a package-level counter, and reading
-	// it once per scrape costs nothing on the serving path.
-	fdPoolMu sync.RWMutex
-	fdPoolFn func() *FDPoolSnapshot
-
-	// Keyspace-push hook — set by package metadata so /metrics can answer "is
-	// push actually delivering". Provider rather than pushed counters because
-	// the verdict is computed, and because metadata must not depend on when a
-	// scrape happens.
-	keyspaceMu sync.RWMutex
-	keyspaceFn func() *KeyspaceSnapshot
-}
-
-// KeyspaceSnapshot reports whether Redis keyspace push is delivering.
-//
-// WHY THIS IS HERE AT ALL: the question was unanswerable from the running
-// process. rc.engaged recorded the state the code INTENDED to be in; nothing
-// counted whether a single event ever arrived, so the 2026-07-10 incident
-// (notify-keyspace-events unset on the NAS, push unable to engage, a permanent
-// 30s SCAN over the tunnel) had to be diagnosed from logs.
-//
-// VERDICT CARRIES A REFUSAL. "unknown" is neither pass nor fail — it means
-// nothing was published and nothing arrived, so there was nothing to observe.
-// Reporting "working" there would be a verdict from no measurement, which is the
-// harness failure this project has been burned by repeatedly.
-type KeyspaceSnapshot struct {
-	// Verdict is working | broken | unknown | unreachable.
-	Verdict string `json:"verdict"`
-	Reason  string `json:"reason"`
-	// EventsApplied counts notifications from the REAL keyspace push feed
-	// (PSUBSCRIBE __keyspace@N__:d*). This is what the verdict keys on.
-	EventsApplied int64 `json:"events_applied"`
-	// SelfWriteEvents counts messages on the separate juicemount:metadata
-	// pub/sub channel, which replays THIS client's own writes. Reported
-	// alongside because the verdict used to key on it by mistake, and it works
-	// whether or not notify-keyspace-events is set — so events_applied == 0
-	// with self_write_events > 0 is the exact fingerprint of dead push.
-	SelfWriteEvents int64 `json:"self_write_events"`
-	// PublishedMutations is the validity DENOMINATOR: our own writes are
-	// replayed back to us, so published>0 with events==0 is conclusive.
-	PublishedMutations int64 `json:"published_mutations"`
-	// ScanPromotions counts push batches abandoned for one full-tree SCAN
-	// because the batch exceeded the burst ceiling. Non-zero on a metered link
-	// means the cheap path stopped being used at the worst possible moment.
-	ScanPromotions int64 `json:"scan_promotions"`
-}
-
-// FDPoolSnapshot reports file-descriptor and memory-buffer occupancy.
-//
-// WHY: FDPool.Stats() and MemoryBuffer.Stats() both existed and were never
-// called, and health.MemoryStats was built to carry these numbers but its
-// SetStatsProvider had no caller — so the process ran with zero fd visibility.
-// The 2026-07-28 audit measured ~1 orphaned fd per invalidation under a rename
-// storm, and there is no Setrlimit in the repo, so an fd leak would surface as
-// an unexplained abort with nothing to point at.
-//
-// Absent (nil) when no mount is up, so "not running" is never misread as
-// "running with an empty pool".
-type FDPoolSnapshot struct {
-	// Open is every pooled descriptor; Active is the subset with refCount > 0.
-	// Open climbing while Active stays flat is the orphan-leak signature.
-	Open   int `json:"open"`
-	Active int `json:"active"`
-
-	MemBufEntries int     `json:"membuf_entries"`
-	MemBufMB      float64 `json:"membuf_mb"`
-	MemBufHits    int64   `json:"membuf_hits"`
-	MemBufMisses  int64   `json:"membuf_misses"`
-	MemBufEvicts  int64   `json:"membuf_evicts"`
-}
-
-// NetworkSnapshot mirrors the netprofile link estimate for /metrics.
-type NetworkSnapshot struct {
-	Class           string  `json:"class"`
-	RTTMs           float64 `json:"rtt_ms"`
-	BandwidthMBps   float64 `json:"bandwidth_mbps"`
-	HaveRTT         bool    `json:"have_rtt"`
-	HaveBandwidth   bool    `json:"have_bandwidth"`
-	ThroughputN     int64   `json:"throughput_samples"`
-	BootstrappedRTT bool    `json:"bootstrapped_from_rtt"`
-	// HighLatency is the HYSTERETIC far-link flag, which is NOT derivable from
-	// Class or RTTMs above: it latches on at a higher RTT than it releases at,
-	// so a link oscillating around the boundary reports one stable answer. It
-	// is what actually selects warmOpTimeout, so a cellular run that behaves
-	// differently from its measured RTT is explained by this field and by
-	// nothing else in this struct.
-	HighLatency bool `json:"high_latency"`
-	// Live readahead policy derived from the class.
-	ReadaheadEnabled bool `json:"readahead_enabled"`
-	ReadaheadSeq     int  `json:"readahead_seq_threshold"`
-	ReadaheadBlocks  int  `json:"readahead_blocks_ahead"`
-	ReadaheadWorkers int  `json:"readahead_workers"`
-}
-
-// BackendSnapshot reports how much of a session actually crossed the link,
-// scraped from the JuiceFS mount daemon's own Prometheus endpoint.
-//
-// Our bytes_read counts bytes SERVED TO THE NFS CLIENT and cannot tell a byte
-// off the local SSD from a byte dragged over a cellular uplink. These counters
-// can. All are cumulative since the juicefs daemon started, so a measurement is
-// a DIFFERENCE across the window under test.
-//
-// The field is ABSENT (nil) when the daemon has not been scraped successfully.
-// It never reports zeros from a failed scrape: "0 bytes from the backend"
-// reads as a perfect cache-hit session, which is the most flattering possible
-// way to be wrong.
-type BackendSnapshot struct {
-	CacheHits      int64 `json:"cache_hits"`
-	CacheMiss      int64 `json:"cache_miss"`
-	CacheHitBytes  int64 `json:"cache_hit_bytes"`
-	CacheMissBytes int64 `json:"cache_miss_bytes"`
-	// ObjectGetBytes vs CacheMissBytes: the excess is read amplification.
-	ObjectGetBytes int64 `json:"object_get_bytes"`
-	ObjectPutBytes int64 `json:"object_put_bytes"`
-	// MetaOps counts Redis round trips — the per-FILE cost that dominates a
-	// high-RTT link, and what --open-cache exists to avoid.
-	MetaOps int64 `json:"meta_ops"`
-}
-
-// RedisSnapshot reports metadata ROUND TRIPS — the cellular cost unit.
-//
-// Not bytes: go-redis hooks see commands rather than the wire, so any byte
-// figure would be an estimate presented as a measurement. Round trips are
-// exact and are what actually costs on a high-RTT link — a 2026-07-29 session
-// at ~500ms RTT spent 67 minutes of cumulative metadata wait against only 77
-// object GETs, all of it round trips.
-type RedisSnapshot struct {
-	Commands          int64 `json:"commands"`
-	Pipelines         int64 `json:"pipelines"`
-	PipelinedCommands int64 `json:"pipelined_commands"`
-	Dials             int64 `json:"dials"`
-	Errors            int64 `json:"errors"`
-	// RoundTrips = commands + pipelines + dials. Pipelined commands are NOT
-	// added: N commands in one pipeline cost ONE trip, and counting them
-	// individually would make pipelining look expensive when it is the fix.
-	RoundTrips int64 `json:"round_trips"`
-}
-
-// StallSnapshot reports live head-of-line blocking: how many NFS RPCs are in
-// flight right now, how old the oldest is, and how many JUKEBOX replies each op
-// has sent.
-//
-// WHY THIS IS REPORTED AT ALL: both numbers were already collected and neither
-// could be read. InflightStats' own doc comment claimed it was "exposed for the
-// metrics endpoint" — it was not; its only caller was the watchdog, which
-// speaks at >=22s. snapshotJukebox had exactly one caller too, a ~15s watchdog
-// log line, and this mount runs `mutejukebox`, so a JUKEBOX storm was invisible
-// to the user AND to /metrics.
-//
-// That is precisely backwards for the case it matters in. A JUKEBOX storm is
-// the mechanism behind Finder "error 100060": the client retries one logical op
-// until its ~40s soft-mount timeout. On a fast link the storm is over before a
-// 22s watchdog looks. On cellular the operator needs to see OldestAgeMs
-// climbing toward the client timeout WHILE it climbs, not in a log after the
-// user has already given up.
-//
-// Cost is one map copy plus one mutex acquisition per /metrics scrape. Nothing
-// is added to the RPC hot path.
-type StallSnapshot struct {
-	// Inflight is the number of NFS RPCs currently being served.
-	Inflight int `json:"inflight"`
-	// OldestOp / OldestAgeMs describe the longest-running one. An age that
-	// climbs monotonically past ~10s is the signature of the 2026-08-05
-	// watchdog panic (three reads hung ~10 min while WindowServer starved).
-	OldestOp    string `json:"oldest_op,omitempty"`
-	OldestAgeMs int64  `json:"oldest_age_ms"`
-	// JukeboxByOp counts JUKEBOX replies per op since start. The completed-RPC
-	// metrics count JUKEBOX as a SUCCESS (it is a valid NFS status, not an
-	// rpc_error), so these counters are the only place a storm is visible.
-	JukeboxByOp  map[string]int64 `json:"jukebox_by_op,omitempty"`
-	JukeboxTotal int64            `json:"jukebox_total"`
-}
-
-// FUSEDataGateSnapshot mirrors the FUSE data-syscall concurrency ceiling for
-// /metrics (nfs/fusedatagate.go).
-//
-// WHY THIS IS REPORTED AT ALL: the ceiling shipped in response to two kernel
-// panics on 2026-08-05, and until this hook existed it had ZERO readers — the
-// protection was unobservable in the field, so "is it engaging?", "is it
-// shedding real work?" and "is the kill switch set?" were all unanswerable
-// after an incident. A guard nobody can measure is a guard nobody can trust.
-//
-// Width is the CURRENT ceiling, not the configured one: the gate lowers itself
-// on slow/metered links, so width moving is expected and is itself the signal
-// that class-based narrowing engaged.
-type FUSEDataGateSnapshot struct {
-	// Enabled is false when JM_FUSE_DATA_GATE=0 disabled the ceiling. Reported
-	// explicitly so a zero InUse/Width is never mistaken for an idle gate.
-	Enabled bool `json:"enabled"`
-	// InUse is the number of FUSE data syscalls admitted and not yet released.
-	InUse int `json:"in_use"`
-	// Width is the ceiling in force right now (class-dependent).
-	Width int `json:"width"`
-	// Refusals counts admissions denied since boot. A rising count means the
-	// session is saturated and work is being shed — the intended behaviour,
-	// but also the number that should correlate with any user-visible stall.
-	Refusals int64 `json:"refusals"`
 }
 
 // HealthSnapshot is the JSON-friendly payload returned by /health.
-//
-// `components` deliberately has NO `,omitempty`: handleHealth normalizes a nil
-// map to {} before encoding, so the field is ALWAYS a JSON object — never null
-// and never absent. A null or missing `components` makes the Swift HealthProbe
-// decoder throw and abort the entire decode (the same class of bug as
-// CacheStatus roots:null — the stuck offline toggle).
 type HealthSnapshot struct {
 	Healthy    bool              `json:"healthy"`
-	Components map[string]string `json:"components"`
+	Components map[string]string `json:"components,omitempty"`
 	Reason     string            `json:"reason,omitempty"`
 }
 
@@ -589,68 +224,6 @@ func (r *Registry) SetHealthProvider(fn func() HealthSnapshot) {
 	r.healthFn = fn
 }
 
-// SetNetworkProvider registers a callback used by /metrics to report the
-// adaptive link estimate. Safe to leave unset (the field is then omitted).
-func (r *Registry) SetNetworkProvider(fn func() *NetworkSnapshot) {
-	r.netMu.Lock()
-	defer r.netMu.Unlock()
-	r.netFn = fn
-}
-
-// SetFUSEDataGateProvider registers a callback used by /metrics to report the
-// FUSE data-syscall ceiling. Safe to leave unset (the field is then omitted).
-// package nfs registers this from an init() deliberately: the defect being
-// fixed here is an accessor that existed with no callers, and an init() cannot
-// be forgotten at a wiring site the way an explicit Set* call can.
-func (r *Registry) SetFUSEDataGateProvider(fn func() *FUSEDataGateSnapshot) {
-	r.dataGateMu.Lock()
-	defer r.dataGateMu.Unlock()
-	r.dataGateFn = fn
-}
-
-// SetRedisProvider registers a callback used by /metrics to report Redis
-// round trips. Safe to leave unset (the field is then omitted).
-func (r *Registry) SetRedisProvider(fn func() *RedisSnapshot) {
-	r.redisMu.Lock()
-	defer r.redisMu.Unlock()
-	r.redisFn = fn
-}
-
-// SetBackendProvider registers a callback used by /metrics to report
-// backend-vs-cache byte accounting. Safe to leave unset (the field is omitted).
-func (r *Registry) SetBackendProvider(fn func() *BackendSnapshot) {
-	r.backendMu.Lock()
-	defer r.backendMu.Unlock()
-	r.backendFn = fn
-}
-
-// SetStallProvider registers a callback used by /metrics to report live
-// in-flight RPCs and JUKEBOX totals. Safe to leave unset (the field is then
-// omitted). package internal/nfs registers this from an init() for the same
-// reason the data gate does: the defect being fixed is an accessor that existed
-// with no callers, and an init() cannot be forgotten at a wiring site.
-func (r *Registry) SetStallProvider(fn func() *StallSnapshot) {
-	r.stallMu.Lock()
-	defer r.stallMu.Unlock()
-	r.stallFn = fn
-}
-
-// SetKeyspaceProvider registers a callback used by /metrics to report keyspace
-// push health. Safe to leave unset (the field is then omitted).
-func (r *Registry) SetKeyspaceProvider(fn func() *KeyspaceSnapshot) {
-	r.keyspaceMu.Lock()
-	defer r.keyspaceMu.Unlock()
-	r.keyspaceFn = fn
-}
-
-// SetFDPoolProvider registers a callback used by /metrics to report descriptor
-// and memory-buffer occupancy. Safe to leave unset (the field is then omitted).
-func (r *Registry) SetFDPoolProvider(fn func() *FDPoolSnapshot) {
-	r.fdPoolMu.Lock()
-	defer r.fdPoolMu.Unlock()
-	r.fdPoolFn = fn
-}
-
 // histFor returns (and lazily creates) the histogram for an RPC type.
 func (r *Registry) histFor(t RPCType) *histogram {
 	r.histsMu.RLock()
@@ -668,6 +241,37 @@ func (r *Registry) histFor(t RPCType) *histogram {
 	r.hists[t] = h
 	return h
 }
+
+// SetInFlightProvider registers the source of the in-flight RPC depth. Pass nil
+// to clear it; with none registered the snapshot reports this registry's own
+// RPCStarted/RPCFinished counters instead.
+func (r *Registry) SetInFlightProvider(fn func() (int64, int64)) {
+	if fn == nil {
+		r.inFlightProvider.Store(func() (int64, int64) { return 0, 0 })
+		return
+	}
+	r.inFlightProvider.Store(fn)
+}
+
+// SetInFlightProvider registers the provider on the default registry.
+func SetInFlightProvider(fn func() (int64, int64)) { Default().SetInFlightProvider(fn) }
+
+// RPCStarted marks an RPC dispatched, returning nothing: the caller pairs it
+// with RPCFinished in a defer. The high-water mark is advanced with a CAS loop
+// rather than a plain compare-and-store, because two goroutines racing here
+// would otherwise both read the old max and the larger one could lose.
+func (r *Registry) RPCStarted() {
+	n := r.rpcInFlight.Add(1)
+	for {
+		max := r.rpcInFlightMax.Load()
+		if n <= max || r.rpcInFlightMax.CompareAndSwap(max, n) {
+			return
+		}
+	}
+}
+
+// RPCFinished marks a dispatched RPC complete.
+func (r *Registry) RPCFinished() { r.rpcInFlight.Add(-1) }
 
 // Observe records a single RPC's outcome. Pass err != nil on failure.
 func (r *Registry) Observe(t RPCType, d time.Duration, err error) {
@@ -692,227 +296,16 @@ func (r *Registry) AddBytesWritten(n int64) {
 	}
 }
 
-// IncReadRetry records that a transient cold-read EIO was retried.
-func (r *Registry) IncReadRetry() { r.readRetries.Add(1) }
-
-// IncReadFail records that a cold read still failed after exhausting retries
-// (the genuinely-bad case — bytes were surfaced to the client as an error).
-func (r *Registry) IncReadFail() { r.readFails.Add(1) }
-
-// --- Nav-latency observability counters (WAVE 0). All QA-35-safe atomics. ---
-
-// IncReaddirMirrorHit records a warm READDIR served from the RAM mirror.
-func (r *Registry) IncReaddirMirrorHit() { r.readdirMirrorHit.Add(1) }
-
-// IncReaddirEmptyRefill records a zero-row dir returned empty + async-refreshed.
-func (r *Registry) IncReaddirEmptyRefill() { r.readdirEmptyRefill.Add(1) }
-
-// IncReaddirColdShed records an async dir-refresh shed because all workers were
-// busy (previously silent — the grader for the S3/S4 refresh fixes).
-func (r *Registry) IncReaddirColdShed() { r.readdirColdShed.Add(1) }
-
-// IncLookupHit records a LOOKUP whose child name resolved.
-func (r *Registry) IncLookupHit() { r.lookupHit.Add(1) }
-
-// IncLookupNoent records a LOOKUP that returned NoEnt (name not present).
-func (r *Registry) IncLookupNoent() { r.lookupNoent.Add(1) }
-
-// IncReadColdSubread records a FUSE subread served cold (real backend/MinIO GET
-// over the link) — see the discriminator in cachedFile.ReadAt.
-func (r *Registry) IncReadColdSubread() { r.readColdSubread.Add(1) }
-
-// IncReadWarmSubread records a FUSE subread served warm (local SSD block cache).
-func (r *Registry) IncReadWarmSubread() { r.readWarmSubread.Add(1) }
-
-// IncReadQoSQueued records a read that found its QoS lane full and waited.
-func (r *Registry) IncReadQoSQueued() { r.readQoSQueued.Add(1) }
-
-// IncReadQoSFailOpen records a QoS wait that crossed its bound and proceeded
-// ungated (the fail-open guarantee — shaping degraded, nothing broke).
-func (r *Registry) IncReadQoSFailOpen() { r.readQoSFailOpen.Add(1) }
-
-// IncReadQoSPrefetchShed records a readahead round dropped because the bulk
-// lane was contended (bandwidth handed back to interactive reads).
-func (r *Registry) IncReadQoSPrefetchShed() { r.readQoSPrefetchShed.Add(1) }
-
-// IncThumbWarmHydrated records one thumbnail blob hydrated into the local cache.
-func (r *Registry) IncThumbWarmHydrated() { r.thumbWarmHydrated.Add(1) }
-
-// IncThumbWarmNegative records an inode found to have no ready thumbnail.
-func (r *Registry) IncThumbWarmNegative() { r.thumbWarmNegative.Add(1) }
-
-// IncThumbWarmShed records a warm pass abandoned at the read-QoS bulk lane.
-func (r *Registry) IncThumbWarmShed() { r.thumbWarmShed.Add(1) }
-
-// IncBackendBlipParked records a data-plane op parked (JUKEBOX) across a
-// backend blip instead of failing hard.
-func (r *Registry) IncBackendBlipParked() { r.backendBlipParked.Add(1) }
-
-// IncSidecarCacheHit records a `._` sidecar read served from the RAM cache.
-func (r *Registry) IncSidecarCacheHit() { r.sidecarCacheHit.Add(1) }
-
-// IncSidecarCacheMiss records a `._` sidecar read that fell through to FUSE.
-func (r *Registry) IncSidecarCacheMiss() { r.sidecarCacheMiss.Add(1) }
-
-// IncSidecarCachePut records a complete `._` body inserted into the cache.
-func (r *Registry) IncSidecarCachePut() { r.sidecarCachePut.Add(1) }
-
-// IncSidecarWarmPopulated records a `._` sidecar pre-read by the readdir warmer.
-func (r *Registry) IncSidecarWarmPopulated() { r.sidecarWarmPopulated.Add(1) }
-
-// IncReadaheadTriggered records one readahead schedule (SeqThreshold trip).
-func (r *Registry) IncReadaheadTriggered() { r.readaheadTriggered.Add(1) }
-
-// AddReadaheadPrefetchedBlocks adds the count of blocks a prefetch pass pulled.
-func (r *Registry) AddReadaheadPrefetchedBlocks(n int64) {
-	if n > 0 {
-		r.readaheadPrefetchedBlocks.Add(uint64(n))
-	}
-}
-
-// IncReadaheadSuppressed records a SeqThreshold trip that the S2 short-run guard
-// capped instead of escalating to the full prefetch window (a preview probe).
-func (r *Registry) IncReadaheadSuppressed() { r.readaheadSuppressed.Add(1) }
-
-// --- H2 stale-recovery graders (S6). QA-35-safe atomics on FromHandle. ---
-
-// IncRecoverLstat records a FromHandle inode-cache miss that entered the
-// evicted-inode recovery branch (tryRecoverEvicted) — the attempt/denominator
-// counter for the H2 stale-recovery path.
-func (r *Registry) IncRecoverLstat() { r.recoverLstat.Add(1) }
-
-// IncRecoverStale records a had-shadow STALE outcome: FromHandle recovery failed
-// but a Layer-B shadow still existed within ShadowTTL (a prune/rename orphan the
-// client still holds a handle for).
-func (r *Registry) IncRecoverStale() { r.recoverStale.Add(1) }
-
-// IncRecoverSuccess records an evicted inode re-confirmed via the FUSE Lstat and
-// promoted back to the live cache — the ms-cost recovery success case.
-func (r *Registry) IncRecoverSuccess() { r.recoverSuccess.Add(1) }
-
-// --- H1 read-admission head-of-line grader (S6). Atomic-only, no lock. ---
-
-// ObserveAdmitWait records how long the per-connection serve loop blocked
-// acquiring the rpcSem admission slot. Callers MUST invoke it ONLY when the
-// acquire actually blocked — a zero-wait fast-path acquire records nothing, so
-// the uncontended per-RPC path pays no cost at all. Mechanism: a monotonic
-// CAS-max gauge plus two threshold buckets — all atomic, never a lock or a
-// syscall. A sub-microsecond wait (rounds to 0 µs) is dropped by the us<=0 guard.
-func (r *Registry) ObserveAdmitWait(d time.Duration) {
-	us := d.Microseconds()
-	if us <= 0 {
-		return
-	}
-	uus := uint64(us)
-	for {
-		cur := r.rpcAdmitWaitMaxUs.Load()
-		if uus <= cur {
-			break
-		}
-		if r.rpcAdmitWaitMaxUs.CompareAndSwap(cur, uus) {
-			break
-		}
-	}
-	if d >= time.Millisecond {
-		r.rpcAdmitWaitOver1ms.Add(1)
-	}
-	if d >= 10*time.Millisecond {
-		r.rpcAdmitWaitOver10ms.Add(1)
-	}
-}
-
-// --- Paged-readdir cache grader (S6). ---
-
-// IncReaddirVerifierHit records a READDIR(PLUS) served from the verifier/cookie
-// cache (DataForVerifier hit — no fs.ReadDir ran).
-func (r *Registry) IncReaddirVerifierHit() { r.readdirVerifierHit.Add(1) }
-
-// IncReaddirFsReaddir records a READDIR(PLUS) that fell to a full fs.ReadDir.
-func (r *Registry) IncReaddirFsReaddir() { r.readdirFsReaddir.Add(1) }
-
-// IncZeroTailSuspect records a spool entry that finalized with unwritten
-// hole(s) below its written size — the interrupted preallocate-then-write
-// download signature (#104). Detection-only; the drain is never gated on it.
-func (r *Registry) IncZeroTailSuspect() { r.zeroTailSuspect.Add(1) }
-
 // Snapshot is the JSON shape returned by /metrics.
 type Snapshot struct {
-	UptimeSec    int64  `json:"uptime_sec"`
-	RPCTotal     uint64 `json:"rpc_total"`
-	RPCErrors    uint64 `json:"rpc_errors"`
-	BytesRead    uint64 `json:"bytes_read"`
-	BytesWritten uint64 `json:"bytes_written"`
-	ReadRetries  uint64 `json:"read_retries"`
-	ReadFails    uint64 `json:"read_fails"`
-
-	// Nav-latency observability counters (WAVE 0). See NAV_LATENCY_DOSSIER §5.
-	ReaddirMirrorHit          uint64 `json:"readdir_mirror_hit"`
-	ReaddirEmptyRefill        uint64 `json:"readdir_empty_refill"`
-	ReaddirColdShed           uint64 `json:"readdir_cold_shed"`
-	LookupHit                 uint64 `json:"lookup_hit"`
-	LookupNoent               uint64 `json:"lookup_noent"`
-	ReadColdSubread           uint64 `json:"read_cold_subread"`
-	ReadWarmSubread           uint64 `json:"read_warm_subread"`
-	ReadQoSQueued             uint64 `json:"read_qos_queued"`
-	ReadQoSFailOpen           uint64 `json:"read_qos_fail_open"`
-	ReadQoSPrefetchShed       uint64 `json:"read_qos_prefetch_shed"`
-	ThumbWarmHydrated         uint64 `json:"thumb_warm_hydrated"`
-	ThumbWarmNegative         uint64 `json:"thumb_warm_negative"`
-	ThumbWarmShed             uint64 `json:"thumb_warm_shed"`
-	BackendBlipParked         uint64 `json:"backend_blip_parked"`
-	SidecarCacheHit           uint64 `json:"sidecar_cache_hit"`
-	SidecarCacheMiss          uint64 `json:"sidecar_cache_miss"`
-	SidecarCachePut           uint64 `json:"sidecar_cache_put"`
-	SidecarWarmPopulated      uint64 `json:"sidecar_warm_populated"`
-	ReadaheadTriggered        uint64 `json:"readahead_triggered"`
-	ReadaheadPrefetchedBlocks uint64 `json:"readahead_prefetched_blocks"`
-	ReadaheadSuppressed       uint64 `json:"readahead_suppressed"`
-
-	// H1/H2 nav-latency graders (S6). See NAV_LATENCY_DOSSIER §5-6.
-	// recover_* grade FromHandle stale-recovery (H2); rpc_admit_wait_* grade
-	// read-admission head-of-line block (H1); readdir_verifier_hit /
-	// readdir_fs_readdir grade paged-readdir cache service.
-	RecoverLstat         uint64 `json:"recover_lstat_total"`
-	RecoverStale         uint64 `json:"recover_stale_total"`
-	RecoverSuccess       uint64 `json:"recover_success_total"`
-	RPCAdmitWaitUs       uint64 `json:"rpc_admit_wait_us"`
-	RPCAdmitWaitOver1ms  uint64 `json:"rpc_admit_wait_over_1ms"`
-	RPCAdmitWaitOver10ms uint64 `json:"rpc_admit_wait_over_10ms"`
-	ReaddirVerifierHit   uint64 `json:"readdir_verifier_hit"`
-	ReaddirFsReaddir     uint64 `json:"readdir_fs_readdir"`
-
-	// Spool zero-tail detection (#104): entries that finalized with unwritten
-	// hole(s) below their written size (drained full-size with zero tails).
-	ZeroTailSuspect uint64 `json:"zero_tail_suspect_total"`
-
-	// FUSE metadata attribution: WHO issued each bounded FUSE metadata
-	// syscall, what it cost, how much of that was queueing for a gate, and
-	// how saturated the three gates got. See fuse_attrib.go.
-	FUSEAttrib FUSEAttribSnapshot `json:"fuse_attrib"`
-
-	RPCs    map[string]RPCSnapshot `json:"rpcs"`
-	Network *NetworkSnapshot       `json:"network,omitempty"`
-
-	// FUSEDataGate reports the post-panic concurrency ceiling. See
-	// FUSEDataGateSnapshot.
-	FUSEDataGate *FUSEDataGateSnapshot `json:"fuse_data_gate,omitempty"`
-
-	// FDPool reports descriptor + memory-buffer occupancy. See FDPoolSnapshot.
-	FDPool *FDPoolSnapshot `json:"fd_pool,omitempty"`
-
-	// Keyspace reports whether Redis keyspace push is delivering. See
-	// KeyspaceSnapshot.
-	Keyspace *KeyspaceSnapshot `json:"keyspace,omitempty"`
-
-	// Stall reports live head-of-line blocking. See StallSnapshot.
-	Stall *StallSnapshot `json:"stall,omitempty"`
-
-	// Backend reports bytes that actually crossed to the object store, versus
-	// bytes served from the local block cache. See BackendSnapshot.
-	Backend *BackendSnapshot `json:"backend,omitempty"`
-
-	// Redis reports metadata round trips. See RedisSnapshot.
-	Redis *RedisSnapshot `json:"redis,omitempty"`
+	UptimeSec      int64                  `json:"uptime_sec"`
+	RPCTotal       uint64                 `json:"rpc_total"`
+	RPCInFlight    int64                  `json:"rpc_in_flight"`
+	RPCInFlightMax int64                  `json:"rpc_in_flight_max"`
+	RPCErrors      uint64                 `json:"rpc_errors"`
+	BytesRead      uint64                 `json:"bytes_read"`
+	BytesWritten   uint64                 `json:"bytes_written"`
+	RPCs           map[string]RPCSnapshot `json:"rpcs"`
 }
 
 // RPCSnapshot is the per-RPC JSON shape.
@@ -927,100 +320,19 @@ type RPCSnapshot struct {
 
 // Snapshot builds a self-contained metrics view.
 func (r *Registry) Snapshot() Snapshot {
+	cur, max := r.rpcInFlight.Load(), r.rpcInFlightMax.Load()
+	if fn, ok := r.inFlightProvider.Load().(func() (int64, int64)); ok && fn != nil {
+		cur, max = fn()
+	}
 	out := Snapshot{
-		UptimeSec:    int64(time.Since(r.startedAt).Seconds()),
-		RPCTotal:     r.rpcTotal.Load(),
-		RPCErrors:    r.rpcErrors.Load(),
-		BytesRead:    r.bytesRead.Load(),
-		BytesWritten: r.bytesWrite.Load(),
-		ReadRetries:  r.readRetries.Load(),
-		ReadFails:    r.readFails.Load(),
-
-		ReaddirMirrorHit:          r.readdirMirrorHit.Load(),
-		ReaddirEmptyRefill:        r.readdirEmptyRefill.Load(),
-		ReaddirColdShed:           r.readdirColdShed.Load(),
-		LookupHit:                 r.lookupHit.Load(),
-		LookupNoent:               r.lookupNoent.Load(),
-		ReadColdSubread:           r.readColdSubread.Load(),
-		ReadWarmSubread:           r.readWarmSubread.Load(),
-		ReadQoSQueued:             r.readQoSQueued.Load(),
-		ReadQoSFailOpen:           r.readQoSFailOpen.Load(),
-		ReadQoSPrefetchShed:       r.readQoSPrefetchShed.Load(),
-		ThumbWarmHydrated:         r.thumbWarmHydrated.Load(),
-		ThumbWarmNegative:         r.thumbWarmNegative.Load(),
-		ThumbWarmShed:             r.thumbWarmShed.Load(),
-		BackendBlipParked:         r.backendBlipParked.Load(),
-		SidecarCacheHit:           r.sidecarCacheHit.Load(),
-		SidecarCacheMiss:          r.sidecarCacheMiss.Load(),
-		SidecarCachePut:           r.sidecarCachePut.Load(),
-		SidecarWarmPopulated:      r.sidecarWarmPopulated.Load(),
-		ReadaheadTriggered:        r.readaheadTriggered.Load(),
-		ReadaheadPrefetchedBlocks: r.readaheadPrefetchedBlocks.Load(),
-		ReadaheadSuppressed:       r.readaheadSuppressed.Load(),
-
-		RecoverLstat:         r.recoverLstat.Load(),
-		RecoverStale:         r.recoverStale.Load(),
-		RecoverSuccess:       r.recoverSuccess.Load(),
-		RPCAdmitWaitUs:       r.rpcAdmitWaitMaxUs.Load(),
-		RPCAdmitWaitOver1ms:  r.rpcAdmitWaitOver1ms.Load(),
-		RPCAdmitWaitOver10ms: r.rpcAdmitWaitOver10ms.Load(),
-		ReaddirVerifierHit:   r.readdirVerifierHit.Load(),
-		ReaddirFsReaddir:     r.readdirFsReaddir.Load(),
-
-		ZeroTailSuspect: r.zeroTailSuspect.Load(),
-
-		FUSEAttrib: r.snapshotFUSEAttrib(),
-
-		RPCs: make(map[string]RPCSnapshot, len(trackedTypes)),
-	}
-
-	r.netMu.RLock()
-	netFn := r.netFn
-	r.netMu.RUnlock()
-	if netFn != nil {
-		out.Network = netFn()
-	}
-
-	r.dataGateMu.RLock()
-	dataGateFn := r.dataGateFn
-	r.dataGateMu.RUnlock()
-	if dataGateFn != nil {
-		out.FUSEDataGate = dataGateFn()
-	}
-
-	r.redisMu.RLock()
-	redisFn := r.redisFn
-	r.redisMu.RUnlock()
-	if redisFn != nil {
-		out.Redis = redisFn()
-	}
-
-	r.backendMu.RLock()
-	backendFn := r.backendFn
-	r.backendMu.RUnlock()
-	if backendFn != nil {
-		out.Backend = backendFn()
-	}
-
-	r.stallMu.RLock()
-	stallFn := r.stallFn
-	r.stallMu.RUnlock()
-	if stallFn != nil {
-		out.Stall = stallFn()
-	}
-
-	r.fdPoolMu.RLock()
-	fdPoolFn := r.fdPoolFn
-	r.fdPoolMu.RUnlock()
-	if fdPoolFn != nil {
-		out.FDPool = fdPoolFn()
-	}
-
-	r.keyspaceMu.RLock()
-	keyspaceFn := r.keyspaceFn
-	r.keyspaceMu.RUnlock()
-	if keyspaceFn != nil {
-		out.Keyspace = keyspaceFn()
+		UptimeSec:      int64(time.Since(r.startedAt).Seconds()),
+		RPCTotal:       r.rpcTotal.Load(),
+		RPCInFlight:    cur,
+		RPCInFlightMax: max,
+		RPCErrors:      r.rpcErrors.Load(),
+		BytesRead:      r.bytesRead.Load(),
+		BytesWritten:   r.bytesWrite.Load(),
+		RPCs:           make(map[string]RPCSnapshot, len(trackedTypes)),
 	}
 
 	r.histsMu.RLock()
@@ -1069,11 +381,7 @@ type Server struct {
 	registry *Registry
 	addr     string
 	listener net.Listener
-	// listener6 is the companion ::1 listener. See Start: a client resolving
-	// "localhost" gets ::1 FIRST on macOS, so an IPv4-only bind is refused for
-	// any client that does not fall back.
-	listener6 net.Listener
-	httpSrv   *http.Server
+	httpSrv  *http.Server
 
 	// ExtraRoutes lets callers (e.g. cbridge) register additional handlers
 	// on the same listener — Pin/Unpin/CacheStatus/Offline endpoints live
@@ -1124,56 +432,13 @@ func (s *Server) Start() error {
 	go func() {
 		_ = s.httpSrv.Serve(l)
 	}()
-
-	// ALSO BIND IPv6 LOOPBACK.
-	//
-	// macOS resolves "localhost" to ::1 BEFORE 127.0.0.1. This server bound
-	// IPv4 only, so a client that connects to the first resolved address and
-	// does not fall back gets ECONNREFUSED and concludes the control plane is
-	// down — while curl, which does fall back, reports it perfectly healthy.
-	// Measured 2026-08-04: http://[::1]:11050 refused, http://127.0.0.1:11050
-	// 200, and that is the shape of a consumer reporting "no success" against a
-	// control plane that answers fine from a shell.
-	//
-	// Loopback ONLY, deliberately: this is a second loopback family, NOT a
-	// widening of exposure. The control plane is unauthenticated and must never
-	// be reachable off-box.
-	//
-	// Best-effort: a machine with IPv6 disabled must still start. The IPv4
-	// listener above remains the one whose failure is fatal.
-	// Port comes from the BOUND listener, not from s.addr: with an ephemeral
-	// ":0" the configured port is 0, so deriving from s.addr would put the ::1
-	// listener on a DIFFERENT random port than the IPv4 one — the companion
-	// would exist and still not answer where the client is looking.
-	if host, _, perr := net.SplitHostPort(s.addr); perr == nil && isLoopbackHost(host) {
-		boundPort := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
-		if l6, e6 := net.Listen("tcp6", net.JoinHostPort("::1", boundPort)); e6 == nil {
-			s.listener6 = l6
-			go func() {
-				_ = s.httpSrv.Serve(l6)
-			}()
-		}
-	}
 	return nil
-}
-
-// isLoopbackHost reports whether a bind host is loopback, so the ::1 companion
-// is added ONLY when we are already loopback-bound — never for a wider bind.
-func isLoopbackHost(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // Stop closes the HTTP server and listener.
 func (s *Server) Stop() {
 	if s.httpSrv != nil {
-		_ = s.httpSrv.Close() // closes every listener it is serving, incl. ::1
-	}
-	if s.listener6 != nil {
-		_ = s.listener6.Close()
+		_ = s.httpSrv.Close()
 	}
 }
 
@@ -1196,14 +461,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		// No provider yet — assume healthy if the server is up.
 		snap = HealthSnapshot{Healthy: true}
 	}
-	// Never emit a null or absent `components`: a nil Go map marshals to JSON
-	// null, which makes the Swift HealthProbe decoder throw valueNotFound and
-	// abort the whole decode (same root cause as CacheStatus roots:null — the
-	// stuck offline toggle). Normalize to an empty object so the JSON is always
-	// `"components": {}` for the fn==nil and monitor-stopped paths.
-	if snap.Components == nil {
-		snap.Components = map[string]string{}
-	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if !snap.Healthy {
@@ -1214,21 +471,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = enc.Encode(snap)
 }
 
-// handleIndex serves the human-readable route banner at the exact root path
-// and returns 404 for anything else. This handler is registered against the
-// ServeMux subtree pattern "/", so it receives every request that no
-// longer-prefix exact route (/metrics, /health, /whoami, /residency, the
-// /manager and /debug/pprof subtrees, …) already claimed. Without the
-// path guard below, a truly-unknown route such as GET /definitely-not-a-real-
-// route would fall through here and get an HTTP 200 — the "catch-all 200 trap"
-// OpenLoupe flagged: capability probing can't distinguish a served route from
-// an unserved one. Registered routes are unaffected because ServeMux always
-// dispatches the longest matching pattern, so they never reach this function.
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = fmt.Fprint(w, "JuiceMount metrics\n  /metrics\n  /health\n")
 }

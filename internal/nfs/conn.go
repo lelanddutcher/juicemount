@@ -16,8 +16,6 @@ import (
 	xdr2 "github.com/rasky/go-xdr/xdr2"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
-
-	"github.com/lelanddutcher/juicemount/internal/metrics"
 )
 
 // [JM5] Buffer pool to avoid allocations on the RPC hot path.
@@ -29,66 +27,18 @@ var responseBufferPool = sync.Pool{
 	},
 }
 
-// largeResponseBufferPool serves READ replies, which are up to the client's
-// rsize (1 MiB with our mount options).
-//
-// WHY A SECOND POOL (2026-08-19, measured). The small pool hands out 4 KiB
-// buffers and putResponseBuffer refused to pool anything above 64 KiB — so the
-// ONE RPC that is reliably large, READ, could never benefit from either. Every
-// read reply grew 4K -> 8K -> ... -> 1M (about eight realloc-and-copy steps),
-// then finish() copied the whole thing once more, and the grown buffer was
-// discarded so the next read repeated all of it.
-//
-// A CPU profile under sustained reads was ~50% garbage collection, and an
-// allocation profile over 15 s of reads showed 50 GB allocated:
-// bytes.growSlice 24.3 GB (48.5%), response.finish 12.1 GB (24.3%),
-// xdr encodeFixedArray 12.1 GB (24.2%). Serving 706 MB/s cost ~3.3 GB/s of
-// garbage.
-//
-// The 64 KiB cap was right in spirit — a 1 MiB buffer inherited by a small
-// GETATTR reply is waste — so the fix is a SECOND pool rather than a bigger
-// cap: small RPCs keep small buffers, READs get one already big enough.
-const largeResponseBufferCap = 1 << 20
-
-var largeResponseBufferPool = sync.Pool{
-	New: func() interface{} {
-		return bytes.NewBuffer(make([]byte, 0, largeResponseBufferCap+4096))
-	},
-}
-
-// getResponseBufferFor picks a pool by RPC. Only NFS READ is reliably large;
-// everything else stays on the small pool.
-func getResponseBufferFor(prog, proc uint32) *bytes.Buffer {
-	var buf *bytes.Buffer
-	if prog == nfsServiceID && proc == uint32(NFSProcedureRead) {
-		buf = largeResponseBufferPool.Get().(*bytes.Buffer)
-	} else {
-		buf = responseBufferPool.Get().(*bytes.Buffer)
-	}
-	buf.Reset()
-	return buf
-}
-
 func getResponseBuffer() *bytes.Buffer {
 	buf := responseBufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	return buf
 }
 
-// putResponseBuffer returns a buffer to the pool that matches its CAPACITY, not
-// the RPC it served — a small RPC that happened to take a large buffer must not
-// demote it back to the small pool, or the next READ pays the growth again.
 func putResponseBuffer(buf *bytes.Buffer) {
-	c := buf.Cap()
-	switch {
-	case c <= 65536:
-		responseBufferPool.Put(buf)
-	case c <= 4*largeResponseBufferCap:
-		largeResponseBufferPool.Put(buf)
-	default:
-		// Genuinely oversized (a jumbo reply): let it go rather than pin
-		// multiple megabytes per pool slot indefinitely.
+	if buf.Cap() > 65536 {
+		// Don't pool oversized buffers (e.g. from large READ responses)
+		return
 	}
+	responseBufferPool.Put(buf)
 }
 
 var (
@@ -100,16 +50,6 @@ var (
 	// [JM5] RPC performance counters
 	rpcCount     atomic.Int64
 	slowRPCCount atomic.Int64
-
-	// [JM6] Data-transfer activity counter — bumped only by READ/WRITE
-	// handlers that actually move file bytes, NOT by metadata/liveness
-	// RPCs (GETATTR/FSSTAT/LOOKUP/READDIR). The macOS NFS client emits a
-	// steady low-rate trickle of those liveness RPCs even on a totally
-	// idle mount, so rpcCount never goes flat — keying the keep-awake
-	// power assertion off rpcCount would pin the Mac awake forever while
-	// the mount is up (battery drain). This counter only advances during
-	// an actual copy/read-back, which is exactly when we must not sleep.
-	dataXferCount atomic.Int64
 
 	// [JM5] Write coalescing metrics
 	tcpFlushCount   atomic.Int64 // number of TCP flush syscalls
@@ -151,29 +91,6 @@ func currentObserver() ObserverFunc {
 // RPCStats returns the current RPC performance counters.
 func RPCStats() (total, slow, flushes, batched int64) {
 	return rpcCount.Load(), slowRPCCount.Load(), tcpFlushCount.Load(), tcpBatchedCount.Load()
-}
-
-// DataXferActivity returns a monotonic counter of keep-awake-worthy activity:
-// it advances when the READ/WRITE handlers move file bytes AND when the spool
-// drains a file to the backend (via NoteDrainProgress). Used by the keep-awake
-// loop to hold a macOS power assertion during an active copy/read-back OR a
-// post-copy drain tail, while still letting a truly idle mount (metadata/
-// liveness chatter only) release it and sleep. See the dataXferCount
-// declaration for why rpcCount is unsuitable here.
-func DataXferActivity() int64 {
-	return dataXferCount.Load()
-}
-
-// NoteDrainProgress records that the spool freed bytes (a file drained to the
-// backend), counting as keep-awake-worthy activity so the Mac stays awake to
-// FINISH a post-copy / post-reconnect drain tail before idle-sleeping — the
-// "reconnect, close the lid, walk away and it still uploads" case. The drainer
-// is paused while offline, so this only fires online; if the drain wedges
-// (stops making progress) the counter goes flat and the assertion releases on
-// the normal idle timer, bounding the battery cost. Called from the spool's
-// releaseCapacity (package nfs) across the internal/nfs boundary.
-func NoteDrainProgress() {
-	dataXferCount.Add(1)
 }
 
 // ResponseCode is a combination of accept_stat and reject_stat.
@@ -234,47 +151,28 @@ func (c *conn) serve(ctx context.Context) {
 		}
 		Log.Tracef("request: %v", w.req)
 
-		// [JM6] Admission control. A WRITE RPC can park INDEFINITELY in the spool
-		// capacity stall (offline buffer full / slow drain). Two hard rules keep
-		// that stall from wedging the single per-connection reader:
-		//   1. The reader (this loop) must NOT block on a write-only gate, or one
-		//      over-cap write head-of-line-blocks every following read/LOOKUP/
-		//      GETATTR on the same TCP mount — the whole mount goes unnavigable.
-		//   2. A parked write must NOT hold an rpcSem slot that reads need.
-		// So: NON-WRITE RPCs acquire the shared rpcSem HERE (reader back-pressure,
-		// bounds read goroutines). WRITE RPCs are dispatched immediately and
-		// acquire the SEPARATE writeSem INSIDE their goroutine — the reader never
-		// parks on a write, and reads keep their full rpcSem pool even when every
-		// write is stalled. The two pools are independent.
-		isWrite := w.req.Header.Prog == nfsServiceID &&
-			w.req.Header.Proc == uint32(NFSProcedureWrite)
-		if !isWrite && c.Server.rpcSem != nil {
-			// [S6 / H1 grader] Admission is the read head-of-line point: when the
-			// shared rpcSem is saturated the reader parks HERE, blocking every
-			// following LOOKUP/GETATTR/READ on this single TCP mount. Grade the
-			// wait WITHOUT adding cost to the uncontended path: attempt a
-			// NON-BLOCKING acquire first — on the common warm case (a free slot)
-			// we take it immediately with NO time.Now(), NO atomic, NO record.
-			// Only when the slot is FULL (exactly the HOL case we want to measure)
-			// do we sample the clock once and record the blocked duration via an
-			// atomic CAS-max gauge + threshold buckets (ObserveAdmitWait — no
-			// lock, no syscall). Warm expectation: rpc_admit_wait_us stays 0. A
-			// fat tail here PROVES admission HOL before any readSem surgery.
+		// [JM6-concurrent] Acquire the cross-connection RPC semaphore
+		// in the serve loop (before dispatching). This back-pressures
+		// the read loop: if the global slot pool is exhausted we wait
+		// here rather than spawning unbounded goroutines. The select
+		// against connCtx.Done() lets us exit cleanly if the client
+		// disconnects while we're blocked on a full pool.
+		if c.Server.rpcSem != nil {
 			select {
 			case c.Server.rpcSem <- struct{}{}:
-				// fast path: slot free, zero admission wait — record nothing.
-			default:
-				admitStart := time.Now()
-				select {
-				case c.Server.rpcSem <- struct{}{}:
-					metrics.Default().ObserveAdmitWait(time.Since(admitStart))
-				case <-connCtx.Done():
-					return
-				}
+			case <-connCtx.Done():
+				return
 			}
 		}
 
 		// [JM6-concurrent] Dispatch the handler in its own goroutine.
+		//
+		// The in-flight count is taken HERE, at dispatch, and released when
+		// the goroutine returns. Without it, "is the client pipelining?" can
+		// only be inferred from throughput arithmetic — and that arithmetic
+		// is ambiguous, because handler p50 plus socket-write time equals the
+		// observed per-RPC cost whether or not the two overlap.
+		rpcInFlightAdd(1)
 		// Each goroutine reads from the request's bytes.Reader (set up
 		// by readRequestHeader), writes through the shared
 		// writeSerializer channel (safe for concurrent senders — Go
@@ -294,6 +192,7 @@ func (c *conn) serve(ctx context.Context) {
 		// return an error and we exit cleanly. net.Conn.Close is
 		// idempotent so multiple goroutines closing is safe.
 		go func(w *response) {
+			defer rpcInFlightAdd(-1)
 			defer func() {
 				// [JM6-concurrent] Recover from handler panics so a
 				// nil-deref or unanticipated XDR state in a single
@@ -308,33 +207,12 @@ func (c *conn) serve(ctx context.Context) {
 					Log.Errorf("handler panic: %v", r)
 					c.Close()
 				}
-				if !isWrite && c.Server.rpcSem != nil {
+				if c.Server.rpcSem != nil {
 					<-c.Server.rpcSem
 				}
 			}()
 
-			// [JM6] WRITE admission happens HERE, off the reader path. A write
-			// parked on a full writeSem is a cheap goroutine holding NO rpcSem
-			// slot, so reads stay live. connCtx.Done() lets an abandoned /
-			// disconnected write unwind before it ever runs the handler.
-			if isWrite && c.Server.writeSem != nil {
-				select {
-				case c.Server.writeSem <- struct{}{}:
-				case <-connCtx.Done():
-					return
-				}
-				defer func() { <-c.Server.writeSem }()
-			}
-
 			start := time.Now()
-			// Track this RPC from dispatch to completion. The completed-op
-			// latency metrics can't see a HUNG RPC (it never completes); the
-			// in-flight watchdog dumps goroutines when one crosses ~22s, well
-			// before the ~40s soft-mount timeout aborts the client's copy with
-			// "error 100060". defer (not an inline call after c.handle) so the
-			// entry is always cleared, even if the handler panics.
-			ifid := inflightRegister(inflightOpName(w.req))
-			defer inflightDone(ifid)
 			err := c.handle(connCtx, w)
 			elapsed := time.Since(start)
 			respErr := w.finish(connCtx)
@@ -435,28 +313,6 @@ func (c *conn) handle(ctx context.Context, w *response) error {
 		return c.err(ctx, w, &ResponseCodeProcUnavailableError{})
 	}
 	appError := handler(ctx, w, c.Server.Handler)
-	if nfsTrace {
-		if appError != nil {
-			Log.Infof("TRACE rpc %s -> ERR %v", w.req.String(), appError)
-		} else {
-			Log.Infof("TRACE rpc %s -> OK", w.req.String())
-		}
-	}
-	// A wedged JuiceFS surfaces as ErrFUSETimeout from the filesystem layer.
-	// Map it (however the handler wrapped it) to NFS3ERR_JUKEBOX so the client
-	// retries instead of aborting on a permanent error. The handler has already
-	// returned — freeing its rpcSem slot — which is what keeps a backend wedge
-	// from exhausting the slot budget and staling the whole mount.
-	// Same treatment for a backend blip (#9): the op failed only because the
-	// metadata backend was mid-restart; a client retry after the reconnect
-	// succeeds. Both sentinels are BOUNDED at their source (wedge probe /
-	// blipParkWindow), so neither can tarpit forever.
-	if appError != nil && (errors.Is(appError, ErrFUSETimeout) || errors.Is(appError, ErrBackendBlip)) {
-		appError = &NFSStatusError{NFSStatusJukebox, appError}
-		// Count it: a JUKEBOX reply is a "success" to the latency metrics, so a
-		// retry storm (the "error 100060" mechanism) is otherwise invisible.
-		recordJukebox(inflightOpName(w.req))
-	}
 	if drainErr := w.drain(ctx); drainErr != nil {
 		return drainErr
 	}
@@ -695,10 +551,9 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		return nil, err
 	}
 
-	// [JM5] Use pooled buffer to avoid allocation per RPC. The header is
-	// already parsed here, so a READ can be given a buffer that is big enough
-	// from the start instead of growing into one.
-	buf := getResponseBufferFor(req.Header.Prog, req.Header.Proc)
+	// [JM5] Use pooled buffer to avoid allocation per RPC.
+	buf := responseBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
 	w = &response{
 		conn:     c,
 		req:      &req,
