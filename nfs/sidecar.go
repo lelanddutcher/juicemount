@@ -1,9 +1,11 @@
 package nfs
 
 import (
+	"bytes"
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -507,4 +509,260 @@ func (h *JuiceMountHandler) noteSidecarWarmResult(attempted, populated int) {
 // sidecarWarmBreakerDisabled restores the pre-fix always-warm behavior.
 func sidecarWarmBreakerDisabled() bool {
 	return os.Getenv("JM_SIDECAR_WARM_BREAKER") == "0"
+}
+
+// ---- drain-time empty-sidecar elision (2026-08-18) ----
+//
+// WHAT AN AppleDouble SIDECAR IS. macOS stores a file's extended attributes
+// (Finder tags, colour labels, resource forks, Spotlight comments) in a
+// SEPARATE companion file named `._<name>`, in the same directory, whenever the
+// underlying filesystem cannot hold xattrs itself. NFS is such a filesystem, so
+// every file a Mac writes to /Volumes/zpool arrives as TWO files: `Foo` and
+// `._Foo`. Both are spooled to local disk and both are drained to the backend.
+//
+// WHY THAT IS EXPENSIVE. The drain is METADATA-bound, not bandwidth-bound.
+// Measured 2026-08-18: one os.Create through the FUSE mount costs 116 ms (the
+// same create on local disk costs 0.07 ms), creates saturate at ~14.8/s no
+// matter the concurrency, and the ceiling is PER-DIRECTORY. Of the ~369 ms a
+// drained row costs, the MinIO upload is 32 ms (9%) and the create is 204 ms.
+// A 30-file Finder copy produces 61 spool rows. So the `._` sidecars consume
+// HALF of a hard, per-directory create ceiling.
+//
+// WHAT THIS DOES. At drain time the spooled bytes already sit on local disk and
+// are free to inspect (0.07 ms). If a `._` body carries no metadata, the file
+// is not created on the backend at all — the row is completed and its mirror
+// entry removed, so the path simply does not exist.
+//
+// WHY THAT IS CORRECT. An ABSENT `._Foo` means "Foo has no extended
+// attributes", which is precisely what an empty AppleDouble body encodes. The
+// macOS NFS client treats ENOENT on `._Foo` as "no xattrs" — the same answer,
+// minus the round trips. A sidecar that carries anything real is drained
+// normally, so no user metadata is ever dropped.
+//
+// REFUTED, do not retry: storing the AppleDouble payload as an xattr on the
+// real file instead. Measured setxattr = 75.0 ms vs create-the-sidecar = 61.0
+// ms — 123% of the cost. juicefs xattrs are Redis metadata writes.
+
+const (
+	appleDoubleMagic   = 0x00051607
+	appleDoubleVersion = 0x00020000
+	adEntryFinderInfo  = 9
+	adEntryResourceFrk = 2
+	adFinderInfoSize   = 32
+	// adEmptyResourceForkSize is the size of the canonical macOS "empty"
+	// resource fork — a 286-byte map whose body reads "This resource fork
+	// intentionally left blank". Every `._` file macOS writes carries one.
+	adEmptyResourceForkSize = 286
+	// attrHeaderSize is the size of the ATTR (com.apple.FinderInfo xattr
+	// region) header that follows the 32-byte Finder info inside the Finder
+	// info entry: magic, debug tag, total size, data start, data length,
+	// 3 reserved words, flags, and the attribute count.
+	attrHeaderSize = 36
+)
+
+var (
+	adAttrMagic          = []byte("ATTR")
+	adEmptyResourceForkK = []byte("This resource fork intentionally left blank")
+)
+
+// adIgnorableAttrs are xattr names whose presence still counts as "this
+// sidecar carries nothing worth a backend file".
+//
+// MEASURED, and it CORRECTS the premise this work started from. A survey of 60
+// real `._` files on the live volume found that 56 of them are NOT byte-empty:
+// every single one carries exactly one xattr, `com.apple.provenance`, inside an
+// otherwise all-zero Finder info block with the canonical blank resource fork.
+// A strict "no attributes at all" predicate would therefore have skipped
+// NOTHING and this change would have measured zero.
+//
+// `com.apple.provenance` is macOS 13+ kernel bookkeeping that records which
+// application created a file, so TCC can decide whether app X may reach files
+// made by app Y. It is per-Mac, per-volume, and identical across every file a
+// given app writes (the same 11-byte value appeared on all 56). It is not user
+// metadata, it is meaningless on a shared network volume, and it is already
+// lost by most copy tools. Dropping it is benign.
+//
+// Nothing else is ignorable. The same survey found one file carrying
+// `com.blackmagicdesign.thumbnail` and one with a non-zero Finder info block —
+// both are refused by the predicate below and drain normally.
+var adIgnorableAttrs = map[string]bool{
+	"com.apple.provenance": true,
+}
+
+// appleDoubleIsDefaultEmpty reports whether body is a well-formed AppleDouble
+// sidecar that carries no metadata worth materialising on the backend.
+//
+// FAILS CLOSED. Anything it does not fully understand — a bad magic, a
+// truncated header, an out-of-range entry, an unknown entry type, a non-zero
+// Finder info block, a resource fork that is not the canonical empty one, an
+// xattr outside adIgnorableAttrs — returns false, and the caller drains the row
+// normally. A false negative costs one create; a false positive would silently
+// lose a user's Finder tags.
+func appleDoubleIsDefaultEmpty(body []byte) bool {
+	if len(body) < 26 {
+		return false
+	}
+	if be32(body[0:4]) != appleDoubleMagic || be32(body[4:8]) != appleDoubleVersion {
+		return false
+	}
+	n := int(be16(body[24:26]))
+	// A default sidecar has exactly the two standard entries (Finder info and
+	// resource fork). More than that means macOS attached something extra —
+	// a comment, an icon, a real name — so materialise it.
+	if n < 1 || n > 2 || len(body) < 26+12*n {
+		return false
+	}
+	sawFinderInfo := false
+	for i := 0; i < n; i++ {
+		off := 26 + 12*i
+		id := be32(body[off : off+4])
+		start := int64(be32(body[off+4 : off+8]))
+		length := int64(be32(body[off+8 : off+12]))
+		if start < 0 || length < 0 || start+length > int64(len(body)) {
+			return false // entry points outside the body: truncated or garbage
+		}
+		blk := body[start : start+length]
+		switch id {
+		case adEntryFinderInfo:
+			sawFinderInfo = true
+			if !finderInfoBlockIsEmpty(blk) {
+				return false
+			}
+		case adEntryResourceFrk:
+			if !resourceForkIsEmpty(blk) {
+				return false
+			}
+		default:
+			return false // an entry type we do not model — never assume empty
+		}
+	}
+	return sawFinderInfo || n == 1
+}
+
+// finderInfoBlockIsEmpty reports whether an AppleDouble Finder info entry holds
+// no user metadata: 32 zero bytes of Finder info, and either nothing after them
+// or an ATTR xattr region containing only ignorable attribute names.
+func finderInfoBlockIsEmpty(blk []byte) bool {
+	if len(blk) < adFinderInfoSize {
+		return false
+	}
+	for _, b := range blk[:adFinderInfoSize] {
+		if b != 0 {
+			return false // Finder flags, colour label, type/creator: real metadata
+		}
+	}
+	rest := blk[adFinderInfoSize:]
+	if len(rest) == 0 {
+		return true
+	}
+	// The ATTR header follows the Finder info, in practice after 2 bytes of
+	// padding (measured: offset +34, not +32). Accept either.
+	hdr := []byte(nil)
+	for _, pad := range []int{0, 2} {
+		if len(rest) >= pad+len(adAttrMagic) && bytes.Equal(rest[pad:pad+len(adAttrMagic)], adAttrMagic) {
+			hdr = rest[pad:]
+			break
+		}
+	}
+	if hdr == nil {
+		// No xattr region. Only all-zero padding is acceptable here; any other
+		// content is something we do not model, so fail closed.
+		for _, b := range rest {
+			if b != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	if len(hdr) < attrHeaderSize {
+		return false // truncated ATTR header
+	}
+	num := int(be16(hdr[34:36]))
+	if num == 0 {
+		return true
+	}
+	p := attrHeaderSize
+	for i := 0; i < num; i++ {
+		// Each attribute entry: offset(4) length(4) flags(2) namelen(1)
+		// name(namelen, NUL-terminated), then padded to a 4-byte boundary.
+		if p+11 > len(hdr) {
+			return false
+		}
+		nameLen := int(hdr[p+10])
+		if p+11+nameLen > len(hdr) {
+			return false
+		}
+		name := string(bytes.TrimRight(hdr[p+11:p+11+nameLen], "\x00"))
+		if !adIgnorableAttrs[name] {
+			return false // a real xattr: this sidecar must reach the backend
+		}
+		p = (p + 11 + nameLen + 3) &^ 3
+	}
+	return true
+}
+
+// resourceForkIsEmpty reports whether an AppleDouble resource-fork entry is
+// absent or is the canonical 286-byte macOS empty fork.
+func resourceForkIsEmpty(blk []byte) bool {
+	if len(blk) == 0 {
+		return true
+	}
+	if len(blk) != adEmptyResourceForkSize {
+		return false
+	}
+	return bytes.Contains(blk, adEmptyResourceForkK)
+}
+
+func be16(b []byte) uint16 { return uint16(b[0])<<8 | uint16(b[1]) }
+func be32(b []byte) uint32 {
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+// drainSkipEmptySidecarsEnabled gates the elision. DEFAULTS ON; set
+// JM_DRAIN_SKIP_EMPTY_SIDECARS=0 to restore the old always-materialise
+// behaviour in the field without a rebuild.
+func drainSkipEmptySidecarsEnabled() bool {
+	return os.Getenv("JM_DRAIN_SKIP_EMPTY_SIDECARS") != "0"
+}
+
+// onSidecarSkipped is the drainer's handler-side hook for a `._` row that is
+// being completed WITHOUT a backend file. It returns false to VETO the skip —
+// the drainer then drains the row normally.
+//
+// The mirror still holds an entry for this path (the NFS CREATE inserted it so
+// Finder could see the file it had just written). That entry must go, or a
+// readdir would list `._Foo`, a LOOKUP would succeed, and the read behind it
+// would fall through to a FUSE file that does not exist. Removing the entry is
+// what turns the elision into the honest answer "this path does not exist".
+//
+// The veto guards mirror the phantom-purge ones: never drop an entry out from
+// under a live NFS handle.
+func (h *JuiceMountHandler) onSidecarSkipped(nfsPath string) bool {
+	if h == nil || h.store == nil {
+		return false
+	}
+	// Mirror keys are stored without a leading slash (same normalisation
+	// juiceFS.Remove does); spool rows may carry one.
+	nfsPath = strings.TrimPrefix(nfsPath, "/")
+	if h.hasActiveWriter(nfsPath) {
+		return false
+	}
+	if h.fdPool != nil && h.fdPool.HasOpenRefs(h.fusePath+"/"+nfsPath) {
+		return false
+	}
+	h.sidecar.invalidate(nfsPath)
+	if h.memBuf != nil {
+		h.memBuf.Invalidate(nfsPath)
+	}
+	// Cache first, then the durable row: a reader between the two resolves the
+	// spool shadow (still present — the drainer removes it after this returns)
+	// and gets the real bytes. The reverse order would leave a window where the
+	// cache says the path exists but nothing can serve it.
+	h.store.DeleteFromCache(nfsPath)
+	go func() {
+		if err := h.store.Delete(nfsPath); err != nil {
+			jmlog.Warn("sidecar skip: delete mirror row failed", "path", nfsPath, "error", err.Error())
+		}
+	}()
+	return true
 }

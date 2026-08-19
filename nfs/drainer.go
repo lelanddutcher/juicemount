@@ -136,6 +136,16 @@ type Drainer struct {
 	// the reconnect edge, so set-before-Start provides the happens-before.
 	onSymlinkMaterialized func(linkPath string)
 
+	// onSidecarSkip, if set, is consulted before completing a `._` row without
+	// materialising it on the backend. It removes the path's mirror entry and
+	// returns false to VETO the skip (a live NFS handle on the path), in which
+	// case the row drains normally. Set once via SetOnSidecarSkip BEFORE Start.
+	onSidecarSkip func(nfsPath string) bool
+
+	// skipEmptySidecars gates the elision (JM_DRAIN_SKIP_EMPTY_SIDECARS,
+	// default ON). Read once at construction.
+	skipEmptySidecars bool
+
 	// atRestVerify gates the post-copy at-rest SHA re-read (re-opening the
 	// just-written file through JuiceFS and re-hashing it). Default OFF: with
 	// --writeback disabled (a86eaf6) dst.Sync() already blocks until the
@@ -222,6 +232,10 @@ type DrainerMetrics struct {
 	Quarantined     atomic.Int64
 	BytesDrained    atomic.Int64
 	InFlight        atomic.Int64
+	// SidecarsSkipped counts `._` rows completed WITHOUT a backend file
+	// because their AppleDouble body carried no metadata. See
+	// appleDoubleIsDefaultEmpty in sidecar.go.
+	SidecarsSkipped atomic.Int64
 }
 
 // NewDrainer constructs but does not start the drainer. Call Start to
@@ -293,15 +307,16 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		cfg.PollFallback = 30 * time.Second
 	}
 	d := &Drainer{
-		spool:        spool,
-		fuseRoot:     cfg.FuseRoot,
-		workers:      cfg.Workers,
-		maxAttempts:  cfg.MaxAttempts,
-		backoffBase:  cfg.BackoffBase,
-		pollFallback: cfg.PollFallback,
-		atRestVerify: os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
-		batchInsert:  os.Getenv("JM_DRAIN_BATCH_INSERT") == "1",
-		sem:          make(chan struct{}, cfg.Workers),
+		spool:             spool,
+		fuseRoot:          cfg.FuseRoot,
+		workers:           cfg.Workers,
+		maxAttempts:       cfg.MaxAttempts,
+		backoffBase:       cfg.BackoffBase,
+		pollFallback:      cfg.PollFallback,
+		atRestVerify:      os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
+		batchInsert:       os.Getenv("JM_DRAIN_BATCH_INSERT") == "1",
+		skipEmptySidecars: drainSkipEmptySidecarsEnabled(),
+		sem:               make(chan struct{}, cfg.Workers),
 		smallSem: func() chan struct{} {
 			if smallWorkers <= 0 {
 				return nil // lane disabled; everything uses sem
@@ -309,10 +324,10 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 			return make(chan struct{}, smallWorkers)
 		}(),
 		smallBytes: smallBytes,
-		slowGate:     make(chan struct{}, 1),
-		notify:       make(chan struct{}, 1),
-		stop:         make(chan struct{}),
-		done:         make(chan struct{}),
+		slowGate:   make(chan struct{}, 1),
+		notify:     make(chan struct{}, 1),
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 	if d.batchInsert {
 		d.batch = newDrainBatcher(d, drainBatchMaxOps, drainBatchMaxDelay)
@@ -429,6 +444,11 @@ func (d *Drainer) SetOnBatchDrainComplete(fn func([]metadata.DrainCommitItem) ([
 // called BEFORE Start (read by the dispatcher on the reconnect edge).
 func (d *Drainer) SetOnSymlinkMaterialized(fn func(linkPath string)) {
 	d.onSymlinkMaterialized = fn
+}
+
+// SetOnSidecarSkip registers the empty-`._`-elision hook. Call before Start.
+func (d *Drainer) SetOnSidecarSkip(fn func(nfsPath string) bool) {
+	d.onSidecarSkip = fn
 }
 
 // flushBatch flushes any pending coalesced drains (Lever 1). No-op when the
@@ -716,6 +736,9 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 	// file in the small lane.
 	lane := d.laneFor(row.Size)
 
+	// How long this row waits for a lane slot. Part of its wall clock but not
+	// part of drainOne, and untimed until 2026-08-18.
+	laneWaitStart := time.Now()
 	select {
 	case <-d.stop:
 		d.inFlight.Done()
@@ -723,6 +746,7 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 		return false
 	case lane <- struct{}{}:
 	}
+	laneWait := time.Since(laneWaitStart)
 
 	go func(r *metadata.SpoolRow) {
 		defer func() {
@@ -744,7 +768,7 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 		}
 		d.metrics.InFlight.Add(1)
 		defer d.metrics.InFlight.Add(-1)
-		d.drainOne(r)
+		d.drainOneWithWait(r, laneWait)
 	}(row)
 	return true
 }
@@ -770,6 +794,51 @@ func drainClassGateEnabled() bool { return os.Getenv("JM_DRAIN_CLASS_GATE") != "
 // drainLinkIsSlow reports whether the measured link class is slow or metered —
 // the classes where concurrent whole-file drains saturate the uplink and
 // starve FUSE (see slowGate). Read per-dispatch: class flips apply live.
+// drainPhaseLog reports where a drain's wall time actually goes, gated on
+// JM_DRAIN_PHASE_LOG=1.
+//
+// WHY THIS EXISTS. On 2026-08-18 a controlled drain of 120 x 64 KiB files took
+// 96.2s — 802 ms of wall per file at concurrency 4, so 3.1 SECONDS of latency
+// per 64 KiB file, while the object store answered PUTs in 29 ms. Three
+// successive explanations were proposed from reading the code and ALL THREE
+// were wrong: the file-count semaphore (a PUT is a juicefs block, not a file),
+// the batch coalescer (the worker returns immediately after enqueue and does
+// not wait), and the at-rest re-read (JM_DRAIN_ATREST_VERIFY defaults OFF, so
+// it never runs). Reading this function is evidently not sufficient to predict
+// its cost. Measure it instead.
+var drainPhaseLogEnabled = os.Getenv("JM_DRAIN_PHASE_LOG") == "1"
+
+type drainPhases struct {
+	t0                                      time.Time
+	openSrc, create, identity, copy, sync_  time.Duration
+	close_, spoolSHA, atRest, chtimes, mark time.Duration
+	// dispatchWait is time the row spent BETWEEN being claimed by the
+	// dispatcher and its lane slot being granted. It is not part of drainOne
+	// at all, but it is part of the row's wall clock, and leaving it untimed
+	// is what left ~495 ms/row unattributed on 2026-08-18.
+	dispatchWait time.Duration
+}
+
+func (p *drainPhases) mark_(d *time.Duration) {
+	if !drainPhaseLogEnabled {
+		return
+	}
+	now := time.Now()
+	*d = now.Sub(p.t0)
+	p.t0 = now
+}
+
+func (p *drainPhases) report(path string, size int64) {
+	if !drainPhaseLogEnabled {
+		return
+	}
+	ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
+	log.Printf("drain-phase size=%d dispatchwait=%.1f open=%.1f create=%.1f ident=%.1f "+
+		"copy=%.1f sync=%.1f close=%.1f spoolsha=%.1f atrest=%.1f chtimes=%.1f mark=%.1f path=%s",
+		size, ms(p.dispatchWait), ms(p.openSrc), ms(p.create), ms(p.identity), ms(p.copy),
+		ms(p.sync_), ms(p.close_), ms(p.spoolSHA), ms(p.atRest), ms(p.chtimes), ms(p.mark), path)
+}
+
 func drainLinkIsSlow() bool {
 	c := netprofile.Default().Class()
 	return c == netprofile.ClassSlow || c == netprofile.ClassMetered
@@ -777,7 +846,24 @@ func drainLinkIsSlow() bool {
 
 // drainOne copies a single spool file into the FUSE mount, SHA-verifies
 // the copy, and dispositions the row.
+// drainOneWithWait is drainOne plus the lane-wait it should attribute. Split
+// rather than changing drainOne's signature because drainOne is called directly
+// from tests and from the recovery path, where there is no lane wait.
+func (d *Drainer) drainOneWithWait(row *metadata.SpoolRow, laneWait time.Duration) {
+	pendingLaneWait.Store(row.ID, laneWait)
+	defer pendingLaneWait.Delete(row.ID)
+	d.drainOne(row)
+}
+
+// pendingLaneWait carries the lane wait from dispatchRow to drainOne for the
+// phase log only. Keyed by row ID, deleted on return.
+var pendingLaneWait sync.Map
+
 func (d *Drainer) drainOne(row *metadata.SpoolRow) {
+	ph := &drainPhases{t0: time.Now()}
+	if v, ok := pendingLaneWait.Load(row.ID); ok {
+		ph.dispatchWait, _ = v.(time.Duration)
+	}
 	d.metrics.DrainsAttempted.Add(1)
 
 	if row.DrainAttempts >= d.maxAttempts {
@@ -793,6 +879,21 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// failTransient's infra-pause branch: requeue, no budget burn).
 	if ok, reason := pin.FUSEIdentityState(); !ok {
 		d.failTransient(row, fmt.Errorf("%s: %w", reason, pin.ErrFUSEIdentityGate))
+		return
+	}
+
+	// EMPTY `._` SIDECAR ELISION (2026-08-18). Half of every Finder copy's
+	// spool rows are `._` AppleDouble sidecars, and the drain's cost is the
+	// FUSE create (204 ms of a 369 ms row), not the upload (32 ms). The
+	// spooled bytes are on local disk here and cost 0.07 ms to inspect, so a
+	// sidecar that encodes "this file has no extended attributes" is completed
+	// WITHOUT ever being created on the backend: an absent `._Foo` says exactly
+	// the same thing to the macOS NFS client, minus the round trips. Anything
+	// the predicate does not fully understand drains normally — see
+	// appleDoubleIsDefaultEmpty in sidecar.go, which fails closed.
+	if d.trySkipEmptySidecar(row) {
+		ph.mark_(&ph.mark)
+		ph.report(row.NFSPath, row.Size)
 		return
 	}
 
@@ -864,10 +965,12 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		}
 	}
 
+	ph.mark_(&ph.identity)
 	h := sha256.New()
 	mw := io.MultiWriter(dst, h)
 	buf := make([]byte, 1<<20)
 	n, copyErr := io.CopyBuffer(mw, src, buf)
+	ph.mark_(&ph.copy)
 	// fsync the FUSE destination before closing so JuiceFS --writeback stages
 	// the bytes coherently. Without it, the at-rest re-read below is a
 	// read-after-close against the writeback cache and can momentarily return
@@ -879,8 +982,10 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	var syncErr error
 	if copyErr == nil {
 		syncErr = dst.Sync()
+		ph.mark_(&ph.sync_)
 	}
 	closeErr := dst.Close()
+	ph.mark_(&ph.close_)
 	if copyErr != nil {
 		_ = os.Remove(dest) // best-effort cleanup of partial write
 		d.failTransient(row, fmt.Errorf("copy to fuse: %w", copyErr))
@@ -986,6 +1091,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 			log.Printf("drain: preserve client mtime failed (non-fatal) path=%s: %v", row.NFSPath, err)
 		}
 	}
+	ph.mark_(&ph.chtimes)
 
 	// Lever 1 (JM_DRAIN_BATCH_INSERT): hand the fully-copied+verified drain to
 	// the write-coalescer instead of committing its (UpdateSize + MarkDone) pair
@@ -997,6 +1103,8 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// spool shadow is evicted, exactly as the per-file path guarantees below.
 	if d.batch != nil {
 		d.batch.enqueue(pendingDrain{row: row, dest: dest, n: n})
+		ph.mark_(&ph.mark)
+		ph.report(row.NFSPath, row.Size)
 		return
 	}
 
@@ -1013,6 +1121,8 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 
 	done, err := d.spool.MarkDrainComplete(row.ID, row.NFSPath, row.SpoolFile, row.Size)
+	ph.mark_(&ph.mark)
+	ph.report(row.NFSPath, row.Size)
 	if err != nil {
 		// Reviewer fix (slice B follow-on): MarkDrainComplete promises
 		// the caller will retry on SQL failure. Doing so here means a
@@ -1049,6 +1159,57 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	if d.onDrainComplete != nil {
 		d.onDrainComplete(row.NFSPath, row.Size)
 	}
+}
+
+// trySkipEmptySidecar completes row WITHOUT creating a backend file when it is
+// a `._` AppleDouble sidecar whose body carries no metadata. Reports whether it
+// took ownership of the row (true = the caller must return immediately).
+//
+// It deliberately does NOT stamp lastDrainSuccessNanos and does NOT add to
+// BytesDrained: nothing reached the object store, so this is not evidence the
+// backend is reachable and must never suppress a reachability probe.
+func (d *Drainer) trySkipEmptySidecar(row *metadata.SpoolRow) bool {
+	if !d.skipEmptySidecars || d.onSidecarSkip == nil {
+		return false
+	}
+	if !isSidecarName(filepath.Base(row.NFSPath)) {
+		return false
+	}
+	// Bound the read. A real sidecar is ~4 KB; anything large is not a default
+	// skeleton and is not worth reading into RAM to find that out.
+	if row.Size <= 0 || row.Size > sidecarMaxFile {
+		return false
+	}
+	body, err := os.ReadFile(row.SpoolFile)
+	if err != nil || int64(len(body)) != row.Size {
+		return false // unreadable or short: let the normal drain path handle it
+	}
+	if !appleDoubleIsDefaultEmpty(body) {
+		return false
+	}
+	// Remove the mirror entry BEFORE marking the row done. The spool shadow is
+	// still in place until MarkDrainComplete evicts it, so a reader in this
+	// window still resolves real bytes; the reverse order would leave the path
+	// visible with nothing behind it. A false return is a veto (live handle).
+	if !d.onSidecarSkip(row.NFSPath) {
+		return false
+	}
+	done, err := d.spool.MarkDrainComplete(row.ID, row.NFSPath, row.SpoolFile, row.Size)
+	if err != nil {
+		// Same contract as the normal path: retry. Re-running this row simply
+		// re-elides it, and the mirror entry is already in its end state.
+		d.failTransient(row, fmt.Errorf("mark drain complete (elided sidecar): %w", err))
+		return true
+	}
+	if !done {
+		// Cancelled mid-drain (the NFS layer deleted the path). Nothing to
+		// undo — we never wrote to FUSE.
+		log.Printf("drainer: row %d (%s) cancelled mid-drain (elided sidecar)", row.ID, row.NFSPath)
+		return true
+	}
+	d.metrics.DrainsSucceeded.Add(1)
+	d.metrics.SidecarsSkipped.Add(1)
+	return true
 }
 
 // failTransient: retryable failure path. Bumps attempts, schedules a
