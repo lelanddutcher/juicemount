@@ -175,6 +175,26 @@ func skipIfFresh(store *derivatives.Store, path string, inode uint64, hash strin
 	if ready == 0 {
 		return false, false
 	}
+	// COMPLETE, not merely non-empty. Everything above is satisfied by a SINGLE
+	// ready row, so an asset holding poster+filmstrip and no waveform at all
+	// reads "fresh" and the waveform is never generated — not on this sweep and
+	// not on any future one, because the skip is what prevents it.
+	//
+	// That is not hypothetical. On 2026-08-19 the farm database held 1,801
+	// assets, of which 1,305 had an audio track in their stored `tech` and NO
+	// waveform row of any status: ffmpeg 4.3.9 could not decode the camera's
+	// `ipcm` audio, so Waveform returned zero samples and — by the branch below
+	// — published nothing. Upgrading to ffmpeg 7.0.2 fixed the decode, and not
+	// one of those 1,305 came back, because this gate skipped every one of them.
+	//
+	// So the asset must be complete for the kinds THIS RUN would produce. The
+	// expected set comes from the stored `tech` metadata (no ffprobe: that is
+	// the cost this gate exists to avoid) crossed with the enabled options, and
+	// a kind counts as satisfied by a row of ANY producer — a contributor's
+	// on-device poster satisfies "thumbnail" exactly as the farm's own does.
+	if !kindsComplete(store, inode, rows, size, opt) {
+		return false, false
+	}
 	// THE ROWS ARE NOT THE DATA. Everything above proves the DATABASE believes
 	// this asset is derived; none of it proves the bytes are on the volume.
 	//
@@ -206,6 +226,70 @@ func skipIfFresh(store *derivatives.Store, path string, inode uint64, hash strin
 		}
 	}
 	return true, repaired
+}
+
+// kindsComplete reports whether the asset already holds a row for every kind
+// this run would produce.
+//
+// The expected set is derived from the STORED `tech` metadata, so it costs one
+// indexed row read rather than the ffprobe this gate exists to skip. Missing
+// tech metadata means the expected set is unknowable, and an unknowable answer
+// resolves the same way every other uncertainty in skipIfFresh does: do the
+// work.
+//
+// A kind is satisfied by a row with status "ready" OR "failed". "failed" is
+// deliberate and is not a loosening: it is the state that says the artifact
+// will never appear (see sidecar.go sanitize), and treating it as unsatisfied
+// would retry a permanently-undecodable source on every single sweep. It also
+// keeps this change behaviour-neutral for failures, which already skip today.
+func kindsComplete(store *derivatives.Store, inode uint64, rows []derivatives.DerivRow, size int64, opt Options) bool {
+	meta, err := store.Metadata(inode, "tech")
+	if err != nil || meta == nil {
+		return false
+	}
+	var tech Tech
+	if err := json.Unmarshal(meta.Payload, &tech); err != nil {
+		return false
+	}
+	have := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if r.Status == "ready" || r.Status == "failed" {
+			have[r.Kind] = true
+		}
+	}
+	for _, k := range expectedKinds(&tech, size, opt) {
+		if !have[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// expectedKinds lists the derivative kinds Process would produce for this
+// source under these options.
+//
+// It MIRRORS the generator gates in Process and must move with them: a kind
+// listed here that Process cannot produce makes the asset permanently
+// unskippable, and a kind Process produces that is missing here reopens the
+// gap this function was written to close. The gates are, in order: the option
+// flag, the stream the kind is derived from, and the blob size threshold —
+// `tech` alone is unconditional.
+func expectedKinds(tech *Tech, size int64, opt Options) []string {
+	kinds := []string{"tech"}
+	bigEnough := opt.MinBlobSizeBytes <= 0 || size >= opt.MinBlobSizeBytes
+	if !bigEnough {
+		return kinds
+	}
+	if opt.Blobs && tech.Video != nil {
+		kinds = append(kinds, "thumbnail")
+	}
+	if opt.Filmstrip && tech.Video != nil {
+		kinds = append(kinds, "filmstrip")
+	}
+	if opt.Waveform && len(tech.Audio) > 0 {
+		kinds = append(kinds, "waveform")
+	}
+	return kinds
 }
 
 // blobsPresent reports whether every ready row that CLAIMS a blob actually has
@@ -413,9 +497,25 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 			}
 		}
 		if err == nil && !wrote {
-			// No audio after all: publish NO row, exactly as a pre-staging run
-			// would have done. WriteFileAt was never called, so there is nothing
-			// on disk to clean up either.
+			// No audio after all. ffprobe said there was an audio stream and the
+			// decode produced zero samples — a real, PERSISTENT disagreement for
+			// a source whose bytes are not changing.
+			//
+			// This used to publish NO row, "exactly as a pre-staging run would
+			// have done". That is what stranded 1,305 assets: no row is
+			// indistinguishable from never-attempted, so kindsComplete cannot
+			// tell "this source has no usable audio" from "nobody has tried yet"
+			// and would re-decode the same silent file on every sweep forever.
+			//
+			// "failed" is the status that already means the artifact will never
+			// appear, so it is the honest one here, and it is contract-legal —
+			// sidecar.go's sanitize accepts exactly "ready" and "failed".
+			// WriteFileAt was never called, so there is no blob to clean up and
+			// the row carries no blob path.
+			rows = append(rows, derivatives.DerivRow{
+				Kind: "waveform", Status: "failed", Producer: opt.Producer, Version: opt.Version,
+				Hash: &hash, MediaType: &mt,
+			})
 		} else if err != nil {
 			blobErrs = append(blobErrs, fmt.Errorf("waveform: %w", err))
 			rows = append(rows, derivatives.DerivRow{

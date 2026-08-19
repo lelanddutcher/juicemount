@@ -1,6 +1,7 @@
 package farm
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,12 +30,36 @@ func freshStore(t *testing.T) *derivatives.Store {
 	return s
 }
 
+// seedTech writes the `tech` metadata row that skipIfFresh reads to work out
+// which derivative kinds this asset ought to have.
+func seedTech(t *testing.T, s *derivatives.Store, inode uint64, hash, payload string) {
+	t.Helper()
+	if err := s.PutMetadata(inode, "tech", "linux-farm", 1, &hash, json.RawMessage(payload)); err != nil {
+		t.Fatalf("PutMetadata tech: %v", err)
+	}
+}
+
 func seed(t *testing.T, s *derivatives.Store, inode uint64, hash string, size int64, status string) {
 	t.Helper()
 	if err := s.PutSource(inode, &hash); err != nil {
 		t.Fatalf("PutSource: %v", err)
 	}
 	sz := size
+	// A real farm-derived asset ALWAYS carries `tech` metadata and a `tech` row:
+	// on 2026-08-19 the live farm database held 1,801 assets and 0 derivative
+	// rows whose inode lacked either. Seeding them is what makes this fixture an
+	// asset the farm could actually have produced, and skipIfFresh now reads the
+	// metadata to learn which kinds the asset OUGHT to have.
+	//
+	// The payload declares video and no audio, so a waveform is not expected of
+	// it — the tests that care about audio seed their own tech.
+	seedTech(t, s, inode, hash, `{"container":"mov","video":{"codec":"h264"},"audio":[]}`)
+	if err := s.PutDeriv(inode, derivatives.DerivRow{
+		Kind: "tech", Status: status, Producer: "linux-farm", Version: 1,
+		Hash: &hash, SourceSize: &sz,
+	}); err != nil {
+		t.Fatalf("PutDeriv tech: %v", err)
+	}
 	if err := s.PutDeriv(inode, derivatives.DerivRow{
 		Kind: "thumbnail", Status: status, Producer: "linux-farm", Version: 1,
 		Hash: &hash, SourceSize: &sz,
@@ -139,6 +164,13 @@ func TestAbsentBlobIsNotFresh(t *testing.T) {
 	}
 	rel := "poster.jpg"
 	sz := int64(1000)
+	seedTech(t, s, 4242, h, `{"container":"mov","video":{"codec":"h264"},"audio":[]}`)
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &h, SourceSize: &sz,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.PutDeriv(4242, derivatives.DerivRow{
 		Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
 		Hash: &h, SourceSize: &sz, BlobRelPath: &rel,
@@ -169,6 +201,13 @@ func TestMovedFileWithBlobPresentStillSkips(t *testing.T) {
 	}
 	rel := "poster.jpg"
 	sz := int64(1000)
+	seedTech(t, s, 4242, h, `{"container":"mov","video":{"codec":"h264"},"audio":[]}`)
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &h, SourceSize: &sz,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.PutDeriv(4242, derivatives.DerivRow{
 		Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
 		Hash: &h, SourceSize: &sz, BlobRelPath: &rel,
@@ -200,6 +239,13 @@ func TestRowWithoutBlobPathDoesNotBlockFreshness(t *testing.T) {
 		t.Fatal(err)
 	}
 	sz := int64(10)
+	seedTech(t, s, 777, h, `{"container":"mov","video":{"codec":"h264"},"audio":[]}`)
+	if err := s.PutDeriv(777, derivatives.DerivRow{
+		Kind: "tech", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &h, SourceSize: &sz,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.PutDeriv(777, derivatives.DerivRow{
 		Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
 		Hash: &h, SourceSize: &sz, // no BlobRelPath
@@ -209,5 +255,154 @@ func TestRowWithoutBlobPathDoesNotBlockFreshness(t *testing.T) {
 	if fresh, _ := skipIfFresh(s, "/jfs/x.mov", 777, h, sz, Options{Mount: mount}); !fresh {
 		t.Error("a metadata-only row (no blob_rel_path) was treated as a missing " +
 			"blob, which would re-derive every asset that has one")
+	}
+}
+
+// THE MISSING-KIND GAP.
+//
+// Every check above this point is satisfied by a SINGLE ready row, so an asset
+// carrying poster and filmstrip but no waveform read "fresh" and its waveform
+// was never generated — the skip being precisely what stopped it. On 2026-08-19
+// that described 1,305 of the farm's 1,801 assets: ffmpeg 4.3.9 could not decode
+// the camera's `ipcm` audio, published no row at all, and every later sweep
+// skipped them. The ffmpeg 7.0.2 upgrade fixed the decode and recovered none of
+// them until this gate learned to ask for COMPLETENESS.
+
+func TestAssetMissingAnExpectedKindIsNotFresh(t *testing.T) {
+	s := freshStore(t)
+	hash, size := "abc123", int64(1000)
+	seed(t, s, 4242, hash, size, "ready")
+	// This source HAS audio, so a waveform run owes it a waveform row.
+	seedTech(t, s, 4242, hash, `{"container":"mov","video":{"codec":"h264"},"audio":[{"codec":"ipcm"}]}`)
+	sz := size
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "filmstrip", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &hash, SourceSize: &sz,
+	}); err != nil {
+		t.Fatalf("PutDeriv: %v", err)
+	}
+	opt := Options{Blobs: true, Filmstrip: true, Waveform: true}
+	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, opt); fresh {
+		t.Error("an asset with poster+filmstrip and NO waveform row read as fresh — " +
+			"this is the skip that stranded 1,305 waveforms behind the ffmpeg upgrade")
+	}
+}
+
+func TestAssetWithEveryExpectedKindIsFresh(t *testing.T) {
+	s := freshStore(t)
+	hash, size := "abc123", int64(1000)
+	seed(t, s, 4242, hash, size, "ready")
+	seedTech(t, s, 4242, hash, `{"container":"mov","video":{"codec":"h264"},"audio":[{"codec":"ipcm"}]}`)
+	sz := size
+	for _, k := range []string{"filmstrip", "waveform"} {
+		if err := s.PutDeriv(4242, derivatives.DerivRow{
+			Kind: k, Status: "ready", Producer: "linux-farm", Version: 1,
+			Hash: &hash, SourceSize: &sz,
+		}); err != nil {
+			t.Fatalf("PutDeriv %s: %v", k, err)
+		}
+	}
+	opt := Options{Blobs: true, Filmstrip: true, Waveform: true}
+	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, opt); !fresh {
+		t.Error("a COMPLETE asset was re-encoded — completeness must not break the " +
+			"moved-file skip this gate exists for")
+	}
+}
+
+// A kind a contributor supplied counts. The farm is not the only producer, and
+// re-deriving a poster ClipLogger already made on hardware-accelerated silicon
+// is exactly the waste this gate prevents.
+func TestContributorRowSatisfiesItsKind(t *testing.T) {
+	s := freshStore(t)
+	hash, size := "abc123", int64(1000)
+	seed(t, s, 4242, hash, size, "ready")
+	seedTech(t, s, 4242, hash, `{"container":"mov","video":{"codec":"h264"},"audio":[]}`)
+	sz := size
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "filmstrip", Status: "ready", Producer: "on-device", Version: 1,
+		Hash: &hash, SourceSize: &sz,
+	}); err != nil {
+		t.Fatalf("PutDeriv: %v", err)
+	}
+	opt := Options{Blobs: true, Filmstrip: true, Waveform: true}
+	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, opt); !fresh {
+		t.Error("a contributor-produced filmstrip did not satisfy the filmstrip kind")
+	}
+}
+
+// A source with no audio is not owed a waveform, or it could never be skipped.
+func TestSilentSourceIsNotOwedAWaveform(t *testing.T) {
+	s := freshStore(t)
+	hash, size := "abc123", int64(1000)
+	seed(t, s, 4242, hash, size, "ready")
+	sz := size
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "filmstrip", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &hash, SourceSize: &sz,
+	}); err != nil {
+		t.Fatalf("PutDeriv: %v", err)
+	}
+	opt := Options{Blobs: true, Filmstrip: true, Waveform: true}
+	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, opt); !fresh {
+		t.Error("a silent source was re-encoded for a waveform it can never have — " +
+			"that is an asset that regenerates on every sweep, forever")
+	}
+}
+
+// A failed row means "this artifact will never appear", so it accounts for its
+// kind. Treating it as unsatisfied would re-decode a permanently broken source
+// on every sweep — and it would also CHANGE today's behaviour, where a failure
+// alongside a ready row already skips.
+func TestFailedRowAccountsForItsKind(t *testing.T) {
+	s := freshStore(t)
+	hash, size := "abc123", int64(1000)
+	seed(t, s, 4242, hash, size, "ready")
+	seedTech(t, s, 4242, hash, `{"container":"mov","video":{"codec":"h264"},"audio":[{"codec":"ipcm"}]}`)
+	sz := size
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "filmstrip", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &hash, SourceSize: &sz,
+	}); err != nil {
+		t.Fatalf("PutDeriv: %v", err)
+	}
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "waveform", Status: "failed", Producer: "linux-farm", Version: 1, Hash: &hash,
+	}); err != nil {
+		t.Fatalf("PutDeriv: %v", err)
+	}
+	opt := Options{Blobs: true, Filmstrip: true, Waveform: true}
+	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, opt); !fresh {
+		t.Error("a failed waveform did not account for its kind — the source will be " +
+			"re-decoded on every sweep for an artifact that can never appear")
+	}
+}
+
+// Without `tech` we cannot know which kinds are owed, and skipIfFresh resolves
+// every uncertainty toward doing the work.
+func TestMissingTechMetadataIsNotFresh(t *testing.T) {
+	s := freshStore(t)
+	hash, size := "abc123", int64(1000)
+	seed(t, s, 4242, hash, size, "ready")
+	if err := s.PutMetadata(4242, "tech", "linux-farm", 1, &hash, json.RawMessage(`null`)); err == nil {
+		// Overwrite with an unparseable payload: same unknowable answer.
+		if err := s.PutMetadata(4242, "tech", "linux-farm", 1, &hash, json.RawMessage(`not json`)); err != nil {
+			t.Fatalf("PutMetadata: %v", err)
+		}
+	}
+	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, Options{}); fresh {
+		t.Error("an asset whose tech metadata cannot be read was declared fresh")
+	}
+}
+
+// The blob size gate skips the decode-heavy kinds, so a sub-threshold clip is
+// owed nothing but its tech row and must still skip.
+func TestSubThresholdClipIsOwedOnlyTech(t *testing.T) {
+	s := freshStore(t)
+	hash, size := "abc123", int64(1000)
+	seed(t, s, 4242, hash, size, "ready")
+	seedTech(t, s, 4242, hash, `{"container":"mov","video":{"codec":"h264"},"audio":[{"codec":"ipcm"}]}`)
+	opt := Options{Blobs: true, Filmstrip: true, Waveform: true, MinBlobSizeBytes: 20 << 20}
+	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, opt); !fresh {
+		t.Error("a sub-threshold clip was re-encoded for blobs its own size gate forbids")
 	}
 }
