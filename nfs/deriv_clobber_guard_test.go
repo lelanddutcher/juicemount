@@ -40,7 +40,7 @@ func TestForeignOwnedDerivativeIsNotOverwritten(t *testing.T) {
 	rel := ".juicemount/derivatives/2313833/waveform.json"
 	dest := writeBlob(t, filepath.Join(root, ".juicemount/derivatives/2313833"), "waveform.json", 670104)
 
-	err := checkDerivClobber(rel, dest, 11541)
+	err := checkDerivClobber(rel, dest, "", 11541)
 	if err == nil {
 		t.Fatal("a 11,541-byte preview was allowed to replace a 670,104-byte " +
 			"full-resolution waveform belonging to another producer. Downsampling " +
@@ -66,7 +66,7 @@ func TestOwnDerivativeIsStillOverwritable(t *testing.T) {
 	rel := ".juicemount/derivatives/999/poster.jpg"
 	dest := writeBlob(t, filepath.Join(root, ".juicemount/derivatives/999"), "poster.jpg", 100)
 
-	if err := checkDerivClobber(rel, dest, 200); err != nil {
+	if err := checkDerivClobber(rel, dest, "", 200); err != nil {
 		t.Fatalf("a producer was blocked from replacing its own blob: %v", err)
 	}
 }
@@ -84,7 +84,7 @@ func TestOrdinaryFilesAreUntouchedByTheGuard(t *testing.T) {
 		".juicemount/other/x.json",
 	} {
 		dest := writeBlob(t, filepath.Join(root, filepath.Dir(rel)), filepath.Base(rel), 10)
-		if err := checkDerivClobber(rel, dest, 20); err != nil {
+		if err := checkDerivClobber(rel, dest, "", 20); err != nil {
 			t.Errorf("%s was guarded but is outside the derivatives tree: %v", rel, err)
 		}
 	}
@@ -99,7 +99,7 @@ func TestFirstContributionIsAllowed(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkDerivClobber(rel, dest, 5000); err != nil {
+	if err := checkDerivClobber(rel, dest, "", 5000); err != nil {
 		t.Fatalf("a contribution to a name nobody has taken was refused: %v", err)
 	}
 }
@@ -134,7 +134,7 @@ func TestDirectoryAtTheDestIsNotAClobber(t *testing.T) {
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkDerivClobber(rel, dest, 10); err != nil {
+	if err := checkDerivClobber(rel, dest, "", 10); err != nil {
 		t.Errorf("a directory at the destination was reported as a clobber: %v", err)
 	}
 }

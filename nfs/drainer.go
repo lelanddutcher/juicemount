@@ -933,7 +933,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// returns, the existing blob is already gone. See deriv_clobber_guard.go —
 	// on 2026-08-11 this was 14 uploads that would each have replaced a
 	// full-resolution farm waveform with a 2,000-pixel preview.
-	if cerr := checkDerivClobber(row.NFSPath, dest, row.Size); cerr != nil {
+	if cerr := checkDerivClobber(row.NFSPath, dest, row.SpoolFile, row.Size); cerr != nil {
 		d.failPermanent(row, cerr.Error())
 		return
 	}

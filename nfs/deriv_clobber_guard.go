@@ -125,7 +125,7 @@ func (e *errDerivClobber) Error() string {
 // resolve. Unresolvable ownership deliberately ALLOWS the write — this guard
 // exists to stop a known, measured data downgrade, not to become a new way for
 // drains to fail on a filesystem that reports ownership differently.
-func checkDerivClobber(nfsPath, dest string, incomingSize int64) error {
+func checkDerivClobber(nfsPath, dest, incomingPath string, incomingSize int64) error {
 	if !isDerivativeBlobPath(nfsPath) {
 		return nil
 	}
@@ -143,6 +143,17 @@ func checkDerivClobber(nfsPath, dest string, incomingSize int64) error {
 	mine := derivClobberEUID()
 	if int(st.Uid) == mine {
 		return nil // our own earlier blob — updating it is not a clobber
+	}
+	// A cross-owner collision on a waveform is decided by RESOLUTION, not by
+	// which producer got there first. Ownership was only ever a proxy for "the
+	// farm's is full resolution and the client's is a preview", and that proxy
+	// is false for any clip under ~43 s (see deriv_waveform_quality.go). Fail
+	// CLOSED: unreadable, unparseable, or not-the-same-audio all keep the
+	// existing blob, because losing detail is the unrecoverable direction.
+	if isWaveformBlob(nfsPath) && incomingPath != "" {
+		if finer, ok := waveformIsFiner(incomingPath, dest); ok && finer {
+			return nil
+		}
 	}
 	return &errDerivClobber{
 		path:      nfsPath,
