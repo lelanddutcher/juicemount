@@ -1301,6 +1301,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 
 	// Wire NFS RPC observation into the metrics package.
 	jmlibnfs.SetObserver(metrics.ObserveRPC)
+	enableContentionProfilers()
 
 	// Start metrics HTTP server (if address configured).
 	if cfg.MetricsAddr != "" {
@@ -1422,6 +1423,25 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// goroutine/heap/cpu/trace dumps. pprof.Index serves
 			// /debug/pprof/goroutine, /debug/pprof/heap, etc. via the
 			// trailing-slash handler plus ?debug=1 query.
+			// /debug/pprof/mutex and /debug/pprof/block are served by
+			// pprof.Index's trailing-slash handler, but they are USELESS
+			// until the runtime is told to sample: both profilers default
+			// to off, so those two endpoints returned "sampling period=0"
+			// and an empty profile for every one of them.
+			//
+			// That is the one instrument this codebase most needed and never
+			// had. A CPU profile CANNOT see blocking by construction — it
+			// samples running goroutines — so the 2026-08-19 finding that
+			// "our RPC handling is only 12.73% of the profile" said nothing
+			// about a read path whose ceiling (~1,650 MB/s, flat from 16 to
+			// 88 in-flight RPCs) sits ~10x below the FUSE layer beneath it
+			// (17,108 MB/s at 4 readers) and below the loopback transport
+			// above it (6,949 MB/s). Contention is exactly what a mutex or
+			// block profile shows and a CPU profile hides.
+			//
+			// Both stay OFF by default: they add cost to every lock and every
+			// blocking operation, which is not something to carry in a
+			// shipped mount daemon. Set the env var to sample.
 			"/debug/pprof/":        pprof.Index,
 			"/debug/pprof/cmdline": pprof.Cmdline,
 			"/debug/pprof/profile": pprof.Profile,
