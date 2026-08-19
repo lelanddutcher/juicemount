@@ -10,10 +10,16 @@ import (
 // wf writes a waveform.json with the given shape. data is not parsed by the
 // comparator, so a token array keeps the fixtures small.
 func wf(t *testing.T, dir, name string, spp, length int) string {
+	return wfRate(t, dir, name, 48000, spp, length)
+}
+
+// wfRate is the same but names the sample rate, which is load-bearing: the two
+// producers do NOT work at the same rate.
+func wfRate(t *testing.T, dir, name string, rate, spp, length int) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
-	body := fmt.Sprintf(`{"version":2,"channels":1,"sample_rate":48000,`+
-		`"samples_per_pixel":%d,"bits":8,"length":%d,"data":[0,0]}`, spp, length)
+	body := fmt.Sprintf(`{"version":2,"channels":1,"sample_rate":%d,`+
+		`"samples_per_pixel":%d,"bits":8,"length":%d,"data":[0,0]}`, rate, spp, length)
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", p, err)
 	}
@@ -176,5 +182,43 @@ func TestGuardAllowsAFinerWaveformAndStillRefusesACoarserOne(t *testing.T) {
 	poster := ".juicemount/derivatives/1597077/poster.jpg"
 	if err := checkDerivClobber(poster, existing, finerIn, 999); err == nil {
 		t.Error("a poster collision was allowed; only waveforms are resolution-judged")
+	}
+}
+
+// THE REAL PAIR THAT THE FIRST IMPLEMENTATION GOT WRONG.
+//
+// Inode 1596857, taken off the live spool on 2026-08-19. The two producers do
+// not work at the same sample rate — the farm renders at the source's 48 kHz,
+// ClipLogger downsamples to 8 kHz first — so comparing raw SAMPLE COUNTS makes
+// 368,640 against 62,000 look like an 83% mismatch when it is 7.68 s against
+// 7.75 s, 0.9% apart. That rejected all 89 live contributions as "not the same
+// audio" and failed closed on every one.
+func TestRealWorldPairAtDifferentSampleRates(t *testing.T) {
+	d := t.TempDir()
+	farm := wfRate(t, d, "farm.json", 48000, 1024, 360)   // 7.68 s
+	client := wfRate(t, d, "client.json", 8000, 31, 2000) // 7.75 s
+
+	finer, ok := waveformIsFiner(client, farm)
+	if !ok {
+		t.Fatal("the real live pair was judged incomparable — comparing sample counts " +
+			"instead of DURATION is what rejected all 89 contributions")
+	}
+	if !finer {
+		t.Error("2,000 pixels lost to 360 for the same 7.7 s of audio")
+	}
+}
+
+// A missing or zero sample rate makes duration unknowable, so it must fail closed
+// rather than silently comparing sample counts again.
+func TestMissingSampleRateFailsClosed(t *testing.T) {
+	d := t.TempDir()
+	good := wf(t, d, "good.json", 1024, 600)
+	noRate := filepath.Join(d, "norate.json")
+	if err := os.WriteFile(noRate, []byte(
+		`{"version":2,"length":2000,"samples_per_pixel":31,"data":[0,0]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := waveformIsFiner(noRate, good); ok {
+		t.Error("a document with no sample_rate was treated as comparable")
 	}
 }

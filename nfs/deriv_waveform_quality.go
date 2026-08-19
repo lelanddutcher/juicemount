@@ -46,9 +46,9 @@ const maxWaveformBytes = 8 << 20
 
 // waveformDurationTolerance is how far two blobs' total sample counts may differ
 // and still be treated as describing the same audio. They are derived from the
-// same source by different tools, so exact agreement is not expected; a large
-// disagreement means they are NOT the same audio and pixel counts are then not
-// comparable at all.
+// same source by different tools AT DIFFERENT SAMPLE RATES, so exact agreement
+// is not expected; a large disagreement means they are NOT the same audio and
+// pixel counts are then not comparable at all.
 const waveformDurationTolerance = 0.05
 
 // isWaveformBlob reports whether a derivative path names a waveform blob.
@@ -73,15 +73,28 @@ func readWaveformDoc(p string) (*waveformDoc, error) {
 	if err := json.Unmarshal(b, &d); err != nil {
 		return nil, err
 	}
-	if d.Version != 2 || d.Length <= 0 || d.SamplesPerPixel <= 0 {
+	// sample_rate is required, not optional: without it the document's duration
+	// is unknowable and two blobs at different rates cannot be compared at all.
+	if d.Version != 2 || d.Length <= 0 || d.SamplesPerPixel <= 0 || d.SampleRate <= 0 {
 		return nil, fmt.Errorf("waveform %s is not a usable v2 document", p)
 	}
 	return &d, nil
 }
 
-// totalSamples is how much audio the document covers.
-func (d *waveformDoc) totalSamples() float64 {
-	return float64(d.Length) * float64(d.SamplesPerPixel)
+// durationSeconds is how much audio the document covers.
+//
+// It MUST divide by the sample rate. Comparing raw sample counts looks
+// equivalent and is not, because the two producers do not work at the same
+// rate: the farm renders at the source's 48 kHz while ClipLogger downsamples to
+// 8 kHz first. On inode 1596857 that is 360 px x 1024 spp = 368,640 samples for
+// the farm against 2,000 x 31 = 62,000 for the client — an 83% "mismatch" that
+// is really 7.68 s versus 7.75 s, 0.9% apart. Comparing sample counts rejected
+// every real pair as "not the same audio" and failed closed on all 89 of them.
+func (d *waveformDoc) durationSeconds() float64 {
+	if d.SampleRate <= 0 {
+		return 0
+	}
+	return float64(d.Length) * float64(d.SamplesPerPixel) / float64(d.SampleRate)
 }
 
 // waveformIsFiner reports whether the INCOMING waveform has more detail than the
@@ -101,7 +114,7 @@ func waveformIsFiner(incomingPath, existingPath string) (finer, ok bool) {
 	if err != nil {
 		return false, false
 	}
-	a, b := in.totalSamples(), ex.totalSamples()
+	a, b := in.durationSeconds(), ex.durationSeconds()
 	if a <= 0 || b <= 0 {
 		return false, false
 	}
