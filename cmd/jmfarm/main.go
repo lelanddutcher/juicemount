@@ -286,6 +286,7 @@ func main() {
 		filmstr  = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
 		filmCell = flag.Int("filmstrip-cell", 320, "filmstrip cell width in px")
 		wave     = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
+		regen    = flag.Bool("regenerate", false, "re-derive assets the freshness gate would skip (the ONLY way to force work on an asset whose derivatives already exist — use after a generator or codec fix)")
 		waveSPP  = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
 		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.logger.json (instead of basic derivatives)")
 		proxyGen = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
@@ -494,6 +495,13 @@ func main() {
 		WhisperBin: *wBin, WhisperModel: *wModel,
 		ProxyVCodec: *vcodec, ProxyCRF: *pCRF, ProxyPreset: *pPreset,
 		MinBlobSizeBytes: minSizeBytes,
+		// The freshness gate is right to skip by default, but a generator fix
+		// leaves behind assets it can now handle and the gate is precisely what
+		// stops them being revisited. Until this flag existed RegenerateFresh
+		// was set by NOTHING — declared, read in one place, wired to no CLI flag
+		// and no queue-job field — so there was no way at all to force a
+		// re-derive after fixing a decoder.
+		RegenerateFresh: *regen,
 	}
 
 	// Proxy transcode pins a core per clip, so it gets its own (lower)
