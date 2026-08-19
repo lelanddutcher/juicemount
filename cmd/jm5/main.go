@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -20,10 +21,13 @@ import (
 
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/health"
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/cplane"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/manager"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/internal/version"
 	"github.com/lelanddutcher/juicemount/metadata"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
@@ -62,7 +66,7 @@ func main() {
 	noMount := flag.Bool("no-mount", false, "Start NFS server without mounting (for testing)")
 	noFuse := flag.Bool("no-fuse", false, "Skip JuiceFS FUSE mount (assume already mounted)")
 	cacheSize := flag.String("cache-size", "100000", "JuiceFS SSD cache size in MB")
-	bucketOverride := flag.String("bucket-override", "", "Override the S3 bucket URL stored in Redis (e.g. http://192.168.0.197:30151/zpool). Empty = use the URL written by juicefs format.")
+	bucketOverride := flag.String("bucket-override", "", "Override the S3 bucket URL stored in Redis (e.g. http://<server-ip>:30151/<bucket>). Empty = use the URL written by juicefs format.")
 	logFile := flag.String("log-file", "", "Optional path to additionally write JSON log records")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	metricsAddr := flag.String("metrics-addr", "127.0.0.1:11050", "HTTP listen address for /metrics and /health")
@@ -146,7 +150,12 @@ func main() {
 	jmlog.Info("initial metadata sync starting")
 	start := time.Now()
 	if err := rc.SyncOnce(); err != nil {
-		log.Fatalf("Initial sync: %v", err)
+		// V2.3 U1/K4: a transient sync failure (slow WAN, backend hiccup)
+		// must not abort the CLI server — the GUI core only Warns here, the
+		// mirror serves what it has, and rc.Start()'s reconcile loop retries
+		// until the backend answers.
+		jmlog.Warn("initial sync failed — serving existing mirror; reconcile loop retries",
+			"error", err.Error())
 	}
 	count, _ := store.Count()
 	jmlog.Info("initial metadata sync complete",
@@ -173,6 +182,10 @@ func main() {
 	}
 
 	// 4. Start NFS server
+	// V2.3 G0: arm the FUSE identity gate before the server (and its
+	// drainer) starts — drains/purges/prunes refuse to act while the
+	// mountpoint has no real filesystem mounted on it.
+	pin.SetFUSEIdentityPath(*fusePath)
 	srv := jmnfs.NewServer(jmnfs.Config{
 		ListenAddr: *listenAddr,
 		FUSEPath:   *fusePath,
@@ -208,10 +221,12 @@ func main() {
 				spoolDir = filepath.Join(home, "Library", "Application Support", "JuiceMount", "spool")
 			}
 		}
-		spoolCapacity := int64(50) << 30
+		// Auto-size to free disk by default so a large SD-card offload fits;
+		// explicit JM_SPOOL_SIZE_GB still wins (clamped to disk in NewSpoolStore).
+		spoolCapacity := jmnfs.AutoSpoolCapacity(spoolDir)
 		if s := os.Getenv("JM_SPOOL_SIZE_GB"); s != "" {
 			if v, err := strconv.ParseInt(s, 10, 64); err != nil || v < 1 {
-				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using 50 GiB default",
+				jmlog.Warn("JM_SPOOL_SIZE_GB ignored (must be >= 1), using auto-sized default",
 					"raw", s)
 			} else {
 				spoolCapacity = v << 30
@@ -231,8 +246,10 @@ func main() {
 					ss.Stop()
 				} else {
 					// Slice F: boot-time scrubber. MUST run BEFORE
-					// drainer.Start so it doesn't race with workers.
-					recCtx, recCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					// drainer.Start so it doesn't race with workers. Generous
+					// deadline (5 min): recovery integrity outranks boot speed,
+					// and 30s stranded `draining` rows at 50k+ (see cbridge.go).
+					recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 					recReport, recErr := ss.RecoverOnBoot(recCtx)
 					recCancel()
 					if recErr != nil {
@@ -250,6 +267,11 @@ func main() {
 					}
 
 					srv.Handler().SetSpool(ss, dr)
+					// QA-30 Layer D: scopedPrune spares paths with a live,
+					// not-yet-drained spool entry (absent from Redis AND FUSE)
+					// so an in-flight spool file is never pruned mid-copy and its
+					// Track-B NFS handle never Forgotten (build-438 error 100070).
+					rc.SetSpoolGuard(ss.HasPending)
 					dr.Start()
 					spoolStore = ss
 					drainer = dr
@@ -264,7 +286,6 @@ func main() {
 
 	// Wire per-RPC observation into the metrics package.
 	jmlibnfs.SetObserver(metrics.ObserveRPC)
-	metrics.SetInFlightProvider(jmlibnfs.InFlightRPCs)
 
 	// Start metrics HTTP server (exposes /metrics and /health, plus
 	// the embedded manager UI at /manager/ when source roots are set).
@@ -348,6 +369,37 @@ func main() {
 	}
 	metricsSrv.ExtraRoutes["/spool"] = func(w http.ResponseWriter, r *http.Request) {
 		jmnfs.WriteSpoolStatusJSON(w, spoolStore, drainer)
+	}
+
+	// /whoami (contract JM-1). The jm5 CLI serves a SMALLER control plane than
+	// the GUI core — only health/metrics/spool — so deployment="cli" and the
+	// capability list derives to ["health","metrics","spool","whoami"].
+	jm5InstanceID := cplane.LoadOrMintInstanceID(*dbPath)
+	metricsSrv.ExtraRoutes["/whoami"] = func(w http.ResponseWriter, r *http.Request) {
+		served := []string{"/health", "/metrics", "/whoami"}
+		for route := range metricsSrv.ExtraRoutes {
+			served = append(served, route)
+		}
+		addr := *metricsAddr
+		if a := metricsSrv.Addr(); a != "" {
+			addr = a
+		}
+		who := cplane.WhoAmI{
+			App:             "JuiceMount",
+			Version:         version.Version,
+			ContractVersion: cplane.ContractVersion,
+			InstanceID:      jm5InstanceID,
+			VolumeName:      filepath.Base(*mountPoint),
+			MountPoint:      *mountPoint,
+			NASRoot:         *mountPoint,
+			ControlPlane:    "http://" + addr,
+			MetadataDBPath:  *dbPath,
+			Deployment:      "cli",
+			WireTerms:       cplane.WireTerms,
+			Capabilities:    cplane.DeriveCapabilities(served),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(who)
 	}
 
 	if err := metricsSrv.Start(); err != nil {
@@ -492,7 +544,17 @@ func mountNFS(addr, mountPoint string) error {
 		return fmt.Errorf("invalid addr: %s", addr)
 	}
 
-	opts := fmt.Sprintf("port=%s,mountport=%s,soft,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=128,actimeo=3600,vers=3,tcp", port, port)
+	// readahead=16 (was 128): readahead=128 over-drives the macOS NFS client and
+	// causes silent file TRUNCATION under high concurrent reads (server is
+	// correct). See bridge/cbridge.go nfsMountOpts + [torn-read 2026-06-15].
+	// hard (was soft): a soft mount's ETIMEDOUT (errno 60) on a timed-out mmap
+	// pagein becomes SIGBUS, crashing apps that mmap media. See bridge/cbridge.go
+	// nfsMountOpts + [mmap-SIGBUS 2026-06-15].
+	// [B4' Fix B] acdir 3-15s (was actimeo=3600): dir-attr + negative-name
+	// cache re-validates in seconds so server-created content becomes visible
+	// at ~(push 3s + acdirmax 15s) instead of up to an hour. acreg stays 3600.
+	// Mirrors bridge/cbridge.go nfsMountOpts — keep in sync.
+	opts := fmt.Sprintf("port=%s,mountport=%s,hard,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15,vers=3,tcp", port, port)
 	cmd := exec.Command("sudo", "mount_nfs", "-o", opts,
 		fmt.Sprintf("%s:/", host), mountPoint)
 
