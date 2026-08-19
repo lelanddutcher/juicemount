@@ -29,18 +29,66 @@ var responseBufferPool = sync.Pool{
 	},
 }
 
+// largeResponseBufferPool serves READ replies, which are up to the client's
+// rsize (1 MiB with our mount options).
+//
+// WHY A SECOND POOL (2026-08-19, measured). The small pool hands out 4 KiB
+// buffers and putResponseBuffer refused to pool anything above 64 KiB — so the
+// ONE RPC that is reliably large, READ, could never benefit from either. Every
+// read reply grew 4K -> 8K -> ... -> 1M (about eight realloc-and-copy steps),
+// then finish() copied the whole thing once more, and the grown buffer was
+// discarded so the next read repeated all of it.
+//
+// A CPU profile under sustained reads was ~50% garbage collection, and an
+// allocation profile over 15 s of reads showed 50 GB allocated:
+// bytes.growSlice 24.3 GB (48.5%), response.finish 12.1 GB (24.3%),
+// xdr encodeFixedArray 12.1 GB (24.2%). Serving 706 MB/s cost ~3.3 GB/s of
+// garbage.
+//
+// The 64 KiB cap was right in spirit — a 1 MiB buffer inherited by a small
+// GETATTR reply is waste — so the fix is a SECOND pool rather than a bigger
+// cap: small RPCs keep small buffers, READs get one already big enough.
+const largeResponseBufferCap = 1 << 20
+
+var largeResponseBufferPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, largeResponseBufferCap+4096))
+	},
+}
+
+// getResponseBufferFor picks a pool by RPC. Only NFS READ is reliably large;
+// everything else stays on the small pool.
+func getResponseBufferFor(prog, proc uint32) *bytes.Buffer {
+	var buf *bytes.Buffer
+	if prog == nfsServiceID && proc == uint32(NFSProcedureRead) {
+		buf = largeResponseBufferPool.Get().(*bytes.Buffer)
+	} else {
+		buf = responseBufferPool.Get().(*bytes.Buffer)
+	}
+	buf.Reset()
+	return buf
+}
+
 func getResponseBuffer() *bytes.Buffer {
 	buf := responseBufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	return buf
 }
 
+// putResponseBuffer returns a buffer to the pool that matches its CAPACITY, not
+// the RPC it served — a small RPC that happened to take a large buffer must not
+// demote it back to the small pool, or the next READ pays the growth again.
 func putResponseBuffer(buf *bytes.Buffer) {
-	if buf.Cap() > 65536 {
-		// Don't pool oversized buffers (e.g. from large READ responses)
-		return
+	c := buf.Cap()
+	switch {
+	case c <= 65536:
+		responseBufferPool.Put(buf)
+	case c <= 4*largeResponseBufferCap:
+		largeResponseBufferPool.Put(buf)
+	default:
+		// Genuinely oversized (a jumbo reply): let it go rather than pin
+		// multiple megabytes per pool slot indefinitely.
 	}
-	responseBufferPool.Put(buf)
 }
 
 var (
@@ -647,9 +695,10 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		return nil, err
 	}
 
-	// [JM5] Use pooled buffer to avoid allocation per RPC.
-	buf := responseBufferPool.Get().(*bytes.Buffer)
-	buf.Reset()
+	// [JM5] Use pooled buffer to avoid allocation per RPC. The header is
+	// already parsed here, so a READ can be given a buffer that is big enough
+	// from the start instead of growing into one.
+	buf := getResponseBufferFor(req.Header.Prog, req.Header.Proc)
 	w = &response{
 		conn:     c,
 		req:      &req,
