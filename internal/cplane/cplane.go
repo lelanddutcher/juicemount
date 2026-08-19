@@ -88,6 +88,13 @@ var capabilityVocab = map[string]bool{
 	// registrable. `contribute-derivatives` is the distinct token that says the
 	// widened route is present. Feature-detect on THIS, never on `contribute`.
 	"contribute-derivatives": true,
+	// JM-22 (2026-08-18): POST /derivatives/batch answers "which of these N
+	// inodes have ready derivatives" in one call. The consumer's reconcile pass
+	// is thousands of inodes wide, and the single-inode route runs an on-the-fly
+	// sidecar reconcile against the FILESYSTEM on a miss — so N single queries
+	// drive N filesystem reconciles. Feature-detect on this token; without it
+	// the consumer's only signal is a 404 from an older provider.
+	"derivatives-batch": true,
 }
 
 // routeCapAlias maps a served route (no leading slash) to a capability token when
@@ -102,6 +109,7 @@ var routeCapAlias = map[string][]string{
 	// pre-REGISTER-ROUTE provider and must not attempt a non-AI register.
 	"derivatives/register": {"contribute", "contribute-derivatives"},
 	"derivatives/changes":  {"changes"},
+	"derivatives/batch":    {"derivatives-batch"},
 }
 
 // DeriveCapabilities computes the capability list as the intersection of the

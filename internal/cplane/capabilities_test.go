@@ -39,3 +39,24 @@ func TestAllAliasTokensAreInTheVocabulary(t *testing.T) {
 		}
 	}
 }
+
+// JM-22. A route the consumer must FEATURE-DETECT is worthless if serving it
+// does not advertise it: their only other signal is a 404 from an older
+// provider, which is indistinguishable from a transient failure.
+//
+// This test exists because the alias was added WITHOUT one, and dropping the
+// alias entirely left the whole suite green — the advertisement was
+// structurally untested.
+func TestBatchRouteAdvertisesItsToken(t *testing.T) {
+	caps := DeriveCapabilities([]string{"/derivatives/batch"})
+	if !slices.Contains(caps, "derivatives-batch") {
+		t.Errorf("serving /derivatives/batch must advertise \"derivatives-batch\" so the "+
+			"consumer can feature-detect instead of probing for a 404; got %v", caps)
+	}
+
+	bare := DeriveCapabilities([]string{"/health", "/derivatives"})
+	if slices.Contains(bare, "derivatives-batch") {
+		t.Errorf("a binary NOT serving /derivatives/batch must not advertise the token — "+
+			"a consumer would send a 1000-inode POST and get a 404; got %v", bare)
+	}
+}
