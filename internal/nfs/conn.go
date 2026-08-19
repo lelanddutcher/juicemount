@@ -342,7 +342,25 @@ func (c *conn) serve(ctx context.Context) {
 			rpcCount.Add(1)
 			if elapsed > 5*time.Millisecond {
 				slowRPCCount.Add(1)
-				if elapsed > 50*time.Millisecond {
+				// RATE-LIMITED, and it has to be. This line was the single
+				// largest source of mutex contention in the whole process
+				// under a concurrent read -- 45.6% of all contention, every
+				// bit of it slog's global logger lock, reached from these
+				// handler goroutines.
+				//
+				// It is a feedback loop, not just overhead. Load makes RPCs
+				// queue; queueing pushes them past 50ms; every one that
+				// crosses then takes a PROCESS-WIDE lock and formats the
+				// whole request with %v; that serializes the handlers, which
+				// lengthens the queue, which makes more RPCs cross 50ms. The
+				// line meant to report slowness was causing it. A read at
+				// 1,650 MB/s with 88 RPCs in flight puts per-RPC wall time at
+				// ~53ms -- sitting exactly on the threshold, so nearly every
+				// RPC logged.
+				//
+				// The COUNTER above stays unconditional, so nothing is lost
+				// that anyone measures; only the log line is thinned.
+				if elapsed > 50*time.Millisecond && allowSlowRPCLog() {
 					Log.Warnf("slow RPC: %v took %v", w.req, elapsed)
 				}
 			}
