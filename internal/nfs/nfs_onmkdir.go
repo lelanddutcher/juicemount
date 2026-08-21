@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	mkdirDefaultMode = 755
+	mkdirDefaultMode = 0o755 // was decimal 755 == 0o1363: garbage perms when client omits mode
 )
 
 func onMkdir(ctx context.Context, w *response, userHandle Handler) error {

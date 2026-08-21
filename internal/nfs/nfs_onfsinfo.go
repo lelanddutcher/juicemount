@@ -51,11 +51,11 @@ func onFSInfo(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	res := fsinfores{
-		Rtmax:       1 << 30,
-		Rtpref:      1 << 30,
+		Rtmax:       1 << 20,
+		Rtpref:      1 << 20,
 		Rtmult:      4096,
-		Wtmax:       1 << 30,
-		Wtpref:      1 << 30,
+		Wtmax:       1 << 20,
+		Wtpref:      1 << 20,
 		Wtmult:      4096,
 		Dtpref:      8192,
 		Maxfilesize: 1 << 62, // wild guess. this seems big.

@@ -3,7 +3,9 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"syscall"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -49,11 +51,8 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 
 	err = fs.Remove(toDelete)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &NFSStatusError{NFSStatusNoEnt, err}
-		}
-		if os.IsPermission(err) {
-			return &NFSStatusError{NFSStatusAccess, err}
+		if status, mapped := removeErrStatus(err); mapped {
+			return status
 		}
 		return &NFSStatusError{NFSStatusIO, err}
 	}
@@ -75,4 +74,21 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 	return nil
+}
+
+// removeErrStatus maps a failed fs.Remove/RmDir to the precise NFSv3 status.
+// Extracted for direct unit testing. mapped=false → caller falls back to IO.
+//
+// ENOTEMPTY previously fell through to NFS3ERR_IO, so Finder rendered a
+// normal user mistake ("folder isn't empty") as an I/O error.
+func removeErrStatus(err error) (*NFSStatusError, bool) {
+	switch {
+	case os.IsNotExist(err):
+		return &NFSStatusError{NFSStatusNoEnt, err}, true
+	case os.IsPermission(err):
+		return &NFSStatusError{NFSStatusAccess, err}, true
+	case errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST):
+		return &NFSStatusError{NFSStatusNotEmpty, err}, true
+	}
+	return nil, false
 }

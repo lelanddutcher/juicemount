@@ -230,6 +230,10 @@ func (c *conn) serve(ctx context.Context) {
 				c.Close()
 				return
 			}
+			// Malformed/oversized frame: without Close the socket and the
+			// serializeWrites goroutine leak per bad frame (a buggy client
+			// could hold fds hostage). Mirror the EOF path.
+			c.Close()
 			return
 		}
 		Log.Tracef("request: %v", w.req)
