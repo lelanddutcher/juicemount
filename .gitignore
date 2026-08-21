@@ -69,3 +69,7 @@ secrets/
 /docs/README_DRAFT.md
 /docs/VISION.md
 /docs/QA-procedure.md
+
+# Untracked local stack file carrying real secrets (see repo CLAUDE.md)
+/compose temp.yml
+compose temp.yml
