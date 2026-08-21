@@ -196,7 +196,11 @@ type Profile struct {
 
 // New builds a fresh profile in the "unknown → medium-safe" state: until a
 // sample arrives, policy is the historical defaults so behavior is unchanged.
-func New() *Profile { return &Profile{now: time.Now} }
+func New() *Profile {
+	p := &Profile{now: time.Now}
+	applyToProfile(p)
+	return p
+}
 
 var (
 	def     *Profile
@@ -264,6 +268,15 @@ func applyEnvThresholds() {
 // ObserveRTT folds a successful-probe dial latency into the smoothed RTT
 // (RFC-6298 style: alpha=1/8, beta=1/4). Cheap; safe from any goroutine.
 func (p *Profile) ObserveRTT(sample time.Duration) {
+	if fl := FakeLinkSpec(); fl != nil {
+		// Simulated link: replace the measurement. A ±10% sawtooth keeps the
+		// RTT-variance smoothing and the hysteretic high-latency flag honest
+		// under synthetic input (a perfectly constant signal would leave
+		// rttvar at its initial value and never exercise the flap logic).
+		phase := (time.Now().UnixNano() / int64(500*time.Millisecond)) % 2
+		jitter := time.Duration(float64(fl.RTT) * 0.10 * float64(phase))
+		sample = fl.RTT + jitter
+	}
 	if sample <= 0 {
 		return
 	}
@@ -369,6 +382,9 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 		return // guard against a zero divisor (clock didn't advance)
 	}
 	rate := float64(p.winBytes) / elapsed.Seconds()
+	if fl := FakeLinkSpec(); fl != nil && fl.BWDown > 0 {
+		rate = fl.BWDown
+	}
 	// Tumble the window so concurrent reads in the next interval aren't
 	// double-counted against this one's already-folded bytes.
 	p.winStart = now
