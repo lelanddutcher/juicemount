@@ -2469,17 +2469,30 @@ func nfsMountOpts(port string) string {
 	ra := netprofile.Default().NFSReadahead()
 	// [B4' Fix B] actimeo=3600 → split attribute caching: acreg stays 3600
 	// (file attrs — unchanged behavior for the read/write paths), but acdir
-	// drops to 3-15s. With actimeo=3600 the client cached DIRECTORY attributes
+	// drops hard. With actimeo=3600 the client cached DIRECTORY attributes
 	// — and therefore its name cache, including NEGATIVE entries — for up to
 	// AN HOUR: one NoEnt answered during the ~3s keyspace-push window and
 	// server-created content (farm output, another machine's import, a
 	// folder move) stayed invisible until a manual readdir flushed it.
 	// Measured live on cellular: content never appeared (>120s, sprint B4').
-	// With the metadata mirror serving GETATTR in µs over loopback, client
-	// dir-attr caching is obsolete — re-validating every 3-15s costs nothing
-	// and bounds new-content visibility at ~(push 3s + acdirmax 15s).
-	// JM_NFS_LEGACY_ACTIMEO=1 restores the old single actimeo=3600.
-	acOpts := "acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15"
+	//
+	// [T6v2 2026-08-21] acdirmin/max 3/15 → 1/2. The negative-entry window is
+	// now the LAST-MILE bound on external-write visibility, and it is pure
+	// loss: live proof — keyspace push mirrors a server-side WebDAV write in
+	// ~220ms (reconcileDir upsert log), a mount created after the upsert sees
+	// the file instantly, yet mounts whose kernel cached the earlier ENOENT
+	// stayed blind 15-24s (negative dentries live to acdirmax). With the
+	// metadata mirror serving GETATTR/LOOKUP from RAM in µs over loopback,
+	// re-validating directory attrs every 1-2s costs nothing measurable and
+	// bounds new-content visibility at ~(push ≤3s + acdirmax 2s) ≈ ≤5s worst
+	// case, ~2s typical. JM_NFS_LEGACY_ACTIMEO=1 restores actimeo=3600;
+	// JM_NFS_ACDIR="min,max" overrides the split values.
+	acOpts := "acregmin=3600,acregmax=3600,acdirmin=1,acdirmax=2"
+	if v := os.Getenv("JM_NFS_ACDIR"); v != "" {
+		if parts := strings.SplitN(v, ",", 2); len(parts) == 2 {
+			acOpts = "acregmin=3600,acregmax=3600,acdirmin=" + strings.TrimSpace(parts[0]) + ",acdirmax=" + strings.TrimSpace(parts[1])
+		}
+	}
 	if os.Getenv("JM_NFS_LEGACY_ACTIMEO") == "1" {
 		acOpts = "actimeo=3600"
 	}
