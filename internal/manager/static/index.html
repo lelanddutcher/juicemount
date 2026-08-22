@@ -28,6 +28,7 @@
         <li><a href="#/backups"      data-tab-link="backups">Backups</a></li>
         <li><a href="#/maintenance"  data-tab-link="maintenance">Maintenance</a></li>
         <li><a href="#/permissions"  data-tab-link="permissions">Permissions</a></li>
+        <li><a href="#/link"         data-tab-link="link">JuiceMount Link</a></li>
         <li><a href="#/settings"     data-tab-link="settings">Settings</a></li>
       </ul>
     </nav>
@@ -833,6 +834,34 @@
 
       <!-- Settings tab — wired to GET/PUT /api/settings and POST
            /api/settings/rotate-admin-key. -->
+      <section data-tab="link" class="tab-pane link-pane" hidden>
+        <h2>JuiceMount Link</h2>
+        <p class="hint">Remote access for your Macs. Pair a device by generating a code, then paste it in the Mac app's Remote Access settings.</p>
+        <div id="link-status" class="card">
+          <h3>Status</h3>
+          <p id="link-enabled">Checking…</p>
+        </div>
+        <div id="link-pair" class="card" style="display:none">
+          <h3>Add a Mac</h3>
+          <button id="btn-pair" class="btn">Generate Pairing Code</button>
+          <div id="pair-result" style="display:none; margin-top:12px">
+            <p>Paste this code in the Mac app's <strong>Remote Access</strong> settings:</p>
+            <code id="pair-code" style="display:block; padding:8px; background:#1a1a2e; color:#0f0; font-size:14px; word-break:break-all; border-radius:4px"></code>
+            <p class="hint" style="margin-top:6px; color:#888">Expires in 1 hour. Each Mac needs its own code.</p>
+          </div>
+        </div>
+        <div id="link-devices" class="card" style="display:none">
+          <h3>Paired Devices</h3>
+          <table id="devices-table" style="width:100%; border-collapse:collapse">
+            <thead><tr style="text-align:left; border-bottom:1px solid #333">
+              <th style="padding:4px 8px">Hostname</th><th>IP</th><th>Online</th><th>Last Seen</th><th></th>
+            </tr></thead>
+            <tbody id="devices-body"></tbody>
+          </table>
+          <button id="btn-refresh-devices" class="btn" style="margin-top:8px">Refresh</button>
+        </div>
+      </section>
+
       <section data-tab="settings" class="tab-pane settings-pane" hidden>
         <div class="settings-header">
           <h2>Settings</h2>

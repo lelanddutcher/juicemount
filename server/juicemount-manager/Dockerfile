@@ -39,7 +39,7 @@ FROM juicedata/mount:ce-v1.3.1
 # supervise it as a child process — one container, one deploy. Pinned
 # version; v0.29.x speaks the 2026-era tsnet client protocol (0.26 rejects
 # noise handshakes from tailscale v1.102 clients — live-verified).
-RUN curl -fsSL https://github.com/juanfont/headscale/releases/download/v0.26.1/headscale_0.29.3_linux_amd64 \
+RUN curl -fsSL https://github.com/juanfont/headscale/releases/download/v0.29.3/headscale_0.29.3_linux_amd64 \
       -o /usr/local/bin/headscale && chmod +x /usr/local/bin/headscale
 
 RUN apt-get update \

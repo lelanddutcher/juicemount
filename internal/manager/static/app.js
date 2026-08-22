@@ -46,6 +46,7 @@
     'maintenance',
     'permissions',
     'settings',
+    'link',
   ];
   const DEFAULT_TAB = 'migrations';
 
@@ -3257,3 +3258,79 @@
   // default route immediately fires the migrator boot path.
   route();
 })();
+
+// ─── JuiceMount Link tab (Tier-2) ────────────────────────────────────────
+let linkInitDone = false;
+
+function initLinkOnce() {
+  if (linkInitDone) return;
+  linkInitDone = true;
+  refreshLinkStatus();
+  refreshDevices();
+
+  document.getElementById('btn-pair')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btn-pair');
+    btn.disabled = true; btn.textContent = 'Generating…';
+    try {
+      const res = await api('POST', '/api/net/pair');
+      if (res.ok && res.code) {
+        document.getElementById('pair-code').textContent = res.code + '\nserver: ' + res.server_url;
+        document.getElementById('pair-result').style.display = 'block';
+        setTimeout(refreshDevices, 30000); // check for new node after code window
+      } else {
+        document.getElementById('pair-code').textContent = 'Error: ' + (res.error || 'unknown');
+        document.getElementById('pair-result').style.display = 'block';
+      }
+    } catch (e) {
+      document.getElementById('pair-code').textContent = 'Error: ' + e.message;
+      document.getElementById('pair-result').style.display = 'block';
+    }
+    btn.disabled = false; btn.textContent = 'Generate Pairing Code';
+  });
+
+  document.getElementById('btn-refresh-devices')?.addEventListener('click', refreshDevices);
+}
+
+async function refreshLinkStatus() {
+  try {
+    const st = await api('GET', '/api/net/link');
+    document.getElementById('link-enabled').textContent =
+      st.enabled ? '✅ Link active — server: ' + st.server_url
+                 : '⚠️ Link not configured. Set JM_NET_HEADSCALE=on and JM_NET_SERVER_URL in the container env.';
+    document.getElementById('link-pair').style.display = st.enabled ? 'block' : 'none';
+    document.getElementById('link-devices').style.display = st.enabled ? 'block' : 'none';
+  } catch { document.getElementById('link-enabled').textContent = 'unreachable'; }
+}
+
+async function refreshDevices() {
+  try {
+    const res = await api('GET', '/api/net/paired');
+    const body = document.getElementById('devices-body');
+    body.innerHTML = '';
+    // Parse the raw `headscale nodes list` table output
+    const lines = (res.raw || '').split('\n').filter(l => l.includes('|') && !l.includes('ID ') && !l.includes('---'));
+    for (const line of lines) {
+      const cols = line.split('|').map(c => c.trim()).filter(Boolean);
+      if (cols.length < 4) continue;
+      const [id, hostname, , , ips, , lastSeen, , connected] = cols;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="padding:4px 8px">${escHtml(hostname)}</td>
+        <td>${escHtml(ips)}</td>
+        <td>${connected.includes('online') ? '🟢' : '🔴'}</td>
+        <td>${escHtml(lastSeen)}</td>
+        <td><button class="btn btn-sm" onclick="revokeNode('${id}')">Revoke</button></td>`;
+      body.appendChild(tr);
+    }
+  } catch { /* silent */ }
+}
+
+async function revokeNode(id) {
+  if (!confirm('Revoke this device? It will lose remote access immediately.')) return;
+  await api('POST', '/api/net/revoke?id=' + id);
+  refreshDevices();
+}
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// Lazy-init hook: called by showTab when link tab activates
