@@ -96,20 +96,23 @@ func main() {
 	if headscaleEnabled() {
 		hs := &headscaleSupervisor{}
 		if err := hs.Start(); err != nil {
-			log.Fatalf("headscale supervisor: %v", err)
-		}
-		defer hs.Stop()
-		adminKeyWrap := func(next http.HandlerFunc) http.HandlerFunc {
-			return func(w http.ResponseWriter, r *http.Request) {
-				if *adminKey == "" || r.Header.Get("X-JuiceMount-Admin-Key") == *adminKey {
-					next(w, r)
-					return
+			// Link must never take the manager down with it: a bad config or
+			// binary mismatch degrades to "pairing unavailable", not a dead UI.
+			log.Printf("ERROR: headscale supervisor failed — Link disabled: %v", err)
+		} else {
+			defer hs.Stop()
+			adminKeyWrap := func(next http.HandlerFunc) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if *adminKey == "" || r.Header.Get("X-JuiceMount-Admin-Key") == *adminKey {
+						next(w, r)
+						return
+					}
+					http.Error(w, "missing or invalid X-JuiceMount-Admin-Key", http.StatusUnauthorized)
 				}
-				http.Error(w, "missing or invalid X-JuiceMount-Admin-Key", http.StatusUnauthorized)
 			}
+			mux.HandleFunc("/api/net/pair", adminKeyWrap(handlePair))
+			log.Printf("JuiceMount Link: headscale supervising on %s (external %s)", hsListen, externalURL())
 		}
-		mux.HandleFunc("/api/net/pair", adminKeyWrap(handlePair))
-		log.Printf("JuiceMount Link: headscale supervising on %s (external %s)", hsListen, externalURL())
 	}
 
 	srv := &http.Server{

@@ -37,8 +37,9 @@ FROM juicedata/mount:ce-v1.3.1
 
 # Headscale (Tier-2 Link): fetched at build time so the manager can
 # supervise it as a child process — one container, one deploy. Pinned
-# version; bump alongside tsnet client compatibility testing.
-RUN curl -fsSL https://github.com/juanfont/headscale/releases/download/v0.26.1/headscale_0.26.1_linux_amd64 \
+# version; v0.29.x speaks the 2026-era tsnet client protocol (0.26 rejects
+# noise handshakes from tailscale v1.102 clients — live-verified).
+RUN curl -fsSL https://github.com/juanfont/headscale/releases/download/v0.26.1/headscale_0.29.3_linux_amd64 \
       -o /usr/local/bin/headscale && chmod +x /usr/local/bin/headscale
 
 RUN apt-get update \

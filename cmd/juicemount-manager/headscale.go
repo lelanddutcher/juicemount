@@ -85,13 +85,13 @@ dns:
   override_local_dns: false
   nameservers:
     global: []
+    split: {}
 derp:
   server:
     enabled: false
   urls:
     - https://controlplane.tailscale.com/derpmap/default
   auto_update_enabled: true
-  use_default_derp_enabled: true
 database:
   type: sqlite
   sqlite:
