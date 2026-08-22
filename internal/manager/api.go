@@ -349,6 +349,12 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mgr.SetSettings(settingsStore)
 	mux.HandleFunc(prefix+"/api/settings", a.auth(a.handleSettings))
 	mux.HandleFunc(prefix+"/api/settings/rotate-admin-key", a.auth(a.handleRotateAdminKey))
+
+	// JuiceMount Link (Tier-2): pairing + node management
+	mux.HandleFunc(prefix+"/api/net/link", a.auth(a.handleLinkStatus))
+	mux.HandleFunc(prefix+"/api/net/pair", a.auth(a.handlePair))
+	mux.HandleFunc(prefix+"/api/net/paired", a.auth(a.handlePairedNodes))
+	mux.HandleFunc(prefix+"/api/net/revoke", a.auth(a.handleRevokeNode))
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
