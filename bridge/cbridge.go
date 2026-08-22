@@ -181,6 +181,13 @@ type ServerConfig struct {
 	LogFile        string `json:"log_file"`
 	LogLevel       string `json:"log_level"`
 	BucketOverride string `json:"bucket_override"`
+
+	// JuiceMount Link (Tier-2 T2.2): embedded tailnet node for remote use.
+	NetControlURL string `json:"net_control_url"` // Headscale coordination URL
+	NetAuthKey    string `json:"net_authkey"`    // preauth key from pairing
+	NetHostname   string `json:"net_hostname"`   // this Mac's node name
+	NetNASAddr    string `json:"net_nas_addr"`   // NAS tailnet IP (mount/health target)
+
 	// Spool (Option 2). Passed from the Swift app via this config JSON —
 	// the env var (JM_SPOOL_ENABLE) does NOT work for the embedded
 	// c-archive because Go snapshots os.Environ at runtime init, so a
@@ -224,6 +231,32 @@ type ServerConfig struct {
 // so the contract is unit-testable without a live server).
 func (c ServerConfig) reconcileInterval() time.Duration {
 	return time.Duration(c.ReconcileSeconds) * time.Second
+}
+
+var (
+	linkMu         sync.Mutex
+	globalLinkNode *jmnfs.LinkNode
+)
+
+// startLinkIfConfigured brings up the embedded tailnet node before mounting
+// so backend traffic can route over it during the rest of startup. Returns
+// the mount host override (NAS tailnet IP) or "" when Link is off.
+func startLinkIfConfigured(cfg ServerConfig) string {
+	if cfg.NetControlURL == "" || cfg.NetAuthKey == "" {
+		return ""
+	}
+	node, addrs, err := jmnfs.StartLinkNode(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, "")
+	if err != nil {
+		jmlog.Warn("JuiceMount Link: node failed to start (continuing without remote)", "error", err.Error())
+		return ""
+	}
+	linkMu.Lock()
+	globalLinkNode = node
+	linkMu.Unlock()
+	if len(addrs) > 0 {
+		jmlog.Info("JuiceMount Link: node up", "addrs", fmt.Sprint(addrs))
+	}
+	return cfg.NetNASAddr
 }
 
 //export NFSServerStart
@@ -577,7 +610,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// needs the opened store), so store→connect stays serial; only the mount
 	// overlaps them.
 	openStore := func() (*metadata.Store, error) {
-		// Open metadata store. If this fails, leave FUSE mounted — the next
+		// JuiceMount Link: bring up the embedded tailnet node first so backend
+	// traffic can route over it during the rest of startup.
+	mountHostOverride := startLinkIfConfigured(cfg)
+	_ = mountHostOverride // T2.2 next step: thread into mountNFSWithPrompt
+
+	// Open metadata store. If this fails, leave FUSE mounted — the next
 		// Start can pick it up. Tearing FUSE down here would force an admin
 		// password prompt on the next attempt, which is hostile.
 		return metadata.Open(cfg.DBPath)
