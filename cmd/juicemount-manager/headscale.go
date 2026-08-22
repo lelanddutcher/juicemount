@@ -114,8 +114,6 @@ func (h *headscaleSupervisor) Start() error {
 	if err != nil {
 		return err
 	}
-	// Idempotent user creation: headscale exits non-zero if it exists.
-	_ = exec.Command(hsBinary, "users", "create", "jm").Run()
 	h.mu.Lock()
 	h.cmd = exec.Command(hsBinary, "serve", "--config", cfg)
 	h.cmd.Stdout = os.Stdout
@@ -130,6 +128,15 @@ func (h *headscaleSupervisor) Start() error {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if processAlive(h.cmd.Process.Pid) {
+			// User creation must happen AFTER serve is accepting gRPC;
+			// before that it fails and pairing would mint against an empty
+			// directory ("user not found"). Idempotent: duplicate = fine.
+			for tries := 0; tries < 10; tries++ {
+				if err := exec.Command(hsBinary, "--config", cfg, "users", "create", "jm").Run(); err == nil {
+					break
+				}
+				time.Sleep(500 * time.Millisecond) // already-exists also lands here; harmless
+			}
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -197,7 +204,8 @@ func pairMint() (string, error) {
 	if url == "" {
 		return "", fmt.Errorf("JM_NET_SERVER_URL not set")
 	}
-	out, err := exec.Command(hsBinary, "preauthkeys", "--user", "1", "create",
+	out, err := exec.Command(hsBinary, "--config", hsDataDir+"/config.yaml",
+		"preauthkeys", "--user", "1", "create",
 		"--reusable", "--expiration", "1h").CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
