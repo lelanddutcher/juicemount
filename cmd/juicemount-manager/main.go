@@ -91,6 +91,27 @@ func main() {
 	}
 	mgr := manager.Register(mux, "", cfg)
 
+	// Tier-2 T2.1: embedded Headscale + pairing endpoint (JuiceMount Link).
+	// Off by default; JM_NET_HEADSCALE=on opts the deployment in.
+	if headscaleEnabled() {
+		hs := &headscaleSupervisor{}
+		if err := hs.Start(); err != nil {
+			log.Fatalf("headscale supervisor: %v", err)
+		}
+		defer hs.Stop()
+		adminKeyWrap := func(next http.HandlerFunc) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				if *adminKey == "" || r.Header.Get("X-JuiceMount-Admin-Key") == *adminKey {
+					next(w, r)
+					return
+				}
+				http.Error(w, "missing or invalid X-JuiceMount-Admin-Key", http.StatusUnauthorized)
+			}
+		}
+		mux.HandleFunc("/api/net/pair", adminKeyWrap(handlePair))
+		log.Printf("JuiceMount Link: headscale supervising on %s (external %s)", hsListen, externalURL())
+	}
+
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           mux,
