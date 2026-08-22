@@ -637,6 +637,10 @@ func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error)
 // rc.rdb field directly.
 func (rc *RedisClient) redisDB() *redis.Client { return rc.rdb.Load() }
 
+// RawDB exposes the live redis client for peer subsystems that need their own
+// keyspace presence (Tier-1 #3 presence tracker). Nil before Start wiring.
+func (rc *RedisClient) RawDB() *redis.Client { return rc.rdb.Load() }
+
 // Store returns the underlying metadata store.
 func (rc *RedisClient) Store() *Store { return rc.store }
 

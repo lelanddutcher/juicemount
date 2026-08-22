@@ -42,6 +42,7 @@ type JuiceMountHandler struct {
 	memBuf      *MemoryBuffer
 	redisClient *metadata.RedisClient // for publishing events
 	pinStore    *pin.Store            // optional; gates reads when offline mode is on
+	presence    *PresenceTracker      // optional; who-has-this-open (Tier-1 #3)
 	thumbWarmer *ThumbWarmer          // optional (#1 hydration pack); nil-safe
 	sidecar     *sidecarCache         // `._` AppleDouble body cache (nav crux); nil-safe
 	blipHook    func() bool           // test override for backendBlipActive (#9)
@@ -1096,6 +1097,10 @@ func (h *JuiceMountHandler) onSymlinkMaterialized(linkPath string) {
 	}
 }
 
+// SetPresence attaches the cross-Mac who-has-this-open tracker (Tier-1 #3).
+// Nil disables presence reporting entirely.
+func (h *JuiceMountHandler) SetPresence(pt *PresenceTracker) { h.presence = pt }
+
 // SetRedisClient attaches a Redis client for publishing metadata events.
 func (h *JuiceMountHandler) SetRedisClient(rc *metadata.RedisClient) {
 	h.redisClient = rc
@@ -1128,6 +1133,7 @@ func (h *JuiceMountHandler) incActiveWriter(path string) {
 // entry when the count returns to zero so the map doesn't grow unbounded
 // across the process lifetime.
 func (h *JuiceMountHandler) decActiveWriter(path string) {
+	h.presence.Close(path)
 	h.activeWritersMu.Lock()
 	if c, ok := h.activeWriters[path]; ok {
 		if c <= 1 {

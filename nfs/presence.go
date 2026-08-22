@@ -125,6 +125,9 @@ func (p *PresenceTracker) Close(path string) {
 	_ = p.store.hdel(ctx, p.key(), path)
 }
 
+// Host returns this tracker's hostname.
+func (p *PresenceTracker) Host() string { return p.host }
+
 // key is the Redis key for this host's presence hash.
 func (p *PresenceTracker) key() string { return presenceKeyPrefix + p.host }
 

@@ -124,6 +124,7 @@ var (
 	// unchanged. Stop tears the drainer down with a 30 s deadline
 	// before closing the spool store, then nils both globals so
 	// /spool returns 503 between Stop and the next Start.
+	globalPresence *jmnfs.PresenceTracker
 	globalSpool   *jmnfs.SpoolStore
 	globalDrainer *jmnfs.Drainer
 
@@ -974,6 +975,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		srv.Handler().SetCacheReader(globalCache)
 	}
 	srv.Handler().SetRedisClient(rc)
+	// Tier-1 #3: cross-Mac "who has this open" via shared Redis. Best-effort:
+	// tracker failures never affect the data path.
+	pt := jmnfs.NewPresenceTracker(rc.RawDB())
+	srv.Handler().SetPresence(pt)
+	globalMu.Lock()
+	globalPresence = pt
+	globalMu.Unlock()
 
 	// #12: after a watchdog FUSE remount, every pooled fd references the
 	// DEAD mount — Get kept re-serving them ("stale fd → 0-byte reads").
@@ -1389,6 +1397,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// and per-entry details. 503 when the spool is disabled
 			// (JM_SPOOL_ENABLE != 1) or hasn't been wired yet.
 			"/spool": handleSpoolHTTP,
+			// Tier-1 #3: cross-Mac who-has-this-open. GET /presence → this
+			// Mac's open write-handles; GET /presence?all=1 → every host.
+			"/presence": handlePresenceHTTP,
 			// Background-operation activity surface (roadmap 4.10): plain-language
 			// view of reconcile / drain / prefetch so the UI can explain why
 			// Finder is momentarily slow ("Uploading 412 files", "Rebuilding
@@ -5035,6 +5046,29 @@ func handleCacheStatusHTTP(w http.ResponseWriter, r *http.Request) {
 // recently-done tail — not all-time history. Capped at 200 rows to
 // keep menu-bar payloads responsive on a 1 Hz poll. Older rows live
 // in SQLite for audit but are not returned here.
+// handlePresenceHTTP serves the live presence snapshot (Tier-1 #3).
+func handlePresenceHTTP(w http.ResponseWriter, r *http.Request) {
+	globalMu.Lock()
+	pt := globalPresence
+	globalMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if pt == nil {
+		w.Write([]byte(`{"enabled":false}`))
+		return
+	}
+	out := map[string]any{"enabled": true, "host": pt.Host()}
+	if r.URL.Query().Get("all") == "1" {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		out["hosts"] = pt.AllSnapshots(ctx)
+	} else {
+		local := pt.LocalSnapshot()
+		out["files"] = local
+		out["open_count"] = len(local)
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 func handleSpoolHTTP(w http.ResponseWriter, r *http.Request) {
 	globalMu.Lock()
 	spool := globalSpool
