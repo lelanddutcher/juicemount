@@ -320,6 +320,23 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		return C.CString(fmt.Sprintf("error: init logger: %v", err))
 	}
 
+	// F1 (cellular): the control plane starts FIRST — before FUSE, Redis,
+	// sync, pin store, spool, or mount. The menu bar's truth and the pprof
+	// endpoints must exist during slow-link startup stalls, not after them.
+	// Routes are attached later via RegisterRoutes as subsystems wire up.
+	var ms *metrics.Server
+	if cfg.MetricsAddr != "" {
+		ms = metrics.NewServer(cfg.MetricsAddr, metrics.Default())
+		if err := ms.Start(); err != nil {
+			jmlog.Warn("metrics server failed to start",
+				"addr", cfg.MetricsAddr, "error", err.Error())
+			ms = nil
+		} else {
+			globalMetrics = ms
+			jmlog.Info("metrics server listening", "addr", ms.Addr())
+		}
+	}
+
 	// A1 — Pre-mount conflict probe. Inspect the kernel mount table for any
 	// foreign owner at the FUSE path or the NFS mount point BEFORE we call
 	// juicefs or mount_nfs. The downstream code's "already mounted, reuse"
@@ -1349,12 +1366,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	jmlibnfs.SetObserver(metrics.ObserveRPC)
 	enableContentionProfilers()
 
-	// Start metrics HTTP server (if address configured).
-	if cfg.MetricsAddr != "" {
-		ms := metrics.NewServer(cfg.MetricsAddr, metrics.Default())
+	// Attach control-plane routes to the already-running metrics server
+	// (started early per F1). Safe on a live listener: Go 1.22+ ServeMux.
+	if cfg.MetricsAddr != "" && ms != nil {
 		// Register pin/offline control endpoints on the same listener so the
 		// CLI doesn't need a separate port.
-		ms.ExtraRoutes = map[string]http.HandlerFunc{
+		routes := map[string]http.HandlerFunc{
 			"/pin":          handlePinHTTP,
 			"/unpin":        handleUnpinHTTP,
 			"/cache-status": handleCacheStatusHTTP,
@@ -1501,17 +1518,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// actually serves plus the metrics-server built-ins (/health, /metrics),
 		// so /whoami can never advertise a route that isn't registered.
 		served := []string{"/health", "/metrics"}
+		ms.RegisterRoutes(routes)
 		for route := range ms.ExtraRoutes {
 			served = append(served, route)
 		}
 		globalCapabilities = cplane.DeriveCapabilities(served)
-		if err := ms.Start(); err != nil {
-			jmlog.Warn("metrics server failed to start",
-				"addr", cfg.MetricsAddr, "error", err.Error())
-		} else {
-			globalMetrics = ms
-			jmlog.Info("metrics server listening", "addr", ms.Addr())
-		}
 	}
 
 	// Mount NFS at the user-visible mount point (e.g. /Volumes/zpool) so

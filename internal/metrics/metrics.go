@@ -1099,6 +1099,10 @@ type Server struct {
 	// on the same listener — Pin/Unpin/CacheStatus/Offline endpoints live
 	// here. Set BEFORE calling Start().
 	ExtraRoutes map[string]http.HandlerFunc
+	// mux is set once Start() builds the serve mux; RegisterRoutes adds
+	// handlers to a LIVE listener safely (Go 1.22+ ServeMux is concurrency-safe).
+	mux *http.ServeMux
+	ru  sync.Mutex
 }
 
 // NewServer creates a metrics HTTP server bound to addr (e.g. 127.0.0.1:11050).
@@ -1129,13 +1133,16 @@ func (s *Server) Start() error {
 	}
 	s.listener = l
 
-	mux := http.NewServeMux()
+	s.ru.Lock()
+	s.mux = http.NewServeMux()
+	mux := s.mux
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/health", s.handleHealth)
 	for path, h := range s.ExtraRoutes {
 		mux.HandleFunc(path, h)
 	}
 	mux.HandleFunc("/", s.handleIndex) // catch-all last
+	s.ru.Unlock()
 
 	s.httpSrv = &http.Server{
 		Handler:           mux,
@@ -1251,4 +1258,25 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = fmt.Fprint(w, "JuiceMount metrics\n  /metrics\n  /health\n")
+}
+
+// RegisterRoutes attaches additional handlers. Safe BEFORE Start (routes are
+// picked up when the mux is built) and AFTER (Go 1.22+ ServeMux allows
+// concurrent registration on a serving mux). Exists so the control plane can
+// start FIRST at boot — before slow subsystems it reports on — and still gain
+// its full route table once those subsystems finish wiring.
+func (s *Server) RegisterRoutes(routes map[string]http.HandlerFunc) {
+	s.ru.Lock()
+	defer s.ru.Unlock()
+	if s.ExtraRoutes == nil {
+		s.ExtraRoutes = make(map[string]http.HandlerFunc, len(routes))
+	}
+	for path, h := range routes {
+		s.ExtraRoutes[path] = h
+	}
+	if s.mux != nil {
+		for path, h := range routes {
+			s.mux.HandleFunc(path, h)
+		}
+	}
 }
