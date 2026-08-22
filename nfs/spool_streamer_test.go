@@ -77,13 +77,33 @@ func TestStreamerLoopActuallyReclaimsBytes(t *testing.T) {
 
 	// The spool file must have physically shrunk. punchedEnd moving is the
 	// bookkeeping; freed blocks are the point.
+	//
+	// FLAKE FIX: two legitimate mechanisms delay block reclamation past the
+	// moment the loop advances punchedEnd:
+	//   1. APFS deallocates punched blocks ASYNCHRONOUSLY — fstat immediately
+	//      after a successful punch can still report pre-punch block counts.
+	//   2. The darwin puncher aligns inward to block size and returns a
+	//      silent no-op for sub-block tails; the streamer correctly defers
+	//      those bytes to the next tick/finalize.
+	// Neither is a product bug, so poll up to 2 s for the physical count to
+	// drop, then fail WITH diagnostics instead of a bare number pair.
 	var st syscall.Stat_t
-	if err := syscall.Stat(e.SpoolFilePath(), &st); err != nil {
-		t.Fatal(err)
+	physical := int64(-1)
+	reclaimDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if sErr := syscall.Stat(e.SpoolFilePath(), &st); sErr != nil {
+			t.Fatal(sErr)
+		}
+		physical = int64(st.Blocks) * 512
+		if physical < int64(len(payload)) || time.Now().After(reclaimDeadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if physical := int64(st.Blocks) * 512; physical >= int64(len(payload)) {
-		t.Errorf("spool file still occupies %d bytes of %d — punchedEnd advanced but "+
-			"no blocks were returned", physical, len(payload))
+	if physical >= int64(len(payload)) {
+		t.Errorf("spool file still occupies %d bytes of %d after 2s poll — punchedEnd=%d "+
+			"advanced but no blocks were returned (APFS async reclaim did not land)",
+			physical, len(payload), e.PunchedEnd())
 	}
 }
 
