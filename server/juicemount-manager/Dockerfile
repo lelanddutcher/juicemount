@@ -35,13 +35,18 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # juicedata/mount gives us /usr/local/bin/juicefs for the sync subprocess.
 FROM juicedata/mount:ce-v1.3.1
 
+# Headscale (Tier-2 Link): vendored from the official image so the manager
+# can supervise it as a child process — one container, one deploy. Pinned
+# version; bump alongside tsnet client compatibility testing.
+COPY --from=headscale/headscale:v0.26.1 /headscale /usr/local/bin/headscale
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/juicemount-manager /usr/local/bin/juicemount-manager
 
-RUN mkdir -p /sources
+RUN mkdir -p /sources /data/headscale
 
 ENV JM_LISTEN=0.0.0.0:8080 \
     JM_DEST_MOUNT=/jfs \
