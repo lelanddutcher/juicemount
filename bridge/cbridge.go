@@ -1026,21 +1026,19 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		return C.CString(fmt.Sprintf("error: start: %v", err))
 	}
 
+	jmlog.Info("STARTUP-TRACE: A-post-srvStart")
 	if globalCache != nil {
 		srv.Handler().SetCacheReader(globalCache)
 	}
+	jmlog.Info("STARTUP-TRACE: B-post-cacheReader")
 	srv.Handler().SetRedisClient(rc)
-	// Tier-1 #3: cross-Mac "who has this open" via shared Redis. Best-effort:
-	// tracker failures never affect the data path.
+	jmlog.Info("STARTUP-TRACE: C-post-redisClient")
 	pt := jmnfs.NewPresenceTracker(rc.RawDB())
+	jmlog.Info("STARTUP-TRACE: D-post-presenceTracker")
 	srv.Handler().SetPresence(pt)
-	globalMu.Lock()
-	globalPresence = pt
-	globalMu.Unlock()
+	globalPresence = pt // already holding globalMu from function entry
+	jmlog.Info("STARTUP-TRACE: E-post-globalMu")
 
-	// #12: after a watchdog FUSE remount, every pooled fd references the
-	// DEAD mount — Get kept re-serving them ("stale fd → 0-byte reads").
-	// Flush the pool the moment a remount succeeds.
 	if globalFUSE != nil {
 		h := srv.Handler()
 		globalFUSE.SetOnRemount(func() {
@@ -1050,6 +1048,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		})
 	}
 	globalServer = srv
+	jmlog.Info("STARTUP-TRACE: F-post-globalServer")
 
 	// Pin store + prefetcher. The pin store lives in its own SQLite file so
 	// it doesn't compete with the metadata store's WAL.
