@@ -197,8 +197,24 @@ public final class Preferences {
         return (raw == "0" || raw == "0s") ? "" : raw
     }
 
+    // JuiceMount Link (Tier-2): remote access pairing.
+    // Stored in UserDefaults directly (not save()) — these are set once
+    // during pairing and rarely change.
+    public var linkServerURL: String {
+        get { UserDefaults.standard.string(forKey: "link_server_url") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "link_server_url") }
+    }
+    public var linkAuthKey: String {
+        get { UserDefaults.standard.string(forKey: "link_auth_key") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "link_auth_key") }
+    }
+    public var linkHostname: String {
+        get { UserDefaults.standard.string(forKey: "link_hostname") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "link_hostname") }
+    }
+
     public func toServerConfig() -> NFSBridge.ServerConfig {
-        NFSBridge.ServerConfig(
+        var cfg = NFSBridge.ServerConfig(
             redisURL: redisURL,
             fusePath: Self.fuseMountPath(),
             mountPoint: mountPoint,
@@ -218,6 +234,11 @@ public final class Preferences {
             reconcileSeconds: reconcileSeconds,
             openCacheTTL: openCacheTTL
         )
+        // JuiceMount Link fields — assigned post-init (ServerConfig vars)
+        cfg.netControlURL = linkServerURL
+        cfg.netAuthKey = linkAuthKey
+        cfg.netHostname = linkHostname
+        return cfg
     }
 
     // MARK: - Persistence
