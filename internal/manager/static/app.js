@@ -96,6 +96,10 @@
     } else {
       stopFarmPolling();
     }
+    // JuiceMount Link tab
+    if (name === 'link') {
+      initLinkOnce();
+    }
     // SLICE 3: lazy-init Trash on first activation. Subsequent
     // activations call refreshTrash() so the list reflects any
     // out-of-band deletions/restores since the user last viewed it.
