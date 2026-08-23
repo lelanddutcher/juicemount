@@ -32,6 +32,10 @@ public enum NFSBridge {
         public var logFile: String
         public var logLevel: String
         public var bucketOverride: String
+    public var netControlURL: String = ""
+    public var netAuthKey: String = ""
+    public var netHostname: String = ""
+    public var netNASAddr: String = ""
         public var spoolEnable: Bool
         public var spoolSizeGB: Int
         /// LB-4 (Phase 3b) tuning knobs. 0 means "Go-side default"
@@ -70,6 +74,10 @@ public enum NFSBridge {
             case memBufFileLimitMB = "membuf_file_limit_mb"
             case reconcileSeconds = "reconcile_seconds"
             case openCacheTTL = "open_cache_ttl"
+            case netControlURL = "net_control_url"
+            case netAuthKey = "net_authkey"
+            case netHostname = "net_hostname"
+            case netNASAddr = "net_nas_addr"
         }
 
         public init(
