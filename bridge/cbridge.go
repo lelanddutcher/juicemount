@@ -1555,9 +1555,10 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		} else {
 			mountAddr, mountPoint := srv.Addr(), cfg.MountPoint
 			go func() {
-				var err error
+				var mountErr error
 				for attempt := 1; attempt <= 6; attempt++ {
-					if err = mountNFSWithPrompt(mountAddr, mountPoint); err == nil {
+					mountErr = mountNFSWithPrompt(mountAddr, mountPoint)
+					if mountErr == nil {
 						jmlog.Info("nfs mounted", "mount_point", mountPoint,
 							"attempt", attempt)
 						warmupMarkServing()
@@ -1568,13 +1569,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					}
 					if attempt < 6 {
 						jmlog.Warn("nfs mount failed, retrying",
-							"attempt", attempt, "error", err.Error())
+							"attempt", attempt, "error", mountErr.Error())
 						time.Sleep(10 * time.Second)
 					}
 				}
 				jmlog.Error("nfs mount failed after 6 attempts — manual mount required",
-					"mount_point", mountPoint, "last_error", err.Error())
-			}()}
+					"mount_point", mountPoint, "last_error", mountErr.Error())
+			}()
 		}
 	}
 
