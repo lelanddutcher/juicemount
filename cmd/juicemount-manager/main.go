@@ -91,6 +91,14 @@ func main() {
 	}
 	mgr := manager.Register(mux, "", cfg)
 
+	// Tier-2 T2.3: teams/seats auth
+	authDB := "/data/auth.db"
+	if err := manager.InitAuth(authDB); err != nil {
+		log.Printf("WARN: auth init failed — teams disabled: %v", err)
+	} else {
+		mux.HandleFunc("/api/auth/login", manager.HandleAuthLogin)
+	}
+
 	// Tier-2 T2.1: embedded Headscale + pairing endpoint (JuiceMount Link).
 	// Off by default; JM_NET_HEADSCALE=on opts the deployment in.
 	if headscaleEnabled() {
