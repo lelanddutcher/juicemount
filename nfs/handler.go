@@ -4186,6 +4186,12 @@ func (f *cachedFile) IncompleteAt(off int64) bool {
 }
 
 func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
+	defer func(start time.Time) {
+		if el := time.Since(start); el > 200*time.Millisecond {
+			jmlog.Warn("slow cached read", "path", f.name,
+				"offset", off, "len", len(p), "elapsed_ms", el.Milliseconds())
+		}
+	}(time.Now())
 	// Priority 0: NEVER serve an unwritten region of an in-flight file.
 	//
 	// This is FIRST, ahead of every serving priority below, for the same reason
