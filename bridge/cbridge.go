@@ -1053,6 +1053,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 
 	// Pin store + prefetcher. The pin store lives in its own SQLite file so
 	// it doesn't compete with the metadata store's WAL.
+	jmlog.Info("BOOT-TRACE: step-2 pre-pin-store")
 	pinDBPath := pinStorePath(cfg.DBPath)
 	if ps, err := pin.Open(pinDBPath); err == nil {
 		globalPinStore = ps
@@ -1103,7 +1104,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// the prefix the gate uses to canonicalize in-mount filenames into
 		// the absolute paths the pin store keys on.
 		srv.Handler().SetPinStore(ps, cfg.MountPoint)
-		jmlog.Info("pin store ready", "path", pinDBPath, "workers", 4)
+		jmlog.Info("BOOT-TRACE: step-3 pin-store-ready", "path", pinDBPath, "workers", 4)
 
 		// Item 0: heal dirs pinned in a PRIOR session. On boot the pin store
 		// remembers the pinned roots but the metadata mirror may not have their
@@ -1366,6 +1367,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	jmlibnfs.SetObserver(metrics.ObserveRPC)
 	enableContentionProfilers()
 
+	jmlog.Info("BOOT-TRACE: step-6 pre-metrics-routes")
 	// Attach control-plane routes to the already-running metrics server
 	// (started early per F1). Safe on a live listener: Go 1.22+ ServeMux.
 	if cfg.MetricsAddr != "" && ms != nil {
@@ -1546,6 +1548,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// the globalMountPath publish; the prompt itself is bounded (180s) in
 	// mountNFSWithPrompt. Boot never waits on a human again.
 	if cfg.MountPoint != "" {
+		jmlog.Info("BOOT-TRACE: step-4 pre-mount-check")
 		if isMounted(cfg.MountPoint) {
 			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
 			warmupMarkServing()
@@ -1579,6 +1582,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	}
 
 	redisAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL)
+	jmlog.Info("BOOT-TRACE: step-7 pre-monitor")
 	globalMonitor = health.New(health.Config{
 		RedisURL:      redisAddr,
 		MinIOURL:      "", // TODO: make configurable
@@ -1692,6 +1696,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		})
 	}
 	globalMonitor.Start()
+	jmlog.Info("BOOT-TRACE: step-8 monitor-started")
 
 	// Expose health to /health endpoint. Capture the monitor in the
 	// closure rather than reading the package var: that way a Stop that
