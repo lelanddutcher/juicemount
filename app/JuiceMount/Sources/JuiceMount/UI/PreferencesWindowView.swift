@@ -241,6 +241,34 @@ struct PreferencesWindowView: View {
             } footer: {
                 footnote("Local loopback endpoints for the built-in NFS server and its control plane. The NFS listen address takes effect after Stop everything → Start (the Finder mount must re-target it); the metrics address applies on the next start — Restart Server is enough. After editing the metrics address, health readouts in the popover pause until that restart.")
             }
+
+            // MARK: - Remote Access (JuiceMount Link)
+
+            Section {
+                LabeledContent("Server URL") {
+                    TextField("http://<nas-ip>:30193", text: $preferences.linkServerURL)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                        .onChange(of: preferences.linkServerURL) { _, newValue in
+                            let clean = newValue.trimmingCharacters(in: .whitespaces)
+                            if clean != newValue { preferences.linkServerURL = clean }
+                        }
+                }
+                LabeledContent("Pairing Code") {
+                    SecureField("hskey-auth-…", text: $preferences.linkAuthKey)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                }
+                LabeledContent("Hostname") {
+                    TextField("juicemount-mac", text: $preferences.linkHostname)
+                        .textFieldStyle(.roundedBorder)
+                }
+                footnote("Remote access via JuiceMount Link. Paste the pairing code from your NAS manager's JuiceMount Link tab. Applies on next Start. Leave empty to disable remote access.")
+            } header: {
+                Text("Remote Access")
+            } footer: {
+                footnote("When configured, JuiceMount routes backend traffic through an encrypted tailnet tunnel. Get a code from your NAS manager's Link tab. Requires JM_NET_HEADSCALE=on on the server.")
+            }
         }
         .formStyle(.grouped)
         .onAppear { seedDerivationAnchor() }
