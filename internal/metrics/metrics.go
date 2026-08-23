@@ -1220,8 +1220,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if fn != nil {
 		snap = fn()
 	} else {
-		// No provider yet — assume healthy if the server is up.
-		snap = HealthSnapshot{Healthy: true}
+		// No provider yet — we're still starting up. Report unhealthy so
+		// consumers (menu bar) show "starting" instead of prematurely
+		// claiming healthy before any subsystem has been checked.
+		snap = HealthSnapshot{Healthy: false, Reason: "starting"}
 	}
 	// Never emit a null or absent `components`: a nil Go map marshals to JSON
 	// null, which makes the Swift HealthProbe decoder throw valueNotFound and
