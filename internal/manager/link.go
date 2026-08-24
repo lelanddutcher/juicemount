@@ -81,7 +81,7 @@ func (a *API) handleRevokeNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := exec.Command(headscaleBin(), "--config", headscaleConfig(),
-		"nodes", "expire", nodeID).CombinedOutput()
+		"nodes", "expire", "--identifier", nodeID).CombinedOutput()
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out)))})
 		return
