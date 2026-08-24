@@ -3303,12 +3303,24 @@ async function refreshDevices() {
     const res = await api('GET', '/api/net/paired');
     const body = document.getElementById('devices-body');
     body.innerHTML = '';
-    // Parse the raw `headscale nodes list` table output
-    const lines = (res.raw || '').split('\n').filter(l => l.includes('|') && !l.includes('ID ') && !l.includes('---'));
-    for (const line of lines) {
-      const cols = line.split('|').map(c => c.trim()).filter(Boolean);
-      if (cols.length < 4) continue;
-      const [id, hostname, , , ips, , lastSeen, , connected] = cols;
+    // Parse the raw `headscale nodes list` table. Column order varies
+    // between headscale versions, so locate each field by its header
+    // name instead of fixed positions.
+    const lines = (res.raw || '').split('\n').map(l => l.replace(/\x1b\[[0-9;]*m/g, ''));
+    const hdrIdx = lines.findIndex(l => l.includes('Hostname') && l.includes('|'));
+    if (hdrIdx === -1) return;
+    const headers = lines[hdrIdx].split('|').map(c => c.trim().toLowerCase());
+    const colOf = (name) => headers.indexOf(name);
+    for (const line of lines.slice(hdrIdx + 1)) {
+      if (!line.includes('|') || line.includes('---')) continue;
+      const cells = line.split('|').map(c => c.trim());
+      if (cells.length < headers.length) continue; // wrapped-cell continuation row
+      const id = cells[colOf('id')] || '';
+      const hostname = cells[colOf('hostname')] || cells[colOf('name')] || '';
+      if (!id && !hostname) continue;
+      const ips = cells[colOf('ip addresses')] || '';
+      const connected = (cells[colOf('connected')] || '').toLowerCase();
+      const lastSeen = cells[colOf('last seen')] || '';
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td style="padding:4px 8px">${escHtml(hostname)}</td>
