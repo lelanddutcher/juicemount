@@ -19,15 +19,14 @@ WORKDIR /src
 RUN apk add --no-cache git build-base
 
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 
 COPY . .
 
 # CGO not required (no sqlite, no FUSE in this binary). Fully static.
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux \
+# No cache mounts — stale Go build cache served old binaries even with
+# --no-cache (BuildKit cache mounts persist independently of layer cache).
+RUN CGO_ENABLED=0 GOOS=linux \
     go build -ldflags="-s -w" \
       -o /out/juicemount-manager ./cmd/juicemount-manager
 
