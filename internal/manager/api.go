@@ -355,6 +355,10 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mux.HandleFunc(prefix+"/api/net/pair", a.auth(a.handlePair))
 	mux.HandleFunc(prefix+"/api/net/paired", a.auth(a.handlePairedNodes))
 	mux.HandleFunc(prefix+"/api/net/revoke", a.auth(a.handleRevokeNode))
+	// Teams/seats: user management (admin-key protected via a.auth)
+	mux.HandleFunc(prefix+"/api/users", a.auth(handleListUsers))
+	mux.HandleFunc(prefix+"/api/users/", a.auth(handleDeleteUser))
+	mux.HandleFunc(prefix+"/api/auth/login", HandleAuthLogin)
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))

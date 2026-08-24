@@ -165,3 +165,93 @@ func bearerAuth(next http.HandlerFunc) http.HandlerFunc {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 	}
 }
+
+// --- User management API (admin only) ---
+
+func (a *authStore) listUsers() ([]map[string]any, error) {
+	rows, err := a.db.Query("SELECT id, username, role, created_at FROM auth_users ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var users []map[string]any
+	for rows.Next() {
+		var id, created int64
+		var username, role string
+		if err := rows.Scan(&id, &username, &role, &created); err != nil {
+			continue
+		}
+		users = append(users, map[string]any{"id": id, "username": username, "role": role, "created_at": created})
+	}
+	return users, rows.Err()
+}
+
+func (a *authStore) deleteUserByID(id int64) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, err := a.db.Exec("DELETE FROM auth_sessions WHERE user_id=?", id)
+	if err != nil {
+		return err
+	}
+	_, err = a.db.Exec("DELETE FROM auth_users WHERE id=?", id)
+	return err
+}
+
+func handleListUsers(w http.ResponseWriter, r *http.Request) {
+	users, err := globalAuthStore.listUsers()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"users": users})
+}
+
+func handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	var req struct{ Username, Password, Role string }
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.Username == "" || req.Password == "" {
+		http.Error(w, "username and password required", http.StatusBadRequest)
+		return
+	}
+	if req.Role == "" {
+		req.Role = "member"
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), 10)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := globalAuthStore.createUser(req.Username, string(hash), req.Role); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "username": req.Username, "role": req.Role})
+}
+
+func handleDeleteUser(w http.ResponseWriter, r *http.Request) {
+	username := strings.TrimPrefix(r.URL.Path, "/api/users/")
+	if username == "" {
+		http.Error(w, "missing username", http.StatusBadRequest)
+		return
+	}
+	if username == "admin" {
+		http.Error(w, "cannot delete admin", http.StatusForbidden)
+		return
+	}
+	a := globalAuthStore
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var uid int64
+	err := a.db.QueryRow("SELECT id FROM auth_users WHERE username=?", username).Scan(&uid)
+	if err != nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+	a.db.Exec("DELETE FROM auth_sessions WHERE user_id=?", uid)
+	_, err = a.db.Exec("DELETE FROM auth_users WHERE id=?", uid)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
