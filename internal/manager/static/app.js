@@ -3255,14 +3255,6 @@
     } catch (err) { showPermError('Save failed: ' + (err.message || err)); }
   }
 
-  // -------- Boot --------
-  // route() reads location.hash, falls back to DEFAULT_TAB
-  // (#/migrations), and shows the matching <section data-tab>.
-  // showTab → initMigrationsOnce, so visiting the page with the
-  // default route immediately fires the migrator boot path.
-  route();
-})();
-
 // ─── JuiceMount Link tab (Tier-2) ────────────────────────────────────────
 let linkInitDone = false;
 
@@ -3338,3 +3330,12 @@ async function revokeNode(id) {
 function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 // Lazy-init hook: called by showTab when link tab activates
+
+
+  // -------- Boot --------
+  // route() reads location.hash, falls back to DEFAULT_TAB
+  // (#/migrations), and shows the matching <section data-tab>.
+  // showTab → initMigrationsOnce, so visiting the page with the
+  // default route immediately fires the migrator boot path.
+  route();
+})();
