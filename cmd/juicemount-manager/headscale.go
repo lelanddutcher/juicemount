@@ -172,7 +172,12 @@ func (h *headscaleSupervisor) supervise(cfg string) {
 }
 
 func (h *headscaleSupervisor) Stop() {
-	h.stopMu.Do(func() { close(h.stop) })
+	h.stopMu.Do(func() {
+		if h.stop == nil {
+			h.stop = make(chan struct{})
+		}
+		close(h.stop)
+	})
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.cmd != nil && h.cmd.Process != nil {
