@@ -129,9 +129,9 @@ if [ "${JM_FARM_QUEUE:-0}" = "1" ] || [ "$MODE" = "queue" ]; then
   if [ -n "$IONICE" ] && command -v ionice >/dev/null 2>&1; then wrap="ionice -c $IONICE $wrap"; fi
   # FARM-NODE-CONFIG: -name gives the node a stable identity for per-node
   # overrides from the manager; -kinds declares which dedicated queue(s) this
-  # worker drains (empty = catch-all); -transcript-device selects whisper's
+  # worker drains (empty/all = every shipped kind + catch-all); -transcript-device selects whisper's
   # compute backend (cpu|vulkan|cuda|sycl — vulkan on Intel Arc).
-  echo "[juicefarm] queue mode: draining $JM_META (nice=$NICE ionice=${IONICE:-off} name=${JM_WORKER_NAME:-unset} kinds=${JM_FARM_KINDS:-catch-all} device=${JM_FARM_TRANSCRIPT_DEVICE:-cpu})"
+  echo "[juicefarm] queue mode: draining $JM_META (nice=$NICE ionice=${IONICE:-off} name=${JM_WORKER_NAME:-unset} kinds=${JM_FARM_KINDS:-all} device=${JM_FARM_TRANSCRIPT_DEVICE:-cpu})"
   # shellcheck disable=SC2086
   exec $wrap jmfarm -queue -meta "$JM_META" -mount "$MNT" -db "$DB" -producer "$PRODUCER" \
     -status "$STATUS" -nice "$NICE" -ionice "$ion" \

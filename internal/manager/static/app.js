@@ -3778,6 +3778,12 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
         caps.textContent = w.capabilities.join(' · ');
         row.appendChild(caps);
       }
+      if (Array.isArray(w.kinds) && w.kinds.length) {
+        const kinds = document.createElement('span');
+        kinds.className = 'farm-worker-caps';
+        kinds.textContent = 'queues: ' + w.kinds.join(' · ');
+        row.appendChild(kinds);
+      }
       if (w.config_revision) {
         const rev = document.createElement('span');
         rev.className = 'farm-worker-rev';

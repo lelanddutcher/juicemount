@@ -654,9 +654,15 @@ func runQueue(cfg queueConfig) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	worker := farmqueue.Worker{ID: farmqueue.NewID(), StartedAt: time.Now().UTC().Format(time.RFC3339), Name: cfg.name, Capabilities: detectCapabilities(cfg.tDevice)}
+	worker := farmqueue.Worker{
+		ID:           farmqueue.NewID(),
+		StartedAt:    time.Now().UTC().Format(time.RFC3339),
+		Name:         cfg.name,
+		Kinds:        farmqueue.DrainKinds(cfg.kinds),
+		Capabilities: detectCapabilities(cfg.tDevice),
+	}
 	fmt.Printf("jmfarm queue: worker %s (name=%q kinds=%v caps=%v) draining %s (db=%s mount=%s producer=%s)\n",
-		worker.ID, worker.Name, cfg.kinds, worker.Capabilities, cfg.meta, cfg.dbPath, cfg.mount, cfg.producer)
+		worker.ID, worker.Name, worker.Kinds, worker.Capabilities, cfg.meta, cfg.dbPath, cfg.mount, cfg.producer)
 
 	// Manager-config state: last revision applied + restart-class drift. The
 	// config doc is polled every loop iteration (idle or post-job); hot knobs

@@ -50,11 +50,11 @@ const (
 const ConfigKeyName = "juicefarm:config"
 
 // QueueKeyFor maps a Job to the queue it should be pushed onto. Jobs that ask
-// for a single explicit kind go to that kind's dedicated queue (so a worker
-// that declared -kinds transcript can BRPOP exactly those); multi-kind or
-// all/empty jobs stay on the shared catch-all queue drained by everyone.
+// for a single supported kind go to that kind's dedicated queue; multi-kind,
+// all/empty, and unknown future kinds stay on the shared catch-all queue so a
+// producer can never strand work on a queue that no shipped worker drains.
 func QueueKeyFor(j *Job) string {
-	if len(j.Kinds) == 1 && j.Kinds[0] != "" && j.Kinds[0] != KindAll {
+	if len(j.Kinds) == 1 && isDedicatedKind(j.Kinds[0]) {
 		return QueueKey + ":" + j.Kinds[0]
 	}
 	return QueueKey
@@ -75,6 +75,58 @@ const (
 	KindTranscript  = "transcript"  // whisper.cpp speech-to-text
 	KindAll         = "all"
 )
+
+// AllKinds returns the dedicated job kinds supported by this worker protocol.
+// Return a fresh slice so callers cannot mutate package state.
+func AllKinds() []string {
+	return []string{KindDerivatives, KindProxy, KindTranscript}
+}
+
+func isDedicatedKind(kind string) bool {
+	switch kind {
+	case KindDerivatives, KindProxy, KindTranscript:
+		return true
+	default:
+		return false
+	}
+}
+
+// DrainKinds normalizes a worker subscription. Empty subscriptions used to
+// mean the catch-all queue only, which made the stock worker silently ignore
+// Manager's default single-kind job. Empty and "all" now mean every supported
+// dedicated queue plus the catch-all queue, preserving compatibility for
+// existing deployments while making the safe generic-worker behavior explicit.
+func DrainKinds(kinds []string) []string {
+	if len(kinds) == 0 {
+		return AllKinds()
+	}
+	for _, kind := range kinds {
+		if kind == KindAll {
+			return AllKinds()
+		}
+	}
+	seen := make(map[string]bool, len(kinds))
+	out := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		if isDedicatedKind(kind) && !seen[kind] {
+			out = append(out, kind)
+			seen[kind] = true
+		}
+	}
+	return out
+}
+
+// QueueKeysForKinds returns the dedicated queues a worker must poll followed
+// by the legacy catch-all queue. A generic worker (empty or "all") polls every
+// known dedicated queue, which prevents Manager defaults from being orphaned.
+func QueueKeysForKinds(kinds []string) []string {
+	drained := DrainKinds(kinds)
+	keys := make([]string, 0, len(drained)+1)
+	for _, kind := range drained {
+		keys = append(keys, QueueKey+":"+kind)
+	}
+	return append(keys, QueueKey)
+}
 
 // Job is the unit a producer enqueues and the worker drains. It is marshaled
 // onto the queue LIST verbatim; field names are the wire contract.
@@ -125,6 +177,7 @@ type Worker struct {
 
 	// Manager-config feedback (FARM-NODE-CONFIG spec):
 	Name           string            `json:"name,omitempty"`            // JM_WORKER_NAME (stable identity)
+	Kinds          []string          `json:"kinds,omitempty"`           // dedicated queues this worker drains
 	ConfigRevision int64             `json:"config_revision,omitempty"` // 0 = unmanaged
 	PendingRestart []string          `json:"pending_restart,omitempty"` // knobs needing container restart
 	Capabilities   []string          `json:"capabilities,omitempty"`    // e.g. ["vulkan","vaapi","cuda"]
@@ -234,24 +287,11 @@ func (c *Client) Dequeue(ctx context.Context, timeout time.Duration) (job Job, o
 
 // DequeueKinds blocks up to timeout for the next job from any of the worker's
 // declared kind queues, falling back to the catch-all QueueKey last so
-// un-routed (all/legacy) jobs still get drained by whoever is free. Round-robins
-// the kind queues by splitting the timeout evenly (BRPOP polls all listed keys
-// in ONE round trip, checking them left-to-right — kind queues first, catch-all
-// last). kinds empty = legacy behavior: drain only the catch-all.
+// un-routed (all/legacy) jobs still get drained by whoever is free. Empty and
+// "all" subscriptions drain every known kind, so a generic stock worker always
+// consumes the Manager's default single-kind jobs.
 func (c *Client) DequeueKinds(ctx context.Context, timeout time.Duration, kinds []string) (job Job, ok bool, err error) {
-	keys := make([]string, 0, len(kinds)+1)
-	seen := map[string]bool{}
-	for _, k := range kinds {
-		if k == "" || k == KindAll {
-			continue
-		}
-		qk := QueueKey + ":" + k
-		if !seen[qk] {
-			keys = append(keys, qk)
-			seen[qk] = true
-		}
-	}
-	keys = append(keys, QueueKey)
+	keys := QueueKeysForKinds(kinds)
 	res, err := c.rdb.BRPop(ctx, timeout, keys...).Result()
 	if err == redis.Nil {
 		return Job{}, false, nil
@@ -395,9 +435,23 @@ func (c *Client) ActiveWorkers(ctx context.Context) ([]Worker, error) {
 	return out, nil
 }
 
-// QueueDepth is the number of jobs waiting (not yet popped).
+// QueueDepth is the aggregate number of jobs waiting (not yet popped) across
+// every shipped dedicated queue and the legacy catch-all queue.
 func (c *Client) QueueDepth(ctx context.Context) (int64, error) {
-	return c.rdb.LLen(ctx, QueueKey).Result()
+	keys := QueueKeysForKinds([]string{KindAll})
+	pipe := c.rdb.Pipeline()
+	cmds := make([]*redis.IntCmd, 0, len(keys))
+	for _, key := range keys {
+		cmds = append(cmds, pipe.LLen(ctx, key))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, cmd := range cmds {
+		total += cmd.Val()
+	}
+	return total, nil
 }
 
 // ---- HASH <-> struct helpers --------------------------------------------

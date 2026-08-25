@@ -271,6 +271,11 @@ services:
       # picked up in near-real-time — what OpenLoupe expects. With this set the
       # entrypoint exec's `jmfarm -queue` and JM_FARM_INTERVAL below is NOT used.
       JM_FARM_QUEUE: "1"
+      # The stock CPU node is the generic fallback: it drains each dedicated
+      # queue as well as the legacy catch-all so Manager's default job cannot
+      # strand waiting for a specialized worker.
+      JM_WORKER_NAME: "nas-cpu"
+      JM_FARM_KINDS: "all"
       # Fallback only: if JM_FARM_QUEUE is unset/0 the worker reverts to a periodic
       # -root sweep every JM_FARM_INTERVAL seconds (the pre-JM-16 behavior).
       JM_FARM_INTERVAL: "900"

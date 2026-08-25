@@ -19,6 +19,7 @@ func TestQueueKeyFor(t *testing.T) {
 		{[]string{}, QueueKey},
 		{nil, QueueKey},
 		{[]string{"proxy", "transcript"}, QueueKey}, // multi-kind → catch-all
+		{[]string{"not-a-kind"}, QueueKey},
 	}
 	for _, tc := range cases {
 		got := QueueKeyFor(&Job{Kinds: tc.kinds})
@@ -28,36 +29,40 @@ func TestQueueKeyFor(t *testing.T) {
 	}
 }
 
-// TestDequeueKindsOrdering verifies DequeueKinds builds its BRPOP key list as
-// [declared kind queues..., catch-all] with dedupe and all/empty filtered out.
-// We can't run a real Redis in unit tests; instead we exercise the key-list
-// logic via a fake by testing the exported helper indirectly: build the same
-// list the function would.
-func TestDequeueKindsKeyList(t *testing.T) {
-	kinds := []string{"transcript", "", KindAll, "transcript", "proxy"}
-	want := []string{QueueKey + ":transcript", QueueKey + ":proxy", QueueKey}
-
-	keys := make([]string, 0, len(kinds)+1)
-	seen := map[string]bool{}
-	for _, k := range kinds {
-		if k == "" || k == KindAll {
-			continue
-		}
-		qk := QueueKey + ":" + k
-		if !seen[qk] {
-			keys = append(keys, qk)
-			seen[qk] = true
-		}
+func TestQueueKeysForKinds(t *testing.T) {
+	cases := []struct {
+		name  string
+		kinds []string
+		want  []string
+	}{
+		{
+			name:  "specific kinds",
+			kinds: []string{KindTranscript, KindProxy, KindTranscript},
+			want:  []string{QueueKey + ":transcript", QueueKey + ":proxy", QueueKey},
+		},
+		{
+			name:  "all expands to every dedicated queue",
+			kinds: []string{KindAll},
+			want:  []string{QueueKey + ":derivatives", QueueKey + ":proxy", QueueKey + ":transcript", QueueKey},
+		},
+		{
+			name:  "empty defaults to generic worker",
+			kinds: nil,
+			want:  []string{QueueKey + ":derivatives", QueueKey + ":proxy", QueueKey + ":transcript", QueueKey},
+		},
 	}
-	keys = append(keys, QueueKey)
-
-	if len(keys) != len(want) {
-		t.Fatalf("key list len %d, want %d", len(keys), len(want))
-	}
-	for i := range want {
-		if keys[i] != want[i] {
-			t.Errorf("keys[%d]=%q want %q", i, keys[i], want[i])
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := QueueKeysForKinds(tc.kinds)
+			if len(got) != len(tc.want) {
+				t.Fatalf("keys = %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("keys[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
 	}
 }
 
