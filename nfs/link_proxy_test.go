@@ -26,6 +26,12 @@ func TestProxyEndpointTargetPreservesEndpointShape(t *testing.T) {
 			wantLoopback: "http://127.0.0.1:4567/zpool",
 		},
 		{
+			raw:          "https://object.example.test/zpool",
+			defaultPort:  "",
+			wantTarget:   "object.example.test:443",
+			wantLoopback: "https://127.0.0.1:4567/zpool",
+		},
+		{
 			raw:          "192.168.0.197:30179/1",
 			defaultPort:  "6379",
 			wantTarget:   "192.168.0.197:30179",

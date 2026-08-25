@@ -288,7 +288,7 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool) {
 	}
 	bucketURL := cfg.BucketOverride
 	if bucketURL != "" {
-		bucketURL, err = node.ProxyEndpoint(bucketURL, "80")
+		bucketURL, err = node.ProxyEndpoint(bucketURL, "")
 		if err != nil {
 			if owned {
 				node.Stop()

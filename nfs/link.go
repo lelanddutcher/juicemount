@@ -174,6 +174,14 @@ func proxyEndpointTarget(raw, defaultPort string) (string, func(string) string, 
 	port := u.Port()
 	if port == "" {
 		port = defaultPort
+		if port == "" {
+			switch strings.ToLower(u.Scheme) {
+			case "http":
+				port = "80"
+			case "https":
+				port = "443"
+			}
+		}
 	}
 	if port == "" {
 		return "", nil, fmt.Errorf("link: endpoint %q has no port", raw)
