@@ -69,7 +69,7 @@ ARG WHISPER_MODEL=medium.en
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates fuse3 libgomp1 util-linux \
         libvulkan1 vulkan-tools mesa-vulkan-drivers \
-        libva2 libva-drm2 vainfo intel-media-va-driver librados2 \
+        libva2 libva-drm2 vainfo intel-media-va-driver librados2 libgfapi0 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
 # The otherwise-static JuiceFS binary dlopens FoundationDB's client library at
