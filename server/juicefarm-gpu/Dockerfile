@@ -64,7 +64,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates libgomp1 util-linux \
         libvulkan1 vulkan-tools mesa-vulkan-drivers \
         libva2 libva-drm2 vainfo \
-    && (apt-get update && apt-get install -y --no-install-recommends intel-media-va-driver-non-free 2>/dev/null || echo "[gpu] non-free iHD driver unavailable; free driver installed (Battlemage needs >=24.1 non-free)") \
+    && (apt-get install -y --no-install-recommends intel-media-va-driver-non-free 2>/dev/null \
+        || (echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
+            && apt-get update && apt-get install -y --no-install-recommends -t bookworm-backports intel-media-va-driver-non-free 2>/dev/null) \
+        || (echo "deb http://deb.debian.org/debian trixie main" > /etc/apt/sources.list.d/trixie.list \
+            && apt-get update && apt-get install -y --no-install-recommends -t trixie intel-media-va-driver-non-free libva2 libva-drm2 2>/dev/null) \
+        || echo "[gpu] all driver sources failed - Battlemage VAAPI encode will not work") \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
 COPY --from=whisper /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
