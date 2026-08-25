@@ -195,13 +195,23 @@ func ensureHeadscaleUser(cfg string) error {
 	var lastErr error
 	for tries := 0; tries < 10; tries++ {
 		out, err := exec.Command(hsBinary, "--config", cfg, "users", "create", "jm").CombinedOutput()
-		if err == nil || strings.Contains(strings.ToLower(string(out)), "already exists") {
+		if err == nil || headscaleUserAlreadyExists(string(out)) {
 			return nil
 		}
 		lastErr = fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("headscale user setup failed: %w", lastErr)
+}
+
+// headscaleUserAlreadyExists recognises the two forms emitted by supported
+// Headscale versions when `users create jm` is repeated. Older releases say
+// "already exists"; newer gRPC-backed releases surface SQLite's unique-key
+// violation instead. Both mean the desired durable Link user is ready.
+func headscaleUserAlreadyExists(out string) bool {
+	s := strings.ToLower(out)
+	return strings.Contains(s, "already exists") ||
+		(strings.Contains(s, "unique constraint failed") && strings.Contains(s, "users.name"))
 }
 
 func (h *headscaleSupervisor) supervise(cfg string) {
