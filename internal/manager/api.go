@@ -355,6 +355,10 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	mux.HandleFunc(prefix+"/api/net/pair", a.auth(a.handlePair))
 	mux.HandleFunc(prefix+"/api/net/paired", a.auth(a.handlePairedNodes))
 	mux.HandleFunc(prefix+"/api/net/revoke", a.auth(a.handleRevokeNode))
+	// T2.2: subnet-route approval for the embedded NAS node (advertise →
+	// approve is headscale's two-step; this surfaces the approve step so
+	// operators can verify/repair routing without shelling into the box).
+	mux.HandleFunc(prefix+"/api/net/routes/approve", a.auth(a.handleNetRouteApprove))
 	// Teams/seats: user management (admin-key protected via a.auth)
 	mux.HandleFunc(prefix+"/api/users", a.auth(handleListUsers))
 	mux.HandleFunc(prefix+"/api/users/", a.auth(handleDeleteUser))

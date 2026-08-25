@@ -33,10 +33,13 @@ import (
 )
 
 const (
-	hsListen  = "0.0.0.0:8091" // in-container; compose maps 30193 → 8091
-	hsDataDir = "/data/headscale"
-	hsBinary  = "/usr/local/bin/headscale"
+	hsListen = "0.0.0.0:8091" // in-container; compose maps 30193 → 8091
+	hsBinary = "/usr/local/bin/headscale"
 )
+
+// hsDataDir is a var (not const) solely so tests can redirect config
+// generation into a temp directory.
+var hsDataDir = "/data/headscale"
 
 // headscaleSupervisor owns the child process lifecycle. Restart-on-exit with
 // bounded backoff; Stop on manager shutdown so the container exits cleanly.
@@ -56,6 +59,32 @@ func headscaleEnabled() bool { return os.Getenv("JM_NET_HEADSCALE") == "on" }
 // error rather than minting keys that point at an unreachable address.
 func externalURL() string { return strings.TrimRight(os.Getenv("JM_NET_SERVER_URL"), "/") }
 
+// tlsConfigBlock renders the headscale TLS stanza for operator-provided
+// certificates (headscale v0.29 "bring your own certificate" mode —
+// tls_cert_path/tls_key_path in config-example.yaml). ACME is deliberately
+// NOT used: it needs port 80 + a public name, which a home NAS rarely has.
+// An empty result means "no TLS" (plain HTTP on listen_addr, today's
+// behavior).
+//
+// DEPLOYMENT (T2.4): mount the PEM cert (full chain) and key into the
+// manager container, then set before FIRST generation:
+//
+//	JM_NET_TLS_CERT=/data/tls/fullchain.pem
+//	JM_NET_TLS_KEY=/data/tls/privkey.pem
+//	JM_NET_SERVER_URL=https://<public-name-or-ip>:30193   # must match the cert
+//
+// config.yaml is generated once and then user-owned, so changing these env
+// vars later requires deleting /data/headscale/config.yaml to regenerate.
+// With TLS on, headscale serves HTTPS on the same listen_addr; Mac clients
+// pair against the https:// server_url, and tsnet verifies the certificate
+// against the system trust store.
+func tlsConfigBlock(certPath, keyPath string) string {
+	if certPath == "" || keyPath == "" {
+		return ""
+	}
+	return fmt.Sprintf("tls_cert_path: %s\ntls_key_path: %s\n", certPath, keyPath)
+}
+
 func ensureConfig() (string, error) {
 	cfgPath := filepath.Join(hsDataDir, "config.yaml")
 	if _, err := os.Stat(cfgPath); err == nil {
@@ -68,13 +97,14 @@ func ensureConfig() (string, error) {
 	if url == "" {
 		return "", fmt.Errorf("JM_NET_SERVER_URL not set (the address Mac clients will use, e.g. http://<nas-ip>:30193)")
 	}
+	tlsBlock := tlsConfigBlock(os.Getenv("JM_NET_TLS_CERT"), os.Getenv("JM_NET_TLS_KEY"))
 	cfg := fmt.Sprintf(`server_url: %s
 listen_addr: %s
 metrics_listen_addr: 127.0.0.1:9091
 grpc_listen_addr: 127.0.0.1:50443
-private_key_path: /data/headscale/node.key
+private_key_path: %[3]s/node.key
 noise:
-  private_key_path: /data/headscale/noise_private.key
+  private_key_path: %[3]s/noise_private.key
 prefixes:
   v4: 100.64.0.0/10
   v6: fd7a:115c:a1e0::/48
@@ -95,12 +125,12 @@ derp:
 database:
   type: sqlite
   sqlite:
-    path: /data/headscale/db.sqlite
+    path: %[3]s/db.sqlite
 log:
   level: info
-unix_socket: /data/headscale/headscale.sock
+%[4]sunix_socket: %[3]s/headscale.sock
 unix_socket_permission: "0770"
-`, url, hsListen)
+`, url, hsListen, hsDataDir, tlsBlock)
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		return "", err
 	}

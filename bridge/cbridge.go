@@ -462,6 +462,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			"redis_url", cfg.RedisURL)
 	}
 
+	// JuiceMount Link (T2.2): the boot probe above ran against the LAN
+	// address on purpose (tsnet is userspace; OS-stack probes can't ride the
+	// tunnel). Now that reachability is classified, bring up the tailnet
+	// node and re-point Redis/MinIO endpoints at the NAS tailnet address so
+	// the mount + connect lanes below target tunnel-routed addresses when
+	// Link is up. Single-threaded here: before the mount/connect goroutines
+	// read cfg.
+	if nasAddr := startLinkIfConfigured(cfg); nasAddr != "" {
+		cfg.RedisURL, cfg.BucketOverride = jmnfs.LinkEndpointOverride(nasAddr, cfg.RedisURL, cfg.BucketOverride)
+		jmlog.Info("JuiceMount Link: backend endpoints re-pointed at NAS tailnet addr", "nas_addr", nasAddr)
+	}
+
 	// Mount JuiceFS FUSE if not already mounted. This is what the standalone
 	// CLI (cmd/jm5/main.go) does on startup; the c-archive bridge needs to do
 	// it too, otherwise NFS will be pointing at an empty directory.
@@ -625,14 +637,9 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// openStore opens the metadata store. Fatal on error (as before): a caller
 	// with no store cannot serve nav. The connect lane runs AFTER this (it
 	// needs the opened store), so store→connect stays serial; only the mount
-	// overlaps them.
+	// overlaps them. (Link node startup moved above the probe — T2.2.)
 	openStore := func() (*metadata.Store, error) {
-		// JuiceMount Link: bring up the embedded tailnet node first so backend
-	// traffic can route over it during the rest of startup.
-	mountHostOverride := startLinkIfConfigured(cfg)
-	_ = mountHostOverride // T2.2 next step: thread into mountNFSWithPrompt
-
-	// Open metadata store. If this fails, leave FUSE mounted — the next
+		// Open metadata store. If this fails, leave FUSE mounted — the next
 		// Start can pick it up. Tearing FUSE down here would force an admin
 		// password prompt on the next attempt, which is hostile.
 		return metadata.Open(cfg.DBPath)
