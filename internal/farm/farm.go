@@ -29,6 +29,18 @@ type Options struct {
 	ProxyCRF      int    // proxy quality; 0 → 21 (lower = sharper/bigger)
 	ProxyPreset   string // proxy x264 preset; "" → "slow" (faster preset = quicker, larger)
 
+	// PosterAlways lifts MinBlobSizeBytes for the POSTER only (T1.1: "poster
+	// always" for media UTIs). A pinned/recently-browsed folder must show real
+	// frames in Finder/QuickLook regardless of clip length; a 5MB BRAW without
+	// a poster reads as a broken icon. tech/filmstrip/waveform keep the gate.
+	// Mirrored in expectedKinds so the freshness gate stays exact.
+	PosterAlways bool
+
+	// QL preview encode box (kind "qlpreview", see qlpreview.go). Only read by
+	// GenerateQLPreview / jmfarm -ql-preview; Process never encodes previews.
+	QLMaxDim  int // fit box long edge px; 0 → 960
+	QLSeconds int // preview duration cap s; <=0 → 20
+
 	// MinBlobSizeBytes gates the EXPENSIVE blob generators (poster, filmstrip,
 	// waveform) — a file below it still gets its cheap `tech` probe row (so it
 	// stays discoverable in OpenLoupe), but skips the decode-heavy derivatives
@@ -277,16 +289,17 @@ func kindsComplete(store *derivatives.Store, inode uint64, rows []derivatives.De
 func expectedKinds(tech *Tech, size int64, opt Options) []string {
 	kinds := []string{"tech"}
 	bigEnough := opt.MinBlobSizeBytes <= 0 || size >= opt.MinBlobSizeBytes
-	if !bigEnough {
+	posterWanted := bigEnough || opt.PosterAlways
+	if !bigEnough && !posterWanted {
 		return kinds
 	}
-	if opt.Blobs && tech.Video != nil {
+	if opt.Blobs && tech.Video != nil && posterWanted {
 		kinds = append(kinds, "thumbnail")
 	}
-	if opt.Filmstrip && tech.Video != nil {
+	if opt.Filmstrip && tech.Video != nil && bigEnough {
 		kinds = append(kinds, "filmstrip")
 	}
-	if opt.Waveform && len(tech.Audio) > 0 {
+	if opt.Waveform && len(tech.Audio) > 0 && bigEnough {
 		kinds = append(kinds, "waveform")
 	}
 	return kinds
@@ -422,7 +435,11 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 			defer derivDir.Close()
 		}
 	}
-	if opt.Blobs && tech.Video != nil && blobBigEnough {
+	// Poster gate (T1.1 "poster always"): MinBlobSizeBytes normally skips the
+	// decode-heavy blobs for sub-threshold clips, but a poster is THE preview
+	// surface — with PosterAlways it is produced for every video clip while
+	// filmstrip/waveform keep the size gate. Mirrored in expectedKinds.
+	if opt.Blobs && tech.Video != nil && (blobBigEnough || opt.PosterAlways) {
 		rel := "poster.jpg"
 		mt := "image/jpeg"
 		staged, out, stErr := stageUnder(derivDir, rel)
