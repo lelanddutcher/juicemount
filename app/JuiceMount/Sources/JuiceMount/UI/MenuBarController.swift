@@ -164,6 +164,9 @@ final class MenuBarController: NSObject {
             )
             image?.accessibilityDescription = accessibilityLabel(for: glance, uploads: uploads)
             button.image = image
+            // F2: the tooltip must tell the truth in BOTH rendering paths —
+            // the legacy SF-Symbol fallback previously had no tooltip at all.
+            button.toolTip = accessibilityLabel(for: glance, uploads: uploads)
         }
     }
 
@@ -194,6 +197,10 @@ final class MenuBarController: NSObject {
         var label: String
         if glance == .degraded, case .degraded(let reason) = server.state {
             label = "JuiceMount: Degraded — \(reason)"
+        } else if case .starting = server.state {
+            // F2 honest tooltip: while starting we have NOT yet confirmed
+            // bridge health — say exactly that instead of implying readiness.
+            label = "JuiceMount: Starting — waiting for first health check"
         } else {
             label = "JuiceMount: \(server.glanceLabel)"
         }

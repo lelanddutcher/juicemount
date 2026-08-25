@@ -13,8 +13,8 @@ struct MenuPopoverView: View {
 
     /// Computed mirror of `server.cacheStatus` — kept under the original
     /// name so the rest of this view's bindings stay untouched. The
-    /// underlying cgo call now runs on `ServerController.workQueue`
-    /// (see `ServerController.refreshCacheStatus`), never on MainActor.
+    /// underlying cgo call now runs on ServerController's dedicated status
+    /// queue (see `ServerController.refreshCacheStatus`), never on MainActor.
     private var cacheStatus: NFSBridge.CacheStatus { server.cacheStatus }
     @State private var cacheTimer: Timer?
     /// Local source of truth for the offline switch. Deliberately NOT a
@@ -108,7 +108,8 @@ struct MenuPopoverView: View {
     }
 
     private func refreshCacheStatus() {
-        // Dispatches the cgo call to ServerController.workQueue and hops
+        // Dispatches the cgo call to ServerController's dedicated status
+        // queue (single-flight, never queued behind mutations) and hops
         // back to MainActor to publish. The view rerenders via the
         // @Bindable server reference.
         server.refreshCacheStatus()
