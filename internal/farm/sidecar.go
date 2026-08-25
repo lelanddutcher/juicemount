@@ -117,6 +117,9 @@ var blobMediaTypes = map[string]string{
 	"thumbnail":   "image/jpeg",
 	"filmstrip":   "image/jpeg",
 	"waveform":    "application/json",
+	// T1.1/F4 Quick Look preview proxy (qlpreview.go): short H.264 MP4 a QL
+	// appex hands to AVPlayer without touching the camera-native source.
+	QLPreviewKind: qlPreviewMedia,
 }
 
 // sanitizeSidecarRow re-derives every trust-bearing field of a manifest row read
@@ -550,6 +553,8 @@ func reservedBlobName(kind string) (string, bool) {
 		return "strip.jpg", true
 	case "waveform":
 		return "waveform.json", true
+	case QLPreviewKind:
+		return qlPreviewBlobName, true
 	case "ai":
 		return derivatives.AIBlobName, true
 	}

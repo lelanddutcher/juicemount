@@ -1182,6 +1182,13 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		}
 	}
 
+	// QLPROXY (F5): arm the hot-project prewarm engine — polls the measured
+	// link class and hydrates posters + QL previews for the hottest project
+	// when on a LAN-class link; /prewarm is its manual/manager trigger.
+	// Re-reads globals per tick, so it no-ops across Stop/Start; JM_QL_PREWARM=0
+	// disables the poller. See bridge/qlproxy.go.
+	startQLPrewarm()
+
 	// Spool wiring (Option 2). Env-gated by JM_SPOOL_ENABLE so the
 	// pre-spool behavior is preserved by default until the rollout
 	// completes (docs/ROADMAP/option-2-spool.md section 9). When
@@ -1420,6 +1427,14 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			// bounded read-through populate on miss, or 404s fast so the appex
 			// errors and macOS falls back to its own generator.
 			"/thumb-local": handleThumbLocalHTTP,
+			// QLPROXY (T1.1/F4/F5): GET /ql-preview?path=<abs> serves a clip's
+			// kind="qlpreview" sidecar asset (short faststart H.264 MP4) from
+			// the local cache / bounded FUSE read-through — the bytes a Quick
+			// Look preview extension plays for camera-native RAW so spacebar
+			// never touches the source. GET/POST /prewarm[?run=1&path=<dir>]
+			// runs/status the F5 hot-project prewarm pass.
+			"/ql-preview": handleQLPreviewHTTP,
+			"/prewarm":    handlePrewarmHTTP,
 			// Release UX: the popover's warm-up card — one consolidated phase
 			// machine (starting/indexing/warming/steady) with a progress pct.
 			"/warmup": handleWarmupHTTP,

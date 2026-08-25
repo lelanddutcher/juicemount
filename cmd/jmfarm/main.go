@@ -51,12 +51,13 @@ var mediaExts = map[string]bool{
 
 // passOpts bundles everything a single sweep needs so runPasses can be shared by
 // the one-shot CLI modes and the queue loop. The booleans select the generator;
-// at most one of Transcript/Proxy is set (else basic derivatives run).
+// at most one of Transcript/Proxy/QLPreview is set (else basic derivatives run).
 type passOpts struct {
 	opt      farm.Options // resolved generator options (already merged with job overrides in queue mode)
-	mode     string       // "derivatives" | "proxy" | "transcript(AI)" — display + status stamp
+	mode     string       // "derivatives" | "proxy" | "ql-preview" | "transcript(AI)" — display + status stamp
 	transcr  bool
 	proxyGen bool
+	qlGen    bool
 	dryRun   bool
 	verbose  bool
 	effConc  int    // resolved worker count for this sweep
@@ -75,7 +76,7 @@ type passOpts struct {
 // proxy and transcript modes all funnel through the same internal/farm calls.
 func runPasses(po passOpts, targets []string) (processed, failed int) {
 	start := time.Now()
-	var ok, fail, thumbs, strips, waves, speech, proxies int64
+	var ok, fail, thumbs, strips, waves, speech, proxies, qls int64
 	// skippedFresh counts assets whose derivatives already matched byte-identical
 	// source — a moved or re-enqueued file that cost no re-encode.
 	var skippedFresh, sidecarsRepaired int64
@@ -143,6 +144,27 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 				atomic.AddInt64(&ok, 1)
 				if po.verbose {
 					fmt.Printf("  [dry] %-50s %s %dms\n", filepath.Base(p), tech.Container, tech.DurationMS)
+				}
+				return
+			}
+
+			if po.qlGen {
+				qr := farm.GenerateQLPreview(po.store, p, po.opt)
+				if qr.Err != nil {
+					atomic.AddInt64(&fail, 1)
+					recordErr(&mu, &firstErrs, p, qr.Err)
+					if po.verbose {
+						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), qr.Inode, qr.Err)
+					}
+					return
+				}
+				atomic.AddInt64(&ok, 1)
+				if qr.Wrote {
+					atomic.AddInt64(&qls, 1)
+				}
+				if po.verbose {
+					fmt.Printf("  [ok] %-50s inode=%d qlpreview=%v skipped=%v\n",
+						filepath.Base(p), qr.Inode, qr.Wrote, qr.SkippedFresh)
 				}
 				return
 			}
@@ -242,6 +264,9 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 	if po.transcr {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d with-speech (transcribed) — %d total\n",
 			time.Since(start).Round(time.Millisecond), ok, fail, speech, len(targets))
+	} else if po.qlGen {
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d ql-previews — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, fail, qls, len(targets))
 	} else if po.proxyGen {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d proxies — %d total\n",
 			time.Since(start).Round(time.Millisecond), ok, fail, proxies, len(targets))
@@ -277,26 +302,30 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 
 func main() {
 	var (
-		dbPath   = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
-		root     = flag.String("root", "", "directory to walk for media (required unless -files)")
-		files    = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
-		mount    = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
-		blobs    = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
-		thumbDim = flag.Int("thumb-dim", 720, "poster fit box in px")
-		filmstr  = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
-		filmCell = flag.Int("filmstrip-cell", 320, "filmstrip cell width in px")
-		wave     = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
-		regen    = flag.Bool("regenerate", false, "re-derive assets the freshness gate would skip (the ONLY way to force work on an asset whose derivatives already exist — use after a generator or codec fix)")
-		waveSPP  = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
-		transcr  = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.logger.json (instead of basic derivatives)")
-		proxyGen = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
-		vcodec   = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
-		pCRF     = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")
-		pPreset  = flag.String("preset", "slow", "proxy x264 preset (faster preset = quicker, larger)")
-		pConc    = flag.Int("proxy-concurrency", 0, "separate (lower) worker count for proxy mode; 0 = use -concurrency (proxy transcode is the CPU hog)")
-		wModel   = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
-		wBin     = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
-		limit    = flag.Int("limit", 0, "max files to process (0 = no limit)")
+		dbPath     = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
+		root       = flag.String("root", "", "directory to walk for media (required unless -files)")
+		files      = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
+		mount      = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
+		blobs      = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
+		thumbDim   = flag.Int("thumb-dim", 720, "poster fit box in px")
+		filmstr    = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
+		filmCell   = flag.Int("filmstrip-cell", 320, "filmstrip cell width in px")
+		wave       = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
+		regen      = flag.Bool("regenerate", false, "re-derive assets the freshness gate would skip (the ONLY way to force work on an asset whose derivatives already exist — use after a generator or codec fix)")
+		waveSPP    = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
+		transcr    = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.logger.json (instead of basic derivatives)")
+		proxyGen   = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
+		qlGen      = flag.Bool("ql-preview", false, "QL-preview mode: generate short spacebar-playable H.264 previews (T1.1/F4), separate from basic derivatives")
+		qlDim      = flag.Int("ql-dim", 960, "QL preview fit box in px")
+		qlSecs     = flag.Int("ql-seconds", 20, "QL preview duration cap in seconds (<=0 → 20)")
+		postAlways = flag.Bool("poster-always", false, "poster-always policy (T1.1): generate posters for every video clip even below -min-size-mb")
+		vcodec     = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
+		pCRF       = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")
+		pPreset    = flag.String("preset", "slow", "proxy x264 preset (faster preset = quicker, larger)")
+		pConc      = flag.Int("proxy-concurrency", 0, "separate (lower) worker count for proxy mode; 0 = use -concurrency (proxy transcode is the CPU hog)")
+		wModel     = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
+		wBin       = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
+		limit      = flag.Int("limit", 0, "max files to process (0 = no limit)")
 		// Throughput audit (2026-07-14): ffmpeg default -threads 0 spawns one
 		// decode thread per core PLUS filter threads (~61 on a 22-core box), so
 		// N parallel workers oversubscribed the box (load 33-45, CPU pinned but
@@ -434,26 +463,29 @@ func main() {
 
 	if *queue {
 		runQueue(queueConfig{
-			meta:     *meta,
-			dbPath:   *dbPath,
-			mount:    *mount,
-			producer: *producer,
-			version:  *version,
-			status:   *status,
-			verbose:  *verbose,
-			conc:     *conc,
-			pConc:    *pConc,
-			vcodec:   *vcodec,
-			crf:      *pCRF,
-			preset:   *pPreset,
-			wModel:   *wModel,
-			wBin:     *wBin,
-			thumbDim: *thumbDim,
-			filmCell: *filmCell,
-			waveSPP:  *waveSPP,
-			minSize:  minSizeBytes,
-			gNice:    *gNice,
-			gIONice:  *gIONice,
+			meta:       *meta,
+			dbPath:     *dbPath,
+			mount:      *mount,
+			producer:   *producer,
+			version:    *version,
+			status:     *status,
+			verbose:    *verbose,
+			conc:       *conc,
+			pConc:      *pConc,
+			vcodec:     *vcodec,
+			crf:        *pCRF,
+			preset:     *pPreset,
+			wModel:     *wModel,
+			wBin:       *wBin,
+			thumbDim:   *thumbDim,
+			filmCell:   *filmCell,
+			waveSPP:    *waveSPP,
+			minSize:    minSizeBytes,
+			gNice:      *gNice,
+			gIONice:    *gIONice,
+			qlMaxDim:   *qlDim,
+			qlSecs:     *qlSecs,
+			postAlways: *postAlways,
 		})
 		return
 	}
@@ -495,6 +527,8 @@ func main() {
 		WhisperBin: *wBin, WhisperModel: *wModel,
 		ProxyVCodec: *vcodec, ProxyCRF: *pCRF, ProxyPreset: *pPreset,
 		MinBlobSizeBytes: minSizeBytes,
+		PosterAlways:     *postAlways,
+		QLMaxDim:         *qlDim, QLSeconds: *qlSecs,
 		// The freshness gate is right to skip by default, but a generator fix
 		// leaves behind assets it can now handle and the gate is precisely what
 		// stops them being revisited. Until this flag existed RegenerateFresh
@@ -514,6 +548,8 @@ func main() {
 	mode := "derivatives"
 	if *transcr {
 		mode = "transcript(AI)"
+	} else if *qlGen {
+		mode = "ql-preview"
 	} else if *proxyGen {
 		mode = "proxy"
 	}
@@ -530,7 +566,7 @@ func main() {
 		*pCRF, *conc, *pConc, *gNice, *gIONice, *gInterval)
 
 	_, failed := runPasses(passOpts{
-		opt: opt, mode: mode, transcr: *transcr, proxyGen: *proxyGen,
+		opt: opt, mode: mode, transcr: *transcr, proxyGen: *proxyGen, qlGen: *qlGen,
 		dryRun: *dryRun, verbose: *verbose, effConc: effConc,
 		status: *status, mount: *mount, producer: *producer,
 		target: target, gov: gov, store: store,
@@ -545,26 +581,29 @@ func main() {
 // queueConfig carries the run-default flags into the standing worker loop. A
 // drained job's options override the matching field where it is non-zero.
 type queueConfig struct {
-	meta     string
-	dbPath   string
-	mount    string
-	producer string
-	version  int
-	status   string
-	verbose  bool
-	conc     int
-	pConc    int
-	vcodec   string
-	crf      int
-	preset   string
-	wModel   string
-	wBin     string
-	thumbDim int
-	filmCell int
-	waveSPP  int
-	minSize  int64 // skip media smaller than this (bytes); 0 = no minimum
-	gNice    int
-	gIONice  int
+	meta       string
+	dbPath     string
+	mount      string
+	producer   string
+	version    int
+	status     string
+	verbose    bool
+	conc       int
+	pConc      int
+	vcodec     string
+	crf        int
+	preset     string
+	wModel     string
+	wBin       string
+	thumbDim   int
+	filmCell   int
+	waveSPP    int
+	minSize    int64 // skip media smaller than this (bytes); 0 = no minimum
+	gNice      int
+	gIONice    int
+	qlMaxDim   int // QL preview fit box px (T1.1/F4)
+	qlSecs     int // QL preview duration cap s (<=0 → default 20)
+	postAlways bool
 }
 
 // runQueue is the JM-16 standing worker. It dials the queue Redis, opens the
@@ -771,11 +810,15 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		mode     string
 		transcr  bool
 		proxyGen bool
+		qlGen    bool
 		effConc  int
 	}
 	var passes []pass
 	if kinds[KindDerivatives] {
 		passes = append(passes, pass{mode: "derivatives", effConc: conc})
+	}
+	if kinds[KindQLPreview] {
+		passes = append(passes, pass{mode: "ql-preview", qlGen: true, effConc: conc})
 	}
 	if kinds[KindProxy] {
 		ec := conc
@@ -801,6 +844,8 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		WhisperBin: cfg.wBin, WhisperModel: wModel,
 		ProxyVCodec: vcodec, ProxyCRF: crf, ProxyPreset: preset,
 		MinBlobSizeBytes: cfg.minSize,
+		PosterAlways:     cfg.postAlways,
+		QLMaxDim:         cfg.qlMaxDim, QLSeconds: cfg.qlSecs,
 	}
 
 	fmt.Printf("jmfarm queue: job %s path=%q kinds=%v files=%d\n",
@@ -812,7 +857,7 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		}
 		gov := farm.NewGovernor(wModel, vcodec, preset, p.mode, crf, conc, pConc, cfg.gNice, cfg.gIONice, 0)
 		pr, pf := runPasses(passOpts{
-			opt: base, mode: p.mode, transcr: p.transcr, proxyGen: p.proxyGen,
+			opt: base, mode: p.mode, transcr: p.transcr, proxyGen: p.proxyGen, qlGen: p.qlGen,
 			dryRun: false, verbose: cfg.verbose, effConc: p.effConc,
 			status: cfg.status, mount: cfg.mount, producer: cfg.producer,
 			target: job.Path, gov: gov, store: store,
@@ -833,9 +878,11 @@ func normalizeKinds(kinds []string) map[string]bool {
 	for _, k := range kinds {
 		switch strings.ToLower(strings.TrimSpace(k)) {
 		case KindAll:
-			out[KindDerivatives], out[KindProxy], out[KindTranscript] = true, true, true
+			out[KindDerivatives], out[KindQLPreview], out[KindProxy], out[KindTranscript] = true, true, true, true
 		case KindDerivatives:
 			out[KindDerivatives] = true
+		case KindQLPreview:
+			out[KindQLPreview] = true
 		case KindProxy:
 			out[KindProxy] = true
 		case KindTranscript:
@@ -846,12 +893,16 @@ func normalizeKinds(kinds []string) map[string]bool {
 }
 
 // Kind constants mirror farmqueue's so the dispatch reads locally; they are the
-// same wire strings.
+// same wire strings. KindQLPreview is defined HERE rather than in farmqueue:
+// the queue package's vocabulary is frozen at its last release and the QL pass
+// is additive — a job carrying kinds:["qlpreview"] round-trips as an ordinary
+// string and older workers ignore it.
 const (
 	KindDerivatives = farmqueue.KindDerivatives
 	KindProxy       = farmqueue.KindProxy
 	KindTranscript  = farmqueue.KindTranscript
 	KindAll         = farmqueue.KindAll
+	KindQLPreview   = "qlpreview"
 )
 
 func recordErr(mu *sync.Mutex, errs *[]string, path string, err error) {
