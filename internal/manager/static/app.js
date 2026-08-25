@@ -47,6 +47,7 @@
     'permissions',
     'settings',
     'link',
+    'teams',
   ];
   const DEFAULT_TAB = 'migrations';
 
@@ -99,6 +100,13 @@
     // JuiceMount Link tab
     if (name === 'link') {
       initLinkOnce();
+    }
+    // Teams & seats tab (T2.3): lazy-init the handlers once, then refresh
+    // the session render + user list on every activation so out-of-band
+    // changes (another browser, jmctl) are reflected.
+    if (name === 'teams') {
+      initTeamsOnce();
+      refreshTeams();
     }
     // SLICE 3: lazy-init Trash on first activation. Subsequent
     // activations call refreshTrash() so the list reflects any
@@ -1628,18 +1636,175 @@
     if (overviewState.inFlight) return; // skip overlap; next tick re-tries
     overviewState.inFlight = true;
     try {
-      const snap = await api('GET', '/api/overview');
-      renderOverview(snap);
-    } catch (err) {
-      // The endpoint is supposed to never 5xx, so anything reaching
-      // here is a transport-layer issue (network blip, auth prompt
-      // cancellation, page navigated mid-flight). Show a non-blocking
-      // hint in the header without nuking the previously-rendered cards.
-      const upd = document.getElementById('overview-updated');
-      if (upd) upd.textContent = 'last poll failed: ' + (err.message || err);
+      // T1.3 home polish: one-screen health summary. The overview snapshot
+      // (volume/redis/minio/jobs) is joined with the farm rollup, farm
+      // worker presence, and Link status — all pre-existing endpoints.
+      // Promise.allSettled so a single unreachable backend degrades only
+      // its own card instead of blanking the dashboard.
+      const [ov, farm, farmJobs, link] = await Promise.allSettled([
+        api('GET', '/api/overview'),
+        api('GET', '/api/farm'),
+        api('GET', '/api/farm/jobs'),
+        api('GET', '/api/net/link'),
+      ]);
+      if (ov.status === 'fulfilled') {
+        renderOverview(ov.value);
+      } else {
+        // Transport-layer failure on the snapshot itself (network blip,
+        // auth prompt cancellation). Non-blocking header hint; previously
+        // rendered cards stay as-is.
+        const upd = document.getElementById('overview-updated');
+        if (upd) upd.textContent = 'last poll failed: ' + ((ov.reason && ov.reason.message) || ov.reason);
+      }
+      renderOverviewFarm(farm, farmJobs);
+      renderOverviewLink(link);
+      renderOverviewErrors(ov.status === 'fulfilled' ? ov.value : null);
     } finally {
       overviewState.inFlight = false;
     }
+  }
+
+  // overviewCardEl + setOverviewCardError are T1.3 helpers for the new
+  // Farm/Link/Errors cards. They reuse the same DOM contract as
+  // renderOverviewCard (header pill + .overview-error <p>) so no new CSS.
+  function overviewCardEl(name) {
+    return document.querySelector(`.overview-card[data-card="${name}"]`);
+  }
+
+  function setOverviewCardError(card, msg) {
+    const errEl = card.querySelector('.overview-error');
+    const stateEl = card.querySelector('.overview-card-state');
+    if (!errEl || !stateEl) return;
+    if (msg) {
+      errEl.textContent = msg;
+      errEl.hidden = false;
+      stateEl.textContent = 'error';
+      stateEl.className = 'overview-card-state error';
+    } else {
+      errEl.hidden = true;
+      errEl.textContent = '';
+    }
+  }
+
+  // renderOverviewFarm fills the Farm health card from two settled fetches:
+  // /api/farm (sweep progress) and /api/farm/jobs (worker presence + depth).
+  // A rejected /api/farm/jobs marks the whole card errored — worker presence
+  // is the load-bearing signal; sweep text degrades independently.
+  function renderOverviewFarm(farmSettled, jobsSettled) {
+    const card = overviewCardEl('farm');
+    if (!card) return;
+    let workers = null;
+    let depth = null;
+    let errMsg = '';
+    if (jobsSettled.status === 'fulfilled' && jobsSettled.value) {
+      workers = Array.isArray(jobsSettled.value.workers) ? jobsSettled.value.workers.length : 0;
+      depth = jobsSettled.value.queue_depth != null ? jobsSettled.value.queue_depth : 0;
+    } else {
+      errMsg = jobsSettled.status === 'rejected'
+        ? String((jobsSettled.reason && jobsSettled.reason.message) || jobsSettled.reason)
+        : 'unreachable';
+    }
+    let sweepTxt = '—';
+    if (farmSettled.status === 'fulfilled' && farmSettled.value && farmSettled.value.available) {
+      const s = farmSettled.value.status || {};
+      const ip = s.in_progress;
+      if (ip) {
+        sweepTxt = 'running — ' + (ip.done || 0).toLocaleString() + ' of ' + (ip.total || 0).toLocaleString();
+      } else {
+        const sw = s.last_sweep;
+        if (sw && (sw.mode || sw.target || sw.processed != null)) {
+          sweepTxt = 'done — ' + (sw.processed || 0).toLocaleString() + ' ok' +
+            ((sw.failed || 0) ? ', ' + sw.failed.toLocaleString() + ' failed' : '');
+        } else {
+          sweepTxt = 'none yet';
+        }
+      }
+    } else if (farmSettled.status === 'rejected') {
+      sweepTxt = 'unavailable';
+    } else {
+      sweepTxt = 'not configured';
+    }
+    setField(card, 'workers', workers == null ? '—' : workers.toLocaleString());
+    setField(card, 'queue', depth == null ? '—' : depth.toLocaleString());
+    setField(card, 'sweep', sweepTxt);
+    setOverviewCardError(card, errMsg);
+    if (!errMsg) {
+      const stateEl = card.querySelector('.overview-card-state');
+      const ok = (workers || 0) > 0;
+      stateEl.textContent = ok ? 'ok' : 'down';
+      stateEl.className = ok ? 'overview-card-state ok' : 'overview-card-state warn';
+    }
+  }
+
+  // renderOverviewLink fills the Link health card from GET /api/net/link.
+  function renderOverviewLink(linkSettled) {
+    const card = overviewCardEl('link');
+    if (!card) return;
+    if (linkSettled.status !== 'fulfilled') {
+      const reason = linkSettled.reason;
+      setField(card, 'status', '—');
+      setField(card, 'server', '—');
+      setOverviewCardError(card, String((reason && reason.message) || reason));
+      return;
+    }
+    const st = linkSettled.value || {};
+    setOverviewCardError(card, '');
+    const stateEl = card.querySelector('.overview-card-state');
+    if (st.enabled) {
+      setField(card, 'status', 'active');
+      setField(card, 'server', st.server_url || '—');
+      stateEl.textContent = 'ok';
+      stateEl.className = 'overview-card-state ok';
+    } else {
+      setField(card, 'status', 'not configured');
+      setField(card, 'server', '—');
+      stateEl.textContent = 'down';
+      stateEl.className = 'overview-card-state warn';
+    }
+  }
+
+  // renderOverviewErrors rolls every problem visible in one overview
+  // snapshot into a single list: per-backend probe errors first, then
+  // failed jobs. Derived entirely client-side from /api/overview — no
+  // extra endpoint.
+  function renderOverviewErrors(snap) {
+    const card = overviewCardEl('errors');
+    if (!card) return;
+    const list = card.querySelector('[data-field="items"]');
+    const stateEl = card.querySelector('.overview-card-state');
+    list.innerHTML = '';
+    if (!snap) {
+      setOverviewCardError(card, 'snapshot unavailable');
+      return;
+    }
+    setOverviewCardError(card, '');
+    const problems = [];
+    if (snap.volume && snap.volume.error) problems.push('volume: ' + snap.volume.error);
+    if (snap.redis && snap.redis.error) problems.push('redis: ' + snap.redis.error);
+    if (snap.minio && snap.minio.error) problems.push('minio: ' + snap.minio.error);
+    const jobItems = (snap.jobs && snap.jobs.items) || [];
+    if (snap.jobs && snap.jobs.error) {
+      problems.push('jobs: ' + snap.jobs.error);
+    } else {
+      for (const j of jobItems) {
+        if (j.state === 'error') problems.push('job ' + j.id + ' failed — ' + j.source + ' → ' + j.destination);
+      }
+    }
+    if (!problems.length) {
+      const li = document.createElement('li');
+      li.innerHTML = '<span class="ov-paths">none in the last ' + jobItems.length + ' jobs</span>';
+      list.appendChild(li);
+      stateEl.textContent = 'clear';
+      stateEl.className = 'overview-card-state ok';
+      return;
+    }
+    for (const p of problems) {
+      const li = document.createElement('li');
+      li.textContent = p;
+      list.appendChild(li);
+    }
+    stateEl.textContent = problems.length + (problems.length === 1 ? ' issue' : ' issues');
+    stateEl.className = 'overview-card-state error';
   }
 
   function renderOverview(snap) {
@@ -1653,6 +1818,10 @@
     }
     renderOverviewCard('volume', snap.volume, (card, v) => {
       setField(card, 'name', v.name || '(unset)');
+      // T1.3: closest existing signal for "volume up" is the `juicefs
+      // status` probe — a successful probe means the metadata engine
+      // answered. There is no dedicated FUSE-mount-state endpoint.
+      setField(card, 'status', v.error ? 'unreachable' : 'healthy');
       setField(card, 'used', formatBytes(v.used_bytes || 0));
       setField(card, 'files', (v.files || 0).toLocaleString());
     });
@@ -3342,6 +3511,219 @@ async function revokeNode(id) {
 function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 // Lazy-init hook: called by showTab when link tab activates
+
+  // -------- Teams & seats (Tier-2 T2.3) --------
+  // User-account management UI over the existing backend:
+  //   GET    /api/users          → {users:[{id,username,role,created_at}]}
+  //   DELETE /api/users/<name>   → {ok:true} (admin itself is protected server-side)
+  //   POST   /api/auth/login     → {ok,token,username,role,expires_at} (24h session)
+  // The login endpoint is NOT admin-key gated, so it is fetched directly
+  // (api()'s 401 handler would wrongly prompt for the admin key on a bad
+  // password). Session state persists in localStorage and is rendered as
+  // a sign-in card; no API route consumes the bearer token yet, so the
+  // session is informational until bearerAuth is wired server-side.
+  const TEAMS_SESSION_KEY = 'jm-teams-session';
+  let teamsInited = false;
+
+  function teamsSession() {
+    try { return JSON.parse(localStorage.getItem(TEAMS_SESSION_KEY) || 'null'); }
+    catch (_) { return null; }
+  }
+
+  function initTeamsOnce() {
+    if (teamsInited) return;
+    teamsInited = true;
+    $('#teams-login-form').addEventListener('submit', teamsLogin);
+    $('#teams-logout-btn').addEventListener('click', teamsLogout);
+    $('#teams-users-refresh').addEventListener('click', loadUsers);
+    $('#teams-add-form').addEventListener('submit', teamsCreateUser);
+    // Delegated delete clicks — the tbody re-renders on every refresh.
+    $('#teams-users-body').addEventListener('click', teamsDeleteClick);
+  }
+
+  function refreshTeams() {
+    renderTeamsSession();
+    loadUsers();
+  }
+
+  function renderTeamsSession() {
+    const sess = teamsSession();
+    const valid = !!(sess && typeof sess.expires_at === 'number' && Date.now() / 1000 < sess.expires_at && sess.token);
+    if (!valid) {
+      try { localStorage.removeItem(TEAMS_SESSION_KEY); } catch (_) {}
+    }
+    $('#teams-login-wrap').hidden = valid;
+    $('#teams-session-info').hidden = !valid;
+    if (!valid) return;
+    $('#teams-session-user').textContent = sess.username || '(unknown)';
+    $('#teams-session-role').textContent = sess.role || 'member';
+    $('#teams-session-expiry').textContent =
+      new Date(sess.expires_at * 1000).toLocaleString();
+  }
+
+  async function teamsLogin(e) {
+    e.preventDefault();
+    const errBox = $('#teams-login-error');
+    errBox.hidden = true;
+    const username = ($('#teams-login-user').value || '').trim();
+    const password = $('#teams-login-pass').value || '';
+    if (!username || !password) {
+      errBox.textContent = 'Username and password are required.';
+      errBox.hidden = false;
+      return;
+    }
+    const btn = $('#teams-login-btn');
+    btn.disabled = true;
+    try {
+      // Raw fetch: /api/auth/login is unauthenticated by design, and
+      // api() maps every 401 to an admin-key prompt — wrong here.
+      const r = await fetch(BASE + '/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await r.json().catch(() => null);
+      if (!r.ok || !data || data.ok !== true || !data.token) {
+        throw new Error((data && data.error) || (r.status + ' ' + r.statusText));
+      }
+      try { localStorage.setItem(TEAMS_SESSION_KEY, JSON.stringify(data)); } catch (_) {}
+      $('#teams-login-pass').value = '';
+      renderTeamsSession();
+    } catch (err) {
+      errBox.textContent = 'Sign-in failed: ' + ((err && err.message) || err);
+      errBox.hidden = false;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function teamsLogout() {
+    try { localStorage.removeItem(TEAMS_SESSION_KEY); } catch (_) {}
+    renderTeamsSession();
+  }
+
+  async function loadUsers() {
+    const errBox = $('#teams-users-error');
+    errBox.hidden = true;
+    const tbody = $('#teams-users-body');
+    tbody.innerHTML = '';
+    let users = null;
+    try {
+      const res = await api('GET', '/api/users');
+      users = (res && res.users) || [];
+    } catch (err) {
+      addTeamsUserRow(tbody, null, 'Load failed: ' + ((err && err.message) || err));
+      errBox.hidden = false;
+      return;
+    }
+    if (!users.length) {
+      addTeamsUserRow(tbody, null, 'No users yet.');
+      return;
+    }
+    const sess = teamsSession();
+    for (const u of users) {
+      const tr = addTeamsUserRow(tbody, u);
+      // Delete button. The backend refuses to delete "admin"; disable
+      // it here too so the affordance matches the server contract.
+      const tdActions = tr.lastElementChild;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-sm';
+      btn.textContent = 'Delete';
+      btn.setAttribute('data-teams-del', String(u.username || ''));
+      if (u.username === 'admin') {
+        btn.disabled = true;
+        btn.title = 'The admin account cannot be deleted.';
+      }
+      if (sess && u.username === sess.username) {
+        btn.title = 'You are signed in as this user.';
+      }
+      tdActions.appendChild(btn);
+    }
+  }
+
+  // addTeamsUserRow appends one <tr>. When `u` is null the row is a
+  // full-width muted message cell (`msg`); all server strings are set
+  // via textContent so a crafted username can't inject markup.
+  function addTeamsUserRow(tbody, u, msg) {
+    const tr = document.createElement('tr');
+    if (!u) {
+      const td = document.createElement('td');
+      td.colSpan = 4;
+      td.className = 'hint';
+      td.textContent = msg || '—';
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return tr;
+    }
+    const tdUser = document.createElement('td');
+    tdUser.textContent = u.username || '—';
+    const tdRole = document.createElement('td');
+    tdRole.textContent = u.role || 'member';
+    const tdCreated = document.createElement('td');
+    tdCreated.textContent = u.created_at
+      ? new Date(u.created_at * 1000).toLocaleDateString()
+      : '—';
+    const tdActions = document.createElement('td');
+    tr.appendChild(tdUser);
+    tr.appendChild(tdRole);
+    tr.appendChild(tdCreated);
+    tr.appendChild(tdActions);
+    tbody.appendChild(tr);
+    return tr;
+  }
+
+  async function teamsDeleteClick(e) {
+    const btn = e.target.closest('button[data-teams-del]');
+    if (!btn) return;
+    const username = btn.getAttribute('data-teams-del');
+    if (!username) return;
+    if (!confirm('Delete user "' + username + '"? They will lose access immediately.')) return;
+    btn.disabled = true;
+    try {
+      await api('DELETE', '/api/users/' + encodeURIComponent(username));
+      await loadUsers();
+    } catch (err) {
+      const errBox = $('#teams-users-error');
+      errBox.textContent = 'Delete failed: ' + ((err && err.message) || err);
+      errBox.hidden = false;
+      btn.disabled = false;
+    }
+  }
+
+  async function teamsCreateUser(e) {
+    e.preventDefault();
+    const errBox = $('#teams-add-error');
+    const flash = $('#teams-add-flash');
+    errBox.hidden = true;
+    flash.hidden = true;
+    const username = ($('#teams-add-email').value || '').trim();
+    const password = $('#teams-add-password').value || '';
+    const role = $('#teams-add-role').value || 'member';
+    if (!username || !password) {
+      errBox.textContent = 'Email/username and password are required.';
+      errBox.hidden = false;
+      return;
+    }
+    const btn = $('#teams-add-btn');
+    btn.disabled = true;
+    try {
+      const res = await api('POST', '/api/users', { username, password, role });
+      // Success contract per handleCreateUser: {ok:true, username, role}.
+      // Anything else (e.g. the list payload returned while the create
+      // route is unwired) is treated as a failure, not silently ignored.
+      if (!res || res.ok !== true) throw new Error('server did not confirm the create');
+      flash.textContent = 'Created ' + (res.username || username) + ' (' + (res.role || role) + ').';
+      flash.hidden = false;
+      $('#teams-add-form').reset();
+      await loadUsers();
+    } catch (err) {
+      errBox.textContent = 'Add failed: ' + ((err && err.message) || err);
+      errBox.hidden = false;
+    } finally {
+      btn.disabled = false;
+    }
+  }
 
 
   // -------- Boot --------
