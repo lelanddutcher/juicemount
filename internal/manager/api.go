@@ -360,7 +360,13 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// operators can verify/repair routing without shelling into the box).
 	mux.HandleFunc(prefix+"/api/net/routes/approve", a.auth(a.handleNetRouteApprove))
 	// Teams/seats: user management (admin-key protected via a.auth)
-	mux.HandleFunc(prefix+"/api/users", a.auth(handleListUsers))
+	mux.HandleFunc(prefix+"/api/users", a.auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			handleCreateUser(w, r)
+			return
+		}
+		handleListUsers(w, r)
+	}))
 	mux.HandleFunc(prefix+"/api/users/", a.auth(handleDeleteUser))
 	mux.HandleFunc(prefix+"/api/auth/login", HandleAuthLogin)
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
