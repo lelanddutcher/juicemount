@@ -32,11 +32,12 @@ import (
 
 // Redis keys + tunables. All under the juicefarm: namespace.
 const (
-	QueueKey      = "juicefarm:queue"   // LIST: marshaled Jobs (LPUSH producer → BRPOP worker, FIFO)
-	JobHashPrefix = "juicefarm:job:"    // HASH per job id: the JobStatus fields
-	JobIndexKey   = "juicefarm:jobs"    // ZSET of job ids scored by enqueue unix-ts (recent-first listing)
-	WorkerPrefix  = "juicefarm:worker:" // STRING per worker: JSON Worker heartbeat, short TTL
-	ConfigKey     = "juicefarm:config"  // STRING: JSON FarmConfig — manager-owned desired state
+	QueueKey       = "juicefarm:queue"   // LIST: marshaled Jobs (LPUSH producer → BRPOP worker, FIFO)
+	JobHashPrefix  = "juicefarm:job:"    // HASH per job id: the JobStatus fields
+	JobIndexKey    = "juicefarm:jobs"    // ZSET of job ids scored by enqueue unix-ts (recent-first listing)
+	WorkerPrefix   = "juicefarm:worker:" // STRING per worker: JSON Worker heartbeat, short TTL
+	WorkerIndexKey = "juicefarm:workers" // SET of worker ids; stale ids are pruned by ActiveWorkers
+	ConfigKey      = "juicefarm:config"  // STRING: JSON FarmConfig — manager-owned desired state
 
 	// JobTTL keeps finished job records around for a week so the UI can show
 	// recent history; the queue LIST entries are consumed immediately.
@@ -334,14 +335,23 @@ func (c *Client) MarkFailed(ctx context.Context, id, errMsg string) error {
 	}).Err()
 }
 
-// Heartbeat publishes/refreshes the worker's liveness key (TTL WorkerTTL).
+// Heartbeat publishes/refreshes the worker's liveness key (TTL WorkerTTL) and
+// records its ID in a compact index. Using an index keeps worker discovery off
+// the full JuiceFS metadata keyspace: Redis SCAN with a MATCH pattern still
+// walks every key and can time out on production-sized volumes.
 func (c *Client) Heartbeat(ctx context.Context, w Worker) error {
 	w.LastSeen = nowISO()
 	raw, err := json.Marshal(w)
 	if err != nil {
 		return err
 	}
-	return c.rdb.Set(ctx, WorkerPrefix+w.ID, raw, WorkerTTL).Err()
+	pipe := c.rdb.TxPipeline()
+	pipe.Set(ctx, WorkerPrefix+w.ID, raw, WorkerTTL)
+	if w.ID != "" {
+		pipe.SAdd(ctx, WorkerIndexKey, w.ID)
+	}
+	_, err = pipe.Exec(ctx)
+	return err
 }
 
 // ---- reader side ---------------------------------------------------------
@@ -405,32 +415,35 @@ func (c *Client) ClearFinished(ctx context.Context) (int, error) {
 }
 
 // ActiveWorkers returns the currently-heartbeating workers (their keys are
-// alive). An empty slice means the farm is NOT draining — the producer should
-// surface "farm offline / not accepting work."
+// alive). Stale IDs are pruned from the compact index as workers expire. An
+// empty slice means the farm is NOT draining — the producer should surface
+// "farm offline / not accepting work."
 func (c *Client) ActiveWorkers(ctx context.Context) ([]Worker, error) {
-	var (
-		out    []Worker
-		cursor uint64
-	)
-	for {
-		keys, next, err := c.rdb.Scan(ctx, cursor, WorkerPrefix+"*", 50).Result()
+	ids, err := c.rdb.SMembers(ctx, WorkerIndexKey).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Worker, 0, len(ids))
+	stale := make([]any, 0)
+	for _, id := range ids {
+		raw, err := c.rdb.Get(ctx, WorkerPrefix+id).Result()
 		if err != nil {
-			return nil, err
-		}
-		for _, k := range keys {
-			raw, err := c.rdb.Get(ctx, k).Result()
-			if err != nil {
-				continue
+			if err == redis.Nil {
+				stale = append(stale, id)
 			}
-			var w Worker
-			if json.Unmarshal([]byte(raw), &w) == nil {
-				out = append(out, w)
-			}
+			continue
 		}
-		if next == 0 {
-			break
+		var w Worker
+		if json.Unmarshal([]byte(raw), &w) == nil {
+			out = append(out, w)
+		} else {
+			stale = append(stale, id)
 		}
-		cursor = next
+	}
+	if len(stale) > 0 {
+		// Best-effort hygiene: a failed prune must not hide the live workers
+		// already read above.
+		_ = c.rdb.SRem(ctx, WorkerIndexKey, stale...).Err()
 	}
 	return out, nil
 }
