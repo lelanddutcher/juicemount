@@ -46,6 +46,7 @@ var validPresets = map[string]bool{
 
 var validVCodecs = map[string]bool{
 	"libx264": true, "h264_nvenc": true, "h264_qsv": true, "h264_vaapi": true,
+	"libx265": true, "hevc_nvenc": true, "hevc_qsv": true, "hevc_vaapi": true,
 }
 
 var validDevices = map[string]bool{

@@ -5,13 +5,14 @@
 #   1. whisper.cpp built with -DGGML_VULKAN=ON — runs transcription on any
 #      Vulkan GPU (Intel Arc Battlemage included; no CUDA needed).
 #   2. Runtime image adds Mesa VAAPI drivers (intel-media-va-driver-non-free,
-#      libva) so ffmpeg can use h264_vaapi for proxy encodes, plus vulkan
+#      libva) so ffmpeg can use h264_vaapi/hevc_vaapi for proxy encodes, plus vulkan
 #      loader/libs for whisper.
 #
 # Run flags the host MUST provide:
 #   --device /dev/dri                      (render node for VAAPI + Vulkan)
 #   -e JM_FARM_TRANSCRIPT_DEVICE=vulkan    (whisper → GPU)
-#   -e JM_FARM_VCODEC=h264_vaapi           (proxy encode → GPU)
+#   -e JM_FARM_VCODEC=h264_vaapi           (H.264 proxy encode → GPU; use
+#                                          hevc_vaapi only as an explicit HEVC opt-in)
 #   -e JM_WORKER_NAME=<unique>             (per-node config identity)
 #   -e JM_FARM_KINDS=transcript            (which dedicated queues to drain)
 #

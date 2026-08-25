@@ -13,10 +13,10 @@ import (
 // fakeFarmQ provides the config-method surface handleFarmConfig uses, without
 // a live Redis.
 type fakeFarmQ struct {
-	cfg      *farmqueue.FarmConfig
-	stored   int
-	deleted  int
-	workers  []farmqueue.Worker
+	cfg     *farmqueue.FarmConfig
+	stored  int
+	deleted int
+	workers []farmqueue.Worker
 }
 
 func (f *fakeFarmQ) Enqueue(ctx context.Context, j farmqueue.Job) error { return nil }
@@ -63,6 +63,10 @@ func TestValidateFarmConfigRejectsBad(t *testing.T) {
 		{"crf out of range", map[string]any{"crf": 99}, true},
 		{"unknown key", map[string]any{"password": "hunter2"}, true},
 		{"bad vcodec", map[string]any{"vcodec": "h264_mpeg999"}, true},
+		{"good HEVC VAAPI codec", map[string]any{"vcodec": "hevc_vaapi"}, false},
+		{"good HEVC QSV codec", map[string]any{"vcodec": "hevc_qsv"}, false},
+		{"good HEVC NVENC codec", map[string]any{"vcodec": "hevc_nvenc"}, false},
+		{"good HEVC software codec", map[string]any{"vcodec": "libx265"}, false},
 		{"good device", map[string]any{"transcript_device": "vulkan"}, false},
 		{"bad device", map[string]any{"transcript_device": "toaster"}, true},
 		{"good preset", map[string]any{"preset": "slow"}, false},
@@ -119,7 +123,7 @@ func TestHandleFarmConfigGetPutDelete(t *testing.T) {
 		t.Fatalf("PUT: %d %s", rec.Code, rec.Body.String())
 	}
 	var resp struct {
-		Revision int64                `json:"revision"`
+		Revision int64                 `json:"revision"`
 		Config   *farmqueue.FarmConfig `json:"config"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)

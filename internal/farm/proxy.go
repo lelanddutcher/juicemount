@@ -11,6 +11,60 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 )
 
+// proxyEncodeArgs returns the video-encoder portion of the ffmpeg command for
+// a contract-locked proxy. Encoder families require materially different
+// options: passing the software CRF/preset pair to VAAPI is a hard ffmpeg error
+// and VAAPI needs frames uploaded to the DRM device before it can encode.
+//
+// H.264 remains the default floor. HEVC is an explicit per-worker/per-job
+// choice; proxyCodecStrings records the resulting codec honestly in the
+// derivative row.
+func proxyEncodeArgs(vcodec string, crf int, preset string) []string {
+	switch {
+	case strings.HasSuffix(vcodec, "_vaapi"):
+		if crf <= 0 {
+			crf = 23
+		}
+		return []string{
+			"-vaapi_device", "/dev/dri/renderD128",
+			"-vf", "format=nv12,hwupload",
+			"-c:v", vcodec,
+			"-qp", strconv.Itoa(crf),
+			"-compression_level", "3",
+			"-bf", "2",
+		}
+	case strings.HasSuffix(vcodec, "_qsv"):
+		if crf <= 0 {
+			crf = 23
+		}
+		if preset == "" {
+			preset = "veryfast"
+		}
+		return []string{
+			"-c:v", vcodec,
+			"-global_quality", strconv.Itoa(crf),
+			"-preset", preset,
+		}
+	case strings.HasSuffix(vcodec, "_nvenc"):
+		// NVENC's constant-quality switch is -cq, not the software
+		// encoders' -crf. Keep the public Farm quality control as CRF-like
+		// 1-51, but translate it at the encoder boundary.
+		return []string{
+			"-c:v", vcodec,
+			"-pix_fmt", "yuv420p",
+			"-cq", strconv.Itoa(crf),
+			"-preset", preset,
+		}
+	default:
+		return []string{
+			"-c:v", vcodec,
+			"-pix_fmt", "yuv420p",
+			"-crf", strconv.Itoa(crf),
+			"-preset", preset,
+		}
+	}
+}
+
 // Proxy transcodes the source to the contract-locked OL-3 proxy: a SINGLE
 // progressive MP4 with the moov atom first (-movflags +faststart) so both
 // AVFoundation (local file + HTTP byte-range) and a browser <video> seek it
@@ -54,19 +108,20 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 	// the volume. Reader visibility is unaffected: the staged name is dot-
 	// prefixed and is never the blob's real name, so a reader only ever sees the
 	// final name appear atomically at the caller's renameat.
-	// -pix_fmt yuv420p forces 8-bit 4:2:0 from any source (10-bit/HDR/422
-	// originals included), the lowest-common-denominator both decoders accept.
-	// crf/preset are the quality knob (size/quality only — interchange-safe).
+	// proxyEncodeArgs selects the correct quality and device wiring for the
+	// configured encoder. The staged output path is intentionally still passed
+	// directly: its descriptor-anchored creation and final rename are owned by
+	// GenerateProxy, not this function.
 	args := append([]string{"-y", "-loglevel", "error"}, proxyThreadArgs()...)
 	args = append(args,
 		"-i", srcPath,
-		"-c:v", vcodec, "-pix_fmt", "yuv420p", "-crf", strconv.Itoa(crf), "-preset", preset,
 		"-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
 		"-movflags", "+faststart",
 		// Force the MP4 muxer: the temp path lacks the .mp4 extension ffmpeg
 		// would otherwise infer the container from.
-		"-f", "mp4",
-		outPath)
+		"-f", "mp4")
+	args = append(args, proxyEncodeArgs(vcodec, crf, preset)...)
+	args = append(args, outPath)
 	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg proxy %q: %w: %s", srcPath, err, out)
