@@ -55,23 +55,21 @@ RUN cd /w && bash ./models/download-ggml-model.sh ${WHISPER_MODEL} \
     && cp models/ggml-${WHISPER_MODEL}.bin /ggml-${WHISPER_MODEL}.bin \
     && cp models/download-ggml-model.sh /download-ggml-model.sh
 
-# ----- Stage 3: runtime (juicefs + VAAPI-capable ffmpeg + whisper-vulkan + jmfarm) -----
-FROM juicedata/mount:ce-v1.3.1
+# The JuiceFS CLI is static, so copy it into the modern runtime below instead
+# of inheriting the upstream image's Debian 11 userland. Intel Battlemage needs
+# the current libva/iHD stack; mixing Debian 13 driver packages into that older
+# base leaves the driver absent or ABI-incompatible.
+FROM juicedata/mount:ce-v1.3.1 AS juicefs
+
+# ----- Stage 3: runtime (JuiceFS + VAAPI-capable ffmpeg + whisper-vulkan + jmfarm) -----
+FROM debian:trixie-slim
 ARG WHISPER_MODEL=medium.en
-# juicedata/mount is Debian-based; the non-free Intel driver needs the
-# debian-multimedia repo on some bases. Prefer intel-media-va-driver-non-free,
-# fall back to the free intel-media-va-driver if unavailable.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg ca-certificates libgomp1 util-linux \
+        ffmpeg ca-certificates fuse3 libgomp1 util-linux \
         libvulkan1 vulkan-tools mesa-vulkan-drivers \
-        libva2 libva-drm2 vainfo \
-    && (apt-get install -y --no-install-recommends intel-media-va-driver-non-free 2>/dev/null \
-        || (echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
-            && apt-get update && apt-get install -y --no-install-recommends -t bookworm-backports intel-media-va-driver-non-free 2>/dev/null) \
-        || (echo "deb http://deb.debian.org/debian trixie main" > /etc/apt/sources.list.d/trixie.list \
-            && apt-get update && apt-get install -y --no-install-recommends -t trixie intel-media-va-driver-non-free libva2 libva-drm2 2>/dev/null) \
-        || echo "[gpu] all driver sources failed - Battlemage VAAPI encode will not work") \
+        libva2 libva-drm2 vainfo intel-media-va-driver \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
 COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
 COPY --from=whisper /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
 COPY --from=whisper /ggml-${WHISPER_MODEL}.bin /models/ggml-${WHISPER_MODEL}.bin
