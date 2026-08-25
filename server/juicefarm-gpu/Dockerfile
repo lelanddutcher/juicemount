@@ -20,7 +20,7 @@
 #   docker build -f server/juicefarm-gpu/Dockerfile -t juicefarm-gpu:local .
 
 # ----- Stage 1: jmfarm (Go, CGO sqlite, static) -----
-FROM golang:1.26-bookworm AS gobuild
+FROM golang:1.26.6-bookworm AS gobuild
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*

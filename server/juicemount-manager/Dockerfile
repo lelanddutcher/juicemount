@@ -12,7 +12,7 @@
 # (see docs/INSTALL-TrueNAS.md for the YAML snippet).
 
 # ----- Stage 1: builder -----
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 
 WORKDIR /src
 

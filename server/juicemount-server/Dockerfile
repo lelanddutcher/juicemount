@@ -21,7 +21,7 @@
 #     -p 2049:2049 -p 11050:11050 jm-server:dev
 
 # ----- Stage 1: builder -----
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 
 WORKDIR /src
 

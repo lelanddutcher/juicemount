@@ -11,7 +11,7 @@
 # then run additively on the ix-juicemount network (see server/docker-compose.yml).
 
 # ----- Stage 1: jmfarm (Go, CGO for SQLite) -----
-FROM golang:1.26-bookworm AS gobuild
+FROM golang:1.26.6-bookworm AS gobuild
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
