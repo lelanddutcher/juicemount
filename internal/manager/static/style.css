@@ -1830,3 +1830,43 @@ footer a:hover { text-decoration: underline; }
   border-radius: 4px;
   word-break: break-word;
 }
+
+/* ==== Farm node config drawer (FARM-NODE-CONFIG spec) ==== */
+.farm-config-drawer {
+  margin: 12px 0;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: var(--panel, #fafafa);
+}
+.farm-config-drawer summary {
+  cursor: pointer;
+  font-weight: 600;
+  user-select: none;
+}
+.farm-config-hint { font-size: 0.85em; color: var(--muted, #777); margin: 8px 0; }
+.farm-workers-list { margin: 8px 0; display: flex; flex-direction: column; gap: 6px; }
+.farm-worker-row {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 6px 10px; border-radius: 6px;
+  background: var(--card, #fff); border: 1px solid var(--border, #e3e3e3);
+}
+.farm-worker-caps { color: var(--muted, #777); font-size: 0.85em; }
+.farm-worker-rev { color: var(--muted, #777); font-size: 0.85em; }
+.farm-worker-badge {
+  font-size: 0.78em; padding: 2px 8px; border-radius: 999px;
+  background: #fff4e0; color: #9a5b00; border: 1px solid #f0c987;
+}
+.farm-config-form { margin-top: 10px; }
+.farm-config-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px; margin: 10px 0;
+}
+.farm-config-grid .field { display: flex; flex-direction: column; gap: 4px; }
+.farm-config-grid .field span { font-size: 0.82em; color: var(--muted, #666); }
+.farm-config-grid input, .farm-config-grid select {
+  padding: 6px 8px; border: 1px solid var(--border, #ccc); border-radius: 6px;
+  background: var(--card, #fff); max-width: 100%;
+}
+.farm-config-actions { display: flex; align-items: center; gap: 12px; }
+.farm-config-status.ok { color: #1c7d34; }

@@ -861,6 +861,7 @@
   // by the SAME tab lifecycle (startFarmPolling/stopFarmPolling) so there's
   // never a second uncleared interval running after the tab is left.
   let farmJobsTimer = null;
+  let farmWorkersTimer = null;
   let farmGenerateInited = false;
   const FARM_JOBS_INTERVAL_MS = 5000;
   let farmSweepInFlight = false;
@@ -868,14 +869,18 @@
   function startFarmPolling() {
     initFarmExplainerOnce();
     initFarmGenerateOnce();
+    initFarmConfigOnce();
     loadFarm();
     loadFarmJobs();
+    loadFarmWorkers();
     if (!farmTimer) farmTimer = setInterval(loadFarm, 10000);
     if (!farmJobsTimer) farmJobsTimer = setInterval(loadFarmJobs, FARM_JOBS_INTERVAL_MS);
+    if (!farmWorkersTimer) farmWorkersTimer = setInterval(loadFarmWorkers, FARM_JOBS_INTERVAL_MS);
   }
   function stopFarmPolling() {
     if (farmTimer) { clearInterval(farmTimer); farmTimer = null; }
     if (farmJobsTimer) { clearInterval(farmJobsTimer); farmJobsTimer = null; }
+    if (farmWorkersTimer) { clearInterval(farmWorkersTimer); farmWorkersTimer = null; }
   }
 
   // initFarmExplainerOnce wires the dismissible "What is the farm?" banner.
@@ -3732,4 +3737,89 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
   // showTab → initMigrationsOnce, so visiting the page with the
   // default route immediately fires the migrator boot path.
   route();
+
+  // ==== FARM NODE CONFIG (FARM-NODE-CONFIG spec) ====
+  // The manager owns worker settings: GET /api/farm/config + /api/farm/workers
+  // render live state; PUT saves a patch that workers apply on their next loop
+  // tick. All wire values go through textContent — no innerHTML.
+  let farmConfigInited = false;
+
+  function initFarmConfigOnce() {
+    if (farmConfigInited) return;
+    farmConfigInited = true;
+    const form = document.getElementById('farm-config-form');
+    if (form) form.addEventListener('submit', onFarmConfigSave);
+  }
+
+  async function loadFarmWorkers() {
+    const list = document.getElementById('farm-workers-list');
+    if (!list) return;
+    let res;
+    try { res = await api('GET', '/api/farm/workers'); } catch (e) { return; }
+    if (!res || !res.available) { list.textContent = ''; return; }
+    list.innerHTML = '';
+    const ws = Array.isArray(res.workers) ? res.workers : [];
+    if (ws.length === 0) {
+      const p = document.createElement('p');
+      p.className = 'farm-config-hint';
+      p.textContent = 'No farm nodes are online right now.';
+      list.appendChild(p);
+      return;
+    }
+    for (const w of ws) {
+      const row = document.createElement('div');
+      row.className = 'farm-worker-row';
+      const name = document.createElement('strong');
+      name.textContent = w.name || ('worker ' + (w.id || '').slice(0, 8));
+      row.appendChild(name);
+      if (Array.isArray(w.capabilities) && w.capabilities.length) {
+        const caps = document.createElement('span');
+        caps.className = 'farm-worker-caps';
+        caps.textContent = w.capabilities.join(' · ');
+        row.appendChild(caps);
+      }
+      if (w.config_revision) {
+        const rev = document.createElement('span');
+        rev.className = 'farm-worker-rev';
+        rev.textContent = 'config r' + w.config_revision;
+        row.appendChild(rev);
+      }
+      if (Array.isArray(w.pending_restart) && w.pending_restart.length) {
+        const badge = document.createElement('span');
+        badge.className = 'farm-worker-badge';
+        badge.title = 'Applied after the node container restarts';
+        badge.textContent = 'needs restart: ' + w.pending_restart.join(', ');
+        row.appendChild(badge);
+      }
+      list.appendChild(row);
+    }
+  }
+
+  async function onFarmConfigSave(ev) {
+    ev.preventDefault();
+    const status = document.getElementById('farm-config-status');
+    const setMsg = (t, ok) => { if (status) { status.textContent = t; status.classList.toggle('ok', !!ok); } };
+    const num = (id) => { const v = document.getElementById(id).value.trim(); return v === '' ? null : Number(v); };
+    const str = (id) => document.getElementById(id).value.trim();
+    const patch = {};
+    const pairs = [['crf', num('cfg-crf')], ['workers', num('cfg-workers')],
+                   ['proxy_workers', num('cfg-proxy-workers')], ['ffmpeg_threads', num('cfg-ffmpeg-threads')]];
+    for (const [k, v] of pairs) if (v !== null && !Number.isNaN(v)) patch[k] = v;
+    for (const [id, key] of [['cfg-model', 'model'], ['cfg-device', 'transcript_device'],
+                             ['cfg-vcodec', 'vcodec'], ['cfg-preset', 'preset']]) {
+      const v = str(id);
+      if (v !== '') patch[key] = v;
+    }
+    if (Object.keys(patch).length === 0) { setMsg('Nothing to save — fill in at least one field.', false); return; }
+    const node = str('farm-config-node').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+    const body = node ? { overrides: { [node]: patch } } : { defaults: patch };
+    setMsg('Saving…', false);
+    try {
+      const res = await api('PUT', '/api/farm/config', body);
+      setMsg(res && res.ok ? 'Saved — revision r' + res.revision + '. Nodes pick it up within ~5 seconds.' : 'Save failed.', !!(res && res.ok));
+      loadFarmWorkers();
+    } catch (e) {
+      setMsg('Save failed: ' + (e && e.message ? e.message : e), false);
+    }
+  }
 })();

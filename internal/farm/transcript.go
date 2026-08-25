@@ -159,6 +159,14 @@ type whisperJSON struct {
 // across lanes (no Apple framework). Returns (nil, nil) when the clip has no
 // audio or no speech.
 func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscript, error) {
+	return TranscribeDevice(ffmpegBin, whisperBin, modelPath, "", srcPath)
+}
+
+// TranscribeDevice is Transcribe with a whisper.cpp device override ("" = the
+// binary's default CPU path; "vulkan"/"cuda"/"sycl" map to whisper-cli's
+// --device flag for GPU offload). Kept as a separate entry point so existing
+// callers (one-shot sweeps, tests) stay source-compatible.
+func TranscribeDevice(ffmpegBin, whisperBin, modelPath, device, srcPath string) (*LoupeTranscript, error) {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -198,7 +206,14 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 	}
 
 	prefix := filepath.Join(tmp, "out")
-	asr := exec.Command(whisperBin, "-m", modelPath, "-f", wav, "-oj", "-of", prefix, "-l", "auto", "-np")
+	asrArgs := []string{"-m", modelPath, "-f", wav, "-oj", "-of", prefix, "-l", "auto", "-np"}
+	if device != "" && device != "cpu" {
+		// whisper.cpp >= 1.7: --device {auto|cpu|cuda|vulkan|sycl}. Unknown
+		// device values fail fast at whisper startup (loud error), which is the
+		// behavior we want — a silently-CPU transcript would hide config drift.
+		asrArgs = append(asrArgs, "--device", device)
+	}
+	asr := exec.Command(whisperBin, asrArgs...)
 	if out, err := asr.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("transcribe: whisper %q: %w: %s", srcPath, err, out)
 	}
@@ -289,7 +304,7 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 		return res
 	}
 
-	tr, err := Transcribe(opt.FFmpegBin, opt.WhisperBin, opt.WhisperModel, path)
+	tr, err := TranscribeDevice(opt.FFmpegBin, opt.WhisperBin, opt.WhisperModel, opt.TranscriptDevice, path)
 	if err != nil {
 		res.Err = fmt.Errorf("transcribe: %w", err)
 		return res

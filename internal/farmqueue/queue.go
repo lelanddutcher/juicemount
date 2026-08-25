@@ -36,6 +36,7 @@ const (
 	JobHashPrefix = "juicefarm:job:"    // HASH per job id: the JobStatus fields
 	JobIndexKey   = "juicefarm:jobs"    // ZSET of job ids scored by enqueue unix-ts (recent-first listing)
 	WorkerPrefix  = "juicefarm:worker:" // STRING per worker: JSON Worker heartbeat, short TTL
+	ConfigKey     = "juicefarm:config"  // STRING: JSON FarmConfig — manager-owned desired state
 
 	// JobTTL keeps finished job records around for a week so the UI can show
 	// recent history; the queue LIST entries are consumed immediately.
@@ -44,6 +45,20 @@ const (
 	// The worker must refresh well within this window (we use ~1/3).
 	WorkerTTL = 30 * time.Second
 )
+
+// ConfigKey is the manager-owned farm config document (STRING, JSON FarmConfig).
+const ConfigKeyName = "juicefarm:config"
+
+// QueueKeyFor maps a Job to the queue it should be pushed onto. Jobs that ask
+// for a single explicit kind go to that kind's dedicated queue (so a worker
+// that declared -kinds transcript can BRPOP exactly those); multi-kind or
+// all/empty jobs stay on the shared catch-all queue drained by everyone.
+func QueueKeyFor(j *Job) string {
+	if len(j.Kinds) == 1 && j.Kinds[0] != "" && j.Kinds[0] != KindAll {
+		return QueueKey + ":" + j.Kinds[0]
+	}
+	return QueueKey
+}
 
 // Job lifecycle status values.
 const (
@@ -98,11 +113,36 @@ type JobStatus struct {
 
 // Worker is the heartbeat a draining worker publishes so producers can tell the
 // farm is alive + accepting work (the `farm-queue` capability signal).
+// Extra fields (all optional/omitted when empty) carry the manager-config
+// feedback loop: which config revision the worker last applied, its effective
+// settings, hardware capabilities, and anything it could NOT apply without a
+// restart. Additive only — older readers ignore unknown JSON keys.
 type Worker struct {
 	ID         string `json:"id"`
 	StartedAt  string `json:"started_at"`
 	LastSeen   string `json:"last_seen"`
 	CurrentJob string `json:"current_job,omitempty"`
+
+	// Manager-config feedback (FARM-NODE-CONFIG spec):
+	Name           string            `json:"name,omitempty"`            // JM_WORKER_NAME (stable identity)
+	ConfigRevision int64             `json:"config_revision,omitempty"` // 0 = unmanaged
+	PendingRestart []string          `json:"pending_restart,omitempty"` // knobs needing container restart
+	Capabilities   []string          `json:"capabilities,omitempty"`    // e.g. ["vulkan","vaapi","cuda"]
+	Effective      map[string]string `json:"effective,omitempty"`       // resolved hot settings
+}
+
+// FarmConfig is the manager-owned desired state published at ConfigKey. The
+// worker deep-merges overrides[<its name>] over defaults; unknown fields are
+// ignored by the worker (forward compat) but REJECTED by the manager's PUT
+// validation (no free-form strings reach argv/env).
+// Secrets are FORBIDDEN here by design — this Redis doubles as the volume
+// metadata store, so anyone who can mount the volume can read this key.
+type FarmConfig struct {
+	Revision  int64                     `json:"revision"`
+	UpdatedAt string                    `json:"updated_at,omitempty"`
+	UpdatedBy string                    `json:"updated_by,omitempty"`
+	Defaults  map[string]any            `json:"defaults,omitempty"`
+	Overrides map[string]map[string]any `json:"overrides,omitempty"` // worker name → patch
 }
 
 // nowISO returns the current UTC time in the wire format.
@@ -162,7 +202,7 @@ func (c *Client) Enqueue(ctx context.Context, j Job) error {
 		Producer: j.Producer, EnqueuedAt: j.EnqueuedAt,
 	}
 	pipe := c.rdb.TxPipeline()
-	pipe.LPush(ctx, QueueKey, raw)
+	pipe.LPush(ctx, QueueKeyFor(&j), raw)
 	pipe.HSet(ctx, JobHashPrefix+j.ID, st.toMap())
 	pipe.Expire(ctx, JobHashPrefix+j.ID, JobTTL)
 	pipe.ZAdd(ctx, JobIndexKey, redis.Z{Score: float64(time.Now().Unix()), Member: j.ID})
@@ -183,6 +223,42 @@ func (c *Client) Dequeue(ctx context.Context, timeout time.Duration) (job Job, o
 		return Job{}, false, err
 	}
 	// res = [key, value]
+	if len(res) != 2 {
+		return Job{}, false, nil
+	}
+	if err := json.Unmarshal([]byte(res[1]), &job); err != nil {
+		return Job{}, false, err
+	}
+	return job, true, nil
+}
+
+// DequeueKinds blocks up to timeout for the next job from any of the worker's
+// declared kind queues, falling back to the catch-all QueueKey last so
+// un-routed (all/legacy) jobs still get drained by whoever is free. Round-robins
+// the kind queues by splitting the timeout evenly (BRPOP polls all listed keys
+// in ONE round trip, checking them left-to-right — kind queues first, catch-all
+// last). kinds empty = legacy behavior: drain only the catch-all.
+func (c *Client) DequeueKinds(ctx context.Context, timeout time.Duration, kinds []string) (job Job, ok bool, err error) {
+	keys := make([]string, 0, len(kinds)+1)
+	seen := map[string]bool{}
+	for _, k := range kinds {
+		if k == "" || k == KindAll {
+			continue
+		}
+		qk := QueueKey + ":" + k
+		if !seen[qk] {
+			keys = append(keys, qk)
+			seen[qk] = true
+		}
+	}
+	keys = append(keys, QueueKey)
+	res, err := c.rdb.BRPop(ctx, timeout, keys...).Result()
+	if err == redis.Nil {
+		return Job{}, false, nil
+	}
+	if err != nil {
+		return Job{}, false, err
+	}
 	if len(res) != 2 {
 		return Job{}, false, nil
 	}
