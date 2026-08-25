@@ -94,8 +94,40 @@ public final class ServerController {
     public var preferences: Preferences
 
     private let log = Logger(subsystem: "com.juicemount.app", category: "ServerController")
+
+    /// Mutations and user operations (start/stop/mounts/sync/setOffline/search).
+    /// A slow operation may legitimately park this queue for seconds — which
+    /// is exactly why status reads must NEVER share it.
     private let workQueue = DispatchQueue(label: "com.juicemount.work", qos: .userInitiated)
+
+    /// F2 (menu-bar truthfulness): dedicated SERIAL queue for status-critical
+    /// reads — stats, cache/offline/spool status, /health probes. Because it
+    /// never accepts mutations, a long mount or search can no longer delay
+    /// the state machine's view of reality (the old single serial queue let
+    /// one slow cgo op freeze every poll behind it → stuck "Starting…").
+    private let pollQueue = DispatchQueue(label: "com.juicemount.poll", qos: .userInitiated)
+
     private var pollTask: Task<Void, Never>?
+
+    /// F2 drop-if-pending/single-flight flags (all touched on MainActor
+    /// only). A poll that finds its predecessor still executing is DROPPED
+    /// instead of stacking onto the queue: a wedged cgo read then costs one
+    /// slot, not an unbounded backlog of stale reads landing late.
+    private var statsRefreshInFlight = false
+    private var cacheRefreshInFlight = false
+    private var selfTestRefreshInFlight = false
+    private var backstopProbeInFlight = false
+
+    /// F2 no-optimistic-flip: true from a successful NFSBridge.start() until
+    /// the FIRST real health evidence lands (cgo Stats snapshot or /health
+    /// probe). While true the machine holds `.starting` — it does not claim
+    /// `.running` until something actual confirms the bridge is up.
+    private var awaitingFirstHealth = false
+
+    /// True while a Sync Now round-trip is in flight. Lets updateStateFromStats
+    /// keep showing `.syncing` during the operation WITHOUT hardcoding
+    /// `.running` afterwards — the post-sync state comes from fresh stats.
+    private var syncInFlight = false
 
     /// Heartbeat: updated at the top of every poll-loop iteration. The recovery
     /// watchdog uses it to detect a stalled/dead poll loop.
@@ -179,6 +211,13 @@ public final class ServerController {
                 let offlinePrefix = "started_offline:"
                 let startedOffline = addr.hasPrefix(offlinePrefix)
                 Task { @MainActor in
+                    // F2: a Stop (or restart's soft-stop) may have been
+                    // requested while the start round-trip was in flight —
+                    // never surface a state the user just cancelled.
+                    guard !self.userStopRequested else {
+                        self.log.info("start completed but a stop was requested meanwhile — ignoring")
+                        return
+                    }
                     if startedOffline {
                         let reason = String(addr.dropFirst(offlinePrefix.count)).trimmingCharacters(in: .whitespaces)
                         self.log.warning("Server started OFFLINE — \(reason, privacy: .public)")
@@ -187,7 +226,12 @@ public final class ServerController {
                         self.log.info("Server started at \(addr, privacy: .public)")
                         self.offlineStartupReason = nil
                     }
-                    self.state = .running
+                    // F2 no-optimistic-flip: stay in `.starting` until the
+                    // poll loop's first REAL health sample confirms the
+                    // bridge (updateStateFromStats / recovery watchdog own
+                    // the transition to .running/.degraded/.disconnected).
+                    self.state = .starting
+                    self.awaitingFirstHealth = true
                     self.lastError = nil
                     // Record the daemon's minted cache size only when this
                     // start could have spawned it (nil = no live daemon).
@@ -231,6 +275,8 @@ public final class ServerController {
             Task { @MainActor in
                 self?.state = .idle
                 self?.stats = .zero
+                self?.awaitingFirstHealth = false
+                self?.syncInFlight = false
                 // Full stop kills the JuiceFS daemon — its minted flags die
                 // with it, so the next start() records fresh ones.
                 self?.appliedSsdCacheGB = nil
@@ -253,6 +299,8 @@ public final class ServerController {
             Task { @MainActor in
                 self?.state = .idle
                 self?.stats = .zero
+                self?.awaitingFirstHealth = false
+                self?.syncInFlight = false
                 completion?()
             }
         }
@@ -271,6 +319,8 @@ public final class ServerController {
             Task { @MainActor in
                 self?.state = .idle
                 self?.stats = .zero
+                self?.awaitingFirstHealth = false
+                self?.syncInFlight = false
                 completion?()
             }
         }
@@ -327,15 +377,17 @@ public final class ServerController {
         // Allow sync from any "running-like" state, not just .running.
         guard isRunningLike else { return }
         state = .syncing
+        syncInFlight = true
         workQueue.async { [weak self] in
             do {
                 _ = try NFSBridge.syncNow()
                 Task { @MainActor in
-                    // Don't restore the previous state — let the polling loop
-                    // reconcile from fresh stats. This avoids suppressing real
-                    // state transitions (e.g. degraded → disconnected) that may
-                    // have happened during the sync.
-                    self?.state = .running
+                    self?.syncInFlight = false
+                    // F2: don't hardcode `.running` — reconcile from a fresh
+                    // stats sample so a genuinely degraded/disconnected bridge
+                    // says so the moment the sync ends. updateStateFromStats
+                    // keeps showing .syncing only while syncInFlight is true,
+                    // then transitions on the strength of real health.
                     self?.refreshStats()
                     // Intentionally NOT triggering refreshSelfTest here. Sync
                     // Now is supposed to be a lightweight metadata refresh.
@@ -348,25 +400,33 @@ public final class ServerController {
                 }
             } catch {
                 Task { @MainActor in
+                    self?.syncInFlight = false
                     self?.lastError = error.localizedDescription
-                    // Same idea — let the next poll tick determine real state
-                    self?.state = .running
+                    // Same idea — let the next stats sample determine real state.
+                    self?.refreshStats()
                 }
             }
         }
     }
 
     /// Fetch cache status from Go and publish on MainActor. The cgo call
-    /// happens on `workQueue`, never on the UI thread. Safe to call at any
+    /// happens on `pollQueue`, never on the UI thread. Safe to call at any
     /// cadence (e.g. the popover's 2 s timer).
+    ///
+    /// F2: runs on the dedicated status queue (never behind mutations) and
+    /// is single-flight — an overlapping call while one is executing is
+    /// dropped, so a slow cgo/HTTP read can't stack a backlog of stale
+    /// publishes.
     ///
     /// Also refreshes the offline state in the same dispatch — that's
     /// what the UI consumes for the menu-bar blue dot and the popover
-    /// "Offline · …" header. Doing both in one workQueue tick keeps the
+    /// "Offline · …" header. Doing both in one pollQueue tick keeps the
     /// two values consistent on every render frame.
     public func refreshCacheStatus() {
+        guard !cacheRefreshInFlight else { return }
+        cacheRefreshInFlight = true
         let metricsAddr = preferences.metricsAddr
-        workQueue.async { [weak self] in
+        pollQueue.async { [weak self] in
             let s = NFSBridge.cacheStatus()
             // Fetch offline state — if the metrics server is
             // unreachable, the helper returns nil. Critically, we do
@@ -385,6 +445,7 @@ public final class ServerController {
             let hp: NFSBridge.HealthProbe? = NFSBridge.healthProbe(metricsAddr: metricsAddr)
             Task { @MainActor in
                 guard let self else { return }
+                self.cacheRefreshInFlight = false
                 // Observe Swift-side offline_mode transitions. This is the exact
                 // value the offline toggle reads; logging its transitions makes
                 // the cgo→Swift cache-status read path visible (the roots:null
@@ -503,7 +564,9 @@ public final class ServerController {
                 self.mountNowInFlight = false
                 if let result, result.ok {
                     NFSBridge.appLog("mount-now ok (already_mounted=\(result.alreadyMounted))")
-                    self.volumeMounted = true
+                    // F2: no optimistic volumeMounted=true here — the /health
+                    // piggyback in refreshCacheStatus publishes the monitor's
+                    // ACTUAL verdict (and keeps last-known if the probe fails).
                     self.refreshCacheStatus()
                 } else {
                     let raw = result?.error ?? "control plane unreachable — is the server running?"
@@ -550,14 +613,22 @@ public final class ServerController {
     /// it on the main actor. `force` issues a POST (rerun) instead of GET.
     /// `delayMs` lets the caller wait for an asynchronous first-run to land
     /// in the Go cache before fetching.
+    ///
+    /// F2: this is a status query with a caller-supplied sleep (the post-start
+    /// 1.5 s warmup), so it runs on a global utility queue — never parked on
+    /// pollQueue where it would stall every health read behind its sleep — and
+    /// is single-flight so overlapping callers can't stack sleeps.
     public func refreshSelfTest(force: Bool = false, delayMs: Int = 0) {
+        guard !selfTestRefreshInFlight else { return }
+        selfTestRefreshInFlight = true
         let addr = preferences.metricsAddr
-        workQueue.async { [weak self] in
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             if delayMs > 0 {
                 Thread.sleep(forTimeInterval: Double(delayMs) / 1000.0)
             }
             let result = NFSBridge.selfTest(force: force, metricsAddr: addr)
             Task { @MainActor in
+                self?.selfTestRefreshInFlight = false
                 self?.selfTest = result
             }
         }
@@ -653,19 +724,30 @@ public final class ServerController {
         }
         stuckTicks &+= 1
         guard stuckTicks >= 3 else { return }
+        // F2: one probe in flight at a time — a slow /health answer drops
+        // subsequent tick-probes instead of queueing them.
+        guard !backstopProbeInFlight else { return }
+        backstopProbeInFlight = true
 
         let metricsAddr = preferences.metricsAddr
-        workQueue.async { [weak self] in
-            guard let probe = NFSBridge.healthProbe(metricsAddr: metricsAddr) else { return }
+        pollQueue.async { [weak self] in
+            guard let probe = NFSBridge.healthProbe(metricsAddr: metricsAddr) else {
+                Task { @MainActor in self?.backstopProbeInFlight = false }
+                return
+            }
             // R-8: gate on coreHealthy (FUSE/Redis/MinIO), NOT probe.healthy
             // (= /health Overall, which ANDs in NFS). The loopback NFS mount
             // recovers on a slower timeline (deferred remount up to ~180s) than
             // the backend, so gating on Overall left the red "Disconnected"
             // latched while reads already worked. NFS-mount health drives
             // volumeMounted separately, not the connected/disconnected verdict.
-            guard probe.coreHealthy else { return }
+            guard probe.coreHealthy else {
+                Task { @MainActor in self?.backstopProbeInFlight = false }
+                return
+            }
             Task { @MainActor in
                 guard let self else { return }
+                self.backstopProbeInFlight = false
                 switch self.state {
                 case .disconnected, .degraded:
                     self.log.warning("backstop: /health probe says core-healthy while state=\(self.state.displayLabel, privacy: .public) for \(self.stuckTicks) ticks — forcing transition to .running")
@@ -740,6 +822,9 @@ public final class ServerController {
                 default:
                     NFSBridge.appLog("recovery watchdog: /health healthy but UI=\(self.state.displayLabel) — forcing .running")
                     self.log.warning("recovery watchdog: /health healthy but UI=\(self.state.displayLabel, privacy: .public) — forcing .running")
+                    // This probe IS the first real health evidence — a start
+                    // still awaiting confirmation is confirmed by it too.
+                    self.awaitingFirstHealth = false
                     self.state = .running
                     self.stuckTicks = 0
                 }
@@ -748,29 +833,48 @@ public final class ServerController {
         }
     }
 
+    /// F2: the primary health feed for the state machine. Runs on pollQueue
+    /// (never behind a mutation) and is single-flight — while one cgo stats
+    /// read is executing, overlapping ticks are dropped rather than queued,
+    /// so a wedged read can't build a backlog of stale samples.
     private func refreshStats() {
-        workQueue.async { [weak self] in
+        guard !statsRefreshInFlight else { return }
+        statsRefreshInFlight = true
+        pollQueue.async { [weak self] in
             guard let self else { return }
             do {
                 let s = try NFSBridge.stats()
                 Task { @MainActor in
+                    self.statsRefreshInFlight = false
                     self.stats = s
                     self.updateStateFromStats(s)
                 }
             } catch {
-                // Bridge may be torn down — ignore
+                // Bridge may be torn down — release the slot so a later
+                // tick can retry.
+                Task { @MainActor in
+                    self.statsRefreshInFlight = false
+                }
             }
         }
     }
 
     private func updateStateFromStats(_ s: NFSBridge.Stats) {
         guard s.running else {
-            // Server stopped from underneath us. Only transition to .disconnected
-            // when we previously believed we were .running — this preserves real
-            // .error / .idle states. Future maintainers: be careful adding cases
-            // here; sticky terminal states (.error, .idle) should NOT be silently
-            // overwritten by a stale stats response.
-            if case .running = state { state = .disconnected }
+            // Server stopped from underneath us. From .running this is a
+            // disconnect. F2: while a start is still awaiting its first
+            // health sample, an immediate death is reported honestly too —
+            // no parking in .starting (the recovery watchdog can revive if
+            // this was a fluke). Sticky .error/.idle stay untouched.
+            if case .running = state {
+                state = .disconnected
+                return
+            }
+            if awaitingFirstHealth, case .starting = state {
+                awaitingFirstHealth = false
+                log.warning("bridge exited immediately after start — reporting disconnected")
+                state = .disconnected
+            }
             return
         }
 
@@ -784,10 +888,25 @@ public final class ServerController {
         let fullyHealthy = s.healthFUSE && s.healthRedis && s.healthMinIO
         if fullyHealthy {
             switch state {
-            case .running, .syncing:
-                // Already in a good state; preserve .syncing (transient).
-                if case .syncing = state { return }
+            case .running:
+                return
+            case .syncing:
+                // Keep the sync spinner ONLY while the sync round-trip is
+                // actually in flight. Once it completes (syncInFlight false),
+                // THIS healthy sample is what earns .running — no hardcoded
+                // optimistic flip at the end of syncNow.
+                if syncInFlight { return }
                 state = .running
+                return
+            case .starting:
+                // F2: the first REAL health confirmation is what ends the
+                // start. Until this sample (or a /health probe) arrived we
+                // stayed honestly in .starting.
+                guard awaitingFirstHealth else { return }
+                awaitingFirstHealth = false
+                log.info("first health sample healthy — starting -> running")
+                state = .running
+                stuckTicks = 0
                 return
             case .disconnected, .degraded:
                 // Recovery edge — log it. Future-me trying to debug a
@@ -797,12 +916,30 @@ public final class ServerController {
                 stuckTicks = 0
                 return
             default:
-                // .idle / .starting / .error are sticky; don't overwrite.
+                // .idle / .error are sticky; don't overwrite.
                 return
             }
         }
 
         // Not fully healthy — pick the most-severe component as the cause.
+        // F2: only running-like states may be remapped (plus a start still
+        // awaiting its first sample). A stale in-flight stats read landing
+        // after Stop must never stomp a deliberate .idle or a real .error,
+        // and the first post-start sample answers "how did it come up?"
+        // rather than leaving the question open.
+        let remappable: Bool
+        switch state {
+        case .running, .syncing, .degraded, .disconnected:
+            remappable = true
+        default:
+            remappable = awaitingFirstHealth
+        }
+        guard remappable else { return }
+        if awaitingFirstHealth {
+            awaitingFirstHealth = false
+            log.warning("first health sample UNHEALTHY after start — reporting degradation honestly")
+        }
+
         if !s.healthFUSE {
             state = .disconnected
         } else if !s.healthRedis {
