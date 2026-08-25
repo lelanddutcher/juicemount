@@ -91,13 +91,9 @@ func main() {
 	}
 	mgr := manager.Register(mux, "", cfg)
 
-	// Tier-2 T2.3: teams/seats auth
-	authDB := "/data/auth.db"
-	if err := manager.InitAuth(authDB); err != nil {
-		log.Printf("WARN: auth init failed — teams disabled: %v", err)
-	} else {
-		mux.HandleFunc("/api/auth/login", manager.HandleAuthLogin)
-	}
+	// Teams/seats is intentionally withheld from the RC. Its old account
+	// scaffold did not enforce permissions on Manager or JuiceFS operations,
+	// so enabling it would create a false security boundary.
 
 	// Tier-2 T2.1: embedded Headscale + pairing endpoint (JuiceMount Link).
 	// Off by default; JM_NET_HEADSCALE=on opts the deployment in.

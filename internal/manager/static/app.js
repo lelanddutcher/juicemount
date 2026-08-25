@@ -47,7 +47,6 @@
     'permissions',
     'settings',
     'link',
-    'teams',
   ];
   const DEFAULT_TAB = 'migrations';
 
@@ -100,13 +99,6 @@
     // JuiceMount Link tab
     if (name === 'link') {
       initLinkOnce();
-    }
-    // Teams & seats tab (T2.3): lazy-init the handlers once, then refresh
-    // the session render + user list on every activation so out-of-band
-    // changes (another browser, jmctl) are reflected.
-    if (name === 'teams') {
-      initTeamsOnce();
-      refreshTeams();
     }
     // SLICE 3: lazy-init Trash on first activation. Subsequent
     // activations call refreshTrash() so the list reflects any

@@ -362,16 +362,12 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// approve is headscale's two-step; this surfaces the approve step so
 	// operators can verify/repair routing without shelling into the box).
 	mux.HandleFunc(prefix+"/api/net/routes/approve", a.auth(a.handleNetRouteApprove))
-	// Teams/seats: user management (admin-key protected via a.auth)
-	mux.HandleFunc(prefix+"/api/users", a.auth(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			handleCreateUser(w, r)
-			return
-		}
-		handleListUsers(w, r)
-	}))
-	mux.HandleFunc(prefix+"/api/users/", a.auth(handleDeleteUser))
-	mux.HandleFunc(prefix+"/api/auth/login", HandleAuthLogin)
+	// Teams and seats deliberately are not registered for this release
+	// candidate. The previous scaffold presented account/session screens but
+	// did not authorize manager operations or JuiceFS data access, making the
+	// roles misleading. Keep the implementation isolated until an end-to-end
+	// authorization model (identity, role enforcement, revocation, and storage
+	// policy) is ready to ship as one feature.
 	// Static UI: serve <prefix>/ and <prefix>/<file>. Strip prefix so
 	// the existing handleStatic logic still works.
 	staticHandler := http.StripPrefix(prefix, http.HandlerFunc(a.handleStatic))
