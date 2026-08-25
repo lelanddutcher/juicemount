@@ -10,6 +10,8 @@
 #
 # Run flags the host MUST provide:
 #   --device /dev/dri                      (render node for VAAPI + Vulkan)
+#   -v /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:ro
+#                                           (use the host iHD driver for newer Intel GPUs)
 #   -e JM_FARM_TRANSCRIPT_DEVICE=vulkan    (whisper → GPU)
 #   -e JM_FARM_VCODEC=h264_vaapi           (H.264 proxy encode → GPU; use
 #                                          hevc_vaapi only as an explicit HEVC opt-in)
@@ -67,7 +69,7 @@ ARG WHISPER_MODEL=medium.en
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates fuse3 libgomp1 util-linux \
         libvulkan1 vulkan-tools mesa-vulkan-drivers \
-        libva2 libva-drm2 vainfo intel-media-va-driver \
+        libva2 libva-drm2 vainfo intel-media-va-driver librados2 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
 # The otherwise-static JuiceFS binary dlopens FoundationDB's client library at
