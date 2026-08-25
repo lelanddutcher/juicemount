@@ -234,6 +234,9 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// Exact path (registered before any subtree) — POST clears terminal
 	// job records from the Recent-jobs list + prunes the leaked index.
 	mux.HandleFunc(prefix+"/api/farm/jobs/clear", a.auth(a.handleFarmJobsClear))
+	// Farm node config (FARM-NODE-CONFIG spec): manager-owned worker settings.
+	mux.HandleFunc(prefix+"/api/farm/config", a.auth(a.handleFarmConfig))
+	mux.HandleFunc(prefix+"/api/farm/workers", a.auth(a.handleFarmWorkers))
 	// JM-15 #56 (server half): relay the farm's pre-aggregated
 	// /derivatives/changes feed (contract derivatives-changes.schema.json,
 	// filtered by ?since=&limit=) so the Mac client learns farm-generated

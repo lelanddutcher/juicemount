@@ -142,6 +142,63 @@
             <span id="farm-active-depth" class="farm-active-depth" hidden></span>
           </div>
 
+          <!-- Node config drawer (FARM-NODE-CONFIG): manager-owned per-worker settings. -->
+          <details id="farm-config-drawer" class="farm-config-drawer">
+            <summary>Node configuration</summary>
+            <p class="farm-config-hint">Settings here are pushed to every farm node over the
+              queue connection — no need to restart containers for quality, model or encoder
+              changes. A node that can't apply a change live shows a “needs restart” badge.</p>
+            <div id="farm-workers-list" class="farm-workers-list"></div>
+            <form id="farm-config-form" class="farm-config-form">
+              <label class="field">
+                <span>Node name (blank = all nodes)</span>
+                <input id="farm-config-node" type="text" placeholder="e.g. b70-gpu"
+                       autocomplete="off" spellcheck="false">
+              </label>
+              <div class="farm-config-grid">
+                <label class="field"><span>Whisper model</span>
+                  <input id="cfg-model" type="text" placeholder="medium.en"></label>
+                <label class="field"><span>Transcript device</span>
+                  <select id="cfg-device">
+                    <option value="">(keep current)</option>
+                    <option value="cpu">cpu</option>
+                    <option value="vulkan">vulkan</option>
+                    <option value="cuda">cuda</option>
+                    <option value="sycl">sycl</option>
+                  </select></label>
+                <label class="field"><span>Proxy encoder</span>
+                  <select id="cfg-vcodec">
+                    <option value="">(keep current)</option>
+                    <option value="libx264">libx264</option>
+                    <option value="h264_vaapi">h264_vaapi</option>
+                    <option value="h264_qsv">h264_qsv</option>
+                    <option value="h264_nvenc">h264_nvenc</option>
+                  </select></label>
+                <label class="field"><span>CRF</span>
+                  <input id="cfg-crf" type="number" min="1" max="51" placeholder="21"></label>
+                <label class="field"><span>x264 preset</span>
+                  <select id="cfg-preset">
+                    <option value="">(keep current)</option>
+                    <option value="ultrafast">ultrafast</option><option value="superfast">superfast</option>
+                    <option value="veryfast">veryfast</option><option value="faster">faster</option>
+                    <option value="fast">fast</option><option value="medium">medium</option>
+                    <option value="slow">slow</option><option value="slower">slower</option>
+                    <option value="veryslow">veryslow</option>
+                  </select></label>
+                <label class="field"><span>Workers</span>
+                  <input id="cfg-workers" type="number" min="1" max="256" placeholder="auto"></label>
+                <label class="field"><span>Proxy workers</span>
+                  <input id="cfg-proxy-workers" type="number" min="0" max="256" placeholder="auto"></label>
+                <label class="field"><span>ffmpeg threads</span>
+                  <input id="cfg-ffmpeg-threads" type="number" min="0" max="64" placeholder="2"></label>
+              </div>
+              <div class="farm-config-actions">
+                <button type="submit" id="farm-config-save">Save config</button>
+                <span id="farm-config-status" class="farm-config-status" role="status"></span>
+              </div>
+            </form>
+          </details>
+
           <!-- Queue-a-sweep form. -->
           <div class="farm-sweep-form">
             <label class="field">
