@@ -70,6 +70,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libva2 libva-drm2 vainfo intel-media-va-driver \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
+# The otherwise-static JuiceFS binary dlopens FoundationDB's client library at
+# startup even for Redis metadata. Carry the compatible library from the same
+# upstream image into the modern VAAPI runtime and register it with ldconfig.
+COPY --from=juicefs /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
+RUN ldconfig
 COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
 COPY --from=whisper /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
 COPY --from=whisper /ggml-${WHISPER_MODEL}.bin /models/ggml-${WHISPER_MODEL}.bin
