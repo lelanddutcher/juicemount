@@ -57,6 +57,37 @@ func postPair(t *testing.T, query string) map[string]any {
 	return resp
 }
 
+func TestLinkStatusRequiresRealConfiguration(t *testing.T) {
+	status := func() LinkStatus {
+		t.Helper()
+		a := &API{}
+		rec := httptest.NewRecorder()
+		a.handleLinkStatus(rec, httptest.NewRequest(http.MethodGet, "/api/net/link", nil))
+		var got LinkStatus
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	t.Setenv("JM_NET_HEADSCALE", "off")
+	t.Setenv("JM_HEADSCALE_CONFIG", "")
+	t.Setenv("JM_NET_SERVER_URL", "")
+	if got := status(); got.Enabled || got.Error == "" {
+		t.Errorf("unconfigured status = %+v, want disabled with an explanation", got)
+	}
+
+	t.Setenv("JM_NET_SERVER_URL", "https://link.example.test")
+	if got := status(); got.Enabled || !strings.Contains(got.Error, "disabled") {
+		t.Errorf("binary-only status = %+v, want disabled", got)
+	}
+
+	t.Setenv("JM_HEADSCALE_CONFIG", "/operator/headscale/config.yaml")
+	if got := status(); !got.Enabled || got.ServerURL != "https://link.example.test" {
+		t.Errorf("external configured status = %+v, want enabled external Link", got)
+	}
+}
+
 // TestPairOneOffByDefault: T2.3 — a plain POST must mint a NON-reusable key.
 // The fake bin's argv log is the proof: no "--reusable" flag on the wire.
 func TestPairOneOffByDefault(t *testing.T) {

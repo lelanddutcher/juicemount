@@ -106,3 +106,10 @@ func TestNasNodeControlURL(t *testing.T) {
 		t.Errorf("external URL preferred under TLS = (%q,%v)", url, err)
 	}
 }
+
+func TestLastKeyLineUsesFinalCLIValue(t *testing.T) {
+	output := "2026-08-25T12:00:00Z INFO minting key\nfirst unrelated line\ntskey-auth-final"
+	if got := lastKeyLine(output); got != "tskey-auth-final" {
+		t.Errorf("lastKeyLine = %q, want final key", got)
+	}
+}

@@ -199,6 +199,14 @@ services:
       JM_STATE_FILE: "/var/lib/manager/state.json"   # persists job history + future control-plane state across container restart
       JM_MINIO_URL: "http://minio:9000"              # SLICE 2: Overview MinIO liveness probe target (internal docker DNS)
       JM_FARM_STATUS: "/farmstate/farm-status.json"  # Farm tab: the juicefarm rollup (juicefarm-state mounted read-only below)
+      # JuiceMount Link is opt-in. To enable it, set all three values, then
+      # redeploy: a stable external URL is mandatory because linked Macs must
+      # reach Headscale when away from the NAS. JM_NET_NAS_ROUTE must be the
+      # LAN subnet containing the Redis and MinIO addresses in client config.
+      JM_NET_HEADSCALE: "off"
+      JM_NET_SERVER_URL: ""             # e.g. https://nas.example.com:30193
+      JM_NET_NAS_NODE: "off"            # set on with Headscale to advertise JM_NET_NAS_ROUTE
+      JM_NET_NAS_ROUTE: "192.168.0.0/24" # EDIT if your NAS LAN uses another subnet
       # EMBEDDED MODE ONLY (command: ["--fuse-mount=/jfs"] + JM_META unset):
       # uncomment so Overview, Trash retention, and GC/FSCK read the volume.
       # Standalone mode (the default above, with JM_META set) leaves it empty.
@@ -219,6 +227,9 @@ services:
       # you want to keep that history, additionally bind-mount the
       # OLD migrator-state dataset at /var/lib/migrator (read-only is fine).
       - /mnt/zSSD/juicemount/manager-state:/var/lib/manager
+      # Persistent Headscale keys, database, and NAS-node identity. Do not
+      # remove this after pairing Macs: doing so invalidates the tailnet.
+      - /mnt/zSSD/juicemount/headscale:/data/headscale
       # Read-only view of the juicefarm's state so the Farm tab can read
       # farm-status.json. Additive; safe if juicefarm hasn't run yet.
       - /mnt/zSSD/juicemount/juicefarm-state:/farmstate:ro

@@ -66,8 +66,9 @@ func nasNodeControlURL() (string, error) {
 // line that is not a timestamped log line (same contract as the manager's
 // parser).
 func lastKeyLine(s string) string {
-	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
-		line = strings.TrimSpace(line)
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
 		if line != "" && !strings.HasPrefix(line, "20") {
 			return line
 		}

@@ -32,10 +32,13 @@ public enum NFSBridge {
         public var logFile: String
         public var logLevel: String
         public var bucketOverride: String
-    public var netControlURL: String = ""
-    public var netAuthKey: String = ""
-    public var netHostname: String = ""
-    public var netNASAddr: String = ""
+        public var netControlURL: String = ""
+        public var netAuthKey: String = ""
+        public var netHostname: String = ""
+        // Retained for compatibility with pre-RC Link configs. The Go bridge
+        // now reaches the original LAN endpoint through the NAS subnet route,
+        // so desktop users never need to supply a NAS tailnet address.
+        public var netNASAddr: String = ""
         public var spoolEnable: Bool
         public var spoolSizeGB: Int
         /// LB-4 (Phase 3b) tuning knobs. 0 means "Go-side default"

@@ -263,7 +263,7 @@ struct PreferencesWindowView: View {
                     TextField("juicemount-mac", text: $preferences.linkHostname)
                         .textFieldStyle(.roundedBorder)
                 }
-                footnote("Remote access via JuiceMount Link. Paste the pairing code from your NAS manager's JuiceMount Link tab. Applies on next Start. Leave empty to disable remote access.")
+                footnote("Remote access via JuiceMount Link. Paste the pairing code from your NAS manager's JuiceMount Link tab. Use Stop Everything, then Start, to apply a changed pairing or disable Link (the normal Stop action intentionally keeps the JuiceFS mount alive).")
             } header: {
                 Text("Remote Access")
             } footer: {

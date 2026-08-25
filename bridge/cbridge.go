@@ -125,8 +125,8 @@ var (
 	// before closing the spool store, then nils both globals so
 	// /spool returns 503 between Stop and the next Start.
 	globalPresence *jmnfs.PresenceTracker
-	globalSpool   *jmnfs.SpoolStore
-	globalDrainer *jmnfs.Drainer
+	globalSpool    *jmnfs.SpoolStore
+	globalDrainer  *jmnfs.Drainer
 
 	// globalDrainerAtomic mirrors globalDrainer for lock-free readers that
 	// must never contend on globalMu (review fix: the reachability liveness
@@ -184,9 +184,12 @@ type ServerConfig struct {
 
 	// JuiceMount Link (Tier-2 T2.2): embedded tailnet node for remote use.
 	NetControlURL string `json:"net_control_url"` // Headscale coordination URL
-	NetAuthKey    string `json:"net_authkey"`    // preauth key from pairing
-	NetHostname   string `json:"net_hostname"`   // this Mac's node name
-	NetNASAddr    string `json:"net_nas_addr"`   // NAS tailnet IP (mount/health target)
+	NetAuthKey    string `json:"net_authkey"`     // preauth key from pairing
+	NetHostname   string `json:"net_hostname"`    // this Mac's node name
+	// NetNASAddr is retained for config compatibility with early Link builds.
+	// Link now keeps the original LAN endpoint and reaches it through the NAS
+	// subnet route, so a tailnet IP is neither required nor used.
+	NetNASAddr string `json:"net_nas_addr"`
 
 	// Spool (Option 2). Passed from the Swift app via this config JSON —
 	// the env var (JM_SPOOL_ENABLE) does NOT work for the embedded
@@ -238,31 +241,118 @@ var (
 	globalLinkNode *jmnfs.LinkNode
 )
 
-// startLinkIfConfigured brings up the embedded tailnet node before mounting
-// so backend traffic can route over it during the rest of startup. Returns
-// the mount host override (NAS tailnet IP) or "" when Link is off.
-func startLinkIfConfigured(cfg ServerConfig) string {
-	if cfg.NetControlURL == "" || cfg.NetAuthKey == "" {
-		return ""
+// linkStateDir keeps the tsnet machine identity next to the app's metadata
+// mirror. /tmp made every launch look like a new device and required another
+// pairing code after a restart.
+func linkStateDir(cfg ServerConfig) string {
+	if cfg.DBPath != "" {
+		if parent := filepath.Dir(cfg.DBPath); parent != "." && parent != "" {
+			return filepath.Join(parent, "link")
+		}
 	}
-	node, addrs, err := jmnfs.StartLinkNode(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, "")
-	if err != nil {
-		jmlog.Warn("JuiceMount Link: node failed to start (continuing without remote)", "error", err.Error())
-		return ""
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, "Library", "Application Support", "JuiceMount", "link")
+	}
+	return ""
+}
+
+// startLinkIfConfigured brings up the embedded tailnet node and rewrites
+// backend URLs to loopback proxies backed by tsnet. It returns the live node
+// so startup can probe the actual route rather than treating a local listener
+// as proof that the NAS is reachable.
+func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool) {
+	if cfg.NetControlURL == "" || cfg.NetAuthKey == "" {
+		return nil, false
 	}
 	linkMu.Lock()
-	globalLinkNode = node
+	node := globalLinkNode
 	linkMu.Unlock()
+	owned := false
+	var addrs []string
+	if node == nil {
+		var err error
+		node, addrs, err = jmnfs.StartLinkNode(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, linkStateDir(*cfg))
+		if err != nil {
+			jmlog.Warn("JuiceMount Link: node failed to start (continuing without remote)", "error", err.Error())
+			return nil, false
+		}
+		owned = true
+	}
+	redisURL, err := node.ProxyEndpoint(cfg.RedisURL, "6379")
+	if err != nil {
+		if owned {
+			node.Stop()
+		}
+		jmlog.Warn("JuiceMount Link: Redis proxy failed (continuing without remote)", "error", err.Error())
+		return nil, false
+	}
+	bucketURL := cfg.BucketOverride
+	if bucketURL != "" {
+		bucketURL, err = node.ProxyEndpoint(bucketURL, "80")
+		if err != nil {
+			if owned {
+				node.Stop()
+			}
+			jmlog.Warn("JuiceMount Link: object-store proxy failed (continuing without remote)", "error", err.Error())
+			return nil, false
+		}
+	}
+	cfg.RedisURL = redisURL
+	cfg.BucketOverride = bucketURL
+	if owned {
+		linkMu.Lock()
+		globalLinkNode = node
+		linkMu.Unlock()
+	}
 	if len(addrs) > 0 {
 		jmlog.Info("JuiceMount Link: node up", "addrs", fmt.Sprint(addrs))
 	}
-	return cfg.NetNASAddr
+	jmlog.Info("JuiceMount Link: backend endpoints now use loopback proxies")
+	return node, owned
+}
+
+func linkBackendReachableRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Duration) (bool, time.Duration) {
+	rtt, err := node.ProbeEndpoint(redisURL, "6379", timeout)
+	if err != nil {
+		jmlog.Warn("JuiceMount Link: backend route unavailable at startup", "error", err.Error())
+		return false, 0
+	}
+	netprofile.Default().ObserveRTT(rtt)
+	return true, rtt
+}
+
+func takeGlobalLinkNode() *jmnfs.LinkNode {
+	linkMu.Lock()
+	node := globalLinkNode
+	globalLinkNode = nil
+	linkMu.Unlock()
+	return node
+}
+
+func stopLinkNode(node *jmnfs.LinkNode) {
+	if node == nil {
+		return
+	}
+	linkMu.Lock()
+	if globalLinkNode == node {
+		globalLinkNode = nil
+	}
+	linkMu.Unlock()
+	node.Stop()
 }
 
 //export NFSServerStart
 func NFSServerStart(configJSON *C.char) *C.char {
 	globalMu.Lock()
 	defer globalMu.Unlock()
+	var linkNode *jmnfs.LinkNode
+	linkOwned := false
+	linkSucceeded := false
+	defer func() {
+		if !linkSucceeded && linkOwned {
+			stopLinkNode(linkNode)
+		}
+	}()
 
 	if globalServer != nil {
 		return C.CString("error: server already running")
@@ -415,7 +505,17 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if bootUserOffline {
 		jmlog.Info("persisted user-offline intent found — starting offline (U3); still probing + mounting FUSE so pinned files stay readable")
 	}
+	// Bring Link up before the boot probe. tsnet is a userspace network stack,
+	// so ordinary TCP dials cannot use its subnet routes; startLink rewrites the
+	// Redis and object-store URLs to loopback proxies, while this probe dials the
+	// original backend through tsnet to verify the far side is genuinely alive.
+	linkProbeURL := cfg.RedisURL
+	linkNode, linkOwned = startLinkIfConfigured(&cfg)
+	globalRedisURL = cfg.RedisURL
 	backendUp, bootRTT := backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
+	if linkNode != nil {
+		backendUp, bootRTT = linkBackendReachableRTT(linkNode, linkProbeURL, 1500*time.Millisecond)
+	}
 	// V2.3 U2/K2: a link can be reachable-but-useless — the TCP handshake
 	// completes inside 1.5s but the RTT is so high that the synchronous
 	// online boot (juicefs mount + first syncs) would churn for minutes.
@@ -460,18 +560,6 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	if !backendUp {
 		jmlog.Warn("metadata backend unreachable at startup — taking the start-while-offline path (serving cached navigation; reads resume when the backend returns)",
 			"redis_url", cfg.RedisURL)
-	}
-
-	// JuiceMount Link (T2.2): the boot probe above ran against the LAN
-	// address on purpose (tsnet is userspace; OS-stack probes can't ride the
-	// tunnel). Now that reachability is classified, bring up the tailnet
-	// node and re-point Redis/MinIO endpoints at the NAS tailnet address so
-	// the mount + connect lanes below target tunnel-routed addresses when
-	// Link is up. Single-threaded here: before the mount/connect goroutines
-	// read cfg.
-	if nasAddr := startLinkIfConfigured(cfg); nasAddr != "" {
-		cfg.RedisURL, cfg.BucketOverride = jmnfs.LinkEndpointOverride(nasAddr, cfg.RedisURL, cfg.BucketOverride)
-		jmlog.Info("JuiceMount Link: backend endpoints re-pointed at NAS tailnet addr", "nas_addr", nasAddr)
 	}
 
 	// Mount JuiceFS FUSE if not already mounted. This is what the standalone
@@ -1055,6 +1143,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		})
 	}
 	globalServer = srv
+	linkSucceeded = true
 	jmlog.Info("STARTUP-TRACE: F-post-globalServer")
 
 	// Pin store + prefetcher. The pin store lives in its own SQLite file so
@@ -2140,6 +2229,14 @@ func NFSServerShutdown() {
 	// iteration 2 commits). No lock held.
 	if fuse != nil {
 		fuse.Stop()
+	}
+	// Link owns the loopback endpoints used by the FUSE daemon, so it must
+	// outlive soft stops (which intentionally leave FUSE mounted). A hard
+	// shutdown is the matching lifecycle boundary: FUSE is gone and all tsnet
+	// state/proxies can be released.
+	if node := takeGlobalLinkNode(); node != nil {
+		jmlog.Info("shutdown step", "component", "LinkNode.Stop")
+		node.Stop()
 	}
 
 	_ = nfsCleaned // currently observable only via logs

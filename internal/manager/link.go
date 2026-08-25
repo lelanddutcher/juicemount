@@ -14,11 +14,13 @@ package manager
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // LinkStatus is returned by GET /api/net/link.
@@ -28,15 +30,48 @@ type LinkStatus struct {
 	Error     string `json:"error,omitempty"`
 }
 
+const embeddedHeadscaleHealthAddr = "127.0.0.1:8091"
+
 // PairRequest is accepted by POST /api/net/pair (empty body is fine).
 type PairRequest struct{}
 
 // handleLinkStatus reports whether the Link subsystem is available.
 func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
-	enabled := os.Getenv("JM_NET_HEADSCALE") == "on" ||
-		headscaleHostBinaryExists()
 	url := strings.TrimRight(os.Getenv("JM_NET_SERVER_URL"), "/")
-	writeJSON(w, http.StatusOK, LinkStatus{Enabled: enabled && url != "", ServerURL: url})
+	if url == "" {
+		writeJSON(w, http.StatusOK, LinkStatus{
+			Error: "Link is not configured: set JM_NET_SERVER_URL to the address Macs can reach",
+		})
+		return
+	}
+	if !linkConfigured() {
+		writeJSON(w, http.StatusOK, LinkStatus{
+			ServerURL: url,
+			Error:     "Link is disabled: set JM_NET_HEADSCALE=on (or configure an external Headscale instance)",
+		})
+		return
+	}
+	if os.Getenv("JM_NET_HEADSCALE") == "on" {
+		conn, err := net.DialTimeout("tcp", embeddedHeadscaleHealthAddr, 250*time.Millisecond)
+		if err != nil {
+			writeJSON(w, http.StatusOK, LinkStatus{
+				ServerURL: url,
+				Error:     "Headscale is configured but not ready: " + err.Error(),
+			})
+			return
+		}
+		_ = conn.Close()
+	}
+	writeJSON(w, http.StatusOK, LinkStatus{Enabled: true, ServerURL: url})
+}
+
+// linkConfigured accepts both the managed container deployment and a
+// deliberately configured external Headscale instance. The mere presence of
+// the bundled headscale binary is not configuration and must not make the UI
+// claim that pairing works.
+func linkConfigured() bool {
+	return os.Getenv("JM_NET_HEADSCALE") == "on" ||
+		strings.TrimSpace(os.Getenv("JM_HEADSCALE_CONFIG")) != ""
 }
 
 // PreauthKeyArgs builds the headscale CLI argument vector for minting a
@@ -169,11 +204,6 @@ func headscaleConfig() string {
 		}
 	}
 	return "/data/headscale/config.yaml"
-}
-
-func headscaleHostBinaryExists() bool {
-	_, err := os.Stat(headscaleBin())
-	return err == nil
 }
 
 func lastNonEmptyLine(s string) string {

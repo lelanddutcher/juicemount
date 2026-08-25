@@ -22,6 +22,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -137,14 +138,20 @@ unix_socket_permission: "0770"
 	return cfgPath, nil
 }
 
-// Start launches (or adopts) the headscale child. Blocks until the process
-// is up or the first failure, then supervises in the background.
+// Start launches the headscale child, waits for its coordination listener,
+// creates the Link user, then supervises it in the background. A live PID is
+// not sufficient: the old behavior declared success while Headscale was
+// still booting (or while user creation had failed), so the UI issued pairing
+// codes that could never register a Mac.
 func (h *headscaleSupervisor) Start() error {
 	cfg, err := ensureConfig()
 	if err != nil {
 		return err
 	}
 	h.mu.Lock()
+	if h.stop == nil {
+		h.stop = make(chan struct{})
+	}
 	h.cmd = exec.Command(hsBinary, "serve", "--config", cfg)
 	h.cmd.Stdout = os.Stdout
 	h.cmd.Stderr = os.Stderr
@@ -154,24 +161,47 @@ func (h *headscaleSupervisor) Start() error {
 	}
 	h.mu.Unlock()
 	go h.supervise(cfg)
-	// Wait briefly for the coordination port before declaring success.
-	deadline := time.Now().Add(10 * time.Second)
+	if err := waitForHeadscaleListener(10 * time.Second); err != nil {
+		h.Stop()
+		return err
+	}
+	if err := ensureHeadscaleUser(cfg); err != nil {
+		h.Stop()
+		return err
+	}
+	return nil
+}
+
+func waitForHeadscaleListener(timeout time.Duration) error {
+	_, port, err := net.SplitHostPort(hsListen)
+	if err != nil {
+		return fmt.Errorf("headscale listener config %q: %w", hsListen, err)
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
 	for time.Now().Before(deadline) {
-		if processAlive(h.cmd.Process.Pid) {
-			// User creation must happen AFTER serve is accepting gRPC;
-			// before that it fails and pairing would mint against an empty
-			// directory ("user not found"). Idempotent: duplicate = fine.
-			for tries := 0; tries < 10; tries++ {
-				if err := exec.Command(hsBinary, "--config", cfg, "users", "create", "jm").Run(); err == nil {
-					break
-				}
-				time.Sleep(500 * time.Millisecond) // already-exists also lands here; harmless
-			}
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 250*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
 			return nil
 		}
+		lastErr = err
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("headscale exited during startup")
+	return fmt.Errorf("headscale did not listen within %s: %w", timeout, lastErr)
+}
+
+func ensureHeadscaleUser(cfg string) error {
+	var lastErr error
+	for tries := 0; tries < 10; tries++ {
+		out, err := exec.Command(hsBinary, "--config", cfg, "users", "create", "jm").CombinedOutput()
+		if err == nil || strings.Contains(strings.ToLower(string(out)), "already exists") {
+			return nil
+		}
+		lastErr = fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("headscale user setup failed: %w", lastErr)
 }
 
 func (h *headscaleSupervisor) supervise(cfg string) {
@@ -215,20 +245,12 @@ func (h *headscaleSupervisor) Stop() {
 	}
 }
 
-func processAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return p.Signal(syscall.Signal(0)) == nil
-}
-
 // pairResponse is the JSON shape of POST /api/net/pair.
 type pairResponse struct {
-	OK          bool   `json:"ok"`
-	Code        string `json:"code,omitempty"`         // the preauth key itself (the "code")
-	ServerURL   string `json:"server_url,omitempty"`   // where the Mac's tsnet dials
-	Error       string `json:"error,omitempty"`
+	OK        bool   `json:"ok"`
+	Code      string `json:"code,omitempty"`       // the preauth key itself (the "code")
+	ServerURL string `json:"server_url,omitempty"` // where the Mac's tsnet dials
+	Error     string `json:"error,omitempty"`
 }
 
 // pairMint runs the headscale CLI to mint a reusable preauth key. CLI over
