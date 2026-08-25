@@ -29,6 +29,7 @@
         <li><a href="#/maintenance"  data-tab-link="maintenance">Maintenance</a></li>
         <li><a href="#/permissions"  data-tab-link="permissions">Permissions</a></li>
         <li><a href="#/link"         data-tab-link="link">JuiceMount Link</a></li>
+        <li><a href="#/teams"        data-tab-link="teams">Teams &amp; seats</a></li>
         <li><a href="#/settings"     data-tab-link="settings">Settings</a></li>
       </ul>
     </nav>
@@ -54,8 +55,23 @@
             <header><h3>Volume</h3><span class="overview-card-state"></span></header>
             <dl>
               <dt>Name</dt><dd data-field="name">—</dd>
+              <dt>Metadata</dt><dd data-field="status">—</dd>
               <dt>Used</dt><dd data-field="used">—</dd>
               <dt>Files</dt><dd data-field="files">—</dd>
+            </dl>
+            <p class="overview-error" hidden></p>
+          </article>
+
+          <!-- T1.3 home polish: farm health at a glance. Worker presence +
+               queue depth come from /api/farm/jobs, sweep progress from the
+               /api/farm rollup — both polled on the same 10s cadence as
+               /api/overview inside pollOverview(). -->
+          <article class="overview-card" data-card="farm">
+            <header><h3>Farm</h3><span class="overview-card-state"></span></header>
+            <dl>
+              <dt>Workers</dt><dd data-field="workers">—</dd>
+              <dt>Queue</dt><dd data-field="queue">—</dd>
+              <dt>Sweep</dt><dd data-field="sweep">—</dd>
             </dl>
             <p class="overview-error" hidden></p>
           </article>
@@ -80,8 +96,28 @@
             <p class="overview-error" hidden></p>
           </article>
 
+          <!-- T1.3 home polish: remote-access (JuiceMount Link) health,
+               from GET /api/net/link on the same overview cadence. -->
+          <article class="overview-card" data-card="link">
+            <header><h3>Link</h3><span class="overview-card-state"></span></header>
+            <dl>
+              <dt>Status</dt><dd data-field="status">—</dd>
+              <dt>Server</dt><dd data-field="server">—</dd>
+            </dl>
+            <p class="overview-error" hidden></p>
+          </article>
+
           <article class="overview-card overview-card-wide" data-card="jobs">
             <header><h3>Recent jobs</h3><span class="overview-card-state"></span></header>
+            <ul class="overview-jobs" data-field="items"></ul>
+            <p class="overview-error" hidden></p>
+          </article>
+
+          <!-- T1.3 home polish: one-screen "what's wrong" rollup. Backend
+               probe errors + failed jobs, derived client-side from the same
+               /api/overview snapshot — no extra endpoint. -->
+          <article class="overview-card overview-card-wide" data-card="errors">
+            <header><h3>Recent errors</h3><span class="overview-card-state"></span></header>
             <ul class="overview-jobs" data-field="items"></ul>
             <p class="overview-error" hidden></p>
           </article>
@@ -860,6 +896,73 @@
           </table>
           <button id="btn-refresh-devices" class="btn" style="margin-top:8px">Refresh</button>
         </div>
+      </section>
+
+      <!-- Teams & seats tab (Tier-2 T2.3). User-account management backed
+           by /api/users (list + delete) and /api/auth/login (24h session
+           tokens). Mirrors the Link tab's card-per-concern layout using the
+           Settings tab's fieldset/field classes. All wire values are set
+           via textContent / DOM nodes — no innerHTML with server data. -->
+      <section data-tab="teams" class="tab-pane" hidden>
+        <div class="settings-header">
+          <h2>Teams &amp; seats</h2>
+          <p class="hint">
+            User accounts for small teams. Listing, adding, and removing
+            users requires the admin key; sign-in issues a 24-hour session.
+          </p>
+        </div>
+
+        <fieldset class="settings-section">
+          <legend>Session</legend>
+          <div id="teams-login-wrap">
+            <p class="hint">Sign in with a team account.</p>
+            <form id="teams-login-form" autocomplete="off">
+              <label class="field"><span>Username</span>
+                <input id="teams-login-user" type="text" autocomplete="username" spellcheck="false"></label>
+              <label class="field"><span>Password</span>
+                <input id="teams-login-pass" type="password" autocomplete="current-password"></label>
+              <div class="settings-actions"><button id="teams-login-btn" type="submit">Sign in</button></div>
+            </form>
+            <p id="teams-login-error" class="error" hidden></p>
+          </div>
+          <div id="teams-session-info" hidden>
+            <p>Signed in as <strong id="teams-session-user">—</strong>
+              (<span id="teams-session-role">member</span>).</p>
+            <p class="hint">Session expires <span id="teams-session-expiry">—</span>.</p>
+            <div class="settings-actions"><button id="teams-logout-btn" type="button">Sign out</button></div>
+          </div>
+        </fieldset>
+
+        <fieldset class="settings-section">
+          <legend>Users</legend>
+          <table class="farm-table teams-users-table">
+            <thead><tr><th>User</th><th>Role</th><th>Created</th><th></th></tr></thead>
+            <tbody id="teams-users-body">
+              <tr><td colspan="4" class="hint">Loading…</td></tr>
+            </tbody>
+          </table>
+          <div class="settings-actions"><button id="teams-users-refresh" type="button">Refresh</button></div>
+          <p id="teams-users-error" class="error" hidden></p>
+        </fieldset>
+
+        <fieldset class="settings-section">
+          <legend>Add user</legend>
+          <form id="teams-add-form" autocomplete="off">
+            <label class="field"><span>Email / username</span>
+              <input id="teams-add-email" type="text" placeholder="person@example.com"
+                     autocomplete="off" spellcheck="false" required></label>
+            <label class="field"><span>Password</span>
+              <input id="teams-add-password" type="password" required></label>
+            <label class="field"><span>Role</span>
+              <select id="teams-add-role">
+                <option value="member" selected>member</option>
+                <option value="admin">admin</option>
+              </select></label>
+            <div class="settings-actions"><button id="teams-add-btn" type="submit">Add user</button></div>
+          </form>
+          <p id="teams-add-flash" class="settings-saved" hidden></p>
+          <p id="teams-add-error" class="error" hidden></p>
+        </fieldset>
       </section>
 
       <section data-tab="settings" class="tab-pane settings-pane" hidden>
