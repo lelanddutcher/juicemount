@@ -44,8 +44,13 @@ var validPresets = map[string]bool{
 	"fast": true, "medium": true, "slow": true, "slower": true, "veryslow": true,
 }
 
+// validVCodecs — every value the manager will publish in farm config or accept
+// as a per-job override. Software x264/x265 plus the three hardware families.
+// PROXY-CODEC (#50): an HEVC encoder stamps the row codec:"hevc"/hvc1 token
+// honestly; see proxy.go proxyEncodeArgs for the per-family ffmpeg wiring.
 var validVCodecs = map[string]bool{
 	"libx264": true, "h264_nvenc": true, "h264_qsv": true, "h264_vaapi": true,
+	"libx265": true, "hevc_nvenc": true, "hevc_qsv": true, "hevc_vaapi": true,
 }
 
 var validDevices = map[string]bool{

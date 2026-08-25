@@ -12,24 +12,70 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 )
 
+// proxyEncodeArgs returns the ffmpeg arguments that turn an input into the
+// contract-locked proxy for the given encoder family. The three families need
+// genuinely different wiring — this is where "just pass -c:v" breaks:
+//
+//   - libx264/libx265 (software): plain -crf N -preset S on decoded frames.
+//   - *_vaapi: frames must live in GPU memory. We init a DRM render device
+//     (-vaapi_device), upload with format=nv12, and drive quality with -qp
+//     (VAAPI has no CRF; QP ≈ CRF+2 at the same visual level) and speed via
+//     -compression_level. No -preset (unsupported → hard error).
+//   - *_nvenc / *_qsv: software frames are uploaded by the encoder itself;
+//     quality maps to -cq/-global_quality respectively, -preset is accepted.
+//
+// HEVC variants of each family produce the same container/audio; the codec tag
+// lands as hvc1 in the MP4 so every AVFoundation/browser decoder recognizes it.
+func proxyEncodeArgs(vcodec string, crf int, preset string) []string {
+	switch {
+	case strings.HasSuffix(vcodec, "_vaapi"):
+		if crf <= 0 {
+			crf = 23 // visual match to x264 crf 21
+		}
+		return []string{
+			"-vaapi_device", "/dev/dri/renderD128",
+			"-vf", "format=nv12,hwupload",
+			"-c:v", vcodec, "-qp", strconv.Itoa(crf),
+			"-compression_level", "3",
+			"-bf", "2", // B-frames: closed-GOP discipline, better compression
+		}
+	case strings.HasSuffix(vcodec, "_qsv"):
+		if crf <= 0 {
+			crf = 23
+		}
+		return []string{
+			"-c:v", vcodec, "-global_quality", strconv.Itoa(crf),
+			"-preset", map[bool]string{true: "very_fast", false: preset}[preset == ""],
+		}
+	default:
+		// libx264 / libx265 / h264_nvenc / hevc_nvenc — CRF-style quality.
+		// nvenc maps -crf to its internal -cq; x264/x265 use it natively.
+		return []string{
+			"-c:v", vcodec, "-pix_fmt", "yuv420p",
+			"-crf", strconv.Itoa(crf), "-preset", preset,
+		}
+	}
+}
+
 // Proxy transcodes the source to the contract-locked OL-3 proxy: a SINGLE
 // progressive MP4 with the moov atom first (-movflags +faststart) so both
 // AVFoundation (local file + HTTP byte-range) and a browser <video> seek it
 // natively over HTTP Range. The interchange-locked fields below MUST NOT vary —
-// a farm proxy and OpenLoupe's local transcode are byte-interchangeable only
-// because every client plays exactly this codec/container:
+// a farm proxy and ClipLogger's local transcode are interchangeable only
+// because every client plays exactly this container:
 //
 //	Container : MP4, single file, +faststart (moov before mdat)
-//	Video     : H.264 (libx264), -pix_fmt yuv420p (8-bit 4:2:0), progressive
+//	Video     : H.264 floor by default; HEVC where configured (#50)
+//	Pix fmt   : yuv420p 8-bit 4:2:0 (software path); nv12 8-bit (VAAPI path —
+//	            same 4:2:0 8-bit semantics, hardware-native layout)
 //	Audio     : AAC, -b:a 128k, 48 kHz, stereo
-//	media_type: video/mp4
+//	media_type: video/mp4, codec_string stamped per PROXY-CODEC schema v2
 //
 // CRF + preset are the farm's QUALITY knob (size/quality only, not
-// playability/interchange): the farm encodes OFFLINE so it picks quality-oriented
-// -crf 21 -preset slow per OL-3, NOT OpenLoupe's realtime fallback values. vcodec
-// defaults to libx264 (CPU); pass a hardware encoder (h264_nvenc/qsv/vaapi) on a
-// GPU/APU NAS — the locked container/pix_fmt/audio stay identical so the blob is
-// still interchangeable. The HTTP Range/206 serving is a SEPARATE lane.
+// playability): the farm encodes OFFLINE so it picks quality-oriented values.
+// vcodec selects the family; see proxyEncodeArgs. The H.264-floor invariant
+// (contract §PROXY-CODEC) is honored operationally: the default config stays
+// libx264/h264_*; HEVC is an explicit per-node or per-job opt-in.
 func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) error {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
@@ -47,22 +93,20 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 		return err
 	}
 	// Encode to a temp sibling, then atomically rename onto outPath so a
-	// concurrent OpenLoupe reader never sees a partially-encoded proxy.
+	// concurrent reader never sees a partially-encoded proxy.
 	tmpPath := atomicTempPath(outPath)
 	defer os.Remove(tmpPath) // no-op once the commit rename consumes it
-	// -pix_fmt yuv420p forces 8-bit 4:2:0 from any source (10-bit/HDR/422
-	// originals included), the lowest-common-denominator both decoders accept.
-	// crf/preset are the quality knob (size/quality only — interchange-safe).
+
 	args := append([]string{"-y", "-loglevel", "error"}, proxyThreadArgs()...)
 	args = append(args,
 		"-i", srcPath,
-		"-c:v", vcodec, "-pix_fmt", "yuv420p", "-crf", strconv.Itoa(crf), "-preset", preset,
 		"-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
 		"-movflags", "+faststart",
 		// Force the MP4 muxer: the temp path lacks the .mp4 extension ffmpeg
 		// would otherwise infer the container from.
-		"-f", "mp4",
-		tmpPath)
+		"-f", "mp4")
+	args = append(args, proxyEncodeArgs(vcodec, crf, preset)...)
+	args = append(args, tmpPath)
 	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg proxy %q: %w: %s", srcPath, err, out)
