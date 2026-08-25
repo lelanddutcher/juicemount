@@ -82,8 +82,16 @@ func buildQLArgs(srcPath, outPath string, maxDim, maxSeconds int) []string {
 		"-i", srcPath,
 		"-vf", scale,
 		"-c:v", "libx264", "-preset", qlPreviewX264Preset, "-crf", strconv.Itoa(qlPreviewCRF),
+		// PROXY_CODEC_SPEC decode floor invariants (ratified 2026-06-27):
+		// High@8-bit 4:2:0, BT.709 SDR tags, CFR, closed GOP — identical
+		// discipline to kind:"proxy" so every consumer that plays a proxy
+		// plays a preview.
+		"-profile:v", "high",
 		"-pix_fmt", "yuv420p",
-		"-c:a", "aac", "-b:a", "96k", "-ar", "48000", "-ac", "2",
+		"-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+		"-fps_mode", "cfr",
+		"-x264-params", "no-open-gop=1:scenecut=40",
+		"-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k", "-ar", "48000", "-ac", "2",
 		"-movflags", "+faststart",
 		"-f", "mp4",
 		outPath,
