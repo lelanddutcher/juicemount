@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +33,7 @@ type Server struct {
 	store    *metadata.Store
 	handler  *JuiceMountHandler
 	listener net.Listener
+	running  atomic.Bool
 }
 
 // NewServer creates a new NFS server.
@@ -61,6 +63,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("listen %s: %w", s.config.ListenAddr, err)
 	}
 	s.listener = &noDelayListener{Listener: l}
+	s.running.Store(true)
 
 	jmlog.Info("nfs server listening",
 		"addr", s.config.ListenAddr,
@@ -75,6 +78,7 @@ func (s *Server) Start() error {
 
 	// Start serving in background
 	go func() {
+		defer s.running.Store(false)
 		if err := nfslib.Serve(s.listener, s.handler); unexpectedServeError(err) {
 			jmlog.Error("nfs server stopped with error", "error", err.Error())
 		}
@@ -90,9 +94,18 @@ func unexpectedServeError(err error) bool {
 // Stop closes the listener and stops the server.
 func (s *Server) Stop() error {
 	if s.listener != nil {
-		return s.listener.Close()
+		err := s.listener.Close()
+		s.running.Store(false)
+		return err
 	}
 	return nil
+}
+
+// IsRunning reports whether the NFS accept loop is active. Server-only
+// deployments use this for readiness instead of checking for a client-side
+// mount that intentionally does not exist inside the container.
+func (s *Server) IsRunning() bool {
+	return s.running.Load()
 }
 
 // Handler returns the NFS handler for configuration (cache reader, redis client, etc.)

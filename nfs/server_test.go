@@ -127,6 +127,28 @@ func TestServerStartStop(t *testing.T) {
 	t.Logf("Server listening on %s", addr)
 }
 
+func TestServerRunningLifecycle(t *testing.T) {
+	store, err := metadata.Open(filepath.Join(t.TempDir(), "lifecycle.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer store.Close()
+
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0", FUSEPath: t.TempDir()}, store)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !srv.IsRunning() {
+		t.Fatal("server must report running after successful listen")
+	}
+	if err := srv.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if srv.IsRunning() {
+		t.Fatal("server must report stopped after listener close")
+	}
+}
+
 func TestClosedListenerIsRecognizedAsNormalShutdown(t *testing.T) {
 	err := &net.OpError{Op: "accept", Net: "tcp", Err: net.ErrClosed}
 	if unexpectedServeError(err) {

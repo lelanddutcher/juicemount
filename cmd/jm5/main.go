@@ -429,15 +429,9 @@ func main() {
 	})
 	netWatcher.Start()
 
-	healthMon := health.New(health.Config{
-		RedisURL: func() string {
-			addr, _, _ := metadata.ParseRedisURL(*redisURL)
-			return addr
-		}(),
-		MinIOURL:      "http://127.0.0.1:9000",
-		FUSEPath:      *fusePath,
-		NFSMountPoint: *mountPoint,
-	})
+	healthMon := health.New(newHealthConfig(
+		*redisURL, *managerMinIOURL, *fusePath, *mountPoint, *noMount,
+	))
 	healthMon.SetNetWatcher(netWatcher)
 	// Allow auto-remount only when we own the mount lifecycle.
 	if !*noMount {
@@ -449,22 +443,7 @@ func main() {
 
 	// Expose health status to /health endpoint.
 	metrics.Default().SetHealthProvider(func() metrics.HealthSnapshot {
-		st := healthMon.Status()
-		comps := map[string]string{
-			"redis": componentLabel(st.Redis.Healthy, st.Redis.Message),
-			"minio": componentLabel(st.MinIO.Healthy, st.MinIO.Message),
-			"fuse":  componentLabel(st.FUSE.Healthy, st.FUSE.Message),
-			"nfs":   componentLabel(st.NFS.Healthy, st.NFS.Message),
-		}
-		reason := ""
-		if !st.Overall {
-			reason = "degraded"
-		}
-		return metrics.HealthSnapshot{
-			Healthy:    st.Overall,
-			Components: comps,
-			Reason:     reason,
-		}
+		return jm5HealthSnapshot(healthMon.Status(), *noMount, srv.IsRunning())
 	})
 
 	// 6. Mount NFS (unless --no-mount)
@@ -532,6 +511,43 @@ func componentLabel(healthy bool, msg string) string {
 		return "unhealthy"
 	}
 	return msg
+}
+
+func newHealthConfig(redisURL, minioURL, fusePath, mountPoint string, serverOnly bool) health.Config {
+	redisAddr, _, _ := metadata.ParseRedisURL(redisURL)
+	if serverOnly {
+		// A server container exports NFS to other machines; it intentionally
+		// does not mount its own export as a client.
+		mountPoint = ""
+	}
+	return health.Config{
+		RedisURL:      redisAddr,
+		MinIOURL:      minioURL,
+		FUSEPath:      fusePath,
+		NFSMountPoint: mountPoint,
+	}
+}
+
+func jm5HealthSnapshot(st health.HealthStatus, serverOnly, serverRunning bool) metrics.HealthSnapshot {
+	nfsHealthy := st.NFS.Healthy
+	nfsMessage := st.NFS.Message
+	overall := st.Overall
+	if serverOnly {
+		nfsHealthy = serverRunning
+		nfsMessage = "listener stopped"
+		overall = st.Redis.Healthy && st.MinIO.Healthy && st.FUSE.Healthy && serverRunning
+	}
+	components := map[string]string{
+		"redis": componentLabel(st.Redis.Healthy, st.Redis.Message),
+		"minio": componentLabel(st.MinIO.Healthy, st.MinIO.Message),
+		"fuse":  componentLabel(st.FUSE.Healthy, st.FUSE.Message),
+		"nfs":   componentLabel(nfsHealthy, nfsMessage),
+	}
+	reason := ""
+	if !overall {
+		reason = "degraded"
+	}
+	return metrics.HealthSnapshot{Healthy: overall, Components: components, Reason: reason}
 }
 
 func mountNFS(addr, mountPoint string) error {
