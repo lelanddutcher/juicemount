@@ -64,6 +64,20 @@ def _ts(d):
     return datetime.datetime.fromisoformat(d["time"]).timestamp()
 
 
+def _in_current_push_session(events, starts):
+    """Return events from the latest keyspace-push process session only.
+
+    The app log is append-only across launches. Comparing the final SCAN from
+    one process with the startup SCAN from its replacement fabricates a short
+    cadence even when each process honored its backstop. If the session marker
+    has rolled out of the bounded log window, refuse to judge instead.
+    """
+    if not starts:
+        return []
+    boundary = max(_ts(row) for row in starts)
+    return [row for row in events if _ts(row) >= boundary]
+
+
 # ---------------------------------------------------------------- invariants
 
 def inv_scan_cadence(_state, tolerance=0.8):
@@ -83,16 +97,22 @@ def inv_scan_cadence(_state, tolerance=0.8):
                       "backstop is SUPPOSED to tighten to 30s, so this check has "
                       "nothing to say" % ks.get("verdict"))
 
-    changes = _log_events("metadata reconcile backstop changed")
+    starts = _log_events("metadata keyspace push: loop starting")
+    if not starts:
+        return SKIP, "no keyspace-push session marker in the log window"
+
+    changes = _in_current_push_session(
+        _log_events("metadata reconcile backstop changed"), starts)
     if not changes:
-        return SKIP, "no backstop value in the log window; cannot judge cadence"
+        return SKIP, "no backstop value in the current push session; cannot judge cadence"
     backstop = changes[-1].get("new_sec")
     if not backstop:
         return SKIP, "backstop value unreadable"
 
-    syncs = _log_events("metadata sync complete")
+    syncs = _in_current_push_session(_log_events("metadata sync complete"), starts)
     if len(syncs) < 3:
-        return SKIP, "saw %d syncs; need >=3 to measure an interval" % len(syncs)
+        return SKIP, ("saw %d syncs in the current push session; need >=3 to "
+                      "measure an interval" % len(syncs))
 
     times = [_ts(s) for s in syncs][-8:]
     gaps = [b - a for a, b in zip(times, times[1:])]
