@@ -114,6 +114,16 @@ func (mb *MemoryBuffer) Get(path string, fileSize int64, fusePath string) []byte
 	}
 
 	mb.mu.Lock()
+	// Stop() deliberately clears entries while already-dispatched NFS RPCs may
+	// still be unwinding. A late Get used to continue through the miss path and
+	// assign mb.entries[path] below, panicking with "assignment to entry in nil
+	// map" during every busy shutdown. Treat the nil map as the terminal state.
+	// Checking under the same lock as Stop closes the race between an earlier
+	// stopCh probe and the map clear.
+	if mb.entries == nil {
+		mb.mu.Unlock()
+		return nil
+	}
 	entry, exists := mb.entries[path]
 
 	if exists {

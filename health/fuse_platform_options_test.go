@@ -11,7 +11,7 @@ func TestJuiceFSMountPlatformOptions(t *testing.T) {
 		goos string
 		want []string
 	}{
-		{name: "macOS hides internal mount", goos: "darwin", want: []string{"-o", "nobrowse"}},
+		{name: "macOS hides internal mount and tolerates cellular IO", goos: "darwin", want: []string{"-o", "nobrowse,daemon_timeout=900"}},
 		{name: "Linux does not receive macOS FUSE option", goos: "linux"},
 		{name: "other platforms remain option-free", goos: "freebsd"},
 	}

@@ -9,6 +9,20 @@ import (
 	"time"
 )
 
+func TestMemBufGetAfterStopIsSafe(t *testing.T) {
+	mb := NewMemoryBuffer(1<<20, 8<<20)
+	mb.Stop()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Get after Stop panicked: %v", r)
+		}
+	}()
+	if got := mb.Get("late-rpc", 1024, filepath.Join(t.TempDir(), "late-rpc")); got != nil {
+		t.Fatalf("Get after Stop returned %d bytes, want cache miss", len(got))
+	}
+}
+
 func TestMemBufBasic(t *testing.T) {
 	mb := NewMemoryBuffer(10*1024*1024, 100*1024*1024) // 10MB threshold, 100MB budget
 	defer mb.Stop()

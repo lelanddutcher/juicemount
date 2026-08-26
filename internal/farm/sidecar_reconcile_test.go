@@ -138,7 +138,10 @@ func TestReconcileRefusesManifestWhoseInodeDisagreesWithItsDirectory(t *testing.
 		t.Fatal(err)
 	}
 
-	res := reconcileOneSidecarInto(store, dir, dirInode)
+	res, err := reconcileOneSidecarInto(store, dir, dirInode)
+	if err != nil {
+		t.Fatalf("mismatched manifest was misclassified as a mount outage: %v", err)
+	}
 	if res.Rows != 0 || res.Assets != 0 {
 		t.Errorf("mismatched manifest was ingested: rows=%d assets=%d", res.Rows, res.Assets)
 	}

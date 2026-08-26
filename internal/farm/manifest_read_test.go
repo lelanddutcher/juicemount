@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
@@ -120,15 +121,33 @@ func TestRefusedManifestIsCountedNotSilent(t *testing.T) {
 	store, _ := derivatives.Open(":memory:")
 	defer store.Close()
 
-	res := reconcileOneSidecarInto(store, mount, 740001)
+	res, err := reconcileOneSidecarInto(store, mount, 740001)
+	if err != nil {
+		t.Fatalf("security refusal was misclassified as a mount outage: %v", err)
+	}
 	if res.Errs == 0 {
 		t.Error("a refused manifest was not counted as an error — it is indistinguishable from absent")
 	}
 
 	// An inode with genuinely no sidecar must stay silent (the full walk hits
 	// this constantly; counting it would drown the signal).
-	quiet := reconcileOneSidecarInto(store, mount, 740002)
+	quiet, err := reconcileOneSidecarInto(store, mount, 740002)
+	if err != nil {
+		t.Fatalf("absent sidecar returned error: %v", err)
+	}
 	if quiet.Errs != 0 {
 		t.Errorf("absent sidecar counted as an error (Errs=%d) — the walk would be all noise", quiet.Errs)
+	}
+}
+
+func TestSidecarMountUnavailableClassification(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.ENXIO, syscall.ESTALE, syscall.ENOTCONN} {
+		err := &os.PathError{Op: "open", Path: "/mount/manifest.json", Err: errno}
+		if !sidecarMountUnavailable(err) {
+			t.Errorf("%v was not classified as a mount-wide outage", errno)
+		}
+	}
+	if sidecarMountUnavailable(os.ErrPermission) {
+		t.Error("per-file permission refusal was misclassified as a mount-wide outage")
 	}
 }

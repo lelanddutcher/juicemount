@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
@@ -79,11 +80,19 @@ func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult,
 		if perr != nil {
 			continue // not an inode-named dir
 		}
-		r := reconcileOneSidecarInto(store, mount, inode)
+		r, fatalErr := reconcileOneSidecarInto(store, mount, inode)
 		res.Sidecars += r.Sidecars
 		res.Assets += r.Assets
 		res.Rows += r.Rows
 		res.Errs += r.Errs
+		if fatalErr != nil {
+			// The mount disappeared after the directory enumeration. Continuing
+			// would issue one doomed FUSE open and one warning per derivative
+			// inode (hundreds of requests and log lines in the live failure).
+			// Stop on the first mount-wide error; the next scheduled reconcile
+			// retries the whole pass after mount recovery.
+			return res, fatalErr
+		}
 	}
 	return res, nil
 }
@@ -96,7 +105,10 @@ func ReconcileSidecars(store *derivatives.Store, mount string) (ReconcileResult,
 // present and ingested; an absent sidecar is (false, nil) — not an error.
 // Idempotent (upserts), safe to call under the WAL the running app reads from.
 func ReconcileOneSidecar(store *derivatives.Store, mount string, inode uint64) (found bool, err error) {
-	r := reconcileOneSidecarInto(store, mount, inode)
+	r, fatalErr := reconcileOneSidecarInto(store, mount, inode)
+	if fatalErr != nil {
+		return false, fatalErr
+	}
 	if r.Sidecars == 0 {
 		return false, nil // no sidecar on the volume for this inode
 	}
@@ -564,7 +576,7 @@ func reservedBlobName(kind string) (string, bool) {
 // reconcileOneSidecarInto reads + ingests <mount>/.juicemount/derivatives/<inode>/
 // manifest.json into the store, returning per-call counts. The shared core of
 // both the full walk (ReconcileSidecars) and the on-miss path (ReconcileOneSidecar).
-func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint64) ReconcileResult {
+func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint64) (ReconcileResult, error) {
 	var res ReconcileResult
 	// THE FILE EVERY SANITIZER BELOW RUNS ON, read with the same guard as any
 	// other derivative — it was the one thing still opened by bare name.
@@ -575,6 +587,9 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 	scRel := derivatives.DerivBlobRel(inode, "manifest.json")
 	raw, err := readSidecarBounded(mount, scRel)
 	if err != nil {
+		if sidecarMountUnavailable(err) {
+			return res, fmt.Errorf("sidecar reconcile: mount unavailable: %w", err)
+		}
 		// ABSENT is normal and silent — most inode dirs are blob-only, and the
 		// full walk hits this constantly. REFUSED is not: a manifest rejected for
 		// being a symlink, a non-regular file, or over the size cap means an
@@ -586,7 +601,7 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 				"inode", inode, "rel", scRel, "error", err)
 			res.Errs++
 		}
-		return res
+		return res, nil
 	}
 	res.Sidecars++
 	// A sidecar freshly (re)written server-side can read back torn/partial on
@@ -606,7 +621,7 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 	}
 	if !parsed {
 		res.Errs++
-		return res
+		return res, nil
 	}
 	// CONFUSED-DEPUTY GUARD (2026-08-04). The DIRECTORY is the authority for
 	// which asset we are reconciling — we found this file at
@@ -624,7 +639,7 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 		jmlog.Warn("sidecar reconcile: manifest inode disagrees with its directory — refusing",
 			"dir_inode", inode, "manifest_inode", sc.Inode, "rel", scRel)
 		res.Errs++
-		return res
+		return res, nil
 	}
 	// source_hash is the value a consumer's documented `hash == source_hash`
 	// freshness check compares against, and it is never re-derived from bytes on
@@ -635,7 +650,7 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 	}
 	if err := store.PutSource(sc.Inode, sc.SourceHash); err != nil {
 		res.Errs++
-		return res
+		return res, nil
 	}
 	// Repopulate /metadata?kind=tech (D1 consume + AI size-guard fallback).
 	if sc.Tech != nil && len(sc.Tech.Payload) > 0 {
@@ -688,12 +703,23 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 		}
 		if err := store.PutDeriv(sc.Inode, clean); err != nil {
 			res.Errs++
-			return res
+			return res, nil
 		}
 		res.Rows++
 	}
 	res.Assets++
-	return res
+	return res, nil
+}
+
+// sidecarMountUnavailable identifies errors that apply to the entire mounted
+// filesystem, rather than one malformed/missing manifest. macFUSE reports a
+// torn-down daemon session as ENXIO ("device not configured"); remote mounts
+// can also surface ESTALE or ENOTCONN. These must abort a full reconcile pass
+// immediately instead of multiplying one outage by every inode in the tree.
+func sidecarMountUnavailable(err error) bool {
+	return errors.Is(err, syscall.ENXIO) ||
+		errors.Is(err, syscall.ESTALE) ||
+		errors.Is(err, syscall.ENOTCONN)
 }
 
 // WriteManifestSidecar serializes the asset's current manifest (source hash + all

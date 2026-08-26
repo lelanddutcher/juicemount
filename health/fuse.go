@@ -827,12 +827,30 @@ func (fm *FUSEManager) Mount() error {
 	return nil
 }
 
+const desktopMacFUSEDaemonTimeoutSeconds = 900
+
 // juiceFSMountPlatformOptions returns only options supported by the host FUSE
 // implementation. nobrowse maps to macOS's MNT_DONTBROWSE flag; Linux
 // fusermount3 rejects it and prevents JuiceFS from mounting at all.
+//
+// macFUSE's default daemon timeout is 60 seconds. That is shorter than one
+// legitimate JuiceFS object request (--get-timeout/--put-timeout both default
+// to 60s), and far shorter than JuiceFS's bounded retry envelope. On a weak
+// cellular path, or when a foreground read shares the tunnel with a durable
+// spool upload, a single request can therefore cross exactly 60s while the
+// daemon is still alive and making progress. macFUSE then tears the whole
+// device down with ENXIO ("device not configured"). Finder loses every open
+// handle and the app spends tens of seconds unmounting/remounting a filesystem
+// that never actually crashed.
+//
+// Keep the kernel/daemon contract alive for the full bounded JuiceFS retry
+// window. NFS still applies its own request/retry policy, JuiceMount still
+// reports backend degradation promptly, and the FUSE watchdog still recovers a
+// genuinely dead process. This only prevents a slow data operation from being
+// mistaken for a dead filesystem session.
 func juiceFSMountPlatformOptions(goos string) []string {
 	if goos == "darwin" {
-		return []string{"-o", "nobrowse"}
+		return []string{"-o", fmt.Sprintf("nobrowse,daemon_timeout=%d", desktopMacFUSEDaemonTimeoutSeconds)}
 	}
 	return nil
 }
