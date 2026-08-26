@@ -22,6 +22,23 @@ type workflowMediaFile struct {
 	seed int64
 }
 
+func cleanupWorkflowPath(t *testing.T, env *e2eEnv, nfsPath string) {
+	t.Helper()
+	rel, err := filepath.Rel(env.mount, nfsPath)
+	if err != nil || !filepath.IsLocal(rel) {
+		t.Fatalf("workflow fixture path %q is outside test mount %q", nfsPath, env.mount)
+	}
+	fusePath := filepath.Join(fuseInternalPath(), rel)
+	t.Cleanup(func() {
+		// Removing through the NFS arm keeps its metadata coherent. The test
+		// server can shut down before every delayed FUSE mutation completes,
+		// though, so remove the same exact generated path through FUSE as a
+		// fallback. Never enumerate or remove user-owned paths.
+		_ = os.RemoveAll(nfsPath)
+		_ = os.RemoveAll(fusePath)
+	})
+}
+
 // setupWorkflowMediaFixture writes deterministic, non-sparse media through the
 // NFS arm under test. Earlier workflow tests selected arbitrary large entries
 // from a Redis snapshot. A stale entry could then return zero bytes while the
@@ -34,7 +51,7 @@ func setupWorkflowMediaFixture(t *testing.T, env *e2eEnv, fileCount int, size in
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("create workflow media fixture: %v", err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	cleanupWorkflowPath(t, env, root)
 
 	files := make([]workflowMediaFile, 0, fileCount)
 	for i := 0; i < fileCount; i++ {
@@ -277,7 +294,7 @@ func TestWorkflow_ProjectSave(t *testing.T) {
 	mount := env.mount
 
 	projectDir := filepath.Join(mount, fmt.Sprintf("__workflow_project_%d", time.Now().UnixNano()))
-	t.Cleanup(func() { _ = os.RemoveAll(projectDir) })
+	cleanupWorkflowPath(t, env, projectDir)
 
 	// Simulate Premiere project save structure
 	t.Log("Creating project directory structure...")
@@ -392,7 +409,7 @@ func TestWorkflow_FinderOps(t *testing.T) {
 	mount := env.mount
 
 	workDir := filepath.Join(mount, fmt.Sprintf("__workflow_finder_%d", time.Now().UnixNano()))
-	t.Cleanup(func() { _ = os.RemoveAll(workDir) })
+	cleanupWorkflowPath(t, env, workDir)
 	for _, dir := range []string{workDir, filepath.Join(workDir, "src"), filepath.Join(workDir, "dst")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("create Finder workflow directory %s: %v", filepath.Base(dir), err)
@@ -499,7 +516,7 @@ func TestWorkflow_RapidProjectAccess(t *testing.T) {
 	mount := env.mount
 
 	projectFile := filepath.Join(mount, fmt.Sprintf("__workflow_rapid_%d.prproj", time.Now().UnixNano()))
-	t.Cleanup(func() { _ = os.Remove(projectFile) })
+	cleanupWorkflowPath(t, env, projectFile)
 
 	// Simulate 10 rapid save cycles (Premiere auto-saves every 5 minutes)
 	t.Log("Simulating 10 rapid project saves...")
