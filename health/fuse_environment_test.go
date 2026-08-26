@@ -36,3 +36,18 @@ func TestDesktopJuiceFSHeartbeatKeepsSessionForFiveMinutes(t *testing.T) {
 		t.Fatalf("desktop session args = %v, want %v", got, want)
 	}
 }
+
+func TestDesktopJuiceFSReadAheadDoesNotFreezeStartupClass(t *testing.T) {
+	t.Setenv("JM_JFS_MAX_READAHEAD", "")
+	want := []string{"--max-readahead", "1M"}
+	if got := desktopJuiceFSReadAheadArgs(); !slices.Equal(got, want) {
+		t.Fatalf("desktop read-ahead args = %v, want %v", got, want)
+	}
+
+	// The rollback switch restores the upstream JuiceFS default without a
+	// rebuild if a field deployment finds a fast-link throughput regression.
+	t.Setenv("JM_JFS_MAX_READAHEAD", "0")
+	if got := desktopJuiceFSReadAheadArgs(); got != nil {
+		t.Fatalf("desktop read-ahead rollback args = %v, want nil", got)
+	}
+}

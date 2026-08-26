@@ -103,6 +103,25 @@ func desktopJuiceFSSessionArgs() []string {
 	}
 }
 
+// desktopJuiceFSReadAheadArgs fixes JuiceFS's immutable per-mount session
+// readahead at the conservative floor.  JuiceMount's NFS readahead controller
+// is the adaptive layer: it changes depth and concurrency live as measured RTT
+// and throughput move between fast, slow, and metered classes.
+//
+// Leaving JuiceFS's own 32 MiB default enabled on a mount that happened to
+// start on Wi-Fi defeats that controller after a Wi-Fi -> cellular handoff:
+// JuiceMount can disable its own speculative reads, but the already-running
+// JuiceFS session continues pulling ahead until the next remount.  A fixed 1
+// MiB ceiling disables that hidden second prefetcher for every startup class;
+// fast links still get parallel 4 MiB block reads from JuiceMount's measured,
+// live controller.  JM_JFS_MAX_READAHEAD=0 is the field rollback switch.
+func desktopJuiceFSReadAheadArgs() []string {
+	if os.Getenv("JM_JFS_MAX_READAHEAD") == "0" {
+		return nil
+	}
+	return []string{"--max-readahead", "1M"}
+}
+
 // juiceFSChildEnvironment deliberately gives the external JuiceFS daemon a
 // small, non-secret environment. The upstream macOS daemon launcher preserves
 // its environment in the daemon process title, which makes inherited API keys
@@ -510,19 +529,11 @@ func (fm *FUSEManager) Mount() error {
 	// pressure across a Wi-Fi -> cellular handoff.
 	args = append(args, desktopJuiceFSSessionArgs()...)
 	args = append(args, juiceFSMountPlatformOptions(runtime.GOOS)...)
-	// S1 (WAVE 1, RC-5): cap JuiceFS session readahead on a WAN link only.
-	// juicefs's --max-readahead defaults to 8×BlockSize = 32 MiB, so a single
-	// cold 4 KB preview touch pulls up to 32 MiB extra off the backend across
-	// the tunnel. On the metered/slow class we set --max-readahead 1M to disable
-	// session readahead entirely (~28 MiB less per cold first-touch). Mount-time
-	// flag ONLY — zero NFS hot-path impact. Fast/Medium (10GbE/GbE) are left
-	// UNSET so they keep the JuiceFS 32 MiB default (LAN behavior unchanged).
-	// Kill-switch: JM_JFS_MAX_READAHEAD=0. Auto-reverts on 10GbE by class.
-	if cls := netprofile.Default().Class(); cls == netprofile.ClassMetered || cls == netprofile.ClassSlow {
-		if os.Getenv("JM_JFS_MAX_READAHEAD") != "0" {
-			args = append(args, "--max-readahead", "1M")
-		}
-	}
+	// Keep JuiceFS's mount-time-only prefetcher at its conservative floor on
+	// every startup class.  The live, measured controller in nfs/readahead.go
+	// supplies parallel depth on fast links and can actually react to a later
+	// Wi-Fi <-> cellular handoff.  See desktopJuiceFSReadAheadArgs.
+	args = append(args, desktopJuiceFSReadAheadArgs()...)
 	// Bind the Prometheus metrics endpoint EXPLICITLY so the bridge can scrape
 	// `juicefs_blockcache_bytes` (the true on-disk block-cache size) for the
 	// cache_used_bytes field. We do NOT rely on JuiceFS's :9567 default — that
