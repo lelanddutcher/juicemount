@@ -456,10 +456,15 @@ func linkRedisPingRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Durati
 	return time.Since(started), nil
 }
 
-const linkDataPlaneBenchmarkBytes = 4 << 20
+// Keep the startup proof large enough to clear netprofile's 256 KiB wire-sample
+// floor, but small enough to finish on a genuinely usable 1 Mbps cellular
+// uplink. The previous 4 MiB payload needed at least 33.5 seconds at 1 Mbps,
+// while each direction had a 15-second deadline, so it deterministically called
+// a healthy cellular Link "offline" before the mount policy was selected.
+const linkDataPlaneBenchmarkBytes = 512 << 10
 
 // linkRedisDataPlaneBenchmark proves that the encrypted subnet route carries
-// a multi-megabyte payload in both directions. Tiny PING and MinIO liveness
+// a verified payload in both directions. Tiny PING and MinIO liveness
 // checks passed on the live RC while a DERP-only path took ~30 seconds per S3
 // chunk and repeatedly killed JuiceFS. A short-lived Redis value exercises the
 // same routed peer without touching volume metadata or requiring S3 secrets.
@@ -528,6 +533,22 @@ func linkRedisDataPlaneBenchmarkWithDial(redisURL string, size int, timeout time
 	bits := float64(size * 8)
 	return bits / uploadElapsed.Seconds() / 1_000_000,
 		bits / downloadElapsed.Seconds() / 1_000_000, nil
+}
+
+// observeLinkDataPlaneDownload seeds the same process-wide adaptive profile
+// consumed by JuiceFS mount policy and the live NFS read-ahead controller. The
+// benchmark returns Mbps rather than elapsed time, so reconstruct the measured
+// duration exactly. Only download is folded in: Profile throughput describes
+// cold-read capacity, while upload remains separately reported to the user.
+func observeLinkDataPlaneDownload(p *netprofile.Profile, size int, downloadMbps float64) {
+	if p == nil || size <= 0 || downloadMbps <= 0 || math.IsNaN(downloadMbps) || math.IsInf(downloadMbps, 0) {
+		return
+	}
+	seconds := float64(size*8) / (downloadMbps * 1_000_000)
+	if seconds <= 0 {
+		return
+	}
+	p.ObserveThroughput(int64(size), time.Duration(seconds*float64(time.Second)))
 }
 
 func takeGlobalLinkNode() *jmnfs.LinkNode {
@@ -636,6 +657,7 @@ func NFSServerLinkTest(configJSON *C.char) *C.char {
 	}
 	result.UploadMbps = uploadMbps
 	result.DownloadMbps = downloadMbps
+	observeLinkDataPlaneDownload(netprofile.Default(), linkDataPlaneBenchmarkBytes, downloadMbps)
 	result.BackendReachable = true
 	if objectRTT > rtt {
 		rtt = objectRTT
@@ -832,6 +854,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				jmlog.Warn("JuiceMount Link: encrypted data-plane benchmark failed at startup — taking offline path",
 					"error", benchErr.Error())
 			} else {
+				observeLinkDataPlaneDownload(netprofile.Default(), linkDataPlaneBenchmarkBytes, downloadMbps)
 				jmlog.Info("JuiceMount Link: encrypted data-plane benchmark verified at startup",
 					"bytes", linkDataPlaneBenchmarkBytes,
 					"upload_mbps", uploadMbps, "download_mbps", downloadMbps)

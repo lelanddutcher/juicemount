@@ -6,6 +6,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
 func TestLinkRedisDataPlaneBenchmarkRoundTrip(t *testing.T) {
@@ -38,5 +40,28 @@ func TestLinkRedisDataPlaneBenchmarkRejectsInvalidInput(t *testing.T) {
 	}
 	if _, _, err := linkRedisDataPlaneBenchmarkWithDial("redis://127.0.0.1:6379/15", 1, time.Second, nil); err == nil {
 		t.Fatal("nil benchmark dialer was accepted")
+	}
+}
+
+func TestLinkDataPlaneSampleSelectsCellularPolicyBeforeMount(t *testing.T) {
+	if linkDataPlaneBenchmarkBytes < 256<<10 {
+		t.Fatalf("startup benchmark %d bytes is below the wire-sample floor", linkDataPlaneBenchmarkBytes)
+	}
+	p := netprofile.New()
+	p.ObserveRTT(300 * time.Millisecond)
+	observeLinkDataPlaneDownload(p, linkDataPlaneBenchmarkBytes, 2.0)
+
+	snap := p.Snapshot()
+	if !snap.HaveRTT || !snap.HaveBW {
+		t.Fatalf("startup Link sample did not fully measure profile: %+v", snap)
+	}
+	if snap.Class != netprofile.ClassMetered {
+		t.Fatalf("2 Mbps / 300 ms Link class = %s, want metered", snap.Class)
+	}
+	if got := p.Readahead(); got.Enabled || got.Blocks != 1 || got.Workers != 1 {
+		t.Fatalf("metered read-ahead = %+v, want disabled 1-block/1-worker", got)
+	}
+	if got := p.JuiceFS(); got.BufferSizeMB != 256 || got.Prefetch != 0 {
+		t.Fatalf("metered JuiceFS policy = %+v, want 256 MiB/prefetch 0", got)
 	}
 }

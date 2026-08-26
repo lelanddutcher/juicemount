@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
 func TestJuiceFSChildEnvironmentDropsParentSecrets(t *testing.T) {
@@ -78,6 +80,30 @@ func TestDesktopJuiceFSHeartbeatKeepsSessionForFiveMinutes(t *testing.T) {
 	want := []string{"--heartbeat", "60s", "--max-uploads", "4"}
 	if got := desktopJuiceFSSessionArgs(); !slices.Equal(got, want) {
 		t.Fatalf("desktop session args = %v, want %v", got, want)
+	}
+}
+
+func TestDesktopJuiceFSObjectTimeoutsKeepCellularBlocksViableAndBounded(t *testing.T) {
+	t.Setenv("JM_JFS_OBJECT_TIMEOUTS", "")
+	tests := []struct {
+		class netprofile.LinkClass
+		want  []string
+	}{
+		{netprofile.ClassMetered, []string{"--get-timeout", "3m", "--put-timeout", "5m", "--io-retries", "2"}},
+		{netprofile.ClassSlow, []string{"--get-timeout", "2m", "--put-timeout", "3m", "--io-retries", "3"}},
+		{netprofile.ClassMedium, nil},
+		{netprofile.ClassFast, nil},
+	}
+	for _, tt := range tests {
+		if got := desktopJuiceFSObjectIOArgs(tt.class); !slices.Equal(got, tt.want) {
+			t.Fatalf("object I/O args for %s = %v, want %v", tt.class, got, tt.want)
+		}
+	}
+
+	// Field rollback restores the exact upstream defaults without a rebuild.
+	t.Setenv("JM_JFS_OBJECT_TIMEOUTS", "0")
+	if got := desktopJuiceFSObjectIOArgs(netprofile.ClassMetered); got != nil {
+		t.Fatalf("object timeout rollback args = %v, want nil", got)
 	}
 }
 

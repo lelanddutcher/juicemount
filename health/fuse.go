@@ -101,6 +101,30 @@ func desktopJuiceFSSessionArgs() []string {
 	}
 }
 
+// desktopJuiceFSObjectIOArgs keeps one fixed 4 MiB JuiceFS block viable on a
+// measured cellular path without allowing the upstream default of ten full
+// retries to hold a dirty inode indefinitely. At 1 Mbps a block needs at least
+// 33.6 seconds before protocol overhead, and a contended phone uplink can take
+// materially longer than the upstream 60-second PUT deadline. JuiceMount's
+// durable spool owns retry across attempts, so the filesystem client needs
+// only a small in-session retry budget.
+//
+// Fast and medium links retain upstream defaults. JM_JFS_OBJECT_TIMEOUTS=0 is
+// the field rollback switch for slow/metered overrides.
+func desktopJuiceFSObjectIOArgs(class netprofile.LinkClass) []string {
+	if os.Getenv("JM_JFS_OBJECT_TIMEOUTS") == "0" {
+		return nil
+	}
+	switch class {
+	case netprofile.ClassMetered:
+		return []string{"--get-timeout", "3m", "--put-timeout", "5m", "--io-retries", "2"}
+	case netprofile.ClassSlow:
+		return []string{"--get-timeout", "2m", "--put-timeout", "3m", "--io-retries", "3"}
+	default:
+		return nil
+	}
+}
+
 // desktopJuiceFSReadAheadArgs fixes JuiceFS's immutable per-mount session
 // readahead at the conservative floor.  JuiceMount's NFS readahead controller
 // is the adaptive layer: it changes depth and concurrency live as measured RTT
@@ -566,6 +590,11 @@ func (fm *FUSEManager) Mount() error {
 	args = append(args, desktopJuiceFSMountArgs(
 		fm.cfg.RedisURL, fm.cfg.MountPoint, bufMB, jfp.Prefetch,
 	)...)
+	// The benchmark that selected jfp also determines whether fixed-size object
+	// blocks need cellular-safe deadlines. Append these before starting JuiceFS
+	// so the very first spool drain cannot inherit a guaranteed 60-second PUT
+	// timeout/retry loop.
+	args = append(args, desktopJuiceFSObjectIOArgs(netprofile.Default().Class())...)
 	// A JuiceFS session expires at five heartbeat intervals. The upstream
 	// 12s default therefore lets another always-on client reap this Mac
 	// after only 60s. A cold or cellular S3 PUT can legitimately consume

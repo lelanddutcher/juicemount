@@ -125,6 +125,7 @@ def pick_dirs(root, want):
 # ------------------------------------------------------------------ shaping
 
 _shaped = False
+_offline = False
 
 
 def _unshape():
@@ -163,13 +164,23 @@ def shape(mbit, delay_ms):
 
 
 def set_offline(on):
+    global _offline
     try:
+        # The control-plane contract is query-based (`?on=on|off`). The old
+        # harness POSTed a JSON body that the handler intentionally ignores;
+        # it still received HTTP 200 from the status response and falsely
+        # labelled an online walk "offline". Register cleanup before engaging
+        # so SIGINT/exception cannot strand the user's persisted intent.
+        if on and not _offline:
+            atexit.register(lambda: set_offline(False))
+        state = "on" if on else "off"
         req = urllib.request.Request(
-            CONTROL + "/offline", method="POST",
-            data=json.dumps({"offline": bool(on)}).encode(),
-            headers={"Content-Type": "application/json"})
+            CONTROL + "/offline?on=" + state, method="POST", data=b"")
         with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status == 200
+            ok = r.status == 200
+            if ok:
+                _offline = bool(on)
+            return ok
     except Exception as e:
         print("  offline toggle failed: %s" % e)
         return False
