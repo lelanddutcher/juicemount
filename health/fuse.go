@@ -8,7 +8,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/url"
@@ -176,41 +175,32 @@ func desktopJuiceFSMountArgs(redisURL, mountPoint string, bufferSizeMB, prefetch
 	}
 }
 
-// tailCapture is a concurrency-safe, bounded stderr tail. Startup failures can
-// be verbose, especially with JM_FUSE_VERBOSE enabled; retaining only the tail
-// keeps memory bounded while preserving the final actionable JuiceFS error.
-type tailCapture struct {
-	mu  sync.Mutex
-	max int
-	buf []byte
-}
-
-func newTailCapture(max int) *tailCapture {
-	if max < 1 {
-		max = 1
+// readFileTailSince returns at most max bytes written to path since offset.
+// Directing the long-lived JuiceFS service to a real file descriptor avoids
+// os/exec's hidden pipe-copy goroutines; on a LaunchServices app stderr can be
+// undrained, and a forever-lived MultiWriter pipe eventually backpressures the
+// filesystem daemon itself. Reading the bounded startup tail only on failure
+// preserves actionable errors without putting a pipe in the hot lifecycle.
+func readFileTailSince(path string, offset int64, max int) string {
+	if path == "" || max < 1 {
+		return ""
 	}
-	return &tailCapture{max: max}
-}
-
-func (b *tailCapture) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(p) >= b.max {
-		b.buf = append(b.buf[:0], p[len(p)-b.max:]...)
-		return len(p), nil
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
 	}
-	if overflow := len(b.buf) + len(p) - b.max; overflow > 0 {
-		copy(b.buf, b.buf[overflow:])
-		b.buf = b.buf[:len(b.buf)-overflow]
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() <= offset {
+		return ""
 	}
-	b.buf = append(b.buf, p...)
-	return len(p), nil
-}
-
-func (b *tailCapture) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return string(append([]byte(nil), b.buf...))
+	start := st.Size() - int64(max)
+	if start < offset {
+		start = offset
+	}
+	buf := make([]byte, st.Size()-start)
+	n, _ := f.ReadAt(buf, start)
+	return string(buf[:n])
 }
 
 // FUSEConfig holds JuiceFS mount configuration.
@@ -827,25 +817,32 @@ func (fm *FUSEManager) Mount() error {
 	cmd.Env = juiceFSDirectEnvironment(os.Getpid())
 
 	// Foreground JuiceFS writes to stdout/stderr rather than its background log.
-	// Preserve that operational log so tailJuiceFSLog continues promoting its
-	// warnings, and retain a bounded stderr tail for actionable startup errors.
-	stderrTail := newTailCapture(64 << 10)
-	logWriter := io.Writer(os.Stderr)
+	// Give it a REAL file descriptor, not an io.MultiWriter: os/exec implements
+	// non-file writers with parent-side pipes, which can backpressure a daemon
+	// launched by Finder/LaunchServices when the app's stderr is not drained.
+	// tailJuiceFSLog still promotes warnings; failures read a bounded suffix.
+	logWriter := os.Stderr
 	var juiceFSLog *os.File
+	var juiceFSLogPath string
+	var juiceFSLogOffset int64
 	if home, err := os.UserHomeDir(); err == nil {
 		logDir := filepath.Join(home, ".juicefs")
 		if err := os.MkdirAll(logDir, 0700); err == nil {
 			logPath := filepath.Join(logDir, "juicefs.log")
 			if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); err == nil {
 				juiceFSLog = f
-				logWriter = io.MultiWriter(os.Stderr, f)
+				juiceFSLogPath = logPath
+				if st, err := f.Stat(); err == nil {
+					juiceFSLogOffset = st.Size()
+				}
+				logWriter = f
 			} else {
 				jmlog.Warn("juicefs log open failed; continuing with stderr", "path", logPath, "error", err.Error())
 			}
 		}
 	}
 	cmd.Stdout = logWriter
-	cmd.Stderr = io.MultiWriter(logWriter, stderrTail)
+	cmd.Stderr = logWriter
 	if err := cmd.Start(); err != nil {
 		if juiceFSLog != nil {
 			_ = juiceFSLog.Close()
@@ -868,7 +865,7 @@ func (fm *FUSEManager) Mount() error {
 	if err := fm.waitForMountProcess(fm.mountVerifyTimeout(), processExit); err != nil {
 		_ = cmd.Process.Kill()
 		noteMountFailure()
-		if reason := lastNonEmptyLine(stderrTail.String()); reason != "" {
+		if reason := lastNonEmptyLine(readFileTailSince(juiceFSLogPath, juiceFSLogOffset, 64<<10)); reason != "" {
 			return fmt.Errorf("mount verification: %w: %s", err, reason)
 		}
 		return fmt.Errorf("mount verification: %w", err)

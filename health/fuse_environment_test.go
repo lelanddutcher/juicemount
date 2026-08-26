@@ -1,6 +1,7 @@
 package health
 
 import (
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -57,19 +58,16 @@ func TestDesktopJuiceFSMountArgsNeverStartUpstreamDaemonSupervisor(t *testing.T)
 	}
 }
 
-func TestTailCaptureRetainsBoundedActionableSuffix(t *testing.T) {
-	b := newTailCapture(8)
-	if n, err := b.Write([]byte("progress-")); err != nil || n != 9 {
-		t.Fatalf("first write = (%d, %v), want (9, nil)", n, err)
+func TestReadFileTailSinceRetainsBoundedLaunchSuffix(t *testing.T) {
+	path := t.TempDir() + "/juicefs.log"
+	if err := os.WriteFile(path, []byte("old-progress-fatal"), 0600); err != nil {
+		t.Fatal(err)
 	}
-	if n, err := b.Write([]byte("fatal")); err != nil || n != 5 {
-		t.Fatalf("second write = (%d, %v), want (5, nil)", n, err)
+	if got := readFileTailSince(path, int64(len("old-")), 8); got != "ss-fatal" {
+		t.Fatalf("bounded launch log tail = %q, want %q", got, "ss-fatal")
 	}
-	if got := b.String(); got != "ss-fatal" {
-		t.Fatalf("bounded stderr tail = %q, want %q", got, "ss-fatal")
-	}
-	if len(b.String()) > 8 {
-		t.Fatalf("bounded stderr tail grew past cap: %d", len(b.String()))
+	if got := readFileTailSince(path, int64(len("old-progress-fatal")), 8); got != "" {
+		t.Fatalf("tail at EOF = %q, want empty", got)
 	}
 }
 
