@@ -23,7 +23,11 @@
 #   docker build -f server/juicefarm-gpu/Dockerfile -t juicefarm-gpu:local .
 
 # ----- Stage 1: jmfarm (Go, CGO sqlite, static) -----
+ARG JM_VERSION=0.5.0
+ARG JM_COMMIT=unknown
 FROM golang:1.26.6-bookworm AS gobuild
+ARG JM_VERSION
+ARG JM_COMMIT
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
@@ -32,7 +36,7 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 GOOS=linux go build -tags sqlite_omit_load_extension \
-      -ldflags="-s -w -linkmode external -extldflags '-static'" -o /out/jmfarm ./cmd/jmfarm
+      -ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" -o /out/jmfarm ./cmd/jmfarm
 
 # ----- Stage 2: whisper.cpp with the Vulkan backend -----
 FROM debian:bookworm AS whisper
@@ -67,6 +71,10 @@ FROM juicedata/mount:ce-v1.3.1 AS juicefs
 # ----- Stage 3: runtime (JuiceFS + VAAPI-capable ffmpeg + whisper-vulkan + jmfarm) -----
 FROM debian:trixie-slim
 ARG WHISPER_MODEL=medium.en
+ARG JM_VERSION
+ARG JM_COMMIT
+LABEL org.opencontainers.image.version="${JM_VERSION}" \
+      org.opencontainers.image.revision="${JM_COMMIT}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates fuse3 libgomp1 util-linux \
         libvulkan1 vulkan-tools mesa-vulkan-drivers \

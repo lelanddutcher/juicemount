@@ -8,7 +8,7 @@
   "required": ["app", "version", "contract_version", "instance_id", "volume_name", "mount_point", "control_plane", "deployment", "capabilities"],
   "properties": {
     "app": { "const": "JuiceMount" },
-    "version": { "type": "string", "description": "The public release version string, e.g. \"0.1.0\" (the notarized release / git tag). Sourced from a single version-of-record (JM-6), distinct from contract_version." },
+    "version": { "type": "string", "description": "The public release version string, e.g. \"0.5.0\" (the release / git tag). Sourced from a single version-of-record (JM-6), distinct from contract_version." },
     "contract_version": { "type": "integer", "minimum": 1, "description": "Integer from this repo's VERSION." },
     "instance_id": { "type": "string", "minLength": 1, "description": "Stable per-install UUID, minted once and persisted. The jm_instance half of durable (instance,inode) identity." },
     "volume_name": { "type": "string", "description": "JuiceFS/NFS volume name, e.g. \"zpool\"." },

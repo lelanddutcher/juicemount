@@ -30,10 +30,23 @@ APP_DIR="$BUILD_DIR/JuiceMount.app"
 APP_BIN_DIR="$APP_DIR/Contents/MacOS"
 APP_RES_DIR="$APP_DIR/Contents/Resources"
 SWIFT_PKG="$PROJECT_ROOT/app/JuiceMount"
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+JM_BUILD_VERSION="${JM_VERSION:-0.5.0}"
+if [ -n "${JM_COMMIT:-}" ]; then
+    JM_BUILD_COMMIT="$JM_COMMIT"
+elif git rev-parse --verify HEAD >/dev/null 2>&1; then
+    JM_BUILD_COMMIT="$(git rev-parse HEAD)"
+else
+    JM_BUILD_COMMIT="unknown"
+fi
+GO_VERSION_PACKAGE="github.com/lelanddutcher/juicemount/internal/version"
+GO_BUILD_LDFLAGS="-X ${GO_VERSION_PACKAGE}.Version=${JM_BUILD_VERSION} -X ${GO_VERSION_PACKAGE}.Commit=${JM_BUILD_COMMIT}"
 
 echo "==> JuiceMount Build"
 echo "    config:    $SWIFT_CONFIG"
 echo "    project:   $PROJECT_ROOT"
+echo "    version:   $JM_BUILD_VERSION"
+echo "    commit:    $JM_BUILD_COMMIT"
 echo ""
 
 # 1. Build the Go c-archive
@@ -48,6 +61,7 @@ MACOSX_DEPLOYMENT_TARGET=14.0 \
 CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=14.0" \
 CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=14.0" \
 CGO_ENABLED=1 go build \
+    -ldflags "$GO_BUILD_LDFLAGS" \
     -buildmode=c-archive \
     -o "$BUILD_DIR/libnfsd.a" \
     ./bridge/
@@ -124,6 +138,8 @@ cp "$SWIFT_BIN" "$APP_BIN_DIR/JuiceMount"
 
 # Copy Info.plist
 cp "$SWIFT_PKG/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+"$PLISTBUDDY" -c "Set :CFBundleShortVersionString $JM_BUILD_VERSION" "$APP_DIR/Contents/Info.plist"
+"$PLISTBUDDY" -c "Set :JMBuildCommit $JM_BUILD_COMMIT" "$APP_DIR/Contents/Info.plist"
 
 # --- Icon rendering (Phase 3 identity) -------------------------------------
 # Render the state-tinted citrus mark SVGs to menu-bar PNGs and the AppIcon
@@ -268,7 +284,6 @@ cp "$SWIFT_PKG/Resources/JuiceMountThumbnails-Info.plist" "$APPEX_DIR/Contents/I
 # Keep the appex version in lockstep with the app's (single source of truth:
 # the app Info.plist already copied above) so a release bump can't drift the
 # two apart — mismatched versions are a notarization/App-verify footgun.
-PLISTBUDDY="/usr/libexec/PlistBuddy"
 APP_SHORT_VER="$($PLISTBUDDY -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
 APP_BUNDLE_VER="$($PLISTBUDDY -c 'Print :CFBundleVersion' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
 if [ -n "$APP_SHORT_VER" ]; then
@@ -277,6 +292,7 @@ fi
 if [ -n "$APP_BUNDLE_VER" ]; then
     "$PLISTBUDDY" -c "Set :CFBundleVersion $APP_BUNDLE_VER" "$APPEX_DIR/Contents/Info.plist"
 fi
+"$PLISTBUDDY" -c "Add :JMBuildCommit string $JM_BUILD_COMMIT" "$APPEX_DIR/Contents/Info.plist"
 echo "    Embedded: JuiceMountThumbnails.appex -> Contents/PlugIns/ (v${APP_SHORT_VER:-?})"
 # --- end QuickLook thumbnail appex embed --------------------------------------
 

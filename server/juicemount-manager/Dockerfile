@@ -12,7 +12,11 @@
 # (see docs/INSTALL-TrueNAS.md for the YAML snippet).
 
 # ----- Stage 1: builder -----
+ARG JM_VERSION=0.5.0
+ARG JM_COMMIT=unknown
 FROM golang:1.26.6-alpine AS builder
+ARG JM_VERSION
+ARG JM_COMMIT
 
 WORKDIR /src
 
@@ -27,12 +31,16 @@ COPY . .
 # No cache mounts — stale Go build cache served old binaries even with
 # --no-cache (BuildKit cache mounts persist independently of layer cache).
 RUN CGO_ENABLED=0 GOOS=linux \
-    go build -ldflags="-s -w" \
+    go build -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
       -o /out/juicemount-manager ./cmd/juicemount-manager
 
 # ----- Stage 2: runtime -----
 # juicedata/mount gives us /usr/local/bin/juicefs for the sync subprocess.
 FROM juicedata/mount:ce-v1.3.1
+ARG JM_VERSION
+ARG JM_COMMIT
+LABEL org.opencontainers.image.version="${JM_VERSION}" \
+      org.opencontainers.image.revision="${JM_COMMIT}"
 
 # Headscale (Tier-2 Link): fetched at build time so the manager can
 # supervise it as a child process — one container, one deploy. Pinned

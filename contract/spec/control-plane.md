@@ -58,8 +58,8 @@ Fixture: [`../fixtures/whoami/gui.json`](../fixtures/whoami/gui.json),
 ```json
 {
   "app": "JuiceMount",
-  "version": "0.1.0",
-  "contract_version": 1,
+  "version": "0.5.0",
+  "contract_version": 2,
   "instance_id": "5C7E0E2A-…",
   "volume_name": "zpool",
   "mount_point": "/Volumes/zpool",
@@ -67,6 +67,7 @@ Fixture: [`../fixtures/whoami/gui.json`](../fixtures/whoami/gui.json),
   "control_plane": "http://127.0.0.1:11050",
   "metadata_db_path": "/Users/leland/Library/Application Support/JuiceMount/metadata.db",
   "deployment": "gui",
+  "wire_terms": "logger/1",
   "capabilities": ["health","whoami","residency","lookup","cache-status","offline","spool","pin","unpin","self-test","verify-pins","metrics"]
 }
 ```
@@ -74,9 +75,9 @@ Fixture: [`../fixtures/whoami/gui.json`](../fixtures/whoami/gui.json),
 - `instance_id`: a **stable per-install UUID** JuiceMount mints once and persists (e.g. in Preferences).
   It is the `jm_instance` half of OpenLoupe's durable `(instance, inode)` identity — so an asset survives a
   remount and is shareable across machines that mount the same volume. See [`identity.md`](identity.md).
-- `version`: the **public release version** string (currently `0.1.0` — the notarized release + only git
-  tag). Source it from a single version-of-record (a Go const set by the release process); reconcile the
-  stale Info.plist marketing string (`2.0.0`) down to match. Distinct from `contract_version`.
+- `version`: the **public release version** string (currently `0.5.0` — the release candidate + git
+  tag). Source it from a single version-of-record injected by the release build; Info.plist must match.
+  Distinct from `contract_version`.
 - `contract_version`: integer from this repo's `VERSION`.
 - `nas_root`: today equal to `mount_point` (paths are mount-anchored); a distinct field so it can diverge.
 - `capabilities`: the **only** correct way to feature-detect. **Derived, never hardcoded** (see
@@ -239,9 +240,9 @@ clean choice and is filed as JM-3 high.)
   so nobody greps the wrong file. Served by **both** the GUI and `jm5`.
 - **The cbridge control-plane route table is at `bridge/cbridge.go:733-789`** on main (the new `/whoami`,
   `/residency`, `/lookup` handlers register there).
-- **No version field exists** in any response and there is no Go version constant — exactly why JM-1
-  `/whoami` matters. (Info.plist marketing version is `2.0.0`; the public/notarized release tag is `v0.1.0`
-  — see [`../HANDOFF_JUICEMOUNT.md`](../HANDOFF_JUICEMOUNT.md) for the version-of-record decision.)
+- **`/whoami` is the public version surface.** Info.plist and the public release version are `0.5.0`;
+  release artifacts also embed the immutable source commit outside this strict wire schema. See
+  [`../HANDOFF_JUICEMOUNT.md`](../HANDOFF_JUICEMOUNT.md) for the version-of-record decision.
 - **No `nas_rel_path` column exists.** Paths are mount-anchored; `nas_rel_path` is *defined* by this contract
   as `path − mount_point` and must be computed.
 - Detection signature `isOurNFSMount` (`bridge/cbridge.go:1803`) is source prefix `127.0.0.1` / `localhost`

@@ -38,11 +38,11 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/manager"
+	"github.com/lelanddutcher/juicemount/internal/version"
 )
 
-var version = "dev"
-
 func main() {
+	buildInfo := flag.Bool("build-info", false, "print release version and source commit, then exit")
 	addr := flag.String("listen", "0.0.0.0:8080", "HTTP listen address")
 	juicefsBin := flag.String("juicefs", "juicefs", "Path to juicefs binary (or just 'juicefs' for PATH lookup)")
 	fuseMount := flag.String("fuse-mount", "", "If set: embedded-mode FUSE mount path (writes via file:///<fuse-mount>/<path>). Mutually exclusive with --meta.")
@@ -57,6 +57,10 @@ func main() {
 	mountOwner := flag.String("mount-owner", envOr("JM_MOUNT_OWNER", ""), "POSIX owner (uid[:gid], e.g. 501:20) that migrated data is chowned to after an embedded-mode sync, so the CLIENT mounting the volume can WRITE it — not just read it. The manager runs as root on the NAS, so without this, `juicefs sync` leaves migrated files root:wheel and a uid-501 Mac client can only read them. Empty = leave raw sync ownership. Set to the uid your Mac client mounts as (usually 501:20).")
 	overviewMeta := flag.String("overview-meta", envOr("JM_OVERVIEW_META", ""), "Redis URL for the Overview tab's `juicefs status` + Redis INFO probes. Use this in EMBEDDED mode (--fuse-mount), where --meta is unavailable (mutually exclusive), so Overview still works. In standalone mode --meta already serves both and this can stay empty.")
 	flag.Parse()
+	if *buildInfo {
+		fmt.Printf("juicemount-manager %s (%s)\n", version.Version, version.Commit)
+		return
+	}
 
 	roots := splitNonEmpty(*sourceRoots, ",")
 	if len(roots) == 0 {
@@ -133,7 +137,7 @@ func main() {
 	if *fuseMount != "" {
 		mode = "embedded (file://)"
 	}
-	log.Printf("juicemount-manager %s starting on %s [mode: %s]", version, *addr, mode)
+	log.Printf("juicemount-manager %s (%s) starting on %s [mode: %s]", version.Version, version.Commit, *addr, mode)
 	log.Printf("  juicefs:      %s", *juicefsBin)
 	if *fuseMount != "" {
 		log.Printf("  fuse-mount:   %s", *fuseMount)

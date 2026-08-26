@@ -1,6 +1,6 @@
 {
   "app": "JuiceMount",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "contract_version": 2,
   "instance_id": "A1B2C3D4-0000-4E6D-8F2A-0C110C110C11",
   "volume_name": "zpool",

@@ -58,6 +58,7 @@ func splitNonEmpty(s, sep string) []string {
 }
 
 func main() {
+	buildInfo := flag.Bool("build-info", false, "print release version and source commit, then exit")
 	redisURL := flag.String("redis", "redis://127.0.0.1:6379/1", "Redis URL")
 	fusePath := flag.String("fuse-path", "", "Path to JuiceFS FUSE mount (auto-detected if empty)")
 	mountPoint := flag.String("mount", "/Volumes/zpool", "Mount point for NFS volume")
@@ -83,6 +84,10 @@ func main() {
 	migratorSourceRoots := flag.String("migrator-source-roots", "", "DEPRECATED: alias for --manager-source-roots, kept for one-release compat.")
 	migratorAdminKey := flag.String("migrator-admin-key", "", "DEPRECATED: alias for --manager-admin-key, kept for one-release compat.")
 	flag.Parse()
+	if *buildInfo {
+		fmt.Printf("jm5 %s (%s)\n", version.Version, version.Commit)
+		return
+	}
 
 	// Initialize structured logging before anything else logs.
 	if err := jmlog.Init(jmlog.Config{
@@ -107,6 +112,8 @@ func main() {
 	cleanupStaleSession(*mountPoint, *listenAddr)
 
 	jmlog.Info("starting JuiceMount5",
+		"version", version.Version,
+		"commit", version.Commit,
 		"redis", *redisURL,
 		"fuse", *fusePath,
 		"mount", *mountPoint,

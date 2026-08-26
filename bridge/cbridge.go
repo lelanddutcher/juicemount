@@ -608,6 +608,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	}); err != nil {
 		return C.CString(fmt.Sprintf("error: init logger: %v", err))
 	}
+	jmlog.Info("JuiceMount build", "version", version.Version, "commit", version.Commit)
 
 	// F1 (cellular): the control plane starts FIRST — before FUSE, Redis,
 	// sync, pin store, spool, or mount. The menu bar's truth and the pprof

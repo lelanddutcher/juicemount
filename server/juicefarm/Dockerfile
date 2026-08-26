@@ -11,7 +11,11 @@
 # then run additively on the ix-juicemount network (see server/docker-compose.yml).
 
 # ----- Stage 1: jmfarm (Go, CGO for SQLite) -----
+ARG JM_VERSION=0.5.0
+ARG JM_COMMIT=unknown
 FROM golang:1.26.6-bookworm AS gobuild
+ARG JM_VERSION
+ARG JM_COMMIT
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
@@ -22,7 +26,7 @@ COPY . .
 # the juicedata/mount runtime ships an older glibc than the bookworm builder.
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 GOOS=linux go build -tags sqlite_omit_load_extension \
-      -ldflags="-s -w -linkmode external -extldflags '-static'" -o /out/jmfarm ./cmd/jmfarm
+      -ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" -o /out/jmfarm ./cmd/jmfarm
 
 # ----- Stage 2: whisper.cpp (whisper-cli) + the ggml model -----
 # Bullseye matches the juicedata/mount runtime's glibc 2.31 + libstdc++, so
@@ -55,6 +59,10 @@ RUN cd /w && bash ./models/download-ggml-model.sh ${WHISPER_MODEL} \
 # juicedata/mount gives /usr/local/bin/juicefs for the in-container FUSE mount.
 FROM juicedata/mount:ce-v1.3.1
 ARG WHISPER_MODEL=medium.en
+ARG JM_VERSION
+ARG JM_COMMIT
+LABEL org.opencontainers.image.version="${JM_VERSION}" \
+      org.opencontainers.image.revision="${JM_COMMIT}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates libgomp1 util-linux \
     && rm -rf /var/lib/apt/lists/*

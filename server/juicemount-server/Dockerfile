@@ -21,7 +21,11 @@
 #     -p 2049:2049 -p 11050:11050 jm-server:dev
 
 # ----- Stage 1: builder -----
+ARG JM_VERSION=0.5.0
+ARG JM_COMMIT=unknown
 FROM golang:1.26.6-alpine AS builder
+ARG JM_VERSION
+ARG JM_COMMIT
 
 WORKDIR /src
 
@@ -44,7 +48,7 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-s -w" -o /out/jm5 ./cmd/jm5
+    go build -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" -o /out/jm5 ./cmd/jm5
 
 # ----- Stage 2: runtime -----
 # Pin to a specific JuiceFS release for CI reproducibility. JuiceFS
@@ -52,6 +56,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # replaced by `ce-v1.3.1` (Community Edition prefix). Bump intentionally
 # on each release rather than tracking `latest`.
 FROM juicedata/mount:ce-v1.3.1
+ARG JM_VERSION
+ARG JM_COMMIT
+LABEL org.opencontainers.image.version="${JM_VERSION}" \
+      org.opencontainers.image.revision="${JM_COMMIT}"
 
 # Tools the entrypoint needs: curl for healthcheck, ca-certificates
 # for any future S3 over HTTPS. The juicedata/mount:ce-v1.3.1 base

@@ -40,6 +40,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/internal/farmqueue"
+	buildversion "github.com/lelanddutcher/juicemount/internal/version"
 )
 
 // mediaExts are the file types we probe. Extension gate is a cheap pre-filter;
@@ -303,6 +304,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 
 func main() {
 	var (
+		buildInfo  = flag.Bool("build-info", false, "print release version and source commit, then exit")
 		dbPath     = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
 		root       = flag.String("root", "", "directory to walk for media (required unless -files)")
 		files      = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
@@ -377,6 +379,10 @@ func main() {
 		wDevice = flag.String("transcript-device", defaultStr(os.Getenv("JM_FARM_TRANSCRIPT_DEVICE"), "cpu"), "whisper.cpp compute device: cpu|vulkan|cuda|sycl")
 	)
 	flag.Parse()
+	if *buildInfo {
+		fmt.Printf("jmfarm %s (%s)\n", buildversion.Version, buildversion.Commit)
+		return
+	}
 
 	// JM-15 reconcile mode: walk the volume sidecars → local db, then exit. The
 	// running app serves the same db (WAL), so reconciled rows appear live.
