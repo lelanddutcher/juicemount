@@ -34,9 +34,8 @@ func TestUnknownDefaultsToMedium(t *testing.T) {
 		t.Fatalf("no-signal class = %v, want medium (unchanged behavior)", c)
 	}
 	ra := p.Readahead()
-	// Medium must equal the historical hard-coded defaults exactly.
-	if ra.SeqThreshold != 3 || ra.Blocks != 8 || ra.Workers != 4 || !ra.Enabled {
-		t.Fatalf("medium policy %+v != historical default {Enabled:true Seq:3 Blocks:8 Workers:4}", ra)
+	if ra.SeqThreshold != 3 || ra.Blocks != 4 || ra.Workers != 2 || !ra.Enabled {
+		t.Fatalf("medium policy %+v != bounded live default {Enabled:true Seq:3 Blocks:4 Workers:2}", ra)
 	}
 }
 
@@ -105,14 +104,14 @@ func TestRTTBootstrapBeforeBandwidth(t *testing.T) {
 	}
 }
 
-func TestBandwidthOverridesRTTBootstrap(t *testing.T) {
-	// A 56ms-RTT link that turns out to be high-bandwidth should reclassify up
-	// once throughput samples arrive (RTT bootstrap was only a placeholder).
+func TestLatencyCapsFatFarLink(t *testing.T) {
+	// A fat 56ms link is still far: bandwidth must not buy the LAN readahead
+	// path when every metadata/open round trip already dominates responsiveness.
 	p := New()
-	p.ObserveRTT(56 * time.Millisecond) // would bootstrap to slow
-	sampleFor(p, 300*1024*1024, 8)      // but it's actually fast
-	if c := p.Class(); c != ClassFast {
-		t.Fatalf("high-bw 56ms link → %v, want fast (bw overrides rtt bootstrap)", c)
+	p.ObserveRTT(56 * time.Millisecond)
+	sampleFor(p, 300*1024*1024, 8)
+	if c := p.Class(); c != ClassSlow {
+		t.Fatalf("high-bw 56ms link → %v, want slow (latency ceiling must win)", c)
 	}
 	if p.Snapshot().BootstrappedRTT {
 		t.Fatal("BootstrappedRTT should be false once bandwidth is known")
@@ -144,10 +143,10 @@ func TestTinySamplesIgnored(t *testing.T) {
 }
 
 func TestJuiceFSPolicyByClass(t *testing.T) {
-	// medium (no signal) == historical mount defaults exactly.
+	// Medium uses a large write buffer but transition-safe immutable prefetch.
 	med := New().JuiceFS()
-	if med.BufferSizeMB != 4096 || med.Prefetch != 3 {
-		t.Fatalf("medium juicefs policy %+v != historical {4096,3}", med)
+	if med.BufferSizeMB != 4096 || med.Prefetch != 1 {
+		t.Fatalf("medium juicefs policy %+v != transition-safe {4096,1}", med)
 	}
 	// metered: prefetch off, buffer still >= a single media file.
 	metered := New()
@@ -159,12 +158,19 @@ func TestJuiceFSPolicyByClass(t *testing.T) {
 	if mp.BufferSizeMB < 256 {
 		t.Fatalf("metered buffer %d MB too small to absorb a single media write", mp.BufferSizeMB)
 	}
-	// fast: wider prefetch than medium to fill the pipe.
+	// Fast keeps the same immutable floor; live server readahead scales up.
 	fast := New()
 	sampleFor(fast, 800*1024*1024, 8)
 	fp := fast.JuiceFS()
-	if fp.Prefetch <= med.Prefetch {
-		t.Fatalf("fast prefetch %d must exceed medium %d (fill 10GbE)", fp.Prefetch, med.Prefetch)
+	if fp.Prefetch != med.Prefetch || fp.Prefetch != 1 {
+		t.Fatalf("fast/medium mount prefetch must stay transition-safe: fast=%d medium=%d", fp.Prefetch, med.Prefetch)
+	}
+	for _, c := range []LinkClass{ClassMetered, ClassSlow, ClassMedium, ClassFast} {
+		p := New()
+		p.ForceClass(&c)
+		if got := p.NFSReadahead(); got != 2 {
+			t.Fatalf("class %s NFS readahead=%d, want immutable handoff-safe floor 2", c, got)
+		}
 	}
 }
 

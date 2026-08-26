@@ -82,6 +82,27 @@ func TestLatencyCeiling_Hysteresis(t *testing.T) {
 	}
 }
 
+// A Mac can accumulate a near-LAN EWMA for hours, then hand off to a phone.
+// The first far sample must clamp immediately rather than waiting many 2s
+// probe periods for the smoothed average to climb past the threshold.
+func TestLatencyCeiling_HandoffClampsOnFirstFarSample(t *testing.T) {
+	p := New()
+	for i := 0; i < 20; i++ {
+		p.ObserveRTT(time.Millisecond)
+	}
+	p.mu.Lock()
+	p.bwBps = 512 * 1024 * 1024
+	p.haveBW = true
+	p.mu.Unlock()
+	if got := p.Class(); got != ClassFast {
+		t.Fatalf("precondition: near fat link class=%v, want fast", got)
+	}
+	p.ObserveRTT(80 * time.Millisecond)
+	if got := p.Class(); got != ClassSlow {
+		t.Fatalf("first 80ms handoff sample class=%v, want immediate slow clamp", got)
+	}
+}
+
 // Metered is already stricter than Slow and must not be relaxed UP to Slow by
 // the ceiling — the ceiling only ever downgrades.
 func TestLatencyCeiling_NeverRelaxesMetered(t *testing.T) {

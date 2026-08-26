@@ -55,10 +55,10 @@ func (c LinkClass) String() string {
 	}
 }
 
-// ReadaheadPolicy is the concrete knob set the ReadaheadManager consumes. Values
-// are chosen so ClassMedium == the historical hard-coded defaults (no LAN
-// regression), ClassFast is strictly MORE aggressive (chase 10GbE), and the slow
-// classes strictly LESS (stop the WAN whole-file over-fetch).
+// ReadaheadPolicy is the concrete knob set the live ReadaheadManager consumes.
+// This is the one layer that may scale up after mount: unlike JuiceFS and the
+// kernel NFS client, it can react to every RTT/throughput reclassification
+// without tearing down Finder's open handles.
 type ReadaheadPolicy struct {
 	Enabled      bool // false → suppress our server-side readahead entirely (metered)
 	SeqThreshold int  // consecutive sequential reads before triggering
@@ -66,13 +66,11 @@ type ReadaheadPolicy struct {
 	Workers      int  // max concurrent prefetch goroutines
 }
 
-// JuiceFSPolicy is the link-aware juicefs MOUNT-time flag set. These are the
-// DOMINANT prefetchers (validated 2026-06-15: with our server readahead capped
-// at 2 blocks a cold 4 KB read still pulled the whole 64 MB file — juicefs's own
-// sequential readahead, driven by --buffer-size + --prefetch, did it). Because
-// they're mount flags they can only change on a (re)mount; the bridge picks them
-// from a one-shot RTT probe at mount time. ClassMedium == the historical mount
-// defaults exactly, so a normal LAN mount is unchanged.
+// JuiceFSPolicy is the juicefs MOUNT-time flag set. These are dominant
+// prefetchers (validated 2026-06-15: with server readahead capped at 2 blocks,
+// a cold 4 KB read still pulled a whole 64 MB file). Because the flags can only
+// change on a disruptive remount, read prefetch is intentionally conservative
+// for every startup class; only the live server layer scales upward.
 //
 // Note --buffer-size also backs write-burst absorption, but writes land on the
 // SPOOL first and durability is independent of it (writeback is off), so a
@@ -83,7 +81,11 @@ type JuiceFSPolicy struct {
 	Prefetch     int // --prefetch (concurrent blocks)
 }
 
-// JuiceFS maps the current link class to mount-time prefetch flags.
+// JuiceFS maps the startup link class to mount-time flags. JuiceFS cannot
+// safely retune these after a handoff without a disruptive FUSE remount, so
+// prefetch stays at a transition-safe floor for every non-metered class. The
+// live server ReadaheadManager is solely responsible for scaling up on a
+// measured fast link.
 func (p *Profile) JuiceFS() JuiceFSPolicy {
 	switch p.Class() {
 	case ClassMetered:
@@ -103,35 +105,27 @@ func (p *Profile) JuiceFS() JuiceFSPolicy {
 		// negligible throughput cost on a 3-30 MB/s link (see ClassMetered).
 		return JuiceFSPolicy{BufferSizeMB: 512, Prefetch: 1}
 	case ClassFast:
-		// 10GbE: keep the big buffer and widen concurrent prefetch to keep more
-		// 4 MB blocks in flight to MinIO (addresses the ~3-of-10 Gbit/s starve).
-		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 8}
-	default: // ClassMedium — the historical mount defaults
-		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 3}
+		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 1}
+	default: // Medium: large write buffer, conservative immutable prefetch floor
+		return JuiceFSPolicy{BufferSizeMB: 4096, Prefetch: 1}
 	}
 }
 
-// NFSReadahead returns the macOS NFS-client `readahead` mount option for the
-// current link. This is the prefetcher that turns a single small touch into a
+// NFSReadahead returns the macOS NFS-client `readahead` mount option. This is
+// the prefetcher that turns a single small touch into a
 // sequential burst (16 × rsize) which juicefs then extends to a whole-file pull
 // (validated 2026-06-15: juicefs --buffer-size/--prefetch alone did NOT cap it;
 // the client-side fan-out is what triggers juicefs's sequential readahead).
 //
-// We only ever LOWER it from the default 16 — never raise it — because 16 is the
-// concurrent-read-TRUNCATION mitigation (#18/#19, the bug appeared at 128). A
-// smaller value is strictly safer for that bug AND shrinks the amplification, so
-// metered/slow are pure wins; medium/fast keep the validated 16 (10GbE throughput
-// comes from juicefs-side concurrency, not client readahead — not worth the
-// truncation risk of raising it). Mount-time only.
+// Mount options cannot be changed safely after a Wi-Fi→cellular handoff without
+// unmounting Finder. Therefore this layer is deliberately fixed at the metered-
+// safe floor for EVERY startup class. The live server ReadaheadManager scales up
+// on a measured fast link; the kernel layer never retains a LAN-sized burst after
+// a handoff. A smaller value is also strictly safer for the concurrent-read
+// truncation family (#18/#19, originally observed at 128).
 func (p *Profile) NFSReadahead() int {
-	switch p.Class() {
-	case ClassMetered:
-		return 2
-	case ClassSlow:
-		return 4
-	default: // medium + fast: keep the truncation-validated default
-		return 16
-	}
+	_ = p
+	return 2
 }
 
 // Snapshot is an immutable read of the profile for metrics/observability.
@@ -152,13 +146,12 @@ var (
 	thrFastBps    = 200.0 * 1024 * 1024 // >= → fast; between slow & fast → medium
 
 	// Latency thresholds for the high-latency ceiling, with hysteresis so a
-	// jittery link cannot flap the class. Enter at 150ms, leave at 100ms.
-	// Sized from a measured Tailscale-over-cellular link (RTT 105-349ms,
-	// smoothed ~105-156ms): comfortably above good Wi-Fi/WAN (sub-20ms) and
-	// below the cellular band, with a 50ms dead zone wider than the observed
-	// smoothed swing. LAN links (sub-ms) never come near it.
-	rttHighEnter = 150 * time.Millisecond
-	rttHighExit  = 100 * time.Millisecond
+	// jittery link cannot flap the class. Above 40ms, round trips—not headline
+	// bandwidth—already dominate Finder metadata/open latency, so the link may
+	// not retain the LAN/medium prefetch path. Clear only after smoothed RTT is
+	// back below 20ms. LAN and normal local Wi-Fi remain comfortably below it.
+	rttHighEnter = 40 * time.Millisecond
+	rttHighExit  = 20 * time.Millisecond
 )
 
 // Profile is the concurrency-safe link estimator. The zero value is not usable;
@@ -300,6 +293,13 @@ func (p *Profile) ObserveRTT(sample time.Duration) {
 	p.rttvar += (diff - p.rttvar) / 4
 	p.rtt += (sample - p.rtt) / 8
 	p.updateHighLatencyLocked()
+	// Handoff fast-path: EWMA is intentionally stable, but stability is the wrong
+	// direction on a LAN→cellular transition. One real far-link probe must clamp
+	// speculative reads immediately; otherwise an old 1ms average can take many
+	// probe periods to cross the ceiling while Finder keeps the LAN policy.
+	if sample >= rttHighEnter {
+		p.highLatency = true
+	}
 }
 
 // updateHighLatencyLocked maintains the hysteretic high-latency flag. Caller
@@ -493,8 +493,8 @@ func (p *Profile) Readahead() ReadaheadPolicy {
 		// 10GbE / LAN: go deep + wide to keep enough 4 MB blocks in flight to
 		// MinIO to actually fill the pipe (addresses the ~3 Gbit/s-of-10 starve).
 		return ReadaheadPolicy{Enabled: true, SeqThreshold: 2, Blocks: 16, Workers: 8}
-	default: // ClassMedium — the historical hard-coded defaults
-		return ReadaheadPolicy{Enabled: true, SeqThreshold: 3, Blocks: 8, Workers: 4}
+	default: // ClassMedium — bounded; Fast alone earns the deep/wide path
+		return ReadaheadPolicy{Enabled: true, SeqThreshold: 3, Blocks: 4, Workers: 2}
 	}
 }
 
@@ -513,7 +513,6 @@ func (p *Profile) Snapshot() Snapshot {
 		BootstrappedRTT: boot,
 	}
 }
-
 
 // latencyCeilingEnabled reports whether the RTT ceiling may downgrade a
 // bandwidth-derived class. Default ON; JM_NET_LATENCY_CEILING=0 restores
