@@ -113,6 +113,42 @@ func TestWatchPerTickCapAndCarryover(t *testing.T) {
 	}
 }
 
+func TestWatchResolvesSettledInodesConcurrently(t *testing.T) {
+	started := make(chan uint64, 4)
+	release := make(chan struct{})
+	w := NewWatcher(WatchConfig{
+		Resolve: func(_ context.Context, ino uint64) (string, bool) {
+			started <- ino
+			<-release
+			return fmt.Sprintf("dir%d", ino), true
+		},
+		Enqueue:        func(context.Context, string) error { return nil },
+		Settle:         time.Second,
+		Tick:           time.Second,
+		MaxPerTick:     4,
+		ResolveWorkers: 4,
+	})
+	t0 := time.Now()
+	for ino := uint64(10); ino < 14; ino++ {
+		w.Note(ino, t0)
+	}
+
+	done := make(chan int, 1)
+	go func() { done <- w.Tick(context.Background(), t0.Add(2*time.Second)) }()
+	for i := 0; i < 4; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("settled inode lookups did not run concurrently")
+		}
+	}
+	close(release)
+	if got := <-done; got != 4 {
+		t.Fatalf("enqueued %d concurrently resolved targets, want 4", got)
+	}
+}
+
 func TestWatchDedupeTTL(t *testing.T) {
 	w, got := testWatcher(map[uint64]string{42: "clips/reel1"}, 200)
 	t0 := time.Now()

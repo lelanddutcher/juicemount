@@ -122,6 +122,19 @@ func TestVideoCostUsesDecodeAndMountMeasurements(t *testing.T) {
 	}
 }
 
+func TestVideoCostPenalizesObservedFailures(t *testing.T) {
+	reliable := Worker{ID: "reliable", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 200, DecodeFPS: 200, AccessMBps: 500,
+			ProxyFilesProcessed: 20}}
+	flaky := Worker{ID: "flaky", Role: QueueClassRender, Encoders: []string{"hevc_qsv"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 220, DecodeFPS: 220, AccessMBps: 500,
+			ProxyFilesProcessed: 15, ProxyFilesFailed: 5}}
+	selected, _, ok := preferredHardwareWorkerWithLoad([]Worker{flaky, reliable}, nil)
+	if !ok || selected.ID != reliable.ID {
+		t.Fatalf("reliability-aware selection = %q/%v, want reliable", selected.ID, ok)
+	}
+}
+
 func TestTranscriptPreferenceUsesObservedSpeed(t *testing.T) {
 	workers := []Worker{
 		{ID: "slow", Role: QueueClassRender, TranscriptBackends: []string{"cpu", "vulkan"}, Benchmarks: WorkerBenchmarks{TranscriptXReal: 2}},

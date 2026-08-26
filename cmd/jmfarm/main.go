@@ -960,15 +960,13 @@ func runQueue(cfg queueConfig) {
 			// recover it after this heartbeat expires.
 			break
 		}
-		fallback := worker.Role == farmqueue.QueueClassRender && job.Attempts < 1 &&
-			(runErr != nil || (failed > 0 && processed == 0))
-		if fallback {
-			reason := "render backend failed; queued explicit CPU/H.264 fallback"
-			if runErr != nil {
-				reason = runErr.Error()
-			}
-			if err := q.RequeueClaim(context.Background(), claim, true, reason); err != nil {
-				fmt.Fprintf(os.Stderr, "jmfarm queue: fallback requeue %s: %v\n", job.ID, err)
+		if requeue, fallbackCPU, reason := renderFailureDisposition(worker, job, runErr); requeue {
+			if err := q.RequeueClaim(context.Background(), claim, fallbackCPU, reason); err != nil {
+				// The durable receipt is still intact. Stop this worker so its
+				// heartbeat expires and another worker's reaper can recover it;
+				// continuing while we still own the claim would strand the job.
+				fmt.Fprintf(os.Stderr, "jmfarm queue: failure requeue %s: %v; stopping with durable claim intact\n", job.ID, err)
+				return
 			}
 			continue
 		}
@@ -1011,6 +1009,8 @@ func recordCompletedJobBenchmark(worker *farmqueue.Worker, job farmqueue.Job, pr
 	seconds := elapsed.Seconds()
 	worker.Benchmarks.LastJobSeconds = seconds
 	worker.Benchmarks.JobsCompleted++
+	worker.Benchmarks.FilesProcessed += int64(processed)
+	worker.Benchmarks.FilesFailed += int64(failed)
 	if len(job.Kinds) != 1 {
 		return
 	}
@@ -1018,9 +1018,13 @@ func recordCompletedJobBenchmark(worker *farmqueue.Worker, job farmqueue.Job, pr
 	case farmqueue.KindProxy:
 		worker.Benchmarks.LastProxySeconds = seconds
 		worker.Benchmarks.ProxyJobsCompleted++
+		worker.Benchmarks.ProxyFilesProcessed += int64(processed)
+		worker.Benchmarks.ProxyFilesFailed += int64(failed)
 	case farmqueue.KindTranscript:
 		worker.Benchmarks.LastTranscriptSeconds = seconds
 		worker.Benchmarks.TranscriptJobsCompleted++
+		worker.Benchmarks.TranscriptFilesProcessed += int64(processed)
+		worker.Benchmarks.TranscriptFilesFailed += int64(failed)
 	}
 }
 
@@ -1158,10 +1162,37 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		processed += pr
 		failed += pf
 	}
-	if failed > 0 && processed == 0 {
-		return processed, failed, fmt.Errorf("all %d media operations failed; inspect worker logs for the per-file errors", failed)
+	if failed > 0 {
+		return processed, failed, passFailure(processed, failed)
 	}
 	return processed, failed, nil
+}
+
+const renderHardwareRetries = 1
+
+// renderFailureDisposition keeps CPU fallback visible and deliberate. A
+// transient accelerator admission failure first gets one newly routed hardware
+// retry (which may select another live GPU); only a repeated hardware failure is
+// demoted to the server's CPU/H.264 lane. Successful files are protected by the
+// freshness gate, so retrying a partially successful batch only recomputes the
+// files that did not publish a valid proxy.
+func renderFailureDisposition(worker farmqueue.Worker, job farmqueue.Job, runErr error) (requeue, fallbackCPU bool, reason string) {
+	if worker.Role != farmqueue.QueueClassRender || runErr == nil {
+		return false, false, ""
+	}
+	if job.Attempts < renderHardwareRetries {
+		return true, false, fmt.Sprintf("render backend failed; retrying on a verified hardware worker: %v", runErr)
+	}
+	return true, true, fmt.Sprintf("render backend failed after %d hardware retries; queued explicit CPU/H.264 fallback: %v",
+		renderHardwareRetries, runErr)
+}
+
+func passFailure(processed, failed int) error {
+	if failed <= 0 {
+		return nil
+	}
+	return fmt.Errorf("%d of %d media operations failed; inspect worker logs for the per-file errors",
+		failed, processed+failed)
 }
 
 // defaultStr returns s if non-empty, otherwise fallback (env-fallback flag

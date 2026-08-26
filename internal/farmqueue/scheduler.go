@@ -193,6 +193,22 @@ func workerQueueCost(w Worker, kind string, queued int) float64 {
 	} else {
 		seconds *= 2
 	}
+
+	// Synthetic speed alone can make a flaky accelerator look attractive. Fold
+	// observed file-level reliability into the same measured cost so a slightly
+	// slower node that consistently publishes valid output wins over a fast node
+	// that repeatedly fails admissions or encodes. Unknown history is neutral.
+	processed, failed := w.Benchmarks.FilesProcessed, w.Benchmarks.FilesFailed
+	switch kind {
+	case KindProxy:
+		processed, failed = w.Benchmarks.ProxyFilesProcessed, w.Benchmarks.ProxyFilesFailed
+	case KindTranscript:
+		processed, failed = w.Benchmarks.TranscriptFilesProcessed, w.Benchmarks.TranscriptFilesFailed
+	}
+	if attempted := processed + failed; attempted > 0 && failed > 0 {
+		failureRate := float64(failed) / float64(attempted)
+		seconds *= 1 + 4*failureRate
+	}
 	return float64(queued+1) * seconds
 }
 

@@ -246,7 +246,9 @@ func (c *Client) RequeueClaim(ctx context.Context, claim Claim, fallbackCPU bool
 	target := QueueKeyFor(&job)
 	processingKey := ProcessingPrefix + claim.WorkerID
 	const script = `
-redis.call('LREM', KEYS[1], 1, ARGV[1])
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+  return 0
+end
 redis.call('LPUSH', KEYS[2], ARGV[2])
 redis.call('ZREM', KEYS[3], ARGV[3])
 redis.call('HSET', KEYS[4],
@@ -257,15 +259,23 @@ if redis.call('LLEN', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[5], ARGV[9])
 end
 return 1`
-	return c.rdb.Eval(ctx, script, []string{
+	n, err := c.rdb.Eval(ctx, script, []string{
 		processingKey, target, LeaseIndexKey, JobHashPrefix + job.ID, ProcessingIndexKey,
 	}, claim.Raw, string(raw), job.ID, job.SelectedBackend, job.SelectedWorker, job.QueueClass,
-		strconv.Itoa(job.Attempts), reason, claim.WorkerID).Err()
+		strconv.Itoa(job.Attempts), reason, claim.WorkerID).Int()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("claim %s is no longer owned by worker %s", job.ID, claim.WorkerID)
+	}
+	return nil
 }
 
 // RecoverAbandonedWorkers requeues every durable claim owned by a worker whose
-// heartbeat expired. Render work is deliberately demoted to the CPU fallback
-// lane; this is the visible, auditable HEVC/H.264 failover boundary.
+// heartbeat expired. Routing is recomputed against current measured worker
+// profiles: another verified render node wins, while CPU/H.264 is used only
+// when no suitable accelerator remains online.
 func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 	workers, err := c.rdb.SMembers(ctx, ProcessingIndexKey).Result()
 	if err != nil {
@@ -282,51 +292,42 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 		if err != nil || !got {
 			continue
 		}
-		const script = `
-local raws = redis.call('LRANGE', KEYS[1], 0, -1)
-for _, raw in ipairs(raws) do
-  local ok, job = pcall(cjson.decode, raw)
-  if ok and job and job.id then
-    local kind = ''
-    if job.kinds and #job.kinds == 1 then kind = job.kinds[1] end
-    job.attempts = (job.attempts or 0) + 1
-    local class = job.queue_class or ''
-    local backend = job.selected_backend or ''
-    local target = ARGV[1]
-    if class == 'render' and kind == 'proxy' then
-      class = 'cpu'; backend = 'libx264'; job.vcodec = 'libx264'
-      job.required_capabilities = {'cpu'}; job.selected_worker = ''
-      target = ARGV[1] .. ':proxy:cpu'
-    elseif class == 'render' and kind == 'transcript' then
-      class = 'cpu'; backend = 'cpu'; job.required_capabilities = {'cpu'}; job.selected_worker = ''
-      target = ARGV[1] .. ':transcript:cpu'
-    elseif kind == 'derivatives' then
-      class = 'server'; backend = 'server-cpu'; target = ARGV[1] .. ':derivatives:server'
-    end
-    job.queue_class = class; job.selected_backend = backend
-    local nextRaw = cjson.encode(job)
-    redis.call('LPUSH', target, nextRaw)
-    local h = ARGV[2] .. job.id
-    redis.call('HSET', h, 'status', 'queued', 'worker', '', 'backend', backend,
-      'target_worker', job.selected_worker or '', 'queue_class', class, 'attempts', tostring(job.attempts),
-      'error', 'recovered after worker ' .. ARGV[3] .. ' disappeared')
-    redis.call('HDEL', h, 'lease_owner', 'lease_expires_at', 'finished_at')
-    redis.call('ZREM', KEYS[3], job.id)
-  else
-    redis.call('LPUSH', ARGV[1], raw)
-  end
-end
-redis.call('DEL', KEYS[1])
-redis.call('SREM', KEYS[2], ARGV[3])
-return #raws`
-		n, evalErr := c.rdb.Eval(ctx, script, []string{
-			ProcessingPrefix + workerID, ProcessingIndexKey, LeaseIndexKey,
-		}, QueueKey, JobHashPrefix, workerID).Int()
-		_ = c.rdb.Del(ctx, lock).Err()
-		if evalErr != nil {
-			return total, evalErr
+		processingKey := ProcessingPrefix + workerID
+		raws, listErr := c.rdb.LRange(ctx, processingKey, 0, -1).Result()
+		if listErr != nil {
+			_ = c.rdb.Del(ctx, lock).Err()
+			return total, listErr
 		}
-		total += n
+		for _, raw := range raws {
+			var job Job
+			if err := json.Unmarshal([]byte(raw), &job); err != nil || job.ID == "" {
+				if err := c.requeueMalformedClaim(ctx, processingKey, workerID, raw); err != nil {
+					_ = c.rdb.Del(ctx, lock).Err()
+					return total, err
+				}
+				total++
+				continue
+			}
+			claim := Claim{Job: job, Raw: raw, WorkerID: workerID}
+			reason := "recovered after worker " + workerID + " disappeared; compatible worker selection rerun"
+			if err := c.RequeueClaim(ctx, claim, false, reason); err != nil {
+				_ = c.rdb.Del(ctx, lock).Err()
+				return total, err
+			}
+			total++
+		}
+		_ = c.rdb.Del(ctx, lock).Err()
 	}
 	return total, nil
+}
+
+func (c *Client) requeueMalformedClaim(ctx context.Context, processingKey, workerID, raw string) error {
+	const script = `
+redis.call('LREM', KEYS[1], 1, ARGV[1])
+redis.call('LPUSH', KEYS[2], ARGV[1])
+if redis.call('LLEN', KEYS[1]) == 0 then
+  redis.call('SREM', KEYS[3], ARGV[2])
+end
+return 1`
+	return c.rdb.Eval(ctx, script, []string{processingKey, QueueKey, ProcessingIndexKey}, raw, workerID).Err()
 }

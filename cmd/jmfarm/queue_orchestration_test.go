@@ -29,11 +29,13 @@ func TestNoMediaJobDoesNotPolluteBenchmarks(t *testing.T) {
 	}
 
 	recordCompletedJobBenchmark(&w, farmqueue.Job{Kinds: []string{farmqueue.KindProxy}}, 1, 0, 2*time.Second)
-	if w.Benchmarks.JobsCompleted != 1 || w.Benchmarks.ProxyJobsCompleted != 1 || w.Benchmarks.LastProxySeconds != 2 {
+	if w.Benchmarks.JobsCompleted != 1 || w.Benchmarks.ProxyJobsCompleted != 1 || w.Benchmarks.LastProxySeconds != 2 ||
+		w.Benchmarks.FilesProcessed != 1 || w.Benchmarks.ProxyFilesProcessed != 1 {
 		t.Fatalf("real proxy job not recorded: %+v", w.Benchmarks)
 	}
 	recordCompletedJobBenchmark(&w, farmqueue.Job{Kinds: []string{farmqueue.KindTranscript}}, 0, 1, 3*time.Second)
-	if w.Benchmarks.JobsCompleted != 2 || w.Benchmarks.TranscriptJobsCompleted != 1 || w.Benchmarks.LastTranscriptSeconds != 3 {
+	if w.Benchmarks.JobsCompleted != 2 || w.Benchmarks.TranscriptJobsCompleted != 1 || w.Benchmarks.LastTranscriptSeconds != 3 ||
+		w.Benchmarks.FilesFailed != 1 || w.Benchmarks.TranscriptFilesFailed != 1 {
 		t.Fatalf("failed transcript sample not recorded: %+v", w.Benchmarks)
 	}
 }

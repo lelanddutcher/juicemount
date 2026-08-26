@@ -46,7 +46,8 @@ import (
 //     JuiceFS attr blobs. Failures drop the dir silently (raced deletes).
 //
 // Kill switch: JM_FARM_WATCH=0. Tunables: JM_FARM_WATCH_SETTLE_SEC,
-// JM_FARM_WATCH_TICK_SEC, JM_FARM_WATCH_MAX_PER_TICK, JM_FARM_WATCH_KINDS.
+// JM_FARM_WATCH_TICK_SEC, JM_FARM_WATCH_MAX_PER_TICK,
+// JM_FARM_WATCH_RESOLVE_WORKERS, JM_FARM_WATCH_KINDS.
 
 // WatchConfig wires a Watcher. Enqueue and (optionally) Resolve are
 // injected so the decision core is unit-testable without Redis, a mount,
@@ -68,11 +69,12 @@ type WatchConfig struct {
 	// the juicefs-info resolver against Mount.
 	Resolve func(ctx context.Context, inode uint64) (string, bool)
 
-	Settle     time.Duration // quiet time before a dirty dir is processed (default 60s)
-	Tick       time.Duration // processing cadence (default 15s)
-	MaxPerTick int           // enqueue budget per tick (default 200)
-	DedupeTTL  time.Duration // suppress re-enqueue of the same dir (default 10m)
-	MaxDirty   int           // dirty-set bound (default 10k)
+	Settle         time.Duration // quiet time before a dirty dir is processed (default 60s)
+	Tick           time.Duration // processing cadence (default 15s)
+	MaxPerTick     int           // enqueue budget per tick (default 200)
+	ResolveWorkers int           // concurrent inode-to-path lookups (default 16)
+	DedupeTTL      time.Duration // suppress re-enqueue of the same dir (default 10m)
+	MaxDirty       int           // dirty-set bound (default 10k)
 
 	Logf func(format string, a ...any) // default: drop
 }
@@ -99,6 +101,12 @@ func NewWatcher(cfg WatchConfig) *Watcher {
 	}
 	if cfg.MaxPerTick <= 0 {
 		cfg.MaxPerTick = envInt("JM_FARM_WATCH_MAX_PER_TICK", 200)
+	}
+	if cfg.ResolveWorkers <= 0 {
+		cfg.ResolveWorkers = envInt("JM_FARM_WATCH_RESOLVE_WORKERS", 16)
+	}
+	if cfg.ResolveWorkers > cfg.MaxPerTick {
+		cfg.ResolveWorkers = cfg.MaxPerTick
 	}
 	if cfg.DedupeTTL <= 0 {
 		cfg.DedupeTTL = 10 * time.Minute
@@ -196,19 +204,49 @@ func (w *Watcher) Tick(ctx context.Context, now time.Time) int {
 		inode uint64
 		path  string
 	}
+	// A stale/deleted inode can consume the resolver's full timeout. Resolving
+	// MaxPerTick candidates serially therefore turns a short pause into a
+	// many-minute discovery stall. Use a bounded worker pool, but retain each
+	// result's input slot so pruning and enqueue order stay deterministic.
+	resolvedSlots := make([]resolvedTarget, len(settled))
+	resolvedOK := make([]bool, len(settled))
+	resolveJobs := make(chan int)
+	workerCount := w.cfg.ResolveWorkers
+	if workerCount > len(settled) {
+		workerCount = len(settled)
+	}
+	var resolveWG sync.WaitGroup
+	resolveWG.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer resolveWG.Done()
+			for idx := range resolveJobs {
+				ino := settled[idx]
+				rel, ok := w.cfg.Resolve(ctx, ino)
+				if !ok || !WatchPathAllowed(rel) {
+					continue // raced delete / unresolvable / excluded
+				}
+				resolvedSlots[idx] = resolvedTarget{inode: ino, path: path.Clean(rel)}
+				resolvedOK[idx] = true
+			}
+		}()
+	}
+feedResolveJobs:
+	for idx := range settled {
+		select {
+		case resolveJobs <- idx:
+		case <-ctx.Done():
+			break feedResolveJobs
+		}
+	}
+	close(resolveJobs)
+	resolveWG.Wait()
+
 	resolved := make([]resolvedTarget, 0, len(settled))
-	for _, ino := range settled {
-		if ctx.Err() != nil {
-			break
+	for idx, ok := range resolvedOK {
+		if ok {
+			resolved = append(resolved, resolvedSlots[idx])
 		}
-		rel, ok := w.cfg.Resolve(ctx, ino)
-		if !ok {
-			continue // raced delete / unresolvable — drop silently
-		}
-		if !WatchPathAllowed(rel) {
-			continue
-		}
-		resolved = append(resolved, resolvedTarget{inode: ino, path: path.Clean(rel)})
 	}
 
 	// One file creation commonly dirties its directory and several ancestors.
