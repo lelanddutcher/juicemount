@@ -26,6 +26,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/mounttable"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
@@ -1006,7 +1007,7 @@ func (fm *FUSEManager) isMountedLocked() bool {
 	// of hanging is the entire UI.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "mount").Output()
+	out, err := mounttable.Output(ctx)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			jmlog.Warn("mount table query timed out — likely a wedged mount entry blocking getfsstat",

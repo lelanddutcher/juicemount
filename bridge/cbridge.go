@@ -41,6 +41,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"github.com/lelanddutcher/juicemount/internal/mounttable"
 	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	jmlibnfs "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/internal/thumbcache"
@@ -3187,9 +3188,18 @@ func unmountNFS(mountPoint string) bool {
 }
 
 func isMounted(path string) bool {
-	out, err := exec.Command("mount").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := mounttable.Output(ctx)
 	if err != nil {
-		return false
+		// A fresh lookup that also times out distinguishes a likely stale
+		// mount from a normal local directory when getfsstat itself is wedged.
+		// Treat the former as mounted so the configured-path recovery flow
+		// attempts a scoped force-unmount instead of mounting on top of it.
+		stale := !nfsMountResponsive(path, 300*time.Millisecond)
+		jmlog.Warn("mount table unavailable during ownership check",
+			"path", path, "treating_as_stale_mount", stale, "error", err.Error())
+		return stale
 	}
 	return strings.Contains(string(out), " "+path+" ")
 }
@@ -3234,8 +3244,11 @@ func nfsMountResponsiveWith(path string, timeout time.Duration, lstat func(strin
 //
 // On parse failure, found is false.
 func mountAt(path string) (source string, kind string, found bool) {
-	out, err := exec.Command("mount").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := mounttable.Output(ctx)
 	if err != nil {
+		jmlog.Warn("mount table unavailable during conflict check", "path", path, "error", err.Error())
 		return "", "", false
 	}
 	// Walk every line; match on " on <path> (" so partial-prefix paths
@@ -3332,9 +3345,25 @@ func formatMountConflictError(path, source, kind, hint string) string {
 // This is a cheap probe to decide whether a fresh juicefs invocation is
 // needed on Start.
 func fuseLooksHealthy(path string) bool {
-	out, err := exec.Command("mount").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := mounttable.Output(ctx)
 	if err != nil {
-		return false
+		// Do not turn a separate wedged table entry into destructive churn of
+		// an otherwise responsive JuiceFS mount. The health monitor will keep
+		// reporting the unreadable mount table; this fallback only answers the
+		// local reuse/readiness question.
+		done := make(chan error, 1)
+		go func() {
+			_, readErr := os.ReadDir(path)
+			done <- readErr
+		}()
+		select {
+		case readErr := <-done:
+			return readErr == nil
+		case <-time.After(2 * time.Second):
+			return false
+		}
 	}
 	if !strings.Contains(string(out), path) {
 		return false

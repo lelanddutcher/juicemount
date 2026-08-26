@@ -18,6 +18,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"github.com/lelanddutcher/juicemount/internal/mounttable"
 )
 
 // Config holds the endpoints and paths that the monitor checks.
@@ -862,8 +863,8 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 	// wedged entry; bound it.
 	mountCtx, mountCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer mountCancel()
-	out, _ := exec.CommandContext(mountCtx, "mount").Output()
-	if mountCtx.Err() == context.DeadlineExceeded {
+	out, mountErr := mounttable.Output(mountCtx)
+	if mountErr != nil {
 		jmlog.Warn("mount table query timed out in checkFUSE", "path", m.cfg.FUSEPath)
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "mount table query timed out"}
 	}
@@ -1035,12 +1036,9 @@ func (m *HealthMonitor) checkNFS() ComponentStatus {
 func mountTableHas(path string, timeout time.Duration) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "mount").Output()
+	out, err := mounttable.Output(ctx)
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return false, fmt.Errorf("mount table query timed out after %s", timeout)
-		}
-		return false, err
+		return false, fmt.Errorf("mount table query failed within %s: %w", timeout, err)
 	}
 	return strings.Contains(string(out), " on "+path+" ("), nil
 }
