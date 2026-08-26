@@ -985,10 +985,14 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		return
 	}
 	// Capture where dest actually lives for the pre-completion device check.
-	destDev := int32(-1)
+	// syscall.Stat_t.Dev is int32 on Darwin and uint64 on Linux. Normalize it
+	// here so the same source builds on both the desktop and server targets.
+	var destDev uint64
+	destDevValid := false
 	if fi, err := dst.Stat(); err == nil {
 		if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
-			destDev = sys.Dev
+			destDev = uint64(sys.Dev)
+			destDevValid = true
 		}
 	}
 
@@ -1094,9 +1098,9 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// mount does not have them: requeue instead of completing. os.Stat on a
 	// healthy mount is cheap; on a wedged one it can block — same hazard
 	// class as the at-rest re-read above (drainer worker, not the hot path).
-	if destDev != -1 {
+	if destDevValid {
 		if fi, statErr := os.Stat(d.fuseRoot); statErr == nil {
-			if sys, ok := fi.Sys().(*syscall.Stat_t); ok && sys.Dev != destDev {
+			if sys, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(sys.Dev) != destDev {
 				_ = os.Remove(dest)
 				d.failTransient(row, fmt.Errorf("dest device %d != current mount device %d (remount raced the copy): %w",
 					destDev, sys.Dev, pin.ErrFUSEIdentityGate))

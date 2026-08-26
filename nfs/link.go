@@ -34,10 +34,11 @@ import (
 )
 
 type LinkNode struct {
-	srv     *tsnet.Server
-	mu      sync.Mutex
-	proxies []*tcpProxy
-	addrs   []string
+	srv            *tsnet.Server
+	mu             sync.Mutex
+	proxies        []*tcpProxy
+	proxyEndpoints map[string]string
+	addrs          []string
 }
 
 // contextDialer is deliberately small so proxy behavior can be tested with a
@@ -221,8 +222,13 @@ func (l *LinkNode) ProxyEndpoint(raw, defaultPort string) (string, error) {
 		return raw, err
 	}
 
+	proxyKey := target + "\x00" + proxyIdleTimeout(raw).String()
 	l.mu.Lock()
 	s := l.srv
+	if addr := l.proxyEndpoints[proxyKey]; addr != "" {
+		l.mu.Unlock()
+		return rewrite(addr), nil
+	}
 	l.mu.Unlock()
 	if s == nil {
 		return raw, fmt.Errorf("link: node is stopped")
@@ -238,7 +244,16 @@ func (l *LinkNode) ProxyEndpoint(raw, defaultPort string) (string, error) {
 		_ = p.Close()
 		return raw, fmt.Errorf("link: node is stopped")
 	}
+	if addr := l.proxyEndpoints[proxyKey]; addr != "" {
+		l.mu.Unlock()
+		_ = p.Close()
+		return rewrite(addr), nil
+	}
+	if l.proxyEndpoints == nil {
+		l.proxyEndpoints = make(map[string]string)
+	}
 	l.proxies = append(l.proxies, p)
+	l.proxyEndpoints[proxyKey] = p.listener.Addr().String()
 	l.mu.Unlock()
 	return rewrite(p.listener.Addr().String()), nil
 }
@@ -335,6 +350,15 @@ func proxyEndpointTarget(raw, defaultPort string) (string, func(string) string, 
 			err = fmt.Errorf("missing host")
 		}
 		return "", nil, fmt.Errorf("link: parse endpoint %q: %w", raw, err)
+	}
+	// A loopback URL cannot preserve certificate identity: rewriting
+	// https://nas.example to https://127.0.0.1 makes JuiceFS validate the
+	// certificate against 127.0.0.1. Refuse encrypted upstream schemes until
+	// the proxy can retain the original hostname/SNI instead of allowing a
+	// preflight probe to pass and the real mount to fail later.
+	switch strings.ToLower(u.Scheme) {
+	case "https", "rediss":
+		return "", nil, fmt.Errorf("link: %s endpoints are not supported by the loopback data proxy; use HTTP/Redis on the private NAS route", strings.ToLower(u.Scheme))
 	}
 	port := u.Port()
 	if port == "" {
@@ -630,6 +654,7 @@ func (l *LinkNode) Stop() {
 	proxies := l.proxies
 	l.srv = nil
 	l.proxies = nil
+	l.proxyEndpoints = nil
 	l.addrs = nil
 	l.mu.Unlock()
 	for _, proxy := range proxies {

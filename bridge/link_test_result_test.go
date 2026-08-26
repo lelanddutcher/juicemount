@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
 
 func TestLinkTestResultAlwaysCarriesRequiredFields(t *testing.T) {
@@ -89,5 +91,40 @@ func TestLinkIdentityChangesWithEveryPairingInput(t *testing.T) {
 		if got := identityForLink(changed); got == want {
 			t.Fatalf("pairing input change reused identity: %+v", changed)
 		}
+	}
+}
+
+func TestReusableLinkNodeRefusesIdentityChangeWithoutStoppingActiveDataPlane(t *testing.T) {
+	base := ServerConfig{
+		NetControlURL: "https://link.example.test",
+		NetAuthKey:    "one-off-key-a",
+		NetHostname:   "editing-mac",
+		DBPath:        "/tmp/jm-test/metadata.db",
+	}
+	node := &jmnfs.LinkNode{}
+	linkMu.Lock()
+	previousNode, previousID := globalLinkNode, globalLinkID
+	globalLinkNode, globalLinkID = node, identityForLink(base)
+	linkMu.Unlock()
+	t.Cleanup(func() {
+		linkMu.Lock()
+		globalLinkNode, globalLinkID = previousNode, previousID
+		linkMu.Unlock()
+	})
+
+	got, err := reusableLinkNode(base)
+	if err != nil || got != node {
+		t.Fatalf("same identity reuse = (%p, %v), want (%p, nil)", got, err, node)
+	}
+	changed := base
+	changed.NetAuthKey = "one-off-key-b"
+	if got, err := reusableLinkNode(changed); err == nil || got != nil || !strings.Contains(err.Error(), "stop everything") {
+		t.Fatalf("changed identity reuse = (%p, %v), want nil actionable error", got, err)
+	}
+	linkMu.Lock()
+	stillPublished := globalLinkNode
+	linkMu.Unlock()
+	if stillPublished != node {
+		t.Fatal("identity change replaced or detached the live Link node before FUSE teardown")
 	}
 }

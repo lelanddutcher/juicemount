@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"tailscale.com/tsnet"
 )
 
 func TestProbeHTTPUsesHealthPathAndRequiresSuccess(t *testing.T) {
@@ -56,12 +58,6 @@ func TestProxyEndpointTargetPreservesEndpointShape(t *testing.T) {
 			wantLoopback: "http://127.0.0.1:4567/zpool",
 		},
 		{
-			raw:          "https://object.example.test/zpool",
-			defaultPort:  "",
-			wantTarget:   "object.example.test:443",
-			wantLoopback: "https://127.0.0.1:4567/zpool",
-		},
-		{
 			raw:          "192.168.0.197:30179/1",
 			defaultPort:  "6379",
 			wantTarget:   "192.168.0.197:30179",
@@ -87,6 +83,53 @@ func TestProxyEndpointTargetPreservesEndpointShape(t *testing.T) {
 				t.Errorf("rewritten endpoint = %q, want %q", got, tt.wantLoopback)
 			}
 		})
+	}
+}
+
+func TestProxyEndpointTargetRejectsTLSIdentityBreakingRewrite(t *testing.T) {
+	for _, raw := range []string{
+		"https://object.example.test/zpool",
+		"rediss://metadata.example.test:6379/1",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			if _, _, err := proxyEndpointTarget(raw, ""); err == nil || !strings.Contains(err.Error(), "not supported") {
+				t.Fatalf("proxyEndpointTarget(%q) error = %v, want actionable rejection", raw, err)
+			}
+		})
+	}
+}
+
+func TestProxyEndpointReusesStableListener(t *testing.T) {
+	node := &LinkNode{srv: &tsnet.Server{}}
+	t.Cleanup(func() {
+		node.mu.Lock()
+		proxies := append([]*tcpProxy(nil), node.proxies...)
+		node.srv = nil
+		node.proxies = nil
+		node.proxyEndpoints = nil
+		node.mu.Unlock()
+		for _, proxy := range proxies {
+			_ = proxy.Close()
+		}
+	})
+
+	const raw = "redis://nas.example:6379/1"
+	first, err := node.ProxyEndpoint(raw, "6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := node.ProxyEndpoint(raw, "6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("proxy endpoint changed across reuse: %q != %q", first, second)
+	}
+	node.mu.Lock()
+	count := len(node.proxies)
+	node.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("proxy listener count = %d, want 1", count)
 	}
 }
 

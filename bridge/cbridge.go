@@ -262,47 +262,41 @@ func identityForLink(cfg ServerConfig) linkNodeIdentity {
 }
 
 // reusableLinkNode returns the warm node only when it represents the exact
-// pairing inputs currently saved by the app. Changed authorization, control
-// URL, hostname, or state location invalidates the in-memory identity.
-func reusableLinkNode(cfg ServerConfig) *jmnfs.LinkNode {
+// pairing inputs currently saved by the app. A changed identity must never
+// stop this node here: its loopback endpoints may still be owned by a warm
+// JuiceFS mount. The caller must perform a full teardown (FUSE first, Link
+// second) before applying different pairing inputs.
+func reusableLinkNode(cfg ServerConfig) (*jmnfs.LinkNode, error) {
 	want := identityForLink(cfg)
 	linkMu.Lock()
+	defer linkMu.Unlock()
 	node := globalLinkNode
 	if node != nil && globalLinkID == want {
-		linkMu.Unlock()
-		return node
+		return node, nil
 	}
 	if node != nil {
-		globalLinkNode = nil
-		globalLinkID = linkNodeIdentity{}
+		return nil, fmt.Errorf("JuiceMount Link pairing changed while its data plane is active; stop everything before applying or testing the new pairing")
 	}
-	linkMu.Unlock()
-	if node != nil {
-		node.Stop()
-	}
-	return nil
+	return nil, nil
 }
 
-func publishLinkNode(cfg ServerConfig, node *jmnfs.LinkNode) *jmnfs.LinkNode {
+func publishLinkNode(cfg ServerConfig, node *jmnfs.LinkNode) (*jmnfs.LinkNode, error) {
 	want := identityForLink(cfg)
 	linkMu.Lock()
 	if globalLinkNode == nil {
 		globalLinkNode = node
 		globalLinkID = want
 		linkMu.Unlock()
-		return node
+		return node, nil
 	}
 	existing := globalLinkNode
-	if globalLinkID != want {
-		globalLinkNode = node
-		globalLinkID = want
-		linkMu.Unlock()
-		existing.Stop()
-		return node
-	}
+	sameIdentity := globalLinkID == want
 	linkMu.Unlock()
 	node.Stop()
-	return existing
+	if !sameIdentity {
+		return nil, fmt.Errorf("JuiceMount Link pairing changed while its data plane is active; stop everything before publishing the replacement")
+	}
+	return existing, nil
 }
 
 type linkTestResult struct {
@@ -348,7 +342,10 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
 	if !configured {
 		return nil, false, nil
 	}
-	node := reusableLinkNode(*cfg)
+	node, err := reusableLinkNode(*cfg)
+	if err != nil {
+		return nil, false, err
+	}
 	owned := false
 	var addrs []string
 	if node == nil {
@@ -377,7 +374,10 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
 	cfg.RedisURL = redisURL
 	cfg.BucketOverride = bucketURL
 	if owned {
-		node = publishLinkNode(*cfg, node)
+		node, err = publishLinkNode(*cfg, node)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	if len(addrs) > 0 {
 		jmlog.Info("JuiceMount Link: node up", "addrs", fmt.Sprint(addrs))
@@ -585,15 +585,22 @@ func NFSServerLinkTest(configJSON *C.char) *C.char {
 	// this operation is meant to validate.
 	linkTestMu.Lock()
 	defer linkTestMu.Unlock()
-	node := reusableLinkNode(cfg)
+	node, err := reusableLinkNode(cfg)
+	if err != nil {
+		result.Error = err.Error()
+		return encode()
+	}
 	if node == nil {
-		var err error
 		node, result.Addresses, err = jmnfs.StartLinkNode(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, linkStateDir(cfg))
 		if err != nil {
 			result.Error = err.Error()
 			return encode()
 		}
-		node = publishLinkNode(cfg, node)
+		node, err = publishLinkNode(cfg, node)
+		if err != nil {
+			result.Error = err.Error()
+			return encode()
+		}
 		result.Addresses = node.Addresses()
 	} else {
 		result.Addresses = node.Addresses()
@@ -816,6 +823,18 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	backendUp, bootRTT := backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
 	if linkNode != nil {
 		backendUp, bootRTT = linkBackendReachableRTT(linkNode, linkProbeURL, 1500*time.Millisecond)
+		if backendUp {
+			uploadMbps, downloadMbps, benchErr := linkRedisDataPlaneBenchmark(linkNode, linkProbeURL, linkDataPlaneBenchmarkBytes, 15*time.Second)
+			if benchErr != nil {
+				backendUp = false
+				jmlog.Warn("JuiceMount Link: encrypted data-plane benchmark failed at startup — taking offline path",
+					"error", benchErr.Error())
+			} else {
+				jmlog.Info("JuiceMount Link: encrypted data-plane benchmark verified at startup",
+					"bytes", linkDataPlaneBenchmarkBytes,
+					"upload_mbps", uploadMbps, "download_mbps", downloadMbps)
+			}
+		}
 	}
 	// V2.3 U2/K2: a link can be reachable-but-useless — the TCP handshake
 	// completes inside 1.5s but the RTT is so high that the synchronous

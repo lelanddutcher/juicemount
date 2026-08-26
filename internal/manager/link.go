@@ -316,9 +316,9 @@ var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 // Headscale 0.29's general node JSON includes available_routes but omits the
 // approved/serving route state, so that JSON cannot prove approval. The
 // dedicated table is the CLI's authoritative approval surface.
-func parseRouteTable(data []byte, nodeID uint64) (approved, available []string, err error) {
+func parseRouteTable(data []byte, nodeID uint64) (approved, available, serving []string, err error) {
 	lines := strings.Split(ansiEscape.ReplaceAllString(string(data), ""), "\n")
-	approvedCol, availableCol, idCol := -1, -1, -1
+	approvedCol, availableCol, servingCol, idCol := -1, -1, -1, -1
 	headerLine := -1
 	for i, line := range lines {
 		if !strings.Contains(line, "|") {
@@ -333,15 +333,17 @@ func parseRouteTable(data []byte, nodeID uint64) (approved, available []string, 
 				approvedCol = j
 			case "available":
 				availableCol = j
+			case "serving (primary)":
+				servingCol = j
 			}
 		}
-		if idCol >= 0 && approvedCol >= 0 && availableCol >= 0 {
+		if idCol >= 0 && approvedCol >= 0 && availableCol >= 0 && servingCol >= 0 {
 			headerLine = i
 			break
 		}
 	}
 	if headerLine < 0 {
-		return nil, nil, fmt.Errorf("parse route table: required columns not found")
+		return nil, nil, nil, fmt.Errorf("parse route table: required columns not found")
 	}
 	wantID := strconv.FormatUint(nodeID, 10)
 	for _, line := range lines[headerLine+1:] {
@@ -349,12 +351,12 @@ func parseRouteTable(data []byte, nodeID uint64) (approved, available []string, 
 			continue
 		}
 		cols := strings.Split(line, "|")
-		if idCol >= len(cols) || approvedCol >= len(cols) || availableCol >= len(cols) || strings.TrimSpace(cols[idCol]) != wantID {
+		if idCol >= len(cols) || approvedCol >= len(cols) || availableCol >= len(cols) || servingCol >= len(cols) || strings.TrimSpace(cols[idCol]) != wantID {
 			continue
 		}
-		return splitRouteList(cols[approvedCol]), splitRouteList(cols[availableCol]), nil
+		return splitRouteList(cols[approvedCol]), splitRouteList(cols[availableCol]), splitRouteList(cols[servingCol]), nil
 	}
-	return nil, nil, fmt.Errorf("parse route table: node %d not found", nodeID)
+	return nil, nil, nil, fmt.Errorf("parse route table: node %d not found", nodeID)
 }
 
 func splitRouteList(cell string) []string {
@@ -368,11 +370,11 @@ func splitRouteList(cell string) []string {
 	return out
 }
 
-func routeTableForNode(bin, config string, nodeID uint64) (approved, available []string, err error) {
+func routeTableForNode(bin, config string, nodeID uint64) (approved, available, serving []string, err error) {
 	out, err := exec.Command(bin, "--config", config, "nodes", "list-routes",
 		"--identifier", strconv.FormatUint(nodeID, 10)).CombinedOutput()
 	if err != nil {
-		return nil, nil, fmt.Errorf("nodes list-routes: %v: %s", err, strings.TrimSpace(string(out)))
+		return nil, nil, nil, fmt.Errorf("nodes list-routes: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return parseRouteTable(out, nodeID)
 }
@@ -390,7 +392,7 @@ func linkRouteReady(bin, config, host, prefix string) (bool, error) {
 	if n == nil {
 		return false, fmt.Errorf("Link NAS node %q is not registered", host)
 	}
-	approved, available, err := routeTableForNode(bin, config, n.ID)
+	approved, available, serving, err := routeTableForNode(bin, config, n.ID)
 	if err != nil {
 		return false, err
 	}
@@ -399,6 +401,9 @@ func linkRouteReady(bin, config, host, prefix string) (bool, error) {
 	}
 	if !containsRoute(approved, prefix) {
 		return false, fmt.Errorf("Link NAS route %s is advertised but not approved", prefix)
+	}
+	if !containsRoute(serving, prefix) {
+		return false, fmt.Errorf("Link NAS route %s is approved but the NAS node is not serving it", prefix)
 	}
 	return true, nil
 }
@@ -482,7 +487,7 @@ func ApproveSubnetRoutes(bin, config, host string, prefixes []string) error {
 	if n == nil {
 		return fmt.Errorf("node %q not registered yet", host)
 	}
-	approved, available, err := routeTableForNode(bin, config, n.ID)
+	approved, available, _, err := routeTableForNode(bin, config, n.ID)
 	if err != nil {
 		return err
 	}
@@ -506,7 +511,7 @@ func ApproveSubnetRoutes(bin, config, host string, prefixes []string) error {
 	if err != nil {
 		return fmt.Errorf("approve-routes: %v: %s", err, strings.TrimSpace(string(setOut)))
 	}
-	verified, _, err := routeTableForNode(bin, config, n.ID)
+	verified, _, _, err := routeTableForNode(bin, config, n.ID)
 	if err != nil {
 		return fmt.Errorf("verify route approval: %w", err)
 	}

@@ -336,9 +336,11 @@ public final class ServerController {
     }
 
     /// Apply the current pairing fields, join/refresh the embedded tailnet
-    /// identity, and verify a real Redis dial through the advertised NAS route.
-    /// If the bridge is already serving, a successful test performs a warm
-    /// restart so the live mount begins using the retained Link node now.
+    /// identity, and verify the real routed data plane. Link owns the loopback
+    /// Redis/object-store endpoints used by JuiceFS, so Apply & Test always
+    /// performs a controlled full teardown first. A warm restart would retain
+    /// a FUSE daemon wired to the old listeners and could leave the mount
+    /// looking healthy while every backend connection is dead.
     public func testLink() {
         guard !linkTestInFlight else { return }
         let serverURL = preferences.linkServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -363,24 +365,27 @@ public final class ServerController {
         let shouldRestart = isRunningLike
         linkTestInFlight = true
         linkTestResult = nil
-        workQueue.async { [weak self] in
-            let result: NFSBridge.LinkTestResult
-            do {
-                result = try NFSBridge.testLink(config: cfg)
-            } catch {
-                result = NFSBridge.LinkTestResult(
-                    ok: false, authorized: false, online: false, backendReachable: false,
-                    redisReachable: false, objectStoreReachable: false,
-                    hostname: cfg.netHostname, addresses: [], rttMS: nil,
-                    error: error.localizedDescription
-                )
-            }
-            Task { @MainActor in
-                guard let self else { return }
-                self.linkTestInFlight = false
-                self.linkTestResult = result
-                if result.ok && shouldRestart {
-                    self.restart()
+        stop { [weak self] in
+            guard let self else { return }
+            self.workQueue.async { [weak self] in
+                let result: NFSBridge.LinkTestResult
+                do {
+                    result = try NFSBridge.testLink(config: cfg)
+                } catch {
+                    result = NFSBridge.LinkTestResult(
+                        ok: false, authorized: false, online: false, backendReachable: false,
+                        redisReachable: false, objectStoreReachable: false,
+                        hostname: cfg.netHostname, addresses: [], rttMS: nil,
+                        error: error.localizedDescription
+                    )
+                }
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.linkTestInFlight = false
+                    self.linkTestResult = result
+                    if result.ok && shouldRestart {
+                        self.start()
+                    }
                 }
             }
         }

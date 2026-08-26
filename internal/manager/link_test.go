@@ -229,7 +229,7 @@ func TestPendingApprovalAndMerge(t *testing.T) {
 func TestParseRouteTable(t *testing.T) {
 	raw := "\x1b[96mID\x1b[0m | Hostname | Approved | Available | Serving (Primary)\n" +
 		"10 | juicemount-nas | 172.16.5.0/24 | 192.168.0.0/24, 172.16.5.0/24 | 192.168.0.0/24\n"
-	approved, available, err := parseRouteTable([]byte(raw), 10)
+	approved, available, serving, err := parseRouteTable([]byte(raw), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,8 +239,39 @@ func TestParseRouteTable(t *testing.T) {
 	if !reflect.DeepEqual(available, []string{"192.168.0.0/24", "172.16.5.0/24"}) {
 		t.Fatalf("available = %v", available)
 	}
-	if _, _, err := parseRouteTable([]byte("not a table"), 10); err == nil {
+	if !reflect.DeepEqual(serving, []string{"192.168.0.0/24"}) {
+		t.Fatalf("serving = %v", serving)
+	}
+	if _, _, _, err := parseRouteTable([]byte("not a table"), 10); err == nil {
 		t.Fatal("malformed route table was accepted")
+	}
+}
+
+func TestLinkRouteReadyRequiresRouteToBeActivelyServed(t *testing.T) {
+	dir := t.TempDir()
+	bin := fakeHeadscale(t, dir, "unused")
+	setLinkEnv(t, bin, dir+"/config.yaml")
+	if err := os.WriteFile(filepath.Join(dir, "nodes.json"), []byte(`[
+      {"id": 3, "name": "juicemount-nas", "given_name": "juicemount-nas",
+       "available_routes": ["192.168.0.0/24"], "approved_routes": ["192.168.0.0/24"]}
+    ]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	approvedButOffline := "ID | Hostname | Approved | Available | Serving (Primary)\n" +
+		"3 | juicemount-nas | 192.168.0.0/24 | 192.168.0.0/24 |\n"
+	if err := os.WriteFile(filepath.Join(dir, "routes.txt"), []byte(approvedButOffline), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := linkRouteReady(bin, dir+"/config.yaml", "juicemount-nas", "192.168.0.0/24"); ready || err == nil || !strings.Contains(err.Error(), "not serving") {
+		t.Fatalf("offline route readiness = (%v, %v), want false actionable error", ready, err)
+	}
+	serving := "ID | Hostname | Approved | Available | Serving (Primary)\n" +
+		"3 | juicemount-nas | 192.168.0.0/24 | 192.168.0.0/24 | 192.168.0.0/24\n"
+	if err := os.WriteFile(filepath.Join(dir, "routes.txt"), []byte(serving), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := linkRouteReady(bin, dir+"/config.yaml", "juicemount-nas", "192.168.0.0/24"); !ready || err != nil {
+		t.Fatalf("serving route readiness = (%v, %v), want true nil", ready, err)
 	}
 }
 

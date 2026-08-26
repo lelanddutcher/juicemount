@@ -3578,11 +3578,11 @@ async function refreshLinkStatus() {
     status.classList.toggle('online', !!st.data_plane_ready);
     status.classList.toggle('offline', !st.data_plane_ready);
     document.getElementById('link-enabled').textContent = st.data_plane_ready
-      ? 'Link data plane ready'
-      : (st.enabled ? 'Link control plane ready; data plane degraded' : 'Link not configured');
+      ? 'Server-side Link path ready'
+      : (st.enabled ? 'Link control plane ready; server path degraded' : 'Link not configured');
     const detail = document.getElementById('link-status-detail');
     if (detail) detail.textContent = st.data_plane_ready
-      ? ('Coordination, NAS route, Redis, and object storage verified · ' + (st.server_url || 'online'))
+      ? ('Server coordination, active NAS route, Redis, and object storage verified · run Apply & Test on the Mac to verify the client path · ' + (st.server_url || 'online'))
       : (st.error || 'Enable Headscale and set the external Link server URL on the Manager container.');
     document.getElementById('link-pair').style.display = st.enabled ? 'block' : 'none';
     document.getElementById('link-devices').style.display = st.enabled ? 'block' : 'none';
