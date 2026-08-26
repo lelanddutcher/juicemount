@@ -1,6 +1,6 @@
 {
-  "_comment": "Baseline timings. Updated by TestBenchmarkSuite_UpdateBaselines.",
-  "_updated": "2026-03-25",
+  "_comment": "Baseline timings. Small-write baseline includes the durable spool's real NFS COMMIT/fsync barriers (50 data files plus macOS AppleDouble sidecars).",
+  "_updated": "2026-08-26",
   "cold_run_ms": 600,
   "concurrent_reads_4x_ms": 1000,
   "deep_tree_walk_ms": 2806.4,
@@ -14,5 +14,5 @@
   "stat_p99_ms": 1.299,
   "warm_run_ms": 550,
   "write_large_10m_ms": 39.4,
-  "write_small_50x1k_ms": 452
+  "write_small_50x1k_ms": 1300
 }
