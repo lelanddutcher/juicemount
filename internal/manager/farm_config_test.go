@@ -130,7 +130,7 @@ func TestHandleFarmConfigGetPutDelete(t *testing.T) {
 	// PUT valid defaults+override.
 	body := map[string]any{
 		"defaults":  map[string]any{"crf": 21},
-		"overrides": map[string]map[string]any{"b70-gpu": {"transcript_device": "vulkan"}},
+		"overrides": map[string]map[string]any{"b70-render-rc0.5": {"transcript_device": "vulkan"}},
 	}
 	raw, _ := json.Marshal(body)
 	rec = httptest.NewRecorder()
@@ -144,8 +144,20 @@ func TestHandleFarmConfigGetPutDelete(t *testing.T) {
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 	if resp.Revision != 1 || resp.Config == nil ||
-		resp.Config.Overrides["b70-gpu"]["transcript_device"] != "vulkan" {
+		resp.Config.Overrides["b70-render-rc0.5"]["transcript_device"] != "vulkan" {
 		t.Fatalf("PUT result wrong: %+v", rec.Body.String())
+	}
+
+	// Worker names commonly contain a release suffix separated by a dot. The
+	// Manager must accept the exact advertised identity or per-node profiles can
+	// never be applied to production workers.
+	if !validWorkerName("b70-render-rc0.5") {
+		t.Fatal("valid release-qualified worker name rejected")
+	}
+	for _, badName := range []string{"", "../worker", "gpu node", "gpu/one", "gpu:one"} {
+		if validWorkerName(badName) {
+			t.Errorf("unsafe worker name %q accepted", badName)
+		}
 	}
 
 	// PUT invalid key → 400 and NOTHING stored (second store call count stays).

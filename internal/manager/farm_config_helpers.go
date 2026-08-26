@@ -32,15 +32,17 @@ func farmqueueValidKeys() []string {
 
 func farmqueueValidate(patch map[string]any) error { return farmqueue.ValidateFarmConfig(patch) }
 
-// validWorkerName mirrors destinations.go's nameRegex discipline: strict
-// lowercase identifier — it becomes a JSON object key and a UI badge.
+// validWorkerName accepts the stable host-style identities workers advertise.
+// Dots are legitimate in release-qualified names and DNS-style hostnames (for
+// example, "b70-render-rc0.5"). Keep the alphabet deliberately narrow because
+// the name becomes a persistent JSON object key and a UI badge.
 func validWorkerName(name string) bool {
 	if name == "" || len(name) > 64 {
 		return false
 	}
 	for _, c := range name {
 		switch {
-		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_':
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_', c == '.':
 		default:
 			return false
 		}
