@@ -1230,6 +1230,14 @@ func (h *JuiceMountHandler) clampWriteSize(path string, size int64) {
 // Also spawns bounded sub-prefetches for immediate subdirectories (one level)
 // for Finder's "expanding disclosure triangle" pattern.
 func (h *JuiceMountHandler) prefetchChildren(dirname string) {
+	// This is speculative remote work, never correctness. A warm READDIR is
+	// already fully served by the local mirror; re-reading the same directory
+	// through FUSE on a slow/metered link turns one Finder click into Redis plus
+	// per-child object/metadata traffic. Suppress it before acquiring any gate or
+	// touching FUSE. The live profile makes this react to Wi-Fi/cellular handoff.
+	if !allowSpeculativeDirectoryWarm(netprofile.Default().Class()) {
+		return
+	}
 	// Batch-3 adversarial review #2: never warm a scan-filtered namespace
 	// (.trash/, .juicemount/) — the #78 open-GC removed their rows and the
 	// push/prune paths ignore them by design, so a prefetch here re-mirrored
@@ -2515,7 +2523,7 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 		//      non-blocking and skip if the pool is busy — prefetch is a
 		//      best-effort nav-latency optimization, not correctness, so
 		//      shedding it under load is the right trade.
-		if !pin.IsOffline() {
+		if !pin.IsOffline() && allowSpeculativeDirectoryWarm(netprofile.Default().Class()) {
 			select {
 			case jfs.handler.prefetchSem <- struct{}{}:
 				go func() {
@@ -2636,6 +2644,15 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	}
 
 	return infos, nil
+}
+
+// allowSpeculativeDirectoryWarm is the single policy gate for background
+// FUSE work launched by a mirror-served READDIR. Medium/fast links may spend
+// bandwidth to front-run a likely next click. Slow/metered links must preserve
+// the defining cellular invariant: listing known metadata is a local-only
+// operation. Foreground reads remain available in every class.
+func allowSpeculativeDirectoryWarm(class netprofile.LinkClass) bool {
+	return class >= netprofile.ClassMedium
 }
 
 // coldDirListing converts the result of a bounded FUSE ReadDir on dirname

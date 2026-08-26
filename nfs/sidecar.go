@@ -13,6 +13,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
 // Sidecar cache (nav-latency crux, 2026-07-10). A Finder listing of a folder
@@ -322,7 +323,8 @@ const (
 )
 
 func (h *JuiceMountHandler) sidecarWarmDirAsync(dir string) {
-	if h == nil || h.sidecar == nil || !h.sidecar.enabled || pin.IsOffline() {
+	if h == nil || h.sidecar == nil || !h.sidecar.enabled || pin.IsOffline() ||
+		!allowSpeculativeDirectoryWarm(netprofile.Default().Class()) {
 		return
 	}
 	// FUTILITY BREAKER — stop warming when warming is not working.

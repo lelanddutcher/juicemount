@@ -10,6 +10,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 )
 
 // ThumbWarmer (#1, INSTANT-NAV — the P2 "hydration pack" substrate consumer).
@@ -172,7 +173,7 @@ func (w *ThumbWarmer) worker() {
 }
 
 func (w *ThumbWarmer) warmDir(dir string) {
-	if pin.IsOffline() {
+	if pin.IsOffline() || !allowSpeculativeDirectoryWarm(netprofile.Default().Class()) {
 		return // dropped; the next online readdir re-triggers
 	}
 	kids := w.children(dir)

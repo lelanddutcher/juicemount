@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"runtime"
+	rmetrics "runtime/metrics"
 	"strings"
 	"sync"
 	"time"
@@ -73,7 +73,7 @@ type HealthStatus struct {
 	HeapAllocMB   float64 // current heap allocation in MB
 	HeapSysMB     float64 // total heap obtained from OS in MB
 	NumGC         uint32  // number of GC cycles
-	GCPauseLastUs uint64  // last GC pause in microseconds
+	GCPauseLastUs uint64  // last GC pause in microseconds; 0 when non-blocking telemetry cannot supply it
 
 	// Application-level memory stats (populated via SetStatsProvider)
 	PathCacheSize  int     // entries in metadata pathCache
@@ -82,6 +82,47 @@ type HealthStatus struct {
 	FDPoolActive   int     // active (in-use) fds in pool
 	MemBufEntries  int     // entries in memory buffer
 	MemBufSizeMB   float64 // total memory buffer size in MB
+}
+
+type runtimeMemorySnapshot struct {
+	heapAllocBytes uint64
+	heapSysBytes   uint64
+	numGC          uint32
+}
+
+// readRuntimeMemorySnapshot uses runtime/metrics counters instead of
+// runtime.ReadMemStats. ReadMemStats performs a stop-the-world: on
+// macOS a goroutine stuck in an uninterruptible FUSE syscall can then prevent
+// the world from restarting, starving the otherwise-independent local control
+// plane and every mirror-served NFS request. Health telemetry must never be
+// able to turn a slow backend operation into an application-wide freeze.
+func readRuntimeMemorySnapshot() runtimeMemorySnapshot {
+	samples := []rmetrics.Sample{
+		{Name: "/memory/classes/heap/objects:bytes"},
+		{Name: "/memory/classes/heap/free:bytes"},
+		{Name: "/memory/classes/heap/released:bytes"},
+		{Name: "/memory/classes/heap/unused:bytes"},
+		{Name: "/gc/cycles/total:gc-cycles"},
+	}
+	rmetrics.Read(samples)
+	readUint := func(i int) uint64 {
+		if samples[i].Value.Kind() != rmetrics.KindUint64 {
+			return 0
+		}
+		return samples[i].Value.Uint64()
+	}
+	heapAlloc := readUint(0)
+	heapSys := heapAlloc + readUint(1) + readUint(2) + readUint(3)
+	gc := readUint(4)
+	maxUint32 := uint64(^uint32(0))
+	if gc > maxUint32 {
+		gc = maxUint32
+	}
+	return runtimeMemorySnapshot{
+		heapAllocBytes: heapAlloc,
+		heapSysBytes:   heapSys,
+		numGC:          uint32(gc),
+	}
 }
 
 // GracePeriod is the duration after a network change during which
@@ -396,14 +437,10 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 	overall := redisStatus.Healthy && minioStatus.Healthy &&
 		fuseStatus.Healthy && nfsStatus.Healthy
 
-	// Collect runtime memory stats.
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-
-	var gcPauseUs uint64
-	if ms.NumGC > 0 {
-		gcPauseUs = ms.PauseNs[(ms.NumGC+255)%256] / 1000
-	}
+	// Collect runtime memory stats without the ReadMemStats stop-the-world path.
+	// runtime/metrics exposes a cumulative pause histogram, not a truthful
+	// "last pause" sample, so report unavailable instead of retaining stale data.
+	ms := readRuntimeMemorySnapshot()
 
 	next := HealthStatus{
 		Redis:          redisStatus,
@@ -413,10 +450,10 @@ func (m *HealthMonitor) runChecks(ctx context.Context) {
 		Overall:        overall,
 		RedisConnState: redisConnState,
 		MinIOConnState: minioConnState,
-		HeapAllocMB:    float64(ms.HeapAlloc) / (1024 * 1024),
-		HeapSysMB:      float64(ms.HeapSys) / (1024 * 1024),
-		NumGC:          ms.NumGC,
-		GCPauseLastUs:  gcPauseUs,
+		HeapAllocMB:    float64(ms.heapAllocBytes) / (1024 * 1024),
+		HeapSysMB:      float64(ms.heapSysBytes) / (1024 * 1024),
+		NumGC:          ms.numGC,
+		GCPauseLastUs:  0,
 	}
 
 	// Populate application-level stats if a provider is registered.
