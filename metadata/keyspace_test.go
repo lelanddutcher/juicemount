@@ -229,9 +229,9 @@ func TestCurrentLinkClassBands(t *testing.T) {
 
 func TestBackstopAndTuningOrdering(t *testing.T) {
 	// With keyspace-push engaged, the periodic full SCAN is only a missed-event
-	// backstop, so every class demotes it to a LONG interval in the intended
-	// 15-30m range (lengthened 2026-06-30 from 10/15/5m after field testing showed
-	// the ~5m WAN SCAN "rebuilding every 5 min" was too eager + churned the mirror).
+	// backstop, so every class demotes it to a DAILY safety audit. Push is the
+	// steady-state path; a full-tree scan every few minutes is polling and makes
+	// a cellular online mount slower than the recalled offline mirror.
 	// All stay well above the 30s DISABLED/DEGRADED cadence; staleness from a
 	// missed push event is bounded by that dir's next d-key event, and a real push
 	// DROP snaps the cadence back to 30s (the unreachable/DEGRADED cases below).
@@ -240,19 +240,12 @@ func TestBackstopAndTuningOrdering(t *testing.T) {
 		if b <= DefaultReconcileInterval {
 			t.Errorf("class %v backstop %v must exceed the 30s DISABLED cadence", c, b)
 		}
-		if b < 10*time.Minute || b > 30*time.Minute {
-			t.Errorf("class %v backstop %v out of the intended ~15-30m demoted-SCAN range", c, b)
+		if b != 24*time.Hour {
+			t.Errorf("class %v backstop %v, want the daily healthy-push safety audit", c, b)
 		}
 	}
-	// Tunnel/cellular stays <= lan/wifi (never the LONGEST): its SCAN is the most
-	// expensive (377k rows over the tunnel) AND push is flappiest there, so a
-	// missed in-place attr edit / reconnect-gap delete is caught soonest on the
-	// link most likely to miss one.
-	if backstopForClass(classTunnel) > backstopForClass(classLAN) ||
-		backstopForClass(classTunnel) > backstopForClass(classWiFi) {
-		t.Errorf("tunnel backstop must be <= lan/wifi: lan=%v wifi=%v tunnel=%v",
-			backstopForClass(classLAN), backstopForClass(classWiFi), backstopForClass(classTunnel))
-	}
+	// A cellular/tunnel link must not audit more often merely because its scan is
+	// more expensive. Detected push loss still switches every class to fallback.
 	// JM_RECONCILE_BACKSTOP_SEC overrides every class (field-tuning kill switch).
 	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "1800")
 	for _, c := range []linkClass{classLAN, classWiFi, classTunnel} {

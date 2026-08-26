@@ -174,15 +174,16 @@ func reachableNow() bool {
 	return fn()
 }
 
-// backstopForClass returns the long, class-gated backstop interval used when
-// the subscription is ENABLED+healthy. The motivation is that the cellular
-// 87-178s SCAN must become RARE — but NOT so rare that the two backstop-bounded
-// staleness windows (foreign in-place size/mtime edits, which fire no d* event;
-// and a delete missed during a subscriber-down window, which heals only via the
-// PruneThreshold ladder) stretch to hours. So tunnel/cellular is CAPPED at 5 min:
-// still a 6x+ reduction from the old 30s cadence (the link-saturation fix holds),
-// while bounding attr drift to <=5 min and a missed-delete ghost to
-// PruneThreshold x 5 min instead of x 45 min. See QA residual risks / REVERT_LOG.
+// backstopForClass returns the long safety-audit interval used when the
+// subscription is ENABLED+healthy. Push is the live path: after the initial
+// baseline, routine directory changes must arrive through PSUBSCRIBE rather
+// than a recurring full-tree poll. A healthy 380k-entry mirror used to be
+// re-read every 15-20 minutes even when push was demonstrably delivering. On a
+// cellular link that periodic audit competed with Finder for hundreds of
+// seconds and made the online mount feel worse than its recalled offline
+// mirror. The safety audit is therefore daily for every class. It still guards
+// against a silently missed event, while a detected subscription drop snaps
+// immediately to the short fallback cadence in setEngagement.
 // reconcileBackstopOverride forces the demoted periodic-SCAN backstop to a
 // caller-chosen interval for ALL link classes when JM_RECONCILE_BACKSTOP_SEC is a
 // positive integer. Field-tuning kill switch per the cellular-revert-safety
@@ -205,26 +206,17 @@ func reconcileBackstopOverride() (time.Duration, bool) {
 // re-engages — so a long value here only ever applies WHILE PUSH IS HEALTHY,
 // and a real outage still converges fast on reconnect.
 //
-// Lengthened 2026-06-30 (from 10/15/5 min) after field testing: the SCAN
-// "rebuilding the index every ~5 min" over WAN was too eager and churned the
-// 438MB mirror (177MB WAL) — visible to the user as periodic sluggishness. With
-// push proven engaged on the live NAS (subscribed + per-dir reconcile), the SCAN
-// can safely be rare. Tunable live via JM_RECONCILE_BACKSTOP_SEC.
+// Lengthened to 24h for the RC cellular acceptance gate: the shipped client
+// proves subscription health, re-subscribes with a gap-fill on disconnect, and
+// incrementally reconciles every changed directory. A frequent full SCAN while
+// that feed is healthy is polling by another name. Tunable live via
+// JM_RECONCILE_BACKSTOP_SEC.
 func backstopForClass(c linkClass) time.Duration {
 	if d, ok := reconcileBackstopOverride(); ok {
 		return d
 	}
-	switch c {
-	case classLAN:
-		return 15 * time.Minute
-	case classWiFi:
-		return 20 * time.Minute
-	default: // tunnel / cellular / WAN — the SCAN is MOST expensive here (377k
-		// rows over the tunnel), so a long backstop helps most; a missed push
-		// event for a dir is re-covered by that dir's next d-key event, and a true
-		// push drop snaps the cadence back to 30s (setEngagement above).
-		return 15 * time.Minute
-	}
+	_ = c // all healthy classes use the same non-interactive safety-audit floor
+	return 24 * time.Hour
 }
 
 // unknownAncestorSyncMin is the global floor between full-SCAN promotions

@@ -15,7 +15,7 @@ const testMaxBackoff = 5 * time.Minute
 // adaptive stretch was applying its ceiling after its floor, so a mechanism
 // meant to LENGTHEN the interval truncated it to a third.
 func TestExpensiveSyncNeverShortensTheBackstop(t *testing.T) {
-	base := 900 * time.Second            // push ENABLED, LAN
+	base := 24 * time.Hour               // push ENABLED: daily safety audit
 	lastSync := 26237 * time.Millisecond // the logged last_sync_ms
 
 	got := adaptReconcileInterval(base, lastSync, testMaxBackoff)
@@ -50,7 +50,7 @@ func TestExpensiveSyncStillStretchesAShortBackstop(t *testing.T) {
 
 // A cheap sync leaves the backstop alone.
 func TestCheapSyncLeavesTheBackstopAlone(t *testing.T) {
-	base := 900 * time.Second
+	base := 24 * time.Hour
 	for _, cheap := range []time.Duration{0, 100 * time.Millisecond, reconcileAdaptiveThreshold} {
 		if got := adaptReconcileInterval(base, cheap, testMaxBackoff); got != base {
 			t.Errorf("lastSync=%v gave %v, want the untouched backstop %v", cheap, got, base)
@@ -61,7 +61,7 @@ func TestCheapSyncLeavesTheBackstopAlone(t *testing.T) {
 // The invariant, swept: whatever the inputs, the cadence never comes out below
 // the backstop the engagement logic chose.
 func TestCadenceIsNeverBelowTheBackstop(t *testing.T) {
-	for _, base := range []time.Duration{30 * time.Second, 5 * time.Minute, 900 * time.Second, 20 * time.Minute} {
+	for _, base := range []time.Duration{30 * time.Second, 5 * time.Minute, 24 * time.Hour, 48 * time.Hour} {
 		for _, last := range []time.Duration{
 			0, time.Second, 2 * time.Second, 26 * time.Second, 5 * time.Minute, time.Hour,
 		} {
