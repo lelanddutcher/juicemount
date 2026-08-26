@@ -3,11 +3,9 @@ package test
 import (
 	"crypto/sha256"
 	"fmt"
-	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,26 +14,108 @@ import (
 // These tests simulate real video editing workflows on the live NFS mount.
 // They use the E2E stack from e2e_test.go.
 
+const workflowBlockSize = 4 * 1024 * 1024
+
+type workflowMediaFile struct {
+	path string
+	size int64
+	seed int64
+}
+
+// setupWorkflowMediaFixture writes deterministic, non-sparse media through the
+// NFS arm under test. Earlier workflow tests selected arbitrary large entries
+// from a Redis snapshot. A stale entry could then return zero bytes while the
+// benchmark still passed. These exact fixtures make a short, stale, corrupt,
+// or failed read fatal and never enumerate unrelated user data.
+func setupWorkflowMediaFixture(t *testing.T, env *e2eEnv, fileCount int, size int64) []workflowMediaFile {
+	t.Helper()
+
+	root := filepath.Join(env.mount, fmt.Sprintf("__jm_workflow_media_%d", time.Now().UnixNano()))
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("create workflow media fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	files := make([]workflowMediaFile, 0, fileCount)
+	for i := 0; i < fileCount; i++ {
+		media := workflowMediaFile{
+			path: filepath.Join(root, fmt.Sprintf("track-%02d.mov", i)),
+			size: size,
+			seed: int64(i+1) * 37,
+		}
+		writeWorkflowPatternFile(t, media)
+		files = append(files, media)
+	}
+	return files
+}
+
+func writeWorkflowPatternFile(t *testing.T, media workflowMediaFile) {
+	t.Helper()
+
+	fd, err := os.OpenFile(media.path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("create workflow media %s: %v", filepath.Base(media.path), err)
+	}
+
+	buf := make([]byte, 1024*1024)
+	var offset int64
+	for offset < media.size {
+		chunk := int64(len(buf))
+		if remaining := media.size - offset; remaining < chunk {
+			chunk = remaining
+		}
+		for i := int64(0); i < chunk; i++ {
+			buf[i] = byte((offset + i + media.seed) % 251)
+		}
+		if _, err := fd.Write(buf[:chunk]); err != nil {
+			_ = fd.Close()
+			t.Fatalf("write workflow media %s at %d: %v", filepath.Base(media.path), offset, err)
+		}
+		offset += chunk
+	}
+	if err := fd.Close(); err != nil {
+		t.Fatalf("close workflow media %s: %v", filepath.Base(media.path), err)
+	}
+	info, err := os.Stat(media.path)
+	if err != nil {
+		t.Fatalf("stat workflow media %s: %v", filepath.Base(media.path), err)
+	}
+	if info.Size() != media.size {
+		t.Fatalf("workflow media %s size=%d, want %d", filepath.Base(media.path), info.Size(), media.size)
+	}
+}
+
+func readAndVerifyWorkflowBlock(fd *os.File, media workflowMediaFile, buf []byte, offset int64) error {
+	n, err := fd.ReadAt(buf, offset)
+	if err != nil {
+		return fmt.Errorf("read %s at %d: %w", filepath.Base(media.path), offset, err)
+	}
+	if n != len(buf) {
+		return fmt.Errorf("short read %s at %d: got %d, want %d", filepath.Base(media.path), offset, n, len(buf))
+	}
+	for i, actual := range buf {
+		expected := byte((offset + int64(i) + media.seed) % 251)
+		if actual != expected {
+			return fmt.Errorf("data mismatch %s at %d: got %d, want %d", filepath.Base(media.path), offset+int64(i), actual, expected)
+		}
+	}
+	return nil
+}
+
 // Workflow 1: Opening a project — browse deep directory tree, stat many files
 func TestWorkflow_BrowseProjectTree(t *testing.T) {
 	env := setupE2E(t)
-	mount := env.mount
-
-	deepRel, ok := deepestCommonDirectory(fuseMountPath, mount)
-	if !ok {
-		t.Fatal("no shared fixture tree available for project browse")
-	}
-	projectRoot := strings.Split(deepRel, string(filepath.Separator))[0]
+	fx := setupFinderFixture(t, env)
 	// Simulate Premiere opening a project: recursively stat the fixture tree.
-	t.Logf("Browsing %s tree (simulates Premiere project open)...", projectRoot)
+	t.Logf("Browsing deterministic project tree (simulates Premiere project open)...")
 
 	start := time.Now()
 	var fileCount, dirCount int
 	var totalSize int64
 
-	err := filepath.Walk(filepath.Join(mount, projectRoot), func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(fx.nfsRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // skip errors (permission, etc)
+			return err
 		}
 		if info.IsDir() {
 			dirCount++
@@ -59,33 +139,31 @@ func TestWorkflow_BrowseProjectTree(t *testing.T) {
 // Workflow 2: Scrubbing video — sequential read of a large file, then random seeks
 func TestWorkflow_VideoScrub(t *testing.T) {
 	env := setupE2E(t)
-	mount := env.mount
+	media := setupWorkflowMediaFixture(t, env, 1, 100*1024*1024)[0]
 
-	videoFile, info := largestRegularFile(mount, 24*1024*1024)
-	if videoFile == "" {
-		t.Fatal("no file larger than 24MB available for video scrub workload")
-	}
+	t.Logf("Video file: %s (%.1f MB)", filepath.Base(media.path), float64(media.size)/(1024*1024))
 
-	t.Logf("Video file: %s (%.1f MB)", info.Name(), float64(info.Size())/(1024*1024))
-
-	fd, err := os.Open(videoFile)
+	fd, err := os.Open(media.path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer fd.Close()
 
-	buf := make([]byte, 4*1024*1024) // 4MB reads (matches JuiceFS block size)
+	buf := make([]byte, workflowBlockSize) // Matches the JuiceFS block size.
 
 	// Phase 1: Sequential read (playback) — first 40MB
 	t.Log("Phase 1: Sequential read (simulates playback)...")
 	seqStart := time.Now()
 	seqBytes := int64(0)
 	for i := 0; i < 10; i++ {
-		n, err := fd.ReadAt(buf, int64(i)*4*1024*1024)
-		seqBytes += int64(n)
-		if err != nil && err != io.EOF {
-			break
+		offset := int64(i) * workflowBlockSize
+		if err := readAndVerifyWorkflowBlock(fd, media, buf, offset); err != nil {
+			t.Fatal(err)
 		}
+		seqBytes += int64(len(buf))
+	}
+	if want := int64(10 * workflowBlockSize); seqBytes != want {
+		t.Fatalf("sequential bytes=%d, want %d", seqBytes, want)
 	}
 	seqDur := time.Since(seqStart)
 	seqThroughput := float64(seqBytes) / seqDur.Seconds() / (1024 * 1024)
@@ -94,27 +172,23 @@ func TestWorkflow_VideoScrub(t *testing.T) {
 	// Phase 2: Random seeks (scrubbing) — 20 random 4MB reads across the file
 	t.Log("Phase 2: Random seeks (simulates scrubbing)...")
 	rng := rand.New(rand.NewSource(42))
-	maxOffset := info.Size() - 4*1024*1024
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
+	maxBlock := media.size/workflowBlockSize - 1
 
 	seekStart := time.Now()
 	seekBytes := int64(0)
-	seekCount := 0
 	for i := 0; i < 20; i++ {
-		offset := rng.Int63n(maxOffset)
-		// Align to 4MB boundary (JuiceFS block alignment)
-		offset = (offset / (4 * 1024 * 1024)) * (4 * 1024 * 1024)
-		n, err := fd.ReadAt(buf, offset)
-		seekBytes += int64(n)
-		seekCount++
-		if err != nil && err != io.EOF {
-			break
+		offset := rng.Int63n(maxBlock+1) * workflowBlockSize
+		if err := readAndVerifyWorkflowBlock(fd, media, buf, offset); err != nil {
+			t.Fatal(err)
 		}
+		seekBytes += int64(len(buf))
+	}
+	const seekCount = 20
+	if want := int64(seekCount * workflowBlockSize); seekBytes != want {
+		t.Fatalf("random-seek bytes=%d, want %d", seekBytes, want)
 	}
 	seekDur := time.Since(seekStart)
-	seekLatency := seekDur / time.Duration(seekCount)
+	seekLatency := seekDur / seekCount
 	t.Logf("  Random seek: %d reads, avg %v per 4MB read, total %v",
 		seekCount, seekLatency, seekDur)
 
@@ -123,99 +197,78 @@ func TestWorkflow_VideoScrub(t *testing.T) {
 	resumeStart := time.Now()
 	resumeBytes := int64(0)
 	for i := 0; i < 5; i++ {
-		offset := int64(20+i) * 4 * 1024 * 1024 // start from block 20
-		n, err := fd.ReadAt(buf, offset)
-		resumeBytes += int64(n)
-		if err != nil && err != io.EOF {
-			break
+		offset := int64(20+i) * workflowBlockSize // start from block 20
+		if err := readAndVerifyWorkflowBlock(fd, media, buf, offset); err != nil {
+			t.Fatal(err)
 		}
+		resumeBytes += int64(len(buf))
+	}
+	if want := int64(5 * workflowBlockSize); resumeBytes != want {
+		t.Fatalf("resume bytes=%d, want %d", resumeBytes, want)
 	}
 	resumeDur := time.Since(resumeStart)
 	resumeThroughput := float64(resumeBytes) / resumeDur.Seconds() / (1024 * 1024)
 	t.Logf("  Resume sequential: %d bytes in %v = %.1f MB/s", resumeBytes, resumeDur, resumeThroughput)
 }
 
-func largestRegularFile(root string, minimum int64) (string, os.FileInfo) {
-	var bestPath string
-	var bestInfo os.FileInfo
-	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || !info.Mode().IsRegular() || info.Size() < minimum {
-			return nil
-		}
-		if bestInfo == nil || info.Size() > bestInfo.Size() {
-			bestPath, bestInfo = path, info
-		}
-		return nil
-	})
-	return bestPath, bestInfo
-}
-
 // Workflow 3: Multi-track editing — concurrent reads from multiple files
 func TestWorkflow_MultiTrackRead(t *testing.T) {
 	env := setupE2E(t)
-	mount := env.mount
-
-	// Find multiple video/media files
-	var mediaFiles []string
-	filepath.Walk(mount, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return nil
-		}
-		if info.Size() > 1*1024*1024 { // >1MB
-			mediaFiles = append(mediaFiles, path)
-		}
-		if len(mediaFiles) >= 4 {
-			return filepath.SkipAll
-		}
-		return nil
-	})
-
-	if len(mediaFiles) < 2 {
-		t.Skipf("Need at least 2 media files, found %d", len(mediaFiles))
-	}
+	mediaFiles := setupWorkflowMediaFixture(t, env, 4, 20*1024*1024)
 
 	t.Logf("Multi-track test with %d files:", len(mediaFiles))
-	for _, f := range mediaFiles {
-		info, _ := os.Stat(f)
-		rel, _ := filepath.Rel(mount, f)
-		t.Logf("  %s (%.1f MB)", rel, float64(info.Size())/(1024*1024))
+	for _, media := range mediaFiles {
+		t.Logf("  %s (%.1f MB)", filepath.Base(media.path), float64(media.size)/(1024*1024))
 	}
 
 	// Simulate concurrent reads (like Premiere reading multiple video tracks)
-	buf := make([]byte, 4*1024*1024)
 	var wg sync.WaitGroup
 	errors := make(chan error, len(mediaFiles))
+	bytesRead := make(chan int64, len(mediaFiles))
 
 	start := time.Now()
-	for _, path := range mediaFiles {
+	for _, media := range mediaFiles {
 		wg.Add(1)
-		go func(p string) {
+		go func(media workflowMediaFile) {
 			defer wg.Done()
-			fd, err := os.Open(p)
+			fd, err := os.Open(media.path)
 			if err != nil {
 				errors <- err
 				return
 			}
 			defer fd.Close()
-			localBuf := make([]byte, len(buf))
+			localBuf := make([]byte, workflowBlockSize)
+			var total int64
 			// Read 5 sequential blocks from each file
 			for i := 0; i < 5; i++ {
-				_, err := fd.ReadAt(localBuf, int64(i)*4*1024*1024)
-				if err != nil && err != io.EOF {
-					break
+				offset := int64(i) * workflowBlockSize
+				if err := readAndVerifyWorkflowBlock(fd, media, localBuf, offset); err != nil {
+					errors <- err
+					return
 				}
+				total += int64(len(localBuf))
 			}
-		}(path)
+			bytesRead <- total
+		}(media)
 	}
 	wg.Wait()
 	close(errors)
+	close(bytesRead)
 	dur := time.Since(start)
 
 	for err := range errors {
 		t.Errorf("concurrent read error: %v", err)
 	}
+	var totalBytes int64
+	for n := range bytesRead {
+		totalBytes += n
+	}
+	wantBytes := int64(len(mediaFiles) * 5 * workflowBlockSize)
+	if totalBytes != wantBytes {
+		t.Fatalf("multi-track bytes=%d, want %d", totalBytes, wantBytes)
+	}
 
-	t.Logf("Multi-track concurrent read: %d files × 5 blocks in %v", len(mediaFiles), dur)
+	t.Logf("Multi-track concurrent read: %d files × 5 verified blocks (%d bytes) in %v", len(mediaFiles), totalBytes, dur)
 }
 
 // Workflow 4: Project save — create directory structure, write project files
@@ -224,6 +277,7 @@ func TestWorkflow_ProjectSave(t *testing.T) {
 	mount := env.mount
 
 	projectDir := filepath.Join(mount, fmt.Sprintf("__workflow_project_%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.RemoveAll(projectDir) })
 
 	// Simulate Premiere project save structure
 	t.Log("Creating project directory structure...")
@@ -262,7 +316,9 @@ func TestWorkflow_ProjectSave(t *testing.T) {
 			lutData[j] = byte(j % 256)
 		}
 		lutFile := filepath.Join(projectDir, "Graphics", fmt.Sprintf("grade_%d.cube", i))
-		os.WriteFile(lutFile, lutData, 0644)
+		if err := os.WriteFile(lutFile, lutData, 0o644); err != nil {
+			t.Fatalf("write LUT %d: %v", i, err)
+		}
 	}
 
 	// Write proxy files (medium size, 1MB each)
@@ -273,7 +329,9 @@ func TestWorkflow_ProjectSave(t *testing.T) {
 			proxyData[j] = byte((i + j) % 256)
 		}
 		proxyFile := filepath.Join(projectDir, "Footage", "Day1", "Proxy", fmt.Sprintf("proxy_%d.mov", i))
-		os.WriteFile(proxyFile, proxyData, 0644)
+		if err := os.WriteFile(proxyFile, proxyData, 0o644); err != nil {
+			t.Fatalf("write proxy %d: %v", i, err)
+		}
 	}
 
 	// Write export file (larger, 5MB)
@@ -284,19 +342,27 @@ func TestWorkflow_ProjectSave(t *testing.T) {
 	}
 	exportFile := filepath.Join(projectDir, "Exports", "final_cut_v1.mp4")
 	exportHash := sha256.Sum256(exportData)
-	os.WriteFile(exportFile, exportData, 0644)
+	if err := os.WriteFile(exportFile, exportData, 0o644); err != nil {
+		t.Fatalf("write export file: %v", err)
+	}
 
 	// Verify: read everything back and check integrity
 	t.Log("Verifying all files...")
 
 	// Project file
-	readBack, _ := os.ReadFile(projectFile)
+	readBack, err := os.ReadFile(projectFile)
+	if err != nil {
+		t.Fatalf("read project file: %v", err)
+	}
 	if len(readBack) != len(projectData) {
 		t.Fatalf("project file size mismatch: %d vs %d", len(readBack), len(projectData))
 	}
 
 	// Export file SHA256
-	readExport, _ := os.ReadFile(exportFile)
+	readExport, err := os.ReadFile(exportFile)
+	if err != nil {
+		t.Fatalf("read export file: %v", err)
+	}
 	readHash := sha256.Sum256(readExport)
 	if readHash != exportHash {
 		t.Fatal("export file SHA256 mismatch")
@@ -304,17 +370,20 @@ func TestWorkflow_ProjectSave(t *testing.T) {
 
 	// Count all files
 	totalFiles := 0
-	filepath.Walk(projectDir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() {
+	if err := filepath.Walk(projectDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
 			totalFiles++
 		}
 		return nil
-	})
+	}); err != nil {
+		t.Fatalf("count project files: %v", err)
+	}
 
 	t.Logf("Project save complete: %d dirs, %d files, all verified", len(dirs), totalFiles)
 
-	// Clean up
-	os.RemoveAll(projectDir)
 }
 
 // Workflow 5: Finder operations — copy, rename, move files between folders
@@ -323,9 +392,12 @@ func TestWorkflow_FinderOps(t *testing.T) {
 	mount := env.mount
 
 	workDir := filepath.Join(mount, fmt.Sprintf("__workflow_finder_%d", time.Now().UnixNano()))
-	os.MkdirAll(workDir, 0755)
-	os.MkdirAll(filepath.Join(workDir, "src"), 0755)
-	os.MkdirAll(filepath.Join(workDir, "dst"), 0755)
+	t.Cleanup(func() { _ = os.RemoveAll(workDir) })
+	for _, dir := range []string{workDir, filepath.Join(workDir, "src"), filepath.Join(workDir, "dst")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create Finder workflow directory %s: %v", filepath.Base(dir), err)
+		}
+	}
 
 	// Create test files
 	var fileHashes map[string][32]byte = make(map[string][32]byte)
@@ -335,13 +407,14 @@ func TestWorkflow_FinderOps(t *testing.T) {
 			data[j] = byte((i*31 + j*17) % 256)
 		}
 		name := fmt.Sprintf("clip_%d.mov", i)
-		os.WriteFile(filepath.Join(workDir, "src", name), data, 0644)
+		if err := os.WriteFile(filepath.Join(workDir, "src", name), data, 0o644); err != nil {
+			t.Fatalf("write source file %s: %v", name, err)
+		}
 		fileHashes[name] = sha256.Sum256(data)
 	}
 
 	// Manual file copy (ditto/cp have issues with xattrs on NFS)
 	t.Log("Copying files src → dst...")
-	os.MkdirAll(filepath.Join(workDir, "dst"), 0755)
 	for name := range fileHashes {
 		src := filepath.Join(workDir, "src", name)
 		dst := filepath.Join(workDir, "dst", name)
@@ -369,10 +442,12 @@ func TestWorkflow_FinderOps(t *testing.T) {
 
 	// Rename (simulates organizing footage)
 	t.Log("Renaming files...")
-	os.Rename(
+	if err := os.Rename(
 		filepath.Join(workDir, "dst", "clip_0.mov"),
 		filepath.Join(workDir, "dst", "A001_hero_shot.mov"),
-	)
+	); err != nil {
+		t.Fatalf("rename clip: %v", err)
+	}
 	// Verify renamed file
 	data, err := os.ReadFile(filepath.Join(workDir, "dst", "A001_hero_shot.mov"))
 	if err != nil {
@@ -386,11 +461,15 @@ func TestWorkflow_FinderOps(t *testing.T) {
 
 	// Move file between directories
 	t.Log("Moving file between directories...")
-	os.MkdirAll(filepath.Join(workDir, "selects"), 0755)
-	os.Rename(
+	if err := os.MkdirAll(filepath.Join(workDir, "selects"), 0o755); err != nil {
+		t.Fatalf("create selects directory: %v", err)
+	}
+	if err := os.Rename(
 		filepath.Join(workDir, "dst", "clip_1.mov"),
 		filepath.Join(workDir, "selects", "clip_1.mov"),
-	)
+	); err != nil {
+		t.Fatalf("move clip: %v", err)
+	}
 	data2, err := os.ReadFile(filepath.Join(workDir, "selects", "clip_1.mov"))
 	if err != nil {
 		t.Fatalf("read moved file: %v", err)
@@ -403,14 +482,14 @@ func TestWorkflow_FinderOps(t *testing.T) {
 
 	// Delete
 	t.Log("Deleting files...")
-	os.Remove(filepath.Join(workDir, "dst", "clip_2.mov"))
+	if err := os.Remove(filepath.Join(workDir, "dst", "clip_2.mov")); err != nil {
+		t.Fatalf("delete clip: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(workDir, "dst", "clip_2.mov")); err == nil {
 		t.Fatal("file should not exist after delete")
 	}
 	t.Log("  delete: verified")
 
-	// Clean up
-	os.RemoveAll(workDir)
 	t.Log("Finder ops workflow: all operations verified")
 }
 
@@ -420,6 +499,7 @@ func TestWorkflow_RapidProjectAccess(t *testing.T) {
 	mount := env.mount
 
 	projectFile := filepath.Join(mount, fmt.Sprintf("__workflow_rapid_%d.prproj", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(projectFile) })
 
 	// Simulate 10 rapid save cycles (Premiere auto-saves every 5 minutes)
 	t.Log("Simulating 10 rapid project saves...")
@@ -458,6 +538,5 @@ func TestWorkflow_RapidProjectAccess(t *testing.T) {
 		}
 	}
 
-	os.Remove(projectFile)
 	t.Log("Rapid project access: 10 save/read cycles verified")
 }
