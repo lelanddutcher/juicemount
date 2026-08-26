@@ -1279,8 +1279,9 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		// re-read the authoritative value and let the backend decide. Costs one
 		// round trip, and only on the rare shrink — an append-only write stream
 		// (the common case) never takes this path at all.
-		if cur := rc.store.LookupByPath(evt.Path); cur != nil && !evt.IsDir && evt.Size < cur.Size {
-			rc.reconcileShrunkEntry(evt, cur.Size)
+		existing := rc.store.LookupByPath(evt.Path)
+		if existing != nil && !evt.IsDir && evt.Size < existing.Size {
+			rc.reconcileShrunkEntry(evt, existing.Size)
 			return
 		}
 		e := &Entry{
@@ -1292,6 +1293,13 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 			Mtime:      time.Unix(evt.Mtime, 0),
 			Inode:      evt.Inode,
 			Mode:       mode,
+			// juicemount:metadata is an unversioned visibility feed and echoes
+			// this client's own writes. Receiving our create/update back is not
+			// proof that JuiceFS has published the child in d{parent}; preserving
+			// LocalOnly keeps a concurrent keyspace HGETALL from treating that
+			// publication gap as a delete. reconcileDir/full SCAN clear the flag
+			// only after observing the path in authoritative Redis metadata.
+			LocalOnly: existing != nil && existing.LocalOnly,
 		}
 		// In-memory cache first (instant, never blocked)
 		rc.store.InsertToCache(e)

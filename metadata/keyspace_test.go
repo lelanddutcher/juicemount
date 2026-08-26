@@ -643,6 +643,86 @@ func TestScopedPruneRootKey(t *testing.T) {
 	}
 }
 
+// A local create becomes visible to NFS before JuiceFS necessarily publishes
+// the child into Redis's d{parent} hash. The unversioned metadata pub/sub feed
+// echoes our own create event during that gap. That echo must not clear
+// LocalOnly, and a concurrent partial HGETALL must not prune the later files in
+// a burst. This is the exact live multi-track regression where four valid files
+// were created but two returned ENOENT when reopened immediately.
+func TestScopedPrunePreservesLocalCreateUntilRedisDirectoryConfirmation(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer store.Close()
+
+	mt := time.Unix(1700000000, 0)
+	parent := MakeEntry("shoot", true, 0, mt, 10)
+	store.InsertToCache(parent)
+	if err := store.Insert(parent); err != nil {
+		t.Fatalf("Insert parent: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		p := fmt.Sprintf("shoot/track-%02d.mov", i)
+		e := MakeEntry(p, false, 20<<20, mt, uint64(20+i))
+		e.LocalOnly = true
+		store.InsertToCache(e)
+		if err := store.Insert(e); err != nil {
+			t.Fatalf("Insert %s: %v", p, err)
+		}
+	}
+
+	rc := &RedisClient{store: store}
+	markPruneHealthy(rc)
+
+	// The self-write visibility feed is not backend directory confirmation.
+	// Replaying all four creates must leave their LocalOnly protection intact.
+	for i := 0; i < 4; i++ {
+		p := fmt.Sprintf("shoot/track-%02d.mov", i)
+		rc.applyEvent(MetadataEvent{
+			Op: "create", Path: p, Size: 20 << 20,
+			Mtime: mt.Unix(), Inode: uint64(20 + i),
+		})
+		if got := store.LookupByPath(p); got == nil || !got.LocalOnly {
+			t.Fatalf("pub/sub echo cleared LocalOnly for %s: %#v", p, got)
+		}
+	}
+
+	// Redis currently exposes only the first half of the just-created burst.
+	// The later local entries must remain visible rather than being interpreted
+	// as deletes.
+	rc.scopedPrune("shoot", map[string]struct{}{
+		"track-00.mov": {},
+		"track-01.mov": {},
+	})
+	for i := 0; i < 4; i++ {
+		p := fmt.Sprintf("shoot/track-%02d.mov", i)
+		if store.LookupByPath(p) == nil {
+			t.Fatalf("publication-gap prune removed valid local file %s", p)
+		}
+	}
+
+	// Unlike the pub/sub echo, observing a child in the authoritative directory
+	// hash must produce an upsert even when every scalar is unchanged, because
+	// that upsert clears LocalOnly.
+	confirmedPath := "shoot/track-02.mov"
+	upserts, _ := buildReconcileChildEntries(
+		[]dirChild{{inode: 22, childPath: confirmedPath, mode: 0o644}},
+		map[uint64][]byte{22: encodeInodeAttr(mt.Unix(), 20<<20)},
+		store.LookupByPath,
+	)
+	if len(upserts) != 1 {
+		t.Fatalf("directory confirmation produced %d upserts, want 1 to clear LocalOnly", len(upserts))
+	}
+	store.InsertToCache(upserts[0])
+	if err := store.Insert(upserts[0]); err != nil {
+		t.Fatalf("persist confirmed child: %v", err)
+	}
+	if got := store.LookupByPath(confirmedPath); got == nil || got.LocalOnly {
+		t.Fatalf("directory confirmation did not clear LocalOnly: %#v", got)
+	}
+}
+
 // ===========================================================================
 // LIVE-REDIS tests (skip cleanly when no local Redis is reachable). These
 // exercise reconcileDir end-to-end and the PARITY gate: incremental store

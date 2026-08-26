@@ -1133,7 +1133,8 @@ func buildReconcileChildEntries(children []dirChild, attrByInode map[uint64][]by
 		if existing == nil ||
 			existing.Mtime.Unix() != e.Mtime.Unix() ||
 			existing.Size != e.Size ||
-			existing.Inode != e.Inode {
+			existing.Inode != e.Inode ||
+			existing.LocalOnly {
 			toUpsert = append(toUpsert, e)
 		}
 		// A never-mirrored (or recreated) child DIR needs its own contents
@@ -1413,11 +1414,14 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 }
 
 // scopedPrune removes store children of parentPath that are absent from the
-// fresh Redis child-name set, applying the QA-30 Layer C (pin) and Layer A
-// (FUSE Lstat) guards VERBATIM in spirit from syncMetadata. Unlike the full
-// SCAN's PruneThreshold ladder, a push 'hdel'/'del' is an authoritative,
-// targeted delete signal, so we act on a single observation — but still never
-// prune a pinned file (Layer C) or a FUSE-present file (Layer A).
+// fresh Redis child-name set, applying the local-publication, QA-30 Layer C
+// (pin), and Layer A (FUSE Lstat) guards. Unlike the full SCAN's
+// PruneThreshold ladder, a push 'hdel'/'del' is an authoritative, targeted
+// delete signal for established backend entries, so we act on a single
+// observation. A LocalOnly child is different: its NFS create is already
+// visible in the local mirror while JuiceFS may not have published the parent
+// directory hash yet. Absence from that hash is therefore not delete evidence
+// until a later reconcile actually observes the child and clears LocalOnly.
 func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]struct{}) {
 	children, err := rc.store.ListChildren(parentPath)
 	if err != nil || len(children) == 0 {
@@ -1449,6 +1453,17 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 	var candidates []string // internal paths to delete
 	for _, ch := range children {
 		if _, present := freshNames[ch.Name]; present {
+			continue
+		}
+		// A local NFS create is inserted into the mirror before JuiceFS commits
+		// its directory entry to Redis. The self-write pub/sub echo deliberately
+		// preserves LocalOnly; only seeing this exact child in HGETALL/full SCAN
+		// clears it. During a burst, HGETALL can therefore contain the first
+		// drained files while later files are still local-only. Pruning those
+		// later entries made valid files disappear between close and reopen in
+		// the live multi-track FUSE workflow. LocalOnly is the authoritative
+		// publication-gap guard; explicit local Remove already deletes the row.
+		if ch.LocalOnly {
 			continue
 		}
 		// === `._` AppleDouble guard (release-battery ._dirN had_shadow STALE) ===
