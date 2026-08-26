@@ -13,18 +13,18 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/farmqueue"
 )
 
-// TestManagerDefaultFarmJobDrainsOnGenericWorker exercises the production Redis
-// path that regressed when per-kind queues were introduced: the Manager's
-// default [derivatives] job must be consumable by a generic worker whose kinds
-// are empty (the configuration older deployments already have).
+// TestManagerDefaultFarmJobDrainsOnServerWorker exercises the current
+// production Redis path end to end: the Manager's default [derivatives] job is
+// routed to the server lane, capability-checked, durably claimed, completed,
+// and acknowledged by the worker profile shipped in cmd/jmfarm.
 //
 // Set JM_TEST_REDIS to an isolated redis:// URL. The test creates one terminal
 // job record with the normal seven-day TTL, so it must never target production
 // metadata Redis.
-func TestManagerDefaultFarmJobDrainsOnGenericWorker(t *testing.T) {
+func TestManagerDefaultFarmJobDrainsOnServerWorker(t *testing.T) {
 	metaURL := os.Getenv("JM_TEST_REDIS")
 	if metaURL == "" {
-		t.Skip("set JM_TEST_REDIS to run the Manager → Redis → generic-worker integration test")
+		t.Skip("set JM_TEST_REDIS to run the Manager → Redis → server-worker integration test")
 	}
 
 	q, err := farmqueue.Open(metaURL)
@@ -57,22 +57,35 @@ func TestManagerDefaultFarmJobDrainsOnGenericWorker(t *testing.T) {
 		t.Fatal("enqueue response has no job id")
 	}
 
-	job, ok, err := q.DequeueKinds(ctx, time.Second, nil)
+	worker := farmqueue.Worker{
+		ID:           "manager-live-server-" + farmqueue.NewID(),
+		Name:         "manager-live-server",
+		Role:         farmqueue.QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"},
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, worker)
 	if err != nil {
-		t.Fatalf("generic worker dequeue: %v", err)
+		t.Fatalf("server worker claim: %v", err)
 	}
 	if !ok {
-		t.Fatal("generic worker did not receive Manager's default derivatives job")
+		t.Fatal("server worker did not receive Manager's default derivatives job")
 	}
+	job := claim.Job
 	if job.ID != response.ID || len(job.Kinds) != 1 || job.Kinds[0] != farmqueue.KindDerivatives {
 		t.Fatalf("dequeued job = %+v, want Manager derivatives job %q", job, response.ID)
 	}
+	if job.QueueClass != farmqueue.QueueClassServer || job.SelectedBackend != "server-cpu" {
+		t.Fatalf("routing = class %q backend %q, want server/server-cpu", job.QueueClass, job.SelectedBackend)
+	}
 
-	if err := q.MarkRunning(ctx, job.ID); err != nil {
+	if err := q.MarkClaimRunning(ctx, claim, worker); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
 	if err := q.MarkDone(ctx, job.ID, 1, 0); err != nil {
 		t.Fatalf("mark done: %v", err)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatalf("ack claim: %v", err)
 	}
 
 	jobs, err := q.ListJobs(ctx, 10)

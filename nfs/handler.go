@@ -34,18 +34,18 @@ import (
 // metadata from SQLite and proxying file I/O to JuiceFS FUSE.
 type JuiceMountHandler struct {
 	store       *metadata.Store
-	fusePath    string // path to hidden JuiceFS FUSE mount
-	mountPoint  string // user-facing NFS mount (e.g. /Volumes/zpool); used to canonicalize pin keys
-	cacheReader *cache.Reader
+	fusePath    string                 // path to hidden JuiceFS FUSE mount
+	mountPoint  atomic.Pointer[string] // user-facing NFS mount; published with pinStore
+	cacheReader atomic.Pointer[cache.Reader]
 	fdPool      *FDPool
 	readahead   *ReadaheadManager
 	memBuf      *MemoryBuffer
-	redisClient *metadata.RedisClient // for publishing events
-	pinStore    *pin.Store            // optional; gates reads when offline mode is on
-	presence    *PresenceTracker      // optional; who-has-this-open (Tier-1 #3)
-	thumbWarmer *ThumbWarmer          // optional (#1 hydration pack); nil-safe
-	sidecar     *sidecarCache         // `._` AppleDouble body cache (nav crux); nil-safe
-	blipHook    func() bool           // test override for backendBlipActive (#9)
+	redisClient atomic.Pointer[metadata.RedisClient] // for publishing events
+	pinStore    atomic.Pointer[pin.Store]            // optional; gates reads when offline mode is on
+	presence    atomic.Pointer[PresenceTracker]      // optional; who-has-this-open (Tier-1 #3)
+	thumbWarmer atomic.Pointer[ThumbWarmer]          // optional (#1 hydration pack); nil-safe
+	sidecar     *sidecarCache                        // `._` AppleDouble body cache (nav crux); nil-safe
+	blipHook    func() bool                          // test override for backendBlipActive (#9)
 
 	// Synthetic inode counter for locally-created entries (atomic)
 	inodeCounter atomic.Uint64
@@ -148,9 +148,10 @@ type JuiceMountHandler struct {
 	// lookup. Files written via spool are temporarily invisible to
 	// reads until the drainer copies them to FUSE (documented
 	// limitation in docs/ROADMAP/option-2-spool.md).
-	spool            *SpoolStore
-	drainer          *Drainer
-	spoolSweeperStop func() // stops the idle-finalize sweeper; set by SetSpool
+	spool            atomic.Pointer[SpoolStore]
+	drainer          atomic.Pointer[Drainer]
+	spoolLifecycleMu sync.Mutex
+	spoolSweeperStop func() // guarded by spoolLifecycleMu
 }
 
 type verifierData struct {
@@ -783,7 +784,7 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 
 // SetCacheReader attaches a direct SSD cache reader for bypassing FUSE on cached reads.
 func (h *JuiceMountHandler) SetCacheReader(cr *cache.Reader) {
-	h.cacheReader = cr
+	h.cacheReader.Store(cr)
 }
 
 // invalidateReadCaches drops any cached bytes for path from BOTH the memory
@@ -809,9 +810,9 @@ func (h *JuiceMountHandler) invalidateReadCaches(path string) {
 	if h.memBuf != nil {
 		h.memBuf.Invalidate(path)
 	}
-	if h.cacheReader != nil {
+	if cr := h.cacheReader.Load(); cr != nil {
 		if e := h.store.LookupByPath(path); e != nil {
-			h.cacheReader.InvalidateSliceCache(e.Inode)
+			cr.InvalidateSliceCache(e.Inode)
 		}
 	}
 }
@@ -896,14 +897,17 @@ func (h *JuiceMountHandler) invalidatePooledReadFDTree(inMountPath string) {
 // used as the prefix when canonicalizing in-mount filenames into the
 // absolute paths the pin store keys on.
 func (h *JuiceMountHandler) SetPinStore(ps *pin.Store, mountPoint string) {
-	h.pinStore = ps
-	h.mountPoint = mountPoint
+	// Publish the mount point before the store. A reader that observes the
+	// store is therefore guaranteed to observe the matching canonical prefix.
+	mp := mountPoint
+	h.mountPoint.Store(&mp)
+	h.pinStore.Store(ps)
 }
 
 // SetThumbWarmer attaches the #1 hydration-pack warmer (optional; the
 // readdir hook is nil-safe). Wired by the bridge after the derivative
 // index + thumb cache exist.
-func (h *JuiceMountHandler) SetThumbWarmer(w *ThumbWarmer) { h.thumbWarmer = w }
+func (h *JuiceMountHandler) SetThumbWarmer(w *ThumbWarmer) { h.thumbWarmer.Store(w) }
 
 // FlushStaleFDs invalidates every pooled FUSE fd (#12) — called by the
 // bridge after a watchdog remount, when all pooled fds reference the dead
@@ -925,7 +929,10 @@ func (h *JuiceMountHandler) FlushStaleFDs() (closed, marked int) {
 //
 // Falls back to the legacy hardcoded prefix when no mount point is set.
 func (h *JuiceMountHandler) canonicalize(filename string) string {
-	mp := h.mountPoint
+	mp := ""
+	if configured := h.mountPoint.Load(); configured != nil {
+		mp = *configured
+	}
 	if mp == "" {
 		mp = "/Volumes/zpool"
 	}
@@ -949,10 +956,11 @@ func (h *JuiceMountHandler) canonicalize(filename string) string {
 // store with status=Ready. Used by the offline-mode open gate.
 // Indexed lookup — safe to call on every OpenFile.
 func (h *JuiceMountHandler) isPinnedReady(canonicalPath string) bool {
-	if h.pinStore == nil {
+	ps := h.pinStore.Load()
+	if ps == nil {
 		return false
 	}
-	return h.pinStore.IsPinnedReady(canonicalPath)
+	return ps.IsPinnedReady(canonicalPath)
 }
 
 // SetSpool attaches the JuiceMount-side write spool and its drainer, and
@@ -969,8 +977,9 @@ func (h *JuiceMountHandler) isPinnedReady(canonicalPath string) bool {
 // Must be called before drainer.Start (it registers the drain-complete
 // callback, which worker goroutines read).
 func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
-	h.spool = spool
-	h.drainer = drainer
+	h.spoolLifecycleMu.Lock()
+	defer h.spoolLifecycleMu.Unlock()
+
 	if drainer != nil {
 		// Post-drain hook: once a spooled file lands in FUSE, sync its real
 		// size into the metadata cache and publish a create event — the
@@ -1038,6 +1047,12 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		}
 		h.spoolSweeperStop = spool.StartSweeper(idle, 0)
 	}
+
+	// Publish the configured objects only after every callback and the sweeper
+	// are wired. NFS begins accepting requests before optional bridge services
+	// finish startup, so readers must see either nil or a complete spool setup.
+	h.drainer.Store(drainer)
+	h.spool.Store(spool)
 }
 
 // publishDrainedSize syncs the real drained size into the metadata cache. It
@@ -1073,8 +1088,8 @@ func (h *JuiceMountHandler) onSpoolDrained(nfsPath string, size int64) {
 	// same name, which routes through the spool), the direct-SSD slice cache
 	// still maps this inode to the OLD slice IDs and the memory buffer holds
 	// the old content; drop both so reads see the freshly-drained data.
-	if h.cacheReader != nil && inode != 0 {
-		h.cacheReader.InvalidateSliceCache(inode)
+	if cr := h.cacheReader.Load(); cr != nil && inode != 0 {
+		cr.InvalidateSliceCache(inode)
 	}
 	if h.memBuf != nil {
 		h.memBuf.Invalidate(nfsPath)
@@ -1099,11 +1114,11 @@ func (h *JuiceMountHandler) onSymlinkMaterialized(linkPath string) {
 
 // SetPresence attaches the cross-Mac who-has-this-open tracker (Tier-1 #3).
 // Nil disables presence reporting entirely.
-func (h *JuiceMountHandler) SetPresence(pt *PresenceTracker) { h.presence = pt }
+func (h *JuiceMountHandler) SetPresence(pt *PresenceTracker) { h.presence.Store(pt) }
 
 // SetRedisClient attaches a Redis client for publishing metadata events.
 func (h *JuiceMountHandler) SetRedisClient(rc *metadata.RedisClient) {
-	h.redisClient = rc
+	h.redisClient.Store(rc)
 }
 
 // nextSyntheticInode returns a unique inode for locally-created entries.
@@ -1133,7 +1148,9 @@ func (h *JuiceMountHandler) incActiveWriter(path string) {
 // entry when the count returns to zero so the map doesn't grow unbounded
 // across the process lifetime.
 func (h *JuiceMountHandler) decActiveWriter(path string) {
-	h.presence.Close(path)
+	if pt := h.presence.Load(); pt != nil {
+		pt.Close(path)
+	}
 	h.activeWritersMu.Lock()
 	if c, ok := h.activeWriters[path]; ok {
 		if c <= 1 {
@@ -1461,7 +1478,7 @@ func (h *JuiceMountHandler) asyncConfirmPhantomPurge(filename, fusePath string) 
 		if h.fdPool != nil && h.fdPool.HasOpenRefs(fusePath) {
 			return
 		}
-		if h.spool != nil && h.spool.HasPending(filename) {
+		if spool := h.spool.Load(); spool != nil && spool.HasPending(filename) {
 			return
 		}
 		// V2.3 G0: a plain-dir mountpoint (kext not loaded / mount absent)
@@ -1489,13 +1506,14 @@ func (h *JuiceMountHandler) asyncConfirmPhantomPurge(filename, fusePath string) 
 
 // publishEvent sends a metadata event via Redis SUBSCRIBE if a client is configured.
 func (h *JuiceMountHandler) publishEvent(evt metadata.MetadataEvent) {
-	if h.redisClient == nil {
+	rc := h.redisClient.Load()
+	if rc == nil {
 		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		h.redisClient.PublishEvent(ctx, evt)
+		rc.PublishEvent(ctx, evt)
 	}()
 }
 
@@ -1584,7 +1602,7 @@ func (h *JuiceMountHandler) evictStaleWriteSizes(ttl time.Duration) int {
 		if h.hasActiveWriter(k) {
 			continue
 		}
-		if h.spool != nil && h.spool.HasPending(k) {
+		if spool := h.spool.Load(); spool != nil && spool.HasPending(k) {
 			continue
 		}
 		h.writeSizeMu.Lock()
@@ -1632,14 +1650,20 @@ func (h *JuiceMountHandler) evictStaleVerifiers(ttl time.Duration) {
 // spool, and the spool's index/db are still needed during the drainer
 // drain-window. Old fdPool and verifierStop sweep after that.
 func (h *JuiceMountHandler) StopHandler() {
-	if h.spoolSweeperStop != nil {
-		h.spoolSweeperStop() // stop finalizing new entries before draining down
+	h.spoolLifecycleMu.Lock()
+	stopSweeper := h.spoolSweeperStop
+	h.spoolSweeperStop = nil
+	drainer := h.drainer.Load()
+	spool := h.spool.Load()
+	h.spoolLifecycleMu.Unlock()
+	if stopSweeper != nil {
+		stopSweeper() // stop finalizing new entries before draining down
 	}
-	if h.drainer != nil {
-		h.drainer.Stop(30 * time.Second)
+	if drainer != nil {
+		drainer.Stop(30 * time.Second)
 	}
-	if h.spool != nil {
-		h.spool.Stop()
+	if spool != nil {
+		spool.Stop()
 	}
 	if h.verifierStop != nil {
 		close(h.verifierStop)
@@ -1933,7 +1957,7 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 	// the spool. Recover straight from the spool shadow and skip the doomed
 	// (2s-timeout) Lstat entirely — HasPending keys by the same no-leading-slash
 	// store path scheme used to build the FUSE path below.
-	if h.spool != nil && h.spool.HasPending(strings.TrimLeft(shadow.Path, "/")) {
+	if spool := h.spool.Load(); spool != nil && spool.HasPending(strings.TrimLeft(shadow.Path, "/")) {
 		recovered := h.store.RecoverShadow(shadow, inode)
 		jmlog.Info("FromHandle recovered spool-pending evicted entry",
 			"inode", fmt.Sprintf("%x", inode),
@@ -2037,13 +2061,17 @@ func (jfs *juiceFS) fullPath(filename string) string {
 //
 // 200ms is the timeout — see the call site for the rationale.
 func (jfs *juiceFS) cacheProbeHit(e *metadata.Entry) bool {
-	if e == nil || jfs.handler.cacheReader == nil {
+	if e == nil {
+		return false
+	}
+	cr := jfs.handler.cacheReader.Load()
+	if cr == nil {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	var scratch [4096]byte
-	n, err := jfs.handler.cacheReader.ReadBlock(ctx, e.Inode, 0, scratch[:])
+	n, err := cr.ReadBlock(ctx, e.Inode, 0, scratch[:])
 	return err == nil && n > 0
 }
 
@@ -2068,8 +2096,8 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 	// (measured in slice A benchmarks). Adding it BEFORE the
 	// writeSizes lock + metadata lookup keeps the hot path's
 	// per-RPC tax at a no-op when no writes are in flight.
-	if jfs.handler.spool != nil {
-		if e, ok := jfs.handler.spool.LookupActive(filename); ok {
+	if spool := jfs.handler.spool.Load(); spool != nil {
+		if e, ok := spool.LookupActive(filename); ok {
 			return spoolFileInfoForEntry(path.Base(filename), e), nil
 		}
 	}
@@ -2170,7 +2198,7 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 				// any file Resolve, Finder Quick Look, or any other
 				// long-open reader has open — the dominant per-metadata-
 				// RPC tax in the playback workload.
-			} else if jfs.handler.redisClient != nil && jfs.handler.redisClient.RecentlyDegraded(60*time.Second) {
+			} else if rc := jfs.handler.redisClient.Load(); rc != nil && rc.RecentlyDegraded(60*time.Second) {
 				// Treat the cache entry as authoritative. Skip purge.
 			} else if strings.HasPrefix(path.Base(filename), "._") {
 				// QA-31 (2026-06-28): NEVER phantom-purge a ._AppleDouble sidecar.
@@ -2185,7 +2213,7 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 				// sidecars are transient metadata; a lingering cache entry is
 				// harmless (overwritten on the next create), so keeping it is
 				// strictly safer than risking a STALE on Finder's open handle.
-			} else if jfs.handler.spool != nil && jfs.handler.spool.HasPending(filename) {
+			} else if spool := jfs.handler.spool.Load(); spool != nil && spool.HasPending(filename) {
 				// QA-30 Layer D, on-Stat purge twin (2026-06-28): NEVER purge a
 				// spool-pending file. A file Finder wrote-and-closed sits in the
 				// spool — no active writer, no open FD, not yet on FUSE — until
@@ -2270,7 +2298,7 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 	// Pinned-and-ready files bypass this: by construction the pin
 	// store knows about them, the FUSE path serves from local cache
 	// without touching Redis.
-	if pin.IsOffline() && jfs.handler.pinStore != nil {
+	if pin.IsOffline() && jfs.handler.pinStore.Load() != nil {
 		canonical := jfs.handler.canonicalize(filename)
 		if !jfs.handler.isPinnedReady(canonical) {
 			jmlog.Debug("offline: refusing stat of un-pinned, un-cached file",
@@ -2346,8 +2374,8 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 	// — empty-spool lookup is ~8 ns and gates the lookup before the
 	// macOS-metadata filter so an in-flight file with one of those
 	// base names is still served from spool. (Unlikely but valid.)
-	if jfs.handler.spool != nil {
-		if e, ok := jfs.handler.spool.LookupActive(filename); ok {
+	if spool := jfs.handler.spool.Load(); spool != nil {
+		if e, ok := spool.LookupActive(filename); ok {
 			return spoolFileInfoForEntry(path.Base(filename), e), nil
 		}
 	}
@@ -2490,7 +2518,9 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 			// #1 hydration pack: hydrate this dir's farm thumbnails into
 			// the local cache in the background. Non-blocking enqueue
 			// (TTL-deduped inside); nil when the warmer isn't wired.
-			jfs.handler.thumbWarmer.WarmDirAsync(dirname)
+			if warmer := jfs.handler.thumbWarmer.Load(); warmer != nil {
+				warmer.WarmDirAsync(dirname)
+			}
 			// Nav crux: front-run Finder's per-entry `._` AppleDouble reads
 			// by warming this dir's sidecar bodies into the RAM cache.
 			jfs.handler.sidecarWarmDirAsync(dirname)
@@ -2931,8 +2961,8 @@ func (jfs *juiceFS) StatCacheOnly(filename string) (os.FileInfo, bool) {
 	// the guarded-CREATE hot path this also serves is unaffected — and a
 	// genuinely-new name (the CREATE case) is NOT in the spool, so CREATE still
 	// correctly sees "absent" and proceeds.
-	if jfs.handler.spool != nil {
-		if e, ok := jfs.handler.spool.LookupActive(filename); ok {
+	if spool := jfs.handler.spool.Load(); spool != nil {
+		if e, ok := spool.LookupActive(filename); ok {
 			return spoolFileInfoForEntry(path.Base(filename), e), true
 		}
 	}
@@ -2964,8 +2994,8 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	// (benchmarked in slice A). Adding it here BEFORE the metadata
 	// lookup keeps the read-OpenFile hot path's per-RPC overhead at
 	// a no-op when no writes are in flight.
-	if !isWrite && jfs.handler.spool != nil {
-		if sentry, ok := jfs.handler.spool.LookupActive(filename); ok {
+	if spool := jfs.handler.spool.Load(); !isWrite && spool != nil {
+		if sentry, ok := spool.LookupActive(filename); ok {
 			return &spoolReadFile{
 				name:  filename,
 				entry: sentry,
@@ -2992,12 +3022,13 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	// (JuiceFS LRU serves from local SSD; no backend round-trip needed).
 	var isPinned bool
 	var canonical string
-	if !isWrite && jfs.handler.pinStore != nil {
+	hasPinStore := jfs.handler.pinStore.Load() != nil
+	if !isWrite && hasPinStore {
 		canonical = jfs.handler.canonicalize(filename)
 		isPinned = jfs.handler.isPinnedReady(canonical)
 	}
 
-	if !isWrite && pin.IsOffline() && jfs.handler.pinStore != nil && !isPinned {
+	if !isWrite && pin.IsOffline() && hasPinStore && !isPinned {
 		// C.2 fix (QA-12, 2026-05-17): before refusing the open,
 		// probe whether the SSD cache can serve the first block of
 		// this file. If it can, the file is "recently cached" and
@@ -3066,7 +3097,7 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 						"path", filename)
 					return nil, err
 				}
-				if jfs.handler.spool != nil && jfs.handler.spool.HasPending(filename) {
+				if spool := jfs.handler.spool.Load(); spool != nil && spool.HasPending(filename) {
 					// QA-30 Layer D twin (2026-06-28): spool-pending file —
 					// written+closed but not yet drained, so FUSE ENOENT is
 					// expected, not a phantom. Purging it destroys the cache
@@ -3120,7 +3151,7 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			fusePath:    fusePath,
 			fdPool:      jfs.handler.fdPool,
 			handler:     jfs.handler,
-			cacheReader: jfs.handler.cacheReader,
+			cacheReader: jfs.handler.cacheReader.Load(),
 			readahead:   jfs.handler.readahead,
 			memBuf:      jfs.handler.memBuf,
 			inode:       e.Inode,
@@ -3155,9 +3186,9 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 		// in-place modify of a file that already lives in FUSE; that MUST
 		// stay on the legacy fdPool path so the drainer never truncates it
 		// via os.Create.
-		if jfs.handler.spool != nil {
-			if _, active := jfs.handler.spool.LookupActive(filename); active {
-				sentry, err := jfs.handler.spool.OpenWrite(filename)
+		if spool := jfs.handler.spool.Load(); spool != nil {
+			if _, active := spool.LookupActive(filename); active {
+				sentry, err := spool.OpenWrite(filename)
 				if err != nil {
 					return nil, err
 				}
@@ -3239,11 +3270,12 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 // not currently spooled (already drained, or spool disabled — those bytes are
 // durable via their own path).
 func (jfs *juiceFS) CommitFile(path string) error {
-	if jfs.handler.spool == nil {
+	spool := jfs.handler.spool.Load()
+	if spool == nil {
 		return nil
 	}
 	path = strings.TrimPrefix(path, "/")
-	if e, ok := jfs.handler.spool.Index().Lookup(path); ok {
+	if e, ok := spool.Index().Lookup(path); ok {
 		start := time.Now()
 		err := e.Sync()
 		// #105: mark committed so the sweeper finalizes even a large entry on the
@@ -3280,7 +3312,7 @@ func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 	// directory listings immediately. Stat/Lstat/READ are shadowed by the
 	// spool index (real growing size) until the drainer lands the file, at
 	// which point onSpoolDrained syncs the final size into this entry.
-	if jfs.handler.spool != nil {
+	if spool := jfs.handler.spool.Load(); spool != nil {
 		inode := jfs.handler.nextSyntheticInode()
 		e := metadata.MakeEntry(filename, false, 0, now, inode)
 		e.LocalOnly = true
@@ -3298,7 +3330,7 @@ func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 		jfs.handler.store.InsertToCache(e)
 		go jfs.handler.store.Insert(e)
 
-		sentry, err := jfs.handler.spool.OpenWrite(filename)
+		sentry, err := spool.OpenWrite(filename)
 		if err != nil {
 			return nil, err
 		}
@@ -3356,7 +3388,7 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	// the spool still targets the old path is exactly the silent-resurrect
 	// bug this exists to fix. The client retries cleanly.
 	migrated := 0
-	if jfs.handler.spool != nil {
+	if spool := jfs.handler.spool.Load(); spool != nil {
 		// Cancel any active destination entry UNCONDITIONALLY (adversarial-
 		// review BUG C) — gating on LookupActive missed rows recovered at
 		// boot, which are deliberately NOT re-indexed (RecoverOnBoot): a
@@ -3364,8 +3396,8 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 		// after ours and overwrite the renamed file with the replaced file's
 		// bytes. CancelForDelete is a no-op when nothing exists (same
 		// unconditional pattern as Remove).
-		jfs.handler.spool.CancelForDelete(newpath)
-		n, needSignal, err := jfs.handler.spool.MigrateForRename(oldpath, newpath)
+		spool.CancelForDelete(newpath)
+		n, needSignal, err := spool.MigrateForRename(oldpath, newpath)
 		if err != nil {
 			jmlog.Warn("rename: spool migration failed — failing RPC",
 				"old", oldpath, "new", newpath, "error", err.Error())
@@ -3378,7 +3410,7 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 			// destination, and our own os.Rename then failed EEXIST against
 			// the directory we had just caused to exist. See
 			// MigrateForRename's note and JuiceMount task #2.
-			defer jfs.handler.spool.SignalReady()
+			defer spool.SignalReady()
 		}
 	}
 
@@ -3580,8 +3612,8 @@ func (jfs *juiceFS) Remove(filename string) error {
 	// mid-flight drain can't resurrect the file we're about to delete. A
 	// drain already copying to FUSE undoes its write when it finds the row
 	// gone at MarkDrainComplete.
-	if jfs.handler.spool != nil {
-		jfs.handler.spool.CancelForDelete(filename)
+	if spool := jfs.handler.spool.Load(); spool != nil {
+		spool.CancelForDelete(filename)
 	}
 
 	e := jfs.handler.store.LookupByPath(filename)
@@ -3761,7 +3793,7 @@ func (jfs *juiceFS) Symlink(target, link string) error {
 			}
 			return err
 		}
-	} else if jfs.handler.spool != nil {
+	} else if spool := jfs.handler.spool.Load(); spool != nil {
 		// PERSIST the deferred link BEFORE inserting into the cache, so a crash
 		// in the (instant) window between the two leaves a durable record rather
 		// than a cache-only link that vanishes on restart with nothing to
@@ -3769,7 +3801,7 @@ func (jfs *juiceFS) Symlink(target, link string) error {
 		// the target. A nil spool means spool/offline-defer is disabled, so we
 		// fall through to the in-memory mirror only (best-effort, non-durable) —
 		// the same posture MkdirAll has with no spool wired.
-		if err := jfs.handler.spool.Meta().PutPendingSymlink(link, target); err != nil {
+		if err := spool.Meta().PutPendingSymlink(link, target); err != nil {
 			return err
 		}
 	}
@@ -3838,8 +3870,8 @@ func (jfs *juiceFS) Readlink(link string) (string, error) {
 	// the store on a not-exist error and only when a spool is wired — a genuine
 	// EINVAL (not a symlink) or other error must still propagate so onReadLink
 	// maps it faithfully.
-	if os.IsNotExist(err) && jfs.handler.spool != nil {
-		if t, gerr := jfs.handler.spool.Meta().GetPendingSymlink(link); gerr == nil {
+	if spool := jfs.handler.spool.Load(); os.IsNotExist(err) && spool != nil {
+		if t, gerr := spool.Meta().GetPendingSymlink(link); gerr == nil {
 			return t, nil
 		}
 	}
@@ -3888,7 +3920,8 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 	// via os.Create regardless, and store.UpdateMode below is the authoritative
 	// NFS-served mode; the FUSE chmod only matters for an IN-PLACE chmod of an
 	// already-landed file. Skip too if there's no FUSE root (bare-handler tests).
-	if h.fusePath != "" && (h.spool == nil || !h.spool.HasPending(rel)) {
+	spool := h.spool.Load()
+	if h.fusePath != "" && (spool == nil || !spool.HasPending(rel)) {
 		fusePath := path.Join(h.fusePath, rel)
 		// BOUNDED (task #70): os.Chmod FOLLOWS symlinks → a framework's nested
 		// links drive it into the most contended JuiceFS resolution; unbounded it

@@ -19,10 +19,19 @@ import (
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
 
-const (
-	redisURL  = "redis://127.0.0.1:6379/1"
-	mountBase = "/tmp/jm5-e2e"
+const mountBase = "/tmp/jm5-e2e"
+
+var (
+	redisURL = testEnvOrDefault("JM_TEST_VOLUME_REDIS", "redis://127.0.0.1:6379/1")
+	minioURL = testEnvOrDefault("JM_TEST_MINIO_URL", "http://127.0.0.1:9000")
 )
+
+func testEnvOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
 
 // fusePath is the JuiceFS FUSE mount for the CURRENT user. It was the literal
 // "/Users/USER/.juicemount/fuse-internal" — a path no machine has — and it is
@@ -92,9 +101,10 @@ func setupE2E(t *testing.T) *e2eEnv {
 	srv.Handler().SetRedisClient(rc)
 
 	// Health monitor
+	redisAddr, _, _ := metadata.ParseRedisURL(redisURL)
 	mon := health.New(health.Config{
-		RedisURL:      "127.0.0.1:6379",
-		MinIOURL:      "http://127.0.0.1:9000",
+		RedisURL:      redisAddr,
+		MinIOURL:      minioURL,
 		FUSEPath:      fusePath,
 		NFSMountPoint: "",
 	})

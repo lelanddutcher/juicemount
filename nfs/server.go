@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"syscall"
@@ -74,12 +75,16 @@ func (s *Server) Start() error {
 
 	// Start serving in background
 	go func() {
-		if err := nfslib.Serve(s.listener, s.handler); err != nil {
+		if err := nfslib.Serve(s.listener, s.handler); unexpectedServeError(err) {
 			jmlog.Error("nfs server stopped with error", "error", err.Error())
 		}
 	}()
 
 	return nil
+}
+
+func unexpectedServeError(err error) bool {
+	return err != nil && !errors.Is(err, net.ErrClosed)
 }
 
 // Stop closes the listener and stops the server.

@@ -37,6 +37,9 @@ var fuseMountPath = fuseInternalPath()
 // worktree and on any machine, instead of only on the one whose path was
 // hardcoded.
 func fuseInternalPath() string {
+	if path := os.Getenv("JM_TEST_FUSE_PATH"); path != "" {
+		return filepath.Clean(path)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -310,15 +313,13 @@ func TestFinderPerf_DeepNavigation(t *testing.T) {
 	t.Log("(Simulates: Finder clicking through Project > Footage > Day1 > Camera A)")
 	t.Log("")
 
-	// Use a known deep path instead of walking the entire FUSE tree
-	// (walking 146K entries through FUSE takes too long over WiFi)
-	rel := "Film Projects/GMTM/All Sports Combines/7v7 Elite SPARQ St Pete/Footage/Friday"
-	maxDepth := strings.Count(rel, "/") + 1
-
-	// Verify it exists
-	if _, err := os.Stat(filepath.Join(fuseMountPath, rel)); err != nil {
-		t.Skipf("Deep path not found: %v", err)
+	// Select an existing path shared by both views. Hard-coding one user's
+	// production project made the check skip on every clean fixture.
+	rel, ok := deepestCommonDirectory(fuseMountPath, nfsMount)
+	if !ok {
+		t.Fatal("no common deep path available for NFS/FUSE navigation")
 	}
+	maxDepth := strings.Count(rel, "/") + 1
 	t.Logf("Deepest path: %s (depth=%d)", rel, maxDepth)
 
 	nfsDeep := filepath.Join(nfsMount, rel)
@@ -562,21 +563,28 @@ func TestFinderPerf_Summary(t *testing.T) {
 	fuseST := benchmarkStat(t, "FUSE", fuseMountPath, 10)
 	results = append(results, result{"Stat (per file)", nfsST, fuseST, float64(fuseST) / float64(nfsST)})
 
-	// Deep lookup — use known path
-	deepRel := "Film Projects/GMTM/All Sports Combines/7v7 Elite SPARQ St Pete/Footage/Friday"
+	// Deep lookup — choose a directory that exists in both arms. The former
+	// hard-coded production path made this isolated E2E test fail on every clean
+	// fixture and could benchmark unrelated user data when it happened to exist.
+	deepRel, ok := deepestCommonDirectory(fuseMountPath, nfsMount)
+	if !ok {
+		t.Fatal("no common directory available for NFS/FUSE deep-lookup comparison")
+	}
 	deepDepth := strings.Count(deepRel, "/") + 1
 	nfsDL := benchmarkDeepLookup(t, "NFS", filepath.Join(nfsMount, deepRel), 50)
 	fuseDL := benchmarkDeepLookup(t, "FUSE", filepath.Join(fuseMountPath, deepRel), 50)
 	results = append(results, result{fmt.Sprintf("Deep lookup (%d levels)", deepDepth), nfsDL, fuseDL, float64(fuseDL) / float64(nfsDL)})
 
-	// Tree walk
+	// Tree walk the same fixture subtree instead of assuming a production
+	// directory named "Film Projects" exists.
+	treeRel := strings.Split(deepRel, "/")[0]
 	nfsTW := time.Now()
-	filepath.Walk(filepath.Join(nfsMount, "Film Projects"), func(path string, info os.FileInfo, err error) error { return nil })
+	filepath.Walk(filepath.Join(nfsMount, treeRel), func(path string, info os.FileInfo, err error) error { return nil })
 	nfsTWDur := time.Since(nfsTW)
 	fuseTW := time.Now()
-	filepath.Walk(filepath.Join(fuseMountPath, "Film Projects"), func(path string, info os.FileInfo, err error) error { return nil })
+	filepath.Walk(filepath.Join(fuseMountPath, treeRel), func(path string, info os.FileInfo, err error) error { return nil })
 	fuseTWDur := time.Since(fuseTW)
-	results = append(results, result{"Tree walk (Film Projects)", nfsTWDur, fuseTWDur, float64(fuseTWDur) / float64(nfsTWDur)})
+	results = append(results, result{"Tree walk (fixture)", nfsTWDur, fuseTWDur, float64(fuseTWDur) / float64(nfsTWDur)})
 
 	// Print summary table
 	t.Log("")
@@ -594,4 +602,34 @@ func TestFinderPerf_Summary(t *testing.T) {
 			r.speedup)
 	}
 	t.Log("└────────────────────────────┴────────────┴────────────┴──────────┘")
+}
+
+// deepestCommonDirectory finds the deepest non-hidden relative directory that
+// is currently reachable through both views of the same volume.
+func deepestCommonDirectory(fuseRoot, nfsRoot string) (string, bool) {
+	best := ""
+	bestDepth := 0
+	_ = filepath.WalkDir(fuseRoot, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || !entry.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(fuseRoot, path)
+		if relErr != nil || rel == "." {
+			return nil
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		for _, part := range parts {
+			if strings.HasPrefix(part, ".") {
+				return filepath.SkipDir
+			}
+		}
+		if info, statErr := os.Stat(filepath.Join(nfsRoot, rel)); statErr != nil || !info.IsDir() {
+			return nil
+		}
+		if depth := len(parts); depth > bestDepth {
+			best, bestDepth = rel, depth
+		}
+		return nil
+	})
+	return best, best != ""
 }

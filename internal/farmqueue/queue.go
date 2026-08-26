@@ -322,7 +322,12 @@ func (c *Client) Enqueue(ctx context.Context, j Job) error {
 	pipe.LPush(ctx, QueueKeyFor(&j), raw)
 	pipe.HSet(ctx, JobHashPrefix+j.ID, st.toMap())
 	pipe.Expire(ctx, JobHashPrefix+j.ID, JobTTL)
-	pipe.ZAdd(ctx, JobIndexKey, redis.Z{Score: float64(time.Now().Unix()), Member: j.ID})
+	// Unix-second scores make every burst of jobs tie. Redis is then free to
+	// return tied members lexicographically, so a just-completed job can be
+	// absent from ListJobs(n) even though older jobs from the same second are
+	// shown. Unix microseconds are still exactly representable by float64 at the
+	// current epoch and preserve enqueue order under Manager-sized bursts.
+	pipe.ZAdd(ctx, JobIndexKey, redis.Z{Score: float64(time.Now().UnixMicro()), Member: j.ID})
 	_, err = pipe.Exec(ctx)
 	return err
 }

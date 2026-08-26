@@ -214,11 +214,10 @@ func (mm *MaintenanceManager) tryStart(kind MaintenanceKind, argv []string) (*Ma
 
 	// Run the subprocess on a goroutine so the HTTP handler can
 	// return immediately and the client polls /stream for live
-	// output. Mutex is released in the goroutine's defer chain so a
-	// second same-kind request between accept and exec correctly
-	// returns 409.
+	// output. The mutex is released only after the runner reaches a terminal
+	// state, so a second same-kind request between accept and completion
+	// correctly returns 409.
 	go func() {
-		defer mu.Unlock()
 		// Release context resources as soon as the runner returns.
 		// Without this, ctx + its internal channels stay live until GC
 		// runs on the op snapshot — bounded (≤5 ops in mm.last) but
@@ -239,9 +238,17 @@ func (mm *MaintenanceManager) tryStart(kind MaintenanceKind, argv []string) (*Ma
 		}
 		op.closeListenersLocked()
 		op.mu.Unlock()
+
+		// Publish completion and release the per-kind gate as one ordered
+		// handoff. Previously active[kind] was cleared before a deferred
+		// mu.Unlock ran, so a caller could observe "not active" and still receive
+		// errKindBusy. Keep mm.mu held while unlocking the gate, then clear the
+		// active slot; any new starter can acquire the gate but cannot publish its
+		// new active op until this bookkeeping is complete.
 		mm.mu.Lock()
-		delete(mm.active, kind)
 		mm.last[kind] = op
+		mu.Unlock()
+		delete(mm.active, kind)
 		mm.mu.Unlock()
 	}()
 	return op, nil

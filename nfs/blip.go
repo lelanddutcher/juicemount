@@ -54,7 +54,7 @@ func (h *JuiceMountHandler) backendBlipActive() bool {
 	if h.blipHook != nil {
 		return h.blipHook()
 	}
-	rc := h.redisClient
+	rc := h.redisClient.Load()
 	if rc == nil {
 		return false
 	}

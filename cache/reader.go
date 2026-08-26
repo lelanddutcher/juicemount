@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	DefaultBlockSize = 4 << 20 // 4MB
+	DefaultBlockSize = 4 << 20  // 4MB
 	ChunkSize        = 64 << 20 // 64MB (JuiceFS default)
 
 	fdTTL     = 5 * time.Minute
@@ -285,6 +285,24 @@ func (r *Reader) Stop() {
 
 // DetectCacheDir finds the JuiceFS cache chunks directory.
 func DetectCacheDir() string {
+	// An explicit cache path makes multi-volume hosts and isolated integration
+	// tests deterministic. Accept either the chunks directory itself or a
+	// volume cache root containing raw/chunks; invalid overrides fail closed
+	// instead of silently reading blocks from a different mounted volume.
+	if configured := strings.TrimSpace(os.Getenv("JM_CACHE_DIR")); configured != "" {
+		candidates := []string{filepath.Join(configured, "raw", "chunks")}
+		if filepath.Base(filepath.Clean(configured)) == "chunks" {
+			candidates = append(candidates, configured)
+		}
+		for _, candidate := range candidates {
+			if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+				log.Printf("cache: using configured JuiceFS cache at %s", candidate)
+				return candidate
+			}
+		}
+		log.Printf("cache: JM_CACHE_DIR %q has no chunks directory", configured)
+		return ""
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""

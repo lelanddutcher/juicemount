@@ -230,6 +230,10 @@ func TestRedisSubscribeRename(t *testing.T) {
 // one reconciliation cycle are NOT deleted, and are only deleted after
 // PruneThreshold consecutive absences.
 func TestPruneThresholdSafeguard(t *testing.T) {
+	// Keep this test independent of the host's current network class. Layer A's
+	// tunnel budget deliberately defers destructive pruning; this test is about
+	// the counter threshold itself, so use the documented unbounded test mode.
+	t.Setenv("JM_LAYERA_BUDGET", "0")
 	rc := newTestRedisClient(t)
 
 	// Seed store with a "ghost" entry — exists in SQLite but not in Redis.
@@ -250,10 +254,28 @@ func TestPruneThresholdSafeguard(t *testing.T) {
 		t.Fatalf("expected pruneAbsent count=1 after first cycle, got %d", count1)
 	}
 
-	// Second sync: ghost has been absent PruneThreshold times — should now be deleted.
-	rc.SyncOnce()
+	// The entry must survive every cycle below PruneThreshold. This test used to
+	// assume PruneThreshold==2; QA-30 raised it to 10, so spelling out only a
+	// "second sync" silently stopped exercising the deletion boundary.
+	for cycle := 2; cycle < PruneThreshold; cycle++ {
+		if err := rc.SyncOnce(); err != nil {
+			t.Fatalf("SyncOnce cycle %d: %v", cycle, err)
+		}
+		if rc.store.LookupByPath(ghost.Path) == nil {
+			t.Fatalf("ghost was deleted after %d cycles, below threshold %d", cycle, PruneThreshold)
+		}
+		if got := rc.pruneAbsent[ghost.Path]; got != cycle {
+			t.Fatalf("pruneAbsent after cycle %d = %d, want %d", cycle, got, cycle)
+		}
+	}
+
+	// Exactly the threshold-th stable absence qualifies the entry for the
+	// destructive layer, where the explicit Layer-A mode confirms it absent.
+	if err := rc.SyncOnce(); err != nil {
+		t.Fatalf("SyncOnce threshold cycle: %v", err)
+	}
 	if rc.store.LookupByPath(ghost.Path) != nil {
-		t.Fatal("ghost should have been pruned after PruneThreshold cycles, but still exists")
+		t.Fatalf("ghost should have been pruned after %d cycles, but still exists", PruneThreshold)
 	}
 	rc.mu.RLock()
 	count2 := rc.pruneAbsent[ghost.Path]

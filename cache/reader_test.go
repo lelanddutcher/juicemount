@@ -48,6 +48,25 @@ func TestDetectCacheDir(t *testing.T) {
 	t.Logf("Cache dir has %d entries", len(entries))
 }
 
+func TestDetectCacheDirConfigured(t *testing.T) {
+	root := t.TempDir()
+	chunks := filepath.Join(root, "raw", "chunks")
+	if err := os.MkdirAll(chunks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("JM_CACHE_DIR", root)
+	if got := DetectCacheDir(); got != chunks {
+		t.Fatalf("DetectCacheDir() = %q, want configured %q", got, chunks)
+	}
+}
+
+func TestDetectCacheDirConfiguredInvalidFailsClosed(t *testing.T) {
+	t.Setenv("JM_CACHE_DIR", filepath.Join(t.TempDir(), "missing"))
+	if got := DetectCacheDir(); got != "" {
+		t.Fatalf("DetectCacheDir() = %q for invalid override, want empty", got)
+	}
+}
+
 func TestVerify(t *testing.T) {
 	rdb := testRedisClient(t)
 	dir := DetectCacheDir()

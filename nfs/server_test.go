@@ -1,7 +1,9 @@
 package nfs
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,11 +14,30 @@ import (
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
-const (
-	testRedisURL  = "redis://127.0.0.1:6379/1"
-	testFUSEPath  = "/Users/USER/.juicemount/fuse-internal"
-	testMountBase = "/tmp/jm5-test-mount"
+const testMountBase = "/tmp/jm5-test-mount"
+
+var (
+	testRedisURL = envOrDefault("JM_TEST_VOLUME_REDIS", "redis://127.0.0.1:6379/1")
+	testFUSEPath = resolveTestFUSEPath()
 )
+
+func envOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func resolveTestFUSEPath() string {
+	if path := os.Getenv("JM_TEST_FUSE_PATH"); path != "" {
+		return filepath.Clean(path)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".juicemount", "fuse-internal")
+}
 
 func setupTestServer(t *testing.T) (*Server, *metadata.Store) {
 	t.Helper()
@@ -104,6 +125,19 @@ func TestServerStartStop(t *testing.T) {
 		t.Fatal("server has no address")
 	}
 	t.Logf("Server listening on %s", addr)
+}
+
+func TestClosedListenerIsRecognizedAsNormalShutdown(t *testing.T) {
+	err := &net.OpError{Op: "accept", Net: "tcp", Err: net.ErrClosed}
+	if unexpectedServeError(err) {
+		t.Fatal("wrapped listener close was classified as a server failure")
+	}
+	if unexpectedServeError(nil) {
+		t.Fatal("nil serve result was classified as a server failure")
+	}
+	if !unexpectedServeError(errors.New("unexpected serve failure")) {
+		t.Fatal("real serve error was suppressed")
+	}
 }
 
 func TestNFSMountAndStat(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,14 +21,19 @@ func TestWorkflow_BrowseProjectTree(t *testing.T) {
 	env := setupE2E(t)
 	mount := env.mount
 
-	// Simulate Premiere opening a project: recursively stat the entire tree
-	t.Log("Browsing Film Projects tree (simulates Premiere project open)...")
+	deepRel, ok := deepestCommonDirectory(fuseMountPath, mount)
+	if !ok {
+		t.Fatal("no shared fixture tree available for project browse")
+	}
+	projectRoot := strings.Split(deepRel, string(filepath.Separator))[0]
+	// Simulate Premiere opening a project: recursively stat the fixture tree.
+	t.Logf("Browsing %s tree (simulates Premiere project open)...", projectRoot)
 
 	start := time.Now()
 	var fileCount, dirCount int
 	var totalSize int64
 
-	err := filepath.Walk(filepath.Join(mount, "Film Projects"), func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(filepath.Join(mount, projectRoot), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // skip errors (permission, etc)
 		}
@@ -55,10 +61,9 @@ func TestWorkflow_VideoScrub(t *testing.T) {
 	env := setupE2E(t)
 	mount := env.mount
 
-	videoFile := filepath.Join(mount, "Soap Regular", "A_0056C829H260207_093739SL_LAD04.MP4")
-	info, err := os.Stat(videoFile)
-	if err != nil {
-		t.Skipf("Video file not found: %v", err)
+	videoFile, info := largestRegularFile(mount, 24*1024*1024)
+	if videoFile == "" {
+		t.Fatal("no file larger than 24MB available for video scrub workload")
 	}
 
 	t.Logf("Video file: %s (%.1f MB)", info.Name(), float64(info.Size())/(1024*1024))
@@ -128,6 +133,21 @@ func TestWorkflow_VideoScrub(t *testing.T) {
 	resumeDur := time.Since(resumeStart)
 	resumeThroughput := float64(resumeBytes) / resumeDur.Seconds() / (1024 * 1024)
 	t.Logf("  Resume sequential: %d bytes in %v = %.1f MB/s", resumeBytes, resumeDur, resumeThroughput)
+}
+
+func largestRegularFile(root string, minimum int64) (string, os.FileInfo) {
+	var bestPath string
+	var bestInfo os.FileInfo
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || !info.Mode().IsRegular() || info.Size() < minimum {
+			return nil
+		}
+		if bestInfo == nil || info.Size() > bestInfo.Size() {
+			bestPath, bestInfo = path, info
+		}
+		return nil
+	})
+	return bestPath, bestInfo
 }
 
 // Workflow 3: Multi-track editing — concurrent reads from multiple files
