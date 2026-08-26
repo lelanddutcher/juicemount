@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -21,7 +22,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	nfsMount = "/Volumes/zpool"
+	defaultNFSMount = "/Volumes/zpool"
 	// fuseMount was the literal "/Users/USER/.juicemount/fuse-internal" and is
 	// referenced nowhere in this file — a dead placeholder. Kept only so the
 	// name resolves if a FUSE arm is added back; see fuseInternalPath().
@@ -43,6 +44,15 @@ const (
 
 	benchmarkBaselinesFile = "benchmark_baselines.json"
 )
+
+var nfsMount = benchmarkMountPath()
+
+func benchmarkMountPath() string {
+	if configured := strings.TrimSpace(os.Getenv("JM_BENCH_MOUNT")); configured != "" {
+		return filepath.Clean(configured)
+	}
+	return defaultNFSMount
+}
 
 type spoolSnapshot struct {
 	PendingFiles int64 `json:"pending_files"`
@@ -303,11 +313,45 @@ func (s *benchSuite) printSummary() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func requireMount(t *testing.T, path string) {
+func requireJuiceMountNFS(t *testing.T, path string) {
 	t.Helper()
-	if _, err := os.Stat(path); err != nil {
+	if os.Getenv("JM_RUN_MOUNT_BENCHMARKS") != "1" {
+		t.Skip("set JM_RUN_MOUNT_BENCHMARKS=1 to run destructive live-mount benchmarks")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
 		t.Skipf("mount not available: %s (%v)", path, err)
 	}
+	if !info.IsDir() {
+		t.Fatalf("benchmark mount is not a directory: %s", path)
+	}
+
+	out, err := exec.Command("/sbin/mount").Output()
+	if err != nil {
+		t.Fatalf("inspect mounted filesystems: %v", err)
+	}
+	line, ok := mountLineForPath(string(out), path)
+	if !ok {
+		t.Fatalf("benchmark target exists but is not an active mount: %s", path)
+	}
+	if !isJuiceMountNFSLine(line, path) {
+		t.Fatalf("refusing live benchmark: %s is not the JuiceMount loopback NFS mount (%s)", path, line)
+	}
+}
+
+func mountLineForPath(output, mountPath string) (string, bool) {
+	needle := " on " + filepath.Clean(mountPath) + " ("
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, needle) {
+			return line, true
+		}
+	}
+	return "", false
+}
+
+func isJuiceMountNFSLine(line, mountPath string) bool {
+	want := "127.0.0.1:/ on " + filepath.Clean(mountPath) + " (nfs"
+	return strings.HasPrefix(line, want)
 }
 
 func requireFile(t *testing.T, path string) {
@@ -394,7 +438,7 @@ func msFromDur(d time.Duration) float64 {
 // ---------------------------------------------------------------------------
 
 func TestBenchmarkSuite(t *testing.T) {
-	requireMount(t, nfsMount)
+	requireJuiceMountNFS(t, nfsMount)
 
 	suite := newBenchSuite(t)
 
@@ -1033,6 +1077,7 @@ func TestBenchmarkSuite_UpdateBaselines(t *testing.T) {
 	if os.Getenv("UPDATE_BASELINES") != "1" {
 		t.Skip("Set UPDATE_BASELINES=1 to update baselines")
 	}
+	requireJuiceMountNFS(t, nfsMount)
 
 	t.Log("Running benchmark suite to capture new baselines...")
 	t.Log("This will overwrite benchmark_baselines.json")

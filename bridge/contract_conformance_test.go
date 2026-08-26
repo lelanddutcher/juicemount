@@ -183,6 +183,13 @@ func seedControlPlane(t *testing.T) func() {
 		t.Fatalf("derivatives.Open: %v", err)
 	}
 	seedDerivatives(t, dstore)
+	// Keep the absent-derivative fixture hermetic. The live handler performs a
+	// one-sidecar reconcile on an unknown inode and prefers globalFUSEPath; if a
+	// test leaves it empty, it falls back to the contract's display path
+	// (/Volumes/zpool) and can read whichever unrelated share the host mounted
+	// there. A local empty root proves the same absent-sidecar contract without
+	// touching user data or poisoning the process-wide sidecar admission gate.
+	fuseRoot := t.TempDir()
 
 	guiRoutes := []string{
 		"/health", "/metrics", "/pin", "/unpin", "/cache-status", "/offline",
@@ -198,16 +205,17 @@ func seedControlPlane(t *testing.T) func() {
 
 	globalMu.Lock()
 	old := struct {
-		store                             *metadata.Store
-		pin                               *pin.Store
-		deriv                             *derivatives.Store
-		mount, want, vol, dbp, addr, inst string
-		caps                              []string
-	}{globalStore, globalPinStore, globalDerivStore, globalMountPath, globalWantMountPoint, globalVolumeName, globalDBPath, globalMetricsAddr, globalInstanceID, globalCapabilities}
+		store                                   *metadata.Store
+		pin                                     *pin.Store
+		deriv                                   *derivatives.Store
+		mount, fuse, want, vol, dbp, addr, inst string
+		caps                                    []string
+	}{globalStore, globalPinStore, globalDerivStore, globalMountPath, globalFUSEPath, globalWantMountPoint, globalVolumeName, globalDBPath, globalMetricsAddr, globalInstanceID, globalCapabilities}
 	globalStore = mstore
 	globalPinStore = pstore
 	globalDerivStore = dstore
 	globalMountPath = mp
+	globalFUSEPath = fuseRoot
 	globalWantMountPoint = mp
 	globalVolumeName = "zpool"
 	globalDBPath = "/seed/Library/Application Support/JuiceMount/metadata.db"
@@ -222,6 +230,7 @@ func seedControlPlane(t *testing.T) func() {
 		globalPinStore = old.pin
 		globalDerivStore = old.deriv
 		globalMountPath = old.mount
+		globalFUSEPath = old.fuse
 		globalWantMountPoint = old.want
 		globalVolumeName = old.vol
 		globalDBPath = old.dbp
