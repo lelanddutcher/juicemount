@@ -855,47 +855,7 @@ func minioHostPort(rawURL string) string {
 func (m *HealthMonitor) checkFUSE() ComponentStatus {
 	now := time.Now()
 
-	// Check 1: directory exists, AND stat doesn't hang.
-	// A bare os.Stat on a wedged FUSE path enters uninterruptible kernel
-	// wait. Wrap in the same goroutine+timeout pattern used below for
-	// readdir.
-	statDone := make(chan struct {
-		info os.FileInfo
-		err  error
-	}, 1)
-	go func() {
-		info, err := os.Stat(m.cfg.FUSEPath)
-		statDone <- struct {
-			info os.FileInfo
-			err  error
-		}{info, err}
-	}()
-	select {
-	case r := <-statDone:
-		if r.err != nil || !r.info.IsDir() {
-			jmlog.Debug("fuse mount missing", "path", m.cfg.FUSEPath)
-			return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("stat failed: %v", r.err)}
-		}
-	case <-time.After(5 * time.Second):
-		// #89 online busy-suppression: a foreground stat that TIMES OUT while a
-		// legitimate heavy ingest is draining is the drain's synchronous MinIO
-		// PUTs saturating the FUSE request queue — BUSY, not wedged. Reporting
-		// degraded here surfaces as the Finder "mount losing communication"
-		// report even though the mount is fine (the destructive remount path
-		// already defers safely; this is purely the reporting layer). The
-		// ONLINE analogue of the pin.IsOffline() readdir suppression below. Only
-		// a TIMEOUT is suppressed — a genuine stat error still degrades (that's
-		// the error branch above, unreachable from here).
-		if m.busyIngesting() {
-			jmlog.Info("fuse stat slow but drain in flight (busy, heavy ingest) — not flagging wedged", "path", m.cfg.FUSEPath)
-			return ComponentStatus{Healthy: true, LastCheck: now, Message: "busy (heavy ingest)"}
-		}
-		jmlog.Warn("fuse stat timed out (path likely wedged)", "path", m.cfg.FUSEPath)
-		go m.logWedgeDiagnostics("stat_timeout")
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: "stat timed out (wedged FUSE mount)"}
-	}
-
-	// Check 2: mount is actually a FUSE filesystem (appears in mount table).
+	// Check 1: mount is actually a FUSE filesystem (appears in mount table).
 	// `mount` (getfsstat) can hang in the kernel if the table contains a
 	// wedged entry; bound it.
 	mountCtx, mountCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -916,45 +876,17 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted (directory exists but no FUSE)"}
 	}
 
-	// Check 3: mount is responsive (stale FUSE mounts hang on readdir)
-	done := make(chan error, 1)
-	go func() {
-		_, err := os.ReadDir(m.cfg.FUSEPath)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			jmlog.Debug("fuse readdir failed", "path", m.cfg.FUSEPath, "error", err.Error())
-			return ComponentStatus{Healthy: false, LastCheck: now, Message: fmt.Sprintf("readdir failed: %v", err)}
-		}
+	// Check 2: the FUSE session answers through JuiceFS's in-memory control
+	// file. Do not stat or readdir the root here: those are metadata operations
+	// against Redis and this function runs every 10 seconds forever. Redis and
+	// object-store reachability are checked independently, so a local liveness
+	// probe is both truthful and free of background WAN traffic.
+	if controlFileResponsiveWithin(m.cfg.FUSEPath, 5*time.Second, os.ReadFile) {
 		return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
-	case <-time.After(5 * time.Second):
-		// Offline-aware (release fix): a root readdir that times out while the
-		// user is OFFLINE is the juicefs daemon being SATURATED by in-flight
-		// spool drains (writes with nowhere to go offline) — BUSY, not wedged.
-		// Reporting unhealthy here feeds the watchdog's escalate-to-remount,
-		// which SIGTERMs a healthy daemon and drops the NFS mount → Finder
-		// "connection interrupted". Offline, treat a readdir timeout as a
-		// transient busy state, not a stale-mount fault.
-		if pin.IsOffline() {
-			jmlog.Debug("fuse readdir slow but offline (busy draining) — not flagging stale", "path", m.cfg.FUSEPath)
-			return ComponentStatus{Healthy: true, LastCheck: now, Message: "offline (busy/draining)"}
-		}
-		// #89 ONLINE analogue of the offline suppression above: a readdir that
-		// times out while a heavy ingest is draining is the same saturated-FUSE-
-		// queue busy state, just ONLINE. Suppress it (busy, not stale) so a
-		// high-concurrency ingest doesn't surface as "mount losing communication"
-		// / feed the watchdog's escalate-to-remount. TIMEOUT-only (genuine
-		// readdir errors take the error branch above and still degrade).
-		if m.busyIngesting() {
-			jmlog.Info("fuse readdir slow but drain in flight (busy, heavy ingest) — not flagging stale", "path", m.cfg.FUSEPath)
-			return ComponentStatus{Healthy: true, LastCheck: now, Message: "busy (heavy ingest)"}
-		}
-		jmlog.Warn("fuse mount unresponsive (stale)", "path", m.cfg.FUSEPath)
-		go m.logWedgeDiagnostics("readdir_unresponsive")
-		return ComponentStatus{Healthy: false, LastCheck: now, Message: "unresponsive (stale mount)"}
 	}
+	jmlog.Warn("fuse control probe timed out (session likely wedged)", "path", m.cfg.FUSEPath)
+	go m.logWedgeDiagnostics("control_timeout")
+	return ComponentStatus{Healthy: false, LastCheck: now, Message: "control probe timed out (wedged FUSE mount)"}
 }
 
 // logWedgeDiagnostics captures backend RTT + process liveness at the instant a

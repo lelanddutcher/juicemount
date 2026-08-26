@@ -1179,14 +1179,53 @@ func (fm *FUSEManager) IsMounted() bool {
 	return fm.isMountedLocked()
 }
 
+// controlFileResponsiveWithin probes JuiceFS's in-memory .config control file.
+// Any returned result, including a prompt error, proves that the FUSE session
+// and daemon answered. Only a timeout means the session is unresponsive.
+//
+// This is deliberately separate from the root readdir used by mount startup:
+// a root readdir is a useful readiness gate while JuiceFS is coming up, but in
+// steady state it walks through JuiceFS metadata and turns a 10-second health
+// ticker into permanent Redis traffic. The control file is local to JuiceFS
+// and therefore safe to probe on a metered/high-latency link.
+func controlFileResponsiveWithin(path string, timeout time.Duration, readFile func(string) ([]byte, error)) bool {
+	done := make(chan struct{}, 1)
+	go func() {
+		_, _ = readFile(filepath.Join(path, ".config"))
+		done <- struct{}{}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// isMountedSteadyLocked is the backend-free steady-state health probe. It keeps
+// the mount-table ownership check but replaces the backend-visible root
+// readdir in isMountedLocked with JuiceFS's local control-file response.
+// Must be called with fm.mu held.
+func (fm *FUSEManager) isMountedSteadyLocked() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := mounttable.Output(ctx)
+	if err != nil || !strings.Contains(string(out), fm.cfg.MountPoint) {
+		return false
+	}
+	return controlFileResponsiveWithin(fm.cfg.MountPoint, 5*time.Second, os.ReadFile)
+}
+
 // isMountedLocked checks if the FUSE mount is live. Must be called with fm.mu held.
 //
 // CRITICAL: `mount` (which calls `getfsstat()`) hangs in the kernel if the
 // mount table contains a wedged entry (server gone, kernel mount retained).
-// Without the context timeout, this function — called every 10 s by the
-// monitor loop under fm.mu — wedges the FUSEManager lock forever, parking
-// every other caller (Stop, IsMounted, Mount) behind it. That was the
-// "click menu → app freezes" pattern.
+// Without the context timeout, this function can wedge the FUSEManager lock
+// forever during startup or an explicit IsMounted call, parking every other
+// caller (Stop, IsMounted, Mount) behind it. That was the "click menu → app
+// freezes" pattern. Periodic monitoring uses isMountedSteadyLocked instead.
 func (fm *FUSEManager) isMountedLocked() bool {
 	// Check 1: appears in macOS mount table as a FUSE mount.
 	// Hard-bounded at 5 s. On timeout, treat as "unknown" (return false) so
@@ -1211,19 +1250,10 @@ func (fm *FUSEManager) isMountedLocked() bool {
 	// Check 2: actually responsive — try listing the directory. A stale FUSE
 	// mount (dead daemon) hangs on any fs op. Kept as a root readdir (NOT the
 	// .config probe) because this same check gates LAUNCH readiness via
-	// waitForMount: right after the JuiceFS service starts the dir is listable before the
-	// .config control file is served, so a .config probe here false-fails the
-	// launch verification. Pure-read, no side-effect umount (QA-34 Slice 2): the
-	// monitorLoop owns the remount decision with its failure tolerance.
-	//
-	// task #72: this 5s readdir DOES flip to "stale" under backend slowness /
-	// cold-start warm, but the DESTRUCTIVE remount is gated by the escalation-
-	// confirm probe (mountResponsiveWithin), which reads the in-memory .config and
-	// so never trips on data-path slowness — a slow-but-alive mount is NEVER
-	// SIGKILLed even though this 5s readdir over-reports "stale" under load. (The
-	// residual cosmetic false "degraded" during heavy load is acceptable; the
-	// watchdog defers to the .config confirm, never destroys on this 5s probe. See
-	// mountResponsiveWithin for why .config beat a generous readdir here.)
+	// waitForMount: right after the JuiceFS service starts the dir is listable
+	// before the .config control file is served, so a .config probe here would
+	// false-fail launch verification. This stronger data-path check must not be
+	// used by a periodic loop; isMountedSteadyLocked owns that path.
 	done := make(chan bool, 1)
 	go func() {
 		_, err := os.ReadDir(fm.cfg.MountPoint)
@@ -1787,7 +1817,7 @@ func (fm *FUSEManager) monitorLoop() {
 			return
 		case <-ticker.C:
 			fm.mu.Lock()
-			healthy := fm.isMountedLocked()
+			healthy := fm.isMountedSteadyLocked()
 			fm.mu.Unlock()
 
 			if healthy {
