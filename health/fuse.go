@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -459,8 +460,8 @@ func (fm *FUSEManager) Mount() error {
 		"--no-usage-report",
 		"--buffer-size", strconv.Itoa(bufMB),
 		"--prefetch", strconv.Itoa(jfp.Prefetch),
-		"-o", "nobrowse", // hide from Finder (MNT_DONTBROWSE flag)
 	)
+	args = append(args, juiceFSMountPlatformOptions(runtime.GOOS)...)
 	// S1 (WAVE 1, RC-5): cap JuiceFS session readahead on a WAN link only.
 	// juicefs's --max-readahead defaults to 8×BlockSize = 32 MiB, so a single
 	// cold 4 KB preview touch pulls up to 32 MiB extra off the backend across
@@ -763,6 +764,16 @@ func (fm *FUSEManager) Mount() error {
 	// (previously leaked on every Stop, holding the open file handle).
 	go fm.tailJuiceFSLog()
 
+	return nil
+}
+
+// juiceFSMountPlatformOptions returns only options supported by the host FUSE
+// implementation. nobrowse maps to macOS's MNT_DONTBROWSE flag; Linux
+// fusermount3 rejects it and prevents JuiceFS from mounting at all.
+func juiceFSMountPlatformOptions(goos string) []string {
+	if goos == "darwin" {
+		return []string{"-o", "nobrowse"}
+	}
 	return nil
 }
 
