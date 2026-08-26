@@ -36,10 +36,16 @@ import (
 
 // ReachabilityCallback is invoked whenever the monitor's reachable
 // state transitions. `reachable` is the new state; `reason` is a
-// human-readable explanation suitable for logging or UI. Callbacks
-// fire from the monitor's polling goroutine; they MUST NOT block —
-// dispatch to your own goroutine if needed.
+// human-readable explanation suitable for logging or UI. Callbacks fire in
+// transition order from a dedicated dispatcher (never the probe loop); they
+// still MUST NOT block, because one callback delays later state delivery.
 type ReachabilityCallback func(reachable bool, reason string)
+
+type reachabilityTransition struct {
+	reachable bool
+	reason    string
+	callbacks []ReachabilityCallback
+}
 
 // dialer is the interface segment of net.Dialer that we need. Pulled
 // out so tests can inject a fake without touching real sockets.
@@ -117,9 +123,16 @@ type Reachability struct {
 	callbacks   []ReachabilityCallback
 
 	triggerCh chan struct{}
-	stopCh    chan struct{}
-	stopOnce  sync.Once
-	running   atomic.Bool
+	// transitionCh keeps state notifications ordered without letting a slow
+	// callback park the probe loop. The old "go cb" fan-out could deliver a
+	// later online transition before an earlier offline transition, leaving UI
+	// and auto-offline consumers in a stale state even though Reachable() was
+	// correct. Transitions are rare; a modest buffer absorbs normal callback
+	// latency, and overflow coalesces toward the newest truthful state.
+	transitionCh chan reachabilityTransition
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	running      atomic.Bool
 }
 
 // ReachabilityOption customizes monitor behavior. Defaults are tuned
@@ -198,6 +211,7 @@ func NewReachability(target string, opts ...ReachabilityOption) *Reachability {
 		livenessOverride: true, // drain-liveness false-flap suppression (kill: JM_REACH_DRAIN_LIVENESS=0)
 		dialer:           &net.Dialer{},
 		triggerCh:        make(chan struct{}, 1),
+		transitionCh:     make(chan reachabilityTransition, 16),
 		stopCh:           make(chan struct{}),
 	}
 	for _, opt := range opts {
@@ -286,6 +300,7 @@ func (r *Reachability) Start() {
 	if !r.running.CompareAndSwap(false, true) {
 		return
 	}
+	go r.dispatchTransitions()
 	go r.loop()
 }
 
@@ -362,6 +377,44 @@ func (r *Reachability) loop() {
 			// Reset the ticker so we don't immediately probe again.
 			ticker.Reset(r.baseInterval)
 		}
+	}
+}
+
+// dispatchTransitions invokes callbacks serially in transition order. It is a
+// separate goroutine so callbacks cannot delay probes. A callback that violates
+// its non-blocking contract can still park only this dispatcher, never network
+// detection itself; enqueue overflow is coalesced to the newest state below.
+func (r *Reachability) dispatchTransitions() {
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case evt := <-r.transitionCh:
+			for _, cb := range evt.callbacks {
+				cb(evt.reachable, evt.reason)
+			}
+		}
+	}
+}
+
+func (r *Reachability) enqueueTransition(evt reachabilityTransition) {
+	select {
+	case r.transitionCh <- evt:
+		return
+	default:
+	}
+
+	// A callback has violated the non-blocking contract long enough to fill the
+	// queue. Drop one stale transition and retain the newest state; consumers
+	// may miss an intermediate flap but cannot be left permanently behind the
+	// monitor's current truth.
+	select {
+	case <-r.transitionCh:
+	default:
+	}
+	select {
+	case r.transitionCh <- evt:
+	default:
 	}
 }
 
@@ -530,14 +583,18 @@ func (r *Reachability) applyResult(ok bool) {
 		// this probe loop indefinitely and prevent recovery transitions
 		// from ever firing. That is exactly the failure mode QA-15
 		// documented: 15 min stuck unreachable while external probes to
-		// the same target succeed. Wrapping each callback in `go` ensures
-		// a hung callback is at most a leaked goroutine — the probe loop
-		// itself stays alive and keeps observing real state.
+		// the same target succeed. The separate dispatcher contains a hung
+		// callback away from the probe loop, which stays alive and keeps
+		// observing real state.
 		//
-		// Transitions are infrequent (only on actual state change, not on
-		// every probe), so unbounded `go` is bounded in practice.
-		for _, cb := range callbacks {
-			go cb(newState, reason)
-		}
+		// The dedicated dispatcher preserves transition order. The earlier
+		// per-callback goroutines allowed recovery=true to run before the prior
+		// offline=false callback, which could leave auto-offline re-engaged while
+		// Reachable() already reported healthy.
+		r.enqueueTransition(reachabilityTransition{
+			reachable: newState,
+			reason:    reason,
+			callbacks: callbacks,
+		})
 	}
 }

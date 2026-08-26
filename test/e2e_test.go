@@ -33,13 +33,6 @@ func testEnvOrDefault(key, fallback string) string {
 	return fallback
 }
 
-// fusePath is the JuiceFS FUSE mount for the CURRENT user. It was the literal
-// "/Users/USER/.juicemount/fuse-internal" — a path no machine has — and it is
-// passed straight into ServerConfig.FUSEPath at two sites below, so this E2E
-// stack was configured against a directory that could never exist. A var, not
-// a const, because it must be resolved at run time.
-var fusePath = fuseInternalPath()
-
 // e2eEnv holds the full stack for E2E testing.
 type e2eEnv struct {
 	store   *metadata.Store
@@ -54,6 +47,7 @@ type e2eEnv struct {
 
 func setupE2E(t *testing.T) *e2eEnv {
 	t.Helper()
+	activeFUSEPath := requireFUSEMount(t)
 
 	dbPath := filepath.Join(t.TempDir(), "e2e.db")
 	store, err := metadata.Open(dbPath)
@@ -90,7 +84,7 @@ func setupE2E(t *testing.T) *e2eEnv {
 	// NFS server
 	srv := jmnfs.NewServer(jmnfs.Config{
 		ListenAddr: "127.0.0.1:0",
-		FUSEPath:   fusePath,
+		FUSEPath:   activeFUSEPath,
 	}, store)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("Start NFS: %v", err)
@@ -105,7 +99,7 @@ func setupE2E(t *testing.T) *e2eEnv {
 	mon := health.New(health.Config{
 		RedisURL:      redisAddr,
 		MinIOURL:      minioURL,
-		FUSEPath:      fusePath,
+		FUSEPath:      activeFUSEPath,
 		NFSMountPoint: "",
 	})
 	mon.Start()

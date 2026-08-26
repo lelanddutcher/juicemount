@@ -149,6 +149,13 @@ func TestReachability_RecoveryAfterFailure(t *testing.T) {
 	if err := waitFor(200*time.Millisecond, func() bool { return r.Reachable() }); err != nil {
 		t.Fatalf("recovery transition didn't fire: %v", err)
 	}
+	if err := waitFor(200*time.Millisecond, func() bool {
+		statesMu.Lock()
+		defer statesMu.Unlock()
+		return len(states) == 2
+	}); err != nil {
+		t.Fatalf("recovery callbacks didn't arrive: %v", err)
+	}
 
 	statesMu.Lock()
 	defer statesMu.Unlock()
@@ -157,6 +164,59 @@ func TestReachability_RecoveryAfterFailure(t *testing.T) {
 	}
 	if states[0] || !states[1] {
 		t.Errorf("expected transitions [false, true], got %v", states)
+	}
+}
+
+func TestReachabilityCallbacksPreserveTransitionOrder(t *testing.T) {
+	d := &fakeDialer{reachable: false}
+	r := NewReachability("ignored:0",
+		withDialer(d),
+		WithBaseInterval(10*time.Second),
+		WithFailureThreshold(1),
+		WithSuccessThreshold(1),
+	)
+	var states []bool
+	var mu sync.Mutex
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	r.OnChange(func(reachable bool, _ string) {
+		if !reachable {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		mu.Lock()
+		states = append(states, reachable)
+		mu.Unlock()
+	})
+
+	r.Start()
+	defer r.Stop()
+	select {
+	case <-firstEntered:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("offline callback did not start")
+	}
+
+	// Recover while the offline callback is deliberately parked. The probe and
+	// state machine must advance, but the online callback must remain ordered
+	// behind the offline callback.
+	d.setReachable(true)
+	r.Notify()
+	if err := waitFor(500*time.Millisecond, r.Reachable); err != nil {
+		t.Fatalf("slow callback parked reachability recovery: %v", err)
+	}
+	close(releaseFirst)
+	if err := waitFor(500*time.Millisecond, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(states) == 2
+	}); err != nil {
+		t.Fatalf("ordered callbacks did not drain: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if states[0] || !states[1] {
+		t.Fatalf("callback order = %v, want [false true]", states)
 	}
 }
 

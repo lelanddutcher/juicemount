@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/mounttable"
 )
 
 // These tests benchmark the metadata operations that determine how "snappy"
@@ -59,6 +62,13 @@ func requireFUSEMount(t *testing.T) string {
 	if err != nil || !st.IsDir() {
 		t.Skipf("FUSE mount %s not present — skipping the FUSE comparison arm "+
 			"rather than timing a directory that does not exist", p)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := mounttable.Output(ctx)
+	if err != nil || !strings.Contains(string(out), " on "+p+" (") {
+		t.Skipf("FUSE path %s is only a directory, not an active mount — skipping "+
+			"rather than reading or writing the hidden local mountpoint", p)
 	}
 	return p
 }
