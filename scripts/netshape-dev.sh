@@ -4,10 +4,12 @@
 #   netshape-dev.sh on  --rtt 300 --bw-down 2 --bw-up 1 --ip 192.168.0.197
 #   netshape-dev.sh off
 #   netshape-dev.sh status
+#   netshape-dev.sh self-test
 #
 # SAFETY CONTRACT (fixes the qa-suite H4 class of bug):
-#   - Shapes ONLY traffic to/from --ip (the NAS). Nothing else on this Mac
-#     is touched — no global pipes, no other destinations.
+#   - Shapes ONLY JuiceMount Redis/object traffic to/from --ip and the explicit
+#     --redis-port/--object-port values. Nothing else on this Mac is touched.
+#     SSH, SMB/Time Machine, and other NAS services cannot match these rules.
 #   - ON saves the COMPLETE prior pf state (enabled-flag + full ruleset) to
 #     a state file; OFF restores it byte-for-byte. We never blind-disable pf,
 #     so host firewalls (LuLu/Little Snitch/corporate) survive the round trip.
@@ -30,17 +32,60 @@ usage() { sed -n '2,10p' "$0"; exit 2; }
 
 cmd="${1:-status}"; shift || true
 
-RTT_MS=300; BW_DOWN=2; BW_UP=1; NAS_IP="192.168.0.197"; PROBE_PORT=30179
+RTT_MS=300; BW_DOWN=2; BW_UP=1; NAS_IP="192.168.0.197"
+REDIS_PORT=30179; OBJECT_PORT=30151; PROBE_PORT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --rtt) RTT_MS="$2"; shift 2;;
     --bw-down) BW_DOWN="$2"; shift 2;;
     --bw-up) BW_UP="$2"; shift 2;;
     --ip) NAS_IP="$2"; shift 2;;
+    --redis-port) REDIS_PORT="$2"; shift 2;;
+    --object-port) OBJECT_PORT="$2"; shift 2;;
     --probe-port) PROBE_PORT="$2"; shift 2;;
     *) usage;;
   esac
 done
+
+# By default the reachability/RTT probe exercises the shaped Redis endpoint.
+# Keep --probe-port as an escape hatch for non-default test deployments.
+PROBE_PORT="${PROBE_PORT:-$REDIS_PORT}"
+
+# These values are interpolated into a root-loaded PF ruleset. Reject anything
+# except a literal address and numeric scalar values before generating it.
+python3 - "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" <<'PY'
+import ipaddress
+import sys
+
+try:
+    ipaddress.ip_address(sys.argv[1])
+    ports = [int(value) for value in sys.argv[2:5]]
+    rtt, down, up = [int(value) for value in sys.argv[5:8]]
+except ValueError as exc:
+    raise SystemExit(f"invalid netshape argument: {exc}")
+if any(port < 1 or port > 65535 for port in ports):
+    raise SystemExit("invalid netshape argument: port must be 1..65535")
+if rtt < 0 or down < 1 or up < 1:
+    raise SystemExit("invalid netshape argument: rtt must be nonnegative and bandwidth positive")
+PY
+
+render_shape_rules() {
+  local port
+  for port in "$REDIS_PORT" "$OBJECT_PORT"; do
+    echo "dummynet in  quick proto tcp from ${NAS_IP} port ${port} to any pipe ${PIPE_IN}"
+    echo "dummynet out quick proto tcp from any to ${NAS_IP} port ${port} pipe ${PIPE_OUT}"
+  done
+}
+
+self_test() {
+  local rules
+  rules=$(render_shape_rules)
+  [ "$(printf '%s\n' "$rules" | wc -l | tr -d ' ')" = "4" ]
+  [ "$(printf '%s\n' "$rules" | grep -Ec '^dummynet (in|out) +quick proto tcp .* port [0-9][0-9]*.* pipe [0-9][0-9]*$')" = "4" ]
+  ! printf '%s\n' "$rules" | grep -Eq 'port (22|137|138|139|445)([^0-9]|$)'
+  ! printf '%s\n' "$rules" | grep -Eq 'from [^ ]+ to any pipe|from any to [^ ]+ pipe'
+  echo "PASS: exactly four backend-port rules; no broad, SSH, or SMB/NetBIOS match"
+}
 
 # This workstation grants the two required binaries through sudoers without
 # necessarily granting the unrelated `sudo true`. Probe the actual operations
@@ -113,8 +158,11 @@ PY
   min_probe_ms=$(( RTT_MS * 3 / 4 ))
   echo "$pipes" | grep -Eq "(^|[[:space:]])0*${PIPE_IN}:" &&
     sudo -n pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' &&
-    echo "$rules" | grep -Eq "dummynet in .*from ${NAS_IP} .*pipe 0*${PIPE_IN}" &&
-    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} .*pipe 0*${PIPE_OUT}" &&
+    echo "$rules" | grep -Eq "dummynet in .*from ${NAS_IP} port (= )?${REDIS_PORT} .*pipe 0*${PIPE_IN}" &&
+    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${REDIS_PORT} .*pipe 0*${PIPE_OUT}" &&
+    echo "$rules" | grep -Eq "dummynet in .*from ${NAS_IP} port (= )?${OBJECT_PORT} .*pipe 0*${PIPE_IN}" &&
+    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${OBJECT_PORT} .*pipe 0*${PIPE_OUT}" &&
+    ! echo "$rules" | grep -Eq "dummynet .*${NAS_IP} port (= )?(22|139|445)([^0-9]|$)" &&
     [ "$probe_ms" -ge "$min_probe_ms" ] &&
     echo "wire probe: ${probe_ms}ms (minimum ${min_probe_ms}ms)"
 }
@@ -139,12 +187,14 @@ activate_shape() {
 
   rules_tmp=$(mktemp -t jum-netshape.XXXXXX)
   {
-    echo "# JuiceMount dev shaping -> ${NAS_IP} (rtt=${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s)"
+    echo "# JuiceMount dev shaping -> ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} (rtt=${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s)"
+    # Dummynet rules are queueing rules, so PF requires all of them before any
+    # saved filtering rules. Exact service ports are safer than broad rules plus
+    # exemptions: SMB/SSH cannot enter either pipe in the first place.
+    render_shape_rules
     # PF is last-match-wins unless a rule is quick. The saved system ruleset
     # contains broad pass rules after ours; without quick, outbound packets
     # bypassed dummynet even though `pfctl -s all` still displayed the rule.
-    echo "dummynet in  quick proto { tcp udp } from ${NAS_IP} to any pipe ${PIPE_IN}"
-    echo "dummynet out quick proto { tcp udp } from any to ${NAS_IP} pipe ${PIPE_OUT}"
     grep -v '^#' "$STATE_FILE" | grep -v '^ENABLED='
   } > "$rules_tmp"
   sudo -n pfctl -f "$rules_tmp"
@@ -176,9 +226,9 @@ case "$cmd" in
       exit 1
     fi
     now=$(date +%s)
-    printf '{"active":true,"ip":"%s","probe_port":%s,"rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"since":%s}\n' \
-      "$NAS_IP" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$now" > "$MARKER"
-    echo "SHAPING ACTIVE -> ${NAS_IP}: rtt≈${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s"
+    printf '{"active":true,"ip":"%s","redis_port":%s,"object_port":%s,"probe_port":%s,"rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"since":%s}\n' \
+      "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$now" > "$MARKER"
+    echo "SHAPING ACTIVE -> ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} rtt≈${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s"
     echo "marker: $MARKER  ('off' to remove; survives until then)"
     ;;
   off)
@@ -192,10 +242,13 @@ case "$cmd" in
         echo "ERROR: marker exists but verified PF/dummynet shaping is not active" >&2
         exit 1
       fi
-      echo "verified: PF enabled; inbound/outbound pipes and scoped rules present"
+      echo "verified: PF enabled; inbound/outbound backend-port pipes present; SMB/SSH excluded by construction"
     else
       echo "not shaping"
     fi
+    ;;
+  self-test)
+    self_test
     ;;
   *) usage;;
 esac
