@@ -1,7 +1,8 @@
 #!/bin/bash
 # netshape-dev.sh — scoped pseudo-cellular wire shaping via macOS dummynet.
 #
-#   netshape-dev.sh on  --rtt 300 --bw-down 2 --bw-up 1 --ip 192.168.0.197
+#   netshape-dev.sh on  --rtt 300 --bw-down 2 --bw-up 1 --ip 192.168.0.197 \
+#     --link-udp-port 63296
 #   netshape-dev.sh off
 #   netshape-dev.sh status
 #   netshape-dev.sh self-test
@@ -9,6 +10,7 @@
 # SAFETY CONTRACT (fixes the qa-suite H4 class of bug):
 #   - Shapes ONLY JuiceMount Redis/object traffic to/from --ip and the explicit
 #     --redis-port/--object-port values. Nothing else on this Mac is touched.
+#     An optional exact local --link-udp-port shapes tsnet/WireGuard traffic;
 #     SSH, SMB/Time Machine, and other NAS services cannot match these rules.
 #   - ON saves the COMPLETE prior pf state (enabled-flag + full ruleset) to
 #     a state file; OFF restores it byte-for-byte. We never blind-disable pf,
@@ -33,7 +35,7 @@ usage() { sed -n '2,10p' "$0"; exit 2; }
 cmd="${1:-status}"; shift || true
 
 RTT_MS=300; BW_DOWN=2; BW_UP=1; NAS_IP="192.168.0.197"
-REDIS_PORT=30179; OBJECT_PORT=30151; PROBE_PORT=""
+REDIS_PORT=30179; OBJECT_PORT=30151; PROBE_PORT=""; LINK_UDP_PORT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --rtt) RTT_MS="$2"; shift 2;;
@@ -43,6 +45,7 @@ while [ $# -gt 0 ]; do
     --redis-port) REDIS_PORT="$2"; shift 2;;
     --object-port) OBJECT_PORT="$2"; shift 2;;
     --probe-port) PROBE_PORT="$2"; shift 2;;
+    --link-udp-port) LINK_UDP_PORT="$2"; shift 2;;
     *) usage;;
   esac
 done
@@ -53,18 +56,23 @@ PROBE_PORT="${PROBE_PORT:-$REDIS_PORT}"
 
 # These values are interpolated into a root-loaded PF ruleset. Reject anything
 # except a literal address and numeric scalar values before generating it.
-python3 - "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" <<'PY'
+python3 - "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$PROBE_PORT" "${LINK_UDP_PORT:-0}" "$RTT_MS" "$BW_DOWN" "$BW_UP" <<'PY'
 import ipaddress
 import sys
 
 try:
     ipaddress.ip_address(sys.argv[1])
     ports = [int(value) for value in sys.argv[2:5]]
-    rtt, down, up = [int(value) for value in sys.argv[5:8]]
+    link_port = int(sys.argv[5])
+    rtt, down, up = [int(value) for value in sys.argv[6:9]]
 except ValueError as exc:
     raise SystemExit(f"invalid netshape argument: {exc}")
 if any(port < 1 or port > 65535 for port in ports):
     raise SystemExit("invalid netshape argument: port must be 1..65535")
+if link_port < 0 or link_port > 65535:
+    raise SystemExit("invalid netshape argument: link UDP port must be 1..65535")
+if any(port in {22, 137, 138, 139, 445} for port in ports + [link_port] if port):
+    raise SystemExit("invalid netshape argument: refusing an SSH/SMB/NetBIOS port")
 if rtt < 0 or down < 1 or up < 1:
     raise SystemExit("invalid netshape argument: rtt must be nonnegative and bandwidth positive")
 PY
@@ -75,16 +83,28 @@ render_shape_rules() {
     echo "dummynet in  quick proto tcp from ${NAS_IP} port ${port} to any pipe ${PIPE_IN}"
     echo "dummynet out quick proto tcp from any to ${NAS_IP} port ${port} pipe ${PIPE_OUT}"
   done
+  if [ -n "$LINK_UDP_PORT" ]; then
+    # Match the app-owned local UDP socket in both directions. This covers the
+    # encrypted tsnet/WireGuard data plane without shaping other NAS traffic.
+    echo "dummynet in  quick proto udp from any to any port ${LINK_UDP_PORT} pipe ${PIPE_IN}"
+    echo "dummynet out quick proto udp from any port ${LINK_UDP_PORT} to any pipe ${PIPE_OUT}"
+  fi
 }
 
 self_test() {
   local rules
+  local expected
   rules=$(render_shape_rules)
-  [ "$(printf '%s\n' "$rules" | wc -l | tr -d ' ')" = "4" ]
+  expected=4
+  [ -z "$LINK_UDP_PORT" ] || expected=6
+  [ "$(printf '%s\n' "$rules" | wc -l | tr -d ' ')" = "$expected" ]
   [ "$(printf '%s\n' "$rules" | grep -Ec '^dummynet (in|out) +quick proto tcp .* port [0-9][0-9]*.* pipe [0-9][0-9]*$')" = "4" ]
+  if [ -n "$LINK_UDP_PORT" ]; then
+    [ "$(printf '%s\n' "$rules" | grep -Ec "^dummynet (in|out) +quick proto udp .* port ${LINK_UDP_PORT}.* pipe [0-9][0-9]*$")" = "2" ]
+  fi
   ! printf '%s\n' "$rules" | grep -Eq 'port (22|137|138|139|445)([^0-9]|$)'
   ! printf '%s\n' "$rules" | grep -Eq 'from [^ ]+ to any pipe|from any to [^ ]+ pipe'
-  echo "PASS: exactly four backend-port rules; no broad, SSH, or SMB/NetBIOS match"
+  echo "PASS: exact backend/link-port rules; no broad, SSH, or SMB/NetBIOS match"
 }
 
 # This workstation grants the two required binaries through sudoers without
@@ -162,6 +182,10 @@ PY
     echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${REDIS_PORT} .*pipe 0*${PIPE_OUT}" &&
     echo "$rules" | grep -Eq "dummynet in .*from ${NAS_IP} port (= )?${OBJECT_PORT} .*pipe 0*${PIPE_IN}" &&
     echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${OBJECT_PORT} .*pipe 0*${PIPE_OUT}" &&
+    { [ -z "$LINK_UDP_PORT" ] || {
+      echo "$rules" | grep -Eq "dummynet in .*proto udp .*to any port (= )?${LINK_UDP_PORT} .*pipe 0*${PIPE_IN}" &&
+      echo "$rules" | grep -Eq "dummynet out .*proto udp .*from any port (= )?${LINK_UDP_PORT} .*pipe 0*${PIPE_OUT}";
+    }; } &&
     ! echo "$rules" | grep -Eq "dummynet .*${NAS_IP} port (= )?(22|139|445)([^0-9]|$)" &&
     [ "$probe_ms" -ge "$min_probe_ms" ] &&
     echo "wire probe: ${probe_ms}ms (minimum ${min_probe_ms}ms)"
@@ -226,9 +250,11 @@ case "$cmd" in
       exit 1
     fi
     now=$(date +%s)
-    printf '{"active":true,"ip":"%s","redis_port":%s,"object_port":%s,"probe_port":%s,"rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"since":%s}\n' \
-      "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$now" > "$MARKER"
-    echo "SHAPING ACTIVE -> ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} rtt≈${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s"
+    link_json=null
+    [ -z "$LINK_UDP_PORT" ] || link_json="$LINK_UDP_PORT"
+    printf '{"active":true,"ip":"%s","redis_port":%s,"object_port":%s,"link_udp_port":%s,"probe_port":%s,"rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"since":%s}\n' \
+      "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$link_json" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$now" > "$MARKER"
+    echo "SHAPING ACTIVE -> backend ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} link_udp=${LINK_UDP_PORT:-off} rtt≈${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s"
     echo "marker: $MARKER  ('off' to remove; survives until then)"
     ;;
   off)
