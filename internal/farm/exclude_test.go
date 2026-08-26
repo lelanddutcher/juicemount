@@ -32,6 +32,7 @@ func TestExcludeReason(t *testing.T) {
 		// Skip-dir defaults (NLE ephemeral).
 		{"media-cache", "Adobe/Media Cache Files/x.pek", 500 * mib, 20 * mib, "skip-dir:media cache"},
 		{"peak-files", "Audio/Peak Files/x.pkf", 500 * mib, 20 * mib, "skip-dir:peak files"},
+		{"farm-benchmark", "__bench_encode_42/sample.mp4", 500 * mib, 20 * mib, "skip-dir:__bench_"},
 
 		// Clean content passes.
 		{"clean", "Footage/A001/A001_C001.braw", 4000 * mib, 20 * mib, ""},
@@ -54,6 +55,7 @@ func TestDirIsExcluded(t *testing.T) {
 		"a/b/PROXY":            true,
 		"Adobe/Media Cache":    true,
 		"Audio/Peak Files":     true,
+		"__bench_decode_17":    true,
 		"Footage/A001":         false,
 		"Projects/Client Work": false,
 		"Footage/proximity":    false, // "proxi" but not proxy/proxies
@@ -89,12 +91,13 @@ func TestSkipDirSubstringsEnv(t *testing.T) {
 // the live watcher never enqueues proxy / NLE-cache paths a sweep would skip.
 func TestWatchPathAllowedExclusion(t *testing.T) {
 	cases := map[string]bool{
-		"Footage/A001/clip.braw":     true,  // clean content
-		"Footage/Proxies/clip.mov":   false, // proxy folder
-		"Footage/clip_proxy.mov":     false, // proxy in filename
-		"Adobe/Media Cache Files/x":  false, // NLE cache dir
-		"Audio/Peak Files/x.pkf":     false, // peak files
-		"Footage/proximity_reel.mov": true,  // not a proxy (no over-match)
+		"Footage/A001/clip.braw":       true,  // clean content
+		"Footage/Proxies/clip.mov":     false, // proxy folder
+		"Footage/clip_proxy.mov":       false, // proxy in filename
+		"Adobe/Media Cache Files/x":    false, // NLE cache dir
+		"Audio/Peak Files/x.pkf":       false, // peak files
+		"__bench_access_17/sample.mp4": false, // farm instrumentation
+		"Footage/proximity_reel.mov":   true,  // not a proxy (no over-match)
 	}
 	for rel, want := range cases {
 		if got := WatchPathAllowed(rel); got != want {

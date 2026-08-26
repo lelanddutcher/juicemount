@@ -30,6 +30,9 @@ import (
 // adds more via JM_FARM_SKIP_DIRS.
 var defaultSkipDirSubstrings = []string{
 	"proxy", "proxies",
+	// Farm/node capability probes and release tests use __bench_* directories.
+	// They may contain valid MP4 samples but are instrumentation, never media.
+	"__bench_",
 	"adobe premiere pro video previews",
 	"adobe premiere pro audio previews",
 	// "media cache" already covers "Media Cache Files/" (superstring), so the

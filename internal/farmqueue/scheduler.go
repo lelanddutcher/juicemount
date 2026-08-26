@@ -2,6 +2,8 @@ package farmqueue
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"sort"
 	"strings"
 )
@@ -28,9 +30,7 @@ func (c *Client) RouteJob(ctx context.Context, j *Job) {
 	if err != nil {
 		workers = nil
 	}
-	sort.SliceStable(workers, func(i, k int) bool {
-		return workers[i].Benchmarks.EncodeFPS > workers[k].Benchmarks.EncodeFPS
-	})
+	loads := c.queuedWorkerLoads(ctx, workers)
 
 	switch kind {
 	case KindDerivatives:
@@ -38,7 +38,7 @@ func (c *Client) RouteJob(ctx context.Context, j *Job) {
 		j.SelectedBackend = "server-cpu"
 		j.RequiredCapabilities = []string{"metadata"}
 	case KindProxy:
-		if selected, enc, ok := preferredHardwareWorker(workers); ok {
+		if selected, enc, ok := preferredHardwareWorkerWithLoad(workers, loads); ok {
 			j.QueueClass = QueueClassRender
 			j.VCodec = enc
 			j.SelectedBackend = enc
@@ -52,7 +52,7 @@ func (c *Client) RouteJob(ctx context.Context, j *Job) {
 		j.SelectedWorker = ""
 		j.RequiredCapabilities = []string{"cpu"}
 	case KindTranscript:
-		if selected, backend, ok := preferredTranscriptWorker(workers); ok {
+		if selected, backend, ok := preferredTranscriptWorkerWithLoad(workers, loads); ok {
 			j.QueueClass = QueueClassRender
 			j.SelectedBackend = backend
 			j.SelectedWorker = workerDisplayName(selected)
@@ -67,20 +67,36 @@ func (c *Client) RouteJob(ctx context.Context, j *Job) {
 }
 
 func preferredHardwareWorker(workers []Worker) (Worker, string, bool) {
-	ordered := append([]Worker(nil), workers...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return ordered[i].Benchmarks.EncodeFPS > ordered[j].Benchmarks.EncodeFPS
-	})
+	return preferredHardwareWorkerWithLoad(workers, nil)
+}
+
+func preferredHardwareWorkerWithLoad(workers []Worker, loads map[string]int) (Worker, string, bool) {
 	for _, family := range []string{"hevc_", "h264_"} {
-		for _, w := range ordered {
+		type candidate struct {
+			worker  Worker
+			encoder string
+			cost    float64
+		}
+		var candidates []candidate
+		for _, w := range workers {
 			if w.Role != QueueClassRender {
 				continue
 			}
 			for _, enc := range w.Encoders {
 				if strings.HasPrefix(enc, family) && enc != "libx265" && enc != "libx264" {
-					return w, enc, true
+					candidates = append(candidates, candidate{
+						worker: w, encoder: enc,
+						cost: workerQueueCost(w, KindProxy, loads[w.ID]),
+					})
+					break
 				}
 			}
+		}
+		if len(candidates) > 0 {
+			sort.SliceStable(candidates, func(i, j int) bool {
+				return candidates[i].cost < candidates[j].cost
+			})
+			return candidates[0].worker, candidates[0].encoder, true
 		}
 	}
 	return Worker{}, "", false
@@ -92,21 +108,142 @@ func preferredHardwareEncoder(workers []Worker) (string, bool) {
 }
 
 func preferredTranscriptWorker(workers []Worker) (Worker, string, bool) {
-	ordered := append([]Worker(nil), workers...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return ordered[i].Benchmarks.TranscriptXReal > ordered[j].Benchmarks.TranscriptXReal
-	})
-	for _, w := range ordered {
+	return preferredTranscriptWorkerWithLoad(workers, nil)
+}
+
+func preferredTranscriptWorkerWithLoad(workers []Worker, loads map[string]int) (Worker, string, bool) {
+	type candidate struct {
+		worker  Worker
+		backend string
+		cost    float64
+	}
+	var candidates []candidate
+	for _, w := range workers {
 		if w.Role != QueueClassRender {
 			continue
 		}
 		for _, backend := range w.TranscriptBackends {
 			if backend != "" && backend != "cpu" {
-				return w, backend, true
+				candidates = append(candidates, candidate{
+					worker: w, backend: backend,
+					cost: workerQueueCost(w, KindTranscript, loads[w.ID]),
+				})
+				break
 			}
 		}
 	}
+	if len(candidates) > 0 {
+		sort.SliceStable(candidates, func(i, j int) bool {
+			return candidates[i].cost < candidates[j].cost
+		})
+		return candidates[0].worker, candidates[0].backend, true
+	}
 	return Worker{}, "", false
+}
+
+// workerQueueCost estimates time-to-finish for one more job on a worker. The
+// codec family is selected before this function is used, so measured capacity
+// only balances jobs among equally preferred HEVC (or H.264) nodes; load can
+// never downgrade a job from HEVC merely because an H.264 device is idle.
+func workerQueueCost(w Worker, kind string, queued int) float64 {
+	if queued < 0 {
+		queued = 0
+	}
+	if w.CurrentJob != "" {
+		queued++
+	}
+
+	seconds := 0.0
+	switch kind {
+	case KindProxy:
+		if w.Benchmarks.ProxyJobsCompleted > 0 && w.Benchmarks.LastProxySeconds > 0 {
+			seconds = w.Benchmarks.LastProxySeconds
+		} else {
+			throughput := positiveMin(w.Benchmarks.EncodeFPS, w.Benchmarks.DecodeFPS)
+			if throughput <= 0 {
+				throughput = positiveMax(w.Benchmarks.EncodeFPS, w.Benchmarks.DecodeFPS)
+			}
+			if throughput <= 0 {
+				throughput = 1
+			}
+			// A 300-frame reference clip turns FPS into an estimated duration.
+			seconds = 300 / throughput
+		}
+	case KindTranscript:
+		if w.Benchmarks.TranscriptJobsCompleted > 0 && w.Benchmarks.LastTranscriptSeconds > 0 {
+			seconds = w.Benchmarks.LastTranscriptSeconds
+		} else {
+			rate := w.Benchmarks.TranscriptXReal
+			if rate <= 0 {
+				rate = 0.1
+			}
+			seconds = 60 / rate // one reference minute of source audio
+		}
+	default:
+		seconds = w.Benchmarks.LastJobSeconds
+		if seconds <= 0 {
+			seconds = 1
+		}
+	}
+	// Real mount throughput is a shared bottleneck for decode, encode, and AI.
+	// Penalize slow/unknown access without letting a synthetic cache-speed spike
+	// dominate the actual codec benchmark.
+	if w.Benchmarks.AccessMBps > 0 {
+		seconds *= 1 + 100/math.Min(w.Benchmarks.AccessMBps, 1000)
+	} else {
+		seconds *= 2
+	}
+	return float64(queued+1) * seconds
+}
+
+func positiveMin(values ...float64) float64 {
+	min := 0.0
+	for _, value := range values {
+		if value > 0 && (min == 0 || value < min) {
+			min = value
+		}
+	}
+	return min
+}
+
+func positiveMax(values ...float64) float64 {
+	max := 0.0
+	for _, value := range values {
+		if value > max {
+			max = value
+		}
+	}
+	return max
+}
+
+// queuedWorkerLoads counts ready jobs already pinned to each exact worker.
+// Running work is represented by Worker.CurrentJob in workerQueueCost. The
+// count is best-effort: a Redis read error falls back to live benchmark-only
+// routing, never to an unverified worker or a different codec class.
+func (c *Client) queuedWorkerLoads(ctx context.Context, workers []Worker) map[string]int {
+	loads := make(map[string]int, len(workers))
+	for _, key := range []string{
+		classQueue(KindProxy, QueueClassRender),
+		classQueue(KindTranscript, QueueClassRender),
+	} {
+		raws, err := c.rdb.LRange(ctx, key, 0, -1).Result()
+		if err != nil {
+			continue
+		}
+		for _, raw := range raws {
+			var job Job
+			if json.Unmarshal([]byte(raw), &job) != nil {
+				continue
+			}
+			for _, required := range job.RequiredCapabilities {
+				if id, ok := strings.CutPrefix(required, "worker:"); ok && id != "" {
+					loads[id]++
+					break
+				}
+			}
+		}
+	}
+	return loads
 }
 
 func preferredTranscriptBackend(workers []Worker) (string, bool) {

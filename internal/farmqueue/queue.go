@@ -203,14 +203,18 @@ type JobStatus struct {
 // probes populate the synthetic fields; LastJobSeconds/JobsCompleted are fed by
 // real queue work and give the scheduler an honest moving signal over time.
 type WorkerBenchmarks struct {
-	EncodeFPS       float64 `json:"encode_fps,omitempty"`
-	DecodeFPS       float64 `json:"decode_fps,omitempty"`
-	TranscriptXReal float64 `json:"transcript_x_realtime,omitempty"`
-	AccessMBps      float64 `json:"access_mbps,omitempty"`
-	LastJobSeconds  float64 `json:"last_job_seconds,omitempty"`
-	JobsCompleted   int64   `json:"jobs_completed,omitempty"`
-	ProbedAt        string  `json:"probed_at,omitempty"`
-	ProbeError      string  `json:"probe_error,omitempty"`
+	EncodeFPS               float64 `json:"encode_fps,omitempty"`
+	DecodeFPS               float64 `json:"decode_fps,omitempty"`
+	TranscriptXReal         float64 `json:"transcript_x_realtime,omitempty"`
+	AccessMBps              float64 `json:"access_mbps,omitempty"`
+	LastJobSeconds          float64 `json:"last_job_seconds,omitempty"`
+	JobsCompleted           int64   `json:"jobs_completed,omitempty"`
+	LastProxySeconds        float64 `json:"last_proxy_seconds,omitempty"`
+	ProxyJobsCompleted      int64   `json:"proxy_jobs_completed,omitempty"`
+	LastTranscriptSeconds   float64 `json:"last_transcript_seconds,omitempty"`
+	TranscriptJobsCompleted int64   `json:"transcript_jobs_completed,omitempty"`
+	ProbedAt                string  `json:"probed_at,omitempty"`
+	ProbeError              string  `json:"probe_error,omitempty"`
 }
 
 // Worker is the heartbeat a draining worker publishes so producers can tell the

@@ -788,10 +788,10 @@ func runQueue(cfg queueConfig) {
 		}
 	}
 
-	// Automatic discovery runs on every worker but only the short-leased leader
-	// is allowed to enqueue. Non-leaders retain their dirty set, which gives a
-	// replacement leader immediate context after a node disappears.
-	if farm.WatchEnabled() {
+	// Discovery is a server/control-plane responsibility. Render workers only
+	// execute accelerator jobs; subscribing every GPU node made any of them able
+	// to become discovery leader and run recursive metadata walks remotely.
+	if workerRunsDiscovery(worker) {
 		kinds := farm.WatchKindsFromEnv()
 		var watchLeader atomic.Bool
 		go func() {
@@ -835,8 +835,10 @@ func runQueue(cfg queueConfig) {
 		}()
 		go runWatchBackstop(ctx, cfg, q, worker.ID, kinds)
 		defer q.ReleaseWatchLeadership(context.Background(), worker.ID)
-	} else {
+	} else if !farm.WatchEnabled() {
 		fmt.Fprintln(os.Stderr, "farm watch: disabled (JM_FARM_WATCH=0)")
+	} else {
+		fmt.Fprintln(os.Stderr, "farm watch: render node does not run server-side discovery")
 	}
 
 	nextReap := time.Time{}
@@ -946,8 +948,7 @@ func runQueue(cfg queueConfig) {
 		processed, failed, runErr := runJob(ctx, store, jobCfg, worker, job)
 		hbStop()
 		<-hbDone
-		worker.Benchmarks.LastJobSeconds = time.Since(jobStarted).Seconds()
-		worker.Benchmarks.JobsCompleted++
+		recordCompletedJobBenchmark(&worker, job, processed, failed, time.Since(jobStarted))
 		if ctx.Err() != nil {
 			// Leave the durable processing receipt intact. A live worker will
 			// recover it after this heartbeat expires.
@@ -988,6 +989,33 @@ func runQueue(cfg queueConfig) {
 	}
 
 	fmt.Printf("jmfarm queue: worker %s stopping (signal)\n", worker.ID)
+}
+
+func workerRunsDiscovery(worker farmqueue.Worker) bool {
+	return farm.WatchEnabled() && worker.Role == farmqueue.QueueClassServer
+}
+
+func recordCompletedJobBenchmark(worker *farmqueue.Worker, job farmqueue.Job, processed, failed int, elapsed time.Duration) {
+	if worker == nil || processed+failed == 0 {
+		// Empty/no-media discovery jobs are skipped work, not performance
+		// samples. Counting them drove LastJobSeconds toward zero and made the
+		// scheduler prefer nodes that had only scanned benchmark directories.
+		return
+	}
+	seconds := elapsed.Seconds()
+	worker.Benchmarks.LastJobSeconds = seconds
+	worker.Benchmarks.JobsCompleted++
+	if len(job.Kinds) != 1 {
+		return
+	}
+	switch job.Kinds[0] {
+	case farmqueue.KindProxy:
+		worker.Benchmarks.LastProxySeconds = seconds
+		worker.Benchmarks.ProxyJobsCompleted++
+	case farmqueue.KindTranscript:
+		worker.Benchmarks.LastTranscriptSeconds = seconds
+		worker.Benchmarks.TranscriptJobsCompleted++
+	}
 }
 
 // runJob runs the passes a single dequeued job asks for, scoped to job.Path, with
@@ -1118,6 +1146,9 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		}, targets)
 		processed += pr
 		failed += pf
+	}
+	if failed > 0 && processed == 0 {
+		return processed, failed, fmt.Errorf("all %d media operations failed; inspect worker logs for the per-file errors", failed)
 	}
 	return processed, failed, nil
 }

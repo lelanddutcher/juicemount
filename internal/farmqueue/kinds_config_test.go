@@ -84,6 +84,44 @@ func TestHardwarePreferenceIsHEVCThenObservedSpeed(t *testing.T) {
 	}
 }
 
+func TestHardwarePreferenceBalancesMeasuredQueueWithinCodecFamily(t *testing.T) {
+	workers := []Worker{
+		{ID: "busy-fast", Role: QueueClassRender, CurrentJob: "running", Encoders: []string{"hevc_qsv"},
+			Benchmarks: WorkerBenchmarks{EncodeFPS: 300, DecodeFPS: 300, AccessMBps: 500}},
+		{ID: "idle-balanced", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"},
+			Benchmarks: WorkerBenchmarks{EncodeFPS: 180, DecodeFPS: 180, AccessMBps: 500}},
+	}
+	selected, _, ok := preferredHardwareWorkerWithLoad(workers, map[string]int{"busy-fast": 3})
+	if !ok || selected.ID != "idle-balanced" {
+		t.Fatalf("load-aware selection = %q/%v, want idle-balanced", selected.ID, ok)
+	}
+
+	// HEVC preference is an invariant, not a soft score: even a heavily loaded
+	// HEVC node remains the target while it is healthy; H.264 is only the next
+	// hardware family when no verified HEVC encoder is online.
+	workers = []Worker{
+		{ID: "busy-hevc", Role: QueueClassRender, CurrentJob: "running", Encoders: []string{"hevc_vaapi"},
+			Benchmarks: WorkerBenchmarks{EncodeFPS: 100, DecodeFPS: 100, AccessMBps: 100}},
+		{ID: "idle-h264", Role: QueueClassRender, Encoders: []string{"h264_nvenc"},
+			Benchmarks: WorkerBenchmarks{EncodeFPS: 500, DecodeFPS: 500, AccessMBps: 1000}},
+	}
+	selected, encoder, ok := preferredHardwareWorkerWithLoad(workers, map[string]int{"busy-hevc": 20})
+	if !ok || selected.ID != "busy-hevc" || encoder != "hevc_vaapi" {
+		t.Fatalf("codec priority selection = %q/%q/%v, want busy-hevc/hevc_vaapi", selected.ID, encoder, ok)
+	}
+}
+
+func TestVideoCostUsesDecodeAndMountMeasurements(t *testing.T) {
+	encodeOnlyFast := Worker{ID: "decode-bound", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 500, DecodeFPS: 40, AccessMBps: 80}}
+	balanced := Worker{ID: "balanced", Role: QueueClassRender, Encoders: []string{"hevc_qsv"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 180, DecodeFPS: 180, AccessMBps: 500}}
+	selected, _, ok := preferredHardwareWorkerWithLoad([]Worker{encodeOnlyFast, balanced}, nil)
+	if !ok || selected.ID != "balanced" {
+		t.Fatalf("measured pipeline selection = %q/%v, want balanced", selected.ID, ok)
+	}
+}
+
 func TestTranscriptPreferenceUsesObservedSpeed(t *testing.T) {
 	workers := []Worker{
 		{ID: "slow", Role: QueueClassRender, TranscriptBackends: []string{"cpu", "vulkan"}, Benchmarks: WorkerBenchmarks{TranscriptXReal: 2}},
@@ -92,6 +130,19 @@ func TestTranscriptPreferenceUsesObservedSpeed(t *testing.T) {
 	selected, backend, ok := preferredTranscriptWorker(workers)
 	if !ok || selected.ID != "fast" || backend != "cuda" {
 		t.Fatalf("selected transcript worker/backend = %q/%q/%v", selected.ID, backend, ok)
+	}
+}
+
+func TestTranscriptPreferenceBalancesQueuedWork(t *testing.T) {
+	workers := []Worker{
+		{ID: "busy", Role: QueueClassRender, TranscriptBackends: []string{"cuda"},
+			Benchmarks: WorkerBenchmarks{TranscriptXReal: 8, AccessMBps: 500}},
+		{ID: "idle", Role: QueueClassRender, TranscriptBackends: []string{"vulkan"},
+			Benchmarks: WorkerBenchmarks{TranscriptXReal: 4, AccessMBps: 500}},
+	}
+	selected, backend, ok := preferredTranscriptWorkerWithLoad(workers, map[string]int{"busy": 4})
+	if !ok || selected.ID != "idle" || backend != "vulkan" {
+		t.Fatalf("load-aware transcript selection = %q/%q/%v, want idle/vulkan", selected.ID, backend, ok)
 	}
 }
 
