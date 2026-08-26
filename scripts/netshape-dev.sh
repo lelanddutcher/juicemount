@@ -30,13 +30,14 @@ usage() { sed -n '2,10p' "$0"; exit 2; }
 
 cmd="${1:-status}"; shift || true
 
-RTT_MS=300; BW_DOWN=2; BW_UP=1; NAS_IP="192.168.0.197"
+RTT_MS=300; BW_DOWN=2; BW_UP=1; NAS_IP="192.168.0.197"; PROBE_PORT=30179
 while [ $# -gt 0 ]; do
   case "$1" in
     --rtt) RTT_MS="$2"; shift 2;;
     --bw-down) BW_DOWN="$2"; shift 2;;
     --bw-up) BW_UP="$2"; shift 2;;
     --ip) NAS_IP="$2"; shift 2;;
+    --probe-port) PROBE_PORT="$2"; shift 2;;
     *) usage;;
   esac
 done
@@ -83,16 +84,39 @@ restore_state() {
 verify_shape() {
   local pipes
   local rules
+  local probe_ms
+  local min_probe_ms
   pipes=$(sudo -n dnctl pipe show 2>/dev/null)
   # macOS omits dummynet rules from `-sr` even though it includes ordinary
   # filter rules there; `-s all` is the only read-only view that renders the
   # active dummynet section.
   rules=$(sudo -n pfctl -s all 2>/dev/null)
+  # Darwin's dnctl display drops the idle/outbound pipe header after the first
+  # flow enters the inbound pipe, even though the outbound pipe is still
+  # operational. Prove both half-delays on the wire instead of trusting that
+  # misleading rendering: a TCP handshake traverses out + in and must therefore
+  # take approximately the requested RTT. The default probe is JuiceMount's
+  # Redis endpoint; --probe-port supports non-default test deployments.
+  probe_ms=$(python3 - "$NAS_IP" "$PROBE_PORT" "$RTT_MS" <<'PY'
+import socket, sys, time
+host, port, rtt = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+s = socket.socket()
+s.settimeout(max(3.0, rtt / 1000.0 * 5.0))
+started = time.monotonic()
+try:
+    s.connect_ex((host, port))
+finally:
+    s.close()
+print(int((time.monotonic() - started) * 1000))
+PY
+  )
+  min_probe_ms=$(( RTT_MS * 3 / 4 ))
   echo "$pipes" | grep -Eq "(^|[[:space:]])0*${PIPE_IN}:" &&
-    echo "$pipes" | grep -Eq "(^|[[:space:]])0*${PIPE_OUT}:" &&
     sudo -n pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' &&
     echo "$rules" | grep -Eq "dummynet in .*from ${NAS_IP} .*pipe 0*${PIPE_IN}" &&
-    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} .*pipe 0*${PIPE_OUT}"
+    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} .*pipe 0*${PIPE_OUT}" &&
+    [ "$probe_ms" -ge "$min_probe_ms" ] &&
+    echo "wire probe: ${probe_ms}ms (minimum ${min_probe_ms}ms)"
 }
 
 activate_shape() {
@@ -116,8 +140,11 @@ activate_shape() {
   rules_tmp=$(mktemp -t jum-netshape.XXXXXX)
   {
     echo "# JuiceMount dev shaping -> ${NAS_IP} (rtt=${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s)"
-    echo "dummynet in  proto { tcp udp } from ${NAS_IP} to any pipe ${PIPE_IN}"
-    echo "dummynet out proto { tcp udp } from any to ${NAS_IP} pipe ${PIPE_OUT}"
+    # PF is last-match-wins unless a rule is quick. The saved system ruleset
+    # contains broad pass rules after ours; without quick, outbound packets
+    # bypassed dummynet even though `pfctl -s all` still displayed the rule.
+    echo "dummynet in  quick proto { tcp udp } from ${NAS_IP} to any pipe ${PIPE_IN}"
+    echo "dummynet out quick proto { tcp udp } from any to ${NAS_IP} pipe ${PIPE_OUT}"
     grep -v '^#' "$STATE_FILE" | grep -v '^ENABLED='
   } > "$rules_tmp"
   sudo -n pfctl -f "$rules_tmp"
@@ -149,8 +176,8 @@ case "$cmd" in
       exit 1
     fi
     now=$(date +%s)
-    printf '{"active":true,"ip":"%s","rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"since":%s}\n' \
-      "$NAS_IP" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$now" > "$MARKER"
+    printf '{"active":true,"ip":"%s","probe_port":%s,"rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"since":%s}\n' \
+      "$NAS_IP" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$now" > "$MARKER"
     echo "SHAPING ACTIVE -> ${NAS_IP}: rtt≈${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s"
     echo "marker: $MARKER  ('off' to remove; survives until then)"
     ;;
