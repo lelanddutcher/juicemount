@@ -94,6 +94,40 @@ func redactURLCreds(raw string) string {
 	return u.String()
 }
 
+const desktopJuiceFSHeartbeat = "60s"
+
+func desktopJuiceFSSessionArgs() []string {
+	return []string{
+		"--heartbeat", desktopJuiceFSHeartbeat,
+		"--max-uploads", "4",
+	}
+}
+
+// juiceFSChildEnvironment deliberately gives the external JuiceFS daemon a
+// small, non-secret environment. The upstream macOS daemon launcher preserves
+// its environment in the daemon process title, which makes inherited API keys
+// and tokens visible through the process table even though JuiceMount never
+// logs them. The desktop mount is fully configured by flags plus the volume
+// metadata in Redis, so it does not need arbitrary parent-process variables.
+//
+// Keep only values required to find the user's cache/home, execute helper
+// binaries, localize diagnostics, and validate TLS certificates. Missing
+// values are omitted rather than synthesized.
+func juiceFSChildEnvironment() []string {
+	allowed := [...]string{
+		"HOME", "USER", "LOGNAME", "PATH", "TMPDIR",
+		"LANG", "LC_ALL", "LC_CTYPE", "TZ",
+		"SSL_CERT_FILE", "SSL_CERT_DIR",
+	}
+	env := make([]string, 0, len(allowed))
+	for _, key := range allowed {
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
+}
+
 // FUSEConfig holds JuiceFS mount configuration.
 type FUSEConfig struct {
 	RedisURL   string // e.g. "redis://127.0.0.1:6379/1"
@@ -459,9 +493,22 @@ func (fm *FUSEManager) Mount() error {
 		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
 		"-d", // daemon mode
 		"--no-usage-report",
+		// A JuiceFS session expires at five heartbeat intervals. The upstream
+		// 12s default therefore lets another always-on client reap this Mac
+		// after only 60s. A cold or cellular S3 PUT can legitimately consume
+		// that entire window; the live RC test reproduced the GPU worker
+		// deleting the Mac session during the first 10 MiB write. Five minutes
+		// protects slow-but-progressing writes without enabling writeback or
+		// weakening durability. Metadata liveness is still monitored by
+		// JuiceMount's independent, seconds-scale reachability checks.
 		"--buffer-size", strconv.Itoa(bufMB),
 		"--prefetch", strconv.Itoa(jfp.Prefetch),
 	)
+	// Twenty simultaneous uploads can monopolize a cellular uplink and inflate
+	// latency for Redis/Finder control traffic. Four 4 MiB flows still provide
+	// ample bandwidth-delay-product on LAN and WAN while bounding queueing
+	// pressure across a Wi-Fi -> cellular handoff.
+	args = append(args, desktopJuiceFSSessionArgs()...)
 	args = append(args, juiceFSMountPlatformOptions(runtime.GOOS)...)
 	// S1 (WAVE 1, RC-5): cap JuiceFS session readahead on a WAN link only.
 	// juicefs's --max-readahead defaults to 8×BlockSize = 32 MiB, so a single
@@ -706,6 +753,7 @@ func (fm *FUSEManager) Mount() error {
 	launchCtx, launchCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer launchCancel()
 	cmd := exec.CommandContext(launchCtx, fm.cfg.JuiceFSBin, args...)
+	cmd.Env = juiceFSChildEnvironment()
 	cmd.Stdout = os.Stdout
 	// Tee stderr: still stream to os.Stderr (the log tail) but also capture it
 	// so a failed launch's RETURNED error carries juicefs's actual reason
