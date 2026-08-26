@@ -87,6 +87,8 @@ func TestScanContextTimeoutEnvOverride(t *testing.T) {
 
 func TestIsDeferredSyncErrClassification(t *testing.T) {
 	t.Setenv("JM_SYNC_DEFERRAL", "")
+	SetClassSignals(func() string { return "en21" }, func() bool { return true })
+	t.Cleanup(func() { SetClassSignals(nil, nil) })
 	deadlineErr := fmt.Errorf("redis SCAN batch: %w", context.DeadlineExceeded)
 	otherErr := errors.New("dial tcp: connection refused")
 
@@ -96,7 +98,11 @@ func TestIsDeferredSyncErrClassification(t *testing.T) {
 		t.Error("deadline error with push NOT engaged must be a FAILURE, not deferred")
 	}
 
-	rc.backstopNanos.Store(int64(15 * time.Minute)) // push ENGAGED
+	rc.backstopNanos.Store(int64(15 * time.Minute)) // long cadence alone is insufficient
+	if rc.isDeferredSyncErr(deadlineErr) {
+		t.Error("long configured cadence with push NOT engaged must remain a FAILURE")
+	}
+	rc.engaged.Store(int32(keyspaceEnabled)) // push ENGAGED
 	if !rc.isDeferredSyncErr(deadlineErr) {
 		t.Error("deadline error with push engaged must be DEFERRED")
 	}
@@ -154,6 +160,9 @@ func TestDoReconcileDeferredSkipsBackoff(t *testing.T) {
 
 	rc := hungRedisClient(t)
 	rc.backstopNanos.Store(int64(15 * time.Minute)) // push ENGAGED
+	rc.engaged.Store(int32(keyspaceEnabled))
+	SetClassSignals(func() string { return "en21" }, func() bool { return true })
+	t.Cleanup(func() { SetClassSignals(nil, nil) })
 	rc.connected = true
 
 	consecutive := 0
@@ -228,8 +237,11 @@ func TestDoReconcileFailurePathUnchanged(t *testing.T) {
 
 func TestIsSyncingFalseAfterDeferredOrFailed(t *testing.T) {
 	t.Setenv("JM_SYNC_DEFERRAL", "")
+	SetClassSignals(func() string { return "en21" }, func() bool { return true })
+	t.Cleanup(func() { SetClassSignals(nil, nil) })
 	rc := &RedisClient{}
 	rc.backstopNanos.Store(int64(15 * time.Minute)) // push ENGAGED
+	rc.engaged.Store(int32(keyspaceEnabled))
 	deadlineErr := fmt.Errorf("redis SCAN batch: %w", context.DeadlineExceeded)
 
 	// In-flight sync → syncing.
@@ -281,8 +293,11 @@ func TestIsSyncingFalseAfterDeferredOrFailed(t *testing.T) {
 
 func TestDeferredStreakCounterResetsOnSuccess(t *testing.T) {
 	t.Setenv("JM_SYNC_DEFERRAL", "")
+	SetClassSignals(func() string { return "en21" }, func() bool { return true })
+	t.Cleanup(func() { SetClassSignals(nil, nil) })
 	rc := &RedisClient{}
 	rc.backstopNanos.Store(int64(15 * time.Minute)) // push ENGAGED
+	rc.engaged.Store(int32(keyspaceEnabled))
 	deadlineErr := fmt.Errorf("redis SCAN batch: %w", context.DeadlineExceeded)
 
 	// Three consecutive deferrals: the streak counts each attempt, but only

@@ -178,6 +178,13 @@ type RedisClient struct {
 	// recovery (NOT to the captured baseInterval). Always holds a value >=
 	// 1; zero is treated as DefaultReconcileInterval by reconcileLoop.
 	backstopNanos atomic.Int64
+	// backstopChangedCh wakes reconcileLoop when resolveBackstop changes the
+	// live cadence. An atomic value alone is insufficient: a loop already
+	// blocked on its old 30-second ticker cannot observe a new 24-hour push
+	// backstop until that stale tick fires, which launches exactly one
+	// redundant full SCAN at startup. Buffered/coalesced because only the most
+	// recent cadence matters.
+	backstopChangedCh chan struct{}
 
 	// configReconcileNanos holds the CONFIG-SEED reconcile cadence (in
 	// nanoseconds) supplied by SetReconcileInterval — the LB-4 "Reconcile
@@ -381,10 +388,10 @@ func (rc *RedisClient) loadSpoolGuard() spoolGuardFunc {
 
 // SetReconcileInterval overrides the periodic reconcile cadence (LB-4:
 // the app's "Reconcile interval" preference, previously a placebo). Same
-// contract as SetPathConfig: must be called before Start — reconcileLoop
-// snapshots the value once at launch, so later writes are both racy and
-// ineffective. d <= 0 keeps DefaultReconcileInterval, letting callers
-// pass an unset (zero) config value straight through.
+// contract as SetPathConfig. It may be called before or after Start;
+// resolveBackstop wakes the running loop so an already-armed ticker cannot
+// fire once at its obsolete cadence. d <= 0 keeps DefaultReconcileInterval,
+// letting callers pass an unset (zero) config value straight through.
 func (rc *RedisClient) SetReconcileInterval(d time.Duration) {
 	if d <= 0 {
 		return
@@ -569,6 +576,7 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 		reconcileInterval: DefaultReconcileInterval,
 		stopCh:            make(chan struct{}),
 		syncNowCh:         make(chan struct{}, 1),
+		backstopChangedCh: make(chan struct{}, 1),
 		connected:         true,
 		pruneAbsent:       make(map[string]int),
 		ladderPersisted:   make(map[string]int),
@@ -617,6 +625,7 @@ func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error)
 		reconcileInterval: DefaultReconcileInterval,
 		stopCh:            make(chan struct{}),
 		syncNowCh:         make(chan struct{}, 1),
+		backstopChangedCh: make(chan struct{}, 1),
 		connected:         false,
 		lastDisconnect:    time.Now(),
 		pruneAbsent:       make(map[string]int),
@@ -1351,25 +1360,24 @@ func (rc *RedisClient) reconcileLoop() {
 		// ticker (short intervals) and must not be overridden by the long
 		// backstop value until it recovers. (Regression guard for the
 		// `baseInterval` captured-once bug.)
-		if consecutiveFailures == 0 {
-			want := rc.currentBackstop()
-			// Re-baseline only when the BASE itself changed (a keyspace engagement
-			// transition or a SetReconcileInterval write) — compare to lastBase,
-			// NOT backoff. backoff can legitimately sit ABOVE the base because
-			// doReconcile applied a task #22 adaptive STRETCH; comparing to backoff
-			// would clobber that stretch every turn, pulling the cadence back down
-			// to the base and defeating the 500GB-copy duty-cycle. On a real base
-			// change we re-baseline; doReconcile re-applies any stretch next sync.
-			if want != lastBase {
-				lastBase = want
-				backoff = want
-				ticker.Reset(backoff)
-			}
-		}
+		rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker)
 
 		select {
 		case <-ticker.C:
+			// A backstop change and the old tick can become ready together. select
+			// is intentionally random among ready cases, so re-check here before
+			// doing any work. Without this guard startup can still run one full
+			// SCAN after push has already demoted it to the 24-hour backstop.
+			if rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker) {
+				continue
+			}
 			rc.doReconcile(&consecutiveFailures, &backoff, maxBackoff, ticker)
+		case <-rc.backstopChangedCh:
+			// Wake an already-blocked loop immediately. A successful keyspace
+			// gap-fill followed by ENABLED is also authoritative recovery from a
+			// prior SCAN failure, so the long push cadence may end that stale
+			// failure backoff.
+			rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker)
 		case <-rc.syncNowCh:
 			// G5 fast-path continuation (review fix): a capped mass-delete
 			// cycle with confirmed survivors schedules its own follow-up.
@@ -1384,8 +1392,8 @@ func (rc *RedisClient) reconcileLoop() {
 				continue
 			}
 			// Keyspace-push deferral (2026-06-27): when the push is actively
-			// ENABLED the backstop is long (setEngagement stores a >30s interval
-			// ONLY for ENABLED+reachable). In that state a network-change/reconnect
+			// ENABLED and the backend is reachable, pushCarriesDeltas reports that
+			// delivery is live. In that state a network-change/reconnect
 			// must NOT fire a full SCAN here — the keyspace loop OWNS reconnect
 			// convergence (PSUBSCRIBE-then-gap-fill on its OWN (re)connect), and the
 			// rare backstop is the safety net. On a flaky link — cellular, or a
@@ -1393,10 +1401,10 @@ func (rc *RedisClient) reconcileLoop() {
 			// PSUBSCRIBE (observed: backend pinging at 16ms while the probe flapped
 			// "unreachable" every ~10s) — this path otherwise fires a full 200k SCAN
 			// PER flap, the exact contention the push was built to remove. When the
-			// push is NOT carrying deltas (backstop == 30s: DISABLED / DEGRADED /
-			// unreachable) we fall through to the classic flap-debounce + SCAN, which
+			// push is NOT carrying deltas (DISABLED / DEGRADED / unreachable) we
+			// fall through to the classic flap-debounce + SCAN, which
 			// is then the authoritative convergence path (byte-identical to before).
-			if rc.currentBackstop() > DefaultReconcileInterval {
+			if rc.pushCarriesDeltas() {
 				jmlog.Info("network-change reconcile deferred to keyspace push",
 					"reason", "push ENABLED; keyspace loop owns reconnect gap-fill")
 				continue
@@ -1455,6 +1463,39 @@ func (rc *RedisClient) reconcileLoop() {
 	}
 }
 
+// rebaselineReconcileTicker applies an actual base-cadence change to a running
+// loop. It returns true when the old ticker was stale and has been reset, so a
+// caller that just received from ticker.C can skip that obsolete tick.
+//
+// Failure backoff normally owns the ticker until doReconcile recovers. The one
+// safe exception is keyspace push becoming ENABLED+reachable: that transition
+// occurs only after its own authoritative gap-fill succeeds, so carrying a
+// stale full-SCAN failure retry into push mode is redundant and harmful.
+func (rc *RedisClient) rebaselineReconcileTicker(lastBase *time.Duration, consecutiveFailures *int, backoff *time.Duration, ticker *time.Ticker) bool {
+	want := rc.currentBackstop()
+	if want == *lastBase {
+		return false
+	}
+	if *consecutiveFailures != 0 {
+		if !rc.pushCarriesDeltas() {
+			return false
+		}
+		*consecutiveFailures = 0
+	}
+	*lastBase = want
+	*backoff = want
+	ticker.Reset(want)
+	return true
+}
+
+// pushCarriesDeltas is the explicit predicate for suppressing redundant full
+// SCANs. A long configured reconcile interval is not proof of push engagement:
+// SetReconcileInterval may legitimately be longer than 30 seconds while push
+// is disabled. The old currentBackstop()>30s shortcut confused those states.
+func (rc *RedisClient) pushCarriesDeltas() bool {
+	return keyspaceEngagement(rc.engaged.Load()) == keyspaceEnabled && reachableNow()
+}
+
 // currentBackstop returns the current desired reconcile interval, reading
 // the live backstopNanos atomic. Falls back to DefaultReconcileInterval if
 // unset/zero so a running loop never spins on a 0-duration ticker.
@@ -1509,9 +1550,9 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 	baseInterval := DefaultReconcileInterval
 	if err := rc.syncMetadata(); err != nil {
 		// G7 (task #80): DEFERRED, not failed. A SCAN that exceeded its
-		// class-gated budget WHILE the keyspace push is engaged (backstop >
-		// DefaultReconcileInterval — the established push-carrying test, see
-		// the reconcileLoop deferral above) is redundant convergence work:
+		// class-gated budget WHILE keyspace push is explicitly ENABLED and
+		// reachable (the same pushCarriesDeltas test used by reconcileLoop) is
+		// redundant convergence work:
 		// deltas are flowing via push the whole time. The failure backoff is
 		// deliberately FASTER than the backstop (outage recovery), which is
 		// exactly wrong here — live 2026-07-01, each fast retry saturated a
@@ -1607,9 +1648,8 @@ func (rc *RedisClient) doReconcile(consecutiveFailures *int, backoff *time.Durat
 // context.DeadlineExceeded (the SCAN exceeded its class-gated wall budget —
 // syncMetadata guarantees the sentinel is present whenever its own context
 // expired) AND the keyspace push is engaged and carrying deltas
-// (currentBackstop() > DefaultReconcileInterval — the same push-carrying test
-// reconcileLoop's network-change deferral uses; setEngagement stores a long
-// backstop ONLY for ENABLED+reachable). In that state the backstop SCAN is
+// (pushCarriesDeltas() — the same explicit predicate reconcileLoop's
+// network-change deferral uses). In that state the backstop SCAN is
 // redundant convergence work and must not drive the fast failure backoff.
 //
 // If the push drops, setEngagement(degraded/disabled) snaps the backstop back
@@ -1620,8 +1660,7 @@ func (rc *RedisClient) isDeferredSyncErr(err error) bool {
 	if err == nil || os.Getenv("JM_SYNC_DEFERRAL") == "0" {
 		return false
 	}
-	return errors.Is(err, context.DeadlineExceeded) &&
-		rc.currentBackstop() > DefaultReconcileInterval
+	return errors.Is(err, context.DeadlineExceeded) && rc.pushCarriesDeltas()
 }
 
 // noteSyncOutcome records the end of a sync attempt (G7, task #80). Called on

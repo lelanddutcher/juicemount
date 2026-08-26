@@ -376,8 +376,8 @@ func TestReconcileBackstopPrecedence(t *testing.T) {
 
 // TestNetworkChangeDeferralPredicate locks the exact gate the reconcileLoop
 // syncNowCh handler uses to DEFER a network-change full SCAN to the keyspace
-// push: currentBackstop() > DefaultReconcileInterval. That is true IFF the push
-// is ENABLED + reachable (PSUBSCRIBE up, deltas flowing) — the one state in
+// push: pushCarriesDeltas(). That is true IFF the push is ENABLED + reachable
+// (PSUBSCRIBE up, deltas flowing) — the one state in
 // which a per-flap full 200k SCAN is redundant, because the keyspace loop owns
 // reconnect gap-fill and the rare backstop is the safety net. In every other
 // state (DISABLED / DEGRADED / ENABLED-but-unreachable) the gate is false and
@@ -387,9 +387,7 @@ func TestReconcileBackstopPrecedence(t *testing.T) {
 // regression (a flaky link silently losing its convergence SCAN) ever ships.
 func TestNetworkChangeDeferralPredicate(t *testing.T) {
 	// Mirrors the reconcileLoop syncNowCh gate exactly.
-	deferred := func(rc *RedisClient) bool {
-		return rc.currentBackstop() > DefaultReconcileInterval
-	}
+	deferred := func(rc *RedisClient) bool { return rc.pushCarriesDeltas() }
 	rc := &RedisClient{}
 	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
 
@@ -408,6 +406,12 @@ func TestNetworkChangeDeferralPredicate(t *testing.T) {
 	rc.setEngagement(keyspaceDisabled)
 	if deferred(rc) {
 		t.Errorf("DISABLED must NOT defer (backstop=%v)", rc.currentBackstop())
+	}
+	// A user-configured long fallback cadence is not push engagement. The old
+	// currentBackstop()>30s shortcut falsely deferred this state forever.
+	rc.SetReconcileInterval(5 * time.Minute)
+	if deferred(rc) {
+		t.Errorf("DISABLED+long config must NOT defer (backstop=%v)", rc.currentBackstop())
 	}
 	// ENABLED but UNREACHABLE -> do NOT defer (push delivery is down).
 	SetClassSignals(func() string { return "en0" }, func() bool { return false })
@@ -508,9 +512,7 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 // ---------------------------------------------------------------------------
 // Backstop controller: a RUNNING reconcileLoop must pick up a live
 // backstopNanos change (regression guard for the baseInterval captured-once
-// bug). We don't run the full loop here (it would hit Redis); instead we
-// assert the read path currentBackstop reflects atomic writes, which is what
-// reconcileLoop consults each turn.
+// bug).
 // ---------------------------------------------------------------------------
 
 func TestCurrentBackstopReflectsLiveWrites(t *testing.T) {
@@ -527,6 +529,52 @@ func TestCurrentBackstopReflectsLiveWrites(t *testing.T) {
 	rc.backstopNanos.Store(0)
 	if rc.currentBackstop() != DefaultReconcileInterval {
 		t.Fatalf("zero backstop = %v, want default", rc.currentBackstop())
+	}
+}
+
+// TestBackstopChangeWakesAndRebaselinesTicker locks the startup race found in
+// the signed RC: reconcileLoop armed its initial 30s ticker, keyspace push
+// engaged and changed the backstop to 24h, but the sleeping loop received no
+// wake. The obsolete 30s tick then launched a full 325k-entry SCAN and stalled
+// Finder plus /health immediately after mount.
+func TestBackstopChangeWakesAndRebaselinesTicker(t *testing.T) {
+	t.Setenv("JM_WAN_MODE", "")
+	t.Setenv("JM_RECONCILE_BACKSTOP_SEC", "")
+	SetClassSignals(func() string { return "en21" }, func() bool { return true })
+	t.Cleanup(func() { SetClassSignals(nil, nil) })
+
+	rc := &RedisClient{backstopChangedCh: make(chan struct{}, 1)}
+	rc.backstopNanos.Store(int64(DefaultReconcileInterval))
+	rc.setEngagement(keyspaceEnabled)
+
+	select {
+	case <-rc.backstopChangedCh:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("backstop change did not wake the running reconcile loop")
+	}
+
+	lastBase := DefaultReconcileInterval
+	backoff := DefaultReconcileInterval
+	consecutiveFailures := 0
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	if !rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker) {
+		t.Fatal("running ticker was not rebaselined after push engagement")
+	}
+	if want := backstopForClass(classLAN); lastBase != want || backoff != want {
+		t.Fatalf("rebaseline lastBase=%v backoff=%v, want %v", lastBase, backoff, want)
+	}
+
+	// A successful push gap-fill is authoritative recovery and cancels an old
+	// full-SCAN failure retry instead of carrying it into healthy push mode.
+	lastBase = DefaultReconcileInterval
+	backoff = 5 * time.Minute
+	consecutiveFailures = 3
+	if !rc.rebaselineReconcileTicker(&lastBase, &consecutiveFailures, &backoff, ticker) {
+		t.Fatal("push recovery did not replace stale failure backoff")
+	}
+	if consecutiveFailures != 0 {
+		t.Fatalf("failure streak=%d after authoritative push recovery, want 0", consecutiveFailures)
 	}
 }
 

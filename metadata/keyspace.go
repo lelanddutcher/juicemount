@@ -436,6 +436,12 @@ func (rc *RedisClient) resolveBackstop(reason string) {
 			"reason", reason, "engaged", e.String(),
 			"class", currentLinkClass().String(),
 			"config_sec", cfg.Seconds())
+		if rc.backstopChangedCh != nil {
+			select {
+			case rc.backstopChangedCh <- struct{}{}:
+			default:
+			}
+		}
 	}
 }
 
