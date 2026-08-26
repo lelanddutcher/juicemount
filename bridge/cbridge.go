@@ -1979,13 +1979,29 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// mountNFSWithPrompt. Boot never waits on a human again.
 	if cfg.MountPoint != "" {
 		jmlog.Info("BOOT-TRACE: step-4 pre-mount-check")
-		if isMounted(cfg.MountPoint) {
+		mounted := isMounted(cfg.MountPoint)
+		if mounted && nfsMountResponsive(cfg.MountPoint, 2*time.Second) {
 			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
 			warmupMarkServing()
 			globalMountPath = cfg.MountPoint
 		} else {
 			mountAddr, mountPoint := srv.Addr(), cfg.MountPoint
 			go func() {
+				if mounted {
+					// A prior process can leave a syntactically valid loopback NFS
+					// mount whose kernel session is still bound to the dead server.
+					// Reusing it makes Finder hang and can briefly publish healthy
+					// state from cached attributes. Prove a fresh LOOKUP reaches this
+					// process; on timeout, force the stale mount away before retrying.
+					jmlog.Warn("existing nfs mount is unresponsive — remounting",
+						"mount_point", mountPoint)
+					if !unmountNFS(mountPoint) {
+						jmlog.Error("stale nfs mount recovery failed",
+							"mount_point", mountPoint,
+							"hint", "use Mount Now after force-unmounting the stale volume")
+						return
+					}
+				}
 				var mountErr error
 				for attempt := 1; attempt <= 6; attempt++ {
 					mountErr = mountNFSWithPrompt(mountAddr, mountPoint)
@@ -3176,6 +3192,35 @@ func isMounted(path string) bool {
 		return false
 	}
 	return strings.Contains(string(out), " "+path+" ")
+}
+
+// nfsMountResponsive proves that an existing kernel NFS mount can exchange a
+// fresh RPC with the currently-running loopback server. A stat of the mount
+// root is insufficient: macOS can satisfy it from its attribute cache after
+// the previous app process has died. Looking up a process-unique missing name
+// forces an uncached NFS LOOKUP while remaining read-only. Both ENOENT and an
+// improbable existing file are successful server responses; a timeout or I/O
+// error means the mount must not be reused.
+func nfsMountResponsive(path string, timeout time.Duration) bool {
+	return nfsMountResponsiveWith(path, timeout, os.Lstat)
+}
+
+func nfsMountResponsiveWith(path string, timeout time.Duration, lstat func(string) (os.FileInfo, error)) bool {
+	if path == "" || timeout <= 0 || lstat == nil {
+		return false
+	}
+	probe := filepath.Join(path, fmt.Sprintf(".jm-live-probe-%d-%d", os.Getpid(), time.Now().UnixNano()))
+	done := make(chan error, 1)
+	go func() {
+		_, err := lstat(probe)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err == nil || errors.Is(err, os.ErrNotExist)
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // mountAt parses `mount` output and returns the current owner of the given
