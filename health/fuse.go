@@ -6,7 +6,6 @@ package health
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -147,6 +146,73 @@ func juiceFSChildEnvironment() []string {
 	return env
 }
 
+// juiceFSDirectEnvironment selects JuiceFS's service stage directly instead
+// of its built-in launchMount supervisor. The upstream supervisor probes the
+// mountpoint every five seconds and SIGKILLs the service after roughly one
+// minute without a response. A cellular object request is legitimately allowed
+// to run for 60 seconds and retry, so that watchdog can destroy a slow-but-live
+// macFUSE session in the middle of useful work. JuiceMount already owns mount
+// health, link-aware grace periods, restart backoff, and exact-process cleanup;
+// running the service stage directly leaves one lifecycle authority.
+//
+// The value is intentionally the JuiceMount process ID. JuiceFS currently only
+// tests that JFS_SUPERVISOR is non-empty, while retaining the parent identity is
+// useful in diagnostics and matches the value set by its own launcher.
+func juiceFSDirectEnvironment(supervisorPID int) []string {
+	env := juiceFSChildEnvironment()
+	return append(env, "JFS_SUPERVISOR="+strconv.Itoa(supervisorPID))
+}
+
+// desktopJuiceFSMountArgs returns the fixed prefix for the directly supervised
+// desktop mount. In particular it must never contain -d/--background: direct
+// service mode stays attached to the exact child process JuiceMount starts and
+// reaps.
+func desktopJuiceFSMountArgs(redisURL, mountPoint string, bufferSizeMB, prefetch int) []string {
+	return []string{
+		"mount", redisURL, mountPoint,
+		"--no-usage-report",
+		"--buffer-size", strconv.Itoa(bufferSizeMB),
+		"--prefetch", strconv.Itoa(prefetch),
+	}
+}
+
+// tailCapture is a concurrency-safe, bounded stderr tail. Startup failures can
+// be verbose, especially with JM_FUSE_VERBOSE enabled; retaining only the tail
+// keeps memory bounded while preserving the final actionable JuiceFS error.
+type tailCapture struct {
+	mu  sync.Mutex
+	max int
+	buf []byte
+}
+
+func newTailCapture(max int) *tailCapture {
+	if max < 1 {
+		max = 1
+	}
+	return &tailCapture{max: max}
+}
+
+func (b *tailCapture) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(p) >= b.max {
+		b.buf = append(b.buf[:0], p[len(p)-b.max:]...)
+		return len(p), nil
+	}
+	if overflow := len(b.buf) + len(p) - b.max; overflow > 0 {
+		copy(b.buf, b.buf[overflow:])
+		b.buf = b.buf[:len(b.buf)-overflow]
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *tailCapture) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(append([]byte(nil), b.buf...))
+}
+
 // FUSEConfig holds JuiceFS mount configuration.
 type FUSEConfig struct {
 	RedisURL   string // e.g. "redis://127.0.0.1:6379/1"
@@ -228,7 +294,6 @@ const DefaultFUSEMetricsAddr = "127.0.0.1:9568"
 type FUSEManager struct {
 	cfg    FUSEConfig
 	mu     sync.Mutex
-	cmd    *exec.Cmd
 	stopCh chan struct{}
 	done   chan struct{}
 	// onRemount fires after a successful WATCHDOG remount (#12): pooled
@@ -508,21 +573,17 @@ func (fm *FUSEManager) Mount() error {
 			bufMB = n
 		}
 	}
-	args = append(args,
-		"mount", fm.cfg.RedisURL, fm.cfg.MountPoint,
-		"-d", // daemon mode
-		"--no-usage-report",
-		// A JuiceFS session expires at five heartbeat intervals. The upstream
-		// 12s default therefore lets another always-on client reap this Mac
-		// after only 60s. A cold or cellular S3 PUT can legitimately consume
-		// that entire window; the live RC test reproduced the GPU worker
-		// deleting the Mac session during the first 10 MiB write. Five minutes
-		// protects slow-but-progressing writes without enabling writeback or
-		// weakening durability. Metadata liveness is still monitored by
-		// JuiceMount's independent, seconds-scale reachability checks.
-		"--buffer-size", strconv.Itoa(bufMB),
-		"--prefetch", strconv.Itoa(jfp.Prefetch),
-	)
+	args = append(args, desktopJuiceFSMountArgs(
+		fm.cfg.RedisURL, fm.cfg.MountPoint, bufMB, jfp.Prefetch,
+	)...)
+	// A JuiceFS session expires at five heartbeat intervals. The upstream
+	// 12s default therefore lets another always-on client reap this Mac
+	// after only 60s. A cold or cellular S3 PUT can legitimately consume
+	// that entire window; the live RC test reproduced the GPU worker
+	// deleting the Mac session during the first 10 MiB write. Five minutes
+	// protects slow-but-progressing writes without enabling writeback or
+	// weakening durability. Metadata liveness is still monitored by
+	// JuiceMount's independent, seconds-scale reachability checks.
 	// Twenty simultaneous uploads can monopolize a cellular uplink and inflate
 	// latency for Redis/Finder control traffic. Four 4 MiB flows still provide
 	// ample bandwidth-delay-product on LAN and WAN while bounding queueing
@@ -757,39 +818,63 @@ func (fm *FUSEManager) Mount() error {
 	log.Printf("[fuse] mounting JuiceFS: %s %s", fm.cfg.JuiceFSBin, strings.Join(logArgs, " "))
 	jmlog.Info("mounting juicefs", "bin", fm.cfg.JuiceFSBin, "args", strings.Join(logArgs, " "))
 
-	// `juicefs mount -d` daemonizes and returns quickly in the happy path,
-	// but can hang on certain backend failures (e.g. unreachable Redis
-	// during Lua init). Bounded at 30 s so a stuck launch can't park the
-	// caller forever.
-	launchCtx, launchCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer launchCancel()
-	cmd := exec.CommandContext(launchCtx, fm.cfg.JuiceFSBin, args...)
-	cmd.Env = juiceFSChildEnvironment()
-	cmd.Stdout = os.Stdout
-	// Tee stderr: still stream to os.Stderr (the log tail) but also capture it
-	// so a failed launch's RETURNED error carries juicefs's actual reason
-	// (e.g. "mountpoint is not empty", "address already in use") instead of a
-	// bare "exit status 1" that tells the user nothing (2026-06-14).
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+	// Run JuiceFS's service stage as one foreground child owned and reaped by
+	// JuiceMount. Do NOT use `-d`: upstream's launchMount supervisor has a
+	// fixed activity watchdog that SIGKILLs a healthy mount when one cellular
+	// object request exceeds roughly a minute. JuiceMount's monitor below has
+	// measured-link grace periods and is the sole restart authority.
+	cmd := exec.Command(fm.cfg.JuiceFSBin, args...)
+	cmd.Env = juiceFSDirectEnvironment(os.Getpid())
 
-	if err := cmd.Run(); err != nil {
+	// Foreground JuiceFS writes to stdout/stderr rather than its background log.
+	// Preserve that operational log so tailJuiceFSLog continues promoting its
+	// warnings, and retain a bounded stderr tail for actionable startup errors.
+	stderrTail := newTailCapture(64 << 10)
+	logWriter := io.Writer(os.Stderr)
+	var juiceFSLog *os.File
+	if home, err := os.UserHomeDir(); err == nil {
+		logDir := filepath.Join(home, ".juicefs")
+		if err := os.MkdirAll(logDir, 0700); err == nil {
+			logPath := filepath.Join(logDir, "juicefs.log")
+			if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); err == nil {
+				juiceFSLog = f
+				logWriter = io.MultiWriter(os.Stderr, f)
+			} else {
+				jmlog.Warn("juicefs log open failed; continuing with stderr", "path", logPath, "error", err.Error())
+			}
+		}
+	}
+	cmd.Stdout = logWriter
+	cmd.Stderr = io.MultiWriter(logWriter, stderrTail)
+	if err := cmd.Start(); err != nil {
+		if juiceFSLog != nil {
+			_ = juiceFSLog.Close()
+		}
 		noteMountFailure()
-		if launchCtx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("juicefs mount: timed out after 30s (backend unreachable?)")
-		}
-		if reason := lastNonEmptyLine(stderrBuf.String()); reason != "" {
-			return fmt.Errorf("juicefs mount: %w: %s", err, reason)
-		}
-		return fmt.Errorf("juicefs mount: %w", err)
+		return fmt.Errorf("juicefs mount start: %w", err)
 	}
 
-	// Wait for the mount to become live (juicefs mount -d returns before FUSE is ready)
-	if err := fm.waitForMount(fm.mountVerifyTimeout()); err != nil {
+	processExit := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		if juiceFSLog != nil {
+			_ = juiceFSLog.Close()
+		}
+		processExit <- err
+	}()
+
+	// The direct service stays attached, so verification also watches for a
+	// fast child exit and returns its actual final stderr line immediately.
+	if err := fm.waitForMountProcess(fm.mountVerifyTimeout(), processExit); err != nil {
+		_ = cmd.Process.Kill()
 		noteMountFailure()
+		if reason := lastNonEmptyLine(stderrTail.String()); reason != "" {
+			return fmt.Errorf("mount verification: %w: %s", err, reason)
+		}
 		return fmt.Errorf("mount verification: %w", err)
 	}
 	kextBlockedFlag.Store(false)
+	go fm.observeJuiceFSExit(cmd.Process.Pid, processExit)
 
 	log.Printf("[fuse] JuiceFS mounted at %s", fm.cfg.MountPoint)
 
@@ -817,7 +902,7 @@ func (fm *FUSEManager) Mount() error {
 		"free_space_ratio", fm.cfg.FreeSpaceRatio,
 		"cache_dir", fm.cfg.CacheDir)
 
-	// Tail JuiceFS's daemon log into our structured logger so warnings like
+	// Tail JuiceFS's service log into our structured logger so warnings like
 	// "space not enough on device, upload it directly" are visible to the
 	// user instead of buried in ~/.juicefs/juicefs.log. Bound to fm.stopCh
 	// so the goroutine exits cleanly when the FUSEManager is stopped
@@ -899,7 +984,7 @@ func checkCacheVolumeHealth(cfg FUSEConfig) string {
 	return ""
 }
 
-// tailJuiceFSLog watches the JuiceFS daemon log file for new lines and
+// tailJuiceFSLog watches the JuiceFS service log file for new lines and
 // promotes WARNING / ERROR records into jmlog so the user can see them in
 // the same JSON stream as everything else. Aggregates the chatty
 // "space not enough" message — emit once per minute with a count instead
@@ -1100,7 +1185,7 @@ func (fm *FUSEManager) isMountedLocked() bool {
 	// Check 2: actually responsive — try listing the directory. A stale FUSE
 	// mount (dead daemon) hangs on any fs op. Kept as a root readdir (NOT the
 	// .config probe) because this same check gates LAUNCH readiness via
-	// waitForMount: right after `juicefs mount -d` the dir is listable before the
+	// waitForMount: right after the JuiceFS service starts the dir is listable before the
 	// .config control file is served, so a .config probe here false-fails the
 	// launch verification. Pure-read, no side-effect umount (QA-34 Slice 2): the
 	// monitorLoop owns the remount decision with its failure tolerance.
@@ -1241,10 +1326,20 @@ func runBoundedCommand(timeout time.Duration, name string, args ...string) {
 	}
 }
 
-// waitForMount polls until the mount is live or timeout expires.
-func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
+// waitForMountProcess polls until the mount is live, the directly supervised
+// JuiceFS process exits, the manager stops, or the verification budget expires.
+// A nil processExit preserves the old polling behavior for focused tests.
+func (fm *FUSEManager) waitForMountProcess(timeout time.Duration, processExit <-chan error) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-processExit:
+			if err == nil {
+				return fmt.Errorf("juicefs service exited before mount became ready")
+			}
+			return fmt.Errorf("juicefs service exited before mount became ready: %w", err)
+		default:
+		}
 		if fm.isMountedLocked() {
 			return nil
 		}
@@ -1252,12 +1347,52 @@ func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
 		// verify would otherwise pin fm.mu through Mount() and park the
 		// user's Stop/quit for the whole window — abort promptly on Stop.
 		select {
+		case err := <-processExit:
+			if err == nil {
+				return fmt.Errorf("juicefs service exited before mount became ready")
+			}
+			return fmt.Errorf("juicefs service exited before mount became ready: %w", err)
 		case <-fm.stopCh:
 			return fmt.Errorf("mount verification aborted: manager stopping")
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+	select {
+	case err := <-processExit:
+		if err == nil {
+			return fmt.Errorf("juicefs service exited before mount became ready")
+		}
+		return fmt.Errorf("juicefs service exited before mount became ready: %w", err)
+	default:
+	}
 	return fmt.Errorf("mount not ready after %v", timeout)
+}
+
+// waitForMount keeps the original focused-test seam while production Mount
+// also observes the foreground service process.
+func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
+	return fm.waitForMountProcess(timeout, nil)
+}
+
+// observeJuiceFSExit reports a direct service exit. The monitor loop remains
+// the single remount authority; this observer only makes the cause visible.
+func (fm *FUSEManager) observeJuiceFSExit(pid int, processExit <-chan error) {
+	select {
+	case err := <-processExit:
+		select {
+		case <-fm.stopCh:
+			return
+		default:
+		}
+		if err != nil {
+			jmlog.Warn("juicefs service exited; mount monitor will recover it",
+				"pid", pid, "error", err.Error())
+		} else {
+			jmlog.Warn("juicefs service exited cleanly outside manager shutdown; mount monitor will recover it",
+				"pid", pid)
+		}
+	case <-fm.stopCh:
+	}
 }
 
 // killJuiceFSProcesses SIGKILLs every `juicefs mount` process bound to this
@@ -1277,10 +1412,9 @@ func (fm *FUSEManager) killJuiceFSProcesses() int {
 		}
 	}
 	if killed > 0 {
-		// Visibility into the one destructive action in this subsystem. This
-		// pattern also matches juicefs's own `-d` supervisor, so a kill here
-		// removes JuiceFS's self-heal too — only acceptable on an explicit
-		// remount/stop, never as a reaction to a transient stall.
+		// Visibility into the one destructive action in this subsystem. The
+		// match is scoped to this exact mountpoint; killing is acceptable only
+		// on an explicit remount/stop, never for a transient stall.
 		jmlog.Warn("unmount: SIGKILL'd juicefs processes for mountpoint",
 			"count", killed, "mountpoint", fm.cfg.MountPoint)
 	}
@@ -1588,28 +1722,27 @@ func redisHostPort(redisURL string) string {
 // monitorLoop checks mount health periodically and remounts ONLY when the
 // JuiceFS process tree is genuinely gone.
 //
-// Design (2026-05-29 audit). There are two layers of self-heal and they
-// must not fight:
+// Design (2026-08-26 cellular RC). There is one lifecycle authority:
 //
-//  1. JuiceFS's own `-d` supervisor: `juicefs mount -d` spawns a watchdog
-//     process that restarts the mount child if it crashes. This is the
-//     first and best line of recovery — it re-establishes the FUSE session
-//     cleanly and knows how to talk to the kernel.
-//  2. This loop: the app-side backstop for when JuiceFS's own supervisor has
-//     itself exhausted its retries and exited (the whole tree is dead).
+//  1. Mount starts one directly supervised JuiceFS service process. The
+//     upstream launchMount supervisor is deliberately bypassed because its
+//     fixed activity watchdog kills legitimate >60s cellular operations.
+//  2. This loop observes service and mount health, applies measured-link grace
+//     periods, and performs the only restart when the service is truly gone.
 //
 // The pre-2026-05-29 code remounted after 3 consecutive unhealthy checks
 // EVEN WHILE juicefs was still alive. On a flapping backend link that was
 // catastrophic: it `kill -9`'d a live-but-slow daemon — and because the kill
-// pattern matches `juicefs mount.*<mountpoint>`, it ALSO killed JuiceFS's own
-// supervisor — then thrashed mount/unmount until macFUSE wedged with
+// pattern matched `juicefs mount.*<mountpoint>`, it killed the whole process
+// tree — then thrashed mount/unmount until macFUSE wedged with
 // "init: 19=operation not supported by device", a kernel state only a full
 // app restart clears. Observed live: juicefs SIGKILL'd mid-slow-PUT, never
 // recovered, mount dead with no log trace.
 //
-// New policy: while ANY juicefs process is alive, NEVER remount — report the
-// staleness and wait for juicefs's supervisor + backend recovery to clear it.
-// Only when the process tree is gone do we own recovery. All decisions log via
+// New policy: while the JuiceFS service is alive, do not remount for ordinary
+// staleness — report it and let backend recovery clear it. Only after the
+// measured-link grace and an independent liveness confirmation may a sustained
+// wedge be replaced. A gone service is restarted here. All decisions log via
 // jmlog (the rotating juicemount.log), not log.Printf → the app's /dev/null
 // stdout — the old channel made this safety-critical loop invisible.
 func (fm *FUSEManager) monitorLoop() {
@@ -1668,11 +1801,11 @@ func (fm *FUSEManager) monitorLoop() {
 					continue
 				}
 				offlineDeferTicks = 0
-				// juicefs (and its own supervisor) is alive — the mount is
+				// juicefs is alive — the mount is
 				// stale, usually a flapping/blipping backend link. Default to
-				// deferring (no kill, no macFUSE thrash). BUT juicefs's own
-				// supervisor only restarts the mount child on a CRASH, not on a
-				// stuck backend connection: a blip can leave juicefs's
+				// deferring (no kill, no macFUSE thrash). A live process does not
+				// necessarily mean its backend connection is making progress: a
+				// link blip can leave juicefs's
 				// connection wedged with FUSE stat hanging indefinitely
 				// (observed 2026-06-01 — a 7-minute continuous wedge with zero
 				// self-recovery). So after a SUSTAINED continuous wedge,
@@ -1728,15 +1861,14 @@ func (fm *FUSEManager) monitorLoop() {
 				}
 				// Rate-limit: first stale tick, then ~once a minute.
 				if staleWhileAliveTicks == 1 || staleWhileAliveTicks%6 == 0 {
-					jmlog.Warn("fuse mount stale but juicefs alive — deferring to juicefs's own supervisor, not remounting",
+					jmlog.Warn("fuse mount stale but juicefs alive — deferring, not remounting",
 						"stale_ticks", staleWhileAliveTicks,
-						"hint", "transient backend/link stall; an app-side remount here would kill juicefs's supervisor and thrash macFUSE")
+						"hint", "transient backend/link stall; replacing a live service here would thrash macFUSE")
 				}
 				continue
 			}
 
-			// juicefs is genuinely GONE — its own supervisor exhausted its
-			// retries and exited. App-side recovery is now the only option.
+			// juicefs is genuinely GONE. App-side recovery is now the only option.
 			staleWhileAliveTicks = 0
 
 			// V2.3 U4: suppress the retry loop when it cannot or should not
