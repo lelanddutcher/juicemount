@@ -11,6 +11,7 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
 	"github.com/lelanddutcher/juicemount/internal/metrics"
+	"github.com/lelanddutcher/juicemount/internal/netprofile"
 	"github.com/lelanddutcher/juicemount/internal/thumbcache"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -301,20 +302,25 @@ func resolveThumbBlobPathPolicy(inode uint64, reconcileUnknown bool) (mountOut, 
 // or closures so the decision core is unit-testable without the bridge
 // globals (mount, mirror, cache, warmer).
 type thumbLocalDeps struct {
-	mount     string                                          // configured user-facing mount point ("/Volumes/zpool")
-	lookup    func(rel string) (inode uint64, isDir, ok bool) // RAM mirror path→inode
-	cachePath func(inode uint64) (root, rel string, ok bool)  // local thumb-cache blob (root+rel: anchored serve)
-	populate  func(inode uint64) (root, rel string, ok bool)  // read-through: resolve+cache, then the same
-	warmDir   func(relDir string)                             // async dir warm (TTL-deduped by the warmer)
+	mount                  string                                          // configured user-facing mount point ("/Volumes/zpool")
+	lookup                 func(rel string) (inode uint64, isDir, ok bool) // RAM mirror path→inode
+	cachePath              func(inode uint64) (root, rel string, ok bool)  // local thumb-cache blob (root+rel: anchored serve)
+	populate               func(inode uint64) (root, rel string, ok bool)  // read-through: resolve+cache, then the same
+	warmDir                func(relDir string)                             // async dir warm (TTL-deduped by the warmer)
+	suppressSourceFallback bool                                            // constrained link: appex draws local placeholder on miss
 }
 
 // serveThumbLocal answers GET /thumb-local?path=<abs>&size=N for the
 // QuickLook thumbnail appex (Wave-3). Contract with the appex:
 //   - 200 image/jpeg  → the farm poster (appex draws it; Apple's generator
 //     never touches the source file — the whole point).
+//   - 204 constrained-placeholder → known JuiceMount path on a Metered/Slow
+//     link with no local poster. The appex draws a local generic thumbnail and
+//     MUST NOT delegate to Apple's generator, which would read/decode the
+//     remote original merely because Finder opened a folder.
 //   - 404 (fast)      → appex errors out and macOS FALLS BACK to its own
-//     generator, so a miss is never worse than today. We kick an async dir
-//     warm so the next visit hits.
+//     generator. This is retained only on Medium/Fast links and for paths
+//     outside JuiceMount. We kick an async dir warm so the next visit hits.
 //
 // Path discipline: the appex sends the user-facing absolute path; the mirror
 // is keyed volume-relative, so translate via the configured mount prefix and
@@ -347,7 +353,17 @@ func serveThumbLocal(w http.ResponseWriter, r *http.Request, d thumbLocalDeps) {
 		return
 	}
 	inode, isDir, ok := d.lookup(rel)
-	if !ok || isDir {
+	if !ok {
+		if d.suppressSourceFallback {
+			w.Header().Set("X-JM-Thumb", "constrained-placeholder")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("X-JM-Thumb", "unknown-path")
+		http.NotFound(w, r)
+		return
+	}
+	if isDir {
 		w.Header().Set("X-JM-Thumb", "unknown-path")
 		http.NotFound(w, r)
 		return
@@ -381,6 +397,11 @@ func serveThumbLocal(w http.ResponseWriter, r *http.Request, d thumbLocalDeps) {
 				return
 			}
 		}
+	}
+	if d.suppressSourceFallback {
+		w.Header().Set("X-JM-Thumb", "constrained-placeholder")
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 	if d.warmDir != nil {
 		d.warmDir(path.Dir(rel))
@@ -438,7 +459,8 @@ func handleThumbLocalHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	serveThumbLocal(w, r, thumbLocalDeps{
-		mount: mount,
+		mount:                  mount,
+		suppressSourceFallback: netprofile.Default().Class() <= netprofile.ClassSlow,
 		lookup: func(rel string) (uint64, bool, bool) {
 			e := rc.Store().LookupByPath(rel)
 			if e == nil {

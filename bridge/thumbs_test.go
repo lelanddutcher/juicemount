@@ -96,6 +96,47 @@ func TestThumbLocalMissWarmsAnd404s(t *testing.T) {
 	}
 }
 
+func TestThumbLocalConstrainedMissSuppressesSourceFallback(t *testing.T) {
+	d, warmed, populated := fakeThumbDeps(t, 0, false)
+	d.suppressSourceFallback = true
+	w := getThumbLocal(t, d, "/thumb-local?path=/Volumes/zpool/clips/a.mov")
+	if w.Code != http.StatusNoContent || w.Header().Get("X-JM-Thumb") != "constrained-placeholder" {
+		t.Fatalf("want 204/constrained-placeholder, got %d/%s", w.Code, w.Header().Get("X-JM-Thumb"))
+	}
+	if len(*populated) != 1 || (*populated)[0] != 42 {
+		t.Fatalf("populate calls = %v, want one bounded poster read-through", *populated)
+	}
+	if len(*warmed) != 0 {
+		t.Fatalf("constrained miss launched speculative directory warm: %v", *warmed)
+	}
+}
+
+func TestThumbLocalConstrainedUnknownPathSuppressesSourceFallback(t *testing.T) {
+	d, warmed, populated := fakeThumbDeps(t, 0, false)
+	d.suppressSourceFallback = true
+	w := getThumbLocal(t, d, "/thumb-local?path=/Volumes/zpool/clips/not-mirrored.mov")
+	if w.Code != http.StatusNoContent || w.Header().Get("X-JM-Thumb") != "constrained-placeholder" {
+		t.Fatalf("want 204/constrained-placeholder, got %d/%s", w.Code, w.Header().Get("X-JM-Thumb"))
+	}
+	if len(*populated) != 0 || len(*warmed) != 0 {
+		t.Fatalf("unknown constrained path did backend work: populated=%v warmed=%v", *populated, *warmed)
+	}
+}
+
+func TestThumbLocalConstrainedStillRejectsOutsidePathsAndDirectories(t *testing.T) {
+	d, _, _ := fakeThumbDeps(t, 0, false)
+	d.suppressSourceFallback = true
+	for _, target := range []string{
+		"/thumb-local?path=/Users/x/a.mov",
+		"/thumb-local?path=/Volumes/zpool/clips",
+	} {
+		w := getThumbLocal(t, d, target)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s: code = %d, want 404", target, w.Code)
+		}
+	}
+}
+
 func TestThumbLocalRejections(t *testing.T) {
 	d, _, _ := fakeThumbDeps(t, 42, false)
 	cases := map[string]struct {

@@ -1161,7 +1161,8 @@ public enum NFSBridge {
         /// goroutine is still running its first probe) is NOT attention-worthy;
         /// it's a transient state, not a real problem.
         public var isAttentionWorthy: Bool {
-            !(status == "green" || status.isEmpty || status == "pending")
+            !(status == "green" || status == "deferred" || status == "constrained"
+              || status.isEmpty || status == "pending")
         }
     }
 

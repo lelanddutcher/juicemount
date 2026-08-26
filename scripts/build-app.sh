@@ -113,9 +113,11 @@ echo "    Built: $SWIFT_BIN"
 # 2b. QuickLook thumbnail appex executable. A tiny sandboxed XPC process that
 # serves the farm-pre-rendered posters from the daemon's loopback endpoint
 # (127.0.0.1:11050/thumb-local) so Finder never decodes remote video just to
-# draw a thumbnail; on any miss/error it fails fast and macOS falls back to
-# Apple's generator. Its link settings (QuickLookThumbnailing etc.) live in
-# Package.swift — no -Xlinker flags here on purpose (see step 2 comment).
+# draw a thumbnail. On constrained-link misses it draws a local placeholder
+# so macOS cannot decode the remote source merely to render Finder; LAN misses
+# and errors retain Apple's normal fallback. Its link settings
+# (QuickLookThumbnailing etc.) live in Package.swift — no -Xlinker flags here
+# on purpose (see step 2 comment).
 echo ""
 echo "==> [2b] Building QuickLook thumbnail appex (JuiceMountThumbnails)..."
 swift build -c "$SWIFT_CONFIG" --product JuiceMountThumbnails

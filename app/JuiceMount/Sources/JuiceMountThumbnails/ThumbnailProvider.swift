@@ -10,17 +10,17 @@
 //
 //      GET http://127.0.0.1:11050/thumb-local?path=<abs path>&size=<max px>
 //        200 image/jpeg   -> draw it
-//        404              -> not cached; the daemon kicks its own background
-//                            warm — we do NOT retry or poll
+//        204              -> constrained link + no local poster; draw a local
+//                            placeholder and suppress remote source decoding
+//        404              -> not cached on a LAN-class link, or not a
+//                            JuiceMount path; let Apple's generator handle it
 //        connection error -> app not running
 //
-//  Contract: this appex is a CACHE IN FRONT of Apple's generator, never a
-//  replacement that degrades correctness. On ANY miss/error/timeout it fails
-//  fast with an error so macOS falls back to the built-in generator. It
-//  never blocks past its tight timeouts, never retries, and never touches
-//  the filesystem (no mount probes — the daemon answers 404 for paths it
-//  doesn't own, which is the cheap way to scope ourselves to JuiceMount
-//  volumes from inside the sandbox).
+//  Contract: on LAN this appex is a cache in front of Apple's generator. On a
+//  Metered/Slow link it is also the firewall that keeps a thumbnail miss from
+//  making Finder decode megabytes of the remote original. The daemon alone
+//  decides when that constraint applies and answers 204; every other miss or
+//  error still falls back normally. The appex never probes the mount itself.
 //
 
 import AppKit
@@ -68,6 +68,56 @@ final class ThumbnailProvider: QLThumbnailProvider {
         cs.insert(charactersIn: "-._~/")
         return cs
     }()
+
+    /// A local, byte-free thumbnail for constrained-link misses. Returning a
+    /// real reply (rather than an error) is what prevents Quick Look from
+    /// falling through to Apple's video/image generator and opening the source
+    /// over NFS. The symbol is derived from the extension string only; neither
+    /// this function nor its drawing closure touches request.fileURL.
+    private static func constrainedPlaceholder(
+        for request: QLFileThumbnailRequest
+    ) -> QLThumbnailReply {
+        let maxSize = request.maximumSize
+        let contextSize = CGSize(width: max(maxSize.width, 1),
+                                 height: max(maxSize.height, 1))
+        let ext = request.fileURL.pathExtension.lowercased()
+        let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "tif", "tiff",
+                                      "cr2", "cr3", "nef", "arw", "dng", "raf", "rw2"]
+        let symbolName = imageExts.contains(ext) ? "photo" : "film"
+
+        return QLThumbnailReply(contextSize: contextSize) { () -> Bool in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            let bounds = CGRect(origin: .zero, size: contextSize)
+            let radius = min(contextSize.width, contextSize.height) * 0.12
+            let background = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1),
+                                          xRadius: radius, yRadius: radius)
+            NSColor(calibratedWhite: 0.13, alpha: 0.96).setFill()
+            background.fill()
+
+            guard let symbol = NSImage(systemSymbolName: symbolName,
+                                       accessibilityDescription: nil) else {
+                ctx.setFillColor(NSColor(calibratedRed: 0.42, green: 0.82, blue: 0.62,
+                                         alpha: 0.90).cgColor)
+                ctx.fill(bounds.insetBy(dx: bounds.width * 0.34,
+                                        dy: bounds.height * 0.34))
+                return true
+            }
+            let pointSize = max(14, min(contextSize.width, contextSize.height) * 0.42)
+            let sizing = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .regular)
+            let palette = NSImage.SymbolConfiguration(paletteColors: [NSColor(
+                calibratedRed: 0.42, green: 0.82, blue: 0.62, alpha: 1
+            )])
+            let configured = symbol.withSymbolConfiguration(sizing.applying(palette)) ?? symbol
+            let size = configured.size
+            let rect = CGRect(x: (contextSize.width - size.width) / 2,
+                              y: (contextSize.height - size.height) / 2,
+                              width: size.width, height: size.height)
+            configured.draw(in: rect, from: .zero, operation: .sourceOver,
+                            fraction: 0.92, respectFlipped: true,
+                            hints: nil)
+            return true
+        }
+    }
 
     override func provideThumbnail(
         for request: QLFileThumbnailRequest,
@@ -144,6 +194,12 @@ final class ThumbnailProvider: QLThumbnailProvider {
             default:
                 fail("error(fetch)", code: 502)
             }
+            return
+        }
+        if status == 204 {
+            os_log("placeholder %{public}@ %.1fms",
+                   log: Self.log, type: .default, basename, elapsedMS())
+            handler(Self.constrainedPlaceholder(for: request), nil)
             return
         }
         if status == 404 {

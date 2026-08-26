@@ -2259,7 +2259,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// is most likely to click the menu bar.
 	go func() {
 		time.Sleep(10 * time.Second)
-		runAndStoreSelfTest()
+		runAndStoreSelfTest(false)
 	}()
 
 	// R-4: when started offline, hand Swift a "started_offline:" status so it
@@ -6404,7 +6404,7 @@ type SelfTestResult struct {
 	ElapsedMs int64   `json:"elapsed_ms"`
 	BytesRead int64   `json:"bytes_read"`
 	MBPerSec  float64 `json:"mb_per_sec"`
-	Status    string  `json:"status"` // "green" | "yellow" | "red" | "error"
+	Status    string  `json:"status"` // green|yellow|red|error|deferred|constrained
 	Hint      string  `json:"hint"`
 	RanAt     string  `json:"ran_at"` // RFC3339; empty until first run
 	Target    string  `json:"target"` // path that was read; "" on error
@@ -6435,19 +6435,35 @@ var (
 	selfTestLast SelfTestResult
 )
 
-// selfTestSize is the read size for the probe — 10 MB matches the planning
-// doc. Big enough to traverse multiple JuiceFS cache blocks and exercise
-// readahead; small enough that even a 50 MB/s "red" mount still finishes
-// in 0.2 s.
-const selfTestSize = 10 * 1024 * 1024
+const (
+	// LAN-sized probe: large enough to traverse multiple JuiceFS blocks and
+	// exercise sustained read throughput.
+	selfTestLANSize = 10 * 1024 * 1024
+	// Manual constrained-link probes must remain small enough not to monopolize
+	// the very connection they are measuring. Automatic probes are deferred
+	// entirely on these classes; these sizes apply only after an explicit POST.
+	selfTestSlowSize    = 2 * 1024 * 1024
+	selfTestMeteredSize = 512 * 1024
+)
 
-// runSelfTest performs one 10 MB read self-test against the live NFS mount.
-// Picks a target file from the SQLite metadata store if one exists that is
-// >= 10 MB, otherwise writes a temp file in the mount, reads it back, and
-// cleans up. The read happens via the user-visible mount path (i.e. the NFS
-// loopback mount), not the FUSE path — that's what the user's apps see, so
-// that's what we measure.
-// runSelfTest performs the 10 MiB read probe. Routes the read through the
+func selfTestSizeForClass(class netprofile.LinkClass) int64 {
+	switch class {
+	case netprofile.ClassMetered:
+		return selfTestMeteredSize
+	case netprofile.ClassSlow:
+		return selfTestSlowSize
+	default:
+		return selfTestLANSize
+	}
+}
+
+// runSelfTest performs an adaptive read probe when force is true. Automatic
+// startup calls always return a zero-I/O deferred result: the link classifier
+// is passive and may not have a sample ten seconds after launch, so using its
+// bootstrap class to authorize synthetic traffic would be unsafe on cellular.
+// Explicit runs pick a target file from the SQLite metadata store if one is
+// large enough, otherwise write a class-sized temp file, read it back, and
+// clean up. The probe routes the read through the
 // FUSE mount path (`~/.juicemount/fuse-internal/...`) rather than the NFS
 // loopback (`/Volumes/zpool/...`) to avoid an in-process deadlock:
 //
@@ -6463,7 +6479,7 @@ const selfTestSize = 10 * 1024 * 1024
 //
 // Also bounded with a wall-clock deadline so a slow FUSE / dead JuiceFS
 // daemon can't wedge the probe goroutine indefinitely.
-func runSelfTest() SelfTestResult {
+func runSelfTest(force bool) SelfTestResult {
 	globalMu.Lock()
 	mountPath := globalMountPath
 	fusePath := globalFUSEPath
@@ -6471,6 +6487,16 @@ func runSelfTest() SelfTestResult {
 	globalMu.Unlock()
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	class := netprofile.Default().Class()
+	if !force {
+		return SelfTestResult{
+			Status: "deferred",
+			Hint: fmt.Sprintf(
+				"Automatic throughput probe deferred to protect navigation. Click rerun for a bounded %d KiB test (current link: %s).",
+				selfTestSizeForClass(class)/1024, class),
+			RanAt: now,
+		}
+	}
 	if fusePath == "" {
 		return SelfTestResult{
 			Status: "error",
@@ -6483,8 +6509,9 @@ func runSelfTest() SelfTestResult {
 	// FUSE read inside this window; if not, the mount is unhealthy and the
 	// probe correctly reports an error rather than hanging forever.
 	probeDeadline := time.Now().Add(30 * time.Second)
+	probeSize := selfTestSizeForClass(class)
 
-	target, cleanup, err := pickSelfTestTarget(store, mountPath, fusePath, probeDeadline)
+	target, cleanup, err := pickSelfTestTarget(store, mountPath, fusePath, probeSize, probeDeadline)
 	if err != nil {
 		return SelfTestResult{
 			Status: "error",
@@ -6559,7 +6586,7 @@ func runSelfTest() SelfTestResult {
 	// AND io.EOF in one call), don't re-enter the loop — it would
 	// spin returning (0, EOF) every iteration until probeDeadline,
 	// turning a tiny file into a 30s false-timeout.
-	for firstErr != io.EOF && total < selfTestSize {
+	for firstErr != io.EOF && total < probeSize {
 		if time.Now().After(probeDeadline) {
 			return SelfTestResult{
 				ElapsedMs:   time.Since(start).Milliseconds(),
@@ -6595,7 +6622,7 @@ func runSelfTest() SelfTestResult {
 	if elapsed > 0 {
 		mbps = (float64(total) / (1024 * 1024)) / elapsed.Seconds()
 	}
-	status, hint := classifySelfTest(mbps)
+	status, hint := classifySelfTestForClass(mbps, class)
 
 	// Write probe: exercise the user-facing write path (NFS → handler →
 	// FUSE → JuiceFS → MinIO/Redis). Failures here are the 2026-05-16
@@ -6711,7 +6738,7 @@ func runWriteProbe(mountPath string, overallBudget time.Duration) (ok bool, elap
 	}
 }
 
-// pickSelfTestTarget finds a file >= selfTestSize via the metadata store. If
+// pickSelfTestTarget finds a file at least probeSize bytes long via the metadata store. If
 // none exists yet (fresh mount, empty bucket), it writes a temp file in the
 // mount and returns a cleanup callback that removes it.
 //
@@ -6724,17 +6751,18 @@ func runWriteProbe(mountPath string, overallBudget time.Duration) (ok bool, elap
 // per-mount probe logic. `deadline` bounds the BFS by wall-clock so a
 // concurrent BulkInsert (holding writeMu, blocking ListChildren) can't
 // wedge the probe.
-func pickSelfTestTarget(store *metadata.Store, mountPath, fusePath string, deadline time.Time) (string, func(), error) {
+func pickSelfTestTarget(store *metadata.Store, mountPath, fusePath string, probeSize int64, deadline time.Time) (string, func(), error) {
 	_ = mountPath // intentionally unused
 	if store != nil {
-		if p := largeFileFromStore(store, fusePath, selfTestSize, deadline); p != "" {
+		if p := largeFileFromStore(store, fusePath, probeSize, deadline); p != "" {
 			return p, nil, nil
 		}
 	}
-	// Fallback: create a 10 MB temp file via the FUSE path. Hidden name so
-	// a crashed run doesn't pollute Finder listings.
+	// Fallback: create a class-sized temp file via the FUSE path. This path is
+	// unreachable for every automatic probe (they defer above), so an upload
+	// occurs only after an explicit user rerun.
 	tmpPath := filepath.Join(fusePath, ".juicemount-selftest.tmp")
-	if err := writeRandomFile(tmpPath, selfTestSize); err != nil {
+	if err := writeRandomFile(tmpPath, probeSize); err != nil {
 		return "", nil, fmt.Errorf("write probe file: %w", err)
 	}
 	cleanup := func() { _ = os.Remove(tmpPath) }
@@ -6827,10 +6855,18 @@ func classifySelfTest(mbps float64) (status, hint string) {
 	}
 }
 
+func classifySelfTestForClass(mbps float64, class netprofile.LinkClass) (status, hint string) {
+	if class <= netprofile.ClassSlow {
+		return "constrained", fmt.Sprintf(
+			"Constrained-link probe: %.2f MB/s. Cellular/WAN navigation safeguards are active.", mbps)
+	}
+	return classifySelfTest(mbps)
+}
+
 // runAndStoreSelfTest is the thread-safe wrapper that updates the cached
 // result for the /self-test endpoint.
-func runAndStoreSelfTest() SelfTestResult {
-	r := runSelfTest()
+func runAndStoreSelfTest(force bool) SelfTestResult {
+	r := runSelfTest(force)
 	selfTestMu.Lock()
 	selfTestLast = r
 	selfTestMu.Unlock()
@@ -6847,14 +6883,14 @@ func runAndStoreSelfTest() SelfTestResult {
 // GET is intentionally non-blocking: if no run has happened yet, return a
 // "pending" placeholder rather than running synchronously. Synchronous runs
 // inside HTTP handlers serialize with other operations on the localhost NFS
-// mount and make the entire mount appear unresponsive while the 10 MB read
-// is in flight. POST still runs synchronously — the user explicitly asked
-// for a rerun by POSTing.
+// mount and make the entire mount appear unresponsive while a read is in
+// flight. POST still runs synchronously with a class-sized bound — the user
+// explicitly asked for a rerun by POSTing.
 func handleSelfTestHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	var out SelfTestResult
 	if r.Method == http.MethodPost {
-		out = runAndStoreSelfTest()
+		out = runAndStoreSelfTest(true)
 	} else {
 		selfTestMu.Lock()
 		out = selfTestLast

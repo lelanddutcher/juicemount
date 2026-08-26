@@ -1103,16 +1103,20 @@ struct MenuPopoverView: View {
                     Text("Self-test: error")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                } else if result.status == "deferred" {
+                    Text("Self-test: deferred on constrained link")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 } else if result.mb_per_sec > 0 {
                     // B.6: show first-byte RTT alongside MB/s when
                     // available. RTT is a distinct signal (round-trip
                     // latency) from throughput (sustained transfer).
                     if result.first_byte_ms > 0 {
-                        Text("Self-test: \(String(format: "%.0f", result.mb_per_sec)) MB/s · \(result.first_byte_ms)ms RTT")
+                        Text("Self-test: \(selfTestSpeed(result.mb_per_sec)) MB/s · \(result.first_byte_ms)ms RTT")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     } else {
-                        Text("Self-test: \(String(format: "%.0f", result.mb_per_sec)) MB/s")
+                        Text("Self-test: \(selfTestSpeed(result.mb_per_sec)) MB/s")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -1130,7 +1134,7 @@ struct MenuPopoverView: View {
                 }
                 .buttonStyle(.plain)
                 .help(result.hint.isEmpty
-                      ? "Re-run the 10 MB read self-test."
+                      ? "Run an adaptive read self-test."
                       : "\(result.hint)\n\nClick to re-run.")
             }
         }
@@ -1142,8 +1146,13 @@ struct MenuPopoverView: View {
         case "yellow": return .yellow
         case "red":    return .red
         case "error":  return .orange
+        case "constrained": return .blue
         default:       return .gray
         }
+    }
+
+    private func selfTestSpeed(_ mbPerSec: Double) -> String {
+        String(format: mbPerSec < 10 ? "%.2f" : "%.0f", mbPerSec)
     }
 
     /// Opens a folder picker rooted at the JuiceMount mount and pins the
