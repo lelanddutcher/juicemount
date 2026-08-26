@@ -193,7 +193,8 @@ var (
 	// Replaceable so tests can avoid invoking `sudo`.
 	forceUnmountFn = forceUnmount
 
-	// isJuiceFSProcessAliveFn reports whether a juicefs mount process is alive.
+	// isJuiceFSProcessAliveFn reports whether the juicefs process for one exact
+	// mount point is alive.
 	// Indirected through a var (default: the real pgrep probe in fuse.go) so
 	// the remount-decision tests are deterministic regardless of what's running
 	// on the host. Without this, a developer's own running JuiceMount makes the
@@ -486,7 +487,7 @@ func (m *HealthMonitor) handleNFSAutoRemount(healthy bool) {
 	// sustained window + backend-reachable check. Remount from here only when
 	// the juicefs process tree is gone, or — as a far-out backstop — if the
 	// NFS layer stays wedged well past the FUSE watchdog's own window.
-	alive := isJuiceFSProcessAliveFn()
+	alive := isJuiceFSProcessAliveFn(m.cfg.FUSEPath)
 	if alive && streak < NFSStaleHardRemountThreshold {
 		jmlog.Warn("nfs mount stale but juicefs alive — deferring to the fuse watchdog, not remounting",
 			"mount_point", mountPoint, "consecutive_failures", streak)
@@ -563,7 +564,7 @@ func (m *HealthMonitor) handleNFSAbsentRecovery(st ComponentStatus, rawFUSEHealt
 	// Probe process table + listener only on ticks that could qualify —
 	// never exec pgrep / dial per tick on the happy path.
 	if absent && in.Enabled && !in.Offline {
-		in.JuiceFSAlive = rawFUSEHealthy && isJuiceFSProcessAliveFn()
+		in.JuiceFSAlive = rawFUSEHealthy && isJuiceFSProcessAliveFn(m.cfg.FUSEPath)
 		in.ServerUp = serverAddr != "" && nfsServerUpFn(serverAddr)
 	}
 	claimed := absent && in.Enabled && !in.Offline && in.JuiceFSAlive && in.ServerUp
@@ -951,7 +952,7 @@ func (m *HealthMonitor) logWedgeDiagnostics(reason string) {
 		"reason", reason,
 		"redis_ok", redisStatus.Healthy, "redis_probe_ms", redisMs, "redis_msg", redisStatus.Message,
 		"minio_ok", minioStatus.Healthy, "minio_probe_ms", minioMs, "minio_msg", minioStatus.Message,
-		"juicefs_alive", isJuiceFSProcessAliveFn(),
+		"juicefs_alive", isJuiceFSProcessAliveFn(m.cfg.FUSEPath),
 	)
 }
 

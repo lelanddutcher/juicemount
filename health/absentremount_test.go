@@ -263,7 +263,7 @@ func TestHandleNFSAbsentRecovery(t *testing.T) {
 	prevAlive := isJuiceFSProcessAliveFn
 	prevServerUp := nfsServerUpFn
 	prevBase := NFSAbsentRemountBackoffBase
-	isJuiceFSProcessAliveFn = func() bool { return true }
+	isJuiceFSProcessAliveFn = func(string) bool { return true }
 	nfsServerUpFn = func(string) bool { return true }
 	NFSAbsentRemountBackoffBase = 1 * time.Minute
 	t.Cleanup(func() {

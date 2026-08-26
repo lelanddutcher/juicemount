@@ -1177,14 +1177,12 @@ func (fm *FUSEManager) waitForMount(timeout time.Duration) error {
 // the FUSE mount, and doing it lock-free breaks the teardown deadlock (see Stop).
 // Returns the number killed. Idempotent: a second call finds nothing.
 func (fm *FUSEManager) killJuiceFSProcesses() int {
-	pgrepCtx, pgrepCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	procs, _ := exec.CommandContext(pgrepCtx, "pgrep", "-f", "juicefs mount.*"+filepath.Base(fm.cfg.MountPoint)).Output()
-	pgrepCancel()
+	procs := juiceFSMountProcessIDs(fm.cfg.MountPoint)
 	killed := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(procs)), "\n") {
-		if line != "" {
+	for _, pid := range procs {
+		if pid != "" {
 			killCtx, killCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = exec.CommandContext(killCtx, "kill", "-9", line).Run()
+			_ = exec.CommandContext(killCtx, "kill", "-9", pid).Run()
 			killCancel()
 			killed++
 		}
@@ -1557,7 +1555,7 @@ func (fm *FUSEManager) monitorLoop() {
 
 			// The mount is unhealthy. Decide WHY before acting — killing a
 			// live-but-slow juicefs is what drove the macFUSE remount thrash.
-			if isJuiceFSProcessAliveFn() {
+			if isJuiceFSProcessAliveFn(fm.cfg.MountPoint) {
 				// OFFLINE GUARD (release fix — Finder "connection interrupted"):
 				// when the user is OFFLINE, a "stale" probe is overwhelmingly the
 				// juicefs daemon being SATURATED by in-flight spool drains (writes
@@ -1714,15 +1712,55 @@ func (fm *FUSEManager) monitorLoop() {
 	}
 }
 
-// isJuiceFSProcessAlive returns true if any `juicefs mount` process
-// is currently running. Used by the watchdog's fast-path exception
-// to distinguish "daemon is slow" from "daemon is dead".
-func isJuiceFSProcessAlive() bool {
-	out, err := exec.Command("pgrep", "-f", "juicefs mount").Output()
-	if err != nil {
+// juiceFSMountCommandTargets reports whether one process-table command is a
+// JuiceFS mount for the exact mount point. Scoping is release-critical: a test
+// mount or a second JuiceMount volume must never convince this manager that its
+// own dead daemon is still alive and suppress recovery forever.
+func juiceFSMountCommandTargets(command, mountPoint string) bool {
+	mountPoint = filepath.Clean(strings.TrimSpace(mountPoint))
+	if mountPoint == "." || mountPoint == "" {
 		return false
 	}
-	return len(strings.TrimSpace(string(out))) > 0
+	fields := strings.Fields(command)
+	if len(fields) < 2 || filepath.Base(fields[0]) != "juicefs" || fields[1] != "mount" {
+		return false
+	}
+	padded := " " + strings.TrimSpace(command) + " "
+	return strings.Contains(padded, " "+mountPoint+" ")
+}
+
+// juiceFSMountProcessIDs returns the process IDs for JuiceFS daemons targeting
+// one exact mount point. The ps call is bounded so a sick host cannot pin the
+// watchdog or shutdown path.
+func juiceFSMountProcessIDs(mountPoint string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		cut := strings.IndexAny(line, " \t")
+		if cut <= 0 {
+			continue
+		}
+		pid := line[:cut]
+		command := strings.TrimSpace(line[cut:])
+		if juiceFSMountCommandTargets(command, mountPoint) {
+			ids = append(ids, pid)
+		}
+	}
+	return ids
+}
+
+// isJuiceFSProcessAlive reports whether the daemon for mountPoint is alive.
+func isJuiceFSProcessAlive(mountPoint string) bool {
+	return len(juiceFSMountProcessIDs(mountPoint)) > 0
 }
 
 // findJuiceFSBin locates the juicefs binary.
