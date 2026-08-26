@@ -41,14 +41,18 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY . .
 
 # CGO_ENABLED=1 because the metadata store and pin store both use
-# mattn/go-sqlite3 which is a cgo binding. Static linking would skip
-# the need for libc in the runtime image, but juicedata/mount is
-# already alpine-based with libc available, so we accept the dynamic
-# link.
+# mattn/go-sqlite3. The builder is Alpine/musl while ce-v1.3.1 is Debian/glibc;
+# a dynamically linked build therefore exists in the final image but fails at
+# exec with "not found" because its musl loader is absent. Link the binary
+# statically, matching the proven farm-worker build. Do not hard-code GOARCH:
+# buildx executes this stage for each target platform, so Go's native target
+# preserves the workflow's amd64/arm64 contract.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-s -w -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" -o /out/jm5 ./cmd/jm5
+    CGO_ENABLED=1 GOOS=linux \
+    go build -tags sqlite_omit_load_extension \
+      -ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
+      -o /out/jm5 ./cmd/jm5
 
 # ----- Stage 2: runtime -----
 # Pin to a specific JuiceFS release for CI reproducibility. JuiceFS
@@ -74,6 +78,12 @@ RUN apt-get update \
 # on PATH; juicefs lives there too so PATH lookups inside the
 # FUSEManager just work.
 COPY --from=builder /out/jm5 /usr/local/bin/jm5
+
+# Container-level regression gate: execute the binary in the ACTUAL runtime
+# stage and verify its embedded release identity. This catches loader/ABI and
+# buildx architecture mismatches during docker build, before an image can be
+# tagged or deployed.
+RUN test "$(/usr/local/bin/jm5 --build-info)" = "jm5 ${JM_VERSION} (${JM_COMMIT})"
 
 # Persistent state goes under /data. The host bind-mounts this in
 # docker-compose. SQLite WAL files + pin.db all live here.
