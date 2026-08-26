@@ -33,8 +33,10 @@ type fdKey struct {
 }
 
 type FDPool struct {
-	mu      sync.Mutex
-	entries map[fdKey]*poolEntry
+	mu       sync.Mutex
+	stopOnce sync.Once
+	stopped  bool
+	entries  map[fdKey]*poolEntry
 	// orphans holds stale-but-held entries displaced by a fresh open — after
 	// a remount (#12) or a rename/delete invalidation. Their holders' Releases
 	// land on the NEW map entry (Release is key-based), so the orphan itself
@@ -136,6 +138,10 @@ func NewFDPool() *FDPool {
 func (p *FDPool) Get(path string) (*os.File, error) {
 	k := fdKey{path: path, write: false}
 	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return nil, os.ErrClosed
+	}
 	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
 		entry.refCount++
@@ -154,12 +160,21 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 		// is absorbed by whichever Get next succeeds in creating an entry.
 		p.mu.Lock()
 		p.endOpenLocked(rec)
+		stopped := p.stopped
 		p.mu.Unlock()
+		if stopped {
+			return nil, os.ErrClosed
+		}
 		return nil, err
 	}
 
 	p.mu.Lock()
 	poisoned := p.endOpenLocked(rec)
+	if p.stopped {
+		p.mu.Unlock()
+		fd.Close()
+		return nil, os.ErrClosed
+	}
 	// Double-check under lock — another goroutine may have inserted
 	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
@@ -191,6 +206,10 @@ func (p *FDPool) Get(path string) (*os.File, error) {
 func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, error) {
 	k := fdKey{path: path, write: true}
 	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return nil, os.ErrClosed
+	}
 	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
 		entry.refCount++
@@ -207,12 +226,21 @@ func (p *FDPool) GetWrite(path string, flag int, perm os.FileMode) (*os.File, er
 	if err != nil {
 		p.mu.Lock()
 		p.endOpenLocked(rec)
+		stopped := p.stopped
 		p.mu.Unlock()
+		if stopped {
+			return nil, os.ErrClosed
+		}
 		return nil, err
 	}
 
 	p.mu.Lock()
 	poisoned := p.endOpenLocked(rec)
+	if p.stopped {
+		p.mu.Unlock()
+		fd.Close()
+		return nil, os.ErrClosed
+	}
 	if entry, ok := p.entries[k]; ok && !entry.stale {
 		entry.lastUsed = time.Now()
 		entry.refCount++
@@ -657,29 +685,41 @@ func (p *FDPool) evictLoop() {
 	}
 }
 
-// Stop closes all pooled fds.
+// Stop closes all pooled fds and permanently rejects later opens.
+//
+// NFS handler goroutines can outlive the listener by a small window: closing a
+// listener prevents NEW connections, but an RPC already inside the handler may
+// reach the pool after teardown begins. Marking the pool stopped before
+// detaching the maps makes that race an ordinary ErrClosed instead of either
+// reopening the dead FUSE mount or assigning into the nil entries map. The
+// in-flight-open check closes an fd whose os.Open completed after Stop.
 func (p *FDPool) Stop() {
-	close(p.stopCh)
-	// Detach the fds under the lock, close them outside it (a FUSE fd Close can
-	// block; don't hold p.mu across it — see evictLoop).
-	p.mu.Lock()
-	entries := p.entries
-	p.entries = nil
-	// Orphans (displaced-but-held fds) were previously left open at Stop —
-	// harmless when only FlushStale produced them (once per remount), but
-	// Invalidate produces them on the ordinary rename/delete path, so close
-	// them here too rather than leaking an fd per displacement.
-	orphans := p.orphans
-	p.orphans = nil
-	p.pendingRefs = nil
-	p.mu.Unlock()
-	for _, entry := range entries {
-		entry.fd.Close()
-	}
-	for _, o := range orphans {
-		o.fd.Close()
-	}
-	log.Printf("fdpool: stopped")
+	p.stopOnce.Do(func() {
+		// Detach the fds under the lock, close them outside it (a FUSE fd Close
+		// can block; don't hold p.mu across it — see evictLoop). Keep empty maps
+		// rather than nil maps so late Release/Invalidate/Stats calls remain safe.
+		p.mu.Lock()
+		p.stopped = true
+		entries := p.entries
+		p.entries = make(map[fdKey]*poolEntry)
+		// Orphans (displaced-but-held fds) were previously left open at Stop —
+		// harmless when only FlushStale produced them (once per remount), but
+		// Invalidate produces them on the ordinary rename/delete path, so close
+		// them here too rather than leaking an fd per displacement.
+		orphans := p.orphans
+		p.orphans = nil
+		p.pendingRefs = make(map[fdKey]pendingRef)
+		p.mu.Unlock()
+
+		close(p.stopCh)
+		for _, entry := range entries {
+			entry.fd.Close()
+		}
+		for _, o := range orphans {
+			o.fd.Close()
+		}
+		log.Printf("fdpool: stopped")
+	})
 }
 
 // Stats returns pool statistics.

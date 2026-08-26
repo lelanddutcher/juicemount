@@ -117,8 +117,9 @@ var (
 
 	// globalKeyspaceNetWatcher provides the active-interface NAME signal used
 	// to class-gate the metadata keyspace-push backstop cadence + coalescer
-	// (LAN/WiFi/tunnel). Only instantiated when JM_METADATA_KEYSPACE_PUSH=1;
-	// nil otherwise (class-gating then falls back to JM_WAN_MODE-only).
+	// (LAN/WiFi/tunnel). Instantiated while keyspace push is enabled (default);
+	// nil only under its rollback switch (class-gating then falls back to
+	// JM_WAN_MODE-only).
 	globalKeyspaceNetWatcher *health.NetWatcher
 
 	// Spool architecture (Option 2 / slices A-E). Set when
@@ -1295,7 +1296,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	}
 
 	// [metadata keyspace push] Wire the class-gating signals BEFORE rc.Start so
-	// the keyspace loop (started inside Start when JM_METADATA_KEYSPACE_PUSH=1)
+	// the keyspace loop (started inside Start unless JM_METADATA_KEYSPACE_PUSH=0)
 	// can class-gate its rare-backstop cadence + coalescer from launch.
 	// Review fix (phase-1 adversarial review): the reachability signal is
 	// wired UNCONDITIONALLY — RecentlyDegraded's reachableNow() gate (the G2
@@ -1309,7 +1310,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		reachFn = globalReach.Reachable
 	}
 	var ifaceFn func() string
-	if os.Getenv("JM_METADATA_KEYSPACE_PUSH") == "1" {
+	if metadata.KeyspacePushEnabled() {
 		// G8 (task #81): classify by the route to the BACKEND, not the default
 		// route. Proven live 2026-07-02 (hotspot + Tailscale): the NAS route was
 		// utun6 but the default-route heuristic reported en0, so currentLinkClass
@@ -1565,7 +1566,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		thumbDir := derivDBPath[:len(derivDBPath)-len("/derivatives.db")] + "/thumbs"
 		if tc, terr := thumbcache.Open(thumbDir, maxBytes); terr == nil {
 			globalThumbCache = tc
-			warmer := jmnfs.NewThumbWarmer(tc, resolveThumbBlobPath, func(dir string) []jmnfs.ThumbChildRef {
+			warmer := jmnfs.NewThumbWarmer(tc, resolveWarmThumbBlobPath, func(dir string) []jmnfs.ThumbChildRef {
 				entries, lerr := store.ListChildren(dir)
 				if lerr != nil {
 					return nil
@@ -2366,6 +2367,13 @@ func stopServerLocked() {
 		monitor.Stop()
 	}
 	if server != nil {
+		// Close the listener before tearing down resources used by RPC handlers.
+		// Existing connections may still have a final in-flight request, and the
+		// handler's FD pool deliberately turns that tail into ErrClosed; reversing
+		// these calls let a late Get reopen the dead FUSE mount and previously
+		// panicked while assigning into the pool's detached map.
+		jmlog.Info("shutdown step", "component", "server.Stop")
+		server.Stop()
 		// StopHandler tears down drainer + spool internally (slice C
 		// integration), but we re-snapshot the globals above and
 		// fall through to redundant Stop calls below as belt-and-
@@ -2373,8 +2381,6 @@ func stopServerLocked() {
 		// some reason — the global is the durable handle.
 		jmlog.Info("shutdown step", "component", "StopHandler")
 		server.Handler().StopHandler()
-		jmlog.Info("shutdown step", "component", "server.Stop")
-		server.Stop()
 	}
 	if drainer != nil {
 		// Belt-and-suspenders: handler StopHandler already drained

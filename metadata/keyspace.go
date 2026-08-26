@@ -69,12 +69,18 @@ func (e keyspaceEngagement) String() string {
 	}
 }
 
-// keyspacePushEnabled reports whether the keyspace-notification push is
-// enabled via the env kill switch. Default OFF until validated against a
-// NAS with notify-keyspace-events configured. JM_METADATA_KEYSPACE_PUSH=1
-// engages; anything else (including unset) keeps the proven 30s-SCAN path.
+// KeyspacePushEnabled reports whether keyspace-notification push is enabled.
+// It defaults ON: the release contract is baseline SCAN, then PSUBSCRIBE-driven
+// deltas with a rare authoritative backstop — not a full-tree polling loop.
+// JM_METADATA_KEYSPACE_PUSH=0 is the explicit rollback switch. A Redis server
+// whose notify-keyspace-events flags are insufficient is detected at runtime
+// and safely falls back to the configured periodic SCAN.
+func KeyspacePushEnabled() bool {
+	return os.Getenv("JM_METADATA_KEYSPACE_PUSH") != "0"
+}
+
 func (rc *RedisClient) keyspacePushEnabled() bool {
-	return os.Getenv("JM_METADATA_KEYSPACE_PUSH") == "1"
+	return KeyspacePushEnabled()
 }
 
 // ----------------------------------------------------------------------------
@@ -511,7 +517,7 @@ func (rc *RedisClient) probeKeyspaceConfig(ctx context.Context) (sufficient bool
 // coalescer. It mirrors subscribeLoop's retry idiom: run runKeyspaceSubscribe,
 // and on return (subscription lost) reset the backstop to 30s, sleep 2s, retry.
 func (rc *RedisClient) keyspaceLoop() {
-	jmlog.Info("metadata keyspace push: loop starting (JM_METADATA_KEYSPACE_PUSH=1)")
+	jmlog.Info("metadata keyspace push: loop starting (default-on; JM_METADATA_KEYSPACE_PUSH=0 disables)")
 	for {
 		select {
 		case <-rc.stopCh:
@@ -692,7 +698,11 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	// skipping the boot gap-fill SCAN below. Stamped immediately so even a
 	// short-lived subscription records liveness.
 	heartbeatStop := make(chan struct{})
-	defer close(heartbeatStop)
+	heartbeatDone := make(chan struct{})
+	defer func() {
+		close(heartbeatStop)
+		<-heartbeatDone
+	}()
 	stampAlive := func() {
 		if err := rc.store.SetMeta(metaKeyPushLastAlive, strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
 			jmlog.Debug("keyspace push: liveness stamp failed", "error", err.Error())
@@ -706,6 +716,7 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 	skipBootGapFill := rc.shouldSkipBootGapFill()
 	stampAlive()
 	go func() {
+		defer close(heartbeatDone)
 		t := time.NewTicker(pushHeartbeatInterval)
 		defer t.Stop()
 		for {
@@ -772,7 +783,9 @@ func (rc *RedisClient) runKeyspaceSubscribe() (established bool) {
 		jmlog.Info("metadata keyspace push: boot gap-fill SCAN DEFERRED to background (slow link)",
 			"note", "serving the recalled mirror now; SCAN converges behind it")
 		rc.setEngagement(keyspaceEnabled)
+		rc.background.Add(1)
 		go func() {
+			defer rc.background.Done()
 			if err := rc.SyncOnce(); err != nil {
 				jmlog.Warn("metadata keyspace push: background gap-fill SCAN failed — backstop will retry",
 					"error", err.Error())
@@ -899,6 +912,11 @@ func parseDirInodeFromChannel(channel, prefix string) (uint64, bool) {
 type inodeCoalescer struct {
 	rc *RedisClient
 
+	// runMu lets stop wait for a timer callback that has already begun. A
+	// stopped timer alone cannot guarantee its callback is not concurrently in
+	// reconcileDir, which would otherwise allow RedisClient.Stop to return and
+	// SQLite to close under an in-flight push application.
+	runMu      sync.Mutex
 	mu         sync.Mutex
 	dirty      map[uint64]struct{}
 	batchStart time.Time
@@ -950,6 +968,9 @@ func (c *inodeCoalescer) add(inode uint64) {
 // flush swaps out the dirty set and reconciles each unique inode (or promotes
 // to one full SCAN if the batch is too large).
 func (c *inodeCoalescer) flush() {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+
 	c.mu.Lock()
 	if c.stopped || len(c.dirty) == 0 {
 		c.mu.Unlock()
@@ -977,8 +998,11 @@ func (c *inodeCoalescer) flush() {
 	}
 }
 
-// stop halts the debounce timer and flushes any pending batch so a clean
-// subscription teardown doesn't strand already-observed changes.
+// stop halts the debounce timer and waits for an already-running flush. Pending
+// work is intentionally discarded on process teardown: Redis remains the
+// authority, and the next subscribe-before-SCAN gap-fill recovers it. Trying to
+// flush after RedisClient.Stop has closed the client only creates noisy failed
+// requests and delays shutdown without improving durability.
 func (c *inodeCoalescer) stop() {
 	c.mu.Lock()
 	if c.stopped {
@@ -989,37 +1013,13 @@ func (c *inodeCoalescer) stop() {
 	if c.timer != nil {
 		c.timer.Stop()
 	}
-	pending := len(c.dirty)
-	c.mu.Unlock()
-	if pending > 0 {
-		// Best-effort drain on teardown; reconcileDir is idempotent.
-		c.flushOnStop()
-	}
-}
-
-// flushOnStop drains the remaining dirty set after stop() set the flag. It
-// mirrors flush() but is callable post-stop (flush() itself early-returns when
-// stopped). Kept separate to keep the stopped-guard in flush() simple.
-func (c *inodeCoalescer) flushOnStop() {
-	c.mu.Lock()
-	batch := c.dirty
 	c.dirty = make(map[uint64]struct{})
-	tuning := tuningForClass(currentLinkClass())
 	c.mu.Unlock()
-	if len(batch) == 0 {
-		return
-	}
-	if len(batch) > tuning.burstCeiling {
-		noteKeyspaceScanPromotion()
-		c.rc.keyspaceTriggerSync()
-		return
-	}
-	for inode := range batch {
-		if err := c.rc.keyspaceReconcileDir(inode); err != nil {
-			jmlog.Warn("metadata keyspace push: reconcileDir (teardown) failed",
-				"inode", inode, "error", err.Error())
-		}
-	}
+
+	// Wait for any callback that passed the stopped check before us. Callbacks
+	// that start later observe stopped=true and return without backend work.
+	c.runMu.Lock()
+	c.runMu.Unlock()
 }
 
 // ----------------------------------------------------------------------------

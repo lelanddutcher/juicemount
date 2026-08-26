@@ -174,11 +174,11 @@ func TestKeyspaceNotifySufficient(t *testing.T) {
 func TestKeyspacePushEnabledKillSwitch(t *testing.T) {
 	rc := &RedisClient{}
 	t.Setenv("JM_METADATA_KEYSPACE_PUSH", "")
-	if rc.keyspacePushEnabled() {
-		t.Error("unset env should be DISABLED")
+	if !rc.keyspacePushEnabled() || !KeyspacePushEnabled() {
+		t.Error("unset env should be ENABLED by default")
 	}
 	t.Setenv("JM_METADATA_KEYSPACE_PUSH", "0")
-	if rc.keyspacePushEnabled() {
+	if rc.keyspacePushEnabled() || KeyspacePushEnabled() {
 		t.Error("=0 should be DISABLED")
 	}
 	t.Setenv("JM_METADATA_KEYSPACE_PUSH", "1")
@@ -308,7 +308,7 @@ func TestReconcileBackstopPrecedence(t *testing.T) {
 
 	// Seed the config to 300s (the exact value cfg.reconcileInterval() supplies).
 	rc.SetReconcileInterval(300 * time.Second)
-	// With push DISABLED (default engaged state), the config cadence applies —
+	// With push DISABLED (the initial engagement state), the config cadence applies —
 	// this is the non-push fallback path, so 300s is the honored value.
 	if got := rc.currentBackstop(); got != 300*time.Second {
 		t.Fatalf("push DISABLED + config=300s: backstop = %v, want 300s (config cadence)", got)

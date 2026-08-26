@@ -20,6 +20,7 @@ package main
 // never cost a backend/FUSE stat.
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
+	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/internal/thumbcache"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -618,6 +620,50 @@ func TestResolveThumbBlobPathFreshResolves(t *testing.T) {
 	}
 	if filepath.IsAbs(p) {
 		t.Errorf("blob rel %q is absolute — it must stay relative to the mount", p)
+	}
+}
+
+func TestWarmResolverDoesNotProbeUnknownManifestButOnDemandDoes(t *testing.T) {
+	seed, restore := seedFreshness(t, freshOpts{
+		mirrorSize: 1240000000, mirrorMtime: 1750000000,
+		rowSize: i64p(1240000000), rowMtime: i64p(1750000000),
+	})
+	defer restore()
+
+	const unknown = uint64(990002)
+	blob := "poster.jpg"
+	mediaType := "image/jpeg"
+	sc := farm.ManifestSidecar{
+		Inode:      unknown,
+		SourceHash: sp("00112233445566aa"),
+		Derivatives: []derivatives.DerivRow{{
+			Kind: "thumbnail", Status: "ready", Producer: "linux-farm", Version: 1,
+			BlobRelPath: &blob, MediaType: &mediaType,
+		}},
+	}
+	dir := filepath.Join(seed.mount, derivatives.DerivDirRel(unknown))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, ok := resolveWarmThumbBlobPath(unknown); ok {
+		t.Fatal("speculative warmer resolved an unknown inode through FUSE")
+	}
+	if known, _ := seed.ds.Known(unknown); known {
+		t.Fatal("speculative warmer ingested an unknown manifest")
+	}
+	if _, rel, ok := resolveThumbBlobPath(unknown); !ok || rel != derivatives.DerivBlobRel(unknown, blob) {
+		t.Fatalf("on-demand resolver = (%q, %v), want reconciled poster", rel, ok)
+	}
+	if known, _ := seed.ds.Known(unknown); !known {
+		t.Fatal("on-demand resolver did not persist the reconciled manifest")
 	}
 }
 

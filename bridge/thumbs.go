@@ -228,10 +228,30 @@ func freshThumbCachePath(ds *derivatives.Store, tc *thumbcache.Cache, inode uint
 // its absolute on-FUSE blob path — the warmer's manifest bridge. Same
 // resolution chain as handleBlobHTTP: local Tier-B index first, then the
 // JM-15 one-sidecar reconcile for a farm-derived asset this app hasn't
-// ingested yet (1-2 FUSE round-trips, which is exactly why the warmer
-// budgets calls to this). Globals are read at call time so a mount-path
-// change mid-session can't serve a stale root.
+// ingested yet. This is the ON-DEMAND path used for one requested thumbnail.
+// The folder warmer uses resolveWarmThumbBlobPath below and never turns one
+// directory listing into a speculative manifest-open storm. Globals are read
+// at call time so a mount-path change mid-session can't serve a stale root.
 func resolveThumbBlobPath(inode uint64) (mountOut, blobRel string, ok bool) {
+	return resolveThumbBlobPathPolicy(inode, true)
+}
+
+// resolveWarmThumbBlobPath is the speculative folder-warmer policy: hydrate
+// only rows already present in the persistent Tier-B index. An unknown inode
+// is a cheap miss, not permission to probe manifest.json through FUSE.
+//
+// Live RC acceptance reproduced why this boundary matters: a normal Finder
+// readdir queued up to 64 unknown children per warmer worker; the resulting
+// open/read/close burst made the bundled JuiceFS/macFUSE pair emit opcode-60,
+// ENOSYS and EIO responses and competed with the navigation it was supposed to
+// accelerate. A specific Quick Look request still calls resolveThumbBlobPath,
+// performs ONE bounded/retried reconcile, and then persists the row for future
+// zero-FUSE warm visits.
+func resolveWarmThumbBlobPath(inode uint64) (mountOut, blobRel string, ok bool) {
+	return resolveThumbBlobPathPolicy(inode, false)
+}
+
+func resolveThumbBlobPathPolicy(inode uint64, reconcileUnknown bool) (mountOut, blobRel string, ok bool) {
 	globalMu.Lock()
 	ds := globalDerivStore
 	tc := globalThumbCache
@@ -244,6 +264,9 @@ func resolveThumbBlobPath(inode uint64) (mountOut, blobRel string, ok bool) {
 		return "", "", false
 	}
 	if known, _ := ds.Known(inode); !known {
+		if !reconcileUnknown {
+			return "", "", false
+		}
 		if found, ferr := farm.ReconcileOneSidecar(ds, mount, inode); ferr != nil || !found {
 			return "", "", false
 		}

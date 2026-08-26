@@ -123,8 +123,18 @@ type RedisClient struct {
 
 	reconcileInterval time.Duration
 	stopCh            chan struct{}
+	startOnce         sync.Once
 	stopOnce          sync.Once
+	background        sync.WaitGroup
 	syncNowCh         chan struct{} // signals reconcileLoop to run immediately
+
+	// subscribeReady is closed only after Redis has acknowledged the
+	// juicemount:metadata SUBSCRIBE. It gives tests and startup diagnostics a
+	// real readiness boundary instead of guessing with sleeps. Production does
+	// not block Start on it: an offline launch must continue serving the recalled
+	// mirror while the subscriber reconnects in the background.
+	subscribeReady     chan struct{}
+	subscribeReadyOnce sync.Once
 
 	// syncMu single-flights syncMetadata. Originally the full SCAN had exactly
 	// one caller goroutine (reconcileLoop), so pruneAbsent (a plain map) was a
@@ -577,6 +587,7 @@ func NewRedisClient(redisURL string, store *Store) (*RedisClient, error) {
 		stopCh:            make(chan struct{}),
 		syncNowCh:         make(chan struct{}, 1),
 		backstopChangedCh: make(chan struct{}, 1),
+		subscribeReady:    make(chan struct{}),
 		connected:         true,
 		pruneAbsent:       make(map[string]int),
 		ladderPersisted:   make(map[string]int),
@@ -626,6 +637,7 @@ func NewRedisClientDeferred(redisURL string, store *Store) (*RedisClient, error)
 		stopCh:            make(chan struct{}),
 		syncNowCh:         make(chan struct{}, 1),
 		backstopChangedCh: make(chan struct{}, 1),
+		subscribeReady:    make(chan struct{}),
 		connected:         false,
 		lastDisconnect:    time.Now(),
 		pruneAbsent:       make(map[string]int),
@@ -984,7 +996,7 @@ func (rc *RedisClient) SyncOnce() error {
 // skipped because the persisted mirror is FRESH and the keyspace-notification
 // push is engaged (C1, 2026-07-02).
 //
-// Rationale: with JM_METADATA_KEYSPACE_PUSH=1 the PSUBSCRIBE gap-fill plus the
+// Rationale: with the default-on keyspace push the PSUBSCRIBE gap-fill plus the
 // periodic backstop SCAN already guarantee convergence, so re-running a full
 // boot SCAN over a recently-synced mirror is pure redundant work (the 174s
 // "Rebuilding index…" spinner on a cellular relay). We skip it ONLY when both
@@ -1047,24 +1059,56 @@ func (rc *RedisClient) ShouldSkipBootSync() bool {
 // Start begins the SUBSCRIBE listener, periodic batch reconciliation, and —
 // when enabled — the Redis keyspace-notification push loop.
 //
-// The keyspace loop is strictly additive and flag-gated (JM_METADATA_KEYSPACE_PUSH).
-// When it is not engaged the system behaves byte-identically to before: 30s
-// full-SCAN reconcile + the self-write juicemount:metadata pub/sub. See
+// The keyspace loop is default-on and rollback-gated
+// (JM_METADATA_KEYSPACE_PUSH=0). When it is not engaged the system uses the
+// configured full-SCAN reconcile + the self-write juicemount:metadata pub/sub. See
 // keyspace.go for the engagement state machine (DISABLED/ENABLED/DEGRADED).
 func (rc *RedisClient) Start() {
-	go rc.subscribeLoop()
-	go rc.reconcileLoop()
-	if rc.keyspacePushEnabled() {
-		go rc.keyspaceLoop()
-	}
+	rc.startOnce.Do(func() {
+		rc.background.Add(2)
+		go func() {
+			defer rc.background.Done()
+			rc.subscribeLoop()
+		}()
+		go func() {
+			defer rc.background.Done()
+			rc.reconcileLoop()
+		}()
+		if rc.keyspacePushEnabled() {
+			rc.background.Add(1)
+			go func() {
+				defer rc.background.Done()
+				rc.keyspaceLoop()
+			}()
+		}
+	})
 }
 
-// Stop halts all background goroutines and closes the Redis connection.
+// Stop halts all background goroutines and closes the Redis connection. It
+// does not return until no subscriber, reconcile, or background gap-fill can
+// touch the metadata store, so callers may safely close SQLite immediately
+// afterward.
 func (rc *RedisClient) Stop() {
 	rc.stopOnce.Do(func() {
 		close(rc.stopCh)
 		rc.redisDB().Close()
 	})
+	rc.background.Wait()
+}
+
+// waitSubscribeReady waits for Redis to acknowledge the self-write metadata
+// subscription. Kept package-private because production startup must remain
+// non-blocking while offline; tests use it to establish a deterministic
+// publish-after-subscribe contract.
+func (rc *RedisClient) waitSubscribeReady(ctx context.Context) error {
+	select {
+	case <-rc.subscribeReady:
+		return nil
+	case <-rc.stopCh:
+		return os.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // PublishEvent sends a metadata event to all subscribed clients.
@@ -1119,6 +1163,10 @@ func (rc *RedisClient) runSubscribe() {
 
 	sub := rc.redisDB().Subscribe(ctx, SubscribeChannel)
 	defer sub.Close()
+	if _, err := sub.Receive(ctx); err != nil {
+		return
+	}
+	rc.subscribeReadyOnce.Do(func() { close(rc.subscribeReady) })
 
 	ch := sub.Channel()
 	for msg := range ch {

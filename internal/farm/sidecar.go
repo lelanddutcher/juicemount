@@ -486,24 +486,98 @@ var knownCodecs = map[string]bool{
 	"h264": true, "hevc": true, "av1": true, "aac": true, "opus": true,
 }
 
+// sidecarReadGate serializes the small open/read/close sequence for manifests.
+//
+// Live macOS 26 + macFUSE 5.3.3 + the bundled JuiceFS 1.3.1 reproduced a
+// transport failure under speculative manifest fan-out: two readers walking
+// 128 manifests produced intermittent ENOSYS/EIO responses and an opcode-60
+// storm, while the same files read cleanly one at a time. This lock is scoped
+// only to tiny manifest JSON (never source or derivative blobs), so it removes
+// the daemon-hostile metadata burst without serializing media throughput. A
+// channel rather than a mutex makes admission timeout-capable: a kernel open
+// stuck behind a dead FUSE daemon must not wedge every /derivatives request.
+var sidecarReadGate = make(chan struct{}, 1)
+
+const sidecarReadAttempts = 3
+const sidecarReadTimeout = 2 * time.Second
+
+var errSidecarReadTimeout = errors.New("sidecar read timed out")
+
+type openRegularFunc func(root, rel string) (*os.File, error)
+
 // readSidecarBounded reads one manifest.json through the anchored, symlink-
 // checking open and refuses anything larger than a manifest could plausibly be.
 // The cap is enforced while READING, not after, so a file that lies about its
-// size (or reports none) still cannot outrun it.
+// size (or reports none) still cannot outrun it. Transient macFUSE response
+// failures get a tiny bounded retry; a later successful read is authoritative.
 func readSidecarBounded(mount, rel string) ([]byte, error) {
-	f, err := derivatives.OpenRegularUnder(mount, rel)
-	if err != nil {
-		return nil, err
+	return readSidecarBoundedWithin(mount, rel, sidecarReadTimeout, sidecarReadGate, derivatives.OpenRegularUnder)
+}
+
+type sidecarReadResult struct {
+	raw []byte
+	err error
+}
+
+// readSidecarBoundedWithin bounds BOTH admission and the FUSE operation. A
+// macOS syscall cannot be canceled once the kernel has entered a wedged FUSE
+// session, so the worker may remain until the mount recovers; the one-slot gate
+// caps that leak at one and makes every caller fail fast instead of joining an
+// unbounded queue behind it.
+func readSidecarBoundedWithin(mount, rel string, timeout time.Duration, gate chan struct{}, openRegular openRegularFunc) ([]byte, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case gate <- struct{}{}:
+	case <-timer.C:
+		return nil, fmt.Errorf("%w waiting to read %q", errSidecarReadTimeout, rel)
 	}
-	defer f.Close()
-	raw, err := io.ReadAll(io.LimitReader(f, maxSidecarBytes+1))
-	if err != nil {
-		return nil, err
+
+	result := make(chan sidecarReadResult, 1)
+	go func() {
+		raw, err := readSidecarBoundedWith(mount, rel, openRegular)
+		<-gate
+		result <- sidecarReadResult{raw: raw, err: err}
+	}()
+
+	select {
+	case got := <-result:
+		return got.raw, got.err
+	case <-timer.C:
+		return nil, fmt.Errorf("%w reading %q", errSidecarReadTimeout, rel)
 	}
-	if int64(len(raw)) > maxSidecarBytes {
-		return nil, fmt.Errorf("sidecar %q exceeds %d bytes", rel, maxSidecarBytes)
+}
+
+func readSidecarBoundedWith(mount, rel string, openRegular openRegularFunc) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < sidecarReadAttempts; attempt++ {
+		f, err := openRegular(mount, rel)
+		if err == nil {
+			raw, readErr := io.ReadAll(io.LimitReader(f, maxSidecarBytes+1))
+			_ = f.Close()
+			if readErr == nil {
+				if int64(len(raw)) > maxSidecarBytes {
+					return nil, fmt.Errorf("sidecar %q exceeds %d bytes", rel, maxSidecarBytes)
+				}
+				return raw, nil
+			}
+			err = readErr
+		}
+		lastErr = err
+		if !sidecarTransportRetryable(err) || attempt == sidecarReadAttempts-1 {
+			return nil, err
+		}
+		// A few milliseconds is enough for macFUSE's response queue to drain;
+		// increase gently across the bounded attempts without adding a human-
+		// visible delay to the on-demand Quick Look path.
+		time.Sleep(time.Duration(attempt+1) * 15 * time.Millisecond)
 	}
-	return raw, nil
+	return nil, lastErr
+}
+
+func sidecarTransportRetryable(err error) bool {
+	return errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EIO)
 }
 
 // maxSidecarBytes: a manifest lists a handful of rows plus one ffprobe payload.
@@ -719,7 +793,13 @@ func reconcileOneSidecarInto(store *derivatives.Store, mount string, inode uint6
 func sidecarMountUnavailable(err error) bool {
 	return errors.Is(err, syscall.ENXIO) ||
 		errors.Is(err, syscall.ESTALE) ||
-		errors.Is(err, syscall.ENOTCONN)
+		errors.Is(err, syscall.ENOTCONN) ||
+		// These are intermittent under macFUSE load, so readSidecarBounded first
+		// retries them. If all attempts still fail, continuing a full walk only
+		// multiplies a transport failure by every inode in the derivative tree.
+		errors.Is(err, syscall.ENOSYS) ||
+		errors.Is(err, syscall.EIO) ||
+		errors.Is(err, errSidecarReadTimeout)
 }
 
 // WriteManifestSidecar serializes the asset's current manifest (source hash + all

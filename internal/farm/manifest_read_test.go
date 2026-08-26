@@ -141,7 +141,7 @@ func TestRefusedManifestIsCountedNotSilent(t *testing.T) {
 }
 
 func TestSidecarMountUnavailableClassification(t *testing.T) {
-	for _, errno := range []syscall.Errno{syscall.ENXIO, syscall.ESTALE, syscall.ENOTCONN} {
+	for _, errno := range []syscall.Errno{syscall.ENXIO, syscall.ESTALE, syscall.ENOTCONN, syscall.ENOSYS, syscall.EIO} {
 		err := &os.PathError{Op: "open", Path: "/mount/manifest.json", Err: errno}
 		if !sidecarMountUnavailable(err) {
 			t.Errorf("%v was not classified as a mount-wide outage", errno)

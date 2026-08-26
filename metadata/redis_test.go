@@ -111,7 +111,11 @@ func TestRedisSubscribePublish(t *testing.T) {
 
 	// Start the SUBSCRIBE listener
 	rc.Start()
-	time.Sleep(500 * time.Millisecond) // let subscriber connect
+	readyCtx, cancelReady := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelReady()
+	if err := rc.waitSubscribeReady(readyCtx); err != nil {
+		t.Fatalf("SUBSCRIBE readiness: %v", err)
+	}
 
 	// Publish a test event
 	ctx := context.Background()
@@ -156,10 +160,15 @@ func TestRedisSubscribePublish(t *testing.T) {
 		Path: "__test__/subscribe_test_file.txt",
 	}
 	rc.PublishEvent(ctx, deleteEvt)
-	time.Sleep(500 * time.Millisecond)
-
-	if e := rc.store.LookupByPath("__test__/subscribe_test_file.txt"); e != nil {
-		t.Fatal("entry should have been deleted via SUBSCRIBE")
+	deleteDeadline := time.Now().Add(5 * time.Second)
+	for {
+		if e := rc.store.LookupByPath("__test__/subscribe_test_file.txt"); e == nil {
+			break
+		}
+		if time.Now().After(deleteDeadline) {
+			t.Fatal("entry should have been deleted via SUBSCRIBE")
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 
 	t.Log("SUBSCRIBE publish/receive/delete cycle passed")
@@ -191,7 +200,11 @@ func TestRedisReconciliationPreservesLocalOnly(t *testing.T) {
 func TestRedisSubscribeRename(t *testing.T) {
 	rc := newTestRedisClient(t)
 	rc.Start()
-	time.Sleep(500 * time.Millisecond)
+	readyCtx, cancelReady := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelReady()
+	if err := rc.waitSubscribeReady(readyCtx); err != nil {
+		t.Fatalf("SUBSCRIBE readiness: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -200,7 +213,13 @@ func TestRedisSubscribeRename(t *testing.T) {
 		Op: "create", Path: "__test__/before_rename.txt",
 		Size: 100, Mtime: time.Now().Unix(), Inode: 777777,
 	})
-	time.Sleep(300 * time.Millisecond)
+	createDeadline := time.Now().Add(5 * time.Second)
+	for rc.store.LookupByPath("__test__/before_rename.txt") == nil {
+		if time.Now().After(createDeadline) {
+			t.Fatal("create event not applied before rename")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 
 	// Rename it
 	rc.PublishEvent(ctx, MetadataEvent{
@@ -208,7 +227,18 @@ func TestRedisSubscribeRename(t *testing.T) {
 		OldPath: "__test__/before_rename.txt",
 		Size:    100, Mtime: time.Now().Unix(), Inode: 777777,
 	})
-	time.Sleep(300 * time.Millisecond)
+	renameDeadline := time.Now().Add(5 * time.Second)
+	for {
+		old := rc.store.LookupByPath("__test__/before_rename.txt")
+		newEntry := rc.store.LookupByPath("__test__/after_rename.txt")
+		if old == nil && newEntry != nil {
+			break
+		}
+		if time.Now().After(renameDeadline) {
+			t.Fatal("rename event not applied within 5s")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 
 	// Old path should be gone
 	if e := rc.store.LookupByPath("__test__/before_rename.txt"); e != nil {
