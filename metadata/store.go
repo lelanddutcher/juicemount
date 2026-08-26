@@ -212,14 +212,23 @@ type PinChecker interface {
 
 // Store is a SQLite-backed metadata store with in-memory caches.
 type Store struct {
-	db           *sql.DB
-	writeMu      sync.Mutex   // serializes all SQLite write operations (eliminates SQLITE_BUSY)
-	mu           sync.RWMutex // protects in-memory caches
-	inodeCache   map[uint64]*Entry
-	pathCache    map[string]*Entry
-	childrenIdx  map[string]map[string]*Entry // parentPath → {path → *Entry}
-	maxCacheSize int
-	pinChecker   PinChecker // optional (QA-30); see PinChecker docstring
+	db          *sql.DB
+	writeMu     sync.Mutex   // serializes all SQLite write operations (eliminates SQLITE_BUSY)
+	mu          sync.RWMutex // protects in-memory caches
+	inodeCache  map[uint64]*Entry
+	pathCache   map[string]*Entry
+	childrenIdx map[string]map[string]*Entry // parentPath → {path → *Entry}
+	// dirVisibilityMtime is an in-memory NFS cache-invalidation generation for
+	// each directory. Redis/JuiceFS directory attrs have second precision, so a
+	// remote mkdir+create burst can leave the directory's authoritative mtime
+	// unchanged even though its child set changed. macOS then keeps an already-
+	// cached empty READDIR result indefinitely. Keyspace-push calls
+	// NoteDirectoryChanged after applying a membership event; the NFS adapter
+	// overlays this timestamp on FileInfo without changing canonical SQLite
+	// metadata or adding a write to the cellular hot path. Guarded by mu.
+	dirVisibilityMtime map[string]time.Time
+	maxCacheSize       int
+	pinChecker         PinChecker // optional (QA-30); see PinChecker docstring
 
 	// spoolStore is the sibling SpoolStore over the SAME *sql.DB (both created
 	// from store.DB(); see the shared-DB note on Open). Wired via
@@ -806,10 +815,13 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	}
 
 	s := &Store{
-		db:               db,
-		inodeCache:       make(map[uint64]*Entry),
-		pathCache:        make(map[string]*Entry),
-		childrenIdx:      make(map[string]map[string]*Entry),
+		db:          db,
+		inodeCache:  make(map[uint64]*Entry),
+		pathCache:   make(map[string]*Entry),
+		childrenIdx: make(map[string]map[string]*Entry),
+		dirVisibilityMtime: map[string]time.Time{
+			".": time.Now(),
+		},
 		maxCacheSize:     maxCacheSize,
 		syntheticHandles: make(map[uint64]string),
 		serve:            &serveStmts{},
@@ -1077,6 +1089,7 @@ func (s *Store) Delete(entryPath string) error {
 		// later proves the file actually exists. Cheap; bounded TTL.
 		s.shadowEvictedLocked(e)
 	}
+	delete(s.dirVisibilityMtime, entryPath)
 	// INSTANT-NAV #2: subtract whatever entry is ACTUALLY leaving pathCache
 	// NOW — re-fetched under this lock, not the pre-fetched e, which can be
 	// stale if a concurrent Insert replaced the path since the RLock above.
@@ -1135,6 +1148,7 @@ func (s *Store) DeleteFromCache(entryPath string) {
 		s.subtreeRemoveLocked(e) // INSTANT-NAV #2
 		delete(s.pathCache, entryPath)
 	}
+	delete(s.dirVisibilityMtime, entryPath)
 	s.mu.Unlock()
 }
 
@@ -1159,6 +1173,7 @@ func (s *Store) evictInodeOrphanLocked(new *Entry) {
 		s.subtreeRemoveLocked(cur)
 	}
 	delete(s.pathCache, prev.Path)
+	delete(s.dirVisibilityMtime, prev.Path)
 }
 
 // evictPathOrphanLocked is the symmetric counterpart to
@@ -1240,6 +1255,50 @@ func (s *Store) lookupByPathRAM(entryPath string) *Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.pathCache[entryPath].snapshot()
+}
+
+// NoteDirectoryChanged advances the local visibility generation for dirPath.
+// It is intentionally memory-only: the canonical JuiceFS mtime remains the
+// authority persisted in SQLite, while this overlay exists solely to make the
+// loopback NFS client's directory/name caches notice a push-delivered child-set
+// change. Nanosecond monotonicity handles multiple mutations in one filesystem
+// mtime second without drifting the durable metadata or generating WAL traffic.
+func (s *Store) NoteDirectoryChanged(dirPath string) {
+	if dirPath == "" || dirPath == "/" {
+		dirPath = "."
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	if e := s.pathCache[dirPath]; e != nil && e.Mtime.After(now) {
+		now = e.Mtime
+	}
+	if previous := s.dirVisibilityMtime[dirPath]; !now.After(previous) {
+		now = previous.Add(time.Nanosecond)
+	}
+	s.dirVisibilityMtime[dirPath] = now
+	// A directory GETATTR body serialized before this event contains the old
+	// mtime. Detach it so the next request serializes the visibility overlay.
+	if e := s.pathCache[dirPath]; e != nil {
+		e.ResetGetAttrCache()
+	}
+	s.mu.Unlock()
+}
+
+// DirectoryVisibilityMtime returns the mtime the NFS adapter should expose for
+// a directory: canonical metadata unless a newer push-driven visibility
+// generation exists. It performs no I/O and is safe on the per-RPC hot path.
+func (s *Store) DirectoryVisibilityMtime(dirPath string, canonical time.Time) time.Time {
+	if dirPath == "" || dirPath == "/" {
+		dirPath = "."
+	}
+	s.mu.RLock()
+	visible := s.dirVisibilityMtime[dirPath]
+	s.mu.RUnlock()
+	if visible.After(canonical) {
+		return visible
+	}
+	return canonical
 }
 
 // ListChildren returns all entries whose parent_path matches the given path.
@@ -2443,6 +2502,7 @@ func (s *Store) DeletePaths(paths []string) error {
 				s.subtreeRemoveLocked(e) // INSTANT-NAV #2
 				delete(s.pathCache, p)
 			}
+			delete(s.dirVisibilityMtime, p)
 		}
 		s.mu.Unlock()
 	}

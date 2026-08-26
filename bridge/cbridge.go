@@ -3014,7 +3014,11 @@ func nfsMountOpts(port string) string {
 	// metadata mirror serving GETATTR/LOOKUP from RAM in µs over loopback,
 	// re-validating directory attrs every 1-2s costs nothing measurable and
 	// bounds new-content visibility at ~(push ≤3s + acdirmax 2s) ≈ ≤5s worst
-	// case, ~2s typical. JM_NFS_LEGACY_ACTIMEO=1 restores actimeo=3600;
+	// case, ~2s typical. nonegnamecache is equally load-bearing: the default
+	// negative-name cache can retain an ENOENT after keyspace push has already
+	// inserted the child into our local mirror. Disabling it adds only a
+	// loopback, RAM-served LOOKUP and prevents a pre-push miss from masking the
+	// now-present file. JM_NFS_LEGACY_ACTIMEO=1 restores actimeo=3600;
 	// JM_NFS_ACDIR="min,max" overrides the split values.
 	acOpts := "acregmin=3600,acregmax=3600,acdirmin=1,acdirmax=2"
 	if v := os.Getenv("JM_NFS_ACDIR"); v != "" {
@@ -3038,7 +3042,7 @@ func nfsMountOpts(port string) string {
 	// and [[project_slow_copy_fsetxattr]]. The retry semantics are what we want;
 	// only the alert is wrong. This mutes the alert and changes nothing else.
 	return fmt.Sprintf(
-		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,mutejukebox,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,%s,vers=3,tcp",
+		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,mutejukebox,nonegnamecache,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,%s,vers=3,tcp",
 		port, port, ra, acOpts)
 }
 

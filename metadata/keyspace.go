@@ -1392,6 +1392,15 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 	// storeParent (not parentPath) is the children-index key — see above.
 	rc.scopedPrune(storeParent, freshNames)
 
+	// The directory-key notification itself is authoritative evidence that this
+	// directory's membership changed. Advance a memory-only NFS visibility
+	// generation even when the backend's second-resolution mtime did not move
+	// (mkdir+create commonly land in the same second). Without this, macOS can
+	// retain an empty READDIR/name-cache result after push has already inserted
+	// the children into the mirror. This is deliberately after upsert/prune so
+	// a client invalidated by the new mtime can only observe the new child set.
+	rc.store.NoteDirectoryChanged(parentPath)
+
 	jmlog.Info("metadata keyspace push: reconcileDir",
 		"inode", dirInode, "parent", parentPath, "children", len(raw), "upserted", len(toUpsert))
 	return nil

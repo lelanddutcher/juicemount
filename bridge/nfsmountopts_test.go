@@ -28,14 +28,15 @@ func TestNFSMountOptsMutesJukeboxAlert(t *testing.T) {
 func TestNFSMountOptsKeepsIncidentDrivenOptions(t *testing.T) {
 	opts := nfsMountOpts("12049")
 	required := map[string]string{
-		"hard":       "a soft mount turns a timed-out mmap PAGEIN into SIGBUS, crashing NLEs (2026-06-15)",
-		"intr":       "interruptible, so a wedged RPC does not make the process unkillable",
-		"timeo=400":  "QA-36: a CREATE stall past the ~60s budget aborted Finder copies with error 100060",
-		"retrans=2":  "bounds dead-server detection; inert under hard but load-bearing if hard is ever revisited",
-		"nolocks":    "we do not serve NLM",
-		"locallocks": "locking is handled client-side",
-		"vers=3":     "the server speaks NFSv3",
-		"tcp":        "UDP is not supported by this server",
+		"hard":           "a soft mount turns a timed-out mmap PAGEIN into SIGBUS, crashing NLEs (2026-06-15)",
+		"intr":           "interruptible, so a wedged RPC does not make the process unkillable",
+		"timeo=400":      "QA-36: a CREATE stall past the ~60s budget aborted Finder copies with error 100060",
+		"retrans=2":      "bounds dead-server detection; inert under hard but load-bearing if hard is ever revisited",
+		"nonegnamecache": "a pre-push ENOENT must not mask a child already delivered into the local mirror",
+		"nolocks":        "we do not serve NLM",
+		"locallocks":     "locking is handled client-side",
+		"vers=3":         "the server speaks NFSv3",
+		"tcp":            "UDP is not supported by this server",
 	}
 	for opt, why := range required {
 		if !hasOpt(opts, opt) {

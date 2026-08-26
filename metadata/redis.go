@@ -1242,6 +1242,9 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		if err := rc.store.Insert(e); err != nil {
 			log.Printf("subscribe apply create/update: %v", err)
 		}
+		if evt.Op == "create" {
+			rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
+		}
 
 	case "delete":
 		// Deletes are NOT namespace-filtered: removing an internal-namespace
@@ -1264,6 +1267,7 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		// with a remote actor). Fired outside the store lock; see
 		// Store.SetOnPathInvalidated.
 		rc.store.NotifyPathInvalidated(evt.Path, delIsDir)
+		rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
 
 	case "rename":
 		// The OldPath removal is UNGATED: a rename INTO .trash is JuiceFS's
@@ -1271,6 +1275,7 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		if evt.OldPath != "" {
 			rc.store.DeleteFromCache(evt.OldPath)
 			rc.store.Delete(evt.OldPath)
+			rc.store.NoteDirectoryChanged(path.Dir(evt.OldPath))
 		}
 		// R1: both ends, same reasoning as juiceFS.Rename's local invalidation —
 		// the source name may be recreated and the destination just replaced
@@ -1299,6 +1304,7 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		if err := rc.store.Insert(e); err != nil {
 			log.Printf("subscribe apply rename: %v", err)
 		}
+		rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
 	}
 }
 

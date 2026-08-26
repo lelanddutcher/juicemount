@@ -577,7 +577,7 @@ func mountNFS(addr, mountPoint string) error {
 	// cache re-validates in seconds so server-created content becomes visible
 	// at ~(push 3s + acdirmax 15s) instead of up to an hour. acreg stays 3600.
 	// Mirrors bridge/cbridge.go nfsMountOpts — keep in sync.
-	opts := fmt.Sprintf("port=%s,mountport=%s,hard,intr,timeo=300,retrans=5,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15,vers=3,tcp", port, port)
+	opts := fmt.Sprintf("port=%s,mountport=%s,hard,intr,timeo=300,retrans=5,nonegnamecache,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=16,acregmin=3600,acregmax=3600,acdirmin=3,acdirmax=15,vers=3,tcp", port, port)
 	cmd := exec.Command("sudo", "mount_nfs", "-o", opts,
 		fmt.Sprintf("%s:/", host), mountPoint)
 

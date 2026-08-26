@@ -102,21 +102,35 @@ func (e *Entry) snapshot() *Entry {
 
 // FileInfo implements fs.FileInfo for an Entry.
 type FileInfo struct {
-	entry *Entry
+	entry         *Entry
+	mtimeOverride time.Time
 }
 
 func (e *Entry) FileInfo() *FileInfo {
 	return &FileInfo{entry: e}
 }
 
+// FileInfoWithModTime preserves the concrete *metadata.FileInfo type (and its
+// pre-serialized GETATTR cache) while allowing the NFS adapter to expose a
+// push-driven directory visibility generation. The override is never persisted
+// and is ignored for zero values.
+func (e *Entry) FileInfoWithModTime(mtime time.Time) *FileInfo {
+	return &FileInfo{entry: e, mtimeOverride: mtime}
+}
+
 // Entry returns the underlying metadata Entry.
 func (fi *FileInfo) Entry() *Entry { return fi.entry }
 
-func (fi *FileInfo) Name() string       { return fi.entry.Name }
-func (fi *FileInfo) Size() int64        { return fi.entry.Size }
-func (fi *FileInfo) Mode() fs.FileMode  { return fi.entry.Mode }
-func (fi *FileInfo) ModTime() time.Time { return fi.entry.Mtime }
-func (fi *FileInfo) IsDir() bool        { return fi.entry.IsDir }
+func (fi *FileInfo) Name() string      { return fi.entry.Name }
+func (fi *FileInfo) Size() int64       { return fi.entry.Size }
+func (fi *FileInfo) Mode() fs.FileMode { return fi.entry.Mode }
+func (fi *FileInfo) ModTime() time.Time {
+	if !fi.mtimeOverride.IsZero() {
+		return fi.mtimeOverride
+	}
+	return fi.entry.Mtime
+}
+func (fi *FileInfo) IsDir() bool { return fi.entry.IsDir }
 
 // Sys returns a *syscall.Stat_t with the correct UID, GID, and Ino so that
 // the NFS file attribute builder (internal/nfs/file) reports the current

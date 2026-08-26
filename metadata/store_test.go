@@ -81,6 +81,47 @@ func TestInsertDir(t *testing.T) {
 	}
 }
 
+func TestDirectoryVisibilityMtimeIsMonotonicAndMemoryOnly(t *testing.T) {
+	s := newTestStore(t)
+	canonical := time.Unix(1_700_000_000, 0)
+	dir := MakeEntry("project", true, 0, canonical, 50)
+	if err := s.Insert(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Exercise the GETATTR invalidation half, not only the timestamp map.
+	cached := s.LookupByPath("project")
+	cached.CacheGetAttr([]byte("old-directory-attrs"))
+
+	s.NoteDirectoryChanged("project")
+	first := s.DirectoryVisibilityMtime("project", canonical)
+	if !first.After(canonical) {
+		t.Fatalf("visibility mtime = %v, must be newer than canonical %v", first, canonical)
+	}
+	if got := s.LookupByPath("project").Mtime; !got.Equal(canonical) {
+		t.Fatalf("canonical mtime changed to %v; visibility generation must stay memory-only", got)
+	}
+	if got := s.LookupByPath("project").CachedGetAttr(); got != nil {
+		t.Fatalf("stale GETATTR body survived directory change: %q", got)
+	}
+
+	s.NoteDirectoryChanged("project")
+	second := s.DirectoryVisibilityMtime("project", canonical)
+	if !second.After(first) {
+		t.Fatalf("second visibility mtime %v must advance past %v", second, first)
+	}
+	if got := s.LookupByPath("project").FileInfoWithModTime(second).ModTime(); !got.Equal(second) {
+		t.Fatalf("NFS FileInfo override = %v, want %v", got, second)
+	}
+
+	rootBefore := s.DirectoryVisibilityMtime(".", time.Time{})
+	s.NoteDirectoryChanged("")
+	rootAfter := s.DirectoryVisibilityMtime(".", time.Time{})
+	if !rootAfter.After(rootBefore) {
+		t.Fatalf("root visibility mtime %v must advance past %v", rootAfter, rootBefore)
+	}
+}
+
 func TestUpdate(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now().Truncate(time.Second)

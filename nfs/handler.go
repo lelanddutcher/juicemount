@@ -2076,12 +2076,20 @@ func (jfs *juiceFS) cacheProbeHit(e *metadata.Entry) bool {
 }
 
 func (jfs *juiceFS) entryToFileInfo(e *metadata.Entry) os.FileInfo {
+	if e != nil && e.IsDir {
+		mtime := jfs.handler.store.DirectoryVisibilityMtime(e.Path, e.Mtime)
+		return e.FileInfoWithModTime(mtime)
+	}
 	return e.FileInfo()
+}
+
+func (jfs *juiceFS) rootFileInfo() os.FileInfo {
+	return &rootDirInfo{mtime: jfs.handler.store.DirectoryVisibilityMtime(".", rootMtime)}
 }
 
 func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 	if filename == "" || filename == "." || filename == "/" {
-		return &rootDirInfo{}, nil
+		return jfs.rootFileInfo(), nil
 	}
 	filename = strings.TrimPrefix(filename, "/")
 
@@ -2275,9 +2283,9 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 			// mtime lands when the cache entry refreshes post-drain. Same bug
 			// class as the #99 root-dir mtime jitter (a stable-but-slightly-
 			// stale mtime is fine for wcc; a jittering one is catastrophic).
-			return clone.FileInfo(), nil
+			return jfs.entryToFileInfo(&clone), nil
 		}
-		return e.FileInfo(), nil
+		return jfs.entryToFileInfo(e), nil
 	}
 
 	// [JM6 tier-1.7] Offline fail-fast for un-pinned, un-cached files.
@@ -2367,7 +2375,7 @@ func (w *writeSizeInfo) Size() int64 { return w.size }
 // existence-of-handle implies existence-of-entry in the common case.
 func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 	if filename == "" || filename == "." || filename == "/" {
-		return &rootDirInfo{}, nil
+		return jfs.rootFileInfo(), nil
 	}
 	filename = strings.TrimPrefix(filename, "/")
 
@@ -2409,9 +2417,9 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 			// mtime lands when the cache entry refreshes post-drain. Same bug
 			// class as the #99 root-dir mtime jitter (a stable-but-slightly-
 			// stale mtime is fine for wcc; a jittering one is catastrophic).
-			return clone.FileInfo(), nil
+			return jfs.entryToFileInfo(&clone), nil
 		}
-		return e.FileInfo(), nil
+		return jfs.entryToFileInfo(e), nil
 	}
 
 	// Cache miss. Stat (the fall-through below) uses os.Stat, which FOLLOWS a
@@ -2436,7 +2444,7 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 		// resolves the link the client now knows is a symlink).
 		jfs.handler.store.InsertToCache(entry)
 		go jfs.handler.store.Insert(entry)
-		return entry.FileInfo(), nil
+		return jfs.entryToFileInfo(entry), nil
 	}
 
 	return jfs.Stat(filename)
@@ -2485,7 +2493,7 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 				base == ".TemporaryItems" {
 				continue
 			}
-			infos = append(infos, e.FileInfo())
+			infos = append(infos, jfs.entryToFileInfo(e))
 		}
 		sort.Slice(infos, func(i, j int) bool {
 			return infos[i].Name() < infos[j].Name()
@@ -2949,7 +2957,7 @@ func (jfs *juiceFS) refreshUnmirroredDir(dirname, fusePath string) {
 func (jfs *juiceFS) StatCacheOnly(filename string) (os.FileInfo, bool) {
 	filename = strings.TrimPrefix(filename, "/")
 	if e := jfs.handler.store.LookupByPath(filename); e != nil {
-		return e.FileInfo(), true
+		return jfs.entryToFileInfo(e), true
 	}
 	// Flicker fix: a name being actively written/downloaded lives only in the
 	// spool index until it drains, and its metadata-cache entry races Insert/
@@ -4829,7 +4837,7 @@ func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 // rootDirInfo is the FileInfo for the root directory.
 // Sys() returns a *syscall.Stat_t with the current user's UID/GID so that
 // Finder doesn't show the red "no access" badge on the mount root.
-type rootDirInfo struct{}
+type rootDirInfo struct{ mtime time.Time }
 
 func (r *rootDirInfo) Name() string      { return "" }
 func (r *rootDirInfo) Size() int64       { return 0 }
@@ -4848,8 +4856,13 @@ func (r *rootDirInfo) Mode() fs.FileMode { return fs.ModeDir | 0755 }
 // root-level changes before the attr-cache TTL, without reintroducing per-stat jitter.
 var rootMtime = time.Now()
 
-func (r *rootDirInfo) ModTime() time.Time { return rootMtime }
-func (r *rootDirInfo) IsDir() bool        { return true }
+func (r *rootDirInfo) ModTime() time.Time {
+	if !r.mtime.IsZero() {
+		return r.mtime
+	}
+	return rootMtime
+}
+func (r *rootDirInfo) IsDir() bool { return true }
 func (r *rootDirInfo) Sys() any {
 	return &syscall.Stat_t{
 		Ino:   1,
