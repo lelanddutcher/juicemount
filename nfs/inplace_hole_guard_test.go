@@ -99,9 +99,10 @@ func TestFilledHoleServesAgainAndStopsCostingReads(t *testing.T) {
 }
 
 // A PURELY SEQUENTIAL WRITER — the overwhelmingly common case, every ordinary
-// copy — must never allocate a tracker at all. If it does, the hot-path gate is
-// non-zero during every copy and the "one atomic load" claim is false.
-func TestSequentialWriterNeverArmsTheGuard(t *testing.T) {
+// copy — must never arm the READ hot-path gate. The tracker deliberately keeps
+// a write-side prefix record between RPCs; that record is what prevents a stale
+// metadata base from making the next sequential RPC look out-of-order.
+func TestSequentialWriterNeverArmsTheReadGuard(t *testing.T) {
 	jfs, _, _ := newIntegrityHarness(t)
 	cf, err := jfs.Create("seq.mov")
 	if err != nil {
@@ -116,6 +117,62 @@ func TestSequentialWriterNeverArmsTheGuard(t *testing.T) {
 			t.Fatalf("sequential write #%d armed the guard (holes=%d) — a plain copy must "+
 				"cost nothing on the read path", i, n)
 		}
+	}
+}
+
+// A new NFS file is written through one OpenFile/WriteAt/Close cycle per RPC.
+// The metadata mirror can still report baseSize=0 for the second RPC even
+// though the first sequential chunk is already on FUSE. The old tracker fast
+// path discarded chunk 1, classified chunk 2 as an out-of-order extent above a
+// hole [0,chunk), and JUKEBOX-held an immediate read for up to 90 seconds.
+// This is the exact geometry reproduced by the live high-speed NFS acceptance
+// test on 2026-08-26.
+func TestSequentialRPCsWithStaleBaseDoNotCreatePhantomHole(t *testing.T) {
+	var tr inPlaceTracker
+	const chunk = int64(1 << 20)
+
+	tr.noteWrite("fresh-copy.bin", 0, 0, chunk)
+	// Deliberately keep base=0: this is the stale mirror value seen by the
+	// independently opened second WRITE RPC.
+	tr.noteWrite("fresh-copy.bin", 0, chunk, 2*chunk)
+
+	if got := tr.holes.Load(); got != 0 {
+		t.Fatalf("sequential RPCs armed the read guard (holes=%d); a complete new file would be JUKEBOX-held", got)
+	}
+	if plan, tracked := tr.inPlaceReadPlan("fresh-copy.bin", 0); tracked && plan == planHold {
+		t.Fatal("immediate read of a fully sequential new file was JUKEBOX-held")
+	}
+	tr.mu.Lock()
+	h := tr.m["fresh-copy.bin"]
+	tr.mu.Unlock()
+	if h == nil || h.contiguousEnd != 2*chunk || h.writtenEnd != 2*chunk {
+		t.Fatalf("prefix record = %+v, want contiguous=written=%d", h, 2*chunk)
+	}
+}
+
+func TestNoHolePrefixRecordCanBeForgottenAndAgedOut(t *testing.T) {
+	var tr inPlaceTracker
+	tr.noteWrite("forgotten.bin", 0, 0, 4096)
+	tr.forget("forgotten.bin")
+	tr.mu.Lock()
+	_, exists := tr.m["forgotten.bin"]
+	tr.mu.Unlock()
+	if exists {
+		t.Fatal("forget left a no-hole prefix record behind")
+	}
+	if got := tr.holes.Load(); got != 0 {
+		t.Fatalf("forget changed the hole gate to %d, want 0", got)
+	}
+
+	tr.noteWrite("stale.bin", 0, 0, 4096)
+	tr.mu.Lock()
+	tr.m["stale.bin"].lastWrite = time.Now().Add(-2 * time.Hour)
+	tr.mu.Unlock()
+	if got := tr.evictStale(time.Hour); got != 1 {
+		t.Fatalf("evictStale removed %d no-hole prefix records, want 1", got)
+	}
+	if got := tr.holes.Load(); got != 0 {
+		t.Fatalf("aging a no-hole prefix changed the hole gate to %d, want 0", got)
 	}
 }
 

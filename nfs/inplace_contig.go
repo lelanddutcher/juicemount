@@ -34,11 +34,12 @@ import (
 //     every read would tax every read in the system to protect the rare file
 //     that has a hole. So the gate is an atomic counter of paths that
 //     currently have a hole — `inPlaceHoles` — and the read path's first act
-//     is one atomic load. It is zero in the overwhelming majority of the
-//     process's life, including during an ordinary sequential copy, because a
-//     tracker is created ONLY when a write actually lands above the contiguous
-//     prefix and is DELETED the moment the hole fills. Sequential writers
-//     never create one.
+//     is one atomic load. It is zero during an ordinary sequential copy. The
+//     tracker does retain the copy's contiguous prefix on the WRITE side,
+//     because go-nfs opens a fresh writeFile per RPC and the metadata mirror
+//     can still report size zero while the next sequential RPC arrives. Those
+//     no-hole prefix records never make reads consult the map and are aged out
+//     with the existing write-size cleanup.
 //
 //  2. TURNING HOLE READS INTO JUKEBOX HOLDS IS WHAT CAUSED THE #100 73s-PER-FILE
 //     STALL. So the decision is not re-derived here — it is delegated to
@@ -92,9 +93,11 @@ func advanceContig(cend int64, exts []spoolExtent, off, end int64) (int64, []spo
 	return cend, insertExtent(exts, off, end)
 }
 
-// inPlaceHole is the per-path record of an in-flight hole on the in-place FUSE
-// write path. It exists ONLY while contiguousEnd < writtenEnd — i.e. only while
-// there is genuinely something to guard.
+// inPlaceHole is the per-path write-prefix record on the in-place FUSE path.
+// A record can remain after a hole fills (contiguousEnd == writtenEnd) so the
+// next WRITE RPC can seed from what this process actually observed, rather than
+// a temporarily stale mirror size. Only records with contiguousEnd <
+// writtenEnd contribute to inPlaceTracker.holes or affect reads.
 type inPlaceHole struct {
 	contiguousEnd int64
 	writtenEnd    int64
@@ -114,12 +117,14 @@ type inPlaceHole struct {
 	fromTruncate bool
 }
 
-// inPlaceTracker holds every path that currently has a hole.
+// inPlaceTracker holds recent per-path write prefixes and counts the subset
+// that currently has a hole.
 //
 // `holes` is the hot-path gate and is the ONLY thing a read touches when no
-// hole exists anywhere. Keep it exactly in step with len(m) — a leaked
-// increment taxes every read in the process with a map lookup, and a missed
-// increment silently disables the guard.
+// hole exists anywhere. It counts only records where contiguousEnd <
+// writtenEnd; m can also contain no-hole prefix records used exclusively by
+// the write path. A leaked increment taxes every read in the process with a
+// map lookup, and a missed increment silently disables the guard.
 type inPlaceTracker struct {
 	mu    sync.Mutex
 	m     map[string]*inPlaceHole
@@ -137,34 +142,41 @@ func (t *inPlaceTracker) noteWrite(path string, base, off, end int64) {
 
 	h, ok := t.m[path]
 	if !ok {
-		// Fast exit for the overwhelmingly common case: a write that extends
-		// (or overwrites within) the known-good prefix leaves no hole, so there
-		// is nothing to track and no entry is created. A purely sequential
-		// copy never allocates here.
-		if off <= base {
-			return
-		}
-		// fromTruncate stays false here: this hole was opened by an
-		// OUT-OF-ORDER WRITE, not by a preallocation.
+		// Retain even a no-hole prefix record. go-nfs opens a fresh writeFile
+		// for every WRITE RPC, and during a new sequential copy the metadata
+		// mirror can still say size=0 when RPC #2 arrives. Discarding RPC #1's
+		// prefix made RPC #2 look out-of-order and JUKEBOX-held a fully written
+		// file for the whole liveness window.
 		h = &inPlaceHole{contiguousEnd: base, writtenEnd: base}
 		if t.m == nil {
 			t.m = make(map[string]*inPlaceHole)
 		}
 		t.m[path] = h
-		t.holes.Add(1)
+	} else if h.contiguousEnd >= h.writtenEnd && base > h.contiguousEnd {
+		// With no tracked hole, a newer mirror size is a valid readable
+		// prefix. Never apply this while a hole exists: the mirror's logical
+		// size may then be only a high-water mark above unwritten bytes.
+		h.contiguousEnd = base
+		h.writtenEnd = base
 	}
 
+	wasHole := h.contiguousEnd < h.writtenEnd
 	h.contiguousEnd, h.extents = advanceContig(h.contiguousEnd, h.extents, off, end)
 	if end > h.writtenEnd {
 		h.writtenEnd = end
 	}
 	h.lastWrite = time.Now()
-
-	// The hole filled. Drop the record so the read path's atomic gate returns
-	// to zero and reads stop paying for it.
-	if h.contiguousEnd >= h.writtenEnd {
-		delete(t.m, path)
+	isHole := h.contiguousEnd < h.writtenEnd
+	if !wasHole && isHole {
+		t.holes.Add(1)
+	} else if wasHole && !isHole {
 		t.holes.Add(-1)
+	}
+	if !isHole {
+		// A later out-of-order write is a new event; do not mislabel it as
+		// preallocation just because this retained prefix record once came from
+		// a truncate-to-grow operation.
+		h.fromTruncate = false
 	}
 }
 
@@ -188,9 +200,12 @@ func (t *inPlaceTracker) noteTruncate(path string, base, size int64) {
 			t.m = make(map[string]*inPlaceHole)
 		}
 		t.m[path] = h
-		t.holes.Add(1)
+	} else if h.contiguousEnd >= h.writtenEnd && base > h.contiguousEnd {
+		h.contiguousEnd = base
+		h.writtenEnd = base
 	}
 
+	wasHole := h.contiguousEnd < h.writtenEnd
 	if size > h.writtenEnd {
 		// A GROW opened (or widened) this hole. Record that even when the entry
 		// already existed from an out-of-order write: for the diagnostic, "a
@@ -208,10 +223,14 @@ func (t *inPlaceTracker) noteTruncate(path string, base, size int64) {
 		h.extents = clampExtents(h.extents, size)
 	}
 	h.lastWrite = time.Now()
-
-	if h.contiguousEnd >= h.writtenEnd {
-		delete(t.m, path)
+	isHole := h.contiguousEnd < h.writtenEnd
+	if !wasHole && isHole {
+		t.holes.Add(1)
+	} else if wasHole && !isHole {
 		t.holes.Add(-1)
+	}
+	if !isHole {
+		h.fromTruncate = false
 	}
 }
 
@@ -295,14 +314,13 @@ func (t *inPlaceTracker) logHold(path string, off int64) {
 
 // forget drops a path's record (file closed, deleted, renamed, or aged out).
 func (t *inPlaceTracker) forget(path string) {
-	if t.holes.Load() == 0 {
-		return
-	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, ok := t.m[path]; ok {
+	if h, ok := t.m[path]; ok {
 		delete(t.m, path)
-		t.holes.Add(-1)
+		if h.contiguousEnd < h.writtenEnd {
+			t.holes.Add(-1)
+		}
 	}
 }
 
@@ -315,9 +333,6 @@ func (t *inPlaceTracker) forget(path string) {
 // planReadAt stops holding once the writer goes quiet — so dropping it costs no
 // safety.
 func (t *inPlaceTracker) evictStale(ttl time.Duration) int {
-	if t.holes.Load() == 0 {
-		return 0
-	}
 	cutoff := time.Now().Add(-ttl)
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -325,7 +340,9 @@ func (t *inPlaceTracker) evictStale(ttl time.Duration) int {
 	for k, h := range t.m {
 		if h.lastWrite.Before(cutoff) {
 			delete(t.m, k)
-			t.holes.Add(-1)
+			if h.contiguousEnd < h.writtenEnd {
+				t.holes.Add(-1)
+			}
 			n++
 		}
 	}
