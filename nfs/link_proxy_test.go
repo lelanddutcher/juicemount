@@ -4,10 +4,40 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestProbeHTTPUsesHealthPathAndRequiresSuccess(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.URL.Path != "/minio/health/live" {
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if _, err := probeHTTP(srv.URL+"/zpool?secret=no", "/minio/health/live", time.Second, (&net.Dialer{}).DialContext); err != nil {
+		t.Fatalf("probeHTTP: %v", err)
+	}
+	if gotPath != "/minio/health/live" {
+		t.Fatalf("probe path = %q", gotPath)
+	}
+
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+	}))
+	defer bad.Close()
+	if _, err := probeHTTP(bad.URL+"/bucket", "/minio/health/live", time.Second, (&net.Dialer{}).DialContext); err == nil {
+		t.Fatal("non-2xx HTTP response was accepted as ready")
+	}
+}
 
 func TestProxyEndpointTargetPreservesEndpointShape(t *testing.T) {
 	tests := []struct {

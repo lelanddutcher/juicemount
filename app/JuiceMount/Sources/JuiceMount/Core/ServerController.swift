@@ -346,6 +346,7 @@ public final class ServerController {
         guard !serverURL.isEmpty, !authKey.isEmpty else {
             linkTestResult = NFSBridge.LinkTestResult(
                 ok: false, authorized: false, online: false, backendReachable: false,
+                redisReachable: false, objectStoreReachable: false,
                 hostname: nil, addresses: [], rttMS: nil,
                 error: "Enter the server URL and pairing code first."
             )
@@ -369,6 +370,7 @@ public final class ServerController {
             } catch {
                 result = NFSBridge.LinkTestResult(
                     ok: false, authorized: false, online: false, backendReachable: false,
+                    redisReachable: false, objectStoreReachable: false,
                     hostname: cfg.netHostname, addresses: [], rttMS: nil,
                     error: error.localizedDescription
                 )

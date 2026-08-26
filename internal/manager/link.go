@@ -12,22 +12,32 @@ package manager
 // using headscale's gRPC API (which changes between versions).
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // LinkStatus is returned by GET /api/net/link.
 type LinkStatus struct {
-	Enabled   bool   `json:"enabled"`
-	ServerURL string `json:"server_url,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	ControlReady     bool   `json:"control_ready"`
+	RouteReady       bool   `json:"route_ready"`
+	RedisReady       bool   `json:"redis_ready"`
+	ObjectStoreReady bool   `json:"object_store_ready"`
+	DataPlaneReady   bool   `json:"data_plane_ready"`
+	ServerURL        string `json:"server_url,omitempty"`
+	Error            string `json:"error,omitempty"`
 }
 
 const embeddedHeadscaleHealthAddr = "127.0.0.1:8091"
@@ -51,18 +61,75 @@ func (a *API) handleLinkStatus(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	status := LinkStatus{Enabled: true, ServerURL: url}
 	if os.Getenv("JM_NET_HEADSCALE") == "on" {
 		conn, err := net.DialTimeout("tcp", embeddedHeadscaleHealthAddr, 250*time.Millisecond)
 		if err != nil {
-			writeJSON(w, http.StatusOK, LinkStatus{
-				ServerURL: url,
-				Error:     "Headscale is configured but not ready: " + err.Error(),
-			})
+			status.Error = "Headscale is configured but not ready: " + err.Error()
+			writeJSON(w, http.StatusOK, status)
 			return
 		}
 		_ = conn.Close()
 	}
-	writeJSON(w, http.StatusOK, LinkStatus{Enabled: true, ServerURL: url})
+	status.ControlReady = true
+	status.RouteReady = true
+	if os.Getenv("JM_NET_NAS_NODE") == "on" || strings.TrimSpace(os.Getenv("JM_NET_NAS_ROUTE")) != "" {
+		ready, err := linkRouteReady(headscaleBin(), headscaleConfig(), envString("JM_NET_NAS_HOSTNAME", DefaultNasHostname), envString("JM_NET_NAS_ROUTE", NasLanSubnet))
+		status.RouteReady = ready
+		if err != nil {
+			status.Error = err.Error()
+		}
+	}
+	status.RedisReady = probeLinkRedis(a.linkMetaURL)
+	status.ObjectStoreReady = probeLinkObjectStore(a.linkMinIOURL)
+	status.DataPlaneReady = status.ControlReady && status.RouteReady && status.RedisReady && status.ObjectStoreReady
+	if status.Error == "" && !status.DataPlaneReady {
+		switch {
+		case a.linkMetaURL == "":
+			status.Error = "Link data plane is incomplete: Redis endpoint is not configured"
+		case a.linkMinIOURL == "":
+			status.Error = "Link data plane is incomplete: object-storage endpoint is not configured"
+		case !status.RedisReady:
+			status.Error = "Link data plane is degraded: Redis is not ready"
+		case !status.ObjectStoreReady:
+			status.Error = "Link data plane is degraded: object storage is not ready"
+		}
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func probeLinkRedis(raw string) bool {
+	if strings.TrimSpace(raw) == "" {
+		return false
+	}
+	opts, err := redis.ParseURL(raw)
+	if err != nil {
+		return false
+	}
+	opts.DialTimeout = 500 * time.Millisecond
+	opts.ReadTimeout = 500 * time.Millisecond
+	opts.WriteTimeout = 500 * time.Millisecond
+	client := redis.NewClient(opts)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return client.Ping(ctx).Err() == nil
+}
+
+func probeLinkObjectStore(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	u.Path = "/minio/health/live"
+	u.RawPath, u.RawQuery, u.Fragment = "", "", ""
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Get(u.String())
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 // linkConfigured accepts both the managed container deployment and a
@@ -243,6 +310,99 @@ type HSNode struct {
 	ApprovedRoutes  []string `json:"approved_routes"`
 }
 
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// parseRouteTable reads the stable human table emitted by `nodes list-routes`.
+// Headscale 0.29's general node JSON includes available_routes but omits the
+// approved/serving route state, so that JSON cannot prove approval. The
+// dedicated table is the CLI's authoritative approval surface.
+func parseRouteTable(data []byte, nodeID uint64) (approved, available []string, err error) {
+	lines := strings.Split(ansiEscape.ReplaceAllString(string(data), ""), "\n")
+	approvedCol, availableCol, idCol := -1, -1, -1
+	headerLine := -1
+	for i, line := range lines {
+		if !strings.Contains(line, "|") {
+			continue
+		}
+		cols := strings.Split(line, "|")
+		for j, col := range cols {
+			switch strings.ToLower(strings.TrimSpace(col)) {
+			case "id":
+				idCol = j
+			case "approved":
+				approvedCol = j
+			case "available":
+				availableCol = j
+			}
+		}
+		if idCol >= 0 && approvedCol >= 0 && availableCol >= 0 {
+			headerLine = i
+			break
+		}
+	}
+	if headerLine < 0 {
+		return nil, nil, fmt.Errorf("parse route table: required columns not found")
+	}
+	wantID := strconv.FormatUint(nodeID, 10)
+	for _, line := range lines[headerLine+1:] {
+		if !strings.Contains(line, "|") {
+			continue
+		}
+		cols := strings.Split(line, "|")
+		if idCol >= len(cols) || approvedCol >= len(cols) || availableCol >= len(cols) || strings.TrimSpace(cols[idCol]) != wantID {
+			continue
+		}
+		return splitRouteList(cols[approvedCol]), splitRouteList(cols[availableCol]), nil
+	}
+	return nil, nil, fmt.Errorf("parse route table: node %d not found", nodeID)
+}
+
+func splitRouteList(cell string) []string {
+	var out []string
+	for _, route := range strings.Split(cell, ",") {
+		route = strings.TrimSpace(route)
+		if route != "" {
+			out = append(out, route)
+		}
+	}
+	return out
+}
+
+func routeTableForNode(bin, config string, nodeID uint64) (approved, available []string, err error) {
+	out, err := exec.Command(bin, "--config", config, "nodes", "list-routes",
+		"--identifier", strconv.FormatUint(nodeID, 10)).CombinedOutput()
+	if err != nil {
+		return nil, nil, fmt.Errorf("nodes list-routes: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return parseRouteTable(out, nodeID)
+}
+
+func linkRouteReady(bin, config, host, prefix string) (bool, error) {
+	out, err := exec.Command(bin, "--config", config, "nodes", "list", "-o", "json").CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("Link route check failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	nodes, err := parseHSNodes(out)
+	if err != nil {
+		return false, err
+	}
+	n := nodeForHost(nodes, host)
+	if n == nil {
+		return false, fmt.Errorf("Link NAS node %q is not registered", host)
+	}
+	approved, available, err := routeTableForNode(bin, config, n.ID)
+	if err != nil {
+		return false, err
+	}
+	if !containsRoute(available, prefix) {
+		return false, fmt.Errorf("Link NAS node %q is not advertising %s", host, prefix)
+	}
+	if !containsRoute(approved, prefix) {
+		return false, fmt.Errorf("Link NAS route %s is advertised but not approved", prefix)
+	}
+	return true, nil
+}
+
 // parseHSNodes decodes `headscale nodes list -o json` output. An empty JSON
 // array (no nodes yet) is valid, not an error.
 func parseHSNodes(data []byte) ([]HSNode, error) {
@@ -322,11 +482,23 @@ func ApproveSubnetRoutes(bin, config, host string, prefixes []string) error {
 	if n == nil {
 		return fmt.Errorf("node %q not registered yet", host)
 	}
-	pending := pendingApproval(n, prefixes)
-	if len(pending) == 0 {
-		return nil // nothing to do
+	approved, available, err := routeTableForNode(bin, config, n.ID)
+	if err != nil {
+		return err
 	}
-	merged := mergeApproved(n.ApprovedRoutes, pending)
+	authoritative := *n
+	authoritative.ApprovedRoutes = approved
+	authoritative.AvailableRoutes = available
+	pending := pendingApproval(&authoritative, prefixes)
+	if len(pending) == 0 {
+		for _, prefix := range prefixes {
+			if prefix != "" && !containsRoute(available, prefix) && !containsRoute(approved, prefix) {
+				return fmt.Errorf("node %q is not advertising route %s", host, prefix)
+			}
+		}
+		return nil
+	}
+	merged := mergeApproved(approved, pending)
 	setOut, err := exec.Command(bin, "--config", config,
 		"nodes", "approve-routes",
 		"--identifier", strconv.FormatUint(n.ID, 10),
@@ -334,7 +506,25 @@ func ApproveSubnetRoutes(bin, config, host string, prefixes []string) error {
 	if err != nil {
 		return fmt.Errorf("approve-routes: %v: %s", err, strings.TrimSpace(string(setOut)))
 	}
+	verified, _, err := routeTableForNode(bin, config, n.ID)
+	if err != nil {
+		return fmt.Errorf("verify route approval: %w", err)
+	}
+	for _, route := range merged {
+		if !containsRoute(verified, route) {
+			return fmt.Errorf("route approval did not persist for node %q: %s is still absent", host, route)
+		}
+	}
 	return nil
+}
+
+func containsRoute(routes []string, want string) bool {
+	for _, route := range routes {
+		if route == want {
+			return true
+		}
+	}
+	return false
 }
 
 // handleNetRouteApprove approves the NAS LAN subnet route on demand:

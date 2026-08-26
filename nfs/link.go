@@ -19,6 +19,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -92,8 +93,28 @@ func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, [
 		addrs = append(addrs, a.String())
 	}
 	node := &LinkNode{srv: s, addrs: append([]string(nil), addrs...)}
+	if err := node.setHostname(hostname); err != nil {
+		s.Close()
+		return nil, nil, err
+	}
 	node.acceptRoutes()
 	return node, addrs, nil
+}
+
+func (l *LinkNode) setHostname(hostname string) error {
+	lc, err := l.srv.LocalClient()
+	if err != nil {
+		return fmt.Errorf("link: hostname preferences unavailable: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs:       ipn.Prefs{Hostname: hostname},
+		HostnameSet: true,
+	}); err != nil {
+		return fmt.Errorf("link: apply hostname %q: %w", hostname, err)
+	}
+	return nil
 }
 
 // Addresses returns the node's tailnet addresses captured at successful Up.
@@ -105,6 +126,22 @@ func (l *LinkNode) Addresses() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return append([]string(nil), l.addrs...)
+}
+
+// DialContext opens a connection through the embedded tailnet. It is exposed
+// for protocol-level readiness checks: accepting a TCP connection is not proof
+// that Redis will authenticate or that object storage will answer requests.
+func (l *LinkNode) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if l == nil {
+		return nil, fmt.Errorf("link: node is nil")
+	}
+	l.mu.Lock()
+	s := l.srv
+	l.mu.Unlock()
+	if s == nil {
+		return nil, fmt.Errorf("link: node is stopped")
+	}
+	return s.Dial(ctx, network, address)
 }
 
 // ProxyEndpoint returns an equivalent URL whose host is a loopback listener.
@@ -161,6 +198,55 @@ func (l *LinkNode) ProbeEndpoint(raw, defaultPort string, timeout time.Duration)
 		return 0, err
 	}
 	_ = conn.Close()
+	return time.Since(started), nil
+}
+
+// ProbeHTTP verifies an application-level HTTP endpoint through tsnet. The
+// request keeps the original hostname, so HTTPS certificate verification and
+// Host routing behave exactly as they will for the real object-store client.
+// probePath replaces any bucket path in raw (for MinIO use
+// "/minio/health/live"). Only a 2xx response is considered ready.
+func (l *LinkNode) ProbeHTTP(raw, probePath string, timeout time.Duration) (time.Duration, error) {
+	if l == nil {
+		return 0, fmt.Errorf("link: node is nil")
+	}
+	return probeHTTP(raw, probePath, timeout, l.DialContext)
+}
+
+func probeHTTP(raw, probePath string, timeout time.Duration, dial contextDialer) (time.Duration, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		if err == nil {
+			err = fmt.Errorf("expected an http or https URL with a host")
+		}
+		return 0, fmt.Errorf("link: parse HTTP endpoint %q: %w", raw, err)
+	}
+	u.Path = probePath
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	transport := &http.Transport{
+		Proxy:       nil,
+		DialContext: dial,
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: timeout}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("link: build HTTP probe: %w", err)
+	}
+	started := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("link: HTTP probe returned %s", resp.Status)
+	}
 	return time.Since(started), nil
 }
 

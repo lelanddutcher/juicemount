@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -240,17 +242,80 @@ var (
 	linkMu         sync.Mutex
 	linkTestMu     sync.Mutex
 	globalLinkNode *jmnfs.LinkNode
+	globalLinkID   linkNodeIdentity
 )
 
+type linkNodeIdentity struct {
+	ControlURL  string
+	Hostname    string
+	StateDir    string
+	AuthKeyHash [sha256.Size]byte
+}
+
+func identityForLink(cfg ServerConfig) linkNodeIdentity {
+	return linkNodeIdentity{
+		ControlURL:  strings.TrimRight(strings.TrimSpace(cfg.NetControlURL), "/"),
+		Hostname:    strings.TrimSpace(cfg.NetHostname),
+		StateDir:    linkStateDir(cfg),
+		AuthKeyHash: sha256.Sum256([]byte(strings.TrimSpace(cfg.NetAuthKey))),
+	}
+}
+
+// reusableLinkNode returns the warm node only when it represents the exact
+// pairing inputs currently saved by the app. Changed authorization, control
+// URL, hostname, or state location invalidates the in-memory identity.
+func reusableLinkNode(cfg ServerConfig) *jmnfs.LinkNode {
+	want := identityForLink(cfg)
+	linkMu.Lock()
+	node := globalLinkNode
+	if node != nil && globalLinkID == want {
+		linkMu.Unlock()
+		return node
+	}
+	if node != nil {
+		globalLinkNode = nil
+		globalLinkID = linkNodeIdentity{}
+	}
+	linkMu.Unlock()
+	if node != nil {
+		node.Stop()
+	}
+	return nil
+}
+
+func publishLinkNode(cfg ServerConfig, node *jmnfs.LinkNode) *jmnfs.LinkNode {
+	want := identityForLink(cfg)
+	linkMu.Lock()
+	if globalLinkNode == nil {
+		globalLinkNode = node
+		globalLinkID = want
+		linkMu.Unlock()
+		return node
+	}
+	existing := globalLinkNode
+	if globalLinkID != want {
+		globalLinkNode = node
+		globalLinkID = want
+		linkMu.Unlock()
+		existing.Stop()
+		return node
+	}
+	linkMu.Unlock()
+	node.Stop()
+	return existing
+}
+
 type linkTestResult struct {
-	OK               bool     `json:"ok"`
-	Authorized       bool     `json:"authorized"`
-	Online           bool     `json:"online"`
-	BackendReachable bool     `json:"backend_reachable"`
-	Hostname         string   `json:"hostname,omitempty"`
-	Addresses        []string `json:"addresses"`
-	RTTMS            int64    `json:"rtt_ms,omitempty"`
-	Error            string   `json:"error,omitempty"`
+	OK                   bool     `json:"ok"`
+	Authorized           bool     `json:"authorized"`
+	Online               bool     `json:"online"`
+	BackendReachable     bool     `json:"backend_reachable"`
+	RedisReachable       bool     `json:"redis_reachable"`
+	ObjectStoreReachable bool     `json:"object_store_reachable"`
+	Hostname             string   `json:"hostname,omitempty"`
+	Addresses            []string `json:"addresses"`
+	RTTMS                int64    `json:"rtt_ms,omitempty"`
+	Error                string   `json:"error,omitempty"`
 }
 
 // linkStateDir keeps the tsnet machine identity next to the app's metadata
@@ -272,21 +337,22 @@ func linkStateDir(cfg ServerConfig) string {
 // backend URLs to loopback proxies backed by tsnet. It returns the live node
 // so startup can probe the actual route rather than treating a local listener
 // as proof that the NAS is reachable.
-func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool) {
-	if cfg.NetControlURL == "" || cfg.NetAuthKey == "" {
-		return nil, false
+func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
+	configured, err := validateLinkConfig(*cfg)
+	if err != nil {
+		return nil, false, err
 	}
-	linkMu.Lock()
-	node := globalLinkNode
-	linkMu.Unlock()
+	if !configured {
+		return nil, false, nil
+	}
+	node := reusableLinkNode(*cfg)
 	owned := false
 	var addrs []string
 	if node == nil {
 		var err error
 		node, addrs, err = jmnfs.StartLinkNode(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, linkStateDir(*cfg))
 		if err != nil {
-			jmlog.Warn("JuiceMount Link: node failed to start (continuing without remote)", "error", err.Error())
-			return nil, false
+			return nil, false, fmt.Errorf("JuiceMount Link node failed to start: %w", err)
 		}
 		owned = true
 	}
@@ -295,48 +361,94 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool) {
 		if owned {
 			node.Stop()
 		}
-		jmlog.Warn("JuiceMount Link: Redis proxy failed (continuing without remote)", "error", err.Error())
-		return nil, false
+		return nil, false, fmt.Errorf("JuiceMount Link Redis proxy failed: %w", err)
 	}
 	bucketURL := cfg.BucketOverride
-	if bucketURL != "" {
-		bucketURL, err = node.ProxyEndpoint(bucketURL, "")
-		if err != nil {
-			if owned {
-				node.Stop()
-			}
-			jmlog.Warn("JuiceMount Link: object-store proxy failed (continuing without remote)", "error", err.Error())
-			return nil, false
+	bucketURL, err = node.ProxyEndpoint(bucketURL, "")
+	if err != nil {
+		if owned {
+			node.Stop()
 		}
+		return nil, false, fmt.Errorf("JuiceMount Link object-store proxy failed: %w", err)
 	}
 	cfg.RedisURL = redisURL
 	cfg.BucketOverride = bucketURL
 	if owned {
-		linkMu.Lock()
-		globalLinkNode = node
-		linkMu.Unlock()
+		node = publishLinkNode(*cfg, node)
 	}
 	if len(addrs) > 0 {
 		jmlog.Info("JuiceMount Link: node up", "addrs", fmt.Sprint(addrs))
 	}
 	jmlog.Info("JuiceMount Link: backend endpoints now use loopback proxies")
-	return node, owned
+	return node, owned, nil
+}
+
+func validateLinkConfig(cfg ServerConfig) (bool, error) {
+	configured := strings.TrimSpace(cfg.NetControlURL) != "" || strings.TrimSpace(cfg.NetAuthKey) != ""
+	if !configured {
+		return false, nil
+	}
+	if strings.TrimSpace(cfg.NetControlURL) == "" || strings.TrimSpace(cfg.NetAuthKey) == "" {
+		return true, fmt.Errorf("JuiceMount Link requires both the server URL and pairing code")
+	}
+	if strings.TrimSpace(cfg.RedisURL) == "" {
+		return true, fmt.Errorf("JuiceMount Link requires a Redis endpoint")
+	}
+	if strings.TrimSpace(cfg.BucketOverride) == "" {
+		return true, fmt.Errorf("JuiceMount Link requires an object-store endpoint override; refusing to leave JuiceFS data traffic outside the tunnel")
+	}
+	return true, nil
 }
 
 func linkBackendReachableRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Duration) (bool, time.Duration) {
-	rtt, err := node.ProbeEndpoint(redisURL, "6379", timeout)
+	rtt, err := linkRedisPingRTT(node, redisURL, timeout)
 	if err != nil {
-		jmlog.Warn("JuiceMount Link: backend route unavailable at startup", "error", err.Error())
+		jmlog.Warn("JuiceMount Link: Redis unavailable at startup", "error", err.Error())
 		return false, 0
 	}
 	netprofile.Default().ObserveRTT(rtt)
 	return true, rtt
 }
 
+// objectStoreHealthBase strips the bucket path while retaining the scheme and
+// authority. HealthMonitor appends /minio/health/live itself.
+func objectStoreHealthBase(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	u.Path = ""
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/")
+}
+
+func linkRedisPingRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Duration) (time.Duration, error) {
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return 0, fmt.Errorf("parse Redis endpoint: %w", err)
+	}
+	opts.DialTimeout = timeout
+	opts.ReadTimeout = timeout
+	opts.WriteTimeout = timeout
+	opts.Dialer = node.DialContext
+	client := redis.NewClient(opts)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	started := time.Now()
+	if err := client.Ping(ctx).Err(); err != nil {
+		return 0, err
+	}
+	return time.Since(started), nil
+}
+
 func takeGlobalLinkNode() *jmnfs.LinkNode {
 	linkMu.Lock()
 	node := globalLinkNode
 	globalLinkNode = nil
+	globalLinkID = linkNodeIdentity{}
 	linkMu.Unlock()
 	return node
 }
@@ -348,6 +460,7 @@ func stopLinkNode(node *jmnfs.LinkNode) {
 	linkMu.Lock()
 	if globalLinkNode == node {
 		globalLinkNode = nil
+		globalLinkID = linkNodeIdentity{}
 	}
 	linkMu.Unlock()
 	node.Stop()
@@ -378,15 +491,17 @@ func NFSServerLinkTest(configJSON *C.char) *C.char {
 		result.Error = "Redis endpoint is required to test the remote route"
 		return encode()
 	}
+	if cfg.BucketOverride == "" {
+		result.Error = "Object storage endpoint is required to prove all mount traffic uses JuiceMount Link"
+		return encode()
+	}
 
 	// A pairing test is serialized because tsnet owns a persistent machine
 	// identity directory. Concurrent Up calls against it corrupt the very state
 	// this operation is meant to validate.
 	linkTestMu.Lock()
 	defer linkTestMu.Unlock()
-	linkMu.Lock()
-	node := globalLinkNode
-	linkMu.Unlock()
+	node := reusableLinkNode(cfg)
 	if node == nil {
 		var err error
 		node, result.Addresses, err = jmnfs.StartLinkNode(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, linkStateDir(cfg))
@@ -394,31 +509,31 @@ func NFSServerLinkTest(configJSON *C.char) *C.char {
 			result.Error = err.Error()
 			return encode()
 		}
-		linkMu.Lock()
-		if globalLinkNode == nil {
-			globalLinkNode = node
-		} else {
-			existing := globalLinkNode
-			linkMu.Unlock()
-			node.Stop()
-			node = existing
-			result.Addresses = node.Addresses()
-			goto joined
-		}
-		linkMu.Unlock()
+		node = publishLinkNode(cfg, node)
+		result.Addresses = node.Addresses()
 	} else {
 		result.Addresses = node.Addresses()
 	}
 
-joined:
 	result.Authorized = true
 	result.Online = true
-	rtt, err := node.ProbeEndpoint(cfg.RedisURL, "6379", 12*time.Second)
+	rtt, err := linkRedisPingRTT(node, cfg.RedisURL, 12*time.Second)
 	if err != nil {
-		result.Error = "paired, but the NAS backend route is unavailable: " + err.Error()
+		result.Error = "paired, but Redis authentication/readiness failed through the NAS route: " + err.Error()
 		return encode()
 	}
+	result.RedisReachable = true
+	objectRTT, err := node.ProbeHTTP(cfg.BucketOverride, "/minio/health/live", 12*time.Second)
+	if err != nil {
+		result.RTTMS = rtt.Milliseconds()
+		result.Error = "paired and Redis is ready, but object storage failed through the NAS route: " + err.Error()
+		return encode()
+	}
+	result.ObjectStoreReachable = true
 	result.BackendReachable = true
+	if objectRTT > rtt {
+		rtt = objectRTT
+	}
 	result.RTTMS = rtt.Milliseconds()
 	result.OK = true
 	netprofile.Default().ObserveRTT(rtt)
@@ -594,7 +709,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// Redis and object-store URLs to loopback proxies, while this probe dials the
 	// original backend through tsnet to verify the far side is genuinely alive.
 	linkProbeURL := cfg.RedisURL
-	linkNode, linkOwned = startLinkIfConfigured(&cfg)
+	var linkErr error
+	linkNode, linkOwned, linkErr = startLinkIfConfigured(&cfg)
+	if linkErr != nil {
+		return C.CString("error: " + linkErr.Error())
+	}
 	globalRedisURL = cfg.RedisURL
 	backendUp, bootRTT := backendReachableRTT(cfg.RedisURL, 1500*time.Millisecond)
 	if linkNode != nil {
@@ -1788,7 +1907,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	jmlog.Info("BOOT-TRACE: step-7 pre-monitor")
 	globalMonitor = health.New(health.Config{
 		RedisURL:      redisAddr,
-		MinIOURL:      "", // TODO: make configurable
+		MinIOURL:      objectStoreHealthBase(cfg.BucketOverride),
 		FUSEPath:      cfg.FUSEPath,
 		NFSMountPoint: cfg.MountPoint,
 	})

@@ -39,13 +39,14 @@ func TestEnsureConfigIncludesTLS(t *testing.T) {
 	})
 
 	for _, tc := range []struct {
-		name        string
-		cert, key   string
-		wantPresent bool
+		name          string
+		cert, key     string
+		wantPresent   bool
+		wantConfigErr bool
 	}{
-		{"both set", "/data/tls/fullchain.pem", "/data/tls/privkey.pem", true},
-		{"cert only", "/data/tls/fullchain.pem", "", false},
-		{"neither set", "", "", false},
+		{"both set", "/data/tls/fullchain.pem", "/data/tls/privkey.pem", true, false},
+		{"cert only", "/data/tls/fullchain.pem", "", false, true},
+		{"neither set", "", "", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hsDataDir = t.TempDir()
@@ -54,6 +55,12 @@ func TestEnsureConfigIncludesTLS(t *testing.T) {
 			t.Setenv("JM_NET_TLS_KEY", tc.key)
 
 			cfgPath, err := ensureConfig()
+			if tc.wantConfigErr {
+				if err == nil {
+					t.Fatal("ensureConfig accepted half-configured TLS")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("ensureConfig: %v", err)
 			}
@@ -73,6 +80,29 @@ func TestEnsureConfigIncludesTLS(t *testing.T) {
 			}
 			if !strings.Contains(cfg, filepath.Join(hsDataDir, "db.sqlite")) {
 				t.Errorf("sqlite path lost:\n%s", cfg)
+			}
+		})
+	}
+}
+
+func TestValidateLinkTransport(t *testing.T) {
+	tests := []struct {
+		name, raw, cert, key string
+		allow                bool
+		wantErr              bool
+	}{
+		{"https", "https://nas.example:30193", "", "", false, false},
+		{"http refused", "http://192.168.0.197:30193", "", "", false, true},
+		{"http explicit test LAN", "http://192.168.0.197:30193", "", "", true, false},
+		{"half TLS", "https://nas.example:30193", "/cert.pem", "", false, true},
+		{"TLS on http", "http://nas.example:30193", "/cert.pem", "/key.pem", true, true},
+		{"missing host", "https:///broken", "", "", false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateLinkTransport(tc.raw, tc.cert, tc.key, tc.allow)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateLinkTransport error = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
 	}

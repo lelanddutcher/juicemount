@@ -206,6 +206,7 @@ services:
       # LAN subnet containing the Redis and MinIO addresses in client config.
       JM_NET_HEADSCALE: "off"
       JM_NET_SERVER_URL: ""             # e.g. https://nas.example.com:30193
+      JM_NET_ALLOW_INSECURE: "0"         # test LAN only: set 1 to permit an explicit http:// URL
       JM_NET_NAS_NODE: "off"            # set on with Headscale to advertise JM_NET_NAS_ROUTE
       JM_NET_NAS_ROUTE: "192.168.0.0/24" # EDIT if your NAS LAN uses another subnet
       # EMBEDDED MODE ONLY (command: ["--fuse-mount=/jfs"] + JM_META unset):

@@ -20,10 +20,9 @@ package main
 // the rest of the manager.
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,17 +87,18 @@ func tlsConfigBlock(certPath, keyPath string) string {
 
 func ensureConfig() (string, error) {
 	cfgPath := filepath.Join(hsDataDir, "config.yaml")
+	publicURL := externalURL()
+	certPath, keyPath := os.Getenv("JM_NET_TLS_CERT"), os.Getenv("JM_NET_TLS_KEY")
+	if err := validateLinkTransport(publicURL, certPath, keyPath, os.Getenv("JM_NET_ALLOW_INSECURE") == "1"); err != nil {
+		return "", err
+	}
 	if _, err := os.Stat(cfgPath); err == nil {
 		return cfgPath, nil
 	}
 	if err := os.MkdirAll(hsDataDir, 0o755); err != nil {
 		return "", err
 	}
-	url := externalURL()
-	if url == "" {
-		return "", fmt.Errorf("JM_NET_SERVER_URL not set (the address Mac clients will use, e.g. http://<nas-ip>:30193)")
-	}
-	tlsBlock := tlsConfigBlock(os.Getenv("JM_NET_TLS_CERT"), os.Getenv("JM_NET_TLS_KEY"))
+	tlsBlock := tlsConfigBlock(certPath, keyPath)
 	cfg := fmt.Sprintf(`server_url: %s
 listen_addr: %s
 metrics_listen_addr: 127.0.0.1:9091
@@ -131,11 +131,31 @@ log:
   level: info
 %[4]sunix_socket: %[3]s/headscale.sock
 unix_socket_permission: "0770"
-`, url, hsListen, hsDataDir, tlsBlock)
+`, publicURL, hsListen, hsDataDir, tlsBlock)
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		return "", err
 	}
 	return cfgPath, nil
+}
+
+func validateLinkTransport(raw, certPath, keyPath string, allowInsecure bool) error {
+	if raw == "" {
+		return fmt.Errorf("JM_NET_SERVER_URL not set (the address Mac clients will use, e.g. https://<nas-name>:30193)")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("JM_NET_SERVER_URL must be an absolute http or https URL")
+	}
+	if (certPath == "") != (keyPath == "") {
+		return fmt.Errorf("JM_NET_TLS_CERT and JM_NET_TLS_KEY must be configured together")
+	}
+	if certPath != "" && u.Scheme != "https" {
+		return fmt.Errorf("JM_NET_SERVER_URL must use https when Link TLS certificates are configured")
+	}
+	if u.Scheme == "http" && !allowInsecure {
+		return fmt.Errorf("refusing plaintext JuiceMount Link control traffic; use https or set JM_NET_ALLOW_INSECURE=1 for an explicitly trusted test LAN")
+	}
+	return nil
 }
 
 // Start launches the headscale child, waits for its coordination listener,
@@ -252,65 +272,5 @@ func (h *headscaleSupervisor) Stop() {
 	defer h.mu.Unlock()
 	if h.cmd != nil && h.cmd.Process != nil {
 		_ = h.cmd.Process.Signal(syscall.SIGTERM)
-	}
-}
-
-// pairResponse is the JSON shape of POST /api/net/pair.
-type pairResponse struct {
-	OK        bool   `json:"ok"`
-	Code      string `json:"code,omitempty"`       // the preauth key itself (the "code")
-	ServerURL string `json:"server_url,omitempty"` // where the Mac's tsnet dials
-	Error     string `json:"error,omitempty"`
-}
-
-// pairMint runs the headscale CLI to mint a reusable preauth key. CLI over
-// the unix socket keeps us off headscale's gRPC API surface (which changes
-// between versions); the CLI is the stable contract.
-func pairMint() (string, error) {
-	url := externalURL()
-	if url == "" {
-		return "", fmt.Errorf("JM_NET_SERVER_URL not set")
-	}
-	out, err := exec.Command(hsBinary, "--config", hsDataDir+"/config.yaml",
-		"preauthkeys", "--user", "1", "create",
-		"--reusable", "--expiration", "1h").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
-	}
-	key := strings.TrimSpace(string(out))
-	// CLI prints a log line + the key; take the last non-empty token.
-	for _, line := range strings.Split(key, "\n") {
-		if strings.HasPrefix(line, "20") { // timestamped log lines
-			continue
-		}
-		if line != "" {
-			return line, nil
-		}
-	}
-	return "", fmt.Errorf("could not parse preauth key from output")
-}
-
-// handlePair mints one pairing code. Registered under /api/net/pair.
-func handlePair(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
-	key, err := pairMint()
-	resp := pairResponse{OK: err == nil, Error: errString(err), Code: key, ServerURL: externalURL()}
-	writeJSON(w, resp)
-}
-
-func errString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }

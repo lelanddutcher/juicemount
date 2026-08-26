@@ -125,6 +125,8 @@ public enum NFSBridge {
         public var authorized: Bool
         public var online: Bool
         public var backendReachable: Bool
+        public var redisReachable: Bool
+        public var objectStoreReachable: Bool
         public var hostname: String?
         public var addresses: [String]
         public var rttMS: Int64?
@@ -133,6 +135,8 @@ public enum NFSBridge {
         enum CodingKeys: String, CodingKey {
             case ok, authorized, online, hostname, addresses, error
             case backendReachable = "backend_reachable"
+            case redisReachable = "redis_reachable"
+            case objectStoreReachable = "object_store_reachable"
             case rttMS = "rtt_ms"
         }
 
@@ -141,6 +145,8 @@ public enum NFSBridge {
             authorized: Bool,
             online: Bool,
             backendReachable: Bool,
+            redisReachable: Bool,
+            objectStoreReachable: Bool,
             hostname: String?,
             addresses: [String],
             rttMS: Int64?,
@@ -150,6 +156,8 @@ public enum NFSBridge {
             self.authorized = authorized
             self.online = online
             self.backendReachable = backendReachable
+            self.redisReachable = redisReachable
+            self.objectStoreReachable = objectStoreReachable
             self.hostname = hostname
             self.addresses = addresses
             self.rttMS = rttMS
@@ -166,6 +174,8 @@ public enum NFSBridge {
             authorized = try values.decodeIfPresent(Bool.self, forKey: .authorized) ?? false
             online = try values.decodeIfPresent(Bool.self, forKey: .online) ?? false
             backendReachable = try values.decodeIfPresent(Bool.self, forKey: .backendReachable) ?? false
+            redisReachable = try values.decodeIfPresent(Bool.self, forKey: .redisReachable) ?? backendReachable
+            objectStoreReachable = try values.decodeIfPresent(Bool.self, forKey: .objectStoreReachable) ?? backendReachable
             hostname = try values.decodeIfPresent(String.self, forKey: .hostname)
             addresses = try values.decodeIfPresent([String].self, forKey: .addresses) ?? []
             rttMS = try values.decodeIfPresent(Int64.self, forKey: .rttMS)

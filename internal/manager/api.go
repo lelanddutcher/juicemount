@@ -31,6 +31,8 @@ type API struct {
 	fuseMount      string   // for ModeEmbedded dest-traversal check; empty in standalone
 	volName        string   // for ModeStandalone dest-validation
 	farmStatusPath string   // juicefarm rollup JSON path (farm-status.json); empty = Farm tab shows "not configured"
+	linkMetaURL    string   // backend endpoint used for Link readiness (never returned to clients)
+	linkMinIOURL   string   // object-store endpoint used for Link readiness (never returned to clients)
 
 	// farmChangesPath is the farm's pre-aggregated /derivatives/changes feed
 	// (JM-15 #56): the contract changes-array the farm writes next to
@@ -184,6 +186,8 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	if overviewMeta == "" {
 		overviewMeta = cfg.MetaURL
 	}
+	a.linkMetaURL = overviewMeta
+	a.linkMinIOURL = cfg.MinIOURL
 	a.overview = newOverviewSource(mgr, cfg.JuiceFSBin, overviewMeta, cfg.MinIOURL)
 	// JM-16: dial the shared juicefarm: job queue on the volume's Redis so
 	// the Farm tab can enqueue server-side generation work + read job
@@ -1383,6 +1387,10 @@ func (a *API) handleStatic(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
 	case ".css":
 		w.Header().Set("Content-Type", "text/css")
+	case ".svg":
+		w.Header().Set("Content-Type", "image/svg+xml")
+	case ".woff2":
+		w.Header().Set("Content-Type", "font/woff2")
 	}
 	_, _ = w.Write(data)
 }

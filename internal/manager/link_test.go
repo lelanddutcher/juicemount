@@ -22,7 +22,11 @@ func fakeHeadscale(t *testing.T, dir string, stdout string) string {
 	t.Helper()
 	bin := filepath.Join(dir, "fake-headscale.sh")
 	script := "#!/bin/sh\necho \"$@\" >> " + dir + "/argv.log\n" +
-		"case \" $* \" in *\" nodes list \"*) cat " + dir + "/nodes.json; exit 0 ;; esac\n" +
+		"case \" $* \" in\n" +
+		"  *\" nodes list-routes \"*) cat " + dir + "/routes.txt; exit 0 ;;\n" +
+		"  *\" nodes list \"*) cat " + dir + "/nodes.json; exit 0 ;;\n" +
+		"  *\" nodes approve-routes \"*) test ! -f " + dir + "/routes-approved.txt || cp " + dir + "/routes-approved.txt " + dir + "/routes.txt; echo node updated; exit 0 ;;\n" +
+		"esac\n" +
 		"echo " + stdout + "\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -222,6 +226,24 @@ func TestPendingApprovalAndMerge(t *testing.T) {
 	}
 }
 
+func TestParseRouteTable(t *testing.T) {
+	raw := "\x1b[96mID\x1b[0m | Hostname | Approved | Available | Serving (Primary)\n" +
+		"10 | juicemount-nas | 172.16.5.0/24 | 192.168.0.0/24, 172.16.5.0/24 | 192.168.0.0/24\n"
+	approved, available, err := parseRouteTable([]byte(raw), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(approved, []string{"172.16.5.0/24"}) {
+		t.Fatalf("approved = %v", approved)
+	}
+	if !reflect.DeepEqual(available, []string{"192.168.0.0/24", "172.16.5.0/24"}) {
+		t.Fatalf("available = %v", available)
+	}
+	if _, _, err := parseRouteTable([]byte("not a table"), 10); err == nil {
+		t.Fatal("malformed route table was accepted")
+	}
+}
+
 // TestApproveSubnetRoutesEndToEnd drives ApproveSubnetRoutes against the
 // fake CLI and asserts BOTH commands it must issue: the json listing and the
 // approve-routes call carrying the MERGED route set.
@@ -234,6 +256,16 @@ func TestApproveSubnetRoutesEndToEnd(t *testing.T) {
       {"id": 3, "name": "juicemount-nas", "given_name": "juicemount-nas",
        "available_routes": ["192.168.0.0/24"], "approved_routes": ["172.16.5.0/24"]}
     ]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := "ID | Hostname | Approved | Available | Serving (Primary)\n" +
+		"3 | juicemount-nas | 172.16.5.0/24 | 192.168.0.0/24, 172.16.5.0/24 |\n"
+	after := "ID | Hostname | Approved | Available | Serving (Primary)\n" +
+		"3 | juicemount-nas | 172.16.5.0/24, 192.168.0.0/24 | 192.168.0.0/24, 172.16.5.0/24 | 192.168.0.0/24\n"
+	if err := os.WriteFile(filepath.Join(dir, "routes.txt"), []byte(before), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "routes-approved.txt"), []byte(after), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

@@ -36,11 +36,18 @@ func TestTeamsSurfaceWithheldFromRC(t *testing.T) {
 	if strings.Contains(string(index), `href="#/teams"`) {
 		t.Fatal("Teams navigation is visible in the RC UI")
 	}
+	for _, marker := range []string{`data-tab="teams"`, `teams-login`, `teams-users`, `teams-add`} {
+		if strings.Contains(string(index), marker) {
+			t.Fatalf("Teams markup %q is still embedded in the RC UI", marker)
+		}
+	}
 	app, err := staticFS.ReadFile("static/app.js")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(app), "'teams',") {
-		t.Fatal("Teams is still a routable UI tab")
+	for _, marker := range []string{"'teams',", "/api/users", "/api/auth/login", "jm-teams-session", "initTeams"} {
+		if strings.Contains(string(app), marker) {
+			t.Fatalf("Teams client marker %q is still embedded in the RC asset", marker)
+		}
 	}
 }

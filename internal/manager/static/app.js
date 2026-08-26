@@ -183,6 +183,26 @@
     return h;
   }
 
+  function compactHTTPError(raw, contentType) {
+    let detail = String(raw || '');
+    if ((contentType || '').includes('application/json')) {
+      try {
+        const parsed = JSON.parse(detail);
+        detail = parsed.error || parsed.message || parsed.detail || detail;
+      } catch { /* retain the bounded raw response */ }
+    } else if ((contentType || '').includes('text/html') || /<\/?[a-z][\s\S]*>/i.test(detail)) {
+      // Reverse proxies and static preview servers return complete HTML error
+      // documents. Render one useful sentence, never the markup dump.
+      const message = detail.match(/<p[^>]*>\s*Message:\s*([^<]+)<\/p>/i);
+      detail = message ? message[1] : detail.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ');
+    }
+    detail = detail.replace(/\s+/g, ' ').trim();
+    if (detail.length > 240) detail = detail.slice(0, 237) + '…';
+    return detail;
+  }
+
   async function api(method, path, body) {
     const opts = { method, headers: authHeaders() };
     if (body) opts.body = JSON.stringify(body);
@@ -198,7 +218,10 @@
       }
       throw new Error('authentication required');
     }
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText} — ${await r.text()}`);
+    if (!r.ok) {
+      const detail = compactHTTPError(await r.text(), r.headers.get('content-type'));
+      throw new Error(`${r.status} ${r.statusText}${detail ? ' — ' + detail : ''}`);
+    }
     if (r.status === 204) return null;
     return r.json();
   }
@@ -1822,13 +1845,18 @@
       return;
     }
     const st = linkSettled.value || {};
-    setOverviewCardError(card, '');
+    setOverviewCardError(card, st.error || '');
     const stateEl = card.querySelector('.overview-card-state');
-    if (st.enabled) {
-      setField(card, 'status', 'active');
+    if (st.data_plane_ready) {
+      setField(card, 'status', 'ready');
       setField(card, 'server', st.server_url || '—');
       stateEl.textContent = 'ok';
       stateEl.className = 'overview-card-state ok';
+    } else if (st.enabled) {
+      setField(card, 'status', 'degraded');
+      setField(card, 'server', st.server_url || '—');
+      stateEl.textContent = 'check';
+      stateEl.className = 'overview-card-state warn';
     } else {
       setField(card, 'status', 'not configured');
       setField(card, 'server', '—');
@@ -3547,13 +3575,15 @@ async function refreshLinkStatus() {
   try {
     const st = await api('GET', '/api/net/link');
     const status = document.getElementById('link-status');
-    status.classList.toggle('online', !!st.enabled);
-    status.classList.toggle('offline', !st.enabled);
-    document.getElementById('link-enabled').textContent = st.enabled ? 'Link active' : 'Link not configured';
+    status.classList.toggle('online', !!st.data_plane_ready);
+    status.classList.toggle('offline', !st.data_plane_ready);
+    document.getElementById('link-enabled').textContent = st.data_plane_ready
+      ? 'Link data plane ready'
+      : (st.enabled ? 'Link control plane ready; data plane degraded' : 'Link not configured');
     const detail = document.getElementById('link-status-detail');
-    if (detail) detail.textContent = st.enabled
-      ? ('Coordination server ' + (st.server_url || 'online'))
-      : 'Enable Headscale and set the external Link server URL on the Manager container.';
+    if (detail) detail.textContent = st.data_plane_ready
+      ? ('Coordination, NAS route, Redis, and object storage verified · ' + (st.server_url || 'online'))
+      : (st.error || 'Enable Headscale and set the external Link server URL on the Manager container.');
     document.getElementById('link-pair').style.display = st.enabled ? 'block' : 'none';
     document.getElementById('link-devices').style.display = st.enabled ? 'block' : 'none';
   } catch {
@@ -3612,220 +3642,6 @@ async function revokeNode(id) {
 function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 // Lazy-init hook: called by showTab when link tab activates
-
-  // -------- Teams & seats (Tier-2 T2.3) --------
-  // User-account management UI over the existing backend:
-  //   GET    /api/users          → {users:[{id,username,role,created_at}]}
-  //   DELETE /api/users/<name>   → {ok:true} (admin itself is protected server-side)
-  //   POST   /api/auth/login     → {ok,token,username,role,expires_at} (24h session)
-  // The login endpoint is NOT admin-key gated, so it is fetched directly
-  // (api()'s 401 handler would wrongly prompt for the admin key on a bad
-  // password). Session state persists in localStorage and is rendered as
-  // a sign-in card; no API route consumes the bearer token yet, so the
-  // session is informational until bearerAuth is wired server-side.
-  const TEAMS_SESSION_KEY = 'jm-teams-session';
-  let teamsInited = false;
-
-  function teamsSession() {
-    try { return JSON.parse(localStorage.getItem(TEAMS_SESSION_KEY) || 'null'); }
-    catch (_) { return null; }
-  }
-
-  function initTeamsOnce() {
-    if (teamsInited) return;
-    teamsInited = true;
-    $('#teams-login-form').addEventListener('submit', teamsLogin);
-    $('#teams-logout-btn').addEventListener('click', teamsLogout);
-    $('#teams-users-refresh').addEventListener('click', loadUsers);
-    $('#teams-add-form').addEventListener('submit', teamsCreateUser);
-    // Delegated delete clicks — the tbody re-renders on every refresh.
-    $('#teams-users-body').addEventListener('click', teamsDeleteClick);
-  }
-
-  function refreshTeams() {
-    renderTeamsSession();
-    loadUsers();
-  }
-
-  function renderTeamsSession() {
-    const sess = teamsSession();
-    const valid = !!(sess && typeof sess.expires_at === 'number' && Date.now() / 1000 < sess.expires_at && sess.token);
-    if (!valid) {
-      try { localStorage.removeItem(TEAMS_SESSION_KEY); } catch (_) {}
-    }
-    $('#teams-login-wrap').hidden = valid;
-    $('#teams-session-info').hidden = !valid;
-    if (!valid) return;
-    $('#teams-session-user').textContent = sess.username || '(unknown)';
-    $('#teams-session-role').textContent = sess.role || 'member';
-    $('#teams-session-expiry').textContent =
-      new Date(sess.expires_at * 1000).toLocaleString();
-  }
-
-  async function teamsLogin(e) {
-    e.preventDefault();
-    const errBox = $('#teams-login-error');
-    errBox.hidden = true;
-    const username = ($('#teams-login-user').value || '').trim();
-    const password = $('#teams-login-pass').value || '';
-    if (!username || !password) {
-      errBox.textContent = 'Username and password are required.';
-      errBox.hidden = false;
-      return;
-    }
-    const btn = $('#teams-login-btn');
-    btn.disabled = true;
-    try {
-      // Raw fetch: /api/auth/login is unauthenticated by design, and
-      // api() maps every 401 to an admin-key prompt — wrong here.
-      const r = await fetch(BASE + '/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      });
-      const data = await r.json().catch(() => null);
-      if (!r.ok || !data || data.ok !== true || !data.token) {
-        throw new Error((data && data.error) || (r.status + ' ' + r.statusText));
-      }
-      try { localStorage.setItem(TEAMS_SESSION_KEY, JSON.stringify(data)); } catch (_) {}
-      $('#teams-login-pass').value = '';
-      renderTeamsSession();
-    } catch (err) {
-      errBox.textContent = 'Sign-in failed: ' + ((err && err.message) || err);
-      errBox.hidden = false;
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
-  function teamsLogout() {
-    try { localStorage.removeItem(TEAMS_SESSION_KEY); } catch (_) {}
-    renderTeamsSession();
-  }
-
-  async function loadUsers() {
-    const errBox = $('#teams-users-error');
-    errBox.hidden = true;
-    const tbody = $('#teams-users-body');
-    tbody.innerHTML = '';
-    let users = null;
-    try {
-      const res = await api('GET', '/api/users');
-      users = (res && res.users) || [];
-    } catch (err) {
-      addTeamsUserRow(tbody, null, 'Load failed: ' + ((err && err.message) || err));
-      errBox.hidden = false;
-      return;
-    }
-    if (!users.length) {
-      addTeamsUserRow(tbody, null, 'No users yet.');
-      return;
-    }
-    const sess = teamsSession();
-    for (const u of users) {
-      const tr = addTeamsUserRow(tbody, u);
-      // Delete button. The backend refuses to delete "admin"; disable
-      // it here too so the affordance matches the server contract.
-      const tdActions = tr.lastElementChild;
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'btn btn-sm';
-      btn.textContent = 'Delete';
-      btn.setAttribute('data-teams-del', String(u.username || ''));
-      if (u.username === 'admin') {
-        btn.disabled = true;
-        btn.title = 'The admin account cannot be deleted.';
-      }
-      if (sess && u.username === sess.username) {
-        btn.title = 'You are signed in as this user.';
-      }
-      tdActions.appendChild(btn);
-    }
-  }
-
-  // addTeamsUserRow appends one <tr>. When `u` is null the row is a
-  // full-width muted message cell (`msg`); all server strings are set
-  // via textContent so a crafted username can't inject markup.
-  function addTeamsUserRow(tbody, u, msg) {
-    const tr = document.createElement('tr');
-    if (!u) {
-      const td = document.createElement('td');
-      td.colSpan = 4;
-      td.className = 'hint';
-      td.textContent = msg || '—';
-      tr.appendChild(td);
-      tbody.appendChild(tr);
-      return tr;
-    }
-    const tdUser = document.createElement('td');
-    tdUser.textContent = u.username || '—';
-    const tdRole = document.createElement('td');
-    tdRole.textContent = u.role || 'member';
-    const tdCreated = document.createElement('td');
-    tdCreated.textContent = u.created_at
-      ? new Date(u.created_at * 1000).toLocaleDateString()
-      : '—';
-    const tdActions = document.createElement('td');
-    tr.appendChild(tdUser);
-    tr.appendChild(tdRole);
-    tr.appendChild(tdCreated);
-    tr.appendChild(tdActions);
-    tbody.appendChild(tr);
-    return tr;
-  }
-
-  async function teamsDeleteClick(e) {
-    const btn = e.target.closest('button[data-teams-del]');
-    if (!btn) return;
-    const username = btn.getAttribute('data-teams-del');
-    if (!username) return;
-    if (!confirm('Delete user "' + username + '"? They will lose access immediately.')) return;
-    btn.disabled = true;
-    try {
-      await api('DELETE', '/api/users/' + encodeURIComponent(username));
-      await loadUsers();
-    } catch (err) {
-      const errBox = $('#teams-users-error');
-      errBox.textContent = 'Delete failed: ' + ((err && err.message) || err);
-      errBox.hidden = false;
-      btn.disabled = false;
-    }
-  }
-
-  async function teamsCreateUser(e) {
-    e.preventDefault();
-    const errBox = $('#teams-add-error');
-    const flash = $('#teams-add-flash');
-    errBox.hidden = true;
-    flash.hidden = true;
-    const username = ($('#teams-add-email').value || '').trim();
-    const password = $('#teams-add-password').value || '';
-    const role = $('#teams-add-role').value || 'member';
-    if (!username || !password) {
-      errBox.textContent = 'Email/username and password are required.';
-      errBox.hidden = false;
-      return;
-    }
-    const btn = $('#teams-add-btn');
-    btn.disabled = true;
-    try {
-      const res = await api('POST', '/api/users', { username, password, role });
-      // Success contract per handleCreateUser: {ok:true, username, role}.
-      // Anything else (e.g. the list payload returned while the create
-      // route is unwired) is treated as a failure, not silently ignored.
-      if (!res || res.ok !== true) throw new Error('server did not confirm the create');
-      flash.textContent = 'Created ' + (res.username || username) + ' (' + (res.role || role) + ').';
-      flash.hidden = false;
-      $('#teams-add-form').reset();
-      await loadUsers();
-    } catch (err) {
-      errBox.textContent = 'Add failed: ' + ((err && err.message) || err);
-      errBox.hidden = false;
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
 
   // ==== FARM NODE CONFIG (FARM-NODE-CONFIG spec) ====
   // The manager owns worker settings: GET /api/farm/config + /api/farm/workers

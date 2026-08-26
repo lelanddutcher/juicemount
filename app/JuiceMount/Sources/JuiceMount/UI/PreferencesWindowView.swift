@@ -287,7 +287,7 @@ struct PreferencesWindowView: View {
                             .help(result.error ?? linkResultText(result))
                     }
                 }
-                footnote("Apply & Test confirms the pairing, refreshes authorization, and dials Redis through the encrypted NAS route. If the mount is running, a successful test applies Link with a soft restart.")
+                footnote("Apply & Test confirms the pairing, refreshes authorization, authenticates to Redis, and checks object storage through the encrypted NAS route. If the mount is running, a successful test applies Link with a soft restart.")
             } header: {
                 Text("Remote Access")
             } footer: {
@@ -301,10 +301,13 @@ struct PreferencesWindowView: View {
     private func linkResultText(_ result: NFSBridge.LinkTestResult) -> String {
         if result.ok {
             let latency = result.rttMS.map { " · \($0) ms" } ?? ""
-            return "Paired, online, backend reachable\(latency)"
+            return "Paired · Redis ready · object storage ready\(latency)"
         }
         if result.online {
-            return "Paired and online; backend route unavailable"
+            if result.redisReachable {
+                return "Paired; Redis ready, object storage unavailable"
+            }
+            return "Paired; Redis unavailable through Link"
         }
         return result.error ?? "Pairing failed"
     }
