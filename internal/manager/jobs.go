@@ -711,7 +711,7 @@ func (m *JobManager) Cancel(id string) bool {
 		}
 		j.State = JobCanceled
 		j.FinishedAt = time.Now().UnixMilli()
-		j.notifyListenersLocked(ProgressEvent{
+		j.Last = mergeProgress(j.Last, ProgressEvent{
 			Files:     j.Last.Files,
 			Bytes:     j.Last.Bytes,
 			Errors:    j.Last.Errors,
@@ -719,6 +719,7 @@ func (m *JobManager) Cancel(id string) bool {
 			ETASec:    -1,
 			UpdatedAt: j.FinishedAt,
 		})
+		j.notifyListenersLocked(j.Last)
 		j.closeListenersLocked()
 		return true
 	default:
@@ -737,19 +738,32 @@ func (m *JobManager) Subscribe(id string) (<-chan ProgressEvent, func(), bool) {
 	}
 	ch := make(chan ProgressEvent, 32)
 	j.mu.Lock()
-	j.listeners = append(j.listeners, ch)
 	last := j.Last
-	state := j.State
-	j.mu.Unlock()
-
-	// Emit the current snapshot immediately so the subscriber gets
-	// the latest state without waiting for the next tick.
-	if last.UpdatedAt > 0 {
-		ch <- last
+	terminal := j.State == JobDone || j.State == JobError || j.State == JobCanceled
+	// Every subscriber gets one immediate snapshot, even when the runner emitted
+	// no progress events (for example an empty migration that completed before
+	// the browser opened its SSE stream). Use the lifecycle timestamp so this is
+	// a real point-in-time state, not an all-zero placeholder.
+	if last.UpdatedAt == 0 {
+		last.UpdatedAt = j.CreatedAt
+		if j.StartedAt > last.UpdatedAt {
+			last.UpdatedAt = j.StartedAt
+		}
+		if j.FinishedAt > last.UpdatedAt {
+			last.UpdatedAt = j.FinishedAt
+		}
 	}
-	if state == JobDone || state == JobError || state == JobCanceled {
+	ch <- last
+	if terminal {
 		close(ch)
+	} else {
+		// Register while still holding j.mu. The runner uses the same lock to
+		// notify and close listeners, so it cannot close ch between this initial
+		// send and registration (the old unlock-then-send ordering could panic by
+		// sending on a concurrently closed channel).
+		j.listeners = append(j.listeners, ch)
 	}
+	j.mu.Unlock()
 
 	cleanup := func() {
 		j.mu.Lock()
@@ -852,6 +866,9 @@ func (m *JobManager) run(j *Job) {
 		j.Error = err.Error()
 	default:
 		j.State = JobDone
+	}
+	if j.Last.UpdatedAt < j.FinishedAt {
+		j.Last.UpdatedAt = j.FinishedAt
 	}
 	j.notifyListenersLocked(j.Last)
 	j.closeListenersLocked()

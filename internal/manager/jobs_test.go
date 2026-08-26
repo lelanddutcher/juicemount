@@ -103,6 +103,9 @@ func TestJobManagerCancel(t *testing.T) {
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if m.Get(j.ID).GetState() == JobCanceled {
+			if got := m.Get(j.ID).GetSnapshot().Last.UpdatedAt; got == 0 {
+				t.Fatal("canceled job did not retain its terminal progress timestamp")
+			}
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -173,6 +176,39 @@ func TestJobManagerSubscribe(t *testing.T) {
 			t.Errorf("subscribe channel did not close in 3s")
 			return
 		}
+	}
+}
+
+func TestJobManagerSubscribeAfterTerminalGetsSnapshot(t *testing.T) {
+	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
+	m.SetRunner(runnerSucceedImmediately)
+
+	j, _ := m.Submit("/tmp/src", "/jfs/dst", DefaultSyncOptions(), 0, "")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && m.Get(j.ID).GetState() != JobDone {
+		time.Sleep(time.Millisecond)
+	}
+	if got := m.Get(j.ID).GetState(); got != JobDone {
+		t.Fatalf("job did not reach Done before late subscribe: %s", got)
+	}
+
+	ch, cleanup, ok := m.Subscribe(j.ID)
+	if !ok {
+		t.Fatal("Subscribe returned ok=false")
+	}
+	defer cleanup()
+	ev, more := <-ch
+	if !more {
+		t.Fatal("terminal subscription closed before its snapshot")
+	}
+	if ev.UpdatedAt == 0 {
+		t.Fatal("terminal subscription snapshot has no timestamp")
+	}
+	if _, more := <-ch; more {
+		t.Fatal("terminal subscription stayed open after its snapshot")
+	}
+	if got := m.Get(j.ID).GetSnapshot().Last.UpdatedAt; got == 0 {
+		t.Fatal("completed job did not retain its terminal progress timestamp")
 	}
 }
 
