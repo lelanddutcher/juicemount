@@ -151,11 +151,50 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 
 // ProxyResult is the per-file outcome of a proxy-generation pass.
 type ProxyResult struct {
-	Path  string
-	Inode uint64
-	Hash  string
-	Wrote bool
-	Err   error
+	Path         string
+	Inode        uint64
+	Hash         string
+	Wrote        bool
+	SkippedFresh bool
+	Err          error
+}
+
+// proxyFresh reports whether the current proxy is already the exact class this
+// pass would produce. A generic source-hash gate is not enough here: a CPU
+// fallback may have left a perfectly current H.264 proxy that must be upgraded
+// when an HEVC worker returns. Conversely, a repeated HEVC watcher job must not
+// spend the accelerator re-encoding identical bytes.
+//
+// Fail closed. The source record, derivative vouch, codec label, and actual
+// regular blob must all agree. Missing/legacy fields regenerate once and become
+// eligible for future skips. RegenerateFresh is the explicit operator override.
+func proxyFresh(store *derivatives.Store, inode uint64, hash string, size int64, opt Options) bool {
+	if store == nil || opt.RegenerateFresh || opt.Mount == "" {
+		return false
+	}
+	known, sourceHash := store.Known(inode)
+	if !known || sourceHash == nil || *sourceHash != hash {
+		return false
+	}
+	rows, err := store.Manifest(inode)
+	if err != nil {
+		return false
+	}
+	desiredCodec, _ := proxyCodecStrings(opt.ProxyVCodec, nil)
+	for _, row := range rows {
+		if row.Kind != "proxy" || row.Status != "ready" ||
+			row.Hash == nil || *row.Hash != hash ||
+			row.SourceSize == nil || *row.SourceSize != size ||
+			row.Codec == nil || *row.Codec != desiredCodec ||
+			row.BlobRelPath == nil || *row.BlobRelPath != "proxy.mp4" {
+			continue
+		}
+		if _, err := derivatives.StatRegularUnder(opt.Mount,
+			derivatives.DerivBlobRel(inode, "proxy.mp4")); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // GenerateProxy renders the OL-3 proxy for one file and commits a single `proxy`
@@ -184,6 +223,14 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		return res
 	}
 	res.Hash = hash
+
+	if proxyFresh(store, inode, hash, fi.Size(), opt) {
+		res.SkippedFresh = true
+		// A valid row+blob can predate or outlive its transport sidecar. Keep the
+		// skip cheap while repairing that index boundary best-effort.
+		_ = WriteManifestSidecar(store, opt.Mount, inode)
+		return res
+	}
 
 	tech, err := Probe(opt.FFprobeBin, path, fi.Size())
 	if err != nil {

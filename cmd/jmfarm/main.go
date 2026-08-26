@@ -78,7 +78,7 @@ type passOpts struct {
 // proxy and transcript modes all funnel through the same internal/farm calls.
 func runPasses(po passOpts, targets []string) (processed, failed int) {
 	start := time.Now()
-	var ok, fail, thumbs, strips, waves, speech, proxies, qls int64
+	var ok, fail, thumbs, strips, waves, speech, proxies, proxySkipped, qls int64
 	// skippedFresh counts assets whose derivatives already matched byte-identical
 	// source — a moved or re-enqueued file that cost no re-encode.
 	var skippedFresh, sidecarsRepaired int64
@@ -185,8 +185,12 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 				if pr.Wrote {
 					atomic.AddInt64(&proxies, 1)
 				}
+				if pr.SkippedFresh {
+					atomic.AddInt64(&proxySkipped, 1)
+				}
 				if po.verbose {
-					fmt.Printf("  [ok] %-50s inode=%d proxy=%v\n", filepath.Base(p), pr.Inode, pr.Wrote)
+					fmt.Printf("  [ok] %-50s inode=%d proxy=%v skipped=%v\n",
+						filepath.Base(p), pr.Inode, pr.Wrote, pr.SkippedFresh)
 				}
 				return
 			}
@@ -270,8 +274,8 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d ql-previews — %d total\n",
 			time.Since(start).Round(time.Millisecond), ok, fail, qls, len(targets))
 	} else if po.proxyGen {
-		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d proxies — %d total\n",
-			time.Since(start).Round(time.Millisecond), ok, fail, proxies, len(targets))
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d proxies, %d skipped-current — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, fail, proxies, proxySkipped, len(targets))
 	} else {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d thumbnails, %d filmstrips, %d waveforms, "+
 			"%d skipped-unchanged (%d manifests repaired) — %d total\n",
