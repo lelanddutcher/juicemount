@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tsnet"
 )
@@ -91,13 +92,26 @@ func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, [
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	st, err := s.Up(ctx)
+	// Do not use tsnet.Server.Up here. Up waits exclusively on an IPN-bus
+	// state-transition notification. In a c-archive host (the signed Mac app),
+	// a fast persisted-identity reconnect can reach Running between Start and
+	// watcher attachment; the notification is then missed and Up blocks until
+	// its context expires even though LocalAPI already reports an online node
+	// with assigned addresses. Polling the stable LocalAPI status is bounded,
+	// observes the current state rather than only future transitions, and gives
+	// us an actionable final state/health error on genuine failures.
+	lc, err := s.LocalClient()
 	if err != nil {
 		s.Close()
-		return nil, nil, fmt.Errorf("link: up: %w", err)
+		return nil, nil, fmt.Errorf("link: local client: %w", err)
 	}
-	addrs := make([]string, 0, len(st.Self.TailscaleIPs))
-	for _, a := range st.Self.TailscaleIPs {
+	st, err := waitForLinkRunning(ctx, lc.StatusWithoutPeers, 200*time.Millisecond)
+	if err != nil {
+		s.Close()
+		return nil, nil, err
+	}
+	addrs := make([]string, 0, len(st.TailscaleIPs))
+	for _, a := range st.TailscaleIPs {
 		addrs = append(addrs, a.String())
 	}
 	node := &LinkNode{srv: s, addrs: append([]string(nil), addrs...)}
@@ -110,6 +124,44 @@ func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, [
 		return nil, nil, err
 	}
 	return node, addrs, nil
+}
+
+type linkStatusFunc func(context.Context) (*ipnstate.Status, error)
+
+func waitForLinkRunning(ctx context.Context, status linkStatusFunc, pollEvery time.Duration) (*ipnstate.Status, error) {
+	if pollEvery <= 0 {
+		pollEvery = 200 * time.Millisecond
+	}
+	var (
+		lastState  = "unknown"
+		lastHealth []string
+		lastErr    error
+	)
+	for {
+		st, err := status(ctx)
+		if err != nil {
+			lastErr = err
+		} else if st != nil {
+			lastState = st.BackendState
+			lastHealth = append(lastHealth[:0], st.Health...)
+			if st.BackendState == ipn.Running.String() && len(st.TailscaleIPs) > 0 {
+				return st, nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			detail := ""
+			if len(lastHealth) > 0 {
+				detail = "; health: " + strings.Join(lastHealth, "; ")
+			}
+			if lastErr != nil {
+				detail += "; last status error: " + lastErr.Error()
+			}
+			return nil, fmt.Errorf("link: backend did not become ready (last state %q%s): %w", lastState, detail, ctx.Err())
+		case <-time.After(pollEvery):
+		}
+	}
 }
 
 func (l *LinkNode) setHostname(hostname string) error {
