@@ -287,7 +287,7 @@ struct PreferencesWindowView: View {
                             .help(result.error ?? linkResultText(result))
                     }
                 }
-                footnote("Apply & Test confirms the pairing, refreshes authorization, authenticates to Redis, and checks object storage through the encrypted NAS route. If the mount is running, a successful test applies Link with a soft restart.")
+                footnote("Apply & Test confirms pairing, refreshes authorization, checks object storage, and transfers a verified payload through the encrypted NAS route. If the mount is running, a successful test applies Link with a soft restart.")
             } header: {
                 Text("Remote Access")
             } footer: {
@@ -301,9 +301,20 @@ struct PreferencesWindowView: View {
     private func linkResultText(_ result: NFSBridge.LinkTestResult) -> String {
         if result.ok {
             let latency = result.rttMS.map { " · \($0) ms" } ?? ""
-            return "Paired · Redis ready · object storage ready\(latency)"
+            let transport = result.transportMode.map { " · \($0 == "direct" ? "direct" : $0)" } ?? ""
+            let throughput: String
+            if let up = result.uploadMbps, let down = result.downloadMbps {
+                throughput = String(format: " · %.0f/%.0f Mb/s", up, down)
+            } else {
+                throughput = ""
+            }
+            return "Paired · data plane verified\(transport)\(throughput)\(latency)"
         }
         if result.online {
+            if result.redisReachable && result.objectStoreReachable {
+                let transport = result.transportMode.map { " (\($0))" } ?? ""
+                return "Paired; endpoints ready, data-plane test failed\(transport)"
+            }
             if result.redisReachable {
                 return "Paired; Redis ready, object storage unavailable"
             }

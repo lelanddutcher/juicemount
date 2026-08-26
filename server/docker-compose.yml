@@ -209,6 +209,7 @@ services:
       JM_NET_ALLOW_INSECURE: "0"         # test LAN only: set 1 to permit an explicit http:// URL
       JM_NET_NAS_NODE: "off"            # set on with Headscale to advertise JM_NET_NAS_ROUTE
       JM_NET_NAS_ROUTE: "192.168.0.0/24" # EDIT if your NAS LAN uses another subnet
+      JM_NET_NAS_UDP_PORT: "41641"       # fixed tsnet peer port; must match the UDP publish below
       # EMBEDDED MODE ONLY (command: ["--fuse-mount=/jfs"] + JM_META unset):
       # uncomment so Overview, Trash retention, and GC/FSCK read the volume.
       # Standalone mode (the default above, with JM_META set) leaves it empty.
@@ -216,6 +217,7 @@ services:
     ports:
       - "30190:8080"                              # manager UI
       - "30193:8091"                              # JuiceMount Link coordination (headscale)                 # web UI
+      - "41641:41641/udp"                         # direct Link data plane (avoids DERP-only bulk transfers)
     volumes:
       # Mount your existing-data datasets here, read-only. Each gets
       # browsed as /sources/<name> in the UI. Add as many lines as you

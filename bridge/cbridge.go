@@ -315,6 +315,9 @@ type linkTestResult struct {
 	Hostname             string   `json:"hostname,omitempty"`
 	Addresses            []string `json:"addresses"`
 	RTTMS                int64    `json:"rtt_ms,omitempty"`
+	TransportMode        string   `json:"transport_mode,omitempty"`
+	UploadMbps           float64  `json:"upload_mbps,omitempty"`
+	DownloadMbps         float64  `json:"download_mbps,omitempty"`
 	Error                string   `json:"error,omitempty"`
 }
 
@@ -407,6 +410,13 @@ func linkBackendReachableRTT(node *jmnfs.LinkNode, redisURL string, timeout time
 		return false, 0
 	}
 	netprofile.Default().ObserveRTT(rtt)
+	statusCtx, statusCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if transport, statusErr := node.TransportStatus(statusCtx); statusErr == nil {
+		jmlog.Info("JuiceMount Link: active NAS transport",
+			"mode", transport.Mode, "peer", transport.Peer,
+			"endpoint", transport.Endpoint, "relay", transport.Relay)
+	}
+	statusCancel()
 	return true, rtt
 }
 
@@ -442,6 +452,80 @@ func linkRedisPingRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Durati
 		return 0, err
 	}
 	return time.Since(started), nil
+}
+
+const linkDataPlaneBenchmarkBytes = 4 << 20
+
+// linkRedisDataPlaneBenchmark proves that the encrypted subnet route carries
+// a multi-megabyte payload in both directions. Tiny PING and MinIO liveness
+// checks passed on the live RC while a DERP-only path took ~30 seconds per S3
+// chunk and repeatedly killed JuiceFS. A short-lived Redis value exercises the
+// same routed peer without touching volume metadata or requiring S3 secrets.
+func linkRedisDataPlaneBenchmark(node *jmnfs.LinkNode, redisURL string, size int, timeout time.Duration) (uploadMbps, downloadMbps float64, err error) {
+	if node == nil {
+		return 0, 0, fmt.Errorf("link node is nil")
+	}
+	return linkRedisDataPlaneBenchmarkWithDial(redisURL, size, timeout, node.DialContext)
+}
+
+func linkRedisDataPlaneBenchmarkWithDial(redisURL string, size int, timeout time.Duration, dial func(context.Context, string, string) (net.Conn, error)) (uploadMbps, downloadMbps float64, err error) {
+	if size <= 0 {
+		return 0, 0, fmt.Errorf("benchmark size must be positive")
+	}
+	if dial == nil {
+		return 0, 0, fmt.Errorf("benchmark dialer is nil")
+	}
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse Redis endpoint: %w", err)
+	}
+	opts.DialTimeout = timeout
+	opts.ReadTimeout = timeout
+	opts.WriteTimeout = timeout
+	opts.PoolSize = 1
+	opts.Dialer = dial
+	client := redis.NewClient(opts)
+	defer client.Close()
+
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i*31 + 17)
+	}
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return 0, 0, fmt.Errorf("benchmark key: %w", err)
+	}
+	key := fmt.Sprintf("jm:link-bench:%x", nonce[:])
+	cleanup := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = client.Del(ctx, key).Err()
+	}
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	started := time.Now()
+	if err := client.Set(ctx, key, payload, time.Minute).Err(); err != nil {
+		cancel()
+		return 0, 0, fmt.Errorf("upload: %w", err)
+	}
+	uploadElapsed := time.Since(started)
+	cancel()
+
+	ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	started = time.Now()
+	got, err := client.Get(ctx, key).Bytes()
+	downloadElapsed := time.Since(started)
+	cancel()
+	if err != nil {
+		return 0, 0, fmt.Errorf("download: %w", err)
+	}
+	if !bytes.Equal(got, payload) {
+		return 0, 0, fmt.Errorf("download verification failed (got %d bytes, want %d)", len(got), len(payload))
+	}
+	bits := float64(size * 8)
+	return bits / uploadElapsed.Seconds() / 1_000_000,
+		bits / downloadElapsed.Seconds() / 1_000_000, nil
 }
 
 func takeGlobalLinkNode() *jmnfs.LinkNode {
@@ -530,6 +614,19 @@ func NFSServerLinkTest(configJSON *C.char) *C.char {
 		return encode()
 	}
 	result.ObjectStoreReachable = true
+	statusCtx, statusCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if transport, statusErr := node.TransportStatus(statusCtx); statusErr == nil {
+		result.TransportMode = transport.Mode
+	}
+	statusCancel()
+	uploadMbps, downloadMbps, err := linkRedisDataPlaneBenchmark(node, cfg.RedisURL, linkDataPlaneBenchmarkBytes, 15*time.Second)
+	if err != nil {
+		result.RTTMS = rtt.Milliseconds()
+		result.Error = "paired and endpoints are reachable, but the encrypted data-plane benchmark failed: " + err.Error()
+		return encode()
+	}
+	result.UploadMbps = uploadMbps
+	result.DownloadMbps = downloadMbps
 	result.BackendReachable = true
 	if objectRTT > rtt {
 		rtt = objectRTT

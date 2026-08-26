@@ -130,6 +130,9 @@ public enum NFSBridge {
         public var hostname: String?
         public var addresses: [String]
         public var rttMS: Int64?
+        public var transportMode: String?
+        public var uploadMbps: Double?
+        public var downloadMbps: Double?
         public var error: String?
 
         enum CodingKeys: String, CodingKey {
@@ -138,6 +141,9 @@ public enum NFSBridge {
             case redisReachable = "redis_reachable"
             case objectStoreReachable = "object_store_reachable"
             case rttMS = "rtt_ms"
+            case transportMode = "transport_mode"
+            case uploadMbps = "upload_mbps"
+            case downloadMbps = "download_mbps"
         }
 
         public init(
@@ -150,6 +156,9 @@ public enum NFSBridge {
             hostname: String?,
             addresses: [String],
             rttMS: Int64?,
+            transportMode: String? = nil,
+            uploadMbps: Double? = nil,
+            downloadMbps: Double? = nil,
             error: String?
         ) {
             self.ok = ok
@@ -161,6 +170,9 @@ public enum NFSBridge {
             self.hostname = hostname
             self.addresses = addresses
             self.rttMS = rttMS
+            self.transportMode = transportMode
+            self.uploadMbps = uploadMbps
+            self.downloadMbps = downloadMbps
             self.error = error
         }
 
@@ -179,6 +191,9 @@ public enum NFSBridge {
             hostname = try values.decodeIfPresent(String.self, forKey: .hostname)
             addresses = try values.decodeIfPresent([String].self, forKey: .addresses) ?? []
             rttMS = try values.decodeIfPresent(Int64.self, forKey: .rttMS)
+            transportMode = try values.decodeIfPresent(String.self, forKey: .transportMode)
+            uploadMbps = try values.decodeIfPresent(Double.self, forKey: .uploadMbps)
+            downloadMbps = try values.decodeIfPresent(Double.self, forKey: .downloadMbps)
             error = try values.decodeIfPresent(String.self, forKey: .error)
         }
     }

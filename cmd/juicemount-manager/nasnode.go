@@ -27,6 +27,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,8 +37,9 @@ import (
 )
 
 const (
-	nasNodeDir = "/data/headscale/nas-node"
-	nasUser    = "jm"
+	nasNodeDir        = "/data/headscale/nas-node"
+	nasUser           = "jm"
+	defaultNASUDPPort = 41641
 )
 
 func nasNodeEnabled() bool { return os.Getenv("JM_NET_NAS_NODE") == "on" }
@@ -47,6 +49,20 @@ func nasRoutePrefix() string { return envOr("JM_NET_NAS_ROUTE", manager.NasLanSu
 
 // nasNodeHostname is this node's name in the tailnet directory.
 func nasNodeHostname() string { return envOr("JM_NET_NAS_HOSTNAME", manager.DefaultNasHostname) }
+
+// nasNodeUDPPort fixes the NAS router's WireGuard listener to the UDP port
+// published by the container. Leaving tsnet on a random container-only port
+// can strand peers on DERP: health checks stay quick, but multi-megabyte S3
+// PUTs crawl until JuiceFS's request deadline aborts the mount. Operators may
+// override the default when another tailnet service already owns 41641.
+func nasNodeUDPPort() (uint16, error) {
+	raw := strings.TrimSpace(envOr("JM_NET_NAS_UDP_PORT", strconv.Itoa(defaultNASUDPPort)))
+	n, err := strconv.ParseUint(raw, 10, 16)
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("JM_NET_NAS_UDP_PORT must be an integer from 1 to 65535")
+	}
+	return uint16(n), nil
+}
 
 // nasNodeControlURL picks where the embedded node dials coordination:
 // the externally-visible server_url when set (required once TLS is on, so
@@ -110,6 +126,10 @@ func (n *nasNodeSupervisor) Start(cfgPath string) error {
 	if err != nil {
 		return err
 	}
+	udpPort, err := nasNodeUDPPort()
+	if err != nil {
+		return err
+	}
 	key, err := mintNasPreauthKey(cfgPath)
 	if err != nil {
 		return err
@@ -120,6 +140,7 @@ func (n *nasNodeSupervisor) Start(cfgPath string) error {
 		AuthKey:    key,
 		Dir:        nasNodeDir,
 		Ephemeral:  false, // persistent node: stable tailnet IP across restarts
+		Port:       udpPort,
 		Logf:       func(string, ...any) {},
 	}
 	if err := s.Start(); err != nil {
@@ -150,7 +171,7 @@ func (n *nasNodeSupervisor) Start(cfgPath string) error {
 	}
 	n.srv = s
 	go n.approveLoop(prefix.String())
-	log.Printf("JuiceMount Link: nas node %q up, advertising %s", s.Hostname, prefix)
+	log.Printf("JuiceMount Link: nas node %q up, advertising %s on UDP %d", s.Hostname, prefix, udpPort)
 	return nil
 }
 
