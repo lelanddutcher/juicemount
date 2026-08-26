@@ -17,9 +17,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"tailscale.com/ipn"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tsnet"
 )
 
@@ -103,7 +104,10 @@ func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, [
 		s.Close()
 		return nil, nil, err
 	}
-	node.acceptRoutes()
+	if err := node.acceptRoutes(); err != nil {
+		s.Close()
+		return nil, nil, err
+	}
 	return node, addrs, nil
 }
 
@@ -147,7 +151,64 @@ func (l *LinkNode) DialContext(ctx context.Context, network, address string) (ne
 	if s == nil {
 		return nil, fmt.Errorf("link: node is stopped")
 	}
-	return s.Dial(ctx, network, address)
+	// UserDial deliberately falls back to the ordinary system network when
+	// no tailnet route matches. That is useful for a general SOCKS proxy but
+	// violates JuiceMount Link's contract: backend traffic must never escape
+	// the encrypted route merely because a subnet router is still converging
+	// or has gone offline. Wait for an explicitly Tailscale-routed plan and
+	// dial the resolved address from that plan.
+	dialer := s.Sys().Dialer.Get()
+	planned, err := waitForTailscaleDialPlan(ctx, network, address,
+		func(ctx context.Context, network, address string) (netip.AddrPort, bool, error) {
+			return dialer.UserDialPlan(ctx, network, address)
+		})
+	if err != nil {
+		return nil, err
+	}
+	conn, err := s.Dial(ctx, network, planned.String())
+	if err != nil {
+		return nil, err
+	}
+	if !linkConnUsesTailnet(conn) {
+		_ = conn.Close()
+		return nil, fmt.Errorf("link: refused non-tailnet connection to %s", address)
+	}
+	return conn, nil
+}
+
+type tailscaleDialPlanner func(context.Context, string, string) (netip.AddrPort, bool, error)
+
+func waitForTailscaleDialPlan(ctx context.Context, network, address string, plan tailscaleDialPlanner) (netip.AddrPort, error) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var last netip.AddrPort
+	for {
+		planned, viaTailscale, err := plan(ctx, network, address)
+		if err != nil {
+			return netip.AddrPort{}, fmt.Errorf("link: route plan for %s: %w", address, err)
+		}
+		last = planned
+		if viaTailscale {
+			return planned, nil
+		}
+		select {
+		case <-ctx.Done():
+			return netip.AddrPort{}, fmt.Errorf("link: no encrypted route to %s (last plan %s): %w", address, last, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func linkConnUsesTailnet(conn net.Conn) bool {
+	if conn == nil || conn.LocalAddr() == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(conn.LocalAddr().String())
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	return err == nil && tsaddr.IsTailscaleIP(ip)
 }
 
 // ProxyEndpoint returns an equivalent URL whose host is a loopback listener.
@@ -167,7 +228,7 @@ func (l *LinkNode) ProxyEndpoint(raw, defaultPort string) (string, error) {
 		return raw, fmt.Errorf("link: node is stopped")
 	}
 
-	p, err := newTCPProxyWithIdleTimeout(target, s.Dial, proxyIdleTimeout(raw))
+	p, err := newTCPProxyWithIdleTimeout(target, l.DialContext, proxyIdleTimeout(raw))
 	if err != nil {
 		return raw, err
 	}
@@ -199,7 +260,7 @@ func (l *LinkNode) ProbeEndpoint(raw, defaultPort string, timeout time.Duration)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	started := time.Now()
-	conn, err := s.Dial(ctx, "tcp", target)
+	conn, err := l.DialContext(ctx, "tcp", target)
 	if err != nil {
 		return 0, err
 	}
@@ -499,13 +560,12 @@ func (p *tcpProxy) Close() error {
 // peers (the NAS LAN prefix). tsnet runs in userspace networking mode — there
 // is no utun interface and no OS route table to populate — so acceptance is a
 // backend-prefs operation and routed destinations are only reachable from
-// dials made through this node's netstack. Best effort: a failure degrades to
-// LAN-only behavior, never blocks the join.
-func (l *LinkNode) acceptRoutes() {
+// dials made through this node's netstack. A failure is fatal: silently
+// degrading to the ordinary LAN would defeat Link's data-plane guarantee.
+func (l *LinkNode) acceptRoutes() error {
 	lc, err := l.srv.LocalClient()
 	if err != nil {
-		log.Printf("[link] accept-routes unavailable: %v", err)
-		return
+		return fmt.Errorf("link: accept-routes unavailable: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -513,8 +573,9 @@ func (l *LinkNode) acceptRoutes() {
 		Prefs:       ipn.Prefs{RouteAll: true},
 		RouteAllSet: true,
 	}); err != nil {
-		log.Printf("[link] accept-routes failed (LAN-only mode): %v", err)
+		return fmt.Errorf("link: accept-routes: %w", err)
 	}
+	return nil
 }
 
 // LinkEndpointOverride is retained for callers that need a pure URL rewrite.
