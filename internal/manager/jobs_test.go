@@ -269,6 +269,26 @@ func TestSetStateFileIdempotent(t *testing.T) {
 	}
 
 	m := NewJobManager("/dev/null", RunSyncSpec{Mode: ModeEmbedded, FUSEMount: "/mnt/juicefs"})
+	// Submit below starts a runner goroutine that persists its terminal state.
+	// Drain it before TempDir's cleanup removes the state directory; otherwise
+	// the final atomic .tmp write can race RemoveAll and make the suite flaky.
+	t.Cleanup(func() {
+		m.StopAll()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			m.mu.RLock()
+			idle := m.active == nil
+			m.mu.RUnlock()
+			if idle {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Error("job manager did not become idle before TempDir cleanup")
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
 	m.SetStateFile(path)
 	if got := m.Get("j1"); got == nil {
 		t.Fatalf("first SetStateFile didn't load seed job")

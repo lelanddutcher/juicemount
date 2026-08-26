@@ -1179,34 +1179,12 @@ func (fm *FUSEManager) IsMounted() bool {
 	return fm.isMountedLocked()
 }
 
-// controlFileResponsiveWithin probes JuiceFS's in-memory .config control file.
-// Any returned result, including a prompt error, proves that the FUSE session
-// and daemon answered. Only a timeout means the session is unresponsive.
-//
-// This is deliberately separate from the root readdir used by mount startup:
-// a root readdir is a useful readiness gate while JuiceFS is coming up, but in
-// steady state it walks through JuiceFS metadata and turns a 10-second health
-// ticker into permanent Redis traffic. The control file is local to JuiceFS
-// and therefore safe to probe on a metered/high-latency link.
-func controlFileResponsiveWithin(path string, timeout time.Duration, readFile func(string) ([]byte, error)) bool {
-	done := make(chan struct{}, 1)
-	go func() {
-		_, _ = readFile(filepath.Join(path, ".config"))
-		done <- struct{}{}
-	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return true
-	case <-timer.C:
-		return false
-	}
-}
-
 // isMountedSteadyLocked is the backend-free steady-state health probe. It keeps
-// the mount-table ownership check but replaces the backend-visible root
-// readdir in isMountedLocked with JuiceFS's local control-file response.
+// the mount-table ownership check but replaces every FUSE-path access with an
+// exact service-process liveness check. Even JuiceFS's .config control file can
+// incur an uncached metadata lookup, so periodic health must not open it.
+// Redis/MinIO have independent health checks, and actual user I/O feeds the NFS
+// stall detector; this probe only establishes local mount/service ownership.
 // Must be called with fm.mu held.
 func (fm *FUSEManager) isMountedSteadyLocked() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1215,7 +1193,7 @@ func (fm *FUSEManager) isMountedSteadyLocked() bool {
 	if err != nil || !strings.Contains(string(out), fm.cfg.MountPoint) {
 		return false
 	}
-	return controlFileResponsiveWithin(fm.cfg.MountPoint, 5*time.Second, os.ReadFile)
+	return isJuiceFSProcessAliveFn(fm.cfg.MountPoint)
 }
 
 // isMountedLocked checks if the FUSE mount is live. Must be called with fm.mu held.

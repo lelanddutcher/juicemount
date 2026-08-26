@@ -87,6 +87,7 @@ func TestMinIOHealthCheck(t *testing.T) {
 }
 
 func TestFUSEMountCheck(t *testing.T) {
+	pretendJuiceFSServiceIsAlive(t)
 	fp := fusePath(t)
 
 	cfg := Config{
@@ -184,6 +185,7 @@ func TestFUSEDebounceAlternatingNeverDegrades(t *testing.T) {
 
 func TestStatusReturnsCorrectState(t *testing.T) {
 	requireLocalBackends(t)
+	pretendJuiceFSServiceIsAlive(t)
 	cfg := Config{
 		RedisURL: "127.0.0.1:6379",
 		MinIOURL: "http://127.0.0.1:9000",
@@ -223,4 +225,11 @@ func TestStatusReturnsCorrectState(t *testing.T) {
 func fusePath(t *testing.T) string {
 	t.Helper()
 	return "/"
+}
+
+func pretendJuiceFSServiceIsAlive(t *testing.T) {
+	t.Helper()
+	previous := isJuiceFSProcessAliveFn
+	isJuiceFSProcessAliveFn = func(string) bool { return true }
+	t.Cleanup(func() { isJuiceFSProcessAliveFn = previous })
 }

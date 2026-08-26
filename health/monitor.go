@@ -876,17 +876,16 @@ func (m *HealthMonitor) checkFUSE() ComponentStatus {
 		return ComponentStatus{Healthy: false, LastCheck: now, Message: "not mounted (directory exists but no FUSE)"}
 	}
 
-	// Check 2: the FUSE session answers through JuiceFS's in-memory control
-	// file. Do not stat or readdir the root here: those are metadata operations
-	// against Redis and this function runs every 10 seconds forever. Redis and
-	// object-store reachability are checked independently, so a local liveness
-	// probe is both truthful and free of background WAN traffic.
-	if controlFileResponsiveWithin(m.cfg.FUSEPath, 5*time.Second, os.ReadFile) {
-		return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
+	// Check 2: the exact JuiceFS service process is alive. Do not stat, read,
+	// or readdir any FUSE path here: even .config incurs an uncached Redis lookup
+	// on the shipping JuiceFS build, and this function runs every 10 seconds
+	// forever. Redis and object-store reachability are checked independently;
+	// actual user I/O feeds the NFS stall detector.
+	if !isJuiceFSProcessAliveFn(m.cfg.FUSEPath) {
+		jmlog.Warn("fuse mount present but JuiceFS service is not running", "path", m.cfg.FUSEPath)
+		return ComponentStatus{Healthy: false, LastCheck: now, Message: "JuiceFS service not running"}
 	}
-	jmlog.Warn("fuse control probe timed out (session likely wedged)", "path", m.cfg.FUSEPath)
-	go m.logWedgeDiagnostics("control_timeout")
-	return ComponentStatus{Healthy: false, LastCheck: now, Message: "control probe timed out (wedged FUSE mount)"}
+	return ComponentStatus{Healthy: true, LastCheck: now, Message: "ok"}
 }
 
 // logWedgeDiagnostics captures backend RTT + process liveness at the instant a
