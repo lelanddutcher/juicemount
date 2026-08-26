@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -178,10 +180,15 @@ func TestReadCachedBlock(t *testing.T) {
 	// This avoids the expensive reverse-map scan.
 	var foundInode uint64
 	var foundChunkIdx int64
+	var cursor uint64
+	if inode, chunkIdx, ok := warmCacheFixture(t, rdb, r); ok {
+		foundInode = inode
+		foundChunkIdx = chunkIdx
+		goto found
+	}
 
 	// Scan a small batch of chunk keys and check if their slices are in cache.
 	// Limit iterations to avoid excessive round-trips on slow networks.
-	var cursor uint64
 	for attempt := 0; attempt < 5; attempt++ {
 		keys, next, err := rdb.Scan(ctx, cursor, "c*", 100).Result()
 		if err != nil {
@@ -219,6 +226,9 @@ func TestReadCachedBlock(t *testing.T) {
 			break
 		}
 	}
+	if os.Getenv("JM_TEST_FUSE_PATH") != "" {
+		t.Fatal("isolated JuiceFS cache fixture did not produce a Redis-matched cached block")
+	}
 	t.Skip("No cached blocks found that match Redis chunk keys")
 
 found:
@@ -250,6 +260,92 @@ found:
 		t.Fatal("all bytes are zero — likely read wrong data")
 	}
 	t.Logf("Data verification: %d/%d non-zero bytes", nonZero, n)
+}
+
+// warmCacheFixture makes the live-cache integration deterministic when the
+// caller supplied an isolated JuiceFS mount. Depending on arbitrary ambient
+// cache contents made the RC gate skip after normal cache eviction or mount
+// restarts. A write + read through the mount gives Redis metadata and the
+// JuiceFS block cache a matching, real slice to verify.
+func warmCacheFixture(t *testing.T, rdb *redis.Client, r *Reader) (uint64, int64, bool) {
+	t.Helper()
+	mountPath := os.Getenv("JM_TEST_FUSE_PATH")
+	if mountPath == "" {
+		return 0, 0, false
+	}
+
+	fixturePath := filepath.Join(mountPath, fmt.Sprintf(".jm-cache-integration-%d.bin", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(fixturePath) })
+	data := make([]byte, DefaultBlockSize+4096)
+	for i := range data {
+		data[i] = byte((i % 251) + 1)
+	}
+	f, err := os.OpenFile(fixturePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Logf("cache fixture create failed, falling back to ambient cache scan: %v", err)
+		return 0, 0, false
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		t.Logf("cache fixture write failed, falling back to ambient cache scan: %v", err)
+		return 0, 0, false
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		t.Logf("cache fixture sync failed, falling back to ambient cache scan: %v", err)
+		return 0, 0, false
+	}
+	if err := f.Close(); err != nil {
+		t.Logf("cache fixture close failed, falling back to ambient cache scan: %v", err)
+		return 0, 0, false
+	}
+	if _, err := os.ReadFile(fixturePath); err != nil {
+		t.Logf("cache fixture warm read failed, falling back to ambient cache scan: %v", err)
+		return 0, 0, false
+	}
+	if juicefsBin, err := exec.LookPath("juicefs"); err == nil {
+		warmCtx, warmCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		warmErr := exec.CommandContext(warmCtx, juicefsBin, "warmup", fixturePath).Run()
+		warmCancel()
+		if warmErr != nil {
+			t.Logf("juicefs warmup failed, checking the read-populated cache: %v", warmErr)
+		}
+	} else {
+		t.Log("juicefs warmup binary unavailable, checking the read-populated cache")
+	}
+	info, err := os.Stat(fixturePath)
+	if err != nil {
+		t.Logf("cache fixture stat failed, falling back to ambient cache scan: %v", err)
+		return 0, 0, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Ino == 0 {
+		t.Log("cache fixture inode unavailable, falling back to ambient cache scan")
+		return 0, 0, false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	key := fmt.Sprintf("c%d_0", stat.Ino)
+	for ctx.Err() == nil {
+		items, err := rdb.LRange(ctx, key, 0, -1).Result()
+		if err == nil {
+			for _, item := range items {
+				encoded := []byte(item)
+				if len(encoded) < 24 {
+					continue
+				}
+				sliceID := binary.BigEndian.Uint64(encoded[4:12])
+				if _, err := os.Stat(r.blockPath(sliceID, 0)); err == nil {
+					t.Logf("Warmed deterministic cached slice: inode=%d chunkIdx=0 sliceID=%d", stat.Ino, sliceID)
+					return stat.Ino, 0, true
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Logf("cache fixture did not materialize before timeout, falling back to ambient cache scan")
+	return 0, 0, false
 }
 
 func TestReadCacheMiss(t *testing.T) {

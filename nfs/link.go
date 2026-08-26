@@ -49,6 +49,11 @@ type tcpProxy struct {
 	listener net.Listener
 	target   string
 	dial     contextDialer
+	// idleTimeout is used for request/response transports such as object
+	// storage. A dead tailnet flow must close before JuiceFS exhausts its own
+	// 30-second S3 attempt and aborts the mount. Zero preserves long-lived idle
+	// connections such as Redis subscriptions.
+	idleTimeout time.Duration
 
 	mu     sync.Mutex
 	closed bool
@@ -161,7 +166,7 @@ func (l *LinkNode) ProxyEndpoint(raw, defaultPort string) (string, error) {
 		return raw, fmt.Errorf("link: node is stopped")
 	}
 
-	p, err := newTCPProxy(target, s.Dial)
+	p, err := newTCPProxyWithIdleTimeout(target, s.Dial, proxyIdleTimeout(raw))
 	if err != nil {
 		return raw, err
 	}
@@ -297,6 +302,25 @@ func proxyEndpointTarget(raw, defaultPort string) (string, func(string) string, 
 }
 
 func newTCPProxy(target string, dial contextDialer) (*tcpProxy, error) {
+	return newTCPProxyWithIdleTimeout(target, dial, 0)
+}
+
+const objectProxyIdleTimeout = 10 * time.Second
+
+func proxyIdleTimeout(raw string) time.Duration {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		return objectProxyIdleTimeout
+	default:
+		return 0
+	}
+}
+
+func newTCPProxyWithIdleTimeout(target string, dial contextDialer, idleTimeout time.Duration) (*tcpProxy, error) {
 	if dial == nil {
 		return nil, fmt.Errorf("link: proxy dialer is nil")
 	}
@@ -305,10 +329,11 @@ func newTCPProxy(target string, dial contextDialer) (*tcpProxy, error) {
 		return nil, fmt.Errorf("link: listen loopback proxy: %w", err)
 	}
 	p := &tcpProxy{
-		listener: listener,
-		target:   target,
-		dial:     dial,
-		conns:    make(map[net.Conn]struct{}),
+		listener:    listener,
+		target:      target,
+		dial:        dial,
+		idleTimeout: idleTimeout,
+		conns:       make(map[net.Conn]struct{}),
 	}
 	go p.serve()
 	return p, nil
@@ -342,13 +367,48 @@ func (p *tcpProxy) forward(local net.Conn) {
 	}
 	defer p.untrackAndClose(remote)
 
+	remoteReader := io.Reader(remote)
+	remoteWriter := io.Writer(remote)
+	localWriter := io.Writer(local)
+	if p.idleTimeout > 0 {
+		// Deadline each individual blocking operation, refreshing on progress.
+		// A single absolute deadline would kill a healthy large transfer; these
+		// wrappers only close a flow that makes no progress for the full window.
+		remoteReader = &readDeadlineConn{Conn: remote, timeout: p.idleTimeout}
+		remoteWriter = &writeDeadlineConn{Conn: remote, timeout: p.idleTimeout}
+		localWriter = &writeDeadlineConn{Conn: local, timeout: p.idleTimeout}
+	}
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(remote, local); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(local, remote); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(remoteWriter, local); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(localWriter, remoteReader); done <- struct{}{} }()
 	<-done
 	_ = local.Close()
 	_ = remote.Close()
 	<-done
+}
+
+type readDeadlineConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *readDeadlineConn) Read(p []byte) (int, error) {
+	if err := c.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(p)
+}
+
+type writeDeadlineConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *writeDeadlineConn) Write(p []byte) (int, error) {
+	if err := c.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(p)
 }
 
 func (p *tcpProxy) track(conn net.Conn) bool {

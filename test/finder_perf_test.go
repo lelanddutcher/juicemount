@@ -63,18 +63,41 @@ func requireFUSEMount(t *testing.T) string {
 	return p
 }
 
-// findDirWithNEntries finds a directory with approximately n entries.
-func findDirWithNEntries(root string, target int, tolerance float64) (string, int) {
+// findCommonDirWithNEntries finds a directory with approximately n entries
+// that is reachable through both views under comparison. Selecting from FUSE
+// alone made the NFS arm benchmark a nonexistent path whenever the live
+// volume contained a hidden or not-yet-indexed directory.
+func findCommonDirWithNEntries(fuseRoot, nfsRoot string, target int, tolerance float64) (string, int) {
 	best := ""
 	bestCount := 0
 	bestDiff := target
 
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	filepath.Walk(fuseRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil || !info.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(fuseRoot, path)
+		if relErr != nil {
+			return nil
+		}
+		if rel != "." {
+			for _, part := range strings.Split(rel, string(filepath.Separator)) {
+				if strings.HasPrefix(part, ".") {
+					return filepath.SkipDir
+				}
+			}
+		}
+		nfsPath := filepath.Join(nfsRoot, rel)
+		nfsInfo, nfsErr := os.Stat(nfsPath)
+		if nfsErr != nil || !nfsInfo.IsDir() {
 			return nil
 		}
 		entries, err := os.ReadDir(path)
 		if err != nil {
+			return nil
+		}
+		nfsEntries, err := os.ReadDir(nfsPath)
+		if err != nil || len(nfsEntries) == 0 {
 			return nil
 		}
 		diff := len(entries) - target
@@ -237,7 +260,7 @@ func TestFinderPerf_ReadDir(t *testing.T) {
 	})
 
 	// Find a medium directory (10-30 entries)
-	medDir, medCount := findDirWithNEntries(fuseMountPath, 20, 0.5)
+	medDir, medCount := findCommonDirWithNEntries(fuseMountPath, nfsMount, 20, 0.5)
 	if medDir != "" {
 		rel, _ := filepath.Rel(fuseMountPath, medDir)
 		tests = append(tests, dirTest{
@@ -249,7 +272,7 @@ func TestFinderPerf_ReadDir(t *testing.T) {
 	}
 
 	// Find a large directory (100+ entries)
-	lgDir, lgCount := findDirWithNEntries(fuseMountPath, 100, 0.5)
+	lgDir, lgCount := findCommonDirWithNEntries(fuseMountPath, nfsMount, 100, 0.5)
 	if lgDir != "" {
 		rel, _ := filepath.Rel(fuseMountPath, lgDir)
 		tests = append(tests, dirTest{
@@ -292,7 +315,7 @@ func TestFinderPerf_Stat(t *testing.T) {
 	// Test stat on a subdirectory with many files
 	t.Log("")
 	t.Log("--- Subdirectory files ---")
-	subDir, count := findDirWithNEntries(fuseMountPath, 50, 0.5)
+	subDir, count := findCommonDirWithNEntries(fuseMountPath, nfsMount, 50, 0.5)
 	if subDir != "" {
 		rel, _ := filepath.Rel(fuseMountPath, subDir)
 		t.Logf("Using: %s (%d entries)", rel, count)

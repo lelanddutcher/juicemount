@@ -23,6 +23,11 @@ type workerProfile struct {
 	Benchmarks         farmqueue.WorkerBenchmarks
 }
 
+type hardwareEncoderProbe struct {
+	Name string
+	FPS  float64
+}
+
 // probeWorkerProfile admits a node from work it actually completes, not device
 // names or container flags. A render node with an exposed-but-broken GPU fails
 // admission instead of silently becoming a CPU worker.
@@ -35,22 +40,26 @@ func probeWorkerProfile(cfg queueConfig) (workerProfile, error) {
 		},
 	}
 	var probeErrs []string
-	encoders, encodeFPS, encoderErrs := probeHardwareEncoders()
-	p.Encoders = encoders
-	p.Benchmarks.EncodeFPS = encodeFPS
+	encoderProbes, encoderErrs := probeHardwareEncoders()
 	probeErrs = append(probeErrs, encoderErrs...)
-	if len(encoders) > 0 {
-		if decoder, fps, err := probeHardwareDecode(encoders[0]); err == nil {
-			p.Decoders = []string{decoder}
-			p.Capabilities = append(p.Capabilities, "decoder:"+decoder)
-			p.Benchmarks.DecodeFPS = fps
-		} else {
+	for _, encoder := range encoderProbes {
+		decoder, fps, err := probeHardwareDecode(encoder.Name)
+		if err != nil {
 			probeErrs = append(probeErrs, err.Error())
-			// Video admission requires both halves of the pipeline. Reporting a
-			// working encoder with an unverified decoder would allow ffmpeg to
-			// burn CPU on input without Manager knowing.
-			p.Encoders = nil
-			p.Benchmarks.EncodeFPS = 0
+			continue
+		}
+		// Video admission is per codec and device family. Keeping only
+		// encoders whose matching decoder passed a live bitstream probe prevents
+		// an HEVC-capable node from claiming H.264 input it cannot decode (or the
+		// reverse) and then burning CPU without Manager knowing.
+		p.Encoders = append(p.Encoders, encoder.Name)
+		p.Decoders = appendUnique(p.Decoders, decoder)
+		p.Capabilities = appendUnique(p.Capabilities, "decoder:"+decoder)
+		if encoder.FPS > p.Benchmarks.EncodeFPS {
+			p.Benchmarks.EncodeFPS = encoder.FPS
+		}
+		if fps > p.Benchmarks.DecodeFPS {
+			p.Benchmarks.DecodeFPS = fps
 		}
 	}
 	for _, enc := range p.Encoders {
@@ -99,18 +108,17 @@ func probeWorkerProfile(cfg queueConfig) (workerProfile, error) {
 	return p, nil
 }
 
-func probeHardwareEncoders() ([]string, float64, []string) {
+func probeHardwareEncoders() ([]hardwareEncoderProbe, []string) {
 	out, err := exec.Command("ffmpeg", "-hide_banner", "-encoders").CombinedOutput()
 	if err != nil {
-		return nil, 0, []string{"ffmpeg encoder inventory unavailable"}
+		return nil, []string{"ffmpeg encoder inventory unavailable"}
 	}
 	inventory := string(out)
 	candidates := []string{
 		"hevc_vaapi", "hevc_qsv", "hevc_nvenc",
 		"h264_vaapi", "h264_qsv", "h264_nvenc",
 	}
-	var verified []string
-	var bestFPS float64
+	var verified []hardwareEncoderProbe
 	var errs []string
 	for _, enc := range candidates {
 		if !strings.Contains(inventory, enc) || !hardwareDevicePresent(enc) {
@@ -121,12 +129,9 @@ func probeHardwareEncoders() ([]string, float64, []string) {
 			errs = append(errs, fmt.Sprintf("%s probe failed", enc))
 			continue
 		}
-		verified = append(verified, enc)
-		if fps > bestFPS {
-			bestFPS = fps
-		}
+		verified = append(verified, hardwareEncoderProbe{Name: enc, FPS: fps})
 	}
-	return verified, bestFPS, errs
+	return verified, errs
 }
 
 func runEncoderProbe(encoder string) (float64, error) {

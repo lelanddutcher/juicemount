@@ -1088,6 +1088,11 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 			job.ID, job.Path)
 		return 0, 0, nil
 	}
+	if len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindProxy {
+		if err := validateRenderProxyTargets(worker, vcodec, targets); err != nil {
+			return 0, 0, err
+		}
+	}
 
 	// Expand the job's kinds into the concrete passes to run, in cheap→expensive
 	// order so the fast derivatives publish before the slow proxy/transcript.

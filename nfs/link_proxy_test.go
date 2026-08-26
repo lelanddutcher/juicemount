@@ -143,6 +143,101 @@ func TestTCPProxyForwardsAndCloses(t *testing.T) {
 	}
 }
 
+func TestObjectProxyDropsStalledFlowBeforeClientTimeout(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	backendDone := make(chan struct{})
+	go func() {
+		defer close(backendDone)
+		conn, err := backend.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	p, err := newTCPProxyWithIdleTimeout(backend.Addr().String(), (&net.Dialer{}).DialContext, 75*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	conn, err := net.DialTimeout("tcp", p.listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("request-with-no-response")); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("stalled backend connection remained open")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("stalled proxy closed after %v, expected well before client timeout", elapsed)
+	}
+	select {
+	case <-backendDone:
+	case <-time.After(time.Second):
+		t.Fatal("stalled backend connection was not closed")
+	}
+}
+
+func TestObjectProxyRefreshesDeadlineOnProgress(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	go func() {
+		conn, err := backend.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for _, b := range []byte("alive") {
+			_, _ = conn.Write([]byte{b})
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	p, err := newTCPProxyWithIdleTimeout(backend.Addr().String(), (&net.Dialer{}).DialContext, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	conn, err := net.DialTimeout("tcp", p.listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	got := make([]byte, len("alive"))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("progressing flow was closed: %v", err)
+	}
+	if string(got) != "alive" {
+		t.Fatalf("progressing flow = %q", got)
+	}
+}
+
+func TestProxyIdleTimeoutOnlyAppliesToHTTP(t *testing.T) {
+	if got := proxyIdleTimeout("http://nas.example/bucket"); got != objectProxyIdleTimeout {
+		t.Fatalf("HTTP timeout = %v", got)
+	}
+	if got := proxyIdleTimeout("https://nas.example/bucket"); got != objectProxyIdleTimeout {
+		t.Fatalf("HTTPS timeout = %v", got)
+	}
+	if got := proxyIdleTimeout("redis://nas.example/1"); got != 0 {
+		t.Fatalf("Redis timeout = %v, want zero", got)
+	}
+}
+
 func TestProxyEndpointTargetRejectsMissingHost(t *testing.T) {
 	for _, raw := range []string{"", "://nope", "redis:///1"} {
 		t.Run(strings.ReplaceAll(raw, "/", "_"), func(t *testing.T) {

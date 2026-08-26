@@ -129,7 +129,12 @@ func setupE2E(t *testing.T) *e2eEnv {
 	}
 
 	t.Cleanup(func() {
-		exec.Command("sudo", "umount", "-f", mountPoint).Run()
+		// A failed NFS assertion can leave the kernel client waiting on an RPC.
+		// Never let cleanup consume the package's entire timeout; closing the
+		// in-process server below remains the second teardown lever.
+		unmountCtx, unmountCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = exec.CommandContext(unmountCtx, "sudo", "umount", "-f", mountPoint).Run()
+		unmountCancel()
 		os.Remove(mountPoint)
 		mon.Stop()
 		srv.Handler().StopHandler()
