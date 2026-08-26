@@ -67,7 +67,9 @@ func (d *Drainer) StartStreamer(tick time.Duration) (stop func()) {
 		d.streamer = &streamer{sessions: map[int64]*streamSession{}}
 	}
 	done := make(chan struct{})
+	exited := make(chan struct{})
 	go func() {
+		defer close(exited)
 		t := time.NewTicker(tick)
 		defer t.Stop()
 		for {
@@ -81,7 +83,15 @@ func (d *Drainer) StartStreamer(tick time.Duration) (stop func()) {
 		}
 	}()
 	var once sync.Once
-	return func() { once.Do(func() { close(done) }) }
+	return func() {
+		once.Do(func() {
+			close(done)
+			// A successful stop is a lifecycle barrier, not merely a request.
+			// Callers (including process shutdown and tests restoring package
+			// configuration) may safely tear down state once this returns.
+			<-exited
+		})
+	}
 }
 
 // streamOnce advances every eligible in-flight entry by one chunk.

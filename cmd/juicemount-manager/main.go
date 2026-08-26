@@ -27,6 +27,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -69,6 +70,9 @@ func main() {
 	}
 	if *metaURL != "" && *volName == "" {
 		log.Fatal("--vol-name is required with --meta (standalone mode)")
+	}
+	if err := validateLinkAdminKey(headscaleEnabled(), *adminKey); err != nil {
+		log.Fatal(err)
 	}
 
 	ownerUID, ownerGID := parseOwner(*mountOwner)
@@ -154,6 +158,26 @@ func main() {
 	log.Println("shutting down...")
 	mgr.StopAll()
 	_ = srv.Close()
+}
+
+// validateLinkAdminKey enforces the minimum authentication boundary for a
+// remotely reachable Manager. Link enrollment grants network reachability to
+// Redis, object storage, and the Manager itself; starting it while Manager auth
+// is disabled turns a pairing feature into an unauthenticated administrative
+// plane. Local/LAN-only development may still run without an admin key while
+// JM_NET_HEADSCALE is off.
+func validateLinkAdminKey(linkEnabled bool, adminKey string) error {
+	if !linkEnabled {
+		return nil
+	}
+	key := strings.TrimSpace(adminKey)
+	if key == "" {
+		return fmt.Errorf("JuiceMount Link requires JM_ADMIN_KEY; refusing to start an unauthenticated remote control plane")
+	}
+	if len(key) < 32 {
+		return fmt.Errorf("JuiceMount Link requires JM_ADMIN_KEY to contain at least 32 characters")
+	}
+	return nil
 }
 
 // envOr returns the environment variable's value if set+non-empty,

@@ -183,7 +183,8 @@ services:
   # Browse host paths under /sources, pick a destination under /jfs,
   # watch live progress via SSE. Set JM_ADMIN_KEY for HTTP auth (the
   # manager owns write access to your data — don't leave it open on
-  # the public internet). Empty admin key = LAN-only / no auth.
+  # the public internet). Empty admin key is accepted only while
+  # JM_NET_HEADSCALE=off; Link refuses to start without 32+ characters.
   juicemount-manager:
     image: ghcr.io/lelanddutcher/juicemount-manager:latest
     pull_policy: always
@@ -195,7 +196,7 @@ services:
       JM_META: "redis://redis:6379/1"
       JM_VOL_NAME: "zpool"
       JM_SOURCE_ROOTS: "/sources"
-      JM_ADMIN_KEY: ""               # EDIT — set to a 32+ char random string for prod
+      JM_ADMIN_KEY: ""               # REQUIRED (32+ chars) before enabling JuiceMount Link
       JM_STATE_FILE: "/var/lib/manager/state.json"   # persists job history + future control-plane state across container restart
       JM_MINIO_URL: "http://minio:9000"              # SLICE 2: Overview MinIO liveness probe target (internal docker DNS)
       JM_FARM_STATUS: "/farmstate/farm-status.json"  # Farm tab: the juicefarm rollup (juicefarm-state mounted read-only below)

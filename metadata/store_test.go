@@ -104,6 +104,57 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+// The NFS create path publishes an Entry to the serving cache immediately and
+// persists that same logical entry on a goroutine. A WRITE close may publish a
+// larger size before either phase finishes. Insert and UpdateSize must have one
+// total order: no data race, and neither SQLite nor the serving cache may end
+// at the stale CREATE size.
+func TestAsyncInsertAndUpdateSizeConverge(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now().Truncate(time.Second)
+
+	for i := 0; i < 64; i++ {
+		entryPath := fmt.Sprintf("concurrent/create-%d.mov", i)
+		e := MakeEntry(entryPath, false, 0, now, uint64(10_000+i))
+		s.InsertToCache(e)
+
+		start := make(chan struct{})
+		errCh := make(chan error, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- s.Insert(e)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- s.UpdateSize(entryPath, 1<<20, now.Add(time.Second))
+		}()
+		close(start)
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			if err != nil {
+				t.Fatalf("concurrent persist %q: %v", entryPath, err)
+			}
+		}
+
+		got := s.LookupByPath(entryPath)
+		if got == nil || got.Size != 1<<20 {
+			t.Fatalf("cache %q = %#v, want size %d", entryPath, got, 1<<20)
+		}
+		var dbSize int64
+		if err := s.DB().QueryRow(`SELECT size FROM entries WHERE path = ?`, entryPath).Scan(&dbSize); err != nil {
+			t.Fatalf("sqlite read %q: %v", entryPath, err)
+		}
+		if dbSize != 1<<20 {
+			t.Fatalf("sqlite size %q = %d, want %d", entryPath, dbSize, 1<<20)
+		}
+	}
+}
+
 func TestDelete(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now().Truncate(time.Second)

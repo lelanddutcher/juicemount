@@ -935,7 +935,32 @@ func (s *Store) Insert(e *Entry) error {
 	if StreamPartialName(e.Name) {
 		return nil
 	}
+	// Serialize the durable write and the cache publication as one ordered
+	// operation. NFS create paths intentionally publish the same *Entry to the
+	// RAM cache first, then persist it asynchronously; a concurrent WRITE close
+	// can therefore call UpdateSize while this goroutine is still starting.
+	//
+	// Snapshot only the durable fields while holding s.mu. In particular, do not
+	// copy PreSerializedGetAttr: the NFS GETATTR fast path owns that ephemeral
+	// cache and may populate it without participating in SQLite persistence.
+	// Holding writeMu before the snapshot gives Insert and UpdateSize a single
+	// total order, so an old CREATE snapshot can never replace a later size bump
+	// in SQLite or pathCache.
 	s.writeMu.Lock()
+	s.mu.RLock()
+	persisted := &Entry{
+		Path:       e.Path,
+		Name:       e.Name,
+		ParentPath: e.ParentPath,
+		IsDir:      e.IsDir,
+		Size:       e.Size,
+		Mtime:      e.Mtime,
+		Inode:      e.Inode,
+		Mode:       e.Mode,
+		LocalOnly:  e.LocalOnly,
+	}
+	s.mu.RUnlock()
+	e = persisted
 	// entries + external-content FTS updated atomically so search stays in sync
 	// without a periodic full rebuild (QA-40). The inode int64 cast for
 	// modernc.org/sqlite (rejects uint64 with the high bit set) is inside
@@ -954,11 +979,6 @@ func (s *Store) Insert(e *Entry) error {
 		s.writeMu.Unlock()
 		return fmt.Errorf("insert commit %q: %w", e.Path, err)
 	}
-	s.writeMu.Unlock()
-	// Nudge the compactor so a just-created file becomes searchable promptly
-	// (within a compact batch) rather than only on the next ticker. No-op when
-	// the flag is off (ftsWake is nil). Non-blocking / coalesced.
-	s.wakeFTSCompactor()
 
 	s.mu.Lock()
 	// Remove old entry from children index if path existed with different parent
@@ -981,6 +1001,12 @@ func (s *Store) Insert(e *Entry) error {
 	s.pathCache[e.Path] = e
 	s.addToChildrenIdx(e)
 	s.mu.Unlock()
+	s.writeMu.Unlock()
+
+	// Nudge the compactor so a just-created file becomes searchable promptly
+	// (within a compact batch) rather than only on the next ticker. No-op when
+	// the flag is off (ftsWake is nil). Non-blocking / coalesced.
+	s.wakeFTSCompactor()
 
 	return nil
 }
@@ -1798,12 +1824,14 @@ func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error 
 		`UPDATE entries SET size = MAX(size, ?), mtime = ? WHERE path = ?`,
 		size, mtime.Unix(), entryPath,
 	)
-	s.writeMu.Unlock()
-
 	if err != nil {
+		s.writeMu.Unlock()
 		return fmt.Errorf("update size %q: %w", entryPath, err)
 	}
 
+	// Keep writeMu through the cache update. Insert uses the same lock order
+	// (writeMu -> mu), making the SQLite row and its serving-cache counterpart
+	// one ordered publication instead of two independently raceable phases.
 	s.mu.Lock()
 	if e, ok := s.pathCache[entryPath]; ok {
 		oldSize := e.Size
@@ -1817,6 +1845,7 @@ func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error 
 		e.PreSerializedGetAttr = nil // [JM5] invalidate cached XDR bytes
 	}
 	s.mu.Unlock()
+	s.writeMu.Unlock()
 
 	return nil
 }
