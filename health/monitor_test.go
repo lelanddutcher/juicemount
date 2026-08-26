@@ -2,8 +2,6 @@ package health
 
 import (
 	"net"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -217,18 +215,12 @@ func TestStatusReturnsCorrectState(t *testing.T) {
 	}
 }
 
-// fusePath returns the expanded ~/.juicemount/fuse-internal path,
-// creating the directory if it doesn't already exist so the FUSE
-// check can succeed.
+// fusePath returns a stable mounted local filesystem so a unit test can never
+// probe the user's live ~/.juicemount/fuse-internal mount. A test stat issued
+// during a real macFUSE teardown can enter an uninterruptible kernel wait and
+// pin the entire package until the device recovers. The monitor behavior under
+// test only requires a path that is present in the mount table and readable.
 func fusePath(t *testing.T) string {
 	t.Helper()
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("cannot determine home dir: %v", err)
-	}
-	fp := filepath.Join(home, ".juicemount", "fuse-internal")
-	if err := os.MkdirAll(fp, 0o755); err != nil {
-		t.Fatalf("cannot create fuse path %s: %v", fp, err)
-	}
-	return fp
+	return "/"
 }

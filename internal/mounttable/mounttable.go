@@ -15,14 +15,6 @@ import (
 
 var queryGate = make(chan struct{}, 1)
 
-// Output returns mount(8)'s stdout or an error before ctx expires. At most one
-// mount query exists at a time. If a timed-out child remains uninterruptible,
-// the gate stays held until it actually exits, so later health ticks fail
-// boundedly instead of leaking more stuck processes and goroutines.
-func Output(ctx context.Context) ([]byte, error) {
-	return output(ctx, queryGate, func() *exec.Cmd { return exec.Command("mount") })
-}
-
 func output(ctx context.Context, gate chan struct{}, command func() *exec.Cmd) ([]byte, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("mount table: nil context")

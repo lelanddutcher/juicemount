@@ -1391,7 +1391,7 @@ func (fm *FUSEManager) ensureUnmountedLocked(attempts int) error {
 func (fm *FUSEManager) stillInMountTable() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "mount").Output()
+	out, err := mounttable.Output(ctx)
 	if err != nil {
 		return false
 	}
