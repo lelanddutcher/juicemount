@@ -23,7 +23,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -115,7 +117,8 @@ func mintNasPreauthKey(cfgPath string) (string, error) {
 
 // nasNodeSupervisor owns the embedded node's lifecycle.
 type nasNodeSupervisor struct {
-	srv *tsnet.Server
+	srv               *tsnet.Server
+	deregisterForward func()
 }
 
 // Start brings the node up, advertises the LAN route, and kicks off the
@@ -169,10 +172,58 @@ func (n *nasNodeSupervisor) Start(cfgPath string) error {
 		s.Close()
 		return fmt.Errorf("nas node advertise %s: %w", prefix, err)
 	}
+	// tsnet's fake-TUN mode deliberately rejects routed TCP flows that do
+	// not have a listener or fallback handler. Advertising and approving a
+	// subnet alone therefore creates a route that looks healthy but returns
+	// RST for Redis, object storage, and every other LAN service. Install the
+	// system-network forwarder before the route can be approved.
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	n.deregisterForward = s.RegisterFallbackTCPHandler(nasRouteTCPHandler(prefix, dialer.DialContext))
 	n.srv = s
 	go n.approveLoop(prefix.String())
 	log.Printf("JuiceMount Link: nas node %q up, advertising %s on UDP %d", s.Hostname, prefix, udpPort)
 	return nil
+}
+
+type nasTCPDialer func(context.Context, string, string) (net.Conn, error)
+
+// nasRouteTCPHandler forwards only addresses inside the explicitly
+// advertised NAS route. Returning intercept=false for everything else keeps
+// the tsnet node from becoming an accidental exit node or generic proxy.
+func nasRouteTCPHandler(prefix netip.Prefix, dial nasTCPDialer) tsnet.FallbackTCPHandler {
+	return func(_ netip.AddrPort, dst netip.AddrPort) (func(net.Conn), bool) {
+		if !prefix.Contains(dst.Addr()) {
+			return nil, false
+		}
+		return func(client net.Conn) {
+			forwardNASTCP(client, dst, dial)
+		}, true
+	}
+}
+
+func forwardNASTCP(client net.Conn, dst netip.AddrPort, dial nasTCPDialer) {
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	upstream, err := dial(ctx, "tcp", dst.String())
+	cancel()
+	if err != nil {
+		log.Printf("JuiceMount Link: routed TCP dial to %s failed: %v", dst, err)
+		return
+	}
+	defer upstream.Close()
+
+	done := make(chan struct{}, 2)
+	copyHalf := func(dstConn, srcConn net.Conn) {
+		_, _ = io.Copy(dstConn, srcConn)
+		if closeWriter, ok := dstConn.(interface{ CloseWrite() error }); ok {
+			_ = closeWriter.CloseWrite()
+		}
+		done <- struct{}{}
+	}
+	go copyHalf(upstream, client)
+	go copyHalf(client, upstream)
+	<-done
+	<-done
 }
 
 // approveLoop approves the advertised route server-side until it sticks.
@@ -193,7 +244,12 @@ func (n *nasNodeSupervisor) approveLoop(prefix string) {
 
 // Stop tears the node down on manager shutdown.
 func (n *nasNodeSupervisor) Stop() {
+	if n.deregisterForward != nil {
+		n.deregisterForward()
+		n.deregisterForward = nil
+	}
 	if n.srv != nil {
 		n.srv.Close()
+		n.srv = nil
 	}
 }
