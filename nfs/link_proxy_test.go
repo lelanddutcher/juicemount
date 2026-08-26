@@ -160,7 +160,17 @@ func TestObjectProxyDropsStalledFlowBeforeClientTimeout(t *testing.T) {
 		_, _ = io.Copy(io.Discard, conn)
 	}()
 
-	p, err := newTCPProxyWithIdleTimeout(backend.Addr().String(), (&net.Dialer{}).DialContext, 75*time.Millisecond)
+	// Model a userspace connection whose socket deadline methods report
+	// success but do not interrupt a blocked Read. The proxy's independent
+	// activity watchdog must still close the flow.
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &deadlineIgnoringConn{Conn: conn}, nil
+	}
+	p, err := newTCPProxyWithIdleTimeout(backend.Addr().String(), dial, 75*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,6 +198,12 @@ func TestObjectProxyDropsStalledFlowBeforeClientTimeout(t *testing.T) {
 		t.Fatal("stalled backend connection was not closed")
 	}
 }
+
+type deadlineIgnoringConn struct{ net.Conn }
+
+func (c *deadlineIgnoringConn) SetDeadline(time.Time) error      { return nil }
+func (c *deadlineIgnoringConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *deadlineIgnoringConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestObjectProxyRefreshesDeadlineOnProgress(t *testing.T) {
 	backend, err := net.Listen("tcp", "127.0.0.1:0")

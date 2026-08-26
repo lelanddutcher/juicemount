@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tailscale.com/ipn"
@@ -367,48 +368,96 @@ func (p *tcpProxy) forward(local net.Conn) {
 	}
 	defer p.untrackAndClose(remote)
 
+	localReader := io.Reader(local)
 	remoteReader := io.Reader(remote)
 	remoteWriter := io.Writer(remote)
 	localWriter := io.Writer(local)
+	var watchdogStop chan struct{}
 	if p.idleTimeout > 0 {
-		// Deadline each individual blocking operation, refreshing on progress.
-		// A single absolute deadline would kill a healthy large transfer; these
-		// wrappers only close a flow that makes no progress for the full window.
-		remoteReader = &readDeadlineConn{Conn: remote, timeout: p.idleTimeout}
-		remoteWriter = &writeDeadlineConn{Conn: remote, timeout: p.idleTimeout}
-		localWriter = &writeDeadlineConn{Conn: local, timeout: p.idleTimeout}
+		// tsnet connections can remain blocked past a socket deadline while a
+		// userspace path is wedged. Track byte-level progress and close both legs
+		// from an independent watchdog, so the external JuiceFS process receives
+		// a retryable connection error before its 30-second S3 attempt aborts the
+		// mount. Healthy large transfers refresh the timer on every read/write.
+		activity := &proxyActivity{}
+		activity.touch()
+		localReader = &activityReader{Reader: localReader, activity: activity}
+		remoteReader = &activityReader{Reader: remoteReader, activity: activity}
+		remoteWriter = &activityWriter{Writer: remoteWriter, activity: activity}
+		localWriter = &activityWriter{Writer: localWriter, activity: activity}
+		watchdogStop = make(chan struct{})
+		go closeProxyAfterIdle(local, remote, activity, p.idleTimeout, watchdogStop)
 	}
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(remoteWriter, local); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(remoteWriter, localReader); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(localWriter, remoteReader); done <- struct{}{} }()
 	<-done
+	if watchdogStop != nil {
+		close(watchdogStop)
+	}
 	_ = local.Close()
 	_ = remote.Close()
 	<-done
 }
 
-type readDeadlineConn struct {
-	net.Conn
-	timeout time.Duration
+type proxyActivity struct {
+	lastProgress atomic.Int64
 }
 
-func (c *readDeadlineConn) Read(p []byte) (int, error) {
-	if err := c.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
-		return 0, err
+func (a *proxyActivity) touch() {
+	a.lastProgress.Store(time.Now().UnixNano())
+}
+
+type activityReader struct {
+	io.Reader
+	activity *proxyActivity
+}
+
+func (r *activityReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 {
+		r.activity.touch()
 	}
-	return c.Conn.Read(p)
+	return n, err
 }
 
-type writeDeadlineConn struct {
-	net.Conn
-	timeout time.Duration
+type activityWriter struct {
+	io.Writer
+	activity *proxyActivity
 }
 
-func (c *writeDeadlineConn) Write(p []byte) (int, error) {
-	if err := c.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
-		return 0, err
+func (w *activityWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if n > 0 {
+		w.activity.touch()
 	}
-	return c.Conn.Write(p)
+	return n, err
+}
+
+func closeProxyAfterIdle(local, remote net.Conn, activity *proxyActivity, idleTimeout time.Duration, stop <-chan struct{}) {
+	interval := idleTimeout / 4
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	if interval > time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-ticker.C:
+			last := time.Unix(0, activity.lastProgress.Load())
+			if now.Sub(last) < idleTimeout {
+				continue
+			}
+			_ = local.Close()
+			_ = remote.Close()
+			return
+		}
+	}
 }
 
 func (p *tcpProxy) track(conn net.Conn) bool {
