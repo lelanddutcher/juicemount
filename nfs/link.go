@@ -34,6 +34,7 @@ type LinkNode struct {
 	srv     *tsnet.Server
 	mu      sync.Mutex
 	proxies []*tcpProxy
+	addrs   []string
 }
 
 // contextDialer is deliberately small so proxy behavior can be tested with a
@@ -90,9 +91,20 @@ func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, [
 	for _, a := range st.Self.TailscaleIPs {
 		addrs = append(addrs, a.String())
 	}
-	node := &LinkNode{srv: s}
+	node := &LinkNode{srv: s, addrs: append([]string(nil), addrs...)}
 	node.acceptRoutes()
 	return node, addrs, nil
+}
+
+// Addresses returns the node's tailnet addresses captured at successful Up.
+// A copy keeps callers from mutating LinkNode state.
+func (l *LinkNode) Addresses() []string {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.addrs...)
 }
 
 // ProxyEndpoint returns an equivalent URL whose host is a loopback listener.
@@ -362,6 +374,7 @@ func (l *LinkNode) Stop() {
 	proxies := l.proxies
 	l.srv = nil
 	l.proxies = nil
+	l.addrs = nil
 	l.mu.Unlock()
 	for _, proxy := range proxies {
 		_ = proxy.Close()

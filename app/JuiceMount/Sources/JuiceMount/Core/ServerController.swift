@@ -23,6 +23,10 @@ public final class ServerController {
     public private(set) var stats: NFSBridge.Stats = .zero
     public private(set) var lastError: String?
 
+    /// Live JuiceMount Link pairing/route verification shown in Preferences.
+    public private(set) var linkTestResult: NFSBridge.LinkTestResult?
+    public private(set) var linkTestInFlight = false
+
     /// Latest cache status (pin coverage + offline flag). Refreshed off
     /// MainActor from `refreshCacheStatus()` so the popover never calls
     /// the cgo `NFSServerCacheStatus()` symbol from the UI thread —
@@ -86,9 +90,9 @@ public final class ServerController {
     /// so a Settings change does NOT reach a running mount. nil = no daemon
     /// launched this app session, or a full Stop killed it (the next Start
     /// mints fresh flags from preferences). Deliberately NOT reset by
-    /// softStop/stopMount/restart() — those keep the JuiceFS daemon (and
-    /// its original flags) alive, which is exactly why the Settings pane
-    /// needs `cacheSizePendingRestart` below.
+    /// stopMount/restart() — those keep the JuiceFS daemon (and its original
+    /// flags) alive, which is exactly why the Settings pane needs
+    /// `cacheSizePendingRestart` below.
     public private(set) var appliedSsdCacheGB: Int?
 
     public var preferences: Preferences
@@ -306,32 +310,12 @@ public final class ServerController {
         }
     }
 
-    /// Internal soft-stop used by `restart()`. Leaves FUSE + NFS mounted so
-    /// the subsequent start is fast and prompt-free. Not exposed in the UI
-    /// — the user-facing Stop button uses the hard `stop()` above.
-    private func softStop(completion: (@MainActor () -> Void)? = nil) {
-        log.info("Soft-stopping server (mounts preserved)")
-        userStopRequested = true
-        pollTask?.cancel()
-        pollTask = nil
-        workQueue.async { [weak self] in
-            NFSBridge.softStop()
-            Task { @MainActor in
-                self?.state = .idle
-                self?.stats = .zero
-                self?.awaitingFirstHealth = false
-                self?.syncInFlight = false
-                completion?()
-            }
-        }
-    }
-
-    /// Restart with a proper completion handoff — waits for soft-stop to
-    /// fully complete before kicking off start. Restart uses softStop so
-    /// FUSE/NFS stay up between the teardown and the new start, avoiding
-    /// a password prompt the user didn't ask for.
+    /// Restart with a proper completion handoff. NFS is briefly unmounted so
+    /// the kernel cannot retain file handles whose handler owns the spool and
+    /// SQLite stores we are about to close. JuiceFS/FUSE stays warm, so this is
+    /// still the inexpensive restart path and does not rebuild the data cache.
     public func restart() {
-        softStop { [weak self] in
+        stopMount { [weak self] in
             self?.start()
         }
     }
@@ -351,6 +335,55 @@ public final class ServerController {
         }
     }
 
+    /// Apply the current pairing fields, join/refresh the embedded tailnet
+    /// identity, and verify a real Redis dial through the advertised NAS route.
+    /// If the bridge is already serving, a successful test performs a warm
+    /// restart so the live mount begins using the retained Link node now.
+    public func testLink() {
+        guard !linkTestInFlight else { return }
+        let serverURL = preferences.linkServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let authKey = preferences.linkAuthKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serverURL.isEmpty, !authKey.isEmpty else {
+            linkTestResult = NFSBridge.LinkTestResult(
+                ok: false, authorized: false, online: false, backendReachable: false,
+                hostname: nil, addresses: [], rttMS: nil,
+                error: "Enter the server URL and pairing code first."
+            )
+            return
+        }
+        if preferences.linkHostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let source = Host.current().localizedName ?? "juicemount-mac"
+            let clean = source.lowercased().map { ch -> Character in
+                (ch.isLetter || ch.isNumber || ch == "-") ? ch : "-"
+            }
+            preferences.linkHostname = String(clean).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        }
+        let cfg = preferences.toServerConfig()
+        let shouldRestart = isRunningLike
+        linkTestInFlight = true
+        linkTestResult = nil
+        workQueue.async { [weak self] in
+            let result: NFSBridge.LinkTestResult
+            do {
+                result = try NFSBridge.testLink(config: cfg)
+            } catch {
+                result = NFSBridge.LinkTestResult(
+                    ok: false, authorized: false, online: false, backendReachable: false,
+                    hostname: cfg.netHostname, addresses: [], rttMS: nil,
+                    error: error.localizedDescription
+                )
+            }
+            Task { @MainActor in
+                guard let self else { return }
+                self.linkTestInFlight = false
+                self.linkTestResult = result
+                if result.ok && shouldRestart {
+                    self.restart()
+                }
+            }
+        }
+    }
+
     /// True when the user's saved SSD cache size differs from the size the
     /// live JuiceFS daemon was launched with. The setting is safely saved,
     /// but it cannot take effect until the volume fully restarts (the
@@ -362,15 +395,12 @@ public final class ServerController {
         return applied != preferences.ssdCacheGB
     }
 
-    /// S-6 Reset-DB flow: expose the soft-stop for maintenance work that
-    /// must run with the Go side fully torn down (metadata store CLOSED —
-    /// deleting SQLite files under a live server is a silent no-op) but
-    /// wants the FUSE/NFS mounts preserved so the follow-up start doesn't
-    /// re-prompt for an admin password. `completion` runs on MainActor
-    /// after teardown finishes; the server is left .idle for the caller
-    /// to optionally start().
+    /// S-6 Reset-DB flow: close the stores and drop only the NFS mount. Keeping
+    /// NFS mounted across this boundary leaves kernel file handles attached to
+    /// the just-closed spool, so the next start appears healthy but all writes
+    /// fail. FUSE remains warm and `completion` runs on MainActor.
     public func softStopForMaintenance(completion: (@MainActor () -> Void)? = nil) {
-        softStop(completion: completion)
+        stopMount(completion: completion)
     }
 
     public func syncNow() {

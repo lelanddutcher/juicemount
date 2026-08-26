@@ -44,14 +44,14 @@ type ProgressEvent struct {
 
 // Job tracks the lifecycle of one sync invocation.
 type Job struct {
-	ID          string        `json:"id"`
-	Source      string        `json:"source"`
-	Destination string        `json:"destination"`
-	Options     SyncOptions   `json:"options"`
-	State       JobState      `json:"state"`
-	CreatedAt   int64         `json:"created_at"` // unix-ms
-	StartedAt   int64         `json:"started_at"`
-	FinishedAt  int64         `json:"finished_at"`
+	ID          string      `json:"id"`
+	Source      string      `json:"source"`
+	Destination string      `json:"destination"`
+	Options     SyncOptions `json:"options"`
+	State       JobState    `json:"state"`
+	CreatedAt   int64       `json:"created_at"` // unix-ms
+	StartedAt   int64       `json:"started_at"`
+	FinishedAt  int64       `json:"finished_at"`
 	// TotalBytes is the pre-computed source size from the UI's preview
 	// pane, passed through on job creation. Used by the frontend to
 	// render a real % progress bar (vs an indeterminate placeholder).

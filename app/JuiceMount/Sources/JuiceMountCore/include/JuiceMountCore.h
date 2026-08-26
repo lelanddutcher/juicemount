@@ -9,6 +9,8 @@ extern "C" {
 
 // Server lifecycle
 char* NFSServerStart(char* configJSON);
+// Join/refresh JuiceMount Link and probe the NAS backend route. Returns JSON.
+char* NFSServerLinkTest(char* configJSON);
 // Soft stop: tears down server/sync/cache/monitor/metrics, but leaves
 // FUSE and NFS mounted so the next Start is fast and prompt-free.
 void NFSServerStop(void);

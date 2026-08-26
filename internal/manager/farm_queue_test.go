@@ -120,6 +120,34 @@ func TestHandleFarmJobsNoQueue(t *testing.T) {
 	}
 }
 
+func TestFarmControlMergePatchPreservesDiscovery(t *testing.T) {
+	fake := &fakeFarmQueue{control: farmqueue.FarmControl{Revision: 4, WatchEnabled: true}}
+	a := &API{farmQ: fake}
+	req := httptest.NewRequest(http.MethodPut, "/api/farm/control", strings.NewReader(`{"paused":true}`))
+	rec := httptest.NewRecorder()
+	a.handleFarmControl(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !fake.control.Paused || !fake.control.WatchEnabled || fake.control.Revision != 5 {
+		t.Fatalf("stored control = %+v", fake.control)
+	}
+	var first farmqueue.FarmControl
+	if err := json.Unmarshal(rec.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first control response: %v", err)
+	}
+	if first.UpdatedAt != "stored-at" {
+		t.Fatalf("response updated_at = %q, want stored value", first.UpdatedAt)
+	}
+
+	req = httptest.NewRequest(http.MethodPut, "/api/farm/control", strings.NewReader(`{"watch_enabled":false}`))
+	rec = httptest.NewRecorder()
+	a.handleFarmControl(rec, req)
+	if rec.Code != http.StatusOK || !fake.control.Paused || fake.control.WatchEnabled {
+		t.Fatalf("second patch status=%d control=%+v", rec.Code, fake.control)
+	}
+}
+
 // ---- success-path + contract conformance (fake queue, no Redis) ------------
 
 // fakeFarmQueue is an in-memory farmQueue so the handlers' SUCCESS paths are
@@ -132,6 +160,7 @@ type fakeFarmQueue struct {
 	depth      int64
 	jobs       []farmqueue.JobStatus
 	clearErr   error
+	control    farmqueue.FarmControl
 }
 
 func (f *fakeFarmQueue) Enqueue(_ context.Context, j farmqueue.Job) error {
@@ -163,6 +192,22 @@ func (f *fakeFarmQueue) ClearFinished(context.Context) (int, error) {
 	}
 	f.jobs = kept
 	return removed, nil
+}
+func (f *fakeFarmQueue) GetControl(context.Context) (farmqueue.FarmControl, error) {
+	if f.control.Revision == 0 && !f.control.WatchEnabled {
+		return farmqueue.DefaultFarmControl(), nil
+	}
+	return f.control, nil
+}
+func (f *fakeFarmQueue) StoreControl(_ context.Context, ctl farmqueue.FarmControl, force int64) (int64, error) {
+	if force > 0 {
+		ctl.Revision = force
+	} else {
+		ctl.Revision = f.control.Revision + 1
+	}
+	ctl.UpdatedAt = "stored-at"
+	f.control = ctl
+	return ctl.Revision, nil
 }
 
 // compileContractSchema loads + compiles one vendored contract schema. loc may
@@ -319,9 +364,10 @@ func TestHandleFarmSweepEnqueueConformance(t *testing.T) {
 		t.Errorf("id = %q, want 16-hex per contract", id)
 	}
 
-	// The enqueued Job is stamped + carries the overrides.
-	if len(fake.enqueued) != 1 {
-		t.Fatalf("enqueued %d jobs, want 1", len(fake.enqueued))
+	// Each pass is independently schedulable so metadata cannot be trapped
+	// behind a long GPU transcode.
+	if len(fake.enqueued) != 2 {
+		t.Fatalf("enqueued %d jobs, want 2", len(fake.enqueued))
 	}
 	j := fake.enqueued[0]
 	if j.Producer != "manager" {
@@ -330,7 +376,7 @@ func TestHandleFarmSweepEnqueueConformance(t *testing.T) {
 	if j.Path != "/jfs/Film Projects/SPARQ" {
 		t.Errorf("path = %q", j.Path)
 	}
-	if len(j.Kinds) != 2 || j.Kinds[0] != "derivatives" || j.Kinds[1] != "proxy" {
+	if len(j.Kinds) != 1 || j.Kinds[0] != "derivatives" {
 		t.Errorf("kinds = %v", j.Kinds)
 	}
 	if j.CRF != 18 || j.Preset != "medium" || j.Model != "medium.en" ||
@@ -339,6 +385,9 @@ func TestHandleFarmSweepEnqueueConformance(t *testing.T) {
 	}
 	if _, err := time.Parse(time.RFC3339, j.EnqueuedAt); err != nil {
 		t.Errorf("enqueued_at %q is not RFC3339: %v", j.EnqueuedAt, err)
+	}
+	if got := fake.enqueued[1].Kinds; len(got) != 1 || got[0] != "proxy" {
+		t.Errorf("second job kinds = %v, want [proxy]", got)
 	}
 }
 

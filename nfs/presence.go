@@ -66,7 +66,7 @@ const (
 // PresenceTracker mirrors write-handle open/close into Redis and keeps the
 // local snapshot in memory for zero-cost local reads.
 type PresenceTracker struct {
-	host string
+	host  string
 	store presenceStore
 
 	mu    sync.Mutex

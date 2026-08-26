@@ -210,8 +210,8 @@ func (a *API) handlePermissionsFix(w http.ResponseWriter, r *http.Request) {
 	}
 	chmodArgs := []string{"-R", "u+rwX,g+rwX,o+rX", real}
 	if !req.Recursive {
-		chmodArgs = chmodArgs[1:]                    // drop -R
-		cargs = []string{chownSpec(uid, gid), real}  // non-recursive chown
+		chmodArgs = chmodArgs[1:]                   // drop -R
+		cargs = []string{chownSpec(uid, gid), real} // non-recursive chown
 	}
 	ctx := r.Context()
 	if out, err := exec.CommandContext(ctx, "chmod", chmodArgs...).CombinedOutput(); err != nil {

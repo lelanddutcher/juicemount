@@ -77,7 +77,7 @@ type memBufEntry struct {
 	data       []byte
 	size       int64
 	lastAccess time.Time
-	loading    bool // true while async load is in progress
+	loading    bool          // true while async load is in progress
 	ready      chan struct{} // closed when loading is complete
 }
 

@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/lelanddutcher/juicemount-contract/spec/schema/farm-jobs.schema.json",
   "title": "GET /farm/jobs — farm worker presence + recent jobs (response)",
-  "description": "The producer's read-back view. `available` = ≥1 active worker draining (so the UI can say 'the farm is generating' vs 'queued, waiting for a worker'). Counts are serialized as typed JSON ints even though the worker keeps a stringified Redis HASH internally.",
+  "description": "The producer's read-back view. `available` = at least one heartbeating worker, including a deliberately paused farm. Counts are typed JSON ints even though the worker keeps a stringified Redis HASH internally. Capability, benchmark, routing, and control properties are additive RC fields.",
   "type": "object",
   "required": ["available", "workers", "queue_depth", "jobs"],
   "properties": {
@@ -18,6 +18,27 @@
           "started_at": { "type": "string" },
           "last_seen": { "type": "string" },
           "current_job": { "type": ["string", "null"] }
+          ,"name": { "type": "string" }
+          ,"role": { "type": "string", "enum": ["server", "render"] }
+          ,"state": { "type": "string", "enum": ["idle", "working", "paused"] }
+          ,"kinds": { "type": "array", "items": { "type": "string" } }
+          ,"capabilities": { "type": "array", "items": { "type": "string" } }
+          ,"encoders": { "type": "array", "items": { "type": "string" } }
+          ,"decoders": { "type": "array", "items": { "type": "string" } }
+          ,"transcript_backends": { "type": "array", "items": { "type": "string" } }
+          ,"benchmarks": {
+            "type": "object",
+            "properties": {
+              "encode_fps": { "type": "number" },
+              "decode_fps": { "type": "number" },
+              "transcript_x_realtime": { "type": "number" },
+              "access_mbps": { "type": "number" },
+              "last_job_seconds": { "type": "number" },
+              "jobs_completed": { "type": "integer" },
+              "probed_at": { "type": "string" },
+              "probe_error": { "type": "string" }
+            }
+          }
         }
       }
     },
@@ -32,14 +53,30 @@
           "status": { "type": "string", "enum": ["queued", "running", "done", "failed"] },
           "path": { "type": "string" },
           "kinds": { "type": "string", "description": "Comma-joined request set." },
-          "producer": { "type": "string", "enum": ["openloupe", "manager"] },
+          "producer": { "type": "string", "enum": ["openloupe", "manager", "farm-watch", "farm-watch-backstop"] },
           "enqueued_at": { "type": "string" },
           "started_at": { "type": "string" },
           "finished_at": { "type": "string" },
           "processed": { "type": "integer" },
           "failed": { "type": "integer" },
-          "error": { "type": "string" }
+          "error": { "type": "string" },
+          "worker": { "type": "string" },
+          "target_worker": { "type": "string" },
+          "backend": { "type": "string" },
+          "queue_class": { "type": "string", "enum": ["server", "render", "cpu"] },
+          "attempts": { "type": "integer" }
         }
+      }
+    },
+    "control": {
+      "type": "object",
+      "required": ["revision", "paused", "watch_enabled"],
+      "properties": {
+        "revision": { "type": "integer" },
+        "paused": { "type": "boolean" },
+        "watch_enabled": { "type": "boolean" },
+        "updated_at": { "type": "string" },
+        "updated_by": { "type": "string" }
       }
     }
   }

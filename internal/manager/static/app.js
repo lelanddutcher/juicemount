@@ -97,9 +97,12 @@
       stopFarmPolling();
     }
     // JuiceMount Link tab
-    if (name === 'link') {
-      initLinkOnce();
-    }
+		if (name === 'link') {
+			initLinkOnce();
+			startLinkPolling();
+		} else {
+			stopLinkPolling();
+		}
     // SLICE 3: lazy-init Trash on first activation. Subsequent
     // activations call refreshTrash() so the list reflects any
     // out-of-band deletions/restores since the user last viewed it.
@@ -854,9 +857,11 @@
   // never a second uncleared interval running after the tab is left.
   let farmJobsTimer = null;
   let farmWorkersTimer = null;
-  let farmGenerateInited = false;
-  const FARM_JOBS_INTERVAL_MS = 5000;
-  let farmSweepInFlight = false;
+	let farmGenerateInited = false;
+	const FARM_JOBS_INTERVAL_MS = 5000;
+	let farmSweepInFlight = false;
+	let farmControlInFlight = false;
+	let farmControlState = { paused: false, watch_enabled: true };
 
   function startFarmPolling() {
     initFarmExplainerOnce();
@@ -912,9 +917,13 @@
       });
     }
     if (btn) btn.addEventListener('click', submitFarmSweep);
-    const clearBtn = $('#farm-jobs-clear');
-    if (clearBtn) clearBtn.addEventListener('click', clearFarmFinishedJobs);
-    updateFarmSweepButton();
+		const clearBtn = $('#farm-jobs-clear');
+		if (clearBtn) clearBtn.addEventListener('click', clearFarmFinishedJobs);
+		const queueToggle = $('#farm-queue-toggle');
+		if (queueToggle) queueToggle.addEventListener('click', () => updateFarmControl({ paused: !farmControlState.paused }));
+		const watchToggle = $('#farm-watch-toggle');
+		if (watchToggle) watchToggle.addEventListener('click', () => updateFarmControl({ watch_enabled: !farmControlState.watch_enabled }));
+		updateFarmSweepButton();
   }
 
   // clearFarmFinishedJobs removes terminal (done/failed) rows from the
@@ -1022,26 +1031,81 @@
   // loadFarmJobs polls GET /api/farm/jobs and renders the active-worker banner
   // + the recent-jobs list. Failures are swallowed (network blip / tab navigated
   // mid-flight) so a transient error doesn't blank the panel mid-session.
-  async function loadFarmJobs() {
+	async function loadFarmJobs() {
     let res;
     try { res = await api('GET', '/api/farm/jobs'); } catch (e) { return; }
     if (!res) return;
-    renderFarmActiveBanner(!!res.available, res.queue_depth || 0);
-    renderFarmJobsList(Array.isArray(res.jobs) ? res.jobs : [], !!res.available);
-  }
+		if (res.control) renderFarmControl(res.control);
+		renderFarmActiveBanner(!!res.available, res.queue_depth || 0, farmControlState,
+			Array.isArray(res.workers) ? res.workers.length : 0);
+		renderFarmJobsList(Array.isArray(res.jobs) ? res.jobs : [], !!res.available);
+	}
+
+	async function updateFarmControl(patch) {
+		if (farmControlInFlight) return;
+		farmControlInFlight = true;
+		const status = $('#farm-control-status');
+		if (status) status.textContent = 'Applying control state…';
+		renderFarmControl(farmControlState);
+		try {
+			const control = await api('PUT', '/api/farm/control', patch);
+			renderFarmControl(control || { ...farmControlState, ...patch });
+			await loadFarmJobs();
+		} catch (e) {
+			if (status) status.textContent = 'Control update failed: ' + (e.message || e);
+		} finally {
+			farmControlInFlight = false;
+			renderFarmControl(farmControlState);
+		}
+	}
+
+	function renderFarmControl(control) {
+		farmControlState = {
+			paused: !!(control && control.paused),
+			watch_enabled: !(control && control.watch_enabled === false),
+		};
+		const queueBtn = $('#farm-queue-toggle');
+		const watchBtn = $('#farm-watch-toggle');
+		const status = $('#farm-control-status');
+		if (queueBtn) {
+			queueBtn.disabled = farmControlInFlight;
+			queueBtn.classList.toggle('engaged', farmControlState.paused);
+			queueBtn.querySelector('.farm-transport-icon').textContent = farmControlState.paused ? '▶' : 'Ⅱ';
+			queueBtn.querySelector('strong').textContent = farmControlState.paused ? 'Resume queue' : 'Pause queue';
+			queueBtn.querySelector('em').textContent = farmControlState.paused
+				? 'Continue claiming queued work across all nodes'
+				: 'Finish active work, then stop claiming jobs';
+		}
+		if (watchBtn) {
+			watchBtn.disabled = farmControlInFlight;
+			watchBtn.classList.toggle('engaged', !farmControlState.watch_enabled);
+			watchBtn.querySelector('strong').textContent = farmControlState.watch_enabled ? 'Discovery on' : 'Discovery off';
+			watchBtn.querySelector('em').textContent = farmControlState.watch_enabled
+				? 'Recursively watch for newly landed media'
+				: 'Filesystem events are retained until re-enabled';
+		}
+		if (status && !farmControlInFlight) {
+			status.textContent = farmControlState.paused
+				? 'Queue paused. Active atomic jobs may still be finishing.'
+				: (farmControlState.watch_enabled ? 'Queue playing · automatic discovery active' : 'Queue playing · automatic discovery disabled');
+		}
+	}
 
   // renderFarmActiveBanner shows worker presence: green + "draining the queue"
   // when ≥1 worker, muted "offline" otherwise. The queue depth ("N waiting")
   // rides along when there's anything queued so the user knows work is pending.
-  function renderFarmActiveBanner(available, depth) {
+	function renderFarmActiveBanner(available, depth, control, workerCount) {
     const banner = $('#farm-active-banner');
     const text = $('#farm-active-text');
     const depthEl = $('#farm-active-depth');
     if (!banner) return;
-    banner.classList.toggle('online', available);
-    banner.classList.toggle('offline', !available);
-    if (available) {
-      text.textContent = 'Farm worker online — draining the queue';
+		banner.classList.toggle('online', available);
+		banner.classList.toggle('offline', !available);
+		banner.classList.toggle('paused', !!control.paused);
+		if (control.paused) {
+			text.textContent = 'Queue paused — ' + workerCount + ' node' + (workerCount === 1 ? '' : 's') + ' standing by';
+		} else if (available) {
+			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') + ' online — routing by measured capability';
     } else {
       text.textContent = 'Farm worker offline — queued jobs will run once it starts';
     }
@@ -1138,7 +1202,7 @@
         });
       }
 
-      const processed = j.processed != null && j.processed !== '' ? Number(j.processed) : null;
+		const processed = j.processed != null && j.processed !== '' ? Number(j.processed) : null;
       const failed = j.failed != null && j.failed !== '' ? Number(j.failed) : null;
       if (processed != null && !Number.isNaN(processed) && processed > 0) {
         const p = document.createElement('span');
@@ -1146,12 +1210,25 @@
         p.textContent = processed.toLocaleString() + ' done';
         meta.appendChild(p);
       }
-      if (failed != null && !Number.isNaN(failed) && failed > 0) {
+		if (failed != null && !Number.isNaN(failed) && failed > 0) {
         const f = document.createElement('span');
         f.className = 'farm-job-count failed';
         f.textContent = failed.toLocaleString() + ' failed';
         meta.appendChild(f);
-      }
+		}
+		for (const [label, value] of [['backend', j.backend], ['target', j.target_worker], ['running on', j.worker]]) {
+			if (!value || (label === 'target' && value === j.worker)) continue;
+			const detail = document.createElement('span');
+			detail.className = 'farm-job-count telemetry';
+			detail.textContent = label + ' ' + value;
+			meta.appendChild(detail);
+		}
+		if (Number(j.attempts || 0) > 0) {
+			const retry = document.createElement('span');
+			retry.className = 'farm-job-count failed';
+			retry.textContent = 'attempt ' + (Number(j.attempts) + 1);
+			meta.appendChild(retry);
+		}
 
       if (meta.childNodes.length) li.appendChild(meta);
 
@@ -1197,8 +1274,8 @@
       desc: 'Renders a sprite sheet of evenly-spaced frames for hover-scrubbing.' },
     { kind: 'waveform',  label: 'Waveform',      tool: 'ffmpeg + audiowaveform',
       desc: 'Decodes the audio and emits a compact JSON waveform for the timeline.' },
-    { kind: 'proxy',     label: 'Proxy',         tool: 'ffmpeg (libx264)',
-      desc: 'Transcodes a lightweight, fast-to-scrub editing copy.' },
+    { kind: 'proxy',     label: 'Proxy',         tool: 'ffmpeg (HEVC-first hardware)',
+      desc: 'Transcodes on a verified accelerator, with an explicit CPU H.264 outage fallback.' },
     { kind: 'ai',        label: 'AI transcript', tool: 'whisper.cpp',
       desc: 'Transcribes spoken audio to searchable, time-coded text.' },
   ];
@@ -3423,13 +3500,26 @@
 
 // ─── JuiceMount Link tab (Tier-2) ────────────────────────────────────────
 let linkInitDone = false;
+let linkPollTimer = null;
+
+function startLinkPolling() {
+  refreshLinkStatus();
+  refreshDevices();
+  if (!linkPollTimer) {
+    linkPollTimer = setInterval(() => {
+      refreshLinkStatus();
+      refreshDevices();
+    }, 5000);
+  }
+}
+
+function stopLinkPolling() {
+  if (linkPollTimer) { clearInterval(linkPollTimer); linkPollTimer = null; }
+}
 
 function initLinkOnce() {
   if (linkInitDone) return;
   linkInitDone = true;
-  refreshLinkStatus();
-  refreshDevices();
-
   document.getElementById('btn-pair')?.addEventListener('click', async () => {
     const btn = document.getElementById('btn-pair');
     btn.disabled = true; btn.textContent = 'Generating…';
@@ -3456,12 +3546,20 @@ function initLinkOnce() {
 async function refreshLinkStatus() {
   try {
     const st = await api('GET', '/api/net/link');
-    document.getElementById('link-enabled').textContent =
-      st.enabled ? '✅ Link active — server: ' + st.server_url
-                 : '⚠️ Link not configured. Set JM_NET_HEADSCALE=on and JM_NET_SERVER_URL in the container env.';
+    const status = document.getElementById('link-status');
+    status.classList.toggle('online', !!st.enabled);
+    status.classList.toggle('offline', !st.enabled);
+    document.getElementById('link-enabled').textContent = st.enabled ? 'Link active' : 'Link not configured';
+    const detail = document.getElementById('link-status-detail');
+    if (detail) detail.textContent = st.enabled
+      ? ('Coordination server ' + (st.server_url || 'online'))
+      : 'Enable Headscale and set the external Link server URL on the Manager container.';
     document.getElementById('link-pair').style.display = st.enabled ? 'block' : 'none';
     document.getElementById('link-devices').style.display = st.enabled ? 'block' : 'none';
-  } catch { document.getElementById('link-enabled').textContent = 'unreachable'; }
+  } catch {
+    document.getElementById('link-enabled').textContent = 'Link status unreachable';
+    document.getElementById('link-status')?.classList.add('offline');
+  }
 }
 
 async function refreshDevices() {
@@ -3488,12 +3586,18 @@ async function refreshDevices() {
       const connected = (cells[colOf('connected')] || '').toLowerCase();
       const lastSeen = cells[colOf('last seen')] || '';
       const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td style="padding:4px 8px">${escHtml(hostname)}</td>
-        <td>${escHtml(ips)}</td>
-        <td>${connected.includes('online') ? '🟢' : '🔴'}</td>
-        <td>${escHtml(lastSeen)}</td>
-        <td><button class="btn btn-sm" onclick="revokeNode('${id}')">Revoke</button></td>`;
+      const values = [hostname, ips, connected.includes('online') ? 'Online' : 'Offline', lastSeen];
+      values.forEach((value, idx) => {
+        const td = document.createElement('td');
+        td.textContent = value;
+        if (idx === 2) td.className = connected.includes('online') ? 'link-node-online' : 'link-node-offline';
+        tr.appendChild(td);
+      });
+      const actions = document.createElement('td');
+      const revoke = document.createElement('button');
+      revoke.type = 'button'; revoke.className = 'btn btn-sm'; revoke.textContent = 'Revoke';
+      revoke.addEventListener('click', () => revokeNode(id));
+      actions.appendChild(revoke); tr.appendChild(actions);
       body.appendChild(tr);
     }
   } catch { /* silent */ }
@@ -3723,13 +3827,6 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
   }
 
 
-  // -------- Boot --------
-  // route() reads location.hash, falls back to DEFAULT_TAB
-  // (#/migrations), and shows the matching <section data-tab>.
-  // showTab → initMigrationsOnce, so visiting the page with the
-  // default route immediately fires the migrator boot path.
-  route();
-
   // ==== FARM NODE CONFIG (FARM-NODE-CONFIG spec) ====
   // The manager owns worker settings: GET /api/farm/config + /api/farm/workers
   // render live state; PUT saves a patch that workers apply on their next loop
@@ -3758,25 +3855,56 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
       list.appendChild(p);
       return;
     }
-    for (const w of ws) {
-      const row = document.createElement('div');
-      row.className = 'farm-worker-row';
-      const name = document.createElement('strong');
-      name.textContent = w.name || ('worker ' + (w.id || '').slice(0, 8));
-      row.appendChild(name);
-      if (Array.isArray(w.capabilities) && w.capabilities.length) {
-        const caps = document.createElement('span');
-        caps.className = 'farm-worker-caps';
-        caps.textContent = w.capabilities.join(' · ');
-        row.appendChild(caps);
-      }
-      if (Array.isArray(w.kinds) && w.kinds.length) {
-        const kinds = document.createElement('span');
-        kinds.className = 'farm-worker-caps';
-        kinds.textContent = 'queues: ' + w.kinds.join(' · ');
-        row.appendChild(kinds);
-      }
-      if (w.config_revision) {
+		for (const w of ws) {
+			const row = document.createElement('div');
+			row.className = 'farm-worker-row farm-worker-card';
+			const head = document.createElement('div');
+			head.className = 'farm-worker-head';
+			const name = document.createElement('strong');
+			name.textContent = w.name || ('worker ' + (w.id || '').slice(0, 8));
+			head.appendChild(name);
+			const role = document.createElement('span');
+			role.className = 'farm-worker-role ' + (w.role || 'legacy');
+			role.textContent = (w.role || 'legacy') + ' node';
+			head.appendChild(role);
+			const state = document.createElement('span');
+			state.className = 'farm-worker-state ' + (w.state || 'idle');
+			state.textContent = w.state || (w.current_job ? 'working' : 'idle');
+			head.appendChild(state);
+			row.appendChild(head);
+
+			const route = document.createElement('p');
+			route.className = 'farm-worker-route';
+			const encoders = Array.isArray(w.encoders) ? w.encoders : [];
+			const transcript = (Array.isArray(w.transcript_backends) ? w.transcript_backends : []).filter((v) => v !== 'cpu');
+			route.textContent = encoders.length
+				? ('Verified video: ' + encoders.join(' · '))
+				: 'Metadata and CPU fallback lane';
+			if (transcript.length) route.textContent += '  /  AI: ' + transcript.join(' · ');
+			row.appendChild(route);
+
+			const bench = w.benchmarks || {};
+			const metrics = document.createElement('div');
+			metrics.className = 'farm-worker-metrics';
+			const metric = (label, value) => {
+				const box = document.createElement('span');
+				const val = document.createElement('strong'); val.textContent = value;
+				const key = document.createElement('em'); key.textContent = label;
+				box.appendChild(val); box.appendChild(key); metrics.appendChild(box);
+			};
+			if (Number(bench.encode_fps) > 0) metric('encode fps', Number(bench.encode_fps).toFixed(1));
+			if (Number(bench.decode_fps) > 0) metric('decode fps', Number(bench.decode_fps).toFixed(1));
+			if (Number(bench.access_mbps) > 0) metric('mount MB/s', Number(bench.access_mbps).toFixed(1));
+			if (Number(bench.transcript_x_realtime) > 0) metric('AI × realtime', Number(bench.transcript_x_realtime).toFixed(2));
+			if (Number(bench.jobs_completed) > 0) metric('jobs observed', Number(bench.jobs_completed).toLocaleString());
+			if (metrics.childNodes.length) row.appendChild(metrics);
+			if (w.current_job) {
+				const current = document.createElement('p');
+				current.className = 'farm-worker-current';
+				current.textContent = 'Current job ' + w.current_job;
+				row.appendChild(current);
+			}
+			if (w.config_revision) {
         const rev = document.createElement('span');
         rev.className = 'farm-worker-rev';
         rev.textContent = 'config r' + w.config_revision;
@@ -3787,9 +3915,15 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
         badge.className = 'farm-worker-badge';
         badge.title = 'Applied after the node container restarts';
         badge.textContent = 'needs restart: ' + w.pending_restart.join(', ');
-        row.appendChild(badge);
-      }
-      list.appendChild(row);
+				row.appendChild(badge);
+			}
+			if (bench.probe_error) {
+				const warning = document.createElement('p');
+				warning.className = 'farm-worker-probe-error';
+				warning.textContent = bench.probe_error;
+				row.appendChild(warning);
+			}
+			list.appendChild(row);
     }
   }
 
@@ -3820,4 +3954,10 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
       setMsg('Save failed: ' + (e && e.message ? e.message : e), false);
     }
   }
+
+  // -------- Boot --------
+  // Keep this after every top-level `let`/`const` initializer. A deep link such
+  // as #/farm immediately calls the tab's lazy initializer; booting earlier
+  // would hit the temporal dead zone for state declared later in this file.
+  route();
 })();

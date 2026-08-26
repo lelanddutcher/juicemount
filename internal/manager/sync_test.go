@@ -121,7 +121,7 @@ func TestApplyUnit(t *testing.T) {
 		{2, "MB", 2 * 1024 * 1024},
 		{2, "MIB", 2 * 1024 * 1024},
 		{0.5, "GB", 0.5 * 1024 * 1024 * 1024},
-		{1, "", 1}, // no unit = pass-through
+		{1, "", 1},    // no unit = pass-through
 		{1, "XYZ", 1}, // unknown unit = pass-through
 	}
 	for _, tc := range cases {
@@ -134,9 +134,9 @@ func TestApplyUnit(t *testing.T) {
 
 func TestNormalizeSourceURI(t *testing.T) {
 	cases := []struct {
-		in        string
-		preserve  bool
-		want      string
+		in       string
+		preserve bool
+		want     string
 	}{
 		// preserve=true → trailing slash always appended (rsync "copy contents")
 		{"/mnt/source", true, "file:///mnt/source/"},

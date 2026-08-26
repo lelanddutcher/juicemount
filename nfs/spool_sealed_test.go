@@ -50,7 +50,7 @@ func TestSealedEndNeverCrossesWrittenData(t *testing.T) {
 		writtenEnd: 4 * gib, contiguousEnd: spoolSealHeadReserve + spoolSealMargin,
 		want: 0,
 	}, {
-		name: "head reserve is absolute: a seal landing inside it yields nothing",
+		name:       "head reserve is absolute: a seal landing inside it yields nothing",
 		writtenEnd: 4 * gib, contiguousEnd: spoolSealHeadReserve,
 		want: 0,
 	}}

@@ -30,8 +30,8 @@ import (
 // "leave that section untouched" — the manager merges with the EXISTING doc so
 // the UI can save one worker's patch without resending global defaults.
 type farmConfigRequest struct {
-	Defaults  *map[string]any            `json:"defaults,omitempty"`
-	Overrides map[string]map[string]any  `json:"overrides,omitempty"` // full replacement of the named worker's patch
+	Defaults  *map[string]any           `json:"defaults,omitempty"`
+	Overrides map[string]map[string]any `json:"overrides,omitempty"` // full replacement of the named worker's patch
 }
 
 // handleFarmConfig serves GET+PUT+DELETE /api/farm/config.

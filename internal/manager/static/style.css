@@ -1,6 +1,6 @@
-/* JuiceMount Manager — minimal, system-native look. Matches the
-   JuiceMount Mac app's design language: SF fonts, light/dark friendly,
-   no framework dependencies, no external CSS.
+/* JuiceMount Manager — an industrial control-room interface. Dense telemetry,
+   clear transport controls, and one coherent light/dark token system; no
+   framework or external font dependency.
 
    SLICE 0 added a sidebar layout: the page is now a two-column grid
    (sidebar + main). The Migrations tab keeps the original three-pane
@@ -11,80 +11,139 @@
 
 :root {
   color-scheme: light dark;
-  --bg: #f6f6f6;
-  --bg-elev: #ffffff;
-  --border: #d0d0d0;
-  --text: #1a1a1a;
-  --text-muted: #6b6b6b;
-  --accent: #007aff;
-  --accent-bg: rgba(0, 122, 255, 0.10);
-  --danger: #d70015;
-  --success: #00875a;
-  --running: #ff9500;
+  --bg: #edf1f3;
+  --bg-elev: #f9fbfc;
+  --panel: #f4f7f8;
+  --card: #ffffff;
+  --border: #c9d1d7;
+  --border-strong: #9ba9b3;
+  --text: #15222b;
+  --text-muted: #61717c;
+  --muted: var(--text-muted);
+  --accent: #be542f;
+  --accent-strong: #8f351a;
+  --accent-bg: rgba(190, 84, 47, 0.11);
+  --danger: #bd2f3d;
+  --success: #087d67;
+  --running: #b36b12;
+  --warn: var(--running);
+  --shadow: 0 14px 40px rgba(25, 38, 47, 0.08);
+  --grid-line: rgba(77, 94, 105, 0.055);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1c1c1e;
-    --bg-elev: #2c2c2e;
-    --border: #3a3a3c;
-    --text: #f2f2f7;
-    --text-muted: #98989d;
-    --accent: #0a84ff;
-    --accent-bg: rgba(10, 132, 255, 0.18);
-    --danger: #ff453a;
-    --success: #30d158;
-    --running: #ff9f0a;
+    --bg: #0b1116;
+    --bg-elev: #111a21;
+    --panel: #152029;
+    --card: #18242d;
+    --border: #293945;
+    --border-strong: #435662;
+    --text: #e8eef1;
+    --text-muted: #91a1ab;
+    --muted: var(--text-muted);
+    --accent: #ff7a46;
+    --accent-strong: #ff9a73;
+    --accent-bg: rgba(255, 122, 70, 0.14);
+    --danger: #ff6572;
+    --success: #46d2aa;
+    --running: #f2b35c;
+    --warn: var(--running);
+    --shadow: 0 18px 52px rgba(0, 0, 0, 0.28);
+    --grid-line: rgba(164, 187, 199, 0.045);
   }
 }
 
 * { box-sizing: border-box; }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  font-family: "Avenir Next", "Segoe UI", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   font-size: 14px;
   line-height: 1.5;
   color: var(--text);
-  background: var(--bg);
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 24px 24px;
   margin: 0;
   padding: 0;
 }
 
-header {
-  padding: 2rem 1.5rem 1rem;
+.app-header {
+  min-height: 82px;
+  padding: 0.9rem clamp(1rem, 3vw, 2.4rem);
   border-bottom: 1px solid var(--border);
-  background: var(--bg-elev);
+  background: color-mix(in srgb, var(--bg-elev) 94%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  backdrop-filter: blur(16px);
 }
 
-header h1 {
+.brand-lockup { display: flex; align-items: center; gap: 0.85rem; }
+.brand-mark {
+  width: 2.5rem;
+  height: 2.5rem;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 6px 14px 6px 6px;
+  font: 700 0.76rem/1 ui-monospace, "SF Mono", Menlo, monospace;
+  letter-spacing: 0.06em;
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.brand-eyebrow, .section-kicker {
+  margin: 0 0 0.1rem;
+  color: var(--accent);
+  font: 700 0.66rem/1.2 ui-monospace, "SF Mono", Menlo, monospace;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.app-header h1 {
   margin: 0;
-  font-size: 1.8rem;
-  font-weight: 600;
-  letter-spacing: -0.02em;
+  font-size: 1.35rem;
+  font-weight: 650;
+  letter-spacing: -0.035em;
 }
 
 .subtitle {
-  margin: 0.25rem 0 0;
+  margin: 0;
   color: var(--text-muted);
-  font-size: 0.95rem;
+  font: 600 0.72rem/1 ui-monospace, "SF Mono", Menlo, monospace;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
+.header-status-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 4px color-mix(in srgb, var(--success) 14%, transparent); }
 
 /* Two-column layout: sidebar (fixed-ish) + main content. Sidebar
    collapses to a horizontal strip on narrow viewports so the tab
    nav stays reachable on iPad / phone. */
 .layout {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 236px minmax(0, 1fr);
   gap: 0;
-  max-width: 1600px;
+  max-width: 1720px;
   margin: 0 auto;
-  min-height: calc(100vh - 180px);
+  min-height: calc(100vh - 82px);
 }
 
 .sidebar {
-  background: var(--bg-elev);
+  background: color-mix(in srgb, var(--bg-elev) 90%, transparent);
   border-right: 1px solid var(--border);
-  padding: 1.25rem 0;
+  padding: 1.25rem 0.8rem;
+  position: sticky;
+  top: 82px;
+  align-self: start;
+  height: calc(100vh - 82px);
 }
 
 .sidebar-list {
@@ -97,12 +156,15 @@ header h1 {
 
 .sidebar-list a {
   display: block;
-  padding: 0.55rem 1.25rem;
+  padding: 0.64rem 0.78rem;
   color: var(--text);
   text-decoration: none;
-  font-size: 0.95rem;
-  font-weight: 500;
-  border-left: 3px solid transparent;
+  font-size: 0.78rem;
+  font-weight: 650;
+  letter-spacing: 0.025em;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  margin-bottom: 0.18rem;
 }
 
 .sidebar-list a:hover {
@@ -111,7 +173,7 @@ header h1 {
 
 .sidebar-list a.active {
   background: var(--accent-bg);
-  border-left-color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
   color: var(--accent);
 }
 
@@ -124,6 +186,8 @@ header h1 {
     border-bottom: 1px solid var(--border);
     padding: 0.5rem 0.5rem;
     overflow-x: auto;
+    position: static;
+    height: auto;
   }
   .sidebar-list {
     display: flex;
@@ -142,8 +206,48 @@ header h1 {
   }
 }
 
+/* JuiceMount Link — live enrollment and presence console. */
+.link-pane { max-width: 1050px; }
+.link-page-header { margin-bottom: 1.35rem; }
+.link-page-header h2 { margin: 0.1rem 0 0.3rem; font-size: clamp(2rem, 4vw, 3.1rem); line-height: 1; letter-spacing: -0.055em; }
+.link-page-header .hint { max-width: 680px; }
+.link-card {
+  margin-bottom: 0.85rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow);
+}
+.link-card h3 { margin: 0.15rem 0 0.3rem; font-size: 1rem; }
+.link-status-card { display: flex; align-items: center; gap: 1rem; border-left: 3px solid var(--border-strong); }
+.link-status-card.online { border-left-color: var(--success); }
+.link-status-light { width: 0.8rem; height: 0.8rem; flex: 0 0 auto; border-radius: 50%; background: var(--text-muted); box-shadow: 0 0 0 6px color-mix(in srgb, var(--text-muted) 10%, transparent); }
+.link-status-card.online .link-status-light { background: var(--success); box-shadow: 0 0 0 6px color-mix(in srgb, var(--success) 12%, transparent); }
+.link-primary-button, .link-card .btn {
+  padding: 0.45rem 0.8rem;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.link-primary-button { color: #fff !important; background: var(--accent) !important; border-color: var(--accent) !important; font-weight: 650; }
+.pair-result { margin-top: 0.9rem; padding-top: 0.85rem; border-top: 1px solid var(--border); }
+.pair-code { display: block; padding: 0.8rem; color: var(--success); background: var(--bg); border: 1px solid var(--border); border-left: 3px solid var(--success); border-radius: 3px; font: 0.78rem/1.5 ui-monospace, "SF Mono", Menlo, monospace; word-break: break-all; }
+.link-devices-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-bottom: 0.65rem; }
+.link-devices-head h3 { margin-bottom: 0; }
+.link-table-wrap { overflow-x: auto; }
+.link-devices-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.link-devices-table th, .link-devices-table td { padding: 0.55rem 0.6rem; text-align: left; border-bottom: 1px solid var(--border); }
+.link-devices-table th { color: var(--text-muted); font: 700 0.65rem/1.2 ui-monospace, "SF Mono", Menlo, monospace; text-transform: uppercase; letter-spacing: 0.06em; }
+.link-node-online, .link-node-offline { font-weight: 650; }
+.link-node-online { color: var(--success); }
+.link-node-offline { color: var(--text-muted); }
+
 main {
-  padding: 1.5rem;
+  padding: clamp(1.25rem, 2.7vw, 2.8rem);
+  min-width: 0;
 }
 
 /* Direction picker (SLICE 1) lives ABOVE the three-pane grid in the
@@ -1284,17 +1388,21 @@ main {
    @media (prefers-color-scheme) rule wins. */
 html[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #1c1c1e; --bg-elev: #2c2c2e; --border: #3a3a3c;
-  --text: #f2f2f7; --text-muted: #98989d;
-  --accent: #0a84ff; --accent-bg: rgba(10, 132, 255, 0.18);
-  --danger: #ff453a; --success: #30d158; --running: #ff9f0a;
+  --bg: #0b1116; --bg-elev: #111a21; --panel: #152029; --card: #18242d;
+  --border: #293945; --border-strong: #435662;
+  --text: #e8eef1; --text-muted: #91a1ab; --muted: var(--text-muted);
+  --accent: #ff7a46; --accent-strong: #ff9a73; --accent-bg: rgba(255, 122, 70, 0.14);
+  --danger: #ff6572; --success: #46d2aa; --running: #f2b35c; --warn: var(--running);
+  --shadow: 0 18px 52px rgba(0, 0, 0, 0.28); --grid-line: rgba(164, 187, 199, 0.045);
 }
 html[data-theme="light"] {
   color-scheme: light;
-  --bg: #f6f6f6; --bg-elev: #ffffff; --border: #d0d0d0;
-  --text: #1a1a1a; --text-muted: #6b6b6b;
-  --accent: #007aff; --accent-bg: rgba(0, 122, 255, 0.10);
-  --danger: #d70015; --success: #00875a; --running: #ff9500;
+  --bg: #edf1f3; --bg-elev: #f9fbfc; --panel: #f4f7f8; --card: #ffffff;
+  --border: #c9d1d7; --border-strong: #9ba9b3;
+  --text: #15222b; --text-muted: #61717c; --muted: var(--text-muted);
+  --accent: #be542f; --accent-strong: #8f351a; --accent-bg: rgba(190, 84, 47, 0.11);
+  --danger: #bd2f3d; --success: #087d67; --running: #b36b12; --warn: var(--running);
+  --shadow: 0 14px 40px rgba(25, 38, 47, 0.08); --grid-line: rgba(77, 94, 105, 0.055);
 }
 
 footer {
@@ -1870,3 +1978,143 @@ footer a:hover { text-decoration: underline; }
 }
 .farm-config-actions { display: flex; align-items: center; gap: 12px; }
 .farm-config-status.ok { color: #1c7d34; }
+
+/* RC control-room pass: Farm is an operational surface first. */
+.farm-pane { max-width: 1280px; }
+.farm-page-header { margin-bottom: 1.4rem !important; }
+.farm-page-header h2 {
+  font-size: clamp(2rem, 4vw, 3.2rem) !important;
+  line-height: 1;
+  letter-spacing: -0.055em;
+  font-weight: 650 !important;
+}
+.farm-page-header .hint { max-width: 760px; font-size: 0.94rem; }
+.farm-generate {
+  padding: clamp(1rem, 2.5vw, 1.6rem);
+  border-top: 3px solid var(--accent);
+  border-radius: 5px 5px 10px 10px;
+  box-shadow: var(--shadow);
+}
+.farm-generate-title {
+  color: var(--text);
+  font-size: 1.35rem;
+  text-transform: none;
+  letter-spacing: -0.025em;
+}
+.farm-active-banner { border-radius: 5px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.farm-active-banner.paused {
+  border-left-color: var(--running);
+  background: color-mix(in srgb, var(--running) 10%, var(--bg));
+}
+.farm-active-banner.paused .farm-active-dot { background: var(--running); animation: none; }
+.farm-control-deck {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(240px, 1fr));
+  gap: 0.7rem;
+  margin-bottom: 1.5rem;
+}
+.farm-transport {
+  display: grid;
+  grid-template-columns: 2.4rem 1fr;
+  align-items: center;
+  gap: 0.75rem;
+  min-height: 4.4rem;
+  padding: 0.7rem 0.85rem;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  text-align: left;
+  cursor: pointer;
+}
+.farm-transport:hover:not(:disabled) { border-color: var(--accent); transform: translateY(-1px); }
+.farm-transport:disabled { opacity: 0.55; cursor: wait; }
+.farm-transport.engaged { border-color: var(--running); background: color-mix(in srgb, var(--running) 9%, var(--panel)); }
+.farm-transport-icon {
+  width: 2.35rem;
+  height: 2.35rem;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  color: var(--accent);
+  font: 700 0.95rem/1 ui-monospace, "SF Mono", Menlo, monospace;
+}
+.farm-transport span:last-child { display: flex; flex-direction: column; min-width: 0; }
+.farm-transport strong { font-size: 0.88rem; }
+.farm-transport em { color: var(--text-muted); font-size: 0.74rem; font-style: normal; margin-top: 0.12rem; }
+.farm-control-status {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--text-muted);
+  font: 0.72rem/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+}
+.farm-node-section {
+  margin: 0 0 0.8rem;
+  padding: 1rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+.farm-node-section .farm-jobs-title { margin-top: 0.18rem; color: var(--text); font-size: 0.92rem; }
+.farm-routing-note { color: var(--text-muted); font: 0.7rem/1.3 ui-monospace, "SF Mono", Menlo, monospace; }
+.farm-workers-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 0.7rem;
+  margin: 0;
+}
+.farm-worker-card {
+  display: block;
+  padding: 0.85rem;
+  background: var(--card);
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  min-width: 0;
+}
+.farm-worker-head { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; }
+.farm-worker-head > strong { margin-right: auto; font-size: 0.93rem; }
+.farm-worker-role, .farm-worker-state {
+  padding: 0.12rem 0.42rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font: 700 0.62rem/1.25 ui-monospace, "SF Mono", Menlo, monospace;
+  text-transform: uppercase;
+}
+.farm-worker-role.render { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 44%, var(--border)); background: var(--accent-bg); }
+.farm-worker-state.working { color: var(--success); }
+.farm-worker-state.paused { color: var(--running); }
+.farm-worker-route { margin: 0.6rem 0; color: var(--text-muted); font: 0.73rem/1.45 ui-monospace, "SF Mono", Menlo, monospace; overflow-wrap: anywhere; }
+.farm-worker-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 0.4rem; }
+.farm-worker-metrics > span { padding: 0.45rem; background: var(--panel); border-left: 2px solid var(--accent); }
+.farm-worker-metrics strong { display: block; font: 700 0.84rem/1.2 ui-monospace, "SF Mono", Menlo, monospace; }
+.farm-worker-metrics em { display: block; color: var(--text-muted); font-size: 0.61rem; font-style: normal; text-transform: uppercase; letter-spacing: 0.04em; }
+.farm-worker-current, .farm-worker-probe-error { margin: 0.55rem 0 0; font: 0.68rem/1.4 ui-monospace, "SF Mono", Menlo, monospace; }
+.farm-worker-current { color: var(--success); }
+.farm-worker-probe-error { color: var(--running); }
+.farm-worker-rev { display: inline-block; margin-top: 0.45rem; }
+.farm-worker-badge { background: color-mix(in srgb, var(--running) 12%, var(--panel)); color: var(--running); border-color: color-mix(in srgb, var(--running) 45%, var(--border)); }
+.farm-config-drawer, .farm-manual-drawer {
+  margin: 0.7rem 0;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+}
+.farm-config-drawer summary, .farm-manual-drawer summary { cursor: pointer; color: var(--text-muted); font-size: 0.8rem; font-weight: 650; }
+.farm-manual-drawer[open] summary, .farm-config-drawer[open] summary { color: var(--accent); }
+.farm-manual-drawer .farm-sweep-form { margin: 0.9rem 0 0; }
+.farm-config-grid input, .farm-config-grid select { color: var(--text); }
+.farm-job-row { border-radius: 4px; border-left: 3px solid var(--border-strong); }
+.farm-job-row:has(.farm-job-chip.running) { border-left-color: var(--accent); }
+.farm-job-row:has(.farm-job-chip.failed) { border-left-color: var(--danger); }
+.farm-job-count.telemetry { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--accent); }
+
+@media (max-width: 720px) {
+  .app-header { position: static; min-height: auto; }
+  .app-header .subtitle { display: none; }
+  .farm-control-deck { grid-template-columns: 1fr; }
+  .farm-control-status { grid-column: 1; }
+  .farm-routing-note { display: none; }
+}

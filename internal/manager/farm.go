@@ -24,6 +24,8 @@ type farmQueue interface {
 	QueueDepth(ctx context.Context) (int64, error)
 	ListJobs(ctx context.Context, n int) ([]farmqueue.JobStatus, error)
 	ClearFinished(ctx context.Context) (int, error)
+	GetControl(ctx context.Context) (farmqueue.FarmControl, error)
+	StoreControl(ctx context.Context, ctl farmqueue.FarmControl, forceRevision int64) (int64, error)
 }
 
 // Compile-time proof the real client implements the manager's queue slice.
@@ -149,22 +151,34 @@ func (a *API) handleFarmSweep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job := farmqueue.NewJob(req.Path, req.Kinds, "manager")
-	applyFarmSweepOptions(&job, req.Options)
-
 	ctx, cancel := context.WithTimeout(r.Context(), farmQueueProbeTimeout)
 	defer cancel()
-	if err := a.farmQ.Enqueue(ctx, job); err != nil {
-		// Contract (FARM_QUEUE_PROTOCOL.md, Manager HTTP surface): "503 if
-		// Redis/meta unavailable" — an enqueue that can't reach Redis is the
-		// unavailable case, not a manager bug, so 503 (retryable) not 500.
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": "enqueue failed (Redis/meta unreachable): " + err.Error(),
-		})
-		return
+	kinds := req.Kinds
+	for _, kind := range req.Kinds {
+		if kind == farmqueue.KindAll {
+			kinds = farmqueue.AllKinds()
+			break
+		}
+	}
+	var firstID string
+	for _, kind := range kinds {
+		job := farmqueue.NewJob(req.Path, []string{kind}, "manager")
+		applyFarmSweepOptions(&job, req.Options)
+		if err := a.farmQ.Enqueue(ctx, job); err != nil {
+			// Contract (FARM_QUEUE_PROTOCOL.md, Manager HTTP surface): "503 if
+			// Redis/meta unavailable" — an enqueue that can't reach Redis is the
+			// unavailable case, not a manager bug, so 503 (retryable) not 500.
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "enqueue failed (Redis/meta unreachable): " + err.Error(),
+			})
+			return
+		}
+		if firstID == "" {
+			firstID = job.ID
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":     job.ID,
+		"id":     firstID,
 		"status": "queued",
 	})
 }
@@ -223,6 +237,10 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 	workers, _ := a.farmQ.ActiveWorkers(ctx)
 	depth, _ := a.farmQ.QueueDepth(ctx)
 	jobs, _ := a.farmQ.ListJobs(ctx, farmRecentJobsLimit)
+	control, controlErr := a.farmQ.GetControl(ctx)
+	if controlErr != nil {
+		control = farmqueue.DefaultFarmControl()
+	}
 	// Normalize nil slices to non-nil so the JSON shape is stable
 	// (`[]` not `null`) — a hard rule in this codebase (Go↔Swift null
 	// discipline) and friendlier for the JS consumer.
@@ -237,6 +255,7 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 		"workers":     workers,
 		"queue_depth": depth,
 		"jobs":        jobs,
+		"control":     control,
 	})
 }
 

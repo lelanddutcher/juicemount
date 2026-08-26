@@ -100,10 +100,10 @@ type MaintenanceOp struct {
 	Error      string           `json:"error,omitempty"`
 
 	// runtime-only — not serialized
-	mu        sync.Mutex          `json:"-"`
-	cancel    context.CancelFunc  `json:"-"`
-	listeners []chan string       `json:"-"`
-	truncated bool                `json:"-"`
+	mu        sync.Mutex         `json:"-"`
+	cancel    context.CancelFunc `json:"-"`
+	listeners []chan string      `json:"-"`
+	truncated bool               `json:"-"`
 }
 
 // MaintenanceRunner is the subprocess-execution indirection. Default

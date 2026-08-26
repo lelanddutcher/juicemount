@@ -17,6 +17,7 @@ type fakeFarmQ struct {
 	stored  int
 	deleted int
 	workers []farmqueue.Worker
+	control farmqueue.FarmControl
 }
 
 func (f *fakeFarmQ) Enqueue(ctx context.Context, j farmqueue.Job) error { return nil }
@@ -28,6 +29,21 @@ func (f *fakeFarmQ) ListJobs(ctx context.Context, n int) ([]farmqueue.JobStatus,
 	return nil, nil
 }
 func (f *fakeFarmQ) ClearFinished(ctx context.Context) (int, error) { return 0, nil }
+func (f *fakeFarmQ) GetControl(ctx context.Context) (farmqueue.FarmControl, error) {
+	if f.control.Revision == 0 && !f.control.WatchEnabled {
+		return farmqueue.DefaultFarmControl(), nil
+	}
+	return f.control, nil
+}
+func (f *fakeFarmQ) StoreControl(ctx context.Context, ctl farmqueue.FarmControl, force int64) (int64, error) {
+	if force > 0 {
+		ctl.Revision = force
+	} else {
+		ctl.Revision = f.control.Revision + 1
+	}
+	f.control = ctl
+	return ctl.Revision, nil
+}
 
 func (f *fakeFarmQ) GetConfig(ctx context.Context) (*farmqueue.FarmConfig, error) {
 	return f.cfg, nil

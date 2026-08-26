@@ -24,12 +24,12 @@ func TestProxyEncodeArgsUsesEncoderFamilySpecificFlags(t *testing.T) {
 		},
 		{
 			vcodec: "h264_vaapi",
-			want:   []string{"-vaapi_device", "/dev/dri/renderD128", "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp"},
+			want:   []string{"-vf", "scale_vaapi=format=nv12", "-c:v", "h264_vaapi", "-qp"},
 			absent: []string{"-crf", "-preset", "-pix_fmt", "-global_quality"},
 		},
 		{
 			vcodec: "hevc_vaapi",
-			want:   []string{"-vaapi_device", "-c:v", "hevc_vaapi", "-qp"},
+			want:   []string{"scale_vaapi=format=nv12", "-c:v", "hevc_vaapi", "-qp"},
 			absent: []string{"-crf", "-preset"},
 		},
 		{
@@ -39,7 +39,7 @@ func TestProxyEncodeArgsUsesEncoderFamilySpecificFlags(t *testing.T) {
 		},
 		{
 			vcodec: "hevc_nvenc",
-			want:   []string{"-c:v", "hevc_nvenc", "-pix_fmt", "yuv420p", "-cq", "-preset"},
+			want:   []string{"-c:v", "hevc_nvenc", "-cq", "-preset"},
 			absent: []string{"-vaapi_device", "-global_quality", "-crf"},
 		},
 	}
@@ -68,5 +68,22 @@ func TestProxyEncodeArgsFamilyDefaults(t *testing.T) {
 				t.Fatal("no encoder arguments")
 			}
 		})
+	}
+}
+
+func TestProxyDecodeArgsNeverSilentlyUseCPUForHardwareEncoder(t *testing.T) {
+	cases := map[string]string{
+		"hevc_vaapi": "vaapi",
+		"hevc_qsv":   "qsv",
+		"hevc_nvenc": "cuda",
+	}
+	for codec, accelerator := range cases {
+		args := proxyDecodeArgs(codec)
+		if !hasArg(args, "-hwaccel") || !hasArg(args, accelerator) {
+			t.Fatalf("%s decode args = %v, want explicit %s hwaccel", codec, args, accelerator)
+		}
+	}
+	if args := proxyDecodeArgs("libx264"); len(args) != 0 {
+		t.Fatalf("CPU fallback decode args = %v, want no hwaccel override", args)
 	}
 }

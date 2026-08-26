@@ -44,6 +44,9 @@ mkdir -p "$BUILD_DIR"
 # changed under an unchanged mtime. Removing the .a/.h pair so the
 # subsequent build creates fresh inodes.
 rm -f "$BUILD_DIR/libnfsd.a" "$BUILD_DIR/libnfsd.h"
+MACOSX_DEPLOYMENT_TARGET=14.0 \
+CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=14.0" \
+CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=14.0" \
 CGO_ENABLED=1 go build \
     -buildmode=c-archive \
     -o "$BUILD_DIR/libnfsd.a" \

@@ -9,6 +9,7 @@ func TestJobStatusRoundTrip(t *testing.T) {
 		ID: "abc123", Status: StatusRunning, Path: "/jfs/a/b", Kinds: "proxy,transcript",
 		Producer: "manager", EnqueuedAt: "2026-06-25T12:00:00Z",
 		StartedAt: "2026-06-25T12:00:05Z", Processed: 7, Failed: 1, Error: "boom",
+		Worker: "gpu-1", TargetWorker: "gpu-1", Backend: "hevc_vaapi", QueueClass: QueueClassRender, Attempts: 1,
 	}
 	// toMap stores ints as strings (Redis HASH is all-strings); reconstitute
 	// via a string map mirroring HGETALL.

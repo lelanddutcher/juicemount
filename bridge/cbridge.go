@@ -238,8 +238,20 @@ func (c ServerConfig) reconcileInterval() time.Duration {
 
 var (
 	linkMu         sync.Mutex
+	linkTestMu     sync.Mutex
 	globalLinkNode *jmnfs.LinkNode
 )
+
+type linkTestResult struct {
+	OK               bool     `json:"ok"`
+	Authorized       bool     `json:"authorized"`
+	Online           bool     `json:"online"`
+	BackendReachable bool     `json:"backend_reachable"`
+	Hostname         string   `json:"hostname,omitempty"`
+	Addresses        []string `json:"addresses"`
+	RTTMS            int64    `json:"rtt_ms,omitempty"`
+	Error            string   `json:"error,omitempty"`
+}
 
 // linkStateDir keeps the tsnet machine identity next to the app's metadata
 // mirror. /tmp made every launch look like a new device and required another
@@ -339,6 +351,78 @@ func stopLinkNode(node *jmnfs.LinkNode) {
 	}
 	linkMu.Unlock()
 	node.Stop()
+}
+
+//export NFSServerLinkTest
+func NFSServerLinkTest(configJSON *C.char) *C.char {
+	result := linkTestResult{Addresses: []string{}}
+	encode := func() *C.char {
+		raw, _ := json.Marshal(result)
+		return C.CString(string(raw))
+	}
+	if configJSON == nil {
+		result.Error = "missing configuration"
+		return encode()
+	}
+	var cfg ServerConfig
+	if err := json.Unmarshal([]byte(C.GoString(configJSON)), &cfg); err != nil {
+		result.Error = "invalid configuration: " + err.Error()
+		return encode()
+	}
+	result.Hostname = cfg.NetHostname
+	if cfg.NetControlURL == "" || cfg.NetAuthKey == "" {
+		result.Error = "server URL and pairing code are required"
+		return encode()
+	}
+	if cfg.RedisURL == "" {
+		result.Error = "Redis endpoint is required to test the remote route"
+		return encode()
+	}
+
+	// A pairing test is serialized because tsnet owns a persistent machine
+	// identity directory. Concurrent Up calls against it corrupt the very state
+	// this operation is meant to validate.
+	linkTestMu.Lock()
+	defer linkTestMu.Unlock()
+	linkMu.Lock()
+	node := globalLinkNode
+	linkMu.Unlock()
+	if node == nil {
+		var err error
+		node, result.Addresses, err = jmnfs.StartLinkNode(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, linkStateDir(cfg))
+		if err != nil {
+			result.Error = err.Error()
+			return encode()
+		}
+		linkMu.Lock()
+		if globalLinkNode == nil {
+			globalLinkNode = node
+		} else {
+			existing := globalLinkNode
+			linkMu.Unlock()
+			node.Stop()
+			node = existing
+			result.Addresses = node.Addresses()
+			goto joined
+		}
+		linkMu.Unlock()
+	} else {
+		result.Addresses = node.Addresses()
+	}
+
+joined:
+	result.Authorized = true
+	result.Online = true
+	rtt, err := node.ProbeEndpoint(cfg.RedisURL, "6379", 12*time.Second)
+	if err != nil {
+		result.Error = "paired, but the NAS backend route is unavailable: " + err.Error()
+		return encode()
+	}
+	result.BackendReachable = true
+	result.RTTMS = rtt.Milliseconds()
+	result.OK = true
+	netprofile.Default().ObserveRTT(rtt)
+	return encode()
 }
 
 //export NFSServerStart

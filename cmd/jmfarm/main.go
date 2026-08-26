@@ -373,6 +373,7 @@ func main() {
 		// -transcript-device selects whisper.cpp's backend (vulkan/cuda/sycl).
 		wName   = flag.String("name", defaultStr(os.Getenv("JM_WORKER_NAME"), ""), "stable worker name (manager per-node overrides key)")
 		wKinds  = flag.String("kinds", os.Getenv("JM_FARM_KINDS"), "comma-separated kinds this worker drains from dedicated queues (e.g. transcript,proxy); empty = catch-all only")
+		wRole   = flag.String("role", defaultStr(os.Getenv("JM_WORKER_ROLE"), "auto"), "worker role: auto|server|render (render requires a verified accelerator)")
 		wDevice = flag.String("transcript-device", defaultStr(os.Getenv("JM_FARM_TRANSCRIPT_DEVICE"), "cpu"), "whisper.cpp compute device: cpu|vulkan|cuda|sycl")
 	)
 	flag.Parse()
@@ -496,6 +497,7 @@ func main() {
 			postAlways: *postAlways,
 			name:       *wName,
 			kinds:      splitKinds(*wKinds),
+			role:       strings.ToLower(strings.TrimSpace(*wRole)),
 			tDevice:    *wDevice,
 		})
 		return
@@ -619,7 +621,38 @@ type queueConfig struct {
 	// Manager-config integration (FARM-NODE-CONFIG spec):
 	name    string   // stable worker identity (JM_WORKER_NAME / -name)
 	kinds   []string // declared kinds → per-kind queue drain + watch filter
+	role    string   // auto|server|render; render is admitted only after live probes
 	tDevice string   // whisper compute device (cpu|vulkan|cuda|sycl)
+}
+
+// restartConfigDrift keeps the Manager's restart badge honest. A config
+// document may include restart-class values even when the entrypoint already
+// launched this worker with those exact settings; only actual drift should be
+// reported as requiring a restart.
+func restartConfigDrift(effective map[string]any, requested []string, nice, ionice int) []string {
+	current := map[string]int{"nice": nice, "ionice": ionice}
+	var drift []string
+	for _, key := range requested {
+		want, ok := configInteger(effective[key])
+		got, known := current[key]
+		if !known || !ok || want != got {
+			drift = append(drift, key)
+		}
+	}
+	return drift
+}
+
+func configInteger(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), n == float64(int(n))
+	case int:
+		return n, true
+	case int64:
+		return int(n), int64(int(n)) == n
+	default:
+		return 0, false
+	}
 }
 
 // runQueue is the JM-16 standing worker. It dials the queue Redis, opens the
@@ -654,15 +687,27 @@ func runQueue(cfg queueConfig) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	worker := farmqueue.Worker{
-		ID:           farmqueue.NewID(),
-		StartedAt:    time.Now().UTC().Format(time.RFC3339),
-		Name:         cfg.name,
-		Kinds:        farmqueue.DrainKinds(cfg.kinds),
-		Capabilities: detectCapabilities(cfg.tDevice),
+	profile, profileErr := probeWorkerProfile(cfg)
+	if profileErr != nil {
+		fmt.Fprintf(os.Stderr, "jmfarm: worker capability admission failed: %v\n", profileErr)
+		os.Exit(1)
 	}
-	fmt.Printf("jmfarm queue: worker %s (name=%q kinds=%v caps=%v) draining %s (db=%s mount=%s producer=%s)\n",
-		worker.ID, worker.Name, worker.Kinds, worker.Capabilities, cfg.meta, cfg.dbPath, cfg.mount, cfg.producer)
+	worker := farmqueue.Worker{
+		ID:                 farmqueue.NewID(),
+		StartedAt:          time.Now().UTC().Format(time.RFC3339),
+		Name:               cfg.name,
+		Kinds:              farmqueue.DrainKinds(cfg.kinds),
+		Capabilities:       profile.Capabilities,
+		Role:               profile.Role,
+		Encoders:           profile.Encoders,
+		Decoders:           profile.Decoders,
+		TranscriptBackends: profile.TranscriptBackends,
+		Benchmarks:         profile.Benchmarks,
+		State:              "idle",
+	}
+	fmt.Printf("jmfarm queue: worker %s (name=%q role=%s encoders=%v transcript=%v caps=%v) draining %s (db=%s mount=%s producer=%s)\n",
+		worker.ID, worker.Name, worker.Role, worker.Encoders, worker.TranscriptBackends,
+		worker.Capabilities, cfg.meta, cfg.dbPath, cfg.mount, cfg.producer)
 
 	// Manager-config state: last revision applied + restart-class drift. The
 	// config doc is polled every loop iteration (idle or post-job); hot knobs
@@ -677,7 +722,7 @@ func runQueue(cfg queueConfig) {
 		cfgMu.Lock()
 		defer cfgMu.Unlock()
 		appliedRev = fc.Revision
-		pendingRestart = append([]string(nil), restart...)
+		pendingRestart = restartConfigDrift(eff, restart, cfg.gNice, cfg.gIONice)
 		// Hot knobs → mutate the live run-defaults (guarded by cfgMu; runJob
 		// reads them through effectiveConfig so a job never sees a torn read).
 		if v, ok := eff["crf"].(float64); ok && v >= 1 && v <= 51 {
@@ -743,23 +788,43 @@ func runQueue(cfg queueConfig) {
 		}
 	}
 
-	// Wave-3 auto-discovery: subscribe to the volume's keyspace events and
-	// self-enqueue derivative jobs for directories where new media settles —
-	// the farm no longer waits for a manager sweep to notice ingests. Runs in
-	// this process beside the drain loop; jobs it enqueues flow through the
-	// exact same BRPOP path below. JM_FARM_WATCH=0 disables.
+	// Automatic discovery runs on every worker but only the short-leased leader
+	// is allowed to enqueue. Non-leaders retain their dirty set, which gives a
+	// replacement leader immediate context after a node disappears.
 	if farm.WatchEnabled() {
 		kinds := farm.WatchKindsFromEnv()
+		var watchLeader atomic.Bool
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				ctl, ctlErr := q.GetControl(ctx)
+				if ctlErr == nil && !ctl.Paused && ctl.WatchEnabled {
+					leader, leaderErr := q.AcquireWatchLeadership(ctx, worker.ID, 45*time.Second)
+					watchLeader.Store(leaderErr == nil && leader)
+				} else {
+					watchLeader.Store(false)
+					_ = q.ReleaseWatchLeadership(context.Background(), worker.ID)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
 		watcher := farm.NewWatcher(farm.WatchConfig{
 			MetaURL: cfg.meta,
 			Mount:   cfg.mount,
+			Enabled: func(context.Context) bool { return watchLeader.Load() },
 			Enqueue: func(ectx context.Context, relDir string) error {
 				// Job.Path is worker-absolute by convention (runJob walks it
 				// verbatim; the manager passes its callers' /jfs paths through
 				// unmodified) — live-proven: a mount-relative path fails the
 				// runner's lstat. The watcher core stays mount-relative for
 				// filtering; join here at the seam.
-				return q.Enqueue(ectx, farmqueue.NewJob(filepath.Join(cfg.mount, relDir), kinds, "farm-watch"))
+				_, err := q.EnqueueDiscovered(ectx, filepath.Join(cfg.mount, relDir), kinds, "farm-watch")
+				return err
 			},
 			Logf: func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) },
 		})
@@ -768,10 +833,13 @@ func runQueue(cfg queueConfig) {
 				fmt.Fprintf(os.Stderr, "farm watch: exited: %v (manager sweeps remain the discovery path)\n", err)
 			}
 		}()
+		go runWatchBackstop(ctx, cfg, q, worker.ID, kinds)
+		defer q.ReleaseWatchLeadership(context.Background(), worker.ID)
 	} else {
 		fmt.Fprintln(os.Stderr, "farm watch: disabled (JM_FARM_WATCH=0)")
 	}
 
+	nextReap := time.Time{}
 	for {
 		if ctx.Err() != nil {
 			break
@@ -780,22 +848,52 @@ func runQueue(cfg queueConfig) {
 		// Manager-config poll: cheap GET; applies only on revision change.
 		pollConfig()
 
-		// Heartbeat (idle): publish presence so a producer sees the farm is draining.
+		ctl, ctlErr := q.GetControl(ctx)
+		if ctlErr != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm queue: control poll: %v\n", ctlErr)
+			ctl = farmqueue.DefaultFarmControl()
+		}
+
+		// Heartbeat (idle/paused): publish presence so Manager can distinguish a
+		// healthy paused node from an offline one.
 		worker.CurrentJob = ""
+		worker.State = "idle"
+		if ctl.Paused {
+			worker.State = "paused"
+		}
 		setHeartbeatExtras(&worker)
 		if err := q.Heartbeat(ctx, worker); err != nil && ctx.Err() == nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: heartbeat: %v\n", err)
 		}
 
-		// Block up to 5s for a job across the worker's declared kind queues,
-		// falling back to the catch-all (DequeueKinds always appends it last).
-		job, ok, err := q.DequeueKinds(ctx, 5*time.Second, cfg.kinds)
+		if ctl.Paused {
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		if nextReap.IsZero() || time.Now().After(nextReap) {
+			if recovered, err := q.RecoverAbandonedWorkers(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: recovery scan: %v\n", err)
+			} else if recovered > 0 {
+				fmt.Printf("jmfarm queue: recovered %d abandoned job(s)\n", recovered)
+			}
+			if recovered, err := q.RecoverUnserviceableReady(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: ready-lane recovery: %v\n", err)
+			} else if recovered > 0 {
+				fmt.Printf("jmfarm queue: re-routed %d unserviceable render job(s)\n", recovered)
+			}
+			nextReap = time.Now().Add(15 * time.Second)
+		}
+
+		claim, ok, err := q.ClaimForWorker(ctx, 5*time.Second, worker)
 		if err != nil {
 			if ctx.Err() != nil {
 				break // cancelled mid-BRPOP → clean exit
 			}
 			// Redis disconnect / transient error: log + back off briefly, keep looping.
-			fmt.Fprintf(os.Stderr, "jmfarm queue: dequeue: %v\n", err)
+			fmt.Fprintf(os.Stderr, "jmfarm queue: claim: %v\n", err)
 			select {
 			case <-ctx.Done():
 			case <-time.After(2 * time.Second):
@@ -805,14 +903,16 @@ func runQueue(cfg queueConfig) {
 		if !ok {
 			continue // timeout, nothing waiting → loop re-heartbeats
 		}
+		job := claim.Job
 
 		// Claim the job: stamp current_job on the heartbeat, flip it to running.
 		worker.CurrentJob = job.ID
+		worker.State = "working"
 		setHeartbeatExtras(&worker)
 		if err := q.Heartbeat(ctx, worker); err != nil && ctx.Err() == nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: heartbeat(claim): %v\n", err)
 		}
-		if err := q.MarkRunning(ctx, job.ID); err != nil && ctx.Err() == nil {
+		if err := q.MarkClaimRunning(ctx, claim, worker); err != nil && ctx.Err() == nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: mark-running %s: %v\n", job.ID, err)
 		}
 
@@ -822,7 +922,10 @@ func runQueue(cfg queueConfig) {
 		// (ActiveWorkers empty) even though it's actively processing. A ~10s
 		// ticker (well inside WorkerTTL) holds it alive until the job returns.
 		hbCtx, hbStop := context.WithCancel(ctx)
+		hbDone := make(chan struct{})
+		hbWorker := worker
 		go func() {
+			defer close(hbDone)
 			t := time.NewTicker(10 * time.Second)
 			defer t.Stop()
 			for {
@@ -830,20 +933,57 @@ func runQueue(cfg queueConfig) {
 				case <-hbCtx.Done():
 					return
 				case <-t.C:
-					_ = q.Heartbeat(context.Background(), worker)
+					_ = q.Heartbeat(context.Background(), hbWorker)
+					_ = q.RenewClaim(context.Background(), claim)
 				}
 			}
 		}()
 
-		processed, failed, runErr := runJob(ctx, store, cfg, worker, job)
+		cfgMu.Lock()
+		jobCfg := cfg
+		cfgMu.Unlock()
+		jobStarted := time.Now()
+		processed, failed, runErr := runJob(ctx, store, jobCfg, worker, job)
 		hbStop()
+		<-hbDone
+		worker.Benchmarks.LastJobSeconds = time.Since(jobStarted).Seconds()
+		worker.Benchmarks.JobsCompleted++
+		if ctx.Err() != nil {
+			// Leave the durable processing receipt intact. A live worker will
+			// recover it after this heartbeat expires.
+			break
+		}
+		fallback := worker.Role == farmqueue.QueueClassRender && job.Attempts < 1 &&
+			(runErr != nil || (failed > 0 && processed == 0))
+		if fallback {
+			reason := "render backend failed; queued explicit CPU/H.264 fallback"
+			if runErr != nil {
+				reason = runErr.Error()
+			}
+			if err := q.RequeueClaim(context.Background(), claim, true, reason); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: fallback requeue %s: %v\n", job.ID, err)
+			}
+			continue
+		}
+		terminalWritten := false
 		if runErr != nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: job %s failed: %v\n", job.ID, runErr)
 			if err := q.MarkFailed(context.Background(), job.ID, runErr.Error()); err != nil {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-failed %s: %v\n", job.ID, err)
+			} else {
+				terminalWritten = true
 			}
-		} else if err := q.MarkDone(context.Background(), job.ID, processed, failed); err != nil {
-			fmt.Fprintf(os.Stderr, "jmfarm queue: mark-done %s: %v\n", job.ID, err)
+		} else {
+			if err := q.MarkDone(context.Background(), job.ID, processed, failed); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-done %s: %v\n", job.ID, err)
+			} else {
+				terminalWritten = true
+			}
+		}
+		if terminalWritten {
+			if err := q.AckClaim(context.Background(), claim); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: ack %s: %v\n", job.ID, err)
+			}
 		}
 	}
 
@@ -855,6 +995,9 @@ func runQueue(cfg queueConfig) {
 // the summed processed/failed across the selected passes; a non-nil error is a
 // HARD failure (couldn't collect targets / nothing usable) → MarkFailed.
 func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, worker farmqueue.Worker, job farmqueue.Job) (processed, failed int, err error) {
+	if !farmqueue.WorkerSupports(worker, job.RequiredCapabilities) {
+		return 0, 0, fmt.Errorf("worker %s does not satisfy job capabilities %v", worker.Name, job.RequiredCapabilities)
+	}
 	// Resolve per-job overrides over the container defaults (zero ⇒ keep default).
 	crf := cfg.crf
 	if job.CRF != 0 {
@@ -879,6 +1022,10 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 	pConc := cfg.pConc
 	if job.ProxyWorkers > 0 {
 		pConc = job.ProxyWorkers
+	}
+	tDevice := cfg.tDevice
+	if len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindTranscript && job.SelectedBackend != "" {
+		tDevice = job.SelectedBackend
 	}
 
 	// Collect the media under the job's path once; every selected pass sweeps the
@@ -948,7 +1095,7 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		Blobs: true, ThumbMaxDim: cfg.thumbDim, Filmstrip: true, FilmstripCell: cfg.filmCell,
 		Waveform: true, WaveformSPP: cfg.waveSPP,
 		WhisperBin: cfg.wBin, WhisperModel: wModel,
-		TranscriptDevice: cfg.tDevice,
+		TranscriptDevice: tDevice,
 		ProxyVCodec:      vcodec, ProxyCRF: crf, ProxyPreset: preset,
 		MinBlobSizeBytes: cfg.minSize,
 		PosterAlways:     cfg.postAlways,
@@ -1028,6 +1175,7 @@ func detectCapabilities(tDevice string) []string {
 // NAME (e.g. "large-v3") maps to the baked default location or the on-demand
 // download dir the entrypoint uses (/models/ggml-<name>.bin or /state/models/...).
 func resolveModelPath(ref string) string {
+	ref = normalizeModelReference(ref)
 	if ref == "" {
 		return ref
 	}
@@ -1043,6 +1191,14 @@ func resolveModelPath(ref string) string {
 		}
 	}
 	return ref // let whisper fail loudly with the name; entrypoint may fetch it
+}
+
+// normalizeModelReference accepts the portable contract identifier Manager
+// stores as well as a raw model name. "whisper.cpp/medium.en" is an identity,
+// not a filesystem path; treating its slash as a path prevents model loading.
+func normalizeModelReference(ref string) string {
+	ref = strings.TrimSpace(ref)
+	return strings.TrimPrefix(ref, "whisper.cpp/")
 }
 
 // normalizeKinds expands a job's kinds list into the concrete passes to run.

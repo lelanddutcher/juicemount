@@ -13,8 +13,9 @@
 #   -v /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:ro
 #                                           (use the host iHD driver for newer Intel GPUs)
 #   -e JM_FARM_TRANSCRIPT_DEVICE=vulkan    (whisper → GPU)
-#   -e JM_FARM_VCODEC=h264_vaapi           (H.264 proxy encode → GPU; use
-#                                          hevc_vaapi only as an explicit HEVC opt-in)
+#   -e JM_FARM_VCODEC=hevc_vaapi           (HEVC proxy encode → GPU; the live
+#                                          scheduler selects this only after a
+#                                          real encode + decode probe succeeds)
 #   -e JM_WORKER_NAME=<unique>             (per-node config identity)
 #   -e JM_FARM_KINDS=transcript            (which dedicated queues to drain)
 #
@@ -87,7 +88,7 @@ ENV JM_FARM_MODEL=/models/ggml-medium.en.bin
 # GPU defaults — overridable. The manager's farm config can flip these live
 # per-node anyway (hot knobs); these ENVs are just sane cold-start values.
 ENV JM_FARM_TRANSCRIPT_DEVICE=vulkan
-ENV JM_FARM_VCODEC=h264_vaapi
+ENV JM_FARM_VCODEC=hevc_vaapi
 # The iHD VAAPI driver isn't auto-probed on the drm display path inside a
 # container; pin it (harmless on non-Intel hosts — vainfo just fails).
 ENV LIBVA_DRIVER_NAME=iHD

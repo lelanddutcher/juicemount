@@ -26,8 +26,7 @@ func proxyEncodeArgs(vcodec string, crf int, preset string) []string {
 			crf = 23
 		}
 		return []string{
-			"-vaapi_device", "/dev/dri/renderD128",
-			"-vf", "format=nv12,hwupload",
+			"-vf", "scale_vaapi=format=nv12",
 			"-c:v", vcodec,
 			"-qp", strconv.Itoa(crf),
 			"-compression_level", "3",
@@ -41,6 +40,7 @@ func proxyEncodeArgs(vcodec string, crf int, preset string) []string {
 			preset = "veryfast"
 		}
 		return []string{
+			"-vf", "scale_qsv=format=nv12",
 			"-c:v", vcodec,
 			"-global_quality", strconv.Itoa(crf),
 			"-preset", preset,
@@ -51,7 +51,6 @@ func proxyEncodeArgs(vcodec string, crf int, preset string) []string {
 		// 1-51, but translate it at the encoder boundary.
 		return []string{
 			"-c:v", vcodec,
-			"-pix_fmt", "yuv420p",
 			"-cq", strconv.Itoa(crf),
 			"-preset", preset,
 		}
@@ -62,6 +61,23 @@ func proxyEncodeArgs(vcodec string, crf int, preset string) []string {
 			"-crf", strconv.Itoa(crf),
 			"-preset", preset,
 		}
+	}
+}
+
+// proxyDecodeArgs forces accelerator-backed decode whenever an accelerator
+// encoder was selected. There is deliberately no software-decode retry inside
+// Proxy: a render node must either complete the whole video path on its GPU or
+// fail the job so the queue can visibly re-route it to the server fallback.
+func proxyDecodeArgs(vcodec string) []string {
+	switch {
+	case strings.HasSuffix(vcodec, "_vaapi"):
+		return []string{"-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128", "-hwaccel_output_format", "vaapi"}
+	case strings.HasSuffix(vcodec, "_qsv"):
+		return []string{"-hwaccel", "qsv", "-hwaccel_device", "/dev/dri/renderD128", "-hwaccel_output_format", "qsv"}
+	case strings.HasSuffix(vcodec, "_nvenc"):
+		return []string{"-hwaccel", "cuda", "-hwaccel_output_format", "cuda"}
+	default:
+		return nil
 	}
 }
 
@@ -113,6 +129,7 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 	// directly: its descriptor-anchored creation and final rename are owned by
 	// GenerateProxy, not this function.
 	args := append([]string{"-y", "-loglevel", "error"}, proxyThreadArgs()...)
+	args = append(args, proxyDecodeArgs(vcodec)...)
 	args = append(args,
 		"-i", srcPath,
 		"-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
@@ -121,6 +138,9 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 		// would otherwise infer the container from.
 		"-f", "mp4")
 	args = append(args, proxyEncodeArgs(vcodec, crf, preset)...)
+	if strings.Contains(vcodec, "hevc") || strings.Contains(vcodec, "h265") || strings.Contains(vcodec, "265") {
+		args = append(args, "-tag:v", "hvc1")
+	}
 	args = append(args, outPath)
 	cmd := exec.Command(ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {

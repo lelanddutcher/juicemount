@@ -8,13 +8,13 @@
 // Scheme (locked in docs/ROADMAP/juicemount-manager.md §3.2):
 //
 //   - KDF:    HKDF-SHA256(JM_ADMIN_KEY, info="juicemount-manager v1 cred-key")
-//             → 32 bytes (suitable for AES-256-GCM)
+//     → 32 bytes (suitable for AES-256-GCM)
 //   - Cipher: AES-256-GCM (AEAD — confidentiality + integrity in one pass)
 //   - Nonce:  12 random bytes per secret, generated with crypto/rand,
-//             NEVER reused under the same key
+//     NEVER reused under the same key
 //   - Tag:    16 bytes (GCM default), appended by Seal, verified by Open
 //   - Wire:   <12B nonce><ciphertext><16B GCM tag>, base64-encoded
-//             inside JSON
+//     inside JSON
 //
 // The info string MUST stay literal — changing it would invalidate
 // every credential previously written to disk because HKDF would derive

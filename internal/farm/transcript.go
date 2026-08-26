@@ -162,9 +162,9 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 	return TranscribeDevice(ffmpegBin, whisperBin, modelPath, "", srcPath)
 }
 
-// TranscribeDevice is Transcribe with a whisper.cpp device override ("" = the
-// binary's default CPU path; "vulkan"/"cuda"/"sycl" map to whisper-cli's
-// --device flag for GPU offload). Kept as a separate entry point so existing
+// TranscribeDevice is Transcribe with a whisper.cpp backend override ("" = the
+// binary's default CPU path; "vulkan"/"cuda"/"sycl" use GPU device index 0 in
+// a binary compiled for that backend). Kept as a separate entry point so existing
 // callers (one-shot sweeps, tests) stay source-compatible.
 func TranscribeDevice(ffmpegBin, whisperBin, modelPath, device, srcPath string) (*LoupeTranscript, error) {
 	if ffmpegBin == "" {
@@ -207,12 +207,7 @@ func TranscribeDevice(ffmpegBin, whisperBin, modelPath, device, srcPath string) 
 
 	prefix := filepath.Join(tmp, "out")
 	asrArgs := []string{"-m", modelPath, "-f", wav, "-oj", "-of", prefix, "-l", "auto", "-np"}
-	if device != "" && device != "cpu" {
-		// whisper.cpp >= 1.7: --device {auto|cpu|cuda|vulkan|sycl}. Unknown
-		// device values fail fast at whisper startup (loud error), which is the
-		// behavior we want — a silently-CPU transcript would hide config drift.
-		asrArgs = append(asrArgs, "--device", device)
-	}
+	asrArgs = append(asrArgs, WhisperDeviceArgs(device)...)
 	asr := exec.Command(whisperBin, asrArgs...)
 	if out, err := asr.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("transcribe: whisper %q: %w: %s", srcPath, err, out)
@@ -238,6 +233,18 @@ func TranscribeDevice(ffmpegBin, whisperBin, modelPath, device, srcPath string) 
 		return nil, nil // silence / non-speech only
 	}
 	return tr, nil
+}
+
+// WhisperDeviceArgs translates JuiceFarm's backend label into whisper.cpp's
+// current CLI contract. The backend is selected when whisper.cpp is compiled;
+// --device selects a numeric device within that backend. Passing "vulkan" here
+// used to abort in std::stoi before any inference ran.
+func WhisperDeviceArgs(backend string) []string {
+	backend = strings.ToLower(strings.TrimSpace(backend))
+	if backend == "" || backend == "cpu" {
+		return nil
+	}
+	return []string{"--device", "0"}
 }
 
 // whisperModelID turns a ggml model path into the contract's provider/model id

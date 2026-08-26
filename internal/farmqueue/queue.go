@@ -11,9 +11,9 @@
 //
 // Lifecycle:
 //
-//	producer:  Enqueue(job)                       → LPUSH queue + HSET status=queued
-//	worker:    Dequeue() → MarkRunning → run →     BRPOP queue, HSET status=running
-//	           MarkDone / MarkFailed               → HSET status=done|failed
+//	producer:  Enqueue(job)                        → route + LPUSH lane + HSET queued
+//	worker:    ClaimForWorker() → run              → durable processing list + lease
+//	           MarkDone/MarkFailed → AckClaim       → terminal status + remove receipt
 //	worker:    Heartbeat() every loop              → SET worker:<id> EX 30
 //	reader:    ListJobs() / ActiveWorkers()        → ZREVRANGE + HGETALL / SCAN
 package farmqueue
@@ -32,12 +32,19 @@ import (
 
 // Redis keys + tunables. All under the juicefarm: namespace.
 const (
-	QueueKey       = "juicefarm:queue"   // LIST: marshaled Jobs (LPUSH producer → BRPOP worker, FIFO)
-	JobHashPrefix  = "juicefarm:job:"    // HASH per job id: the JobStatus fields
-	JobIndexKey    = "juicefarm:jobs"    // ZSET of job ids scored by enqueue unix-ts (recent-first listing)
-	WorkerPrefix   = "juicefarm:worker:" // STRING per worker: JSON Worker heartbeat, short TTL
-	WorkerIndexKey = "juicefarm:workers" // SET of worker ids; stale ids are pruned by ActiveWorkers
-	ConfigKey      = "juicefarm:config"  // STRING: JSON FarmConfig — manager-owned desired state
+	QueueKey       = "juicefarm:queue"        // LIST: marshaled Jobs (LPUSH producer → BRPOP worker, FIFO)
+	JobHashPrefix  = "juicefarm:job:"         // HASH per job id: the JobStatus fields
+	JobIndexKey    = "juicefarm:jobs"         // ZSET of job ids scored by enqueue unix-ts (recent-first listing)
+	WorkerPrefix   = "juicefarm:worker:"      // STRING per worker: JSON Worker heartbeat, short TTL
+	WorkerIndexKey = "juicefarm:workers"      // SET of worker ids; stale ids are pruned by ActiveWorkers
+	ConfigKey      = "juicefarm:config"       // STRING: JSON FarmConfig — manager-owned desired state
+	ControlKey     = "juicefarm:control"      // STRING: JSON FarmControl — global play/pause + discovery state
+	WatchLeaderKey = "juicefarm:watch:leader" // STRING: short lease held by one discovery watcher
+	WatchCursorKey = "juicefarm:watch:cursor" // STRING: recursive backstop's last completed scan time
+
+	ProcessingPrefix   = "juicefarm:processing:" // LIST per worker: atomically claimed raw jobs
+	ProcessingIndexKey = "juicefarm:processing"  // SET of worker ids with a processing list
+	LeaseIndexKey      = "juicefarm:leases"      // ZSET: job id scored by lease expiry unix seconds
 
 	// JobTTL keeps finished job records around for a week so the UI can show
 	// recent history; the queue LIST entries are consumed immediately.
@@ -56,9 +63,22 @@ const ConfigKeyName = "juicefarm:config"
 // producer can never strand work on a queue that no shipped worker drains.
 func QueueKeyFor(j *Job) string {
 	if len(j.Kinds) == 1 && isDedicatedKind(j.Kinds[0]) {
+		if j.QueueClass != "" {
+			return classQueue(j.Kinds[0], j.QueueClass)
+		}
 		return QueueKey + ":" + j.Kinds[0]
 	}
 	return QueueKey
+}
+
+func allQueueKeys() []string {
+	keys := QueueKeysForKinds([]string{KindAll})
+	for _, kind := range AllKinds() {
+		for _, class := range []string{QueueClassServer, QueueClassRender, QueueClassCPU} {
+			keys = append(keys, classQueue(kind, class))
+		}
+	}
+	return uniqueStrings(keys)
 }
 
 // Job lifecycle status values.
@@ -72,7 +92,7 @@ const (
 // Kinds the worker understands. "all" expands to the full pipeline.
 const (
 	KindDerivatives = "derivatives" // tech + thumbnail/poster + filmstrip + waveform (the cheap passes)
-	KindProxy       = "proxy"       // the H.264 faststart playback proxy (CPU-heavy)
+	KindProxy       = "proxy"       // faststart playback proxy (HEVC-first GPU, H.264 fallback)
 	KindTranscript  = "transcript"  // whisper.cpp speech-to-text
 	KindAll         = "all"
 )
@@ -146,22 +166,51 @@ type Job struct {
 	VCodec       string `json:"vcodec,omitempty"`
 	Workers      int    `json:"workers,omitempty"`
 	ProxyWorkers int    `json:"proxy_workers,omitempty"`
+
+	// Scheduler annotations are additive wire fields. QueueClass is chosen from
+	// verified live worker profiles; RequiredCapabilities makes the decision
+	// inspectable in Manager and prevents a generic CPU worker from racing a GPU
+	// for accelerator-only work.
+	QueueClass           string   `json:"queue_class,omitempty"`
+	RequiredCapabilities []string `json:"required_capabilities,omitempty"`
+	SelectedBackend      string   `json:"selected_backend,omitempty"`
+	SelectedWorker       string   `json:"selected_worker,omitempty"`
+	Attempts             int      `json:"attempts,omitempty"`
 }
 
 // JobStatus is the worker-maintained record a producer reads back. Stored as a
 // flat Redis HASH (all string fields) so HGETALL round-trips without a codec.
 type JobStatus struct {
-	ID         string `json:"id"`
-	Status     string `json:"status"` // queued|running|done|failed
-	Path       string `json:"path"`
-	Kinds      string `json:"kinds"` // comma-joined for display
-	Producer   string `json:"producer"`
-	EnqueuedAt string `json:"enqueued_at"`
-	StartedAt  string `json:"started_at,omitempty"`
-	FinishedAt string `json:"finished_at,omitempty"`
-	Processed  int    `json:"processed"`
-	Failed     int    `json:"failed"`
-	Error      string `json:"error,omitempty"`
+	ID           string `json:"id"`
+	Status       string `json:"status"` // queued|running|done|failed
+	Path         string `json:"path"`
+	Kinds        string `json:"kinds"` // comma-joined for display
+	Producer     string `json:"producer"`
+	EnqueuedAt   string `json:"enqueued_at"`
+	StartedAt    string `json:"started_at,omitempty"`
+	FinishedAt   string `json:"finished_at,omitempty"`
+	Processed    int    `json:"processed"`
+	Failed       int    `json:"failed"`
+	Error        string `json:"error,omitempty"`
+	Worker       string `json:"worker,omitempty"`
+	TargetWorker string `json:"target_worker,omitempty"`
+	Backend      string `json:"backend,omitempty"`
+	QueueClass   string `json:"queue_class,omitempty"`
+	Attempts     int    `json:"attempts"`
+}
+
+// WorkerBenchmarks records observed rather than advertised capability. Startup
+// probes populate the synthetic fields; LastJobSeconds/JobsCompleted are fed by
+// real queue work and give the scheduler an honest moving signal over time.
+type WorkerBenchmarks struct {
+	EncodeFPS       float64 `json:"encode_fps,omitempty"`
+	DecodeFPS       float64 `json:"decode_fps,omitempty"`
+	TranscriptXReal float64 `json:"transcript_x_realtime,omitempty"`
+	AccessMBps      float64 `json:"access_mbps,omitempty"`
+	LastJobSeconds  float64 `json:"last_job_seconds,omitempty"`
+	JobsCompleted   int64   `json:"jobs_completed,omitempty"`
+	ProbedAt        string  `json:"probed_at,omitempty"`
+	ProbeError      string  `json:"probe_error,omitempty"`
 }
 
 // Worker is the heartbeat a draining worker publishes so producers can tell the
@@ -177,12 +226,18 @@ type Worker struct {
 	CurrentJob string `json:"current_job,omitempty"`
 
 	// Manager-config feedback (FARM-NODE-CONFIG spec):
-	Name           string            `json:"name,omitempty"`            // JM_WORKER_NAME (stable identity)
-	Kinds          []string          `json:"kinds,omitempty"`           // dedicated queues this worker drains
-	ConfigRevision int64             `json:"config_revision,omitempty"` // 0 = unmanaged
-	PendingRestart []string          `json:"pending_restart,omitempty"` // knobs needing container restart
-	Capabilities   []string          `json:"capabilities,omitempty"`    // e.g. ["vulkan","vaapi","cuda"]
-	Effective      map[string]string `json:"effective,omitempty"`       // resolved hot settings
+	Name               string            `json:"name,omitempty"`            // JM_WORKER_NAME (stable identity)
+	Kinds              []string          `json:"kinds,omitempty"`           // dedicated queues this worker drains
+	ConfigRevision     int64             `json:"config_revision,omitempty"` // 0 = unmanaged
+	PendingRestart     []string          `json:"pending_restart,omitempty"` // knobs needing container restart
+	Capabilities       []string          `json:"capabilities,omitempty"`    // e.g. ["vulkan","vaapi","cuda"]
+	Effective          map[string]string `json:"effective,omitempty"`       // resolved hot settings
+	Role               string            `json:"role,omitempty"`            // server|render
+	Encoders           []string          `json:"encoders,omitempty"`        // successfully probed ffmpeg encoders
+	Decoders           []string          `json:"decoders,omitempty"`        // verified/listed hardware decoders
+	TranscriptBackends []string          `json:"transcript_backends,omitempty"`
+	Benchmarks         WorkerBenchmarks  `json:"benchmarks,omitempty"`
+	State              string            `json:"state,omitempty"` // idle|working|paused
 }
 
 // FarmConfig is the manager-owned desired state published at ConfigKey. The
@@ -247,13 +302,17 @@ func (c *Client) Enqueue(ctx context.Context, j Job) error {
 	if j.EnqueuedAt == "" {
 		j.EnqueuedAt = nowISO()
 	}
+	if j.QueueClass == "" {
+		c.RouteJob(ctx, &j)
+	}
 	raw, err := json.Marshal(j)
 	if err != nil {
 		return err
 	}
 	st := JobStatus{
 		ID: j.ID, Status: StatusQueued, Path: j.Path, Kinds: strings.Join(j.Kinds, ","),
-		Producer: j.Producer, EnqueuedAt: j.EnqueuedAt,
+		Producer: j.Producer, EnqueuedAt: j.EnqueuedAt, Backend: j.SelectedBackend,
+		TargetWorker: j.SelectedWorker, QueueClass: j.QueueClass, Attempts: j.Attempts,
 	}
 	pipe := c.rdb.TxPipeline()
 	pipe.LPush(ctx, QueueKeyFor(&j), raw)
@@ -451,7 +510,7 @@ func (c *Client) ActiveWorkers(ctx context.Context) ([]Worker, error) {
 // QueueDepth is the aggregate number of jobs waiting (not yet popped) across
 // every shipped dedicated queue and the legacy catch-all queue.
 func (c *Client) QueueDepth(ctx context.Context) (int64, error) {
-	keys := QueueKeysForKinds([]string{KindAll})
+	keys := allQueueKeys()
 	pipe := c.rdb.Pipeline()
 	cmds := make([]*redis.IntCmd, 0, len(keys))
 	for _, key := range keys {
@@ -474,6 +533,7 @@ func (s JobStatus) toMap() map[string]any {
 		"id": s.ID, "status": s.Status, "path": s.Path, "kinds": s.Kinds,
 		"producer": s.Producer, "enqueued_at": s.EnqueuedAt,
 		"processed": strconv.Itoa(s.Processed), "failed": strconv.Itoa(s.Failed),
+		"attempts": strconv.Itoa(s.Attempts),
 	}
 	if s.StartedAt != "" {
 		m["started_at"] = s.StartedAt
@@ -483,6 +543,18 @@ func (s JobStatus) toMap() map[string]any {
 	}
 	if s.Error != "" {
 		m["error"] = s.Error
+	}
+	if s.Worker != "" {
+		m["worker"] = s.Worker
+	}
+	if s.TargetWorker != "" {
+		m["target_worker"] = s.TargetWorker
+	}
+	if s.Backend != "" {
+		m["backend"] = s.Backend
+	}
+	if s.QueueClass != "" {
+		m["queue_class"] = s.QueueClass
 	}
 	return m
 }
@@ -494,5 +566,6 @@ func jobStatusFromMap(m map[string]string) JobStatus {
 		Producer: m["producer"], EnqueuedAt: m["enqueued_at"],
 		StartedAt: m["started_at"], FinishedAt: m["finished_at"],
 		Processed: atoi(m["processed"]), Failed: atoi(m["failed"]), Error: m["error"],
+		Worker: m["worker"], TargetWorker: m["target_worker"], Backend: m["backend"], QueueClass: m["queue_class"], Attempts: atoi(m["attempts"]),
 	}
 }

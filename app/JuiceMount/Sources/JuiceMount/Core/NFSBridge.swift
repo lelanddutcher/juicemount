@@ -21,7 +21,7 @@ public enum NFSBridge {
         return URLSession(configuration: cfg)
     }
 
-    public struct ServerConfig: Codable {
+    public struct ServerConfig: Codable, Sendable {
         public var redisURL: String
         public var fusePath: String
         public var mountPoint: String
@@ -117,6 +117,59 @@ public enum NFSBridge {
             self.memBufFileLimitMB = memBufFileLimitMB
             self.reconcileSeconds = reconcileSeconds
             self.openCacheTTL = openCacheTTL
+        }
+    }
+
+    public struct LinkTestResult: Codable, Equatable, Sendable {
+        public var ok: Bool
+        public var authorized: Bool
+        public var online: Bool
+        public var backendReachable: Bool
+        public var hostname: String?
+        public var addresses: [String]
+        public var rttMS: Int64?
+        public var error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case ok, authorized, online, hostname, addresses, error
+            case backendReachable = "backend_reachable"
+            case rttMS = "rtt_ms"
+        }
+
+        public init(
+            ok: Bool,
+            authorized: Bool,
+            online: Bool,
+            backendReachable: Bool,
+            hostname: String?,
+            addresses: [String],
+            rttMS: Int64?,
+            error: String?
+        ) {
+            self.ok = ok
+            self.authorized = authorized
+            self.online = online
+            self.backendReachable = backendReachable
+            self.hostname = hostname
+            self.addresses = addresses
+            self.rttMS = rttMS
+            self.error = error
+        }
+
+        // Decode additively so the desktop can still display a useful result
+        // when paired with a Manager/bridge from the immediately preceding RC.
+        // Link status is a diagnostic surface; one newly-added boolean must not
+        // turn the entire Apply & Test response into an opaque decode failure.
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            ok = try values.decodeIfPresent(Bool.self, forKey: .ok) ?? false
+            authorized = try values.decodeIfPresent(Bool.self, forKey: .authorized) ?? false
+            online = try values.decodeIfPresent(Bool.self, forKey: .online) ?? false
+            backendReachable = try values.decodeIfPresent(Bool.self, forKey: .backendReachable) ?? false
+            hostname = try values.decodeIfPresent(String.self, forKey: .hostname)
+            addresses = try values.decodeIfPresent([String].self, forKey: .addresses) ?? []
+            rttMS = try values.decodeIfPresent(Int64.self, forKey: .rttMS)
+            error = try values.decodeIfPresent(String.self, forKey: .error)
         }
     }
 
@@ -1178,6 +1231,30 @@ public enum NFSBridge {
         }
     }
 
+    /// Pair (or refresh an existing Link identity), then prove the encrypted
+    /// subnet route can reach the configured Redis backend. A successful node
+    /// is retained by the Go bridge so the next server start can immediately
+    /// install its loopback proxies without pairing again.
+    public static func testLink(config: ServerConfig) throws -> LinkTestResult {
+        let json = try JSONEncoder().encode(config)
+        let cString = String(data: json, encoding: .utf8) ?? ""
+        return try cString.withMutableCString { ptr in
+            guard let result = NFSServerLinkTest(ptr) else {
+                throw BridgeError.startFailed("Link test returned no response")
+            }
+            defer { NFSServerFreeString(result) }
+            let raw = String(cString: result)
+            guard let data = raw.data(using: .utf8) else {
+                throw BridgeError.decodingFailed("invalid UTF-8 in Link test")
+            }
+            do {
+                return try JSONDecoder().decode(LinkTestResult.self, from: data)
+            } catch {
+                throw BridgeError.decodingFailed("Link test: \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// User-visible Stop: tears everything down AND unmounts FUSE + NFS.
     /// This matches user expectations — "Stop" means the mount is gone.
     ///
@@ -1188,9 +1265,10 @@ public enum NFSBridge {
         NFSServerShutdown()
     }
 
-    /// Soft stop for the internal Restart path. Leaves FUSE + NFS mounted
-    /// so the subsequent Start avoids re-mounting. Never call this from a
-    /// user-initiated Stop — the user expects the mount to disappear.
+    /// Legacy low-level soft stop. It leaves FUSE + NFS mounted, so it must not
+    /// be followed by a new server with freshly-opened stores: cached NFS file
+    /// handles would still reference the closed handler. Desktop restart and
+    /// maintenance flows use stopMount() instead.
     public static func softStop() {
         NFSServerStop()
     }

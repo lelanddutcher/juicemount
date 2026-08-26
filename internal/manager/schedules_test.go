@@ -301,7 +301,6 @@ func TestScheduleResolvesDestination(t *testing.T) {
 	}
 }
 
-
 // TestScheduleSourceGate is the regression test for the schedule source
 // confinement fix. Before it, validateSchedule only required Source.Path
 // to be absolute — so a backup schedule could juicefs-sync an arbitrary

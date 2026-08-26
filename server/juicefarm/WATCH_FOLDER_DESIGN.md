@@ -1,10 +1,12 @@
 # Watch-folder — auto-pre-generate farm derivatives on file arrival
 
-> **STATUS: EARMARKED — design only, no build. (2026-06-25)**
-> Leland: "hold off for now." This is the architecture + phased path for a new-file
-> watcher that auto-enqueues farm derivatives. Nothing here is built beyond the
-> components explicitly marked BUILT. Do not start the watcher until its blocking
-> dependencies (below) land.
+> **STATUS: SUPERSEDED BY THE RC IMPLEMENTATION. (2026-08-25)**
+> The standing worker now ships automatic JuiceFS/Redis discovery, a short-leased
+> single leader, settle/dedupe, Manager pause/play and discovery controls, and a
+> persistent recursive modified-directory backstop. The remainder of this file is
+> retained as historical design context; statements below that say "not built" or
+> require a manual folder target no longer describe current behavior. The current
+> operator and wire behavior is documented in `docs/JUICEFARM.md`.
 
 ## Intent
 You drop files onto a JuiceMount volume — a Finder copy, an NLE export, or (the headline

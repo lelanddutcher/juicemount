@@ -1,0 +1,16 @@
+# Rebuild only the Manager Go binary and layer it over a proven runtime image.
+# This keeps headscale, JuiceFS, curl, and the runtime entrypoint identical while
+# allowing a small control-plane fix to be promoted without re-fetching them.
+ARG BASE_IMAGE=jm-manager:rc-0.5
+FROM golang:1.26.6-alpine AS gobuild
+
+WORKDIR /src
+RUN apk add --no-cache git build-base
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" \
+      -o /out/juicemount-manager ./cmd/juicemount-manager
+
+FROM ${BASE_IMAGE}
+COPY --from=gobuild /out/juicemount-manager /usr/local/bin/juicemount-manager

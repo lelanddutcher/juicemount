@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,6 +58,11 @@ type WatchConfig struct {
 	// Enqueue submits a settled, filtered, mount-relative DIRECTORY for
 	// derivative generation. Required.
 	Enqueue func(ctx context.Context, relDir string) error
+
+	// Enabled is evaluated at the start of every tick. Returning false keeps
+	// dirty events queued in memory so discovery can resume without losing the
+	// work that landed while the operator paused the farm. Nil means enabled.
+	Enabled func(ctx context.Context) bool
 
 	// Resolve maps a directory inode to its mount-relative path. Nil means
 	// the juicefs-info resolver against Mount.
@@ -120,13 +126,13 @@ func NewWatcher(cfg WatchConfig) *Watcher {
 func WatchEnabled() bool { return os.Getenv("JM_FARM_WATCH") != "0" }
 
 // WatchKindsFromEnv returns the job kinds the watcher enqueues.
-// Default is derivatives-only: posters/strips/waveforms are the instant-browse
-// payload and cheap; proxies are GB-scale transcodes that stay a deliberate
-// (manager-sweep / OpenLoupe) decision.
+// The default covers the complete ingest pipeline. Routing splits these kinds
+// into independent jobs so server metadata stays local while proxy/transcript
+// work is sent to the best eligible render node.
 func WatchKindsFromEnv() []string {
 	raw := strings.TrimSpace(os.Getenv("JM_FARM_WATCH_KINDS"))
 	if raw == "" {
-		return []string{"derivatives"}
+		return []string{"derivatives", "proxy", "transcript"}
 	}
 	var kinds []string
 	for _, k := range strings.Split(raw, ",") {
@@ -135,7 +141,7 @@ func WatchKindsFromEnv() []string {
 		}
 	}
 	if len(kinds) == 0 {
-		return []string{"derivatives"}
+		return []string{"derivatives", "proxy", "transcript"}
 	}
 	return kinds
 }
@@ -162,6 +168,9 @@ func (w *Watcher) Note(inode uint64, now time.Time) {
 // up to MaxPerTick. Unresolved-yet-unsettled inodes stay dirty; resolved or
 // dropped ones leave the set. Returns the number of jobs enqueued.
 func (w *Watcher) Tick(ctx context.Context, now time.Time) int {
+	if w.cfg.Enabled != nil && !w.cfg.Enabled(ctx) {
+		return 0
+	}
 	// Snapshot the settled candidates under the lock, then resolve/enqueue
 	// outside it (resolution shells out; enqueue talks to Redis).
 	w.mu.Lock()
@@ -183,7 +192,11 @@ func (w *Watcher) Tick(ctx context.Context, now time.Time) int {
 	}
 	w.mu.Unlock()
 
-	enqueued := 0
+	type resolvedTarget struct {
+		inode uint64
+		path  string
+	}
+	resolved := make([]resolvedTarget, 0, len(settled))
 	for _, ino := range settled {
 		if ctx.Err() != nil {
 			break
@@ -195,6 +208,34 @@ func (w *Watcher) Tick(ctx context.Context, now time.Time) int {
 		if !WatchPathAllowed(rel) {
 			continue
 		}
+		resolved = append(resolved, resolvedTarget{inode: ino, path: path.Clean(rel)})
+	}
+
+	// One file creation commonly dirties its directory and several ancestors.
+	// Keep the deepest disjoint targets in this settled batch; recursively
+	// walking both "Project" and "Project/Reel" duplicates every derivative
+	// and can turn a single ingest into a full project scan.
+	sort.SliceStable(resolved, func(i, j int) bool {
+		return len(resolved[i].path) > len(resolved[j].path)
+	})
+	pruned := resolved[:0]
+	for _, candidate := range resolved {
+		overlapped := false
+		prefix := strings.TrimSuffix(candidate.path, "/") + "/"
+		for _, kept := range pruned {
+			if kept.path == candidate.path || strings.HasPrefix(kept.path, prefix) {
+				overlapped = true
+				break
+			}
+		}
+		if !overlapped {
+			pruned = append(pruned, candidate)
+		}
+	}
+
+	enqueued := 0
+	for _, target := range pruned {
+		ino, rel := target.inode, target.path
 		w.mu.Lock()
 		if t, seen := w.recent[rel]; seen && now.Sub(t) < w.cfg.DedupeTTL {
 			w.mu.Unlock()
@@ -254,9 +295,12 @@ func WatchPathAllowed(rel string) bool {
 }
 
 // Run subscribes to the volume's keyspace events and drives the tick loop
-// until ctx is done. go-redis PubSub reconnects and resubscribes internally;
-// events during a gap are simply missed (logged once at start — the manager
-// sweep remains the catch-up path).
+// until ctx is done. Resolution is deliberately isolated in its own goroutine:
+// `juicefs info -i` can take close to a second on a large live volume, and a
+// 200-directory burst used to stop this goroutine from reading PubSub long
+// enough for go-redis' channel to fill and drop exactly the events we need.
+// go-redis reconnects and resubscribes internally; the recursive backstop
+// covers events missed during a real connection gap.
 func (w *Watcher) Run(ctx context.Context) error {
 	opt, err := redis.ParseURL(w.cfg.MetaURL)
 	if err != nil {
@@ -273,9 +317,30 @@ func (w *Watcher) Run(ctx context.Context) error {
 	w.cfg.Logf("farm watch: engaged (db=%d settle=%s tick=%s cap=%d kinds via job) — gaps during reconnects are covered by manager sweeps",
 		opt.DB, w.cfg.Settle, w.cfg.Tick, w.cfg.MaxPerTick)
 
-	ticker := time.NewTicker(w.cfg.Tick)
-	defer ticker.Stop()
 	ch := sub.Channel(redis.WithChannelSize(4096))
+	tickCtx, stopTicks := context.WithCancel(ctx)
+	var tickWG sync.WaitGroup
+	tickWG.Add(1)
+	go func() {
+		defer tickWG.Done()
+		ticker := time.NewTicker(w.cfg.Tick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-tickCtx.Done():
+				return
+			case now := <-ticker.C:
+				// Ticks are intentionally serialized. time.Ticker coalesces while a
+				// slow batch is resolving, which bounds work without blocking event
+				// intake or launching an unbounded resolver backlog.
+				w.Tick(tickCtx, now)
+			}
+		}
+	}()
+	defer func() {
+		stopTicks()
+		tickWG.Wait()
+	}()
 
 	for {
 		select {
@@ -294,8 +359,6 @@ func (w *Watcher) Run(ctx context.Context) error {
 				continue
 			}
 			w.Note(ino, time.Now())
-		case <-ticker.C:
-			w.Tick(ctx, time.Now())
 		}
 	}
 }

@@ -514,9 +514,9 @@ func setTrashConfig(ctx context.Context, juicefsBin, metaURL string, days int) e
 // it); Recommended is trashConfigRetentionDays so the UI can mark
 // the matching drop-down entry.
 type trashConfigResponse struct {
-	Days        int   `json:"days"`
-	Recommended int   `json:"recommended"`
-	Choices     []int `json:"choices"`
+	Days        int    `json:"days"`
+	Recommended int    `json:"recommended"`
+	Choices     []int  `json:"choices"`
 	Error       string `json:"error,omitempty"`
 }
 

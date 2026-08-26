@@ -30,7 +30,7 @@ type ManifestRecord struct {
 	// row.SHA256 lookup failed) from "we forgot to populate the field."
 	// Without this, an auditor reading a quarantine record with no sha
 	// can't tell whether the SHA never existed or was suppressed.
-	SHA256Unavailable bool `json:"sha256_unavailable,omitempty"`
+	SHA256Unavailable bool   `json:"sha256_unavailable,omitempty"`
 	Reason            string `json:"reason,omitempty"`
 }
 

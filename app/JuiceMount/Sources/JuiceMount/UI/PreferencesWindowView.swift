@@ -8,8 +8,8 @@ import UserNotifications
 ///     that states exactly WHEN each group takes effect (immediate vs next
 ///     start vs full Stop → Start) — accurate to the actual plumbing:
 ///     `Preferences.toServerConfig()` is read once in
-///     `ServerController.start()`, and Restart (soft-stop) keeps the
-///     JuiceFS daemon + Finder mount alive, so daemon-level settings only
+///     `ServerController.start()`, and Restart keeps the JuiceFS daemon warm
+///     while briefly remounting Finder/NFS, so daemon-level settings only
 ///     apply after a full Stop everything → Start.
 ///   - Fixed 600 pt width; each tab declares its own content height so the
 ///     window hugs the form (no scroll-within-scroll, no dead space). The
@@ -263,7 +263,31 @@ struct PreferencesWindowView: View {
                     TextField("juicemount-mac", text: $preferences.linkHostname)
                         .textFieldStyle(.roundedBorder)
                 }
-                footnote("Remote access via JuiceMount Link. Paste the pairing code from your NAS manager's JuiceMount Link tab. Use Stop Everything, then Start, to apply a changed pairing or disable Link (the normal Stop action intentionally keeps the JuiceFS mount alive).")
+                HStack(spacing: 10) {
+                    Button {
+                        server.testLink()
+                    } label: {
+                        if server.linkTestInFlight {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Pairing & Testing…")
+                            }
+                        } else {
+                            Label("Apply & Test", systemImage: "network.badge.shield.half.filled")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(server.linkTestInFlight || preferences.linkServerURL.isEmpty || preferences.linkAuthKey.isEmpty)
+
+                    if let result = server.linkTestResult {
+                        Label(linkResultText(result), systemImage: result.ok ? "checkmark.circle.fill" : (result.online ? "exclamationmark.triangle.fill" : "xmark.circle.fill"))
+                            .font(.caption)
+                            .foregroundStyle(result.ok ? .green : (result.online ? .orange : .red))
+                            .lineLimit(2)
+                            .help(result.error ?? linkResultText(result))
+                    }
+                }
+                footnote("Apply & Test confirms the pairing, refreshes authorization, and dials Redis through the encrypted NAS route. If the mount is running, a successful test applies Link with a soft restart.")
             } header: {
                 Text("Remote Access")
             } footer: {
@@ -272,6 +296,17 @@ struct PreferencesWindowView: View {
         }
         .formStyle(.grouped)
         .onAppear { seedDerivationAnchor() }
+    }
+
+    private func linkResultText(_ result: NFSBridge.LinkTestResult) -> String {
+        if result.ok {
+            let latency = result.rttMS.map { " · \($0) ms" } ?? ""
+            return "Paired, online, backend reachable\(latency)"
+        }
+        if result.online {
+            return "Paired and online; backend route unavailable"
+        }
+        return result.error ?? "Pairing failed"
     }
 
     // MARK: - Cache & Storage
@@ -440,7 +475,7 @@ struct PreferencesWindowView: View {
             } header: {
                 Text("Server")
             } footer: {
-                footnote("Restart soft-stops and starts the server; the JuiceFS daemon and the Finder mount stay up throughout.")
+                footnote("Restart briefly remounts Finder/NFS so open file handles cannot outlive their backing stores. The JuiceFS daemon and data cache stay warm.")
             }
 
             Section {
@@ -669,8 +704,8 @@ struct PreferencesWindowView: View {
     /// RUNNING server — the open file handle kept the data live, so it was
     /// a silent no-op until some future restart the dialog never mentioned.
     /// New flow: explain exactly what will happen → stop the server first
-    /// (soft-stop: the Go side closes the store; FUSE + the Finder mount
-    /// stay up, so no admin re-prompt) → delete metadata.db/-wal/-shm
+    /// (the Go side closes the store; FUSE stays warm while the Finder mount
+    /// briefly disappears) → delete metadata.db/-wal/-shm
     /// (NOT pin.db — pins are a user contract for offline availability) →
     /// offer "Start Now" / "Later".
     private func resetDatabase() {
@@ -684,7 +719,7 @@ struct PreferencesWindowView: View {
         alert.messageText = "Reset local metadata cache?"
         var info = "The local metadata cache will be deleted:\n\(dbPath)\n\nIt is a mirror of the metadata in Redis and rebuilds on the next start. Files on the volume are not affected. Offline pins (pin.db) are NOT touched — pinned files stay available offline."
         if serverIsRunning {
-            info += "\n\nThe server will stop first so the delete is real (deleting under a running server silently does nothing). The volume stays mounted but won't respond until the server starts again."
+            info += "\n\nThe server will stop first so the delete is real (deleting under a running server silently does nothing). The Finder mount briefly disappears; the warm JuiceFS backend is retained for a fast restart."
         }
         alert.informativeText = info
         alert.alertStyle = .warning

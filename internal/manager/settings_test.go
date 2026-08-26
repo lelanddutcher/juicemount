@@ -516,4 +516,3 @@ func settingsEqual(a, b Settings) bool {
 	bb, _ := json.Marshal(b)
 	return bytes.Equal(ab, bb)
 }
-

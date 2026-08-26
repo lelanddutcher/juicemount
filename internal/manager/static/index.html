@@ -4,12 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>JuiceMount Manager</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=0.5.0-rc1">
 </head>
 <body>
-  <header>
-    <h1>JuiceMount Manager</h1>
-    <p class="subtitle">Single-pane control plane for your JuiceFS volume</p>
+  <header class="app-header">
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true">JM</span>
+      <div>
+        <p class="brand-eyebrow">Storage orchestration</p>
+        <h1>JuiceMount Manager</h1>
+      </div>
+    </div>
+    <p class="subtitle"><span class="header-status-dot" aria-hidden="true"></span>Volume control plane</p>
   </header>
 
   <div class="layout">
@@ -129,10 +135,11 @@
            yet (throttle/trigger come later); this is the "what has the
            farm produced" glance. -->
       <section data-tab="farm" class="tab-pane farm-pane" hidden>
-        <div class="overview-header">
-          <h2>Farm</h2>
+        <div class="overview-header farm-page-header">
+          <p class="section-kicker">Compute fabric</p>
+          <h2>Media Farm</h2>
           <p class="hint">
-            Server-side derivative + AI generation coverage. Refreshed every 10 seconds while this tab is open.
+            An always-on ingest queue that discovers media, keeps metadata local, and routes heavy work to verified accelerators.
             <span id="farm-updated" class="overview-updated"></span>
           </p>
         </div>
@@ -164,10 +171,10 @@
              untrusted path or error string can't inject markup. -->
         <section class="farm-generate" aria-label="Generate on the farm">
           <div class="overview-header">
-            <h3 class="farm-generate-title">Generate on the farm</h3>
+            <p class="section-kicker">Queue command</p>
+            <h3 class="farm-generate-title">Automatic ingest</h3>
             <p class="hint">
-              Queue a folder or file for the NAS to pre-generate previews, proxies,
-              and transcripts in the background. Jobs run as soon as a farm worker is online.
+              New media is detected recursively. Metadata stays on the server; HEVC video and accelerated AI work go to the fastest verified render node.
             </p>
           </div>
 
@@ -178,13 +185,35 @@
             <span id="farm-active-depth" class="farm-active-depth" hidden></span>
           </div>
 
+          <div class="farm-control-deck" aria-label="Farm queue controls">
+            <button id="farm-queue-toggle" class="farm-transport" type="button" disabled>
+              <span class="farm-transport-icon" aria-hidden="true">Ⅱ</span>
+              <span><strong>Pause queue</strong><em>Finish active work, then stop claiming jobs</em></span>
+            </button>
+            <button id="farm-watch-toggle" class="farm-transport secondary" type="button" disabled>
+              <span class="farm-transport-icon" aria-hidden="true">◎</span>
+              <span><strong>Discovery on</strong><em>Recursively watch for newly landed media</em></span>
+            </button>
+            <p id="farm-control-status" class="farm-control-status" role="status">Loading queue controls…</p>
+          </div>
+
+          <section class="farm-node-section" aria-labelledby="farm-node-title">
+            <div class="farm-jobs-header">
+              <div>
+                <p class="section-kicker">Routing telemetry</p>
+                <h4 id="farm-node-title" class="farm-jobs-title">Active nodes</h4>
+              </div>
+              <span class="farm-routing-note">HEVC → hardware H.264 → CPU H.264</span>
+            </div>
+            <div id="farm-workers-list" class="farm-workers-list"></div>
+          </section>
+
           <!-- Node config drawer (FARM-NODE-CONFIG): manager-owned per-worker settings. -->
           <details id="farm-config-drawer" class="farm-config-drawer">
-            <summary>Node configuration</summary>
+            <summary>Advanced node configuration</summary>
             <p class="farm-config-hint">Settings here are pushed to every farm node over the
               queue connection — no need to restart containers for quality, model or encoder
               changes. A node that can't apply a change live shows a “needs restart” badge.</p>
-            <div id="farm-workers-list" class="farm-workers-list"></div>
             <form id="farm-config-form" class="farm-config-form">
               <label class="field">
                 <span>Node name (blank = all nodes)</span>
@@ -239,7 +268,10 @@
             </form>
           </details>
 
-          <!-- Queue-a-sweep form. -->
+          <!-- The standing watcher is the normal path. This manual override is
+               deliberately secondary for repairs and targeted re-runs. -->
+          <details class="farm-manual-drawer">
+            <summary>Manual target override</summary>
           <div class="farm-sweep-form">
             <label class="field">
               <span>Path to sweep (a folder or a single file)</span>
@@ -257,7 +289,7 @@
               <label class="opt">
                 <input type="checkbox" id="farm-kind-proxy" value="proxy">
                 <span><strong>Proxy</strong>
-                  <em>A lightweight, fast-to-scrub editing copy. CPU-heavy.</em></span>
+                  <em>HEVC on a verified GPU; H.264 only on the explicit CPU fallback lane.</em></span>
               </label>
               <label class="opt">
                 <input type="checkbox" id="farm-kind-transcript" value="transcript">
@@ -271,6 +303,7 @@
             </div>
             <p id="farm-sweep-error" class="error" hidden></p>
           </div>
+          </details>
 
           <!-- Recent jobs from the queue, newest first. -->
           <div class="farm-jobs-wrap">
@@ -931,30 +964,37 @@
       <!-- Settings tab — wired to GET/PUT /api/settings and POST
            /api/settings/rotate-admin-key. -->
       <section data-tab="link" class="tab-pane link-pane" hidden>
-        <h2>JuiceMount Link</h2>
-        <p class="hint">Remote access for your Macs. Pair a device by generating a code, then paste it in the Mac app's Remote Access settings.</p>
-        <div id="link-status" class="card">
-          <h3>Status</h3>
-          <p id="link-enabled">Checking…</p>
+        <div class="link-page-header">
+          <p class="section-kicker">Encrypted edge access</p>
+          <h2>JuiceMount Link</h2>
+          <p class="hint">Pair Macs into your private media network, then watch authorization and route presence update live.</p>
         </div>
-        <div id="link-pair" class="card" style="display:none">
+        <div id="link-status" class="card link-card link-status-card offline">
+          <span class="link-status-light" aria-hidden="true"></span>
+          <div><p class="section-kicker">Control plane</p>
+          <h3 id="link-enabled">Checking…</h3>
+          <p id="link-status-detail" class="hint">Contacting the coordination service.</p></div>
+        </div>
+        <div id="link-pair" class="card link-card" style="display:none">
+          <p class="section-kicker">Enrollment</p>
           <h3>Add a Mac</h3>
-          <button id="btn-pair" class="btn">Generate Pairing Code</button>
-          <div id="pair-result" style="display:none; margin-top:12px">
+          <p class="hint">Generate a one-hour authorization code, then use Apply &amp; Test in the desktop app.</p>
+          <button id="btn-pair" class="btn link-primary-button">Generate pairing code</button>
+          <div id="pair-result" class="pair-result" style="display:none">
             <p>Paste this code in the Mac app's <strong>Remote Access</strong> settings:</p>
-            <code id="pair-code" style="display:block; padding:8px; background:#1a1a2e; color:#0f0; font-size:14px; word-break:break-all; border-radius:4px"></code>
-            <p class="hint" style="margin-top:6px; color:#888">Expires in 1 hour. Each Mac needs its own code.</p>
+            <code id="pair-code" class="pair-code"></code>
+            <p class="hint">Expires in 1 hour. Each Mac needs its own code.</p>
           </div>
         </div>
-        <div id="link-devices" class="card" style="display:none">
-          <h3>Paired Devices</h3>
-          <table id="devices-table" style="width:100%; border-collapse:collapse">
-            <thead><tr style="text-align:left; border-bottom:1px solid #333">
-              <th style="padding:4px 8px">Hostname</th><th>IP</th><th>Online</th><th>Last Seen</th><th></th>
+        <div id="link-devices" class="card link-card" style="display:none">
+          <div class="link-devices-head"><div><p class="section-kicker">Tailnet presence</p><h3>Paired devices</h3></div>
+          <button id="btn-refresh-devices" class="btn">Refresh</button></div>
+          <div class="link-table-wrap"><table id="devices-table" class="link-devices-table">
+            <thead><tr>
+              <th>Hostname</th><th>IP</th><th>Status</th><th>Last seen</th><th></th>
             </tr></thead>
             <tbody id="devices-body"></tbody>
-          </table>
-          <button id="btn-refresh-devices" class="btn" style="margin-top:8px">Refresh</button>
+          </table></div>
         </div>
       </section>
 
@@ -1126,6 +1166,6 @@
     </small>
   </footer>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=0.5.0-rc1"></script>
 </body>
 </html>

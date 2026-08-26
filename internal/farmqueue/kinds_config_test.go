@@ -20,12 +20,78 @@ func TestQueueKeyFor(t *testing.T) {
 		{nil, QueueKey},
 		{[]string{"proxy", "transcript"}, QueueKey}, // multi-kind → catch-all
 		{[]string{"not-a-kind"}, QueueKey},
+		{[]string{"proxy"}, classQueue("proxy", QueueClassRender)},
 	}
 	for _, tc := range cases {
-		got := QueueKeyFor(&Job{Kinds: tc.kinds})
+		job := &Job{Kinds: tc.kinds}
+		if len(tc.kinds) == 1 && tc.kinds[0] == "proxy" && tc.want == classQueue("proxy", QueueClassRender) {
+			job.QueueClass = QueueClassRender
+		}
+		got := QueueKeyFor(job)
 		if got != tc.want {
 			t.Errorf("QueueKeyFor(%v) = %q, want %q", tc.kinds, got, tc.want)
 		}
+	}
+}
+
+func TestWorkerQueueKeysAreDisjointByRole(t *testing.T) {
+	server := WorkerQueueKeys(Worker{Role: QueueClassServer})
+	render := WorkerQueueKeys(Worker{
+		Role: QueueClassRender, Encoders: []string{"hevc_vaapi"},
+		TranscriptBackends: []string{"cpu", "vulkan"},
+	})
+	serverSet := map[string]bool{}
+	for _, key := range server {
+		serverSet[key] = true
+	}
+	for _, key := range render {
+		if serverSet[key] {
+			t.Fatalf("server/render both drain %q; accelerator jobs could race CPU", key)
+		}
+	}
+	if !serverSet[classQueue(KindProxy, QueueClassCPU)] || !serverSet[QueueKey] {
+		t.Fatalf("server queues = %v, want CPU fallback and legacy catch-all", server)
+	}
+	if len(render) != 2 || render[0] != classQueue(KindProxy, QueueClassRender) || render[1] != classQueue(KindTranscript, QueueClassRender) {
+		t.Fatalf("render queues = %v", render)
+	}
+}
+
+func TestHardwarePreferenceIsHEVCThenObservedSpeed(t *testing.T) {
+	workers := []Worker{
+		{ID: "fast-h264", Role: QueueClassRender, Encoders: []string{"h264_nvenc"}, Benchmarks: WorkerBenchmarks{EncodeFPS: 400}},
+		{ID: "hevc", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"}, Benchmarks: WorkerBenchmarks{EncodeFPS: 120}},
+	}
+	if got, ok := preferredHardwareEncoder(workers); !ok || got != "hevc_vaapi" {
+		t.Fatalf("preferred encoder = %q/%v, want HEVC hardware", got, ok)
+	}
+	if selected, _, ok := preferredHardwareWorker(workers); !ok || selected.ID != "hevc" {
+		t.Fatalf("selected worker = %q/%v, want HEVC worker", selected.ID, ok)
+	}
+	workers = []Worker{
+		{ID: "server", Role: QueueClassServer, Encoders: []string{"hevc_vaapi"}},
+		{ID: "render", Role: QueueClassRender, Encoders: []string{"h264_qsv"}},
+	}
+	if got, ok := preferredHardwareEncoder(workers); !ok || got != "h264_qsv" {
+		t.Fatalf("preferred encoder = %q/%v, want eligible render encoder", got, ok)
+	}
+	workers = []Worker{
+		{ID: "slow", Role: QueueClassRender, Encoders: []string{"hevc_vaapi"}, Benchmarks: WorkerBenchmarks{EncodeFPS: 80}},
+		{ID: "fast", Role: QueueClassRender, Encoders: []string{"hevc_qsv"}, Benchmarks: WorkerBenchmarks{EncodeFPS: 220}},
+	}
+	if selected, _, ok := preferredHardwareWorker(workers); !ok || selected.ID != "fast" {
+		t.Fatalf("same-codec selection = %q/%v, want fastest observed worker", selected.ID, ok)
+	}
+}
+
+func TestTranscriptPreferenceUsesObservedSpeed(t *testing.T) {
+	workers := []Worker{
+		{ID: "slow", Role: QueueClassRender, TranscriptBackends: []string{"cpu", "vulkan"}, Benchmarks: WorkerBenchmarks{TranscriptXReal: 2}},
+		{ID: "fast", Role: QueueClassRender, TranscriptBackends: []string{"cpu", "cuda"}, Benchmarks: WorkerBenchmarks{TranscriptXReal: 7}},
+	}
+	selected, backend, ok := preferredTranscriptWorker(workers)
+	if !ok || selected.ID != "fast" || backend != "cuda" {
+		t.Fatalf("selected transcript worker/backend = %q/%q/%v", selected.ID, backend, ok)
 	}
 }
 

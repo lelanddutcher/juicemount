@@ -673,13 +673,13 @@ func (a *API) handleDestinationTest(w http.ResponseWriter, r *http.Request, name
 //
 //   - file:   os.Stat the path; verify directory + writable.
 //   - s3/b2:  HEAD <endpoint>/<bucket>. We use raw HTTP rather than an
-//             SDK to keep the dependency surface small; the response
-//             code distinguishes 200 (ok), 403 (auth), 404 (bucket not
-//             found), 0 (network).
+//     SDK to keep the dependency surface small; the response
+//     code distinguishes 200 (ok), 403 (auth), 404 (bucket not
+//     found), 0 (network).
 //   - sftp:   SSH dial + handshake + close. Does not open a session;
-//             the auth handshake is enough.
+//     the auth handshake is enough.
 //   - webdav: PROPFIND on the root with Depth: 0. Servers return 207
-//             Multi-Status on success.
+//     Multi-Status on success.
 //   - jfs:    Redis PING against the meta_url.
 //
 // For test-only HTTP probes (s3, b2, webdav) we use a short HTTP

@@ -24,6 +24,8 @@
 #                      it heartbeats + BRPOPs jobs forever (exit on SIGTERM). All the
 #                      one-shot env above still supplies the per-job run defaults a
 #                      job's options override (CRF/preset/model/vcodec/workers).
+#   JM_FARM_CACHE_DIR  persistent local JuiceFS cache path (default: /jfs-cache)
+#   JM_FARM_CACHE_SIZE cache budget in MiB (default: 20000)
 set -eu
 
 : "${JM_META:?JM_META (redis://redis:6379/1) is required}"
@@ -51,6 +53,8 @@ PRESET="${JM_FARM_PRESET:-slow}"
 # the cheap passes so a full sweep can't saturate the NAS (manager governor sets it).
 PROXY_WORKERS="${JM_FARM_PROXY_WORKERS:-2}"
 STATUS="${JM_FARM_STATUS:-/state/farm-status.json}"
+CACHE_DIR="${JM_FARM_CACHE_DIR:-/jfs-cache}"
+CACHE_SIZE="${JM_FARM_CACHE_SIZE:-20000}"
 # Yield CPU + IO to interactive load so a sweep never starves the live mount.
 # JM_FARM_NICE: niceness 0-19 (higher = nicer). JM_FARM_IONICE: best-effort IO
 # class 3=idle; set empty to disable. Both are guarded by command -v.
@@ -82,7 +86,8 @@ MODEL=$(resolve_model)
 # Own FUSE mount of the same volume — JuiceFS supports many concurrent mounts,
 # so this does NOT disturb the Mac client or the server's juicefs container.
 echo "[juicefarm] mounting $JM_META → $MNT"
-juicefs mount --cache-dir /jfs-cache --cache-size 20000 --backup-meta 0 "$JM_META" "$MNT" &
+mkdir -p "$CACHE_DIR"
+juicefs mount --cache-dir "$CACHE_DIR" --cache-size "$CACHE_SIZE" --backup-meta 0 "$JM_META" "$MNT" &
 i=0; until mountpoint -q "$MNT"; do i=$((i+1)); [ "$i" -gt 60 ] && { echo "[juicefarm] mount timeout" >&2; exit 1; }; sleep 1; done
 echo "[juicefarm] mounted; target=$TARGET mode=$MODE producer=$PRODUCER"
 
