@@ -2261,6 +2261,7 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 		if hasWriteSize && writeSize > e.Size {
 			clone := *e
 			clone.Size = writeSize
+			clone.ResetGetAttrCache()
 			// #100: KEEP the cached mtime — do NOT re-sample time.Now() here.
 			// This branch fires in the post-drain "sticky writeSizes" window
 			// (spool LookupActive has cleared but writeSizes still holds the
@@ -2347,8 +2348,8 @@ type writeSizeInfo struct {
 func (w *writeSizeInfo) Size() int64 { return w.size }
 
 // Lstat is the fast-path for NFS GETATTR. It is called from
-// internal/nfs/nfs_ongetattr.go which then uses Entry.PreSerializedGetAttr to
-// skip XDR encoding entirely.
+// internal/nfs/nfs_ongetattr.go which then uses Entry's atomic GETATTR cache
+// to skip XDR encoding entirely.
 //
 // QA-35 (2026-05-26): GETATTR runs at high frequency (every kernel attr
 // cache refresh — typically every 3 s per open file, more under sustained
@@ -2394,6 +2395,7 @@ func (jfs *juiceFS) Lstat(filename string) (os.FileInfo, error) {
 		if hasWriteSize && writeSize > e.Size {
 			clone := *e
 			clone.Size = writeSize
+			clone.ResetGetAttrCache()
 			// #100: KEEP the cached mtime — do NOT re-sample time.Now() here.
 			// This branch fires in the post-drain "sticky writeSizes" window
 			// (spool LookupActive has cleared but writeSizes still holds the
@@ -3537,13 +3539,13 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 		// them into place, so every .app copy died here (JM_NFS_TRACE proof:
 		// Symlink reply type=5 → post-Rename Lookup of the same fileid type=1).
 		// Cloning also preserves LocalOnly (prune protection must survive a
-		// rename). The pre-serialized GETATTR blob is dropped defensively; the
+		// rename). The pre-serialized GETATTR cache is dropped defensively; the
 		// first GETATTR at the new path recomputes it.
 		clone := *oldEntry
 		clone.Path = newpath
 		clone.Name = path.Base(newpath)
 		clone.ParentPath = path.Dir(newpath)
-		clone.PreSerializedGetAttr = nil
+		clone.ResetGetAttrCache()
 		newEntry := &clone
 		jfs.handler.store.InsertToCache(newEntry)
 

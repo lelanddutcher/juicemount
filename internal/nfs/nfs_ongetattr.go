@@ -43,11 +43,13 @@ func onGetAttr(ctx context.Context, w *response, userHandle Handler) error {
 	// bytes (from our metadata cache), skip XDR marshaling entirely.
 	// This eliminates reflection-based encoding on the hottest NFS path.
 	if fi, ok := info.(*metadata.FileInfo); ok {
-		if entry := fi.Entry(); entry != nil && entry.PreSerializedGetAttr != nil {
-			if err := w.Write(entry.PreSerializedGetAttr); err != nil {
-				return &NFSStatusError{NFSStatusServerFault, err}
+		if entry := fi.Entry(); entry != nil {
+			if cached := entry.CachedGetAttr(); cached != nil {
+				if err := w.Write(cached); err != nil {
+					return &NFSStatusError{NFSStatusServerFault, err}
+				}
+				return nil
 			}
-			return nil
 		}
 	}
 
@@ -76,7 +78,7 @@ func onGetAttr(ctx context.Context, w *response, userHandle Handler) error {
 	if !metadata.ServeFromSQLite() {
 		if fi, ok := info.(*metadata.FileInfo); ok {
 			if entry := fi.Entry(); entry != nil {
-				entry.PreSerializedGetAttr = bodyBytes
+				entry.CacheGetAttr(bodyBytes)
 			}
 		}
 	}

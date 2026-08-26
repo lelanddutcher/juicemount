@@ -144,6 +144,7 @@ func scanEntryPooled(rows *sql.Rows) (*Entry, error) {
 		e.Mode |= fs.ModeDir
 	}
 	e.LocalOnly = sc.localOnly != 0
+	e.prepareGetAttrCache()
 	return e, nil
 }
 

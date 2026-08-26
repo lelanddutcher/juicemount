@@ -703,7 +703,7 @@ func (m *JobManager) Cancel(id string) bool {
 		return false
 	}
 	j.mu.Lock()
-	defer j.mu.Unlock()
+	canceled := false
 	switch j.State {
 	case JobPending, JobRunning:
 		if j.cancel != nil {
@@ -721,10 +721,19 @@ func (m *JobManager) Cancel(id string) bool {
 		})
 		j.notifyListenersLocked(j.Last)
 		j.closeListenersLocked()
-		return true
-	default:
-		return false
+		canceled = true
 	}
+	j.mu.Unlock()
+	if canceled {
+		// Pending cancellations have no runner completion path to persist them;
+		// running cancellations should be durable immediately rather than only
+		// after the subprocess notices its context. Do not hold j.mu here because
+		// saveStateLocked snapshots every job under that same lock.
+		m.mu.Lock()
+		m.saveStateLocked()
+		m.mu.Unlock()
+	}
+	return canceled
 }
 
 // Subscribe returns a channel that receives every subsequent
@@ -806,6 +815,15 @@ func (m *JobManager) StopAll() {
 func (m *JobManager) run(j *Job) {
 	ctx, cancel := context.WithCancel(context.Background())
 	j.mu.Lock()
+	// Cancel/StopAll can win the small window between Submit launching this
+	// goroutine and the goroutine acquiring j.mu. Never resurrect that terminal
+	// job as Running or start its external sync process.
+	if j.State != JobPending {
+		j.mu.Unlock()
+		cancel()
+		m.advanceQueue(j)
+		return
+	}
 	j.cancel = cancel
 	j.State = JobRunning
 	j.StartedAt = time.Now().UnixMilli()
@@ -874,13 +892,21 @@ func (m *JobManager) run(j *Job) {
 	j.closeListenersLocked()
 	j.mu.Unlock()
 
-	// Dequeue and kick the next pending job if any.
+	m.advanceQueue(j)
+}
+
+// advanceQueue removes completed from the single active slot and starts the
+// next job that is still pending. Job state belongs to Job.mu; reading it only
+// under JobManager.mu raced with Cancel, which writes the state under Job.mu.
+func (m *JobManager) advanceQueue(completed *Job) {
 	m.mu.Lock()
-	m.active = nil
+	if m.active == completed {
+		m.active = nil
+	}
 	var nextToRun *Job
 	for _, id := range m.order {
 		next := m.jobs[id]
-		if next.State == JobPending {
+		if next.GetState() == JobPending {
 			m.active = next
 			nextToRun = next
 			break

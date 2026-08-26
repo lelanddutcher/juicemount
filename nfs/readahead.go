@@ -50,8 +50,11 @@ type ReadaheadManager struct {
 
 	// Semaphore for concurrent readahead goroutines (sized to the fast-link max;
 	// the per-link policy.Workers caps how many slots are actually used).
-	sem    chan struct{}
-	stopCh chan struct{}
+	sem      chan struct{}
+	stopCh   chan struct{}
+	stopped  bool
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 
 	// activePrefetch is the live count of in-flight prefetch goroutines, gated
 	// against the current policy's Workers so a slow link stays gentle.
@@ -93,7 +96,11 @@ func NewReadaheadManager(fusePath string, fdPool *FDPool, profile *netprofile.Pr
 		sem:      make(chan struct{}, maxReadaheadWorkers),
 		stopCh:   make(chan struct{}),
 	}
-	go rm.cleanupLoop()
+	rm.wg.Add(1)
+	go func() {
+		defer rm.wg.Done()
+		rm.cleanupLoop()
+	}()
 	return rm
 }
 
@@ -147,6 +154,9 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
+	if rm.stopped {
+		return
+	}
 
 	tracker, ok := rm.trackers[inode]
 	if !ok {
@@ -211,7 +221,11 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 		metrics.Default().IncReadaheadTriggered()
 
 		// Fire background prefetch (non-blocking), capped by the policy's worker budget.
-		go rm.prefetch(filePath, prefetchStart, prefetchEnd, policy.Workers)
+		rm.wg.Add(1)
+		go func() {
+			defer rm.wg.Done()
+			rm.prefetch(filePath, prefetchStart, prefetchEnd, policy.Workers)
+		}()
 	}
 }
 
@@ -353,7 +367,18 @@ func (rm *ReadaheadManager) cleanupLoop() {
 
 // Stop shuts down the readahead manager.
 func (rm *ReadaheadManager) Stop() {
-	close(rm.stopCh)
-	log.Printf("readahead: stopped (triggered=%d, prefetched=%d blocks)",
-		rm.triggered, rm.prefetched)
+	rm.stopOnce.Do(func() {
+		// Serialize the stopped transition with OnRead's WaitGroup.Add. Once
+		// stopped is visible, no new prefetch goroutine can be registered, so
+		// waiting for the existing set is valid and teardown cannot leak work
+		// into the next server/test instance.
+		rm.mu.Lock()
+		rm.stopped = true
+		close(rm.stopCh)
+		rm.mu.Unlock()
+		rm.wg.Wait()
+		triggered, prefetched := rm.Stats()
+		log.Printf("readahead: stopped (triggered=%d, prefetched=%d blocks)",
+			triggered, prefetched)
+	})
 }

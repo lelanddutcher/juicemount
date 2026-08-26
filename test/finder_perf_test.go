@@ -67,53 +67,65 @@ func requireFUSEMount(t *testing.T) string {
 // that is reachable through both views under comparison. Selecting from FUSE
 // alone made the NFS arm benchmark a nonexistent path whenever the live
 // volume contained a hidden or not-yet-indexed directory.
+//
+// This discovery must remain bounded: filepath.Walk previously traversed the
+// entire live media volume and the race suite timed out after ten minutes in
+// this helper. A breadth-first directory-only search gives representative
+// shallow candidates while capping both namespace work and wall time.
 func findCommonDirWithNEntries(fuseRoot, nfsRoot string, target int, tolerance float64) (string, int) {
+	const maxDirs = 512
+	deadline := time.Now().Add(10 * time.Second)
+
+	type candidate struct {
+		fusePath string
+		rel      string
+	}
+	queue := []candidate{{fusePath: fuseRoot, rel: "."}}
 	best := ""
 	bestCount := 0
 	bestDiff := target
+	visited := 0
 
-	filepath.Walk(fuseRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil || !info.IsDir() {
-			return nil
-		}
-		rel, relErr := filepath.Rel(fuseRoot, path)
-		if relErr != nil {
-			return nil
-		}
-		if rel != "." {
-			for _, part := range strings.Split(rel, string(filepath.Separator)) {
-				if strings.HasPrefix(part, ".") {
-					return filepath.SkipDir
-				}
-			}
-		}
-		nfsPath := filepath.Join(nfsRoot, rel)
-		nfsInfo, nfsErr := os.Stat(nfsPath)
-		if nfsErr != nil || !nfsInfo.IsDir() {
-			return nil
-		}
-		entries, err := os.ReadDir(path)
+	for len(queue) > 0 && visited < maxDirs && time.Now().Before(deadline) {
+		cur := queue[0]
+		queue = queue[1:]
+		visited++
+
+		entries, err := os.ReadDir(cur.fusePath)
 		if err != nil {
-			return nil
+			continue
 		}
+		nfsPath := filepath.Join(nfsRoot, cur.rel)
 		nfsEntries, err := os.ReadDir(nfsPath)
 		if err != nil || len(nfsEntries) == 0 {
-			return nil
+			continue
 		}
 		diff := len(entries) - target
 		if diff < 0 {
 			diff = -diff
 		}
 		if diff < bestDiff || (diff == bestDiff && len(entries) > bestCount) {
-			best = path
+			best = cur.fusePath
 			bestCount = len(entries)
 			bestDiff = diff
 		}
 		if float64(diff)/float64(target) < tolerance {
-			return filepath.SkipAll
+			return best, bestCount
 		}
-		return nil
-	})
+
+		for _, entry := range entries {
+			if len(queue)+visited >= maxDirs || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			if entry.IsDir() {
+				rel := filepath.Join(cur.rel, entry.Name())
+				queue = append(queue, candidate{
+					fusePath: filepath.Join(cur.fusePath, entry.Name()),
+					rel:      rel,
+				})
+			}
+		}
+	}
 	return best, bestCount
 }
 

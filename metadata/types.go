@@ -3,6 +3,7 @@ package metadata
 import (
 	"io/fs"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -33,11 +34,70 @@ type Entry struct {
 	Mode       fs.FileMode
 	LocalOnly  bool // true = created locally, not yet confirmed in Redis
 
-	// [JM5] Pre-serialized XDR bytes for the NFS GETATTR response body
-	// (NFSStatusOk + fattr3). Cached here so that repeated GETATTRs for
-	// the same file skip XDR marshaling entirely — just copy 88 bytes.
-	// nil means not yet computed; set lazily on first GETATTR.
-	PreSerializedGetAttr []byte
+	// getAttrCache is shared by immutable read snapshots of this entry. The
+	// payload is published atomically because GETATTR is a hot concurrent path.
+	// Store mutations replace the cache pointer before publishing the new
+	// scalar values, so an older snapshot can never repopulate stale XDR bytes
+	// for a newer size/mode/mtime generation.
+	getAttrCache *entryGetAttrCache
+}
+
+type entryGetAttrBody struct {
+	body []byte
+}
+
+type entryGetAttrCache struct {
+	body atomic.Pointer[entryGetAttrBody]
+}
+
+// prepareGetAttrCache initializes the cache before an Entry is published in
+// Store's RAM indexes. Caller must own the Entry or hold Store.mu for writing.
+func (e *Entry) prepareGetAttrCache() {
+	if e != nil && e.getAttrCache == nil {
+		e.getAttrCache = &entryGetAttrCache{}
+	}
+}
+
+// ResetGetAttrCache detaches this Entry from any previously serialized
+// attributes. Use whenever a clone changes a field encoded by NFS GETATTR.
+func (e *Entry) ResetGetAttrCache() {
+	if e != nil {
+		e.getAttrCache = &entryGetAttrCache{}
+	}
+}
+
+// CachedGetAttr returns immutable pre-serialized NFS GETATTR bytes, if any.
+func (e *Entry) CachedGetAttr() []byte {
+	if e == nil || e.getAttrCache == nil {
+		return nil
+	}
+	if cached := e.getAttrCache.body.Load(); cached != nil {
+		return cached.body
+	}
+	return nil
+}
+
+// CacheGetAttr atomically publishes immutable pre-serialized NFS GETATTR
+// bytes. The caller hands ownership of body to Entry and must not mutate it.
+func (e *Entry) CacheGetAttr(body []byte) {
+	if e == nil || e.getAttrCache == nil || len(body) == 0 {
+		return
+	}
+	e.getAttrCache.body.Store(&entryGetAttrBody{body: body})
+}
+
+// snapshot returns a stable scalar view for callers outside Store's lock.
+// The concurrency-safe GETATTR cache remains shared until a mutation replaces
+// the cached Entry's cache pointer.
+func (e *Entry) snapshot() *Entry {
+	if e == nil {
+		return nil
+	}
+	clone := *e
+	if clone.getAttrCache == nil {
+		clone.getAttrCache = &entryGetAttrCache{}
+	}
+	return &clone
 }
 
 // FileInfo implements fs.FileInfo for an Entry.

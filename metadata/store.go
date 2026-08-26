@@ -503,6 +503,7 @@ func (s *Store) RecoverShadow(rec evictedShadow, inode uint64) *Entry {
 		Inode:      inode,
 		Mode:       rec.Mode,
 	}
+	e.prepareGetAttrCache()
 	s.mu.Lock()
 	old := s.pathCache[e.Path]
 	if old != nil {
@@ -517,7 +518,7 @@ func (s *Store) RecoverShadow(rec evictedShadow, inode uint64) *Entry {
 	// Clear the shadow now that the entry is live again.
 	delete(s.recentlyEvicted, inode)
 	s.mu.Unlock()
-	return e
+	return e.snapshot()
 }
 
 // SetPinChecker installs the pin-store backed pin checker. Nil-safe: callers
@@ -940,9 +941,9 @@ func (s *Store) Insert(e *Entry) error {
 	// RAM cache first, then persist it asynchronously; a concurrent WRITE close
 	// can therefore call UpdateSize while this goroutine is still starting.
 	//
-	// Snapshot only the durable fields while holding s.mu. In particular, do not
-	// copy PreSerializedGetAttr: the NFS GETATTR fast path owns that ephemeral
-	// cache and may populate it without participating in SQLite persistence.
+	// Snapshot only the durable fields while holding s.mu. The NFS GETATTR fast
+	// path owns an independent atomic cache and does not participate in SQLite
+	// persistence.
 	// Holding writeMu before the snapshot gives Insert and UpdateSize a single
 	// total order, so an old CREATE snapshot can never replace a later size bump
 	// in SQLite or pathCache.
@@ -959,6 +960,7 @@ func (s *Store) Insert(e *Entry) error {
 		Mode:       e.Mode,
 		LocalOnly:  e.LocalOnly,
 	}
+	persisted.prepareGetAttrCache()
 	s.mu.RUnlock()
 	e = persisted
 	// entries + external-content FTS updated atomically so search stays in sync
@@ -1220,7 +1222,7 @@ func (s *Store) LookupByInode(inode uint64) *Entry {
 func (s *Store) lookupByInodeRAM(inode uint64) *Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.inodeCache[inode]
+	return s.inodeCache[inode].snapshot()
 }
 
 // LookupByPath returns the entry at the given path, or nil.
@@ -1237,7 +1239,7 @@ func (s *Store) LookupByPath(entryPath string) *Entry {
 func (s *Store) lookupByPathRAM(entryPath string) *Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.pathCache[entryPath]
+	return s.pathCache[entryPath].snapshot()
 }
 
 // ListChildren returns all entries whose parent_path matches the given path.
@@ -1267,7 +1269,7 @@ func (s *Store) listChildrenRAM(parentPath string) ([]*Entry, error) {
 	}
 	entries := make([]*Entry, 0, len(children))
 	for _, e := range children {
-		entries = append(entries, e)
+		entries = append(entries, e.snapshot())
 	}
 	return entries, nil
 }
@@ -1842,7 +1844,7 @@ func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error 
 		// the ancestor aggregates. Zero delta (MAX rejected a shrink) no-ops.
 		s.subtreeResizeLocked(e, oldSize)
 		e.Mtime = mtime
-		e.PreSerializedGetAttr = nil // [JM5] invalidate cached XDR bytes
+		e.ResetGetAttrCache()
 	}
 	s.mu.Unlock()
 	s.writeMu.Unlock()
@@ -1880,7 +1882,7 @@ func (s *Store) UpdateMode(entryPath string, mode fs.FileMode) error {
 	if e, ok := s.pathCache[entryPath]; ok {
 		// Preserve type bits (ModeDir/ModeSymlink), replace perm bits only.
 		e.Mode = (e.Mode &^ fs.ModePerm) | (mode & fs.ModePerm)
-		e.PreSerializedGetAttr = nil // invalidate cached XDR attrs (see UpdateSize)
+		e.ResetGetAttrCache()
 	}
 	s.mu.Unlock()
 
@@ -2631,7 +2633,7 @@ func MakeEntry(entryPath string, isDir bool, size int64, mtime time.Time, inode 
 	if isDir {
 		mode = 0755 | fs.ModeDir
 	}
-	return &Entry{
+	e := &Entry{
 		Path:       entryPath,
 		Name:       path.Base(entryPath),
 		ParentPath: path.Dir(entryPath),
@@ -2641,6 +2643,8 @@ func MakeEntry(entryPath string, isDir bool, size int64, mtime time.Time, inode 
 		Inode:      inode,
 		Mode:       mode,
 	}
+	e.prepareGetAttrCache()
+	return e
 }
 
 type scanner interface {
@@ -2668,6 +2672,7 @@ func scanEntry(s scanner) (*Entry, error) {
 		e.Mode |= fs.ModeDir
 	}
 	e.LocalOnly = localOnly != 0
+	e.prepareGetAttrCache()
 	return &e, nil
 }
 

@@ -158,7 +158,7 @@ func (s *Store) BatchDrainComplete(items []DrainCommitItem) ([]DrainCommitResult
 			// the (new−old) delta to the ancestor subtree aggregates.
 			s.subtreeResizeLocked(e, oldSize)
 			e.Mtime = it.Mtime
-			e.PreSerializedGetAttr = nil
+			e.ResetGetAttrCache()
 		}
 	}
 	s.mu.Unlock()

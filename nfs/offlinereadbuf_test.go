@@ -8,15 +8,8 @@ import (
 	"time"
 )
 
-const sentinel = 0xA7
-
-func marked(b []byte) bool {
-	return len(b) > 0 && b[0] == sentinel && b[len(b)-1] == sentinel
-}
-
-func mark(b []byte) {
-	b[0] = sentinel
-	b[len(b)-1] = sentinel
+func sameBuffer(a, b []byte) bool {
+	return len(a) > 0 && len(b) > 0 && &a[0] == &b[0]
 }
 
 // POSITIVE CONTROL. Without this, the timed-out test below would pass even if
@@ -26,10 +19,9 @@ func TestCompletedReadBufferIsRecycled(t *testing.T) {
 	seen := false
 	for i := 0; i < 200 && !seen; i++ {
 		b := offlineReadBuf(offlineReadBufCap)
-		mark(b)
 		releaseOfflineReadBuf(b, true)
 		got := offlineReadBuf(offlineReadBufCap)
-		seen = marked(got)
+		seen = sameBuffer(b, got)
 		releaseOfflineReadBuf(got, true)
 	}
 	if !seen {
@@ -45,11 +37,10 @@ func TestCompletedReadBufferIsRecycled(t *testing.T) {
 func TestTimedOutReadBufferIsNeverRecycled(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		b := offlineReadBuf(offlineReadBufCap)
-		mark(b)
 		releaseOfflineReadBuf(b, false) // bound exceeded: goroutine still owns it
 
 		got := offlineReadBuf(offlineReadBufCap)
-		if marked(got) {
+		if sameBuffer(b, got) {
 			t.Fatalf("iteration %d: a buffer from a TIMED-OUT read came back out of "+
 				"the pool. Its orphan goroutine is still writing into it, so the "+
 				"next offline read would serve bytes another read is mutating", i)
