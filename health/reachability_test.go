@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -595,4 +596,29 @@ func TestReachability_MiddleboxHandshakeIsNotReachable(t *testing.T) {
 	t.Fatal("a TCP handshake with no RESP reply was treated as REACHABLE — " +
 		"this lifts auto-offline against a dead backend and reintroduces the " +
 		"multi-second first-open stall on cellular")
+}
+
+func TestWithDialContextUsesFarSideDialerAndRequiresRESP(t *testing.T) {
+	var gotNetwork, gotAddress string
+	r := NewReachability("nas.private:6379", WithDialContext(func(_ context.Context, network, address string) (net.Conn, error) {
+		gotNetwork, gotAddress = network, address
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			request := make([]byte, len("PING\r\n"))
+			if _, err := io.ReadFull(server, request); err != nil {
+				return
+			}
+			if string(request) == "PING\r\n" {
+				_, _ = server.Write([]byte("+PONG\r\n"))
+			}
+		}()
+		return client, nil
+	}))
+	if !r.probe() {
+		t.Fatal("far-side Redis PING through custom dialer was not accepted")
+	}
+	if gotNetwork != "tcp" || gotAddress != "nas.private:6379" {
+		t.Fatalf("custom dialer received (%q, %q)", gotNetwork, gotAddress)
+	}
 }

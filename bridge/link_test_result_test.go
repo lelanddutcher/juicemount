@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -126,5 +127,31 @@ func TestReusableLinkNodeRefusesIdentityChangeWithoutStoppingActiveDataPlane(t *
 	linkMu.Unlock()
 	if stillPublished != node {
 		t.Fatal("identity change replaced or detached the live Link node before FUSE teardown")
+	}
+}
+
+func TestStartupDefersLinkReadinessAndProbesFarSideThroughLink(t *testing.T) {
+	raw, err := os.ReadFile("cbridge.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	start := strings.Index(source, "func startLinkIfConfigured")
+	end := strings.Index(source, "func validateLinkConfig")
+	if start < 0 || end <= start {
+		t.Fatal("could not locate Link startup implementation")
+	}
+	startup := source[start:end]
+	for _, required := range []string{
+		"StartLinkNodeDeferred",
+		"reachURL = linkProbeURL",
+		"health.WithDialContext(linkNode.DialContext)",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("startup wiring no longer contains %q", required)
+		}
+	}
+	if strings.Contains(startup, "StartLinkNode(") {
+		t.Fatal("app startup reverted to a synchronous Link readiness wait")
 	}
 }

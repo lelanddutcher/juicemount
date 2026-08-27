@@ -339,10 +339,9 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
 		return nil, false, err
 	}
 	owned := false
-	var addrs []string
 	if node == nil {
 		var err error
-		node, addrs, err = jmnfs.StartLinkNode(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, linkStateDir(*cfg))
+		node, err = jmnfs.StartLinkNodeDeferred(cfg.NetControlURL, cfg.NetAuthKey, cfg.NetHostname, linkStateDir(*cfg))
 		if err != nil {
 			return nil, false, fmt.Errorf("JuiceMount Link node failed to start: %w", err)
 		}
@@ -371,8 +370,10 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
 			return nil, false, err
 		}
 	}
-	if len(addrs) > 0 {
+	if addrs := node.Addresses(); len(addrs) > 0 {
 		jmlog.Info("JuiceMount Link: node up", "addrs", fmt.Sprint(addrs))
+	} else {
+		jmlog.Info("JuiceMount Link: node started; registration and route acceptance continuing in background")
 	}
 	jmlog.Info("JuiceMount Link: backend endpoints now use loopback proxies")
 	return node, owned, nil
@@ -635,6 +636,14 @@ func NFSServerLinkTest(configJSON *C.char) *C.char {
 	} else {
 		result.Addresses = node.Addresses()
 	}
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	readyAddrs, readyErr := node.WaitReady(readyCtx)
+	readyCancel()
+	if readyErr != nil {
+		result.Error = "paired identity is saved, but JuiceMount Link is not online yet: " + readyErr.Error()
+		return encode()
+	}
+	result.Addresses = readyAddrs
 
 	result.Authorized = true
 	result.Online = true
@@ -1229,11 +1238,19 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// offline mode, refuse un-pinned reads fast, and surface state
 	// in the UI. For now this is purely observational — it logs
 	// transitions but does not yet affect any other state.
-	if reachAddr, _, _ := metadata.ParseRedisURL(cfg.RedisURL); reachAddr != "" {
+	reachURL := cfg.RedisURL
+	if linkNode != nil {
+		// The proxy listener is local and therefore reachable even while Link's
+		// far-side route is down. Probe the original NAS endpoint through the
+		// Link dialer so recovery/offline transitions describe the real encrypted
+		// data plane and never clear offline merely because 127.0.0.1 accepted.
+		reachURL = linkProbeURL
+	}
+	if reachAddr, _, _ := metadata.ParseRedisURL(reachURL); reachAddr != "" {
 		// Feed successful-probe RTT into the network-profile link estimator so
 		// adaptive readahead can bootstrap link class (fast LAN vs slow WAN)
 		// before any throughput sample arrives (internal/netprofile).
-		globalReach = health.NewReachability(reachAddr,
+		reachOpts := []health.ReachabilityOption{
 			health.WithFailureThreshold(backendFailuresToOffline),
 			health.WithRTTObserver(netprofile.Default().ObserveRTT),
 			// Drain-liveness false-flap override (task #66 salvage, NFSv3
@@ -1264,7 +1281,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					return time.Duration(math.MaxInt64)
 				}
 				return time.Since(last)
-			}))
+			}),
+		}
+		if linkNode != nil {
+			reachOpts = append(reachOpts, health.WithDialContext(linkNode.DialContext))
+		}
+		globalReach = health.NewReachability(reachAddr, reachOpts...)
 		globalReach.OnChange(func(reachable bool, reason string) {
 			if reachable {
 				// Recovery is intentionally not debounced: the moment a real

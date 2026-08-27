@@ -35,11 +35,19 @@ import (
 )
 
 type LinkNode struct {
-	srv            *tsnet.Server
-	mu             sync.Mutex
-	proxies        []*tcpProxy
-	proxyEndpoints map[string]string
-	addrs          []string
+	srv             *tsnet.Server
+	mu              sync.Mutex
+	hostname        string
+	proxies         []*tcpProxy
+	proxyEndpoints  map[string]string
+	addrs           []string
+	readyCh         chan struct{}
+	readyOnce       sync.Once
+	readyErr        error
+	readyCancel     context.CancelFunc
+	readyState      string
+	readyHealth     []string
+	readyAttemptErr error
 }
 
 // contextDialer is deliberately small so proxy behavior can be tested with a
@@ -64,9 +72,10 @@ type tcpProxy struct {
 	conns  map[net.Conn]struct{}
 }
 
-// StartLinkNode brings up the embedded tailnet node and waits (bounded) for
-// registration. Returns the node + this Mac's tailnet addresses.
-func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, []string, error) {
+// newLinkNode starts tsnet without waiting for the control plane or subnet
+// route. status is separated so synchronous Apply/Test and deferred app startup
+// can share one constructor while choosing their own readiness lifecycle.
+func newLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, linkStatusFunc, error) {
 	if controlURL == "" || authKey == "" {
 		return nil, nil, fmt.Errorf("link: control URL and auth key required")
 	}
@@ -90,43 +99,208 @@ func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, [
 	if err := s.Start(); err != nil {
 		return nil, nil, fmt.Errorf("link: start: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-	// Do not use tsnet.Server.Up here. Up waits exclusively on an IPN-bus
-	// state-transition notification. In a c-archive host (the signed Mac app),
-	// a fast persisted-identity reconnect can reach Running between Start and
-	// watcher attachment; the notification is then missed and Up blocks until
-	// its context expires even though LocalAPI already reports an online node
-	// with assigned addresses. Polling the stable LocalAPI status is bounded,
-	// observes the current state rather than only future transitions, and gives
-	// us an actionable final state/health error on genuine failures.
 	lc, err := s.LocalClient()
 	if err != nil {
 		s.Close()
 		return nil, nil, fmt.Errorf("link: local client: %w", err)
 	}
-	st, err := waitForLinkRunning(ctx, lc.StatusWithoutPeers, 200*time.Millisecond)
+	node := &LinkNode{
+		srv:      s,
+		hostname: hostname,
+		readyCh:  make(chan struct{}),
+	}
+	return node, lc.StatusWithoutPeers, nil
+}
+
+// StartLinkNode brings up the embedded tailnet node and waits (bounded) for
+// registration. Apply/Test uses this synchronous contract so success means the
+// encrypted route is ready now, not merely retrying in the background.
+func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, []string, error) {
+	node, status, err := newLinkNode(controlURL, authKey, hostname, stateDir)
 	if err != nil {
-		s.Close()
 		return nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	st, err := waitForLinkRunning(ctx, status, 200*time.Millisecond)
+	if err == nil {
+		err = node.configureReady(st)
+	}
+	if err != nil {
+		node.Stop()
+		return nil, nil, err
+	}
+	node.completeReady(nil)
+	return node, node.Addresses(), nil
+}
+
+// StartLinkNodeDeferred starts the encrypted-only data plane immediately and
+// completes registration in the background. The returned node can create
+// loopback proxies before the route is online; their outbound DialContext waits
+// for a Tailscale route and never falls back to the ordinary LAN. This lets the
+// app serve its offline metadata mirror during a cold cellular/LAN transition
+// instead of turning a transient control-key fetch into a fatal startup modal.
+func StartLinkNodeDeferred(controlURL, authKey, hostname, stateDir string) (*LinkNode, error) {
+	node, status, err := newLinkNode(controlURL, authKey, hostname, stateDir)
+	if err != nil {
+		return nil, err
+	}
+	node.startDeferredReadiness(status, 200*time.Millisecond)
+	return node, nil
+}
+
+type linkStatusFunc func(context.Context) (*ipnstate.Status, error)
+
+func (l *LinkNode) startDeferredReadiness(status linkStatusFunc, pollEvery time.Duration) {
+	l.startDeferredReadinessWith(status, pollEvery, l.configureReady)
+}
+
+// startDeferredReadinessWith separates the long-lived retry loop from tsnet's
+// preference calls. Tests inject configure so they can prove that a transient
+// Running -> EditPrefs failure is retried instead of permanently poisoning the
+// saved Link identity.
+func (l *LinkNode) startDeferredReadinessWith(status linkStatusFunc, pollEvery time.Duration, configure func(*ipnstate.Status) error) {
+	if pollEvery <= 0 {
+		pollEvery = 200 * time.Millisecond
+	}
+	l.mu.Lock()
+	s := l.srv
+	l.mu.Unlock()
+	if s == nil {
+		l.completeReady(fmt.Errorf("link: node is stopped"))
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	l.mu.Lock()
+	if l.readyCancel != nil {
+		l.readyCancel()
+	}
+	l.readyCancel = cancel
+	l.mu.Unlock()
+	go func() {
+		for {
+			st, err := waitForLinkRunning(ctx, func(ctx context.Context) (*ipnstate.Status, error) {
+				current, statusErr := status(ctx)
+				l.noteReadinessAttempt(current, statusErr)
+				return current, statusErr
+			}, pollEvery)
+			if err != nil {
+				l.completeReady(err)
+				return
+			}
+			if err := configure(st); err == nil {
+				l.completeReady(nil)
+				return
+			} else {
+				l.noteReadinessAttempt(st, err)
+			}
+			// BackendState can become Running before LocalAPI preference edits
+			// are available during a cold boot. Keep the node pending and retry;
+			// Apply/Test remains bounded by its caller's WaitReady context.
+			select {
+			case <-ctx.Done():
+				l.completeReady(ctx.Err())
+				return
+			case <-time.After(pollEvery):
+			}
+		}
+	}()
+}
+
+func (l *LinkNode) noteReadinessAttempt(st *ipnstate.Status, err error) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if st != nil {
+		l.readyState = st.BackendState
+		l.readyHealth = append(l.readyHealth[:0], st.Health...)
+	}
+	l.readyAttemptErr = err
+}
+
+func (l *LinkNode) configureReady(st *ipnstate.Status) error {
+	if st == nil {
+		return fmt.Errorf("link: ready status is missing")
+	}
+	if err := l.setHostname(l.hostname); err != nil {
+		return err
+	}
+	if err := l.acceptRoutes(); err != nil {
+		return err
 	}
 	addrs := make([]string, 0, len(st.TailscaleIPs))
 	for _, a := range st.TailscaleIPs {
 		addrs = append(addrs, a.String())
 	}
-	node := &LinkNode{srv: s, addrs: append([]string(nil), addrs...)}
-	if err := node.setHostname(hostname); err != nil {
-		s.Close()
-		return nil, nil, err
+	l.mu.Lock()
+	if l.srv == nil {
+		l.mu.Unlock()
+		return fmt.Errorf("link: node stopped during readiness")
 	}
-	if err := node.acceptRoutes(); err != nil {
-		s.Close()
-		return nil, nil, err
-	}
-	return node, addrs, nil
+	l.addrs = append([]string(nil), addrs...)
+	l.mu.Unlock()
+	return nil
 }
 
-type linkStatusFunc func(context.Context) (*ipnstate.Status, error)
+func (l *LinkNode) completeReady(err error) {
+	if l == nil {
+		return
+	}
+	l.readyOnce.Do(func() {
+		l.mu.Lock()
+		l.readyErr = err
+		if err == nil {
+			l.readyAttemptErr = nil
+		}
+		readyCh := l.readyCh
+		l.mu.Unlock()
+		if readyCh != nil {
+			close(readyCh)
+		}
+	})
+}
+
+// WaitReady waits for deferred registration and route acceptance. It never
+// starts or stops the node and therefore can be used by diagnostics without
+// racing the data-plane lifecycle.
+func (l *LinkNode) WaitReady(ctx context.Context) ([]string, error) {
+	if l == nil {
+		return nil, fmt.Errorf("link: node is nil")
+	}
+	l.mu.Lock()
+	readyCh := l.readyCh
+	l.mu.Unlock()
+	if readyCh == nil {
+		return nil, fmt.Errorf("link: readiness is unavailable")
+	}
+	select {
+	case <-ctx.Done():
+		l.mu.Lock()
+		state := l.readyState
+		health := append([]string(nil), l.readyHealth...)
+		attemptErr := l.readyAttemptErr
+		l.mu.Unlock()
+		detail := ""
+		if state != "" {
+			detail = fmt.Sprintf("; last state %q", state)
+		}
+		if len(health) > 0 {
+			detail += "; health: " + strings.Join(health, "; ")
+		}
+		if attemptErr != nil {
+			detail += "; last attempt: " + attemptErr.Error()
+		}
+		return nil, fmt.Errorf("link: readiness is still pending%s: %w", detail, ctx.Err())
+	case <-readyCh:
+		l.mu.Lock()
+		err := l.readyErr
+		addrs := append([]string(nil), l.addrs...)
+		l.mu.Unlock()
+		return addrs, err
+	}
+}
 
 func waitForLinkRunning(ctx context.Context, status linkStatusFunc, pollEvery time.Duration) (*ipnstate.Status, error) {
 	if pollEvery <= 0 {
@@ -165,7 +339,13 @@ func waitForLinkRunning(ctx context.Context, status linkStatusFunc, pollEvery ti
 }
 
 func (l *LinkNode) setHostname(hostname string) error {
-	lc, err := l.srv.LocalClient()
+	l.mu.Lock()
+	s := l.srv
+	l.mu.Unlock()
+	if s == nil {
+		return fmt.Errorf("link: node is stopped")
+	}
+	lc, err := s.LocalClient()
 	if err != nil {
 		return fmt.Errorf("link: hostname preferences unavailable: %w", err)
 	}
@@ -639,7 +819,13 @@ func (p *tcpProxy) Close() error {
 // dials made through this node's netstack. A failure is fatal: silently
 // degrading to the ordinary LAN would defeat Link's data-plane guarantee.
 func (l *LinkNode) acceptRoutes() error {
-	lc, err := l.srv.LocalClient()
+	l.mu.Lock()
+	s := l.srv
+	l.mu.Unlock()
+	if s == nil {
+		return fmt.Errorf("link: node is stopped")
+	}
+	lc, err := s.LocalClient()
 	if err != nil {
 		return fmt.Errorf("link: accept-routes unavailable: %w", err)
 	}
@@ -704,15 +890,21 @@ func (l *LinkNode) Stop() {
 	l.mu.Lock()
 	s := l.srv
 	proxies := l.proxies
+	readyCancel := l.readyCancel
 	l.srv = nil
 	l.proxies = nil
 	l.proxyEndpoints = nil
 	l.addrs = nil
+	l.readyCancel = nil
 	l.mu.Unlock()
+	if readyCancel != nil {
+		readyCancel()
+	}
 	for _, proxy := range proxies {
 		_ = proxy.Close()
 	}
 	if s != nil {
 		_ = s.Close()
 	}
+	l.completeReady(fmt.Errorf("link: node is stopped"))
 }

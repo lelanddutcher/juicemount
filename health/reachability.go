@@ -53,6 +53,16 @@ type dialer interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
+// DialContextFunc adapts a function to the reachability dialer contract. Link
+// uses this to make probes traverse its userspace encrypted route instead of
+// probing the loopback proxy listener (which is reachable even when the far
+// side is not).
+type DialContextFunc func(context.Context, string, string) (net.Conn, error)
+
+func (f DialContextFunc) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return f(ctx, network, address)
+}
+
 // Reachability monitors whether a backend host:port is reachable from
 // this machine. Concurrent-safe; one instance per app process.
 type Reachability struct {
@@ -167,6 +177,17 @@ func WithSuccessThreshold(n int) ReachabilityOption {
 // production code never needs it.
 func withDialer(d dialer) ReachabilityOption {
 	return func(r *Reachability) { r.dialer = d }
+}
+
+// WithDialContext routes probes through fn. A successful result must still
+// answer the Redis protocol-level PING performed by probe(), so a connected
+// local listener alone can never be mistaken for backend readiness.
+func WithDialContext(fn func(context.Context, string, string) (net.Conn, error)) ReachabilityOption {
+	return func(r *Reachability) {
+		if fn != nil {
+			r.dialer = DialContextFunc(fn)
+		}
+	}
 }
 
 // WithRTTObserver registers a callback invoked with the dial latency of every
