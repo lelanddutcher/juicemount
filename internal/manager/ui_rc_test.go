@@ -16,9 +16,13 @@ func TestManagerRCUIKeepsAccessibilityAndBoundedErrors(t *testing.T) {
 	css := string(cssRaw)
 	for _, marker := range []string{
 		"--focus-ring:",
+		"--control-border: rgba(27, 16, 42, 0.5)",
+		"--control-border: rgba(250, 253, 232, 0.42)",
 		"outline: 2px solid var(--focus-ring)",
+		"textarea { border-color: var(--control-border); }",
 		"@media (prefers-reduced-motion: reduce)",
 		"min-height: 2.25rem",
+		".sidebar-list a { min-height: 2.75rem",
 	} {
 		if !strings.Contains(css, marker) {
 			t.Errorf("Manager CSS lost RC accessibility contract %q", marker)

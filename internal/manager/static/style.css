@@ -30,6 +30,7 @@
   --card: #ffffff;
   --border: rgba(27, 16, 42, 0.18);
   --border-strong: rgba(27, 16, 42, 0.36);
+  --control-border: rgba(27, 16, 42, 0.5);
   --text: var(--pulp-ink);
   --text-muted: #565257;
   --muted: var(--text-muted);
@@ -57,6 +58,7 @@
     --card: #24252a;
     --border: rgba(250, 253, 232, 0.14);
     --border-strong: rgba(250, 253, 232, 0.3);
+    --control-border: rgba(250, 253, 232, 0.42);
     --text: var(--rind-cream);
     --text-muted: rgba(250, 253, 232, 0.7);
     --muted: var(--text-muted);
@@ -1436,6 +1438,7 @@ html[data-theme="dark"] {
   color-scheme: dark;
   --bg: var(--cinema-dark); --bg-elev: #1e1f23; --panel: #222328; --card: #24252a;
   --border: rgba(250, 253, 232, 0.14); --border-strong: rgba(250, 253, 232, 0.3);
+  --control-border: rgba(250, 253, 232, 0.42);
   --text: var(--rind-cream); --text-muted: rgba(250, 253, 232, 0.7); --muted: var(--text-muted);
   --accent: var(--juice-green); --accent-strong: #c3df7c; --accent-text: #c9e487;
   --accent-ink: var(--pulp-ink); --accent-bg: rgba(170, 205, 88, 0.13);
@@ -1447,6 +1450,7 @@ html[data-theme="light"] {
   color-scheme: light;
   --bg: var(--rind-cream); --bg-elev: #ffffff; --panel: #f4f7e7; --card: #ffffff;
   --border: rgba(27, 16, 42, 0.18); --border-strong: rgba(27, 16, 42, 0.36);
+  --control-border: rgba(27, 16, 42, 0.5);
   --text: var(--pulp-ink); --text-muted: #565257; --muted: var(--text-muted);
   --accent: var(--juice-green); --accent-strong: #6f8c24; --accent-text: #526b13;
   --accent-ink: var(--pulp-ink); --accent-bg: rgba(170, 205, 88, 0.16);
@@ -2230,6 +2234,10 @@ button,
 input:not([type="checkbox"]):not([type="radio"]),
 select { min-height: 2.25rem; }
 
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea { border-color: var(--control-border); }
+
 main h2,
 .overview-pane .overview-header h2,
 .trash-pane .trash-header h2,
@@ -2314,7 +2322,11 @@ pre,
 @media (max-width: 720px) {
   main { padding: 1rem; }
   .sidebar-heading { display: none; }
-  .sidebar-list a { min-height: 2.5rem; display: flex; align-items: center; }
+  .sidebar-list a { min-height: 2.75rem; display: flex; align-items: center; }
+  button,
+  [role="button"],
+  input:not([type="checkbox"]):not([type="radio"]),
+  select { min-height: 2.75rem; }
   .overview-grid { gap: 0.65rem; }
   .overview-grid > .overview-card { margin: 0; }
   .farm-control-deck { gap: 1px; }
