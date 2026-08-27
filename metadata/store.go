@@ -62,6 +62,16 @@ CREATE TABLE IF NOT EXISTS store_meta (
 );
 `
 
+// ftsIndexEpoch is a durable declaration that entries_fts was fully built by
+// code with the current FTS schema/maintenance invariants. Bump the value when
+// the FTS schema or tokenizer changes. A missing/older value makes Open perform
+// one migration rebuild; subsequent clean launches can safely skip it.
+const (
+	ftsIndexEpochKey = "fts_index_epoch"
+	ftsIndexEpoch    = "1"
+	ftsIndexDirty    = "dirty"
+)
+
 // ftsSchema creates a full-text search virtual table for instant filename search.
 // Uses FTS5 with a trigram tokenizer so partial matches work (e.g. "explosion" matches
 // "Big_Explosion_4K.mov"). NO triggers — FTS is rebuilt manually after bulk operations
@@ -98,7 +108,8 @@ DROP TRIGGER IF EXISTS entries_au;
 // crash+restart the compactor resumes from whatever pending rows survived — and
 // because entries_fts is external-content, the index is always fully rebuildable
 // from `entries` regardless (RebuildFTS at Open re-derives everything). No FTS
-// data can be lost, only deferred.
+// data can be lost, only deferred. Open performs a recovery rebuild whenever
+// pending markers survive a restart.
 //
 // INTEGRITY (the landmine): a pending marker is ONLY ever the NEW rowid of a
 // still-present entries row. The OLD-rowid entries_fts('delete', ...) stays
@@ -759,6 +770,17 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		return nil, fmt.Errorf("create meta schema: %w", err)
 	}
 
+	// Capture this before CREATE IF NOT EXISTS. A database upgraded from a
+	// pre-FTS build may already contain entries but no index; the epoch alone
+	// cannot be trusted if the virtual table itself had to be created now.
+	var ftsTableExisted int
+	if err := db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entries_fts'
+	)`).Scan(&ftsTableExisted); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("detect existing FTS schema: %w", err)
+	}
+
 	if _, err := db.Exec(ftsSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create FTS schema: %w", err)
@@ -793,10 +815,10 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 	// The full SCAN can never return these paths (see scanFilteredPath), so
 	// they were permanently absent from every SCAN diff and cycled in the
 	// pruneAbsent ladder forever (~112k pending_prune floor). Runs HERE —
-	// after the schema, BEFORE rebuildCaches and RebuildFTS — so neither the
-	// in-memory caches nor the FTS index ever see the removed rows (RebuildFTS
-	// below re-derives FTS from `entries`, which is why bare DELETEs without
-	// per-row FTS 'delete' ops are safe at this site and only this site).
+	// after the schema and before rebuildCaches. gcInternalNamespaces deletes
+	// the FTS epoch in the SAME transaction as any bare entries delete, so Open
+	// must rebuild the index before it can declare it current again. That makes
+	// interruption between cleanup and rebuild crash-safe.
 	// `._` rows are deliberately NOT touched. Kill switch: JM_MIRROR_NS_GC=0
 	// (see docs/TUNING/REVERT_LOG.md).
 	if os.Getenv("JM_MIRROR_NS_GC") != "0" {
@@ -847,20 +869,56 @@ func OpenWithMaxCacheSize(dbPath string, maxCacheSize int) (*Store, error) {
 		return nil, fmt.Errorf("rebuild caches: %w", err)
 	}
 
-	// Rebuild FTS index on startup to ensure consistency with the entries table.
-	// This is fast (<1s for 131K entries) and only runs once.
+	// Do not unconditionally rebuild FTS on every app launch. Every ordinary
+	// Insert/Delete/BulkInsert changes `entries` and its external-content FTS
+	// state in the SAME SQLite transaction, so a clean steady-state database is
+	// already crash-atomic. Rebuilding 383K live rows was measured at 10.4s and
+	// sat directly between a ready FUSE mount and Finder's NFS mount.
 	//
-	// This full rebuild re-derives entries_fts from `entries` and is exactly the
-	// FTS-deferral crash-safety backstop: it makes the index consistent with
-	// EVERY entries row regardless of what was pending when the process last
-	// exited. So after a crash under the flag the index is already correct at
-	// boot; the fts_pending markers that survived are then indexed again
-	// (idempotent INSERT OR REPLACE into an external-content FTS) by the
-	// compactor and cleared. The rebuild also does NOT touch fts_pending, so a
-	// pending marker for a row that still exists survives into the compactor.
-	if err := s.RebuildFTS(); err != nil {
+	// A durable fts_pending row is the exceptional state that DOES require the
+	// crash-recovery backstop; preserve the previous full-rebuild behavior for
+	// that case. JM_FTS_REBUILD_ON_BOOT=1 remains an explicit repair lever. A
+	// genuinely empty/new database stays uninitialized so its first large sync
+	// still gets the efficient one-shot bulk build instead of hundreds of
+	// thousands of per-row FTS inserts.
+	var entryCount, pendingFTS int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM entries`).Scan(&entryCount); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("rebuild FTS: %w", err)
+		return nil, fmt.Errorf("count entries for FTS init: %w", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM fts_pending`).Scan(&pendingFTS); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("count pending FTS at open: %w", err)
+	}
+	var persistedFTSEpoch string
+	ftsEpochErr := s.db.QueryRow(`SELECT value FROM store_meta WHERE key = ?`, ftsIndexEpochKey).Scan(&persistedFTSEpoch)
+	if ftsEpochErr != nil && ftsEpochErr != sql.ErrNoRows {
+		db.Close()
+		return nil, fmt.Errorf("read FTS index epoch: %w", ftsEpochErr)
+	}
+	forcedFTSRebuild := os.Getenv("JM_FTS_REBUILD_ON_BOOT") == "1"
+	// A present non-current value is an explicit dirty marker and must rebuild
+	// even when cleanup removed the final entry (stale FTS tokens can otherwise
+	// survive in an externally-backed index). A wholly new empty DB has neither
+	// rows nor a marker and correctly defers its first build.
+	ftsEpochPresent := ftsEpochErr == nil
+	migrationFTSRebuild := (entryCount > 0 && (ftsTableExisted == 0 || !ftsEpochPresent)) ||
+		(ftsEpochPresent && persistedFTSEpoch != ftsIndexEpoch)
+	if pendingFTS > 0 || forcedFTSRebuild || migrationFTSRebuild {
+		if err := s.RebuildFTS(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("rebuild FTS: %w", err)
+		}
+		log.Printf("metadata: FTS boot rebuild complete (entries=%d pending_before=%d migration=%t forced=%t)",
+			entryCount, pendingFTS, migrationFTSRebuild, forcedFTSRebuild)
+	}
+	if entryCount > 0 {
+		// Existing FTS is transactionally current, or the recovery rebuild above
+		// just made it so. Large post-open reconciles must remain incremental.
+		s.ftsInitialized.Store(true)
+		if pendingFTS == 0 && !migrationFTSRebuild && !forcedFTSRebuild {
+			log.Printf("metadata: FTS boot rebuild skipped (transactionally current, entries=%d)", entryCount)
+		}
 	}
 
 	// Start the background FTS compactor only when the deferral flag is on. It
@@ -907,12 +965,34 @@ func gcInternalNamespaces(db *sql.DB) (int64, error) {
 		LIMIT 5000)`
 	var total int64
 	for {
-		res, err := db.Exec(batch)
+		tx, err := db.Begin()
 		if err != nil {
+			return total, err
+		}
+		res, err := tx.Exec(batch)
+		if err != nil {
+			tx.Rollback()
 			return total, err
 		}
 		n, err := res.RowsAffected()
 		if err != nil {
+			tx.Rollback()
+			return total, err
+		}
+		if n > 0 {
+			// The deletes above deliberately bypass per-row external-content
+			// FTS maintenance. Invalidate the epoch atomically with the rows so
+			// a crash before Open's rebuild cannot make a stale index look clean.
+			if _, err := tx.Exec(
+				`INSERT INTO store_meta (key, value) VALUES (?, ?)
+				 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+				ftsIndexEpochKey, ftsIndexDirty,
+			); err != nil {
+				tx.Rollback()
+				return total, err
+			}
+		}
+		if err := tx.Commit(); err != nil {
 			return total, err
 		}
 		total += n
@@ -2212,11 +2292,21 @@ func (s *Store) RebuildFTS() error {
 	// NOT take this path (the QA-40 stall). Incremented under writeMu.
 	s.ftsFullRebuilds.Add(1)
 
-	// Delete all FTS content, then re-insert from entries table
-	if _, err := s.db.Exec(`INSERT INTO entries_fts(entries_fts) VALUES('delete-all')`); err != nil {
+	// Keep delete-all, reinsert, pending-marker clear, and the durable epoch in
+	// one transaction. Without this, a crash after delete-all could leave an
+	// empty index carrying a previously-current epoch and the next boot would
+	// incorrectly skip repair.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("fts rebuild begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Delete all FTS content, then re-insert from entries table.
+	if _, err := tx.Exec(`INSERT INTO entries_fts(entries_fts) VALUES('delete-all')`); err != nil {
 		return fmt.Errorf("fts delete-all: %w", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO entries_fts(rowid, name, path) SELECT rowid, name, path FROM entries`); err != nil {
+	if _, err := tx.Exec(`INSERT INTO entries_fts(rowid, name, path) SELECT rowid, name, path FROM entries`); err != nil {
 		return fmt.Errorf("fts rebuild: %w", err)
 	}
 	// A full rebuild indexes EVERY entries row, so nothing is un-indexed
@@ -2224,8 +2314,18 @@ func (s *Store) RebuildFTS() error {
 	// and the compactor does no redundant re-index work. Safe: the FTS now
 	// covers every row these markers pointed at. No-op when the table is empty
 	// (flag-off). This runs under writeMu so it is atomic w.r.t. the write path.
-	if _, err := s.db.Exec(`DELETE FROM fts_pending`); err != nil {
+	if _, err := tx.Exec(`DELETE FROM fts_pending`); err != nil {
 		return fmt.Errorf("fts clear pending: %w", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO store_meta (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		ftsIndexEpochKey, ftsIndexEpoch,
+	); err != nil {
+		return fmt.Errorf("fts persist index epoch: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("fts rebuild commit: %w", err)
 	}
 	return nil
 }
