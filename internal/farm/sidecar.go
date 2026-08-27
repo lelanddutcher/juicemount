@@ -13,6 +13,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
+	"golang.org/x/sys/unix"
 )
 
 // ManifestSidecar is the self-describing index the farm writes to the volume next
@@ -830,10 +831,6 @@ func WriteManifestSidecar(store *derivatives.Store, mount string, inode uint64) 
 	if tm, err := store.Metadata(inode, "tech"); err == nil && tm != nil {
 		sc.Tech = &TechSidecar{Producer: tm.Producer, Version: tm.Version, Hash: tm.Hash, Payload: tm.Payload}
 	}
-	b, err := json.MarshalIndent(sc, "", "  ")
-	if err != nil {
-		return err
-	}
 	// Written THROUGH the directory descriptor. This runs from all three farm
 	// entry points, and os.MkdirAll + a path-addressed atomic write followed a
 	// symlinked <inode> component straight out of the volume — clobbering
@@ -843,7 +840,186 @@ func WriteManifestSidecar(store *derivatives.Store, mount string, inode uint64) 
 		return err
 	}
 	defer dir.Close()
+
+	// The manifest is a cross-worker UNION, not the private contents of whichever
+	// SQLite cache happened to write last. Proxy, transcript, and metadata passes
+	// may run on different hosts, each with its own /state database. The previous
+	// last-writer-wins write let a NAS transcript pass erase a GPU's HEVC row from
+	// the shared sidecar. A later CPU recovery could then see the HEVC bytes but no
+	// authoritative current row and overwrite them with H.264.
+	//
+	// Serialize cooperative writers with a per-inode flock, re-read the sidecar
+	// while holding it, sanitize that untrusted volume data, and merge rows by
+	// kind. The fixed lock file is opened relative to the already validated inode
+	// directory with O_NOFOLLOW, so neither the lock nor the manifest write can be
+	// redirected through a planted symlink.
+	lock, err := lockManifestDir(dir)
+	if err != nil {
+		return err
+	}
+	defer unlockManifestDir(lock)
+	if raw, rerr := readManifestAt(dir); rerr == nil {
+		var prior ManifestSidecar
+		if json.Unmarshal(raw, &prior) == nil {
+			sc = mergeManifestSidecar(sc, prior, dir)
+		}
+	} else if !errors.Is(rerr, os.ErrNotExist) {
+		return rerr
+	}
+
+	b, err := json.MarshalIndent(sc, "", "  ")
+	if err != nil {
+		return err
+	}
 	return derivatives.WriteFileAt(dir, "manifest.json", b, 0o644)
+}
+
+const manifestLockName = ".manifest.lock"
+
+// lockManifestDir obtains a bounded cross-process/cross-host advisory lock for
+// one inode's manifest. A wedged or malicious holder must not stall a worker
+// indefinitely, so acquisition fails after the same small human-invisible
+// window used by bounded sidecar reads.
+func lockManifestDir(dir *os.File) (*os.File, error) {
+	dfd := int(dir.Fd())
+	fd, err := unix.Openat(dfd, manifestLockName,
+		unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0o666)
+	if err != nil {
+		return nil, fmt.Errorf("sidecar lock: open: %w", err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("sidecar lock: stat: %w", err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		return nil, fmt.Errorf("sidecar lock: %q is not a regular file", manifestLockName)
+	}
+	// Match the directory's read/write permission bits so a root farm worker and
+	// a logged-in Mac client can both participate in the lock on shared media.
+	// Ownership inheritance is best-effort for the same reason as derivative-dir
+	// creation: an unprivileged client may not be allowed to chown.
+	var dst unix.Stat_t
+	if unix.Fstat(dfd, &dst) == nil {
+		_ = unix.Fchmod(fd, uint32(dst.Mode&0o666))
+		_ = unix.Fchown(fd, int(dst.Uid), int(dst.Gid))
+	}
+
+	deadline := time.Now().Add(sidecarReadTimeout)
+	for {
+		if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err == nil {
+			return os.NewFile(uintptr(fd), manifestLockName), nil
+		} else if err != unix.EWOULDBLOCK && err != unix.EAGAIN {
+			unix.Close(fd)
+			return nil, fmt.Errorf("sidecar lock: acquire: %w", err)
+		}
+		if time.Now().After(deadline) {
+			unix.Close(fd)
+			return nil, fmt.Errorf("sidecar lock: timed out acquiring %q", manifestLockName)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func unlockManifestDir(lock *os.File) {
+	if lock == nil {
+		return
+	}
+	_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	_ = lock.Close()
+}
+
+// readManifestAt reads manifest.json relative to a held, validated inode
+// directory. It enforces the same regular-file and size invariants as the
+// public reconcile path without re-resolving any ancestor by name.
+func readManifestAt(dir *os.File) ([]byte, error) {
+	fd, err := unix.Openat(int(dir.Fd()), "manifest.json",
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), "manifest.json")
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("sidecar manifest is not a regular file")
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxSidecarBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > maxSidecarBytes {
+		return nil, fmt.Errorf("sidecar manifest exceeds %d bytes", maxSidecarBytes)
+	}
+	return raw, nil
+}
+
+// mergeManifestSidecar retains current rows published by another worker when
+// both sidecars describe the same source bytes. Existing volume data is always
+// sanitized before it is carried forward; the file supplies data, never policy.
+func mergeManifestSidecar(current, prior ManifestSidecar, dir *os.File) ManifestSidecar {
+	if prior.Inode != current.Inode || prior.SourceHash == nil || current.SourceHash == nil ||
+		*prior.SourceHash != *current.SourceHash {
+		return current
+	}
+
+	byKind := make(map[string]int, len(current.Derivatives))
+	for i, row := range current.Derivatives {
+		byKind[row.Kind] = i
+	}
+	for _, row := range prior.Derivatives {
+		clean, ok := sanitizeSidecarRow(row)
+		if !ok || clean.Hash == nil || *clean.Hash != *current.SourceHash {
+			continue
+		}
+		i, exists := byKind[clean.Kind]
+		if !exists {
+			byKind[clean.Kind] = len(current.Derivatives)
+			current.Derivatives = append(current.Derivatives, clean)
+			continue
+		}
+		cur := current.Derivatives[i]
+		// A stale local cache row must never beat a shared row that matches the
+		// source hash this writer just recorded. Otherwise a metadata-only NAS
+		// pass can resurrect its pre-GPU H.264 row over a newer HEVC result.
+		curMatches := cur.Hash != nil && *cur.Hash == *current.SourceHash
+		curMatchesBlob := manifestRowMatchesBlobAt(dir, cur)
+		priorMatchesBlob := manifestRowMatchesBlobAt(dir, clean)
+		if !curMatches || (priorMatchesBlob && !curMatchesBlob) ||
+			(priorMatchesBlob == curMatchesBlob && clean.UpdatedAt > cur.UpdatedAt) {
+			current.Derivatives[i] = clean
+		}
+	}
+	if current.Tech == nil && prior.Tech != nil && prior.Tech.Hash != nil &&
+		*prior.Tech.Hash == *current.SourceHash {
+		if clean, ok := sanitizeTechSidecar(prior.Tech); ok {
+			current.Tech = clean
+		}
+	}
+	return current
+}
+
+// manifestRowMatchesBlobAt breaks cross-host timestamp ties using the shared
+// bytes themselves. Proxy rows carry blob_size; whichever row matches the file
+// that is actually present wins even if one host's wall clock is a few seconds
+// ahead. Rows without a size vouch fall back to the sanitized timestamp rule.
+func manifestRowMatchesBlobAt(dir *os.File, row derivatives.DerivRow) bool {
+	if dir == nil || row.Status != "ready" || row.BlobRelPath == nil || row.BlobSize == nil {
+		return false
+	}
+	name := *row.BlobRelPath
+	if name == "" || filepath.IsAbs(name) || filepath.Base(name) != name {
+		return false
+	}
+	var st unix.Stat_t
+	if err := unix.Fstatat(int(dir.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return false
+	}
+	return st.Mode&unix.S_IFMT == unix.S_IFREG && st.Size == *row.BlobSize
 }
 
 // derefStr is a nil-safe *string for log lines.

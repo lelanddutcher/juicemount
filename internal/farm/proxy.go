@@ -172,6 +172,22 @@ func proxyFresh(store *derivatives.Store, inode uint64, hash string, size int64,
 	if store == nil || opt.RegenerateFresh || opt.Mount == "" {
 		return false
 	}
+	if proxyFreshIndexed(store, inode, hash, size, opt) {
+		return true
+	}
+	// Farm workers keep private SQLite caches, while manifest.json is the
+	// cross-worker index. A NAS fallback cannot decide freshness from its local
+	// rows alone: the successful HEVC proxy may have been produced by a GPU whose
+	// /state database is on another host. Reconcile on a local miss, then repeat
+	// the exact same fail-closed checks. This read is avoided for the common hot
+	// path where the current worker already owns a valid row.
+	if _, err := ReconcileOneSidecar(store, opt.Mount, inode); err != nil {
+		return false
+	}
+	return proxyFreshIndexed(store, inode, hash, size, opt)
+}
+
+func proxyFreshIndexed(store *derivatives.Store, inode uint64, hash string, size int64, opt Options) bool {
 	known, sourceHash := store.Known(inode)
 	if !known || sourceHash == nil || *sourceHash != hash {
 		return false
@@ -197,12 +213,59 @@ func proxyFresh(store *derivatives.Store, inode uint64, hash string, size int64,
 			row.BlobRelPath == nil || *row.BlobRelPath != "proxy.mp4" {
 			continue
 		}
-		if _, err := derivatives.StatRegularUnder(opt.Mount,
-			derivatives.DerivBlobRel(inode, "proxy.mp4")); err == nil {
-			return true
+		blobRel := derivatives.DerivBlobRel(inode, "proxy.mp4")
+		blobInfo, err := derivatives.StatRegularUnder(opt.Mount, blobRel)
+		if err != nil {
+			continue
 		}
+		// Cross-worker replacement is possible: a GPU cache can still say HEVC
+		// after a CPU worker atomically replaced the shared bytes with H.264.
+		// Generated rows carry the exact blob size, so reject that stale vouch.
+		if row.BlobSize != nil && *row.BlobSize != blobInfo.Size() {
+			continue
+		}
+		if opt.PreserveHEVCOnFallback && row.Codec != nil && *row.Codec == "hevc" {
+			// The preservation exception must validate the bytes, not merely trust
+			// the sidecar's label. manifest.json is consumer-writable; an ffprobe
+			// of the held regular file proves the shared blob is actually HEVC.
+			actual, err := probeProxyBlobCodec(opt.FFprobeBin, opt.Mount, blobRel)
+			if err != nil || actual != "hevc" {
+				continue
+			}
+		}
+		return true
 	}
 	return false
+}
+
+func probeProxyBlobCodec(ffprobeBin, mount, rel string) (string, error) {
+	if ffprobeBin == "" {
+		ffprobeBin = "ffprobe"
+	}
+	f, err := derivatives.OpenRegularUnder(mount, rel)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	// Pass the already-open, O_NOFOLLOW-validated descriptor to ffprobe. Using
+	// the joined path here would reintroduce a check/use race after the anchored
+	// stat above. ExtraFiles exposes f as descriptor 3 in the child on Unix.
+	cmd := exec.Command(ffprobeBin,
+		"-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
+		"-of", "default=nk=1:nw=1", "/dev/fd/3")
+	cmd.ExtraFiles = []*os.File{f}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ffprobe proxy codec: %w: %s", err, out)
+	}
+	codec := strings.ToLower(strings.TrimSpace(string(out)))
+	if line, _, ok := strings.Cut(codec, "\n"); ok {
+		codec = strings.TrimSpace(line)
+	}
+	if codec == "h265" {
+		codec = "hevc"
+	}
+	return codec, nil
 }
 
 // GenerateProxy renders the OL-3 proxy for one file and commits a single `proxy`

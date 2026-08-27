@@ -38,10 +38,12 @@ func seedFreshProxy(t *testing.T, codec string) (*derivatives.Store, string, uin
 	rel := "proxy.mp4"
 	mediaType := "video/mp4"
 	size := info.Size()
+	proxyBytes := []byte("proxy bytes")
+	blobSize := int64(len(proxyBytes))
 	if err := store.PutDeriv(inode, derivatives.DerivRow{
 		Kind: "proxy", Status: "ready", Producer: "linux-farm", Version: 1,
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mediaType, Codec: &codec,
-		SourceSize: &size,
+		SourceSize: &size, BlobSize: &blobSize,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -49,10 +51,19 @@ func seedFreshProxy(t *testing.T, codec string) (*derivatives.Store, string, uin
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, rel), []byte("proxy bytes"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, rel), proxyBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return store, mount, inode, hash, size
+}
+
+func fakeFFprobeCodec(t *testing.T, codec string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "ffprobe")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\nprintf '%s\\n' "+codec+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 func TestProxyFreshRequiresMatchingCodecAndBlob(t *testing.T) {
@@ -67,6 +78,7 @@ func TestProxyFreshRequiresMatchingCodecAndBlob(t *testing.T) {
 	}
 	if !proxyFresh(store, inode, hash, size, Options{
 		Mount: mount, ProxyVCodec: "libx264", PreserveHEVCOnFallback: true,
+		FFprobeBin: fakeFFprobeCodec(t, "hevc"),
 	}) {
 		t.Fatal("CPU fallback must preserve a current, better HEVC result")
 	}
@@ -86,6 +98,94 @@ func TestProxyFreshRequiresMatchingCodecAndBlob(t *testing.T) {
 	if proxyFresh(store, inode, hash, size, hevc) {
 		t.Fatal("a ready database row must not skip when the proxy bytes are missing")
 	}
+}
+
+func TestProxyFreshFallbackVerifiesSharedBlobCodec(t *testing.T) {
+	store, mount, inode, hash, size := seedFreshProxy(t, "hevc")
+	if proxyFresh(store, inode, hash, size, Options{
+		Mount: mount, ProxyVCodec: "libx264", PreserveHEVCOnFallback: true,
+		FFprobeBin: fakeFFprobeCodec(t, "h264"),
+	}) {
+		t.Fatal("a sidecar HEVC label must not preserve bytes that probe as H.264")
+	}
+}
+
+func TestProxyFreshReconcilesGPUProxyAcrossWorkerStores(t *testing.T) {
+	gpu, mount, inode, hash, size := seedFreshProxy(t, "hevc")
+	if err := WriteManifestSidecar(gpu, mount, inode); err != nil {
+		t.Fatal(err)
+	}
+
+	// A metadata-only NAS worker has its own SQLite cache. Its sidecar write must
+	// merge, rather than erase, the GPU's proxy row.
+	nas := freshStore(t)
+	if err := nas.PutSource(inode, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := nas.PutDeriv(inode, derivatives.DerivRow{
+		Kind: "transcript", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &hash, SourceSize: &size,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteManifestSidecar(nas, mount, inode); err != nil {
+		t.Fatal(err)
+	}
+
+	if proxyFreshIndexed(nas, inode, hash, size, Options{
+		Mount: mount, ProxyVCodec: "libx264", PreserveHEVCOnFallback: true,
+		FFprobeBin: fakeFFprobeCodec(t, "hevc"),
+	}) {
+		t.Fatal("the NAS private cache unexpectedly knew the GPU row before reconcile")
+	}
+	if !proxyFresh(nas, inode, hash, size, Options{
+		Mount: mount, ProxyVCodec: "libx264", PreserveHEVCOnFallback: true,
+		FFprobeBin: fakeFFprobeCodec(t, "hevc"),
+	}) {
+		t.Fatal("CPU fallback did not reconcile and preserve the shared GPU HEVC proxy")
+	}
+}
+
+func TestSidecarMergeUsesSharedBlobOverClockSkew(t *testing.T) {
+	gpu, mount, inode, hash, size := seedFreshProxy(t, "hevc")
+	if err := WriteManifestSidecar(gpu, mount, inode); err != nil {
+		t.Fatal(err)
+	}
+
+	nas := freshStore(t)
+	if err := nas.PutSource(inode, &hash); err != nil {
+		t.Fatal(err)
+	}
+	rel, mediaType, h264 := "proxy.mp4", "video/mp4", "h264"
+	wrongSize := int64(99999)
+	if err := nas.PutDeriv(inode, derivatives.DerivRow{
+		Kind: "proxy", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &hash, BlobRelPath: &rel, MediaType: &mediaType, Codec: &h264,
+		SourceSize: &size, BlobSize: &wrongSize, UpdatedAt: nowUnix() + 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteManifestSidecar(nas, mount, inode); err != nil {
+		t.Fatal(err)
+	}
+
+	consumer := freshStore(t)
+	if found, err := ReconcileOneSidecar(consumer, mount, inode); err != nil || !found {
+		t.Fatalf("reconcile merged sidecar: found=%v err=%v", found, err)
+	}
+	rows, err := consumer.Manifest(inode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Kind == "proxy" {
+			if row.Codec == nil || *row.Codec != "hevc" {
+				t.Fatalf("newer stale H.264 cache row beat the HEVC bytes: %+v", row)
+			}
+			return
+		}
+	}
+	t.Fatal("merged sidecar lost the proxy row")
 }
 
 func TestProxyFreshDoesNotTreatH264AsHEVC(t *testing.T) {

@@ -30,6 +30,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,10 +74,11 @@ type passOpts struct {
 
 // runPasses dispatches one sweep over targets with the worker pool + live
 // progress ticker + final farm-status rollup, exactly as the one-shot path does.
-// It returns the (processed, failed) counts so the queue loop can MarkDone with
-// them. The generator dispatch below is the single source of truth: the basic,
-// proxy and transcript modes all funnel through the same internal/farm calls.
-func runPasses(po passOpts, targets []string) (processed, failed int) {
+// It returns the counts plus the exact failed paths so a partially successful
+// render batch can retry only its failures. The generator dispatch below is the
+// single source of truth: the basic, proxy and transcript modes all funnel
+// through the same internal/farm calls.
+func runPasses(po passOpts, targets []string) (processed, failed int, failedTargets []string) {
 	start := time.Now()
 	var ok, fail, thumbs, strips, waves, speech, proxies, proxySkipped, qls int64
 	// skippedFresh counts assets whose derivatives already matched byte-identical
@@ -84,6 +86,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 	var skippedFresh, sidecarsRepaired int64
 	var mu sync.Mutex
 	var firstErrs []string
+	var failedPaths []string
 
 	// Live progress: while the sweep runs, write farm-status.json every ~3s with an
 	// in_progress block {pass, total, done, failed, started_at} so the manager Farm
@@ -140,7 +143,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 				tech, e := farm.Probe(po.opt.FFprobeBin, p, 0)
 				if e != nil {
 					atomic.AddInt64(&fail, 1)
-					recordErr(&mu, &firstErrs, p, e)
+					recordFailure(&mu, &firstErrs, &failedPaths, p, e)
 					return
 				}
 				atomic.AddInt64(&ok, 1)
@@ -154,7 +157,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 				qr := farm.GenerateQLPreview(po.store, p, po.opt)
 				if qr.Err != nil {
 					atomic.AddInt64(&fail, 1)
-					recordErr(&mu, &firstErrs, p, qr.Err)
+					recordFailure(&mu, &firstErrs, &failedPaths, p, qr.Err)
 					if po.verbose {
 						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), qr.Inode, qr.Err)
 					}
@@ -175,7 +178,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 				pr := farm.GenerateProxy(po.store, p, po.opt)
 				if pr.Err != nil {
 					atomic.AddInt64(&fail, 1)
-					recordErr(&mu, &firstErrs, p, pr.Err)
+					recordFailure(&mu, &firstErrs, &failedPaths, p, pr.Err)
 					if po.verbose {
 						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), pr.Inode, pr.Err)
 					}
@@ -199,7 +202,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 				tr := farm.GenerateTranscript(po.store, p, po.opt)
 				if tr.Err != nil {
 					atomic.AddInt64(&fail, 1)
-					recordErr(&mu, &firstErrs, p, tr.Err)
+					recordFailure(&mu, &firstErrs, &failedPaths, p, tr.Err)
 					if po.verbose {
 						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), tr.Inode, tr.Err)
 					}
@@ -219,7 +222,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 			r := farm.Process(po.store, p, po.opt)
 			if r.Err != nil {
 				atomic.AddInt64(&fail, 1)
-				recordErr(&mu, &firstErrs, p, r.Err)
+				recordFailure(&mu, &firstErrs, &failedPaths, p, r.Err)
 				if po.verbose {
 					fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), r.Inode, r.Err)
 				}
@@ -303,7 +306,8 @@ func runPasses(po passOpts, targets []string) (processed, failed int) {
 			fmt.Fprintf(os.Stderr, "jmfarm: status write: %v\n", err)
 		}
 	}
-	return int(ok), int(fail)
+	sort.Strings(failedPaths)
+	return int(ok), int(fail), failedPaths
 }
 
 func main() {
@@ -588,7 +592,7 @@ func main() {
 	gov := farm.NewGovernor(*wModel, *vcodec, *pPreset, mode,
 		*pCRF, *conc, *pConc, *gNice, *gIONice, *gInterval)
 
-	_, failed := runPasses(passOpts{
+	_, failed, _ := runPasses(passOpts{
 		opt: opt, mode: mode, transcr: *transcr, proxyGen: *proxyGen, qlGen: *qlGen,
 		dryRun: *dryRun, verbose: *verbose, effConc: effConc,
 		status: *status, mount: *mount, producer: *producer,
@@ -955,7 +959,7 @@ func runQueue(cfg queueConfig) {
 		jobCfg := cfg
 		cfgMu.Unlock()
 		jobStarted := time.Now()
-		processed, failed, runErr := runJob(ctx, store, jobCfg, worker, job)
+		processed, failed, failedTargets, runErr := runJob(ctx, store, jobCfg, worker, job)
 		hbStop()
 		<-hbDone
 		recordCompletedJobBenchmark(&worker, job, processed, failed, time.Since(jobStarted))
@@ -965,6 +969,9 @@ func runQueue(cfg queueConfig) {
 			break
 		}
 		if requeue, fallbackCPU, reason := renderFailureDisposition(worker, job, runErr); requeue {
+			if len(failedTargets) > 0 {
+				claim.Job.RetryTargets = failedTargets
+			}
 			if err := q.RequeueClaim(context.Background(), claim, fallbackCPU, reason); err != nil {
 				// The durable receipt is still intact. Stop this worker so its
 				// heartbeat expires and another worker's reaper can recover it;
@@ -1036,9 +1043,9 @@ func recordCompletedJobBenchmark(worker *farmqueue.Worker, job farmqueue.Job, pr
 // the job's non-zero options overriding the container run-defaults. It returns
 // the summed processed/failed across the selected passes; a non-nil error is a
 // HARD failure (couldn't collect targets / nothing usable) → MarkFailed.
-func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, worker farmqueue.Worker, job farmqueue.Job) (processed, failed int, err error) {
+func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, worker farmqueue.Worker, job farmqueue.Job) (processed, failed int, failedTargets []string, err error) {
 	if !farmqueue.WorkerSupports(worker, job.RequiredCapabilities) {
-		return 0, 0, fmt.Errorf("worker %s does not satisfy job capabilities %v", worker.Name, job.RequiredCapabilities)
+		return 0, 0, nil, fmt.Errorf("worker %s does not satisfy job capabilities %v", worker.Name, job.RequiredCapabilities)
 	}
 	// Resolve per-job overrides over the container defaults (zero ⇒ keep default).
 	crf := cfg.crf
@@ -1073,9 +1080,15 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 	// Collect the media under the job's path once; every selected pass sweeps the
 	// same target set. cfg.minSize applies the same size floor here (skip entirely)
 	// that MinBlobSizeBytes applies in Process — single source, the -min-size-mb flag.
-	targets, cErr := collectTargets(job.Path, "", 0, cfg.minSize)
+	var targets []string
+	var cErr error
+	if len(job.RetryTargets) > 0 {
+		targets, cErr = collectRetryTargets(cfg.mount, job.Path, job.RetryTargets, cfg.minSize)
+	} else {
+		targets, cErr = collectTargets(job.Path, "", 0, cfg.minSize)
+	}
 	if cErr != nil {
-		return 0, 0, fmt.Errorf("collect %q: %w", job.Path, cErr)
+		return 0, 0, nil, fmt.Errorf("collect %q: %w", job.Path, cErr)
 	}
 
 	// FARM-3: run the software-only decode classes first (HEVC Rext 4:2:2/4:4:4,
@@ -1094,11 +1107,11 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		// count — otherwise every excluded folder shows up as a false failure.
 		fmt.Printf("jmfarm queue: job %s path=%q — no derivable media (empty or all-excluded); nothing to do\n",
 			job.ID, job.Path)
-		return 0, 0, nil
+		return 0, 0, nil, nil
 	}
 	if len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindProxy {
 		if err := validateRenderProxyTargets(worker, vcodec, targets); err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 	}
 
@@ -1129,12 +1142,12 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 	}
 	if kinds[KindTranscript] {
 		if wModel == "" {
-			return 0, 0, fmt.Errorf("transcript kind needs a whisper model (job.model or -whisper-model)")
+			return 0, 0, nil, fmt.Errorf("transcript kind needs a whisper model (job.model or -whisper-model)")
 		}
 		passes = append(passes, pass{mode: "transcript(AI)", transcr: true, effConc: conc})
 	}
 	if len(passes) == 0 {
-		return 0, 0, fmt.Errorf("job %s has no runnable kinds (%v)", job.ID, job.Kinds)
+		return 0, 0, nil, fmt.Errorf("job %s has no runnable kinds (%v)", job.ID, job.Kinds)
 	}
 
 	base := farm.Options{
@@ -1161,7 +1174,7 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 			break // cancelled between passes → stop cleanly, report what we did
 		}
 		gov := farm.NewGovernor(wModel, vcodec, preset, p.mode, crf, conc, pConc, cfg.gNice, cfg.gIONice, 0)
-		pr, pf := runPasses(passOpts{
+		pr, pf, failedPaths := runPasses(passOpts{
 			opt: base, mode: p.mode, transcr: p.transcr, proxyGen: p.proxyGen, qlGen: p.qlGen,
 			dryRun: false, verbose: cfg.verbose, effConc: p.effConc,
 			status: cfg.status, mount: cfg.mount, producer: cfg.producer,
@@ -1169,11 +1182,13 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		}, targets)
 		processed += pr
 		failed += pf
+		failedTargets = append(failedTargets, failedPaths...)
 	}
 	if failed > 0 {
-		return processed, failed, passFailure(processed, failed)
+		sort.Strings(failedTargets)
+		return processed, failed, uniqueSortedStrings(failedTargets), passFailure(processed, failed)
 	}
-	return processed, failed, nil
+	return processed, failed, nil, nil
 }
 
 const renderHardwareRetries = 1
@@ -1325,6 +1340,79 @@ func recordErr(mu *sync.Mutex, errs *[]string, path string, err error) {
 	if len(*errs) < 10 {
 		*errs = append(*errs, fmt.Sprintf("%s: %v", filepath.Base(path), err))
 	}
+}
+
+func recordFailure(mu *sync.Mutex, errs, failedTargets *[]string, path string, err error) {
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*errs) < 10 {
+		*errs = append(*errs, fmt.Sprintf("%s: %v", filepath.Base(path), err))
+	}
+	*failedTargets = append(*failedTargets, path)
+}
+
+// collectRetryTargets validates worker-authored partial-batch paths before they
+// are trusted from the Redis wire again. Every target must remain inside both
+// the configured mount and the original job scope; then the normal collector
+// re-applies media-extension, exclusion, and minimum-size policy.
+func collectRetryTargets(mount, scope string, requested []string, minBytes int64) ([]string, error) {
+	cleanMount := filepath.Clean(mount)
+	cleanScope := filepath.Clean(scope)
+	scopeInfo, err := os.Stat(cleanScope)
+	if err != nil {
+		return nil, err
+	}
+	if !pathWithin(cleanMount, cleanScope) {
+		return nil, fmt.Errorf("job scope %q escapes mount %q", scope, mount)
+	}
+	seen := make(map[string]bool, len(requested))
+	out := make([]string, 0, len(requested))
+	for _, requestedPath := range requested {
+		candidate := filepath.Clean(requestedPath)
+		if !filepath.IsAbs(candidate) || !pathWithin(cleanMount, candidate) {
+			return nil, fmt.Errorf("retry target %q escapes mount %q", requestedPath, mount)
+		}
+		if scopeInfo.IsDir() {
+			if !pathWithin(cleanScope, candidate) {
+				return nil, fmt.Errorf("retry target %q escapes job scope %q", requestedPath, scope)
+			}
+		} else if candidate != cleanScope {
+			return nil, fmt.Errorf("retry target %q differs from file job scope %q", requestedPath, scope)
+		}
+		if seen[candidate] {
+			continue
+		}
+		collected, err := collectTargets(candidate, "", 1, minBytes)
+		if err != nil {
+			return nil, fmt.Errorf("retry target %q: %w", requestedPath, err)
+		}
+		if len(collected) == 1 {
+			seen[candidate] = true
+			out = append(out, collected[0])
+		}
+	}
+	return out, nil
+}
+
+func pathWithin(base, candidate string) bool {
+	rel, err := filepath.Rel(base, candidate)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func uniqueSortedStrings(in []string) []string {
+	if len(in) < 2 {
+		return in
+	}
+	out := in[:1]
+	for _, s := range in[1:] {
+		if s != out[len(out)-1] {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func collectTargets(root, files string, limit int, minBytes int64) ([]string, error) {

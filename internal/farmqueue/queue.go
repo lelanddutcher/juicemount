@@ -176,6 +176,11 @@ type Job struct {
 	SelectedBackend      string   `json:"selected_backend,omitempty"`
 	SelectedWorker       string   `json:"selected_worker,omitempty"`
 	Attempts             int      `json:"attempts,omitempty"`
+	// RetryTargets is worker-authored after a partially successful batch. It
+	// narrows the next hardware retry or CPU fallback to the exact files that
+	// failed, so a directory-shaped job can never recompute successful GPU
+	// outputs. Workers validate every path remains under Path and the mount.
+	RetryTargets []string `json:"retry_targets,omitempty"`
 }
 
 // JobStatus is the worker-maintained record a producer reads back. Stored as a
