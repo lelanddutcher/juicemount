@@ -2560,7 +2560,7 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 			infos = append(infos, jfs.entryToFileInfo(e))
 		}
 		sort.Slice(infos, func(i, j int) bool {
-			return infos[i].Name() < infos[j].Name()
+			return directoryNameLess(infos[i].Name(), infos[j].Name())
 		})
 		// Proactively prefetch subdirectories' children in background so
 		// Finder's subsequent navigation is instant. Two guards make this
@@ -2700,6 +2700,33 @@ func (jfs *juiceFS) ReadDir(dirname string) ([]os.FileInfo, error) {
 	}
 
 	return infos, nil
+}
+
+// directoryNameLess keeps an AppleDouble sidecar adjacent to the principal it
+// describes while retaining a deterministic directory order. A plain lexical
+// sort groups every `._` name before every user file; on macOS, a directory
+// with thousands of pairs then overflows the client's prefetched vnode/name
+// cache between READDIRPLUS pages and turns a names-only listing into thousands
+// of redundant LOOKUPs. Readdir order is not a filesystem sorting contract, so
+// pairing changes no visible set or file semantics: the principal sorts first,
+// followed immediately by its sidecar, and unpaired names remain deterministic.
+func directoryNameLess(a, b string) bool {
+	aKey, aSidecar := directoryNameSortKey(a)
+	bKey, bSidecar := directoryNameSortKey(b)
+	if aKey != bKey {
+		return aKey < bKey
+	}
+	if aSidecar != bSidecar {
+		return !aSidecar
+	}
+	return a < b
+}
+
+func directoryNameSortKey(name string) (key string, sidecar bool) {
+	if isSidecarName(name) {
+		return name[sidecarNamePfxLn:], true
+	}
+	return name, false
 }
 
 // allowSpeculativeDirectoryWarm is the single policy gate for background
