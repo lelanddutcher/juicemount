@@ -67,3 +67,10 @@ func TestReadDirStartIndexJumpsDirectlyFromCookie(t *testing.T) {
 		}
 	}
 }
+
+func TestFSInfoDirectoryPreferenceMatchesBulkTransferWindow(t *testing.T) {
+	got := defaultFSInfoResponse()
+	if got.Dtpref != 1<<20 || got.Rtpref != got.Dtpref || got.Wtpref != got.Dtpref {
+		t.Fatalf("FSINFO transfer preferences = read:%d write:%d dir:%d, want one shared 1 MiB window", got.Rtpref, got.Wtpref, got.Dtpref)
+	}
+}

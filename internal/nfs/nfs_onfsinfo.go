@@ -9,6 +9,14 @@ import (
 )
 
 const (
+	// FSInfoPreferredTransferSize is the server's preferred bulk and directory
+	// transfer window. macOS clamps the client's requested dsize to Dtpref from
+	// FSINFO: leaving the old 8 KiB value here silently overrode the app's 1 MiB
+	// mount option and split a 5,000-entry READDIRPLUS into dozens of sequential
+	// loopback RPCs. The server already advertises and handles 1 MiB reads and
+	// writes, so use the same bounded window for directory replies.
+	FSInfoPreferredTransferSize = 1 << 20
+
 	// FSInfoPropertyLink does the FS support hard links?
 	FSInfoPropertyLink = 0x0001
 	// FSInfoPropertySymlink does the FS support soft links?
@@ -18,6 +26,34 @@ const (
 	// FSInfoPropertyCanSetTime can the FS support setting access/mod times?
 	FSInfoPropertyCanSetTime = 0x0010
 )
+
+type fsInfoResponse struct {
+	Rtmax       uint32
+	Rtpref      uint32
+	Rtmult      uint32
+	Wtmax       uint32
+	Wtpref      uint32
+	Wtmult      uint32
+	Dtpref      uint32
+	Maxfilesize uint64
+	TimeDelta   uint64
+	Properties  uint32
+}
+
+func defaultFSInfoResponse() fsInfoResponse {
+	return fsInfoResponse{
+		Rtmax:       FSInfoPreferredTransferSize,
+		Rtpref:      FSInfoPreferredTransferSize,
+		Rtmult:      4096,
+		Wtmax:       FSInfoPreferredTransferSize,
+		Wtpref:      FSInfoPreferredTransferSize,
+		Wtmult:      4096,
+		Dtpref:      FSInfoPreferredTransferSize,
+		Maxfilesize: 1 << 62, // wild guess. this seems big.
+		TimeDelta:   1,       // nanosecond precision.
+		Properties:  0,
+	}
+}
 
 func onFSInfo(ctx context.Context, w *response, userHandle Handler) error {
 	roothandle, err := xdr.ReadOpaque(w.req.Body)
@@ -37,31 +73,7 @@ func onFSInfo(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 
-	type fsinfores struct {
-		Rtmax       uint32
-		Rtpref      uint32
-		Rtmult      uint32
-		Wtmax       uint32
-		Wtpref      uint32
-		Wtmult      uint32
-		Dtpref      uint32
-		Maxfilesize uint64
-		TimeDelta   uint64
-		Properties  uint32
-	}
-
-	res := fsinfores{
-		Rtmax:       1 << 20,
-		Rtpref:      1 << 20,
-		Rtmult:      4096,
-		Wtmax:       1 << 20,
-		Wtpref:      1 << 20,
-		Wtmult:      4096,
-		Dtpref:      8192,
-		Maxfilesize: 1 << 62, // wild guess. this seems big.
-		TimeDelta:   1,       // nanosecond precision.
-		Properties:  0,
-	}
+	res := defaultFSInfoResponse()
 
 	// TODO: these aren't great indications of support, really.
 	if _, ok := fs.(billy.Symlink); ok {
