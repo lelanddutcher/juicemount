@@ -456,27 +456,12 @@ func (fm *FUSEManager) Mount() error {
 		return err
 	}
 
-	// Pre-mount: if free space is tight on the cache volume but APFS is
-	// holding lots of purgeable (Time Machine local snapshots, mostly),
-	// reclaim it so JuiceFS doesn't immediately hit "space not enough on
-	// device" warnings on the very first cache write. This is the diff
-	// between the conservative statfs view and macOS's "important capacity"
-	// view, which can be hundreds of GB on a laptop.
-	//
-	// Threshold: reclaim if free is below 50 GB. Conservative — won't fire
-	// for users with healthy disks; will fire for the typical "97% full
-	// video editor's laptop" we shipped this for.
-	{
-		free, _ := volumeFreeBytes("/")
-		if free < 50*(1<<30) {
-			if freed, _, _, err := ReclaimPurgeableSpace("/", 0); err != nil {
-				jmlog.Warn("auto-reclaim failed (non-fatal)", "error", err.Error())
-			} else if freed > 0 {
-				jmlog.Info("auto-reclaim succeeded before mount",
-					"freed_gb", fmt.Sprintf("%.1f", float64(freed)/(1<<30)))
-			}
-		}
-	}
+	// Never reclaim storage on startup. ReclaimPurgeableSpace thins Time
+	// Machine local snapshots and can take up to 90 seconds; doing that before
+	// mount made an ordinary app launch both destructive and Finder-blocking.
+	// The cache-size/free-space-ratio policy below already preserves the hard
+	// disk floor. Low space is surfaced in health/UI, and the user may choose
+	// the explicit Reclaim action if they want to trade snapshots for cache.
 
 	// Cache-size policy (2026-06-08). Replaces the prior "max(configured, 85%
 	// of disk)" auto-expansion, which IGNORED the user's configured size — it
@@ -2100,6 +2085,13 @@ func logVolumeCapacityBreakdown(volume string) {
 		"hint", "popover shows reclaimable space (Foundation URLResourceKey for important usage); use the Reclaim button or POST /reclaim to free Time Machine local snapshots")
 }
 
+// ReclaimAuthorization makes the destructive nature of purgeable-space
+// reclamation explicit at every call site. There is deliberately no startup or
+// automatic authorization value.
+type ReclaimAuthorization uint8
+
+const ReclaimExplicitUserAction ReclaimAuthorization = 1
+
 // ReclaimPurgeableSpace asks macOS to free purgeable disk space — primarily
 // Time Machine local snapshots, which can hoard tens of GB on a typical
 // laptop. Returns the bytes freed, count of snapshots thinned, and a
@@ -2112,7 +2104,10 @@ func logVolumeCapacityBreakdown(volume string) {
 // We measure the actual freed bytes by sampling the volume's free space
 // before and after; the tmutil command's own output is unreliable for this
 // (depends on macOS version and which snapshots existed).
-func ReclaimPurgeableSpace(volume string, targetBytes int64) (freedBytes int64, snapshotsThinned int, source string, err error) {
+func ReclaimPurgeableSpace(auth ReclaimAuthorization, volume string, targetBytes int64) (freedBytes int64, snapshotsThinned int, source string, err error) {
+	if auth != ReclaimExplicitUserAction {
+		return 0, 0, "Time Machine local snapshots", fmt.Errorf("purgeable-space reclaim requires explicit user authorization")
+	}
 	beforeFree, _ := volumeFreeBytes(volume)
 
 	// Urgency 4 = thin as much as possible. tmutil rejects "0" as an invalid

@@ -6150,7 +6150,7 @@ func handleStopHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleReclaimHTTP(w http.ResponseWriter, r *http.Request) {
-	freed, snapshots, source, err := health.ReclaimPurgeableSpace("/", 0)
+	freed, snapshots, source, err := health.ReclaimPurgeableSpace(health.ReclaimExplicitUserAction, "/", 0)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		w.WriteHeader(500)
