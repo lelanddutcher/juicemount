@@ -3,6 +3,7 @@
 #
 #   netshape-dev.sh on  --rtt 300 --bw-down 2 --bw-up 1 --ip 192.168.0.197 \
 #     --link-udp-port 63296
+#   netshape-dev.sh on  --loss 1 --ip 192.168.0.197 --link-udp-port 63296
 #   netshape-dev.sh off
 #   netshape-dev.sh status
 #   netshape-dev.sh self-test
@@ -34,13 +35,14 @@ usage() { sed -n '2,10p' "$0"; exit 2; }
 
 cmd="${1:-status}"; shift || true
 
-RTT_MS=300; BW_DOWN=2; BW_UP=1; NAS_IP="192.168.0.197"
+RTT_MS=300; BW_DOWN=2; BW_UP=1; LOSS_RATE=0; NAS_IP="192.168.0.197"
 REDIS_PORT=30179; OBJECT_PORT=30151; PROBE_PORT=""; LINK_UDP_PORT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --rtt) RTT_MS="$2"; shift 2;;
     --bw-down) BW_DOWN="$2"; shift 2;;
     --bw-up) BW_UP="$2"; shift 2;;
+    --loss) LOSS_RATE="$2"; shift 2;;
     --ip) NAS_IP="$2"; shift 2;;
     --redis-port) REDIS_PORT="$2"; shift 2;;
     --object-port) OBJECT_PORT="$2"; shift 2;;
@@ -56,7 +58,7 @@ PROBE_PORT="${PROBE_PORT:-$REDIS_PORT}"
 
 # These values are interpolated into a root-loaded PF ruleset. Reject anything
 # except a literal address and numeric scalar values before generating it.
-python3 - "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$PROBE_PORT" "${LINK_UDP_PORT:-0}" "$RTT_MS" "$BW_DOWN" "$BW_UP" <<'PY'
+python3 - "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$PROBE_PORT" "${LINK_UDP_PORT:-0}" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$LOSS_RATE" <<'PY'
 import ipaddress
 import sys
 
@@ -65,6 +67,7 @@ try:
     ports = [int(value) for value in sys.argv[2:5]]
     link_port = int(sys.argv[5])
     rtt, down, up = [int(value) for value in sys.argv[6:9]]
+    loss = float(sys.argv[9])
 except ValueError as exc:
     raise SystemExit(f"invalid netshape argument: {exc}")
 if any(port < 1 or port > 65535 for port in ports):
@@ -75,6 +78,8 @@ if any(port in {22, 137, 138, 139, 445} for port in ports + [link_port] if port)
     raise SystemExit("invalid netshape argument: refusing an SSH/SMB/NetBIOS port")
 if rtt < 0 or down < 1 or up < 1:
     raise SystemExit("invalid netshape argument: rtt must be nonnegative and bandwidth positive")
+if loss < 0 or loss > 1:
+    raise SystemExit("invalid netshape argument: loss must be between 0 and 1")
 PY
 
 render_shape_rules() {
@@ -149,6 +154,7 @@ restore_state() {
 verify_shape() {
   local pipes
   local rules
+  local probe_code
   local probe_ms
   local min_probe_ms
   pipes=$(sudo -n dnctl pipe show 2>/dev/null)
@@ -162,19 +168,19 @@ verify_shape() {
   # misleading rendering: a TCP handshake traverses out + in and must therefore
   # take approximately the requested RTT. The default probe is JuiceMount's
   # Redis endpoint; --probe-port supports non-default test deployments.
-  probe_ms=$(python3 - "$NAS_IP" "$PROBE_PORT" "$RTT_MS" <<'PY'
+  read -r probe_code probe_ms <<< "$(python3 - "$NAS_IP" "$PROBE_PORT" "$RTT_MS" <<'PY'
 import socket, sys, time
 host, port, rtt = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 s = socket.socket()
 s.settimeout(max(3.0, rtt / 1000.0 * 5.0))
 started = time.monotonic()
 try:
-    s.connect_ex((host, port))
+    code = s.connect_ex((host, port))
 finally:
     s.close()
-print(int((time.monotonic() - started) * 1000))
+print(code, int((time.monotonic() - started) * 1000))
 PY
-  )
+  )"
   min_probe_ms=$(( RTT_MS * 3 / 4 ))
   echo "$pipes" | grep -Eq "(^|[[:space:]])0*${PIPE_IN}:" &&
     sudo -n pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' &&
@@ -187,8 +193,13 @@ PY
       echo "$rules" | grep -Eq "dummynet out .*proto udp .*from any port (= )?${LINK_UDP_PORT} .*pipe 0*${PIPE_OUT}";
     }; } &&
     ! echo "$rules" | grep -Eq "dummynet .*${NAS_IP} port (= )?(22|139|445)([^0-9]|$)" &&
-    [ "$probe_ms" -ge "$min_probe_ms" ] &&
-    echo "wire probe: ${probe_ms}ms (minimum ${min_probe_ms}ms)"
+    { if [ "$LOSS_RATE" = "1" ] || [ "$LOSS_RATE" = "1.0" ]; then
+        [ "$probe_code" -ne 0 ] && [ "$probe_ms" -ge 1000 ] &&
+          echo "wire probe: blocked for ${probe_ms}ms (100% loss verified)"
+      else
+        [ "$probe_code" -eq 0 ] && [ "$probe_ms" -ge "$min_probe_ms" ] &&
+          echo "wire probe: ${probe_ms}ms (minimum ${min_probe_ms}ms)"
+      fi; }
 }
 
 activate_shape() {
@@ -206,12 +217,12 @@ activate_shape() {
   # macOS dnctl requires the unit to be attached to the value (`150ms`), and
   # uses `bw`; the previous split `delay 150 ms bandwidth ...` was rejected
   # while the script continued and falsely wrote an ACTIVE marker.
-  sudo -n dnctl pipe "$PIPE_IN" config delay "${half}ms" bw "${BW_DOWN}Mbit/s"
-  sudo -n dnctl pipe "$PIPE_OUT" config delay "${half}ms" bw "${BW_UP}Mbit/s"
+  sudo -n dnctl pipe "$PIPE_IN" config delay "${half}ms" bw "${BW_DOWN}Mbit/s" plr "$LOSS_RATE"
+  sudo -n dnctl pipe "$PIPE_OUT" config delay "${half}ms" bw "${BW_UP}Mbit/s" plr "$LOSS_RATE"
 
   rules_tmp=$(mktemp -t jum-netshape.XXXXXX)
   {
-    echo "# JuiceMount dev shaping -> ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} (rtt=${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s)"
+    echo "# JuiceMount dev shaping -> ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} (rtt=${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s loss=${LOSS_RATE})"
     # Dummynet rules are queueing rules, so PF requires all of them before any
     # saved filtering rules. Exact service ports are safer than broad rules plus
     # exemptions: SMB/SSH cannot enter either pipe in the first place.
@@ -252,9 +263,9 @@ case "$cmd" in
     now=$(date +%s)
     link_json=null
     [ -z "$LINK_UDP_PORT" ] || link_json="$LINK_UDP_PORT"
-    printf '{"active":true,"ip":"%s","redis_port":%s,"object_port":%s,"link_udp_port":%s,"probe_port":%s,"rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"since":%s}\n' \
-      "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$link_json" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$now" > "$MARKER"
-    echo "SHAPING ACTIVE -> backend ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} link_udp=${LINK_UDP_PORT:-off} rtt≈${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s"
+    printf '{"active":true,"ip":"%s","redis_port":%s,"object_port":%s,"link_udp_port":%s,"probe_port":%s,"rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"loss_rate":%s,"since":%s}\n' \
+      "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$link_json" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$LOSS_RATE" "$now" > "$MARKER"
+    echo "SHAPING ACTIVE -> backend ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} link_udp=${LINK_UDP_PORT:-off} rtt≈${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s loss=${LOSS_RATE}"
     echo "marker: $MARKER  ('off' to remove; survives until then)"
     ;;
   off)
