@@ -176,6 +176,17 @@
     previewTotals: { bytes: 0, files: 0, truncated: false },
   };
 
+  let authPromptDeclined = false;
+
+  function updateAuthState(message) {
+    const el = $('#auth-state');
+    if (el) el.textContent = message;
+  }
+
+  updateAuthState(state.adminKey
+    ? 'Admin key stored · verification pending'
+    : 'Authentication not yet verified');
+
   // -------- Fetch helpers --------
   function authHeaders() {
     const h = { 'Content-Type': 'application/json' };
@@ -203,25 +214,50 @@
     return detail;
   }
 
-  async function api(method, path, body) {
+  async function api(method, path, body, authRetry = false) {
     const opts = { method, headers: authHeaders() };
     if (body) opts.body = JSON.stringify(body);
     // path is "/api/..." with no base; rewrite to BASE-relative.
     const url = path.startsWith('/api') ? BASE + path : path;
+    const sentKey = state.adminKey;
     const r = await fetch(url, opts);
     if (r.status === 401) {
+      updateAuthState('Authentication required');
+      // Another concurrent request may already have collected a key while
+      // this request was in flight. Retry with it instead of opening a
+      // second native prompt.
+      if (!authRetry && state.adminKey && state.adminKey !== sentKey) {
+        return api(method, path, body, true);
+      }
+      if (authRetry) {
+        if (state.adminKey === sentKey) {
+          state.adminKey = '';
+          localStorage.removeItem('jm-admin-key');
+        }
+        authPromptDeclined = true;
+        updateAuthState('Admin key rejected');
+        throw new Error('authentication failed');
+      }
+      // Background Farm/Overview polls often fail together. Once the user
+      // declines, suppress repeat prompts until reload instead of nagging on
+      // every interval tick.
+      if (authPromptDeclined) throw new Error('authentication required');
       const key = prompt('X-JuiceMount-Admin-Key (will be saved locally):');
       if (key) {
         state.adminKey = key;
         localStorage.setItem('jm-admin-key', key);
-        return api(method, path, body); // retry once
+        authPromptDeclined = false;
+        updateAuthState('Admin key stored · verification pending');
+        return api(method, path, body, true); // retry once
       }
+      authPromptDeclined = true;
       throw new Error('authentication required');
     }
     if (!r.ok) {
       const detail = compactHTTPError(await r.text(), r.headers.get('content-type'));
       throw new Error(`${r.status} ${r.statusText}${detail ? ' — ' + detail : ''}`);
     }
+    updateAuthState(state.adminKey ? 'Admin key verified' : 'Authentication disabled');
     if (r.status === 204) return null;
     return r.json();
   }
@@ -882,9 +918,13 @@
   let farmWorkersTimer = null;
 	let farmGenerateInited = false;
 	const FARM_JOBS_INTERVAL_MS = 5000;
+	const FARM_JOBS_PAGE_SIZE = 12;
 	let farmSweepInFlight = false;
 	let farmControlInFlight = false;
 	let farmControlState = { paused: false, watch_enabled: true };
+	let farmJobsVisibleLimit = FARM_JOBS_PAGE_SIZE;
+	let farmJobsSnapshot = [];
+	let farmJobsWorkersActive = false;
 
   function startFarmPolling() {
     initFarmExplainerOnce();
@@ -942,6 +982,16 @@
     if (btn) btn.addEventListener('click', submitFarmSweep);
 		const clearBtn = $('#farm-jobs-clear');
 		if (clearBtn) clearBtn.addEventListener('click', clearFarmFinishedJobs);
+		const moreBtn = $('#farm-jobs-more');
+		if (moreBtn) moreBtn.addEventListener('click', () => {
+			farmJobsVisibleLimit += FARM_JOBS_PAGE_SIZE;
+			renderFarmJobsList(farmJobsSnapshot, farmJobsWorkersActive);
+		});
+		const collapseBtn = $('#farm-jobs-collapse');
+		if (collapseBtn) collapseBtn.addEventListener('click', () => {
+			farmJobsVisibleLimit = FARM_JOBS_PAGE_SIZE;
+			renderFarmJobsList(farmJobsSnapshot, farmJobsWorkersActive);
+		});
 		const queueToggle = $('#farm-queue-toggle');
 		if (queueToggle) queueToggle.addEventListener('click', () => updateFarmControl({ paused: !farmControlState.paused }));
 		const watchToggle = $('#farm-watch-toggle');
@@ -965,6 +1015,7 @@
         flash.hidden = false;
         setTimeout(() => { flash.hidden = true; }, 4000);
       }
+		farmJobsVisibleLimit = FARM_JOBS_PAGE_SIZE;
       await loadFarmJobs();
     } catch (e) {
       if (flash) {
@@ -1061,7 +1112,9 @@
 		if (res.control) renderFarmControl(res.control);
 		renderFarmActiveBanner(!!res.available, res.queue_depth || 0, farmControlState,
 			Array.isArray(res.workers) ? res.workers.length : 0);
-		renderFarmJobsList(Array.isArray(res.jobs) ? res.jobs : [], !!res.available);
+		farmJobsSnapshot = Array.isArray(res.jobs) ? res.jobs : [];
+		farmJobsWorkersActive = !!res.available;
+		renderFarmJobsList(farmJobsSnapshot, farmJobsWorkersActive);
 	}
 
 	async function updateFarmControl(patch) {
@@ -1142,7 +1195,7 @@
 
   // FARM_JOB_STATUS_LABEL maps a queue status to readable chip copy.
   const FARM_JOB_STATUS_LABEL = {
-    queued: 'Queued', running: 'Running', done: 'Done', failed: 'Failed',
+    queued: 'Queued', running: 'Running', done: 'Done', partial: 'Partial', failed: 'Failed',
   };
 
   // renderFarmJobsList renders one row per JobStatus, newest first (the backend
@@ -1159,6 +1212,7 @@
       li.className = 'farm-jobs-empty';
       li.textContent = 'No jobs queued yet.';
       list.appendChild(li);
+		renderFarmJobsPagination(0, 0);
       return;
     }
     // Float the running job(s) to the top so the active sweep is always
@@ -1171,8 +1225,13 @@
     const ordered = workersActive
       ? [...jobs].sort((a, b) => ((a.status === 'running') ? 0 : 1) - ((b.status === 'running') ? 0 : 1))
       : jobs;
-    ordered.forEach((j) => {
-      const status = j.status || 'queued';
+	const visible = ordered.slice(0, farmJobsVisibleLimit);
+    visible.forEach((j) => {
+		const failed = j.failed != null && j.failed !== '' ? Number(j.failed) : null;
+		const rawStatus = j.status || 'queued';
+		const status = rawStatus === 'done' && failed != null && !Number.isNaN(failed) && failed > 0
+			? 'partial'
+			: rawStatus;
       const li = document.createElement('li');
       li.className = 'farm-job-row';
 
@@ -1226,7 +1285,6 @@
       }
 
 		const processed = j.processed != null && j.processed !== '' ? Number(j.processed) : null;
-      const failed = j.failed != null && j.failed !== '' ? Number(j.failed) : null;
       if (processed != null && !Number.isNaN(processed) && processed > 0) {
         const p = document.createElement('span');
         p.className = 'farm-job-count';
@@ -1237,7 +1295,15 @@
         const f = document.createElement('span');
         f.className = 'farm-job-count failed';
         f.textContent = failed.toLocaleString() + ' failed';
-        meta.appendChild(f);
+			meta.appendChild(f);
+		}
+		const cpuH264Fallback = kinds.includes('proxy') && j.backend === 'libx264';
+		if (cpuH264Fallback) {
+			const fallback = document.createElement('span');
+			fallback.className = 'farm-job-count fallback';
+			fallback.textContent = 'CPU H.264 fallback';
+			meta.appendChild(fallback);
+			li.classList.add('fallback');
 		}
 		for (const [label, value] of [['backend', j.backend], ['target', j.target_worker], ['running on', j.worker]]) {
 			if (!value || (label === 'target' && value === j.worker)) continue;
@@ -1255,17 +1321,34 @@
 
       if (meta.childNodes.length) li.appendChild(meta);
 
-      // Failed rows surface the error string.
-      if (status === 'failed' && j.error) {
+      // Surface fallback/recovery notes even when the eventual job succeeded.
+      // A successful CPU fallback must never look like a clean GPU completion.
+      if (j.error) {
         const errEl = document.createElement('p');
-        errEl.className = 'farm-job-error';
-        errEl.textContent = j.error;
+		errEl.className = status === 'failed' ? 'farm-job-error' : 'farm-job-notice';
+		errEl.textContent = status === 'failed' ? j.error : ('Recovery note: ' + j.error);
         li.appendChild(errEl);
       }
 
       list.appendChild(li);
     });
+	renderFarmJobsPagination(ordered.length, visible.length);
   }
+
+	function renderFarmJobsPagination(total, shown) {
+		const summary = $('#farm-jobs-summary');
+		const more = $('#farm-jobs-more');
+		const collapse = $('#farm-jobs-collapse');
+		if (summary) summary.textContent = total === 0 ? '' : ('Showing ' + shown + ' of ' + total);
+		if (more) {
+			const remaining = Math.max(0, total - shown);
+			more.hidden = remaining === 0;
+			more.textContent = remaining > 0
+				? ('Show ' + Math.min(FARM_JOBS_PAGE_SIZE, remaining) + ' older')
+				: 'Show older';
+		}
+		if (collapse) collapse.hidden = shown <= FARM_JOBS_PAGE_SIZE;
+	}
 
   // farmRelativeTime renders an RFC3339 timestamp as a calm "just now / 5 min
   // ago / 2 hr ago / 3 days ago" label. Unparseable / missing → ''.

@@ -1891,6 +1891,19 @@ footer a:hover { text-decoration: underline; }
   margin: 0 0 0.5rem;
 }
 .farm-jobs-header .farm-jobs-title { margin: 0; }
+.farm-jobs-toolbar,
+.farm-jobs-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+.farm-jobs-summary {
+  color: var(--text-muted);
+  font: 0.68rem/1.3 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
 .farm-jobs-clear {
   font-size: 0.72rem;
   padding: 0.2rem 0.55rem;
@@ -1941,6 +1954,7 @@ footer a:hover { text-decoration: underline; }
 .farm-job-chip.queued  { background: rgba(155, 155, 155, 0.20); color: var(--text-muted); }
 .farm-job-chip.running { background: var(--accent-bg); color: var(--accent-text); animation: farm-chip-pulse 1.6s ease-in-out infinite; }
 .farm-job-chip.done    { background: rgba(0, 135, 90, 0.18); color: var(--success); }
+.farm-job-chip.partial { background: color-mix(in srgb, var(--running) 14%, transparent); color: var(--running); }
 .farm-job-chip.failed  { background: rgba(215, 0, 21, 0.18); color: var(--danger); }
 @keyframes farm-chip-pulse {
   0%, 100% { opacity: 1; }
@@ -1979,6 +1993,12 @@ footer a:hover { text-decoration: underline; }
   color: var(--text-muted);
 }
 .farm-job-count.failed { color: var(--danger); font-weight: 500; }
+.farm-job-count.fallback {
+  color: var(--running);
+  border: 1px solid color-mix(in srgb, var(--running) 45%, var(--border));
+  background: color-mix(in srgb, var(--running) 10%, transparent);
+  padding: 0.08rem 0.4rem;
+}
 .farm-job-error {
   margin: 0.4rem 0 0;
   padding: 0.35rem 0.55rem;
@@ -1988,6 +2008,24 @@ footer a:hover { text-decoration: underline; }
   border-radius: 4px;
   word-break: break-word;
 }
+.farm-job-notice {
+  margin: 0.4rem 0 0;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.78rem;
+  color: var(--running);
+  background: color-mix(in srgb, var(--running) 9%, transparent);
+  border-left: 2px solid var(--running);
+  word-break: break-word;
+}
+.farm-jobs-pagination { margin-top: 0.7rem; }
+.farm-jobs-pagination button {
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+.farm-jobs-pagination button:hover { border-color: var(--accent); }
 
 /* ==== Farm node config drawer (FARM-NODE-CONFIG spec) ==== */
 .farm-config-drawer {
@@ -2027,7 +2065,7 @@ footer a:hover { text-decoration: underline; }
   background: var(--card, #fff); max-width: 100%;
 }
 .farm-config-actions { display: flex; align-items: center; gap: 12px; }
-.farm-config-status.ok { color: #1c7d34; }
+.farm-config-status.ok { color: var(--success); }
 
 /* RC control-room pass: Farm is an operational surface first. */
 .farm-pane { max-width: 1280px; }
@@ -2152,12 +2190,23 @@ footer a:hover { text-decoration: underline; }
   border-radius: 5px;
   background: var(--panel);
 }
-.farm-config-drawer summary, .farm-manual-drawer summary { cursor: pointer; color: var(--text-muted); font-size: 0.8rem; font-weight: 650; }
+.farm-config-drawer summary, .farm-manual-drawer summary {
+  min-height: 2.75rem;
+  display: flex;
+  align-items: center;
+  padding: 0 0.2rem;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-weight: 650;
+}
 .farm-manual-drawer[open] summary, .farm-config-drawer[open] summary { color: var(--accent-text); }
 .farm-manual-drawer .farm-sweep-form { margin: 0.9rem 0 0; }
 .farm-config-grid input, .farm-config-grid select { color: var(--text); }
 .farm-job-row { border-radius: 4px; border-left: 3px solid var(--border-strong); }
 .farm-job-row:has(.farm-job-chip.running) { border-left-color: var(--accent); }
+.farm-job-row:has(.farm-job-chip.partial),
+.farm-job-row.fallback { border-left-color: var(--running); }
 .farm-job-row:has(.farm-job-chip.failed) { border-left-color: var(--danger); }
 .farm-job-count.telemetry { font-family: var(--font-mono); color: var(--accent-text); }
 
