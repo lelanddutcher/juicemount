@@ -1,6 +1,11 @@
 package farm
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 // D5/D2 density ask (CONSUMER_STATUS 2026-07-21) + the short-clip frame floor
 // (BACKLOG). These pin the DEFAULTS, which is the whole substance of the ask —
@@ -32,5 +37,84 @@ func TestShortClipFrameFloor(t *testing.T) {
 				t.Errorf("frameTarget(%.2fs, %.0ffps) = %d, want %d", tc.durSec, tc.fps, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestFilmstripFallsBackWhenKeyframePassProducesEmptyOutput(t *testing.T) {
+	dir := t.TempDir()
+	ffmpeg := filepath.Join(dir, "fake-ffmpeg")
+	logPath := filepath.Join(dir, "calls.log")
+	t.Setenv("JM_FILMSTRIP_TEST_LOG", logPath)
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$JM_FILMSTRIP_TEST_LOG"
+out=""
+for arg in "$@"; do out="$arg"; done
+case " $* " in
+  *" -discard nokey "*) : > "$out"; exit 0 ;;
+esac
+printf 'jpeg-bytes' > "$out"
+`
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outPath := filepath.Join(dir, "strip.jpg")
+	geo, err := Filmstrip(ffmpeg, filepath.Join(dir, "short.mp4"), outPath, 8022, 1920, 1080, 320, 30)
+	if err != nil {
+		t.Fatalf("Filmstrip fallback: %v", err)
+	}
+	if geo == nil || geo.FrameCount != 36 || geo.Cols != 12 || geo.Rows != 3 {
+		t.Fatalf("unexpected geometry: %+v", geo)
+	}
+	blob, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(blob) != "jpeg-bytes" {
+		t.Fatalf("fallback output = %q", blob)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("ffmpeg calls = %d, want fast pass + fallback: %q", len(lines), calls)
+	}
+	if !strings.Contains(lines[0], "-discard nokey") {
+		t.Fatalf("first pass lost keyframe optimization: %q", lines[0])
+	}
+	if strings.Contains(lines[1], "-discard nokey") {
+		t.Fatalf("fallback still discarded non-keyframes: %q", lines[1])
+	}
+}
+
+func TestFilmstripKeepsNonemptyKeyframeFastPath(t *testing.T) {
+	dir := t.TempDir()
+	ffmpeg := filepath.Join(dir, "fake-ffmpeg")
+	logPath := filepath.Join(dir, "calls.log")
+	t.Setenv("JM_FILMSTRIP_TEST_LOG", logPath)
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$JM_FILMSTRIP_TEST_LOG"
+out=""
+for arg in "$@"; do out="$arg"; done
+printf 'fast-jpeg' > "$out"
+`
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outPath := filepath.Join(dir, "strip.jpg")
+	if _, err := Filmstrip(ffmpeg, filepath.Join(dir, "normal.mp4"), outPath, 60_000, 1920, 1080, 320, 30); err != nil {
+		t.Fatalf("Filmstrip fast path: %v", err)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("nonempty fast path invoked ffmpeg %d times, want 1: %q", len(lines), calls)
+	}
+	if !strings.Contains(lines[0], "-discard nokey") {
+		t.Fatalf("fast path lost keyframe optimization: %q", lines[0])
 	}
 }

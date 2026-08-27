@@ -3,6 +3,7 @@ package farm
 import (
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
@@ -123,13 +124,45 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
 	args = append(args, "-discard", "nokey", "-an", "-i", srcPath,
 		"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", outPath)
-	cmd := exec.Command(ffmpegBin, args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("ffmpeg filmstrip %q: %w: %s", srcPath, err, out)
+	fastOut, fastErr := runFilmstripPass(ffmpegBin, args, outPath)
+	if fastErr != nil {
+		// A sparse-GOP clip can hold fewer keyframes than tile needs to fill its
+		// grid. FFmpeg then exits 0 but writes zero bytes (live reproduced on an
+		// 8 s / 2 s-GOP acceptance clip), leaving a permanently failed filmstrip
+		// even though a normal decode succeeds. Keep the fast keyframe-only path
+		// for the common case; pay for full decode only after a proven empty/error
+		// result. The output path is the caller's already-anchored staged file, and
+		// ffmpeg -y safely replaces the failed pass in place.
+		fallbackArgs := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
+		fallbackArgs = append(fallbackArgs, "-an", "-i", srcPath,
+			"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", outPath)
+		fallbackOut, fallbackErr := runFilmstripPass(ffmpegBin, fallbackArgs, outPath)
+		if fallbackErr != nil {
+			return nil, fmt.Errorf("ffmpeg filmstrip %q: keyframe pass: %v: %s; full-decode fallback: %w: %s",
+				srcPath, fastErr, fastOut, fallbackErr, fallbackOut)
+		}
 	}
 
 	return &derivatives.FilmstripGeo{
 		FrameCount: frameCount, Cols: cols, Rows: rows,
 		CellW: cellW, CellH: cellH, IntervalMS: intervalMS, DurationMS: int(durationMS),
 	}, nil
+}
+
+func runFilmstripPass(ffmpegBin string, args []string, outPath string) ([]byte, error) {
+	out, err := exec.Command(ffmpegBin, args...).CombinedOutput()
+	if err != nil {
+		return out, err
+	}
+	st, err := os.Stat(outPath)
+	if err != nil {
+		return out, fmt.Errorf("output missing after successful ffmpeg exit: %w", err)
+	}
+	if !st.Mode().IsRegular() {
+		return out, fmt.Errorf("output is not a regular file")
+	}
+	if st.Size() == 0 {
+		return out, fmt.Errorf("ffmpeg exited successfully but produced empty output")
+	}
+	return out, nil
 }
