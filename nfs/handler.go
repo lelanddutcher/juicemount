@@ -307,6 +307,40 @@ var fuseStatTimeout = func() time.Duration {
 	return 800 * time.Millisecond
 }()
 
+// mutationOpTimeout is the deadline for FUSE mutations that must complete
+// before an NFS RPC can be acknowledged (currently mkdir and symlink; chmod is
+// best-effort but shares the same helper).
+//
+// Keep the measured 800 ms LAN ceiling: it prevents a genuinely wedged FUSE
+// mount from parking Finder's RPC slots. On a measured metered/slow or
+// high-latency Link, however, 800 ms is not a wedge detector. A healthy remote
+// mkdir was observed completing just beyond that boundary, so the server sent
+// NFS3ERR_JUKEBOX and macOS surfaced the retry as EACCES/"Permission denied".
+// Use the already-live netprofile signal rather than JM_WAN_MODE, which is
+// fixed at process start and cannot follow Wi-Fi/cellular transitions.
+//
+// JM_MUTATION_OP_TIMEOUT_MS is a field/debug override. It is intentionally
+// separate from JM_FUSE_OP_TIMEOUT_MS so an operator can widen mutation
+// acknowledgement without also making every foreground stat/read wait longer.
+func mutationOpTimeout() time.Duration {
+	if v := os.Getenv("JM_MUTATION_OP_TIMEOUT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	p := netprofile.Default()
+	return mutationOpTimeoutFor(p.Class(), p.HighLatency(), fuseStatTimeout)
+}
+
+func mutationOpTimeoutFor(class netprofile.LinkClass, highLatency bool, base time.Duration) time.Duration {
+	if highLatency || class == netprofile.ClassMetered || class == netprofile.ClassSlow {
+		if base < 2*time.Second {
+			return 2 * time.Second
+		}
+	}
+	return base
+}
+
 // syncColdPopulateTimeout bounds the S3 fast-link synchronous cold-populate
 // (WAVE 1, RC-6). It is DELIBERATELY tight (~50ms) so this path can never block
 // the READDIR RPC longer than one bounded FUSE readdir — on a timeout it falls
@@ -3710,7 +3744,7 @@ func (jfs *juiceFS) MkdirAll(dirname string, perm os.FileMode) error {
 	if !pin.IsOffline() {
 		// BOUNDED (task #70): unbounded os.MkdirAll on the MKDIR RPC path parks
 		// on a drain-loaded FUSE and stalls the mount; JUKEBOX-retry instead.
-		err, ok := mkdirAllWithTimeout(metrics.FUSESrcForeground, jfs.fullPath(dirname), perm, fuseStatTimeout)
+		err, ok := mkdirAllWithTimeout(metrics.FUSESrcForeground, jfs.fullPath(dirname), perm, mutationOpTimeout())
 		if !ok {
 			return errFUSETimeout
 		}
@@ -3806,7 +3840,7 @@ func (jfs *juiceFS) Symlink(target, link string) error {
 	if !offline {
 		// BOUNDED (task #70): unbounded os.Symlink on the SYMLINK RPC path parks
 		// on a drain-loaded FUSE and stalls the mount; JUKEBOX-retry instead.
-		err, ok := symlinkWithTimeout(metrics.FUSESrcForeground, target, fusePath, fuseStatTimeout)
+		err, ok := symlinkWithTimeout(metrics.FUSESrcForeground, target, fusePath, mutationOpTimeout())
 		if !ok {
 			return errFUSETimeout
 		}
@@ -3954,7 +3988,7 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 		// links drive it into the most contended JuiceFS resolution; unbounded it
 		// parked on a drain-loaded FUSE and stalled the mount. On a wedge degrade
 		// to metadata-only (store.UpdateMode below is the authoritative mode).
-		if err, ok := chmodWithTimeout(metrics.FUSESrcForeground, fusePath, mode.Perm(), fuseStatTimeout); !ok {
+		if err, ok := chmodWithTimeout(metrics.FUSESrcForeground, fusePath, mode.Perm(), mutationOpTimeout()); !ok {
 			jmlog.Debug("Chmod: FUSE chmod timed out (non-fatal, store update is authority)", "path", rel)
 		} else if err != nil && !os.IsNotExist(err) {
 			jmlog.Debug("Chmod: FUSE chmod failed (non-fatal, store update is authority)",
