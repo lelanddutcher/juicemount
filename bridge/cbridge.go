@@ -106,15 +106,6 @@ var (
 	// resilience plan consume its state and OnChange callback.
 	globalReach *health.Reachability
 
-	// Auto-offline debounce (2026-06-01). A brief network blip (a few seconds
-	// of cold-dial failures) must NOT flip the app to "offline" — that
-	// contradicts the still-healthy Redis/MinIO/FUSE components (which ride
-	// through the same blip on warm pooled connections) and jars the user. We
-	// wait for offlineEngageDelay of CONTINUOUS unreachability before engaging
-	// offline mode; recovery is instant. Guarded by offlineEngageMu.
-	offlineEngageMu    sync.Mutex
-	offlineEngageTimer *time.Timer
-
 	// globalKeyspaceNetWatcher provides the active-interface NAME signal used
 	// to class-gate the metadata keyspace-push backstop cadence + coalescer
 	// (LAN/WiFi/tunnel). Instantiated while keyspace push is enabled (default);
@@ -163,15 +154,14 @@ var (
 	globalRedisURL string
 )
 
-// offlineEngageDelay is how long the backend must be CONTINUOUSLY unreachable
-// (on top of globalReach's ~4s detection) before auto-offline engages. Sized
-// to ride out the brief LAN/Tailscale blips that trip a cold-dial probe but
-// not the warm-connection health checks — keeping the menu bar from flapping
-// to "offline" on a 2-6s hiccup. Total engage latency ≈ 22s end-to-end.
-//
-// Recovery is NOT debounced: the moment reachability returns, the pending
-// engage is cancelled and any active auto-offline is lifted immediately.
-var offlineEngageDelay = 18 * time.Second
+// backendFailuresToOffline deliberately admits one failed PROTOCOL-level probe.
+// Reachability does more than connect: it sends Redis PING and requires a RESP
+// reply, while its recent-drain liveness override suppresses congestion-induced
+// false failures. Adding another threshold or timer here previously left Finder
+// on the blocking FUSE path for about 22 seconds after a real route loss. A
+// single bounded failure makes the durable local cache/spool policy effective
+// within roughly one probe timeout; the first successful probe recovers online.
+const backendFailuresToOffline = 1
 
 // ServerConfig is the JSON configuration passed from Swift.
 type ServerConfig struct {
@@ -1244,6 +1234,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// adaptive readahead can bootstrap link class (fast LAN vs slow WAN)
 		// before any throughput sample arrives (internal/netprofile).
 		globalReach = health.NewReachability(reachAddr,
+			health.WithFailureThreshold(backendFailuresToOffline),
 			health.WithRTTObserver(netprofile.Default().ObserveRTT),
 			// Drain-liveness false-flap override (task #66 salvage, NFSv3
 			// sprint): a completed drain (a MinIO PUT that landed) is positive
@@ -1275,17 +1266,10 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				return time.Since(last)
 			}))
 		globalReach.OnChange(func(reachable bool, reason string) {
-			offlineEngageMu.Lock()
-			defer offlineEngageMu.Unlock()
 			if reachable {
-				// Cancel any pending offline-engage and lift auto-offline at
-				// once. Recovery is intentionally NOT debounced — the moment
-				// the route is back we want un-pinned reads flowing again. The
+				// Recovery is intentionally not debounced: the moment a real
+				// Redis response returns, resume remote reads and draining. The
 				// user-intent flag (SetOffline) is untouched.
-				if offlineEngageTimer != nil {
-					offlineEngageTimer.Stop()
-					offlineEngageTimer = nil
-				}
 				jmlog.Info("network path to backend recovered",
 					"target", reachAddr, "reason", reason)
 				pin.SetAutoOffline(false, "")
@@ -1294,33 +1278,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 				// does a non-blocking send to an undrained channel. Benign.
 				rc.TriggerSync()
 			} else {
-				// DEBOUNCE: do NOT engage offline on a brief blip. Arm a timer;
-				// only engage if the backend is STILL unreachable after
-				// offlineEngageDelay of continuous failure. A 2-6s blip (which
-				// the warm-connection health checks ride straight through)
-				// recovers long before this fires, so the app never shows a
-				// spurious "offline" while Redis/MinIO/FUSE all read OK.
-				if offlineEngageTimer != nil {
-					offlineEngageTimer.Stop()
-				}
-				jmlog.Warn("network path to backend lost — deferring offline engage",
-					"target", reachAddr, "reason", reason,
-					"engage_after", offlineEngageDelay.String())
-				capturedReason := reason
-				offlineEngageTimer = time.AfterFunc(offlineEngageDelay, func() {
-					offlineEngageMu.Lock()
-					defer offlineEngageMu.Unlock()
-					if globalReach.Reachable() {
-						return // recovered during the debounce window — no-op
-					}
-					jmlog.Warn("backend unreachable for sustained window — engaging offline mode",
-						"target", reachAddr, "reason", capturedReason,
-						"sustained", offlineEngageDelay.String())
-					// NFS handler reads pin.IsOffline() in the read path to
-					// fail-fast un-pinned reads instead of stalling on
-					// kernel-NFS timeouts.
-					pin.SetAutoOffline(true, capturedReason)
-				})
+				jmlog.Warn("network path to backend lost — engaging offline mode",
+					"target", reachAddr, "reason", reason)
+				// NFS handler reads pin.IsOffline() in the read and write paths
+				// to stay on local cache/spool instead of blocking in FUSE.
+				pin.SetAutoOffline(true, reason)
 			}
 		})
 		// R-4: if we started offline, seed the monitor "unreachable" so the FIRST
