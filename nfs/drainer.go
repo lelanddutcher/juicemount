@@ -1083,7 +1083,16 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	ph.mark_(&ph.identity)
 	buf := make([]byte, 1<<20)
 	syncInterval := d.durableSyncInterval()
-	copyResult, copyErr := copyWithDurableCheckpoints(dst, src, syncInterval, buf)
+	// On macOS, os.File.Sync issues fcntl(F_FULLFSYNC). That operation is for
+	// forcing a LOCAL physical disk's volatile cache to stable media; it is not
+	// the FUSE fsync operation. JuiceFS/macFUSE accepts it but can leave the Go
+	// thread in an uninterruptible kernel wait for its full daemon timeout
+	// (15-17 minutes observed live), which also starves the embedded control
+	// plane. Wrap the destination so Darwin uses fsync(2), which crosses the
+	// actual FUSE fsync boundary. With JuiceFS --writeback disabled, successful
+	// fsync still means the checkpoint reached the backend; the spool copy is
+	// retained until all checkpoints, verification, close, and row commit pass.
+	copyResult, copyErr := copyWithDurableCheckpoints(fuseDurableFile{File: dst}, src, syncInterval, buf)
 	n := copyResult.Bytes
 	ph.mark_(&ph.copy)
 	// copyWithDurableCheckpoints includes every destination Sync. With JuiceFS
