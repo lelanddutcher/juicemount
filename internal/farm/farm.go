@@ -32,6 +32,11 @@ type Options struct {
 	ProxyVCodec      string // proxy H.264 encoder; "" → "libx264" (GPU: h264_nvenc/qsv/vaapi)
 	ProxyCRF         int    // proxy quality; 0 → 21 (lower = sharper/bigger)
 	ProxyPreset      string // proxy x264 preset; "" → "slow" (faster preset = quicker, larger)
+	// PreserveHEVCOnFallback prevents a queue-routed CPU/H.264 fallback from
+	// replacing an already-current HEVC proxy. It is set only by the worker for
+	// the explicit fallback lane; ordinary one-shot/explicit codec runs retain
+	// exact-codec semantics.
+	PreserveHEVCOnFallback bool
 
 	// PosterAlways lifts MinBlobSizeBytes for the POSTER only (T1.1: "poster
 	// always" for media UTIs). A pinned/recently-browsed folder must show real

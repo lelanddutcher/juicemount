@@ -1144,9 +1144,13 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 		WhisperBin: cfg.wBin, WhisperModel: wModel,
 		TranscriptDevice: tDevice,
 		ProxyVCodec:      vcodec, ProxyCRF: crf, ProxyPreset: preset,
-		MinBlobSizeBytes: cfg.minSize,
-		PosterAlways:     cfg.postAlways,
-		QLMaxDim:         cfg.qlMaxDim, QLSeconds: cfg.qlSecs,
+		// A CPU lane selected by the scheduler is an explicit fallback. Its
+		// directory retry must fill only the files hardware could not publish;
+		// existing HEVC results are already better and must not be downgraded.
+		PreserveHEVCOnFallback: job.QueueClass == farmqueue.QueueClassCPU && vcodec == "libx264",
+		MinBlobSizeBytes:       cfg.minSize,
+		PosterAlways:           cfg.postAlways,
+		QLMaxDim:               cfg.qlMaxDim, QLSeconds: cfg.qlSecs,
 	}
 
 	fmt.Printf("jmfarm queue: job %s path=%q kinds=%v files=%d\n",

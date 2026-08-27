@@ -63,7 +63,12 @@ func TestProxyFreshRequiresMatchingCodecAndBlob(t *testing.T) {
 	}
 
 	if proxyFresh(store, inode, hash, size, Options{Mount: mount, ProxyVCodec: "libx264"}) {
-		t.Fatal("HEVC row must not satisfy an H.264 request")
+		t.Fatal("ordinary H.264 request must retain exact-codec semantics")
+	}
+	if !proxyFresh(store, inode, hash, size, Options{
+		Mount: mount, ProxyVCodec: "libx264", PreserveHEVCOnFallback: true,
+	}) {
+		t.Fatal("CPU fallback must preserve a current, better HEVC result")
 	}
 	if proxyFresh(store, inode, hash, size, Options{Mount: mount, ProxyVCodec: "hevc_vaapi", RegenerateFresh: true}) {
 		t.Fatal("explicit regeneration must bypass the proxy freshness gate")
@@ -80,6 +85,15 @@ func TestProxyFreshRequiresMatchingCodecAndBlob(t *testing.T) {
 	}
 	if proxyFresh(store, inode, hash, size, hevc) {
 		t.Fatal("a ready database row must not skip when the proxy bytes are missing")
+	}
+}
+
+func TestProxyFreshDoesNotTreatH264AsHEVC(t *testing.T) {
+	store, mount, inode, hash, size := seedFreshProxy(t, "h264")
+	if proxyFresh(store, inode, hash, size, Options{
+		Mount: mount, ProxyVCodec: "hevc_vaapi", PreserveHEVCOnFallback: true,
+	}) {
+		t.Fatal("H.264 must not satisfy an HEVC job; the returning GPU should upgrade it")
 	}
 }
 

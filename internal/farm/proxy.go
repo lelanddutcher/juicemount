@@ -182,10 +182,18 @@ func proxyFresh(store *derivatives.Store, inode uint64, hash string, size int64,
 	}
 	desiredCodec, _ := proxyCodecStrings(opt.ProxyVCodec, nil)
 	for _, row := range rows {
+		codecSatisfied := row.Codec != nil && *row.Codec == desiredCodec
+		if opt.PreserveHEVCOnFallback && desiredCodec == "h264" &&
+			row.Codec != nil && *row.Codec == "hevc" {
+			// HEVC is the preferred farm result. A CPU fallback exists to keep
+			// an unserviceable source moving, not to downgrade successful files
+			// from the same directory-shaped retry.
+			codecSatisfied = true
+		}
 		if row.Kind != "proxy" || row.Status != "ready" ||
 			row.Hash == nil || *row.Hash != hash ||
 			row.SourceSize == nil || *row.SourceSize != size ||
-			row.Codec == nil || *row.Codec != desiredCodec ||
+			!codecSatisfied ||
 			row.BlobRelPath == nil || *row.BlobRelPath != "proxy.mp4" {
 			continue
 		}
