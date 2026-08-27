@@ -36,15 +36,34 @@ func TestReadDirEntryMaxBytesIsUpperBound(t *testing.T) {
 	}
 }
 
-// TestReadDirEntryMaxBytesDefaultUnchanged: with the flag OFF (default), the
-// estimate is the historical flat 512, so READDIR paging behaviour is
-// byte-for-byte identical to before C11.
-func TestReadDirEntryMaxBytesDefaultUnchanged(t *testing.T) {
-	// flag unset by default in the test env
-	if got := readDirEntryMaxBytes("anything.mov"); got != 512 {
-		t.Fatalf("default (accurate sizing OFF) = %d, want the historical 512", got)
+func TestReadDirEntryAccurateSizingDefaultsOnWithRollbackSwitch(t *testing.T) {
+	t.Setenv("JM_READDIR_ACCURATE_SIZING", "")
+	if got := readDirEntryMaxBytes("anything.mov"); got >= 512 {
+		t.Fatalf("default accurate sizing = %d, want a packed short-name estimate below the legacy 512", got)
 	}
-	if got := readDirEntryMaxBytes(strings.Repeat("x", 255)); got != 512 {
-		t.Fatalf("default OFF for a long name = %d, want 512", got)
+	t.Setenv("JM_READDIR_ACCURATE_SIZING", "0")
+	if got := readDirEntryMaxBytes("anything.mov"); got != 512 {
+		t.Fatalf("rollback switch = %d, want historical 512", got)
+	}
+}
+
+func TestReadDirStartIndexJumpsDirectlyFromCookie(t *testing.T) {
+	cases := []struct {
+		cookie uint64
+		length int
+		want   int
+	}{
+		{0, 5000, 0}, // first page includes dot entries, then content[0]
+		{1, 5000, 0}, // dotdot continuation starts at content[0]
+		{2, 5000, 1}, // content[0] was the last acknowledged entry
+		{100, 5000, 99},
+		{5001, 5000, 5000},
+		{9000, 5000, 5000},
+		{2, 0, 0},
+	}
+	for _, tc := range cases {
+		if got := readDirStartIndex(tc.cookie, tc.length); got != tc.want {
+			t.Errorf("cookie=%d len=%d start=%d, want %d", tc.cookie, tc.length, got, tc.want)
+		}
 	}
 }

@@ -1122,7 +1122,14 @@ func (h *JuiceMountHandler) onSpoolDrained(nfsPath string, size int64) {
 			if err, ok := chmodWithTimeout(metrics.FUSESrcForeground, fusePath, e.Mode.Perm(), mutationOpTimeout()); !ok {
 				jmlog.Warn("onSpoolDrained: FUSE chmod timed out", "path", nfsPath)
 			} else if err != nil && !os.IsNotExist(err) {
-				jmlog.Warn("onSpoolDrained: FUSE chmod failed", "path", nfsPath, "error", err.Error())
+				// Metadata mode is authoritative for NFS. JuiceFS can reject this
+				// best-effort backend chmod with EPERM during an AppleDouble rewrite;
+				// it is not a failed upload or a Finder permission error.
+				if os.IsPermission(err) {
+					jmlog.Debug("onSpoolDrained: FUSE chmod rejected (metadata mode remains authoritative)", "path", nfsPath)
+				} else {
+					jmlog.Warn("onSpoolDrained: FUSE chmod failed", "path", nfsPath, "error", err.Error())
+				}
 			}
 		}
 	}

@@ -58,8 +58,7 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 	entities := make([]readDirEntity, 0)
 	maxBytes := uint32(100) // conservative overhead measure
 
-	started := obj.Cookie == 0
-	if started {
+	if obj.Cookie == 0 {
 		// add '.' and '..' to entities
 		dotdotFileID := uint64(0)
 		if len(p) > 0 {
@@ -81,26 +80,23 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 
 	eof := true
 	maxEntities := userHandle.HandleLimit() / 2
-	for i, c := range contents {
+	for i := readDirStartIndex(obj.Cookie, len(contents)); i < len(contents); i++ {
+		c := contents[i]
 		// cookie equates to index within contents + 2 (for '.' and '..')
 		cookie := uint64(i + 2)
-		if started {
-			maxBytes += readDirEntryMaxBytes(c.Name())
-			if maxBytes > obj.Count || len(entities) > maxEntities {
-				eof = false
-				break
-			}
-
-			attrs := ToFileAttribute(c, path.Join(append(p, c.Name())...))
-			entities = append(entities, readDirEntity{
-				FileID: attrs.Fileid,
-				Name:   []byte(c.Name()),
-				Cookie: cookie,
-				Next:   true,
-			})
-		} else if cookie == obj.Cookie {
-			started = true
+		maxBytes += readDirEntryMaxBytes(c.Name())
+		if maxBytes > obj.Count || len(entities) > maxEntities {
+			eof = false
+			break
 		}
+
+		attrs := ToFileAttribute(c, path.Join(append(p, c.Name())...))
+		entities = append(entities, readDirEntity{
+			FileID: attrs.Fileid,
+			Name:   []byte(c.Name()),
+			Cookie: cookie,
+			Next:   true,
+		})
 	}
 
 	writer := bytes.NewBuffer([]byte{})
@@ -185,13 +181,28 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 	return contents, id, nil
 }
 
+// readDirStartIndex converts the last cookie acknowledged by the client into
+// the first content index to emit on the continuation page. Cookies 0 and 1
+// name the synthetic dot entries; content index i has cookie i+2. Jumping here
+// is load-bearing for large directories: rescanning from index zero for every
+// page made a 5,000-entry warm/offline listing quadratic (~520 ms locally).
+func readDirStartIndex(cookie uint64, contentLen int) int {
+	if cookie <= 1 {
+		return 0
+	}
+	next := cookie - 1
+	if next >= uint64(contentLen) {
+		return contentLen
+	}
+	return int(next)
+}
+
 // readDirAccurateSizing gates C11: accurate per-entry READDIR size estimation.
-// OFF (default) preserves the historical flat 512-byte/entry over-estimate,
-// which breaks the READDIR page after ~15 entries regardless of the client's
-// Count and forces many small round-trips — marginal on a µs-RTT LAN, real on a
-// high-RTT cellular link. Enable with JM_READDIR_ACCURATE_SIZING=1 after the
-// live big-dir completeness check passes.
-func readDirAccurateSizing() bool { return os.Getenv("JM_READDIR_ACCURATE_SIZING") == "1" }
+// ON by default after the live 5,000-entry completeness/custody gate. The old
+// flat 512-byte estimate broke pages after only a handful of short names and
+// multiplied high-RTT cellular round trips. JM_READDIR_ACCURATE_SIZING=0 is the
+// rollback switch.
+func readDirAccurateSizing() bool { return os.Getenv("JM_READDIR_ACCURATE_SIZING") != "0" }
 
 // readDirEntryMaxBytes returns a CONSERVATIVE upper bound on the XDR-encoded
 // size of one readDirEntity — FileID(8) + Name(4+padded) + Cookie(8) + Next(4)
@@ -207,8 +218,8 @@ func readDirEntryMaxBytes(name string) uint32 {
 		return 512
 	}
 	nameLen := uint32(len(name))
-	namePadded := (nameLen + 3) &^ 3          // XDR pads names to a 4-byte boundary
-	return 8 + 4 + namePadded + 8 + 4 + 8     // FileID + NameLen + name + Cookie + Next + margin
+	namePadded := (nameLen + 3) &^ 3      // XDR pads names to a 4-byte boundary
+	return 8 + 4 + namePadded + 8 + 4 + 8 // FileID + NameLen + name + Cookie + Next + margin
 }
 
 func hashPathAndContents(path string, contents []fs.FileInfo) uint64 {
