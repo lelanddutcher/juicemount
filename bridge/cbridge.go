@@ -436,6 +436,21 @@ func objectStoreHealthBase(raw string) string {
 	return strings.TrimRight(u.String(), "/")
 }
 
+// cacheRedisOptions keeps the cache probe's caller-supplied context deadline
+// authoritative. go-redis otherwise ignores context deadlines once a local
+// Link proxy has accepted the TCP connection and waits for ReadTimeout instead;
+// a promised 200 ms offline cache probe then stalls an NFS READ for 10 seconds.
+func cacheRedisOptions(addr string, db int) *redis.Options {
+	return &redis.Options{
+		Addr:                  addr,
+		DB:                    db,
+		ReadTimeout:           10 * time.Second,
+		WriteTimeout:          5 * time.Second,
+		DialTimeout:           5 * time.Second,
+		ContextTimeoutEnabled: true,
+	}
+}
+
 func linkRedisPingRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Duration) (time.Duration, error) {
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
@@ -444,6 +459,7 @@ func linkRedisPingRTT(node *jmnfs.LinkNode, redisURL string, timeout time.Durati
 	opts.DialTimeout = timeout
 	opts.ReadTimeout = timeout
 	opts.WriteTimeout = timeout
+	opts.ContextTimeoutEnabled = true
 	opts.Dialer = node.DialContext
 	client := redis.NewClient(opts)
 	defer client.Close()
@@ -489,6 +505,7 @@ func linkRedisDataPlaneBenchmarkWithDial(redisURL string, size int, timeout time
 	opts.DialTimeout = timeout
 	opts.ReadTimeout = timeout
 	opts.WriteTimeout = timeout
+	opts.ContextTimeoutEnabled = true
 	opts.PoolSize = 1
 	opts.Dialer = dial
 	client := redis.NewClient(opts)
@@ -1435,13 +1452,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// read and a 30s stall there cascades through every concurrent NFS
 		// RPC under the current per-connection sequential dispatch. Matches
 		// the timeouts on the metadata client.
-		rdb := redis.NewClient(&redis.Options{
-			Addr:         addr,
-			DB:           db,
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 5 * time.Second,
-			DialTimeout:  5 * time.Second,
-		})
+		rdb := redis.NewClient(cacheRedisOptions(addr, db))
 		globalRDB = rdb
 		cr := cache.NewReader(cacheDir, cache.DefaultBlockSize, rdb)
 		if err := cr.Verify(); err == nil {

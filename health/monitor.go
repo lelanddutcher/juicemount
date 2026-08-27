@@ -279,9 +279,10 @@ func (m *HealthMonitor) busyIngesting() bool {
 // New creates a HealthMonitor for the given configuration.
 func New(cfg Config) *HealthMonitor {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:        cfg.RedisURL,
-		DialTimeout: 3 * time.Second,
-		ReadTimeout: 3 * time.Second,
+		Addr:                  cfg.RedisURL,
+		DialTimeout:           3 * time.Second,
+		ReadTimeout:           3 * time.Second,
+		ContextTimeoutEnabled: true,
 	})
 
 	return &HealthMonitor{

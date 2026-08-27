@@ -178,7 +178,11 @@ func main() {
 	var cr *cache.Reader
 	if cacheDir != "" {
 		addr, db, _ := metadata.ParseRedisURL(*redisURL)
-		rdb := redis.NewClient(&redis.Options{Addr: addr, DB: db})
+		rdb := redis.NewClient(&redis.Options{
+			Addr:                  addr,
+			DB:                    db,
+			ContextTimeoutEnabled: true,
+		})
 		cr = cache.NewReader(cacheDir, cache.DefaultBlockSize, rdb)
 		if err := cr.Verify(); err != nil {
 			jmlog.Warn("ssd cache reader disabled", "error", err)
