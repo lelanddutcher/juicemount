@@ -74,3 +74,38 @@ func TestFSInfoDirectoryPreferenceMatchesBulkTransferWindow(t *testing.T) {
 		t.Fatalf("FSINFO transfer preferences = read:%d write:%d dir:%d, want one shared 1 MiB window", got.Rtpref, got.Wtpref, got.Dtpref)
 	}
 }
+
+func TestReadDirPlusEntryMaxBytesMatchesOptionalPayloads(t *testing.T) {
+	attrs := FileAttribute{}
+	for _, tc := range []struct {
+		name         string
+		includeAttrs bool
+		handleLen    int
+	}{
+		{name: "clip.mov", includeAttrs: true, handleLen: 8},
+		{name: "._clip.mov", includeAttrs: false, handleLen: -1},
+		{name: strings.Repeat("x", 255), includeAttrs: true, handleLen: -1},
+		{name: "alternate-handle", includeAttrs: true, handleLen: 36},
+	} {
+		entity := readDirPlusEntity{
+			FileID: 1,
+			Name:   []byte(tc.name),
+			Cookie: 2,
+			Next:   true,
+		}
+		if tc.includeAttrs {
+			entity.Attributes = &attrs
+		}
+		if tc.handleLen >= 0 {
+			handle := []byte(strings.Repeat("h", tc.handleLen))
+			entity.Handle = &handle
+		}
+		var buf bytes.Buffer
+		if err := xdr.Write(&buf, entity); err != nil {
+			t.Fatalf("xdr encode %q: %v", tc.name, err)
+		}
+		if got, want := readDirPlusEntryMaxBytes(tc.name, tc.includeAttrs, tc.handleLen), uint32(buf.Len()); got != want {
+			t.Fatalf("name %q optional attrs=%v handleLen=%d: estimate %d != encoded %d", tc.name, tc.includeAttrs, tc.handleLen, got, want)
+		}
+	}
+}
