@@ -326,6 +326,19 @@ func TestOfflineSetattrZeroReplacesExistingViaSpool(t *testing.T) {
 	if err := jfs.handler.store.Insert(entry); err != nil {
 		t.Fatalf("seed metadata: %v", err)
 	}
+	if err := os.Chmod(fullPath, 0o644); err != nil {
+		t.Fatalf("seed FUSE mode: %v", err)
+	}
+	if err := jfs.handler.Change(jfs).Chmod("existing.bin", 0o600); err != nil {
+		t.Fatalf("offline metadata-only chmod: %v", err)
+	}
+	fiBeforeDrain, err := os.Stat(fullPath)
+	if err != nil || fiBeforeDrain.Mode().Perm() != 0o644 {
+		t.Fatalf("offline chmod touched FUSE: mode=%v err=%v, want 0644 until drain", fiBeforeDrain.Mode().Perm(), err)
+	}
+	if gotMode := jfs.handler.store.LookupByPath("existing.bin").Mode.Perm(); gotMode != 0o600 {
+		t.Fatalf("offline chmod metadata mode=%#o, want 0600", gotMode)
+	}
 
 	zero := uint64(0)
 	start := time.Now()
@@ -375,6 +388,10 @@ func TestOfflineSetattrZeroReplacesExistingViaSpool(t *testing.T) {
 	}
 	if gotSize := jfs.handler.store.LookupByPath("existing.bin").Size; gotSize != int64(len(replacement)) {
 		t.Fatalf("post-drain metadata size=%d, want %d", gotSize, len(replacement))
+	}
+	fiAfterDrain, err := os.Stat(fullPath)
+	if err != nil || fiAfterDrain.Mode().Perm() != 0o600 {
+		t.Fatalf("post-drain FUSE mode=%v err=%v, want offline metadata mode 0600", fiAfterDrain.Mode().Perm(), err)
 	}
 }
 

@@ -1113,6 +1113,18 @@ func (h *JuiceMountHandler) onSpoolDrained(nfsPath string, size int64) {
 	inode := uint64(0)
 	if e := h.store.LookupByPath(nfsPath); e != nil {
 		inode = e.Inode
+		// SETATTR mode is metadata-authoritative while the path exists only
+		// in the local spool. Once its bytes land, carry the final permission
+		// to FUSE so an offline replacement's mode remains durable without
+		// making the outage-time client wait on the backend.
+		if h.fusePath != "" {
+			fusePath := path.Join(h.fusePath, strings.TrimPrefix(nfsPath, "/"))
+			if err, ok := chmodWithTimeout(metrics.FUSESrcForeground, fusePath, e.Mode.Perm(), mutationOpTimeout()); !ok {
+				jmlog.Warn("onSpoolDrained: FUSE chmod timed out", "path", nfsPath)
+			} else if err != nil && !os.IsNotExist(err) {
+				jmlog.Warn("onSpoolDrained: FUSE chmod failed", "path", nfsPath, "error", err.Error())
+			}
+		}
 	}
 	// The drainer just (re)wrote this path's bytes into FUSE. If this drain was
 	// an OVERWRITE of a previously-read file (re-export / NLE relink over the
@@ -1165,7 +1177,13 @@ func (h *JuiceMountHandler) nextSyntheticInode() uint64 {
 // the inode cache entry would surface as ESTALE on the writer's next RPC).
 func (h *JuiceMountHandler) incActiveWriter(path string) {
 	h.activeWritersMu.Lock()
+	first := h.activeWriters[path] == 0
 	h.activeWriters[path]++
+	if first {
+		if pt := h.presence.Load(); pt != nil {
+			pt.Open(path)
+		}
+	}
 	h.activeWritersMu.Unlock()
 	// A write handle opening on a `._` sidecar means its body is changing —
 	// drop any cached copy so a subsequent read repopulates from the fresh
@@ -1179,13 +1197,13 @@ func (h *JuiceMountHandler) incActiveWriter(path string) {
 // entry when the count returns to zero so the map doesn't grow unbounded
 // across the process lifetime.
 func (h *JuiceMountHandler) decActiveWriter(path string) {
-	if pt := h.presence.Load(); pt != nil {
-		pt.Close(path)
-	}
 	h.activeWritersMu.Lock()
 	if c, ok := h.activeWriters[path]; ok {
 		if c <= 1 {
 			delete(h.activeWriters, path)
+			if pt := h.presence.Load(); pt != nil {
+				pt.Close(path)
+			}
 		} else {
 			h.activeWriters[path] = c - 1
 		}
@@ -4043,7 +4061,7 @@ func (jc *juiceChange) Chmod(name string, mode os.FileMode) error {
 	// NFS-served mode; the FUSE chmod only matters for an IN-PLACE chmod of an
 	// already-landed file. Skip too if there's no FUSE root (bare-handler tests).
 	spool := h.spool.Load()
-	if h.fusePath != "" && (spool == nil || !spool.HasPending(rel)) {
+	if !pin.IsOffline() && h.fusePath != "" && (spool == nil || !spool.HasPending(rel)) {
 		fusePath := path.Join(h.fusePath, rel)
 		// BOUNDED (task #70): os.Chmod FOLLOWS symlinks → a framework's nested
 		// links drive it into the most contended JuiceFS resolution; unbounded it

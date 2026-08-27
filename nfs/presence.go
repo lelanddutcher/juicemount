@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -61,7 +62,15 @@ const (
 	presenceKeyPrefix = "jum:presence:"
 	presenceTTL       = 45 * time.Second
 	presenceRefresh   = 15 * time.Second
+	presenceWriteWait = 750 * time.Millisecond
+	presenceQueueSize = 256
 )
+
+type presenceUpdate struct {
+	path  string
+	since int64
+	open  bool
+}
 
 // PresenceTracker mirrors write-handle open/close into Redis and keeps the
 // local snapshot in memory for zero-cost local reads.
@@ -72,8 +81,9 @@ type PresenceTracker struct {
 	mu    sync.Mutex
 	opens map[string]int64 // mount-path -> firstOpenUnix
 
-	stopCh chan struct{}
-	once   sync.Once
+	updates chan presenceUpdate
+	stopCh  chan struct{}
+	once    sync.Once
 }
 
 // NewPresenceTracker builds a tracker for this host. Nil-safe construction is
@@ -83,21 +93,28 @@ func NewPresenceTracker(rdb *redis.Client) *PresenceTracker {
 	if err != nil || host == "" {
 		host = "unknown-mac"
 	}
+	return newPresenceTracker(host, &redisPresenceStore{rdb: rdb})
+}
+
+func newPresenceTracker(host string, store presenceStore) *PresenceTracker {
 	p := &PresenceTracker{
-		host:   host,
-		store:  &redisPresenceStore{rdb: rdb},
-		opens:  make(map[string]int64),
-		stopCh: make(chan struct{}),
+		host:    host,
+		store:   store,
+		opens:   make(map[string]int64),
+		updates: make(chan presenceUpdate, presenceQueueSize),
+		stopCh:  make(chan struct{}),
 	}
+	go p.updateLoop()
 	go p.refreshLoop()
 	return p
 }
 
 // Open records a write-handle open for path. Fire-and-forget: presence is
-// best-effort telemetry and must never add latency to the write hot path —
-// the Redis write happens on this goroutine but failures are swallowed
-// (the local snapshot is still updated, so local reads stay correct even
-// when the backend is unreachable).
+// best-effort telemetry and must never add latency to the write hot path. The
+// local snapshot changes synchronously; Redis work goes through a bounded
+// background queue and is skipped while offline. A saturated queue may drop
+// telemetry, but Redis TTL expiry removes stale presence and file custody never
+// waits behind it.
 func (p *PresenceTracker) Open(path string) {
 	if p == nil {
 		return
@@ -106,13 +123,10 @@ func (p *PresenceTracker) Open(path string) {
 	p.mu.Lock()
 	p.opens[path] = now
 	p.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = p.store.hset(ctx, p.key(), path, strconv.FormatInt(now, 10))
-	_ = p.store.expire(ctx, p.key(), presenceTTL)
+	p.enqueue(presenceUpdate{path: path, since: now, open: true})
 }
 
-// Close records a write-handle close. Same fire-and-forget contract as Open.
+// Close records a write-handle close. Same non-blocking contract as Open.
 func (p *PresenceTracker) Close(path string) {
 	if p == nil {
 		return
@@ -120,9 +134,43 @@ func (p *PresenceTracker) Close(path string) {
 	p.mu.Lock()
 	delete(p.opens, path)
 	p.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = p.store.hdel(ctx, p.key(), path)
+	p.enqueue(presenceUpdate{path: path})
+}
+
+func (p *PresenceTracker) enqueue(update presenceUpdate) {
+	if pin.IsOffline() {
+		return
+	}
+	select {
+	case p.updates <- update:
+	case <-p.stopCh:
+	default:
+		// Best-effort only. Unprocessed fields disappear via presenceTTL.
+	}
+}
+
+func (p *PresenceTracker) updateLoop() {
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case update := <-p.updates:
+			// The route can disappear after enqueue. Do not spend even the
+			// short telemetry deadline once the data path is offline.
+			if pin.IsOffline() {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), presenceWriteWait)
+			if update.open {
+				if p.store.hset(ctx, p.key(), update.path, strconv.FormatInt(update.since, 10)) == nil {
+					_ = p.store.expire(ctx, p.key(), presenceTTL)
+				}
+			} else {
+				_ = p.store.hdel(ctx, p.key(), update.path)
+			}
+			cancel()
+		}
+	}
 }
 
 // Host returns this tracker's hostname.
