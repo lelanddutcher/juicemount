@@ -7,7 +7,11 @@
 # static CGO in particular, because the juicedata/mount runtime ships an older
 # glibc than the bookworm builder and a dynamically-linked binary will not run.
 ARG BASE_IMAGE=juicefarm:stream-exclusion
+ARG JM_VERSION=0.5.0
+ARG JM_COMMIT=unknown
 FROM golang:1.26.6-bookworm AS gobuild
+ARG JM_VERSION
+ARG JM_COMMIT
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
@@ -15,7 +19,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=1 GOOS=linux go build -tags sqlite_omit_load_extension \
-      -ldflags="-s -w -linkmode external -extldflags '-static'" -o /out/jmfarm ./cmd/jmfarm
+      -ldflags="-s -w -linkmode external -extldflags '-static' -X github.com/lelanddutcher/juicemount/internal/version.Version=${JM_VERSION} -X github.com/lelanddutcher/juicemount/internal/version.Commit=${JM_COMMIT}" \
+      -o /out/jmfarm ./cmd/jmfarm
 
 FROM ${BASE_IMAGE}
+ARG JM_VERSION
+ARG JM_COMMIT
+LABEL org.opencontainers.image.version="${JM_VERSION}" \
+      org.opencontainers.image.revision="${JM_COMMIT}"
 COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
+RUN test "$(/usr/local/bin/jmfarm --build-info)" = "jmfarm ${JM_VERSION} (${JM_COMMIT})"
