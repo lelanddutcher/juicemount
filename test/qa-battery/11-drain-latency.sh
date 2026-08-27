@@ -5,8 +5,8 @@
 #
 # THE GATE (hard requirement — the spinner-under-drain regression test):
 #   While the drainer is actively pushing a SUSTAINED multi-GB copy to the
-#   backend (io.CopyBuffer(1MiB) + dst.Sync() per file through the same
-#   JuiceFS/FUSE daemon), opening an ALREADY-CACHED directory AND stat'ing an
+#   backend (bounded durable copy checkpoints through the same JuiceFS/FUSE
+#   daemon), opening an ALREADY-CACHED directory AND stat'ing an
 #   already-cached file must STILL return near-instantly from the local
 #   metadata DB. The user must NEVER see Finder's loading spinner because a
 #   copy is draining in the background.
@@ -35,7 +35,7 @@
 #   1. Pre-stage an UNRELATED tree off-mount, Finder-copy it onto the mount, and
 #      drain it so it is genuinely CACHED (in the local metadata DB, at rest).
 #   2. Start a SUSTAINED multi-GB Finder copy (hundreds of files) in the
-#      background — enough payload to keep the drainer's CopyBuffer+Sync hot for
+#      background — enough payload to keep the drainer's durable checkpoints hot for
 #      the whole measurement window.
 #   3. For the FULL drain duration, LOOP measuring directory-open latency AND a
 #      per-file Stat/GETATTR latency on the CACHED tree. Record p50/p99 for each.

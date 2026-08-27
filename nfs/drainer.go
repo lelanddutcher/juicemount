@@ -3,11 +3,9 @@ package nfs
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -49,6 +47,9 @@ type Drainer struct {
 	maxAttempts  int
 	backoffBase  time.Duration
 	pollFallback time.Duration
+	// syncIntervalBytes overrides the adaptive durable-checkpoint interval when
+	// positive. Zero selects the live link-class policy for every drain.
+	syncIntervalBytes int64
 
 	sem chan struct{}
 
@@ -221,6 +222,13 @@ type DrainerConfig struct {
 	// re-scans even without a wake signal. Protects against missed
 	// signals after process restart. 0 → 30 seconds.
 	PollFallback time.Duration
+
+	// SyncIntervalBytes bounds how many destination bytes may remain dirty
+	// between durable JuiceFS flushes. Zero selects the adaptive production
+	// policy (1 MiB metered, 2 MiB slow, 4 MiB medium/fast). A positive value is
+	// a field override clamped to 256 KiB..4 MiB so it cannot recreate the
+	// whole-file Fsync. JM_DRAIN_SYNC_BYTES takes precedence.
+	SyncIntervalBytes int64
 }
 
 // DrainerMetrics exposes counters useful for the manager UI + tests.
@@ -307,6 +315,12 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 	if cfg.PollFallback <= 0 {
 		cfg.PollFallback = 30 * time.Second
 	}
+	syncIntervalBytes := cfg.SyncIntervalBytes
+	if v := os.Getenv("JM_DRAIN_SYNC_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			syncIntervalBytes = n
+		}
+	}
 	d := &Drainer{
 		spool:             spool,
 		fuseRoot:          cfg.FuseRoot,
@@ -314,6 +328,7 @@ func NewDrainer(spool *SpoolStore, cfg DrainerConfig) (*Drainer, error) {
 		maxAttempts:       cfg.MaxAttempts,
 		backoffBase:       cfg.BackoffBase,
 		pollFallback:      cfg.PollFallback,
+		syncIntervalBytes: syncIntervalBytes,
 		atRestVerify:      os.Getenv("JM_DRAIN_ATREST_VERIFY") == "1",
 		batchInsert:       os.Getenv("JM_DRAIN_BATCH_INSERT") == "1",
 		skipEmptySidecars: drainSkipEmptySidecarsEnabled(),
@@ -863,6 +878,65 @@ func drainLinkIsSlow() bool {
 	return c == netprofile.ClassSlow || c == netprofile.ClassMetered
 }
 
+const (
+	drainSyncMinBytes     = int64(256 << 10)
+	drainSyncMeteredBytes = int64(1 << 20)
+	drainSyncSlowBytes    = int64(2 << 20)
+	drainSyncDefaultBytes = int64(4 << 20)
+)
+
+// durableSyncInterval reads the live class for every row so a LAN↔cellular
+// handoff changes the maximum dirty window without an app restart. Keeping the
+// interval at or below JuiceFS's normal 4 MiB object block also prevents the
+// single whole-file Fsync that wedged macFUSE on the 1.18 GB Finder copy.
+func (d *Drainer) durableSyncInterval() int64 {
+	if d.syncIntervalBytes > 0 {
+		if d.syncIntervalBytes < drainSyncMinBytes {
+			return drainSyncMinBytes
+		}
+		if d.syncIntervalBytes > drainSyncDefaultBytes {
+			return drainSyncDefaultBytes
+		}
+		return d.syncIntervalBytes
+	}
+	switch netprofile.Default().Class() {
+	case netprofile.ClassMetered:
+		return drainSyncMeteredBytes
+	case netprofile.ClassSlow:
+		return drainSyncSlowBytes
+	default:
+		return drainSyncDefaultBytes
+	}
+}
+
+// acquireDrainFUSESlot registers a drain as background FUSE data work. It
+// waits without occupying the gate so cached foreground reads retain the
+// reserve enforced by backgroundFUSEDataWidth. Stop aborts the wait cleanly.
+func (d *Drainer) acquireDrainFUSESlot() (release func(), ok bool) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if release, ok := tryAcquireFUSEDataBackground(); ok {
+			return release, true
+		}
+		// An operator may deliberately set JM_FUSE_DATA_GATE=1. The normal
+		// background policy reserves that sole slot, which is correct for
+		// optional warming but would stop required spool durability forever.
+		// In that degenerate configuration, contend through the foreground
+		// admission path instead; it remains bounded and observable.
+		if fuseDataGateEnabled && backgroundFUSEDataWidth() == 0 {
+			if release, ok := acquireFUSEData(); ok {
+				return release, true
+			}
+		}
+		select {
+		case <-d.stop:
+			return func() {}, false
+		case <-ticker.C:
+		}
+	}
+}
+
 // drainOne copies a single spool file into the FUSE mount, SHA-verifies
 // the copy, and dispositions the row.
 // drainOneWithWait is drainOne plus the lane-wait it should attribute. Split
@@ -935,6 +1009,16 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 	defer src.Close()
 
+	// Draining is background work on the same FUSE daemon Finder reads through.
+	// Count it against the background half of the global data gate for the whole
+	// destination lifecycle; foreground reads always retain their reservation.
+	releaseFUSE, admitted := d.acquireDrainFUSESlot()
+	if !admitted {
+		_ = d.spool.Meta().ResetToReady(row.ID)
+		return
+	}
+	defer releaseFUSE()
+
 	// #103: capture the spool file's on-disk mtime — the client's last-write
 	// time, which is exactly what the in-flight spool served as ModTime while
 	// this file was pending. os.Create below would otherwise stamp the backend
@@ -997,34 +1081,32 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	}
 
 	ph.mark_(&ph.identity)
-	h := sha256.New()
-	mw := io.MultiWriter(dst, h)
 	buf := make([]byte, 1<<20)
-	n, copyErr := io.CopyBuffer(mw, src, buf)
+	syncInterval := d.durableSyncInterval()
+	copyResult, copyErr := copyWithDurableCheckpoints(dst, src, syncInterval, buf)
+	n := copyResult.Bytes
 	ph.mark_(&ph.copy)
-	// fsync the FUSE destination before closing so JuiceFS --writeback stages
-	// the bytes coherently. Without it, the at-rest re-read below is a
-	// read-after-close against the writeback cache and can momentarily return
-	// inconsistent bytes under a many-file burst — which the SHA check then
-	// mis-diagnoses as a permanent bit flip and quarantines an intact file
-	// (observed ~0.3% under a 2000-file storm). In writeback mode fsync
-	// flushes to the local cache (it does NOT wait for the MinIO upload), so
-	// it is cheap relative to the full readback that follows.
-	var syncErr error
-	if copyErr == nil {
-		syncErr = dst.Sync()
-		ph.mark_(&ph.sync_)
+	// copyWithDurableCheckpoints includes every destination Sync. With JuiceFS
+	// writeback disabled, each call waits for the corresponding backend PUT;
+	// the local spool remains the safety copy until every checkpoint and the
+	// final row commit succeed.
+	if ph.copy >= copyResult.SyncDuration {
+		ph.copy -= copyResult.SyncDuration
+	}
+	ph.sync_ = copyResult.SyncDuration
+	if copyResult.MaxSync >= 10*time.Second {
+		jmlog.Warn("drain: durable checkpoint was slow",
+			"path", row.NFSPath,
+			"max_sync_ms", copyResult.MaxSync.Milliseconds(),
+			"sync_calls", copyResult.SyncCalls,
+			"interval_bytes", syncInterval,
+			"link_class", netprofile.Default().Class().String())
 	}
 	closeErr := dst.Close()
 	ph.mark_(&ph.close_)
 	if copyErr != nil {
 		_ = os.Remove(dest) // best-effort cleanup of partial write
 		d.failTransient(row, fmt.Errorf("copy to fuse: %w", copyErr))
-		return
-	}
-	if syncErr != nil {
-		_ = os.Remove(dest)
-		d.failTransient(row, fmt.Errorf("sync fuse dest: %w", syncErr))
 		return
 	}
 	if closeErr != nil {
@@ -1038,7 +1120,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		return
 	}
 
-	copyStreamSHA := h.Sum(nil)
+	copyStreamSHA := copyResult.SHA256[:]
 	if len(row.SHA256) > 0 && !bytes.Equal(copyStreamSHA, row.SHA256) {
 		// The bytes we read out of the spool file disagree with the
 		// streaming SHA recorded at spool-write time → bit flip on the

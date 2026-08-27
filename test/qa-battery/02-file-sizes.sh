@@ -7,7 +7,7 @@
 #   1-byte markers, KB JSON/XMP, ~5MB stills, ~100MB ProRes proxies, and
 #   multi-GB camera-original clips. Each size class stresses a different part of
 #   the chain: zero/1-byte exercise CREATE+SETATTR with no WRITE body; KB lands
-#   in a single block; ~5MB/~100MB span the io.CopyBuffer drain loop; >1GB forces
+#   in a single block; ~5MB/~100MB span several durable checkpoints; >1GB forces
 #   the long-tail drain where a torn/partial-size read is most likely to surface.
 #
 # WHAT IT PROVES (per the spec for this category)
@@ -15,7 +15,7 @@
 #      Synthetic ops false-green; Finder exercises the true NFS path
 #      (LOOKUP/CREATE/SETATTR/WRITE/READ + ._AppleDouble + xattr forks).
 #   2. FULL CHAIN OF CUSTODY per file: Finder write -> NFS handler -> write spool
-#      -> drainer (io.CopyBuffer + SHA at-rest verify) -> JuiceFS backend ->
+#      -> drainer (durable checkpoints + SHA verify) -> JuiceFS backend ->
 #      readback -> md5 == source. We qa_wait_drain (pending_files==0 &&
 #      in_progress==0) BEFORE verifying so we read the at-rest backend copy, not
 #      the cache.
@@ -154,12 +154,12 @@ run_size_case() {
     # echoes -1 on CP error — treat <=0 as "no quarantine".
     local q f
     q="$(qa_spool_field quarantined)"
-    f="$(qa_spool_field failed)"
+    f="$(qa_spool_actionable_failed)"
     if [ "${q:-0}" -gt 0 ] 2>/dev/null; then
         qa_fail "quarantined=$q after drain for $label ($casedir/$srcname) — SHA at-rest mismatch?"
     fi
     if [ "${f:-0}" -gt 0 ] 2>/dev/null; then
-        qa_fail "failed=$f after drain for $label ($casedir/$srcname)"
+        qa_fail "failed_files=$f after drain for $label ($casedir/$srcname)"
     fi
 
     # ----- Custody (the END of the chain: at-rest readback md5 == source) -----

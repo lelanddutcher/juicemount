@@ -2298,8 +2298,8 @@ func (jfs *juiceFS) Stat(filename string) (os.FileInfo, error) {
 				// RC drain-latency fix (2026-06-28) — QA-35 / feedback_perf_hot_path:
 				// the phantom-purge confirmation must NEVER FUSE-syscall on the
 				// SYNCHRONOUS Stat path. Idle, the os.Lstat below is µs; but under
-				// a spool drain the drainer pushes io.CopyBuffer(1MiB)+dst.Sync()
-				// per file through the SAME JuiceFS/FUSE daemon, so the Lstat
+				// a spool drain pushes durable copy checkpoints through the SAME
+				// JuiceFS/FUSE daemon, so the Lstat
 				// blocks up to its full timeout. Each slow Stat holds an
 				// nfsLstatGate slot AND an rpcSem slot; the reader admits each
 				// non-WRITE RPC on rpcSem BEFORE spawning the handler goroutine

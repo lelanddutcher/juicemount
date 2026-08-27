@@ -15,13 +15,14 @@
 #   * Control plane http://127.0.0.1:11050:
 #       GET /offline?on=1   -> force offline (writes buffer to spool, NO drain)
 #       GET /offline?on=0   -> back online   (drainer resumes)
-#       GET /spool          -> pending_files, in_progress, succeeded, failed,
+#       GET /spool          -> pending_files, in_progress, succeeded,
+#                              failed (cumulative), failed_files (actionable),
 #                              quarantined, pending_bytes, capacity_used,
 #                              capacity_total, stall_waiters, offline,
 #                              offline_buffer_full, entries[].drain_state/last_error
 #   * Chain of custody (nfs/drainer.go): Finder write -> NFS handler CREATE/WRITE
-#     -> write spool -> drainer.drainOne io.CopyBuffer to FUSE -> SHA re-read
-#     at-rest verify (mismatch => quarantine) -> JuiceFS backend -> DrainDone.
+#     -> write spool -> drainer.drainOne durable checkpoints to FUSE -> SHA
+#     verify -> JuiceFS backend -> DrainDone.
 #     Drained  <=>  pending_files==0 AND in_progress==0.
 #   * GRACEFUL STALL (nfs/spool_status.go StallWaiters/OfflineBufferFull): when
 #     the spool hits capacity the write PARKS (blocks for headroom) — it does
@@ -226,9 +227,9 @@ while [ "$i" -lt 30 ]; do
     [ "$(_spool_offline_flag)" = "1" ] && A_OFFLINE_CONFIRMED=1
     p="$(qa_spool_pending)"
     [ "$p" -gt "$A_MAX_PENDING" ] 2>/dev/null && A_MAX_PENDING="$p"
-    f="$(qa_spool_field failed)"; q="$(qa_spool_field quarantined)"
+    f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
     if [ "$f" != "0" ] && [ "$f" != "-1" ]; then
-        qa_fail "A: spool reported failed=$f while buffering offline (dest $A_DEST)"
+        qa_fail "A: spool reported failed_files=$f while buffering offline (dest $A_DEST)"
         break
     fi
     if [ "$q" != "0" ] && [ "$q" != "-1" ]; then
@@ -280,8 +281,8 @@ else
 fi
 
 # Post-drain failed/quarantined MUST be zero (SHA mismatch => quarantine = FAIL).
-af="$(qa_spool_field failed)"; aq="$(qa_spool_field quarantined)"
-[ "$af" = "0" ] || [ "$af" = "-1" ] || qa_fail "A: post-drain failed=$af (dest $A_DEST)"
+af="$(qa_spool_actionable_failed)"; aq="$(qa_spool_field quarantined)"
+[ "$af" = "0" ] || [ "$af" = "-1" ] || qa_fail "A: post-drain failed_files=$af (dest $A_DEST)"
 [ "$aq" = "0" ] || [ "$aq" = "-1" ] || qa_fail "A: post-drain quarantined=$aq — SHA mismatch at rest (dest $A_DEST)"
 
 qa_info "A: verifying full chain of custody (md5 readback vs source manifest)"
@@ -373,9 +374,9 @@ WARN
             B_OUTAGE_CLEAN=1
             j=0
             while [ "$j" -lt 25 ]; do
-                f="$(qa_spool_field failed)"; q="$(qa_spool_field quarantined)"
+                f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
                 if { [ "$f" != "0" ] && [ "$f" != "-1" ]; } || { [ "$q" != "0" ] && [ "$q" != "-1" ]; }; then
-                    qa_fail "B: spool failed=$f quarantined=$q during real outage (dest $B_DEST)"
+                    qa_fail "B: spool failed_files=$f quarantined=$q during real outage (dest $B_DEST)"
                     B_OUTAGE_CLEAN=0; break
                 fi
                 if [ "$j" = "4" ]; then
@@ -469,9 +470,9 @@ while [ "$n" -le "$STALL_MAX_FILES" ]; do
             break
         fi
         # Hard gate: a spool-full condition must NEVER surface as failed/quarantined.
-        f="$(qa_spool_field failed)"; q="$(qa_spool_field quarantined)"
+        f="$(qa_spool_actionable_failed)"; q="$(qa_spool_field quarantined)"
         if { [ "$f" != "0" ] && [ "$f" != "-1" ]; } || { [ "$q" != "0" ] && [ "$q" != "-1" ]; }; then
-            qa_fail "C: spool-full produced failed=$f quarantined=$q (must STALL, not fail; dest $C_DEST)"
+            qa_fail "C: spool-full produced failed_files=$f quarantined=$q (must STALL, not fail; dest $C_DEST)"
             C_STALL_SEEN=2  # sentinel: errored, stop
             break
         fi
@@ -517,8 +518,8 @@ if qa_wait_drain; then
 else
     qa_fail "C: spool did NOT drain after relieving the stall (dest $C_DEST)"
 fi
-cf2="$(qa_spool_field failed)"; cq2="$(qa_spool_field quarantined)"
-[ "$cf2" = "0" ] || [ "$cf2" = "-1" ] || qa_fail "C: post-stall failed=$cf2 (dest $C_DEST)"
+cf2="$(qa_spool_actionable_failed)"; cq2="$(qa_spool_field quarantined)"
+[ "$cf2" = "0" ] || [ "$cf2" = "-1" ] || qa_fail "C: post-stall failed_files=$cf2 (dest $C_DEST)"
 [ "$cq2" = "0" ] || [ "$cq2" = "-1" ] || qa_fail "C: post-stall quarantined=$cq2 — corruption at rest (dest $C_DEST)"
 
 # Custody: only assert files that actually landed (a parked-then-cancelled write

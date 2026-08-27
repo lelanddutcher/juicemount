@@ -46,7 +46,7 @@
 #         no -48 / STALE / phantom.
 #
 # Chain of custody (every file): Finder write -> NFS handler (CREATE/WRITE) ->
-# write spool -> drainer.drainOne io.CopyBuffer to FUSE -> SHA re-read at-rest
+# write spool -> drainer.drainOne durable checkpoints to FUSE -> SHA verify
 # verify -> JuiceFS backend -> readback md5 == source. We ALWAYS qa_wait_drain
 # (pending_files==0 AND in_progress==0) BEFORE qa_verify_custody, because
 # verifying a non-drained spool reads cache, not the at-rest backend copy.

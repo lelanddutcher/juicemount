@@ -33,7 +33,7 @@
 #   - a file with an ACL: chmod +a "<user> allow read"
 #
 # CHAIN OF CUSTODY (principle #2): Finder write → NFS handler (CREATE/WRITE) →
-# write spool → drainer (io.CopyBuffer + SHA re-read verify) → JuiceFS backend →
+# write spool → drainer (durable checkpoints + SHA verify) → JuiceFS backend →
 # READBACK md5 == source. We qa_wait_drain (pending_files==0 && in_progress==0)
 # BEFORE any verify — verifying a non-drained spool reads cache, not at-rest.
 #

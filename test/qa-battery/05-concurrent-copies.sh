@@ -395,13 +395,13 @@ fi
 
 # Surface any failed/quarantined rows explicitly — quarantine == SHA mismatch
 # at-rest, which is a hard data-integrity failure.
-sp_failed="$(qa_spool_field failed)"
+sp_failed="$(qa_spool_actionable_failed)"
 sp_quar="$(qa_spool_field quarantined)"
 if [ "$sp_quar" != "0" ] && [ "$sp_quar" != "-1" ]; then
     qa_fail "CASE D: spool reports quarantined=$sp_quar (SHA mismatch at-rest under concurrency)"
 fi
 if [ "$sp_failed" != "0" ] && [ "$sp_failed" != "-1" ]; then
-    qa_warn "CASE D: spool reports failed=$sp_failed (inspect drain rows)"
+    qa_warn "CASE D: spool reports failed_files=$sp_failed (inspect drain rows)"
 fi
 
 # Per-dest custody. Each copy duplicated tree$i INTO dest, so the landed leaf

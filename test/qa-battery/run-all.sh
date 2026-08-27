@@ -67,6 +67,7 @@ ALL_CATEGORIES="
 08-chain-of-custody
 09-finder-snappiness
 10-index-stability
+11-drain-latency
 "
 
 # ---------------------------------------------------------------------------

@@ -463,7 +463,7 @@ qa_spool_pending() {
 }
 
 # qa_spool_field FIELD — echo any integer field from GET /spool (e.g. in_progress,
-# failed, quarantined, succeeded). -1 on error/missing.
+# failed_files, quarantined, succeeded). -1 on error/missing.
 qa_spool_field() {
     local field="$1" body
     body="$(qa_timeout 5 curl -s "$CP_BASE/spool" 2>/dev/null)"
@@ -471,6 +471,14 @@ qa_spool_field() {
     printf '%s' "$body" \
         | tr ',{}' '\n\n\n' \
         | awk -F: -v f="\"$field\"" '$0 ~ f {gsub(/[^0-9-]/,"",$2); print $2; found=1} END{if(!found) print -1}'
+}
+
+# qa_spool_actionable_failed — current rows that genuinely require operator or
+# retry action. Do NOT gate on `.failed`: that field is the process-lifetime
+# cumulative DrainsFailed metric and remains non-zero after an old failure has
+# been retried, cleared, or classified as a deliberate policy decline.
+qa_spool_actionable_failed() {
+    qa_spool_field failed_files
 }
 
 # qa_spool_pending_bytes — echo the total bytes still in flight (pending_bytes +
@@ -553,7 +561,7 @@ qa_wait_drain() {
         perl -e 'select undef,undef,undef,2'
         waited=$((waited+2))
     done
-    qa_warn "qa_wait_drain TIMEOUT after ${timeout}s (pending=$(qa_spool_pending) in_progress=$(qa_spool_field in_progress) failed=$(qa_spool_field failed) quarantined=$(qa_spool_field quarantined))"
+    qa_warn "qa_wait_drain TIMEOUT after ${timeout}s (pending=$(qa_spool_pending) in_progress=$(qa_spool_field in_progress) failed_files=$(qa_spool_actionable_failed) quarantined=$(qa_spool_field quarantined))"
     return 1
 }
 
