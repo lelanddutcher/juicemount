@@ -140,7 +140,7 @@ func TestDeferredReadinessCancellationReleasesWaiters(t *testing.T) {
 	}
 }
 
-func TestDeferredReadinessRestartsPersistedControlSessionFromNoState(t *testing.T) {
+func TestDeferredReadinessLetsControlClientRecoverWithoutRestart(t *testing.T) {
 	node := &LinkNode{srv: &tsnet.Server{}, readyCh: make(chan struct{})}
 	t.Cleanup(func() {
 		node.mu.Lock()
@@ -152,10 +152,12 @@ func TestDeferredReadinessRestartsPersistedControlSessionFromNoState(t *testing.
 		}
 	})
 
-	var recovered atomic.Bool
-	var recoveryCalls atomic.Int64
+	var statusCalls atomic.Int64
 	status := func(context.Context) (*ipnstate.Status, error) {
-		if !recovered.Load() {
+		// A slow initial map is expected on a cold control plane. The readiness
+		// loop must keep observing the existing control client instead of calling
+		// LocalBackend.Start, which disconnects it and begins the map request over.
+		if statusCalls.Add(1) <= 20 {
 			return &ipnstate.Status{BackendState: "NoState", Health: []string{"control fetch failed"}}, nil
 		}
 		return &ipnstate.Status{
@@ -163,11 +165,6 @@ func TestDeferredReadinessRestartsPersistedControlSessionFromNoState(t *testing.
 			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.23")},
 		}, nil
 	}
-	recoverControl := func(context.Context, *ipnstate.Status) error {
-		recoveryCalls.Add(1)
-		recovered.Store(true)
-		return nil
-	}
 	configure := func(st *ipnstate.Status) error {
 		node.mu.Lock()
 		node.addrs = []string{st.TailscaleIPs[0].String()}
@@ -175,125 +172,17 @@ func TestDeferredReadinessRestartsPersistedControlSessionFromNoState(t *testing.
 		return nil
 	}
 
-	node.startDeferredReadinessWithRecovery(status, time.Millisecond, configure, recoverControl, 2*time.Millisecond, 0)
+	node.startDeferredReadinessWith(status, time.Millisecond, configure)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	addrs, err := node.WaitReady(ctx)
 	if err != nil {
-		t.Fatalf("WaitReady after persisted-session restart: %v", err)
+		t.Fatalf("WaitReady after control-client recovery: %v", err)
 	}
 	if len(addrs) != 1 || addrs[0] != "100.64.0.23" {
 		t.Fatalf("ready addresses = %v", addrs)
 	}
-	if got := recoveryCalls.Load(); got != 1 {
-		t.Fatalf("control recovery calls = %d, want 1", got)
-	}
-}
-
-func TestShouldRestartLinkControlDoesNotHideRevocation(t *testing.T) {
-	cases := []struct {
-		state string
-		want  bool
-	}{
-		{"NoState", true},
-		{"Starting", false},
-		{"NeedsLogin", false},
-		{"NeedsMachineAuth", false},
-		{"Running", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.state, func(t *testing.T) {
-			if got := shouldRestartLinkControl(&ipnstate.Status{BackendState: tc.state}); got != tc.want {
-				t.Fatalf("shouldRestartLinkControl(%q) = %v, want %v", tc.state, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestShouldRestartStalledLinkControlDoesNotHideRevocation(t *testing.T) {
-	threshold := 45 * time.Second
-	cases := []struct {
-		name         string
-		state        string
-		unchangedFor time.Duration
-		threshold    time.Duration
-		want         bool
-	}{
-		{"starting below threshold", "Starting", threshold - time.Millisecond, threshold, false},
-		{"starting at threshold", "Starting", threshold, threshold, true},
-		{"starting above threshold", "Starting", threshold + time.Minute, threshold, true},
-		{"needs login", "NeedsLogin", threshold + time.Minute, threshold, false},
-		{"needs machine auth", "NeedsMachineAuth", threshold + time.Minute, threshold, false},
-		{"running", "Running", threshold + time.Minute, threshold, false},
-		{"disabled threshold", "Starting", time.Hour, 0, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := shouldRestartStalledLinkControl(
-				&ipnstate.Status{BackendState: tc.state},
-				tc.unchangedFor,
-				tc.threshold,
-			)
-			if got != tc.want {
-				t.Fatalf("shouldRestartStalledLinkControl(%q, %v) = %v, want %v", tc.state, tc.unchangedFor, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestDeferredReadinessRestartsPersistedControlSessionStuckStarting(t *testing.T) {
-	node := &LinkNode{srv: &tsnet.Server{}, readyCh: make(chan struct{})}
-	t.Cleanup(func() {
-		node.mu.Lock()
-		cancel := node.readyCancel
-		node.srv = nil
-		node.mu.Unlock()
-		if cancel != nil {
-			cancel()
-		}
-	})
-
-	var recovered atomic.Bool
-	var recoveryCalls atomic.Int64
-	status := func(context.Context) (*ipnstate.Status, error) {
-		if !recovered.Load() {
-			return &ipnstate.Status{BackendState: "Starting", Health: []string{"control pending"}}, nil
-		}
-		return &ipnstate.Status{
-			BackendState: "Running",
-			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.24")},
-		}, nil
-	}
-	recoverControl := func(context.Context, *ipnstate.Status) error {
-		recoveryCalls.Add(1)
-		recovered.Store(true)
-		return nil
-	}
-	configure := func(st *ipnstate.Status) error {
-		node.mu.Lock()
-		node.addrs = []string{st.TailscaleIPs[0].String()}
-		node.mu.Unlock()
-		return nil
-	}
-
-	node.startDeferredReadinessWithRecovery(
-		status,
-		time.Millisecond,
-		configure,
-		recoverControl,
-		time.Millisecond,
-		5*time.Millisecond,
-	)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	addrs, err := node.WaitReady(ctx)
-	if err != nil {
-		t.Fatalf("WaitReady after stalled Starting recovery: %v", err)
-	}
-	if len(addrs) != 1 || addrs[0] != "100.64.0.24" {
-		t.Fatalf("ready addresses = %v", addrs)
-	}
-	if got := recoveryCalls.Load(); got != 1 {
-		t.Fatalf("control recovery calls = %d, want 1", got)
+	if got := statusCalls.Load(); got < 21 {
+		t.Fatalf("status calls = %d, want existing control attempt to be observed through recovery", got)
 	}
 }
