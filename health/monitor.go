@@ -384,6 +384,37 @@ func (m *HealthMonitor) Status() HealthStatus {
 	return m.status
 }
 
+// RefreshNFS performs an out-of-band, truthful NFS probe and folds only that
+// component into the cached health snapshot. The app's user-visible mount is
+// created asynchronously after the NFS server starts; a successful mount can
+// therefore land just after Start's initial check and would otherwise remain
+// reported as "not mounted" until the next 10-second tick. Mount completion
+// calls this method to remove that stale window. It never assumes success: the
+// same bounded stat + kernel mount-table checks as the periodic monitor must
+// pass before NFS or Overall become healthy.
+func (m *HealthMonitor) RefreshNFS() ComponentStatus {
+	nextNFS := m.checkNFS()
+
+	m.mu.Lock()
+	prevNFS := m.status.NFS
+	prevOverall := m.status.Overall
+	m.status.NFS = nextNFS
+	m.status.Overall = m.status.Redis.Healthy && m.status.MinIO.Healthy &&
+		m.status.FUSE.Healthy && nextNFS.Healthy
+	nextOverall := m.status.Overall
+	m.mu.Unlock()
+
+	m.logTransition("NFS", prevNFS, nextNFS)
+	if prevOverall != nextOverall {
+		if nextOverall {
+			jmlog.Info("system recovered — all components healthy")
+		} else {
+			jmlog.Warn("system degraded — one or more components unhealthy")
+		}
+	}
+	return nextNFS
+}
+
 // InGracePeriod returns true if a network change happened recently enough
 // that transient failures should be suppressed.
 func (m *HealthMonitor) InGracePeriod() bool {

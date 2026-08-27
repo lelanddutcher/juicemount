@@ -2002,10 +2002,12 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// their own goroutine AFTER the boot wiring, taking globalMu only for
 	// the globalMountPath publish; the prompt itself is bounded (180s) in
 	// mountNFSWithPrompt. Boot never waits on a human again.
+	nfsMountReused := false
 	if cfg.MountPoint != "" {
 		jmlog.Info("BOOT-TRACE: step-4 pre-mount-check")
 		mounted := isMounted(cfg.MountPoint)
 		if mounted && nfsMountResponsive(cfg.MountPoint, 2*time.Second) {
+			nfsMountReused = true
 			jmlog.Info("nfs already mounted, reusing", "mount_point", cfg.MountPoint)
 			warmupMarkServing()
 			globalMountPath = cfg.MountPoint
@@ -2036,7 +2038,11 @@ func NFSServerStart(configJSON *C.char) *C.char {
 						warmupMarkServing()
 						globalMu.Lock()
 						globalMountPath = mountPoint
+						mon := globalMonitor
 						globalMu.Unlock()
+						if mon != nil {
+							refreshNFSHealthAfterMount(mon, mountPoint)
+						}
 						return
 					}
 					if attempt < 6 {
@@ -2177,6 +2183,14 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	}
 	globalMonitor.Start()
 	jmlog.Info("BOOT-TRACE: step-8 monitor-started")
+	// The mount runs concurrently so startup never blocks on an admin prompt.
+	// If the fast passwordless tier completed near the initial health check,
+	// immediately replace that potentially stale NFS sample with a fresh,
+	// kernel-verified one. The mount goroutine repeats this on its completion
+	// path for slower interactive mounts.
+	if nfsMountReused {
+		go refreshNFSHealthAfterMount(globalMonitor, cfg.MountPoint)
+	}
 
 	// Expose health to /health endpoint. Capture the monitor in the
 	// closure rather than reading the package var: that way a Stop that
@@ -2283,6 +2297,30 @@ func labelFor(healthy bool, msg string) string {
 		return "unhealthy"
 	}
 	return msg
+}
+
+// refreshNFSHealthAfterMount closes the short race between mount_nfs returning
+// and the new mount becoming visible through macOS's mount table. It never
+// publishes optimistic success: HealthMonitor.RefreshNFS runs the same bounded
+// checks as the periodic monitor. The one-second retry window covers normal
+// kernel publication latency; genuinely absent/wedged mounts stay unhealthy
+// and remain subject to the ordinary recovery loop.
+func refreshNFSHealthAfterMount(mon *health.HealthMonitor, mountPoint string) {
+	if mon == nil || mountPoint == "" {
+		return
+	}
+	for attempt := 1; attempt <= 10; attempt++ {
+		st := mon.RefreshNFS()
+		if st.Healthy {
+			jmlog.Info("nfs health refreshed after mount", "mount_point", mountPoint, "attempt", attempt)
+			return
+		}
+		if attempt < 10 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	jmlog.Warn("nfs mount completed but health confirmation is still pending",
+		"mount_point", mountPoint, "hint", "periodic health checks will continue")
 }
 
 // NFSServerStop is a *soft* stop: it tears down the NFS server, the
