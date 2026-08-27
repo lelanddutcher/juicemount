@@ -22,7 +22,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
+	"github.com/lelanddutcher/juicemount/metadata"
 )
 
 // TestSpoolWriteFileTruncateSupportsResize covers the ftruncate shapes NFS
@@ -300,6 +302,125 @@ func TestSetattrShrinkReflectsInStatAfterDrain(t *testing.T) {
 	}
 	if fi.Size() != 2048 {
 		t.Errorf("Stat after drain reports %d, want 2048 (stale writeSizes high-water leaked through)", fi.Size())
+	}
+}
+
+// TestOfflineSetattrZeroReplacesExistingViaSpool reproduces Finder/cp's
+// existing-destination sequence during a true Link route outage. SETATTR zero
+// must not open FUSE; it establishes a durable replacement spool entry using
+// the existing inode, subsequent WRITE RPCs stay local, and recovery drains an
+// exact (possibly smaller) replacement rather than preserving the stale size.
+func TestOfflineSetattrZeroReplacesExistingViaSpool(t *testing.T) {
+	wasOffline := pin.IsOffline()
+	pin.SetOffline(true)
+	t.Cleanup(func() { pin.SetOffline(wasOffline) })
+
+	jfs, spool, drainer, fuseRoot := newSpoolWiredHandlerNoDrain(t)
+	original := patternedPayload(4096, 61)
+	fullPath := filepath.Join(fuseRoot, "existing.bin")
+	if err := os.WriteFile(fullPath, original, 0o644); err != nil {
+		t.Fatalf("seed FUSE file: %v", err)
+	}
+	const inode = uint64(424242)
+	entry := metadata.MakeEntry("existing.bin", false, int64(len(original)), time.Now(), inode)
+	if err := jfs.handler.store.Insert(entry); err != nil {
+		t.Fatalf("seed metadata: %v", err)
+	}
+
+	zero := uint64(0)
+	start := time.Now()
+	if err := (&nfslib.SetFileAttributes{SetSize: &zero}).Apply(jfs.handler.Change(jfs), jfs, "existing.bin"); err != nil {
+		t.Fatalf("offline SETATTR zero: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("offline SETATTR blocked for %s, want local completion under 500ms", elapsed)
+	}
+	sentry, ok := spool.LookupActive("existing.bin")
+	if !ok {
+		t.Fatal("offline replacement did not create a spool shadow")
+	}
+	if got := sentry.Inode(); got != inode {
+		t.Fatalf("replacement inode=%d, want existing inode %d", got, inode)
+	}
+	if got := jfs.handler.store.LookupByPath("existing.bin").Size; got != 0 {
+		t.Fatalf("metadata size after authoritative truncate=%d, want 0", got)
+	}
+	if got, err := os.ReadFile(fullPath); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("offline SETATTR touched backend bytes: len=%d err=%v", len(got), err)
+	}
+
+	replacement := patternedPayload(513, 67)
+	wf, err := jfs.OpenFile("existing.bin", os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open replacement spool: %v", err)
+	}
+	if _, err := wf.(io.WriterAt).WriteAt(replacement, 0); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatalf("close replacement: %v", err)
+	}
+
+	pin.SetOffline(false)
+	if n := spool.sweepOnce(0); n != 1 {
+		t.Fatalf("finalized %d replacement entries, want 1", n)
+	}
+	drainAllForTest(t, drainer)
+	got, err := os.ReadFile(fullPath)
+	if err != nil {
+		t.Fatalf("read drained replacement: %v", err)
+	}
+	if !bytes.Equal(got, replacement) {
+		t.Fatalf("drained replacement mismatch: got len=%d want len=%d", len(got), len(replacement))
+	}
+	if gotSize := jfs.handler.store.LookupByPath("existing.bin").Size; gotSize != int64(len(replacement)) {
+		t.Fatalf("post-drain metadata size=%d, want %d", gotSize, len(replacement))
+	}
+}
+
+// TestOfflinePartialExistingWriteFailsFast proves an outage cannot silently
+// manufacture a zero-filled replacement for an operation that depends on old
+// backend bytes. Both non-zero truncate and a direct in-place write must return
+// promptly, leave no spool entry, and preserve the backend file.
+func TestOfflinePartialExistingWriteFailsFast(t *testing.T) {
+	wasOffline := pin.IsOffline()
+	pin.SetOffline(true)
+	t.Cleanup(func() { pin.SetOffline(wasOffline) })
+
+	jfs, spool, _, fuseRoot := newSpoolWiredHandlerNoDrain(t)
+	original := []byte("preserve every byte of this existing file")
+	fullPath := filepath.Join(fuseRoot, "partial.bin")
+	if err := os.WriteFile(fullPath, original, 0o644); err != nil {
+		t.Fatalf("seed FUSE file: %v", err)
+	}
+	entry := metadata.MakeEntry("partial.bin", false, int64(len(original)), time.Now(), 9898)
+	if err := jfs.handler.store.Insert(entry); err != nil {
+		t.Fatalf("seed metadata: %v", err)
+	}
+
+	size := uint64(7)
+	start := time.Now()
+	err := (&nfslib.SetFileAttributes{SetSize: &size}).Apply(jfs.handler.Change(jfs), jfs, "partial.bin")
+	if err == nil {
+		t.Fatal("offline non-zero truncate unexpectedly succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("offline partial truncate blocked for %s, want under 500ms", elapsed)
+	}
+
+	start = time.Now()
+	if f, err := jfs.OpenFile("partial.bin", os.O_RDWR, 0o644); err == nil {
+		_ = f.Close()
+		t.Fatal("offline direct in-place write unexpectedly opened")
+	} else if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("offline direct write blocked for %s, want under 500ms", elapsed)
+	}
+	if spool.HasPending("partial.bin") {
+		t.Fatal("unsafe partial operation created a destructive spool entry")
+	}
+	got, err := os.ReadFile(fullPath)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("unsafe partial operation changed backend bytes: got=%q err=%v", got, err)
 	}
 }
 

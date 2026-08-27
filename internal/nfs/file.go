@@ -308,6 +308,19 @@ type SetFileAttributes struct {
 	SetMtime *time.Time
 }
 
+// FileTruncater is an optional filesystem capability for handling an
+// authoritative SETATTR{size} without opening the file through the generic
+// billy write path. Filesystems that return handled=false retain the default
+// OpenFile+Truncate behavior below.
+//
+// JuiceMount uses this seam while its remote backend is unavailable: a safe
+// whole-file replacement (truncate-to-zero followed by WRITE RPCs) can begin
+// in the durable local spool, while an unsafe partial in-place truncate can
+// fail promptly instead of blocking inside FUSE until the route recovers.
+type FileTruncater interface {
+	TruncateFile(file string, size int64) (handled bool, err error)
+}
+
 // Apply uses a `Change` implementation to set defined attributes on a
 // provided file.
 func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, file string) error {
@@ -362,27 +375,39 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 		if curr.Mode()&os.ModeSymlink != 0 {
 			return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
 		}
-		fp, err := fs.OpenFile(file, os.O_WRONLY|os.O_EXCL, 0)
-		if errors.Is(err, os.ErrPermission) {
-			return &NFSStatusError{NFSStatusAccess, err}
-		} else if err != nil {
-			return nfsStatusErrorFrom(err)
+		handled := false
+		if truncater, ok := fs.(FileTruncater); ok {
+			if *s.SetSize > math.MaxInt64 {
+				return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+			}
+			handled, err = truncater.TruncateFile(file, int64(*s.SetSize))
+			if err != nil {
+				return nfsStatusErrorFrom(err)
+			}
 		}
-		// From here on fp MUST be closed on every path. The backing
-		// handler counts open write handles (JuiceMount's spool entries
-		// refcount them); a dropped handle blocks idle-finalize forever —
-		// the entry sits in `writing` state, never drains, and leaks its
-		// capacity reservation (Phase-1 BUG 2, 43 stuck entries).
-		if *s.SetSize > math.MaxInt64 {
-			_ = fp.Close()
-			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
-		}
-		if err := fp.Truncate(int64(*s.SetSize)); err != nil {
-			_ = fp.Close()
-			return nfsStatusErrorFrom(err)
-		}
-		if err := fp.Close(); err != nil {
-			return nfsStatusErrorFrom(err)
+		if !handled {
+			fp, err := fs.OpenFile(file, os.O_WRONLY|os.O_EXCL, 0)
+			if errors.Is(err, os.ErrPermission) {
+				return &NFSStatusError{NFSStatusAccess, err}
+			} else if err != nil {
+				return nfsStatusErrorFrom(err)
+			}
+			// From here on fp MUST be closed on every path. The backing
+			// handler counts open write handles (JuiceMount's spool entries
+			// refcount them); a dropped handle blocks idle-finalize forever —
+			// the entry sits in `writing` state, never drains, and leaks its
+			// capacity reservation (Phase-1 BUG 2, 43 stuck entries).
+			if *s.SetSize > math.MaxInt64 {
+				_ = fp.Close()
+				return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+			}
+			if err := fp.Truncate(int64(*s.SetSize)); err != nil {
+				_ = fp.Close()
+				return nfsStatusErrorFrom(err)
+			}
+			if err := fp.Close(); err != nil {
+				return nfsStatusErrorFrom(err)
+			}
 		}
 	}
 

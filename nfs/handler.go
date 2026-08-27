@@ -1091,16 +1091,15 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 
 // publishDrainedSize syncs the real drained size into the metadata cache. It
 // runs BEFORE the spool index entry is evicted (task #65) so no fresh read can
-// snapshot a stale 0/partial Entry.Size in the post-eviction window. UpdateSize
-// is MAX-only and idempotent, so the later onSpoolDrained UpdateSize is a no-op
-// on size (kept there for crash-safety if onSizeReady is ever unwired). On a
-// cancelled drain the entry is already deleted, so UpdateSize (pure UPDATE)
-// no-ops — no resurrection.
+// snapshot a stale 0/partial Entry.Size in the post-eviction window. A completed
+// spool file is an authoritative whole-file image, so this must assign the exact
+// size rather than use UpdateSize's concurrent-writer MAX semantics: offline
+// replacement can legitimately shrink an existing file, including to zero. On
+// a cancelled drain the entry is already deleted, so the pure UPDATE no-ops —
+// no resurrection.
 func (h *JuiceMountHandler) publishDrainedSize(nfsPath string, size int64) {
-	if size > 0 {
-		if err := h.store.UpdateSize(nfsPath, size, time.Now()); err != nil {
-			jmlog.Warn("publishDrainedSize: UpdateSize failed (will heal on reconcile)", "path", nfsPath, "error", err.Error())
-		}
+	if err := h.store.SetSizeExact(nfsPath, size, time.Now()); err != nil {
+		jmlog.Warn("publishDrainedSize: SetSizeExact failed (will heal on reconcile)", "path", nfsPath, "error", err.Error())
 	}
 }
 
@@ -1110,9 +1109,7 @@ func (h *JuiceMountHandler) publishDrainedSize(nfsPath string, size int64) {
 // normal Redis reconcile (identical to the legacy create lifecycle).
 func (h *JuiceMountHandler) onSpoolDrained(nfsPath string, size int64) {
 	now := time.Now()
-	if size > 0 {
-		_ = h.store.UpdateSize(nfsPath, size, now)
-	}
+	_ = h.store.SetSizeExact(nfsPath, size, now)
 	inode := uint64(0)
 	if e := h.store.LookupByPath(nfsPath); e != nil {
 		inode = e.Inode
@@ -3076,8 +3073,9 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	// FUSE buffering accidentally serve un-pinned bytes when the user
 	// is on cellular and explicitly asked us to fail fast.
 	//
-	// Pinned-and-ready files are allowed through. Writes are always
-	// allowed (the user explicitly created them; they go to FUSE cache).
+	// Pinned-and-ready files are allowed through. New and replacement writes
+	// are allowed through the durable local spool; unsafe in-place writes are
+	// rejected below rather than entering an unavailable FUSE backend.
 	// Compute pinned-ness once per open. We use this both for the offline
 	// gate below AND to skip the read-time offline EIO on pinned files
 	// (JuiceFS LRU serves from local SSD; no backend round-trip needed).
@@ -3275,6 +3273,17 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			}
 		}
 
+		// No spool shadow means this is an in-place edit of a backend-resident
+		// file. During a route outage that path cannot be made durable locally
+		// without first knowing the untouched byte ranges, so fail promptly.
+		// SETATTR{size=0} for a whole-file replacement creates the spool shadow
+		// through TruncateFile before its WRITE RPCs reach this branch.
+		if pin.IsOffline() {
+			jmlog.Warn("offline: refusing unsafe in-place write without spool shadow",
+				"in_mount", filename)
+			return nil, pin.ErrOfflineNotAvailable
+		}
+
 		fd, err := jfs.handler.fdPool.GetWrite(fullPath, flag, perm)
 		if err != nil {
 			return nil, err
@@ -3322,6 +3331,58 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	// branch (e == nil, no metadata cache) pick up the same offline policy
 	// as the cachedFile branch.
 	return &billyFile{File: f, name: filename, pinned: isPinned, handler: jfs.handler}, nil
+}
+
+// TruncateFile implements internal/nfs.FileTruncater. While online the normal
+// OpenFile+Truncate path retains existing in-place semantics. While offline, an
+// active spool entry is already safe and likewise uses the normal path. For a
+// backend-resident file with no spool shadow, only truncate-to-zero is a safe
+// local operation: it declares a complete replacement and lets all subsequent
+// WRITE RPCs populate a fresh durable spool image. Non-zero truncates would
+// require copying unavailable old bytes, so they fail immediately.
+func (jfs *juiceFS) TruncateFile(filename string, size int64) (bool, error) {
+	if !pin.IsOffline() {
+		return false, nil
+	}
+	filename = strings.TrimPrefix(filename, "/")
+	spool := jfs.handler.spool.Load()
+	if spool == nil {
+		return true, pin.ErrOfflineNotAvailable
+	}
+	if _, active := spool.LookupActive(filename); active {
+		return false, nil
+	}
+	if size != 0 {
+		jmlog.Warn("offline: refusing unsafe partial truncate without spool shadow",
+			"in_mount", filename, "size", size)
+		return true, pin.ErrOfflineNotAvailable
+	}
+
+	entry := jfs.handler.store.LookupByPath(filename)
+	if entry == nil || entry.IsDir {
+		return true, os.ErrNotExist
+	}
+	sentry, err := spool.OpenWrite(filename)
+	if err != nil {
+		return true, err
+	}
+	inode := entry.Inode
+	if inode == 0 {
+		inode = jfs.handler.nextSyntheticInode()
+	}
+	sentry.SetInode(inode)
+	jfs.handler.clampWriteSize(filename, 0)
+	if err := jfs.handler.store.SetSizeExact(filename, 0, time.Now()); err != nil {
+		// This entry was created by this method and has not been exposed to a
+		// writer yet, so cancellation is a complete rollback.
+		spool.CancelForDelete(filename)
+		return true, err
+	}
+	// OpenWrite owns one per-operation reference. SETATTR itself does not
+	// return a file handle, so release it now; subsequent WRITE RPCs reopen the
+	// same entry and hold their own references.
+	sentry.ReleaseHandle()
+	return true, nil
 }
 
 // CommitFile satisfies the internal/nfs Committer interface: it fsyncs any

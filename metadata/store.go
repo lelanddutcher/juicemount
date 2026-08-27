@@ -1991,6 +1991,35 @@ func (s *Store) UpdateSize(entryPath string, size int64, mtime time.Time) error 
 	return nil
 }
 
+// SetSizeExact records an authoritative file size, including a shrink to zero.
+// Unlike UpdateSize, this is not a concurrent-write high-water contribution:
+// callers use it only after an explicit truncate or after a completed spool
+// drain, where the supplied size is the complete file length.
+func (s *Store) SetSizeExact(entryPath string, size int64, mtime time.Time) error {
+	s.writeMu.Lock()
+	_, err := s.db.Exec(
+		`UPDATE entries SET size = ?, mtime = ? WHERE path = ?`,
+		size, mtime.Unix(), entryPath,
+	)
+	if err != nil {
+		s.writeMu.Unlock()
+		return fmt.Errorf("set exact size %q: %w", entryPath, err)
+	}
+
+	s.mu.Lock()
+	if e, ok := s.pathCache[entryPath]; ok {
+		oldSize := e.Size
+		e.Size = size
+		s.subtreeResizeLocked(e, oldSize)
+		e.Mtime = mtime
+		e.ResetGetAttrCache()
+	}
+	s.mu.Unlock()
+	s.writeMu.Unlock()
+
+	return nil
+}
+
 // UpdateMode persists a new permission mode for entryPath and updates the
 // in-memory cache. Only the permission bits (os.ModePerm) are stored; the
 // type bits (dir/symlink) are preserved from the existing cached Entry so a
