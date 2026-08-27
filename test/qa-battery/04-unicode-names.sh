@@ -176,6 +176,10 @@ fi
 # NOTE: '/' and ':' are NOT usable as literal leaf bytes (path separator / HFS
 # colon-mapped) — we exercise the HFS colon edge via a name CONTAINING a colon,
 # which Finder maps to '/' on display; we assert it lands without a -36/-43.
+# Literal `._*` source leaves are also excluded: Finder reserves that namespace
+# for AppleDouble metadata and silently omits an ordinary `._foo` file when
+# duplicating between two local APFS directories too. Requiring it here tested
+# Finder's platform policy, not JuiceMount's filename handling.
 _NAMES="
 emoji_🎬🔥_clip.mov
 ${CAFE_NFC}
@@ -194,7 +198,6 @@ single'quote.mov
 double\"quote.mov
 hash#and%percent.mov
 ${LONG255}
-._real_dot_underscore.mov
 "
 
 _staged=0

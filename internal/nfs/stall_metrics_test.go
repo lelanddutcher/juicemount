@@ -47,6 +47,18 @@ func TestJukeboxCountsReachTheMetricsSnapshot(t *testing.T) {
 	}
 }
 
+func TestJukeboxStormThresholdDoesNotGateOnOneRecoveredRetry(t *testing.T) {
+	if isJukeboxStormWindow(1) {
+		t.Fatal("one recovered JUKEBOX retry was classified as an error 100060 storm")
+	}
+	if isJukeboxStormWindow(jukeboxStormMinReplies - 1) {
+		t.Fatal("a below-threshold retry window was classified as a storm")
+	}
+	if !isJukeboxStormWindow(jukeboxStormMinReplies) {
+		t.Fatal("the configured high-rate retry window was not classified as a storm")
+	}
+}
+
 func TestInflightRPCIsVisibleWhileItRuns(t *testing.T) {
 	// The whole point is seeing a hang WHILE it hangs. Hold an RPC open and
 	// assert the scrape sees it, rather than checking after it completed.

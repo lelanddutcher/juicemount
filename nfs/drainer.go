@@ -1049,7 +1049,7 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 		d.failTransient(row, err)
 		return
 	}
-	dst, err := os.Create(dest)
+	dst, err := createDrainDestination(dest)
 	if err != nil {
 		d.failTransient(row, fmt.Errorf("create dest: %w", err))
 		return
@@ -1281,6 +1281,39 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	if d.onDrainComplete != nil {
 		d.onDrainComplete(row.NFSPath, row.Size)
 	}
+}
+
+// createDrainDestination opens dest for a spool drain. Finder can rewrite an
+// AppleDouble sidecar several times while copying metadata. A prior drain may
+// already have materialised that sidecar and onSpoolDrained may have applied
+// its final read-only mode (observed live as 0444). The later, authoritative
+// spool row must still be able to replace the directory entry: os.Create tries
+// to truncate the read-only inode in place and returns EACCES/EPERM even though
+// the containing directory permits replacement.
+//
+// Recover only that exact case. We never remove directories or symlinks, and
+// every non-permission error is returned unchanged. The derivative ownership
+// policy remains enforced before this helper is called.
+func createDrainDestination(dest string) (*os.File, error) {
+	dst, err := os.Create(dest)
+	if err == nil {
+		return dst, nil
+	}
+	return retryCreateAfterPermission(dest, err)
+}
+
+func retryCreateAfterPermission(dest string, createErr error) (*os.File, error) {
+	if !errors.Is(createErr, os.ErrPermission) {
+		return nil, createErr
+	}
+	fi, err := os.Lstat(dest)
+	if err != nil || !fi.Mode().IsRegular() {
+		return nil, createErr
+	}
+	if err := os.Remove(dest); err != nil {
+		return nil, fmt.Errorf("replace read-only regular destination: %w", err)
+	}
+	return os.Create(dest)
 }
 
 // trySkipEmptySidecar completes row WITHOUT creating a backend file when it is

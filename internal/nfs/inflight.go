@@ -156,6 +156,15 @@ func InflightStats() (count int, oldestOp string, oldestAge time.Duration) {
 // another guess.
 var jukeboxByOp sync.Map // op string -> *atomic.Int64
 
+// A single JUKEBOX reply is an expected, invisible recovery mechanism for an
+// idempotent RPC crossing a bounded FUSE blip. Finder's error 100060 signature
+// is a retry storm, not one successful retry. Keep every reply in metrics, but
+// reserve the release-gating error log for three or more replies in one ~15s
+// window. Lower rates remain visible as warnings without the 100060 signature.
+const jukeboxStormMinReplies int64 = 3
+
+func isJukeboxStormWindow(total int64) bool { return total >= jukeboxStormMinReplies }
+
 func recordJukebox(op string) {
 	v, _ := jukeboxByOp.LoadOrStore(op, new(atomic.Int64))
 	v.(*atomic.Int64).Add(1)
@@ -178,8 +187,9 @@ func inflightWatchdog() {
 	prevJuke := map[string]int64{}
 	var sinceJukeLog int
 	for range tick.C {
-		// Every ~15s, report any op whose JUKEBOX count grew — a storming op
-		// is the "error 100060" signature.
+		// Every ~15s, report every op whose JUKEBOX count grew. Isolated retries
+		// stay diagnostic; only a high-rate window carries the release-gating
+		// "error 100060" signature.
 		sinceJukeLog++
 		if sinceJukeLog >= 5 {
 			sinceJukeLog = 0
@@ -198,10 +208,16 @@ func inflightWatchdog() {
 			if len(grew) > 0 {
 				sort.Slice(grew, func(i, j int) bool { return grew[i].d > grew[j].d })
 				parts := ""
+				var total int64
 				for _, g := range grew {
 					parts += fmt.Sprintf(" %s=%d", g.op, g.d)
+					total += g.d
 				}
-				Log.Errorf("JUKEBOX-RATE (per ~15s):%s — a high per-op rate is the 'error 100060' retry-storm signature", parts)
+				if isJukeboxStormWindow(total) {
+					Log.Errorf("JUKEBOX-RATE (per ~15s):%s — a high retry rate is the 'error 100060' retry-storm signature", parts)
+				} else {
+					Log.Warnf("JUKEBOX-RETRY (per ~15s):%s — isolated idempotent retry recovered", parts)
+				}
 			}
 		}
 		count, op, age := InflightStats()

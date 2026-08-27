@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -103,6 +104,71 @@ func TestDrainerHappyPath(t *testing.T) {
 	}
 	if d.Metrics().BytesDrained.Load() != int64(len(payload)) {
 		t.Errorf("bytes=%d, want %d", d.Metrics().BytesDrained.Load(), len(payload))
+	}
+}
+
+func TestDrainerReplacesReadOnlyRegularDestination(t *testing.T) {
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	dest := filepath.Join(d.fuseRoot, "perms", "._readonly.dat")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(dest, []byte("older-sidecar"), 0o444); err != nil {
+		t.Fatalf("seed read-only destination: %v", err)
+	}
+
+	payload := []byte("new-authoritative-appledouble")
+	e := writeSpoolEntry(t, spool, "/perms/._readonly.dat", payload)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if n := d.DrainOnceForTest(ctx); n != 1 {
+		t.Fatalf("processed=%d, want 1", n)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read replacement: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("replacement=%q, want %q", got, payload)
+	}
+	row, err := spool.Meta().Get(e.ID())
+	if err != nil {
+		t.Fatalf("get row: %v", err)
+	}
+	if row.DrainState != metadata.DrainDone {
+		t.Fatalf("state=%q error=%q, want done", row.DrainState, row.LastError)
+	}
+}
+
+func TestPermissionRecoveryNeverRemovesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "destination")
+	if err := os.WriteFile(target, []byte("keep-me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := retryCreateAfterPermission(link, os.ErrPermission)
+	if f != nil {
+		f.Close()
+		t.Fatal("permission recovery unexpectedly opened a symlink")
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("error=%v, want original permission error", err)
+	}
+	fi, statErr := os.Lstat(link)
+	if statErr != nil {
+		t.Fatalf("symlink was removed: %v", statErr)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink was replaced: mode=%v", fi.Mode())
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "keep-me" {
+		t.Fatalf("target changed: %q err=%v", got, err)
 	}
 }
 
