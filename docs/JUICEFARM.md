@@ -193,6 +193,37 @@ passed into the container. Render admission fails closed if the configured
 accelerator cannot complete its live probe. `auto` chooses render only when the
 probe succeeds; otherwise it becomes a server worker.
 
+For the Intel Arc/Vulkan image, expose the render node and the host's matching
+userspace drivers as read-only files. This matters for a GPU whose PCI ID is newer
+than the Mesa release in the image (for example, Intel Battlemage `8086:e223`). The
+Intel image pins `VK_ICD_FILENAMES` to the hardware ICD so Mesa's CPU-only llvmpipe
+device cannot satisfy admission:
+
+```bash
+docker run -d --name juicefarm-gpu-worker \
+  --restart unless-stopped \
+  --network <juicefs_compose_network> \
+  --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+  --device /dev/fuse --device /dev/dri \
+  -v /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:ro \
+  -v /usr/lib/x86_64-linux-gnu/libvulkan_intel.so:/usr/lib/x86_64-linux-gnu/libvulkan_intel.so:ro \
+  -v /path/to/juicefarm-cache:/jfs-cache \
+  -v /path/to/juicefarm-state:/state \
+  -e JM_META=redis://redis:6379/1 \
+  -e JM_FARM_QUEUE=1 \
+  -e JM_WORKER_ROLE=render \
+  -e JM_FARM_TRANSCRIPT_DEVICE=vulkan \
+  -e JM_FARM_VCODEC=hevc_vaapi \
+  juicefarm-gpu:local
+```
+
+The host driver bind is a recorded deployment dependency, not evidence of GPU
+readiness by itself. On every start, `jmfarm` runs a real hardware encode and
+decode plus a one-second Whisper inference. The worker advertises
+`transcript:vulkan` only after that inference succeeds. Check the Manager worker
+profile for a non-zero transcript real-time ratio and no Vulkan probe error before
+allowing it to claim accelerated AI jobs.
+
 Build gotchas (baked into the Dockerfile):
 
 - The JuiceFS `ce-v1.3.x` runtime is Debian **bullseye / glibc 2.31**; statically link

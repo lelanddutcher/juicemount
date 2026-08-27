@@ -12,6 +12,10 @@
 #   --device /dev/dri                      (render node for VAAPI + Vulkan)
 #   -v /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so:ro
 #                                           (use the host iHD driver for newer Intel GPUs)
+#   -v /usr/lib/x86_64-linux-gnu/libvulkan_intel.so:/usr/lib/x86_64-linux-gnu/libvulkan_intel.so:ro
+#                                           (use the host Intel Vulkan ICD for a
+#                                          GPU whose PCI ID is newer than Mesa
+#                                          in this image; verified for BMG e223)
 #   -e JM_FARM_TRANSCRIPT_DEVICE=vulkan    (whisper → GPU)
 #   -e JM_FARM_VCODEC=hevc_vaapi           (HEVC proxy encode → GPU; the live
 #                                          scheduler selects this only after a
@@ -97,6 +101,12 @@ ENV JM_FARM_MODEL=/models/ggml-medium.en.bin
 # per-node anyway (hot knobs); these ENVs are just sane cold-start values.
 ENV JM_FARM_TRANSCRIPT_DEVICE=vulkan
 ENV JM_FARM_VCODEC=hevc_vaapi
+# Use only the Intel hardware ICD in this Intel-specific image. Without this,
+# Mesa can also enumerate llvmpipe and make a broken GPU deployment appear to
+# have a usable Vulkan device. jmfarm still requires both a physical-device
+# inventory result and a successful real whisper inference before advertising
+# transcript:vulkan.
+ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/intel_icd.json
 # The iHD VAAPI driver isn't auto-probed on the drm display path inside a
 # container; pin it (harmless on non-Intel hosts — vainfo just fails).
 ENV LIBVA_DRIVER_NAME=iHD
