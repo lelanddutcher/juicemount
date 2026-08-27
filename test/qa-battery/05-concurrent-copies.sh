@@ -85,7 +85,9 @@ _cc_teardown() {
     rm -rf "$CC_TMP" 2>/dev/null || true
     # qa_end runs qa_cleanup (removes our QA_*_$$_* dests + $QA_STAGE).
 }
-trap '_cc_teardown' EXIT INT TERM
+trap '_cc_teardown' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Background workers.

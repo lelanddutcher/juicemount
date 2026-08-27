@@ -106,7 +106,9 @@ _c06_cleanup() {
     # qa_cleanup removes $QA_STAGE + any QA_*_$$_* dests (guarded), best-effort.
     qa_cleanup
 }
-trap _c06_cleanup EXIT INT TERM
+trap _c06_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 qa_begin "$QA_CAT"

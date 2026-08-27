@@ -83,6 +83,19 @@ func TestDisablingTheLaneRoutesEverythingThroughMedia(t *testing.T) {
 	}
 }
 
+func TestSlowLinkGateSerializesMediaButNotTinyRows(t *testing.T) {
+	d := newLaneTestDrainer(4, 1<<20)
+	if d.slowGateAppliesTo(d.laneFor(4096)) {
+		t.Fatal("a 4 KiB AppleDouble row was serialized by the slow-link media gate; the small lane is defeated")
+	}
+	if !d.slowGateAppliesTo(d.laneFor(72 << 20)) {
+		t.Fatal("a media-sized row bypassed the slow-link gate and can saturate a cellular uplink")
+	}
+	if !d.slowGateAppliesTo(d.laneFor(0)) {
+		t.Fatal("an unknown-size row bypassed the conservative slow-link media gate")
+	}
+}
+
 // The lane changes the drainer's concurrency contract, so the new bound is
 // stated explicitly rather than left implied. Total in-flight is
 // Workers + SmallWorkers; the byte bound is (Workers x media sizes) +

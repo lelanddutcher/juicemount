@@ -53,7 +53,9 @@ _coc_cleanup() {
     [ -n "$COC_SRC" ]  && rm -rf "$COC_SRC"  2>/dev/null
     qa_cleanup 2>/dev/null || true
 }
-trap _coc_cleanup EXIT INT TERM
+trap _coc_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # _coc_first_bad MANIFEST DEST — echo the first MISSING/WRONG file (path + detail)
 # for the VERDICT reason. Called BEFORE qa_end cleans the dest, only on failure.

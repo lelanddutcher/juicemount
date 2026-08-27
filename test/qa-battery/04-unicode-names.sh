@@ -67,7 +67,9 @@ _on_exit() {
     fi
     qa_cleanup 2>/dev/null || true
 }
-trap _on_exit EXIT INT TERM
+trap _on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Helpers local to this category (NOT lib.sh helpers — pure shell, no mount).

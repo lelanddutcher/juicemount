@@ -65,7 +65,7 @@ source "$(dirname "$0")/lib.sh"
 # Tunables (env-overridable so the orchestrator can scale up/down).
 : "${OFFLINE_DIRS:=3}"            # case A: subdirs in the staged tree
 : "${OFFLINE_FPD:=100}"           # case A: files per dir (=> ~300 files)
-: "${OFFLINE_SIZE:=131072}"       # case A: per-file bytes (128 KiB)
+: "${OFFLINE_SIZE:=524288}"       # case A: per-file bytes (512 KiB; keeps Finder active through the toggle)
 : "${STALL_FILE_SIZE:=33554432}"  # case C: per-file bytes (32 MiB) to grow spool fast
 : "${STALL_MAX_FILES:=400}"       # case C: hard cap so we never run unbounded
 : "${STALL_OBSERVE_S:=45}"        # case C: seconds to watch for a stall signal
@@ -103,7 +103,11 @@ cleanup_07() {
     qa_cleanup
     return $rc
 }
-trap cleanup_07 EXIT INT TERM
+trap cleanup_07 EXIT
+# A signal trap that merely returns lets the interrupted test continue creating
+# files. Exit explicitly; the EXIT trap above performs the connectivity cleanup.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Helpers local to this category (not in lib.sh — see RETURN notes).
@@ -221,6 +225,16 @@ qa_info "A: offline body: $A_OFF_BODY"
 # While offline, the copy must KEEP WRITING into the spool. Observe pending rise
 # and confirm no backend writes are failing.
 A_OFFLINE_CONFIRMED=0
+# Confirm the state transition independently of the Finder driver's lifetime.
+# A small local-to-NFS copy can finish between the toggle and the first process
+# poll; tying this proof to kill -0 made a real offline transition false-red.
+for _offline_probe in $(seq 1 20); do
+    if [ "$(_spool_offline_flag)" = "1" ]; then
+        A_OFFLINE_CONFIRMED=1
+        break
+    fi
+    perl -e 'select undef,undef,undef,0.25'
+done
 i=0
 A_MAX_PENDING=0
 while [ "$i" -lt 30 ]; do
@@ -452,8 +466,21 @@ C_PARKED_PID=""
 C_COPIED=0
 C_MANIFEST="$QA_CAT_DIR/offline_C.manifest"
 : > "$C_MANIFEST"
+C_FILE_LIMIT="$STALL_MAX_FILES"
+C_CAP_REACHABLE=1
+_c_cap_total="$(qa_spool_field capacity_total)"
+_c_cap_used="$(qa_spool_field capacity_used)"
+if [ "$_c_cap_total" -gt 0 ] 2>/dev/null && [ "$_c_cap_used" -ge 0 ] 2>/dev/null; then
+    _c_remaining=$((_c_cap_total - _c_cap_used))
+    _c_max_stage=$((STALL_MAX_FILES * STALL_FILE_SIZE))
+    if [ "$_c_max_stage" -le "$_c_remaining" ] 2>/dev/null; then
+        C_CAP_REACHABLE=0
+        C_FILE_LIMIT=3
+        qa_warn "C: live spool headroom is ${_c_remaining}B, but this bounded fixture can stage only ${_c_max_stage}B; a cap stall is impossible in this run. Running three offline custody samples instead of writing all $STALL_MAX_FILES files."
+    fi
+fi
 n=1
-while [ "$n" -le "$STALL_MAX_FILES" ]; do
+while [ "$n" -le "$C_FILE_LIMIT" ]; do
     cf="$C_SRC/stall_$n.dat"
     cmd5="$(qa_stage_file "$cf" "$STALL_FILE_SIZE")"
     pid="$(_kick_finder_bg "$cf" "$C_DEST")"
@@ -491,7 +518,11 @@ if [ "$C_STALL_SEEN" = "1" ]; then
 elif [ "$C_STALL_SEEN" = "2" ]; then
     : # already qa_fail'd above
 else
-    qa_warn "C: never reached the spool cap within $STALL_MAX_FILES x ${STALL_FILE_SIZE}B; cap likely larger than the staged volume. Increase STALL_FILE_SIZE/STALL_MAX_FILES to exercise the stall. (No error observed, which is itself acceptable.)"
+    if [ "$C_CAP_REACHABLE" = "0" ]; then
+        qa_warn "C: spool-full stall not exercised because the preflight proved the bounded fixture cannot reach the live cap; this remains an explicit acceptance item."
+    else
+        qa_warn "C: never reached the spool cap within $STALL_MAX_FILES x ${STALL_FILE_SIZE}B; cap likely larger than the staged volume. Increase STALL_FILE_SIZE/STALL_MAX_FILES to exercise the stall. (No error observed, which is itself acceptable.)"
+    fi
 fi
 
 # Confirm we never saw a Finder/NFS error signature DURING the over-fill, even

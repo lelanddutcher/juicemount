@@ -79,7 +79,9 @@ snap_on_exit() {
     fi
     qa_cleanup 2>/dev/null || true
 }
-trap snap_on_exit EXIT INT TERM
+trap snap_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Latency table accumulation (bash 3.2: no assoc arrays — append to a string).

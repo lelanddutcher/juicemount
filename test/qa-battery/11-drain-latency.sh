@@ -111,7 +111,9 @@ drain_on_exit() {
     fi
     qa_cleanup 2>/dev/null || true
 }
-trap drain_on_exit EXIT INT TERM
+trap drain_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Per-file Stat/GETATTR latency. stat(2) of a cached file forces a GETATTR over

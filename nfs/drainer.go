@@ -78,8 +78,8 @@ type Drainer struct {
 	// files/sec change from this.
 	smallSem   chan struct{}
 	smallBytes int64
-	// slowGate serializes drains on slow/metered links (cap 1). [cellular
-	// drain saturation 2026-07-10] 4 concurrent whole-file copies + blocking
+	// slowGate serializes MEDIA-LANE drains on slow/metered links (cap 1).
+	// [cellular drain saturation 2026-07-10] 4 concurrent whole-file copies + blocking
 	// Sync saturated a cellular tunnel's uplink: FUSE fsyncs stretched past
 	// 120s, the macFUSE session degraded (EBADF), and the mount died while
 	// "draining normally" — on every boot, killing both a new deploy AND its
@@ -769,11 +769,13 @@ func (d *Drainer) dispatchRow(row *metadata.SpoolRow) bool {
 			<-lane
 			d.inFlight.Done()
 		}()
-		// Slow/metered link: serialize (see slowGate doc). Acquired BEFORE
-		// the InFlight metric so the UI shows the one truly-active drain,
-		// not N workers parked on the gate. On stop, the parked row resets
-		// to Ready — same contract as the dispatch-side stop case.
-		if drainClassGateEnabled() && drainLinkIsSlow() {
+		// Slow/metered link: serialize media rows (see slowGate doc). Tiny
+		// rows already have their own byte-bounded lane (4 MiB worst case);
+		// serializing them here defeated that lane and turned a 5,000-entry
+		// directory's AppleDouble drain into a many-minute backlog. Acquired
+		// BEFORE the InFlight metric so the UI shows truly-active drains, not
+		// workers parked on the gate. On stop, the parked row resets to Ready.
+		if drainClassGateEnabled() && drainLinkIsSlow() && d.slowGateAppliesTo(lane) {
 			select {
 			case d.slowGate <- struct{}{}:
 				defer func() { <-d.slowGate }()
@@ -802,6 +804,11 @@ func (d *Drainer) laneFor(size int64) chan struct{} {
 	}
 	return d.sem
 }
+
+// slowGateAppliesTo reports whether a row's selected lane carries media-sized
+// work. Small-lane concurrency is already bounded separately by both worker
+// count and bytes, so cellular safety does not require serializing it again.
+func (d *Drainer) slowGateAppliesTo(lane chan struct{}) bool { return lane == d.sem }
 
 // drainClassGateEnabled: JM_DRAIN_CLASS_GATE=0 disables the slow-link
 // serialization (restores unconditional Workers-wide concurrency).
