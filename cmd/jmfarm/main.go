@@ -80,7 +80,7 @@ type passOpts struct {
 // through the same internal/farm calls.
 func runPasses(po passOpts, targets []string) (processed, failed int, failedTargets []string) {
 	start := time.Now()
-	var ok, fail, thumbs, strips, waves, speech, proxies, proxySkipped, qls int64
+	var ok, fail, thumbs, strips, waves, speech, transcriptSkipped, proxies, proxySkipped, qls int64
 	// skippedFresh counts assets whose derivatives already matched byte-identical
 	// source — a moved or re-enqueued file that cost no re-encode.
 	var skippedFresh, sidecarsRepaired int64
@@ -212,9 +212,12 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 				if tr.HasSpeech {
 					atomic.AddInt64(&speech, 1)
 				}
+				if tr.SkippedFresh {
+					atomic.AddInt64(&transcriptSkipped, 1)
+				}
 				if po.verbose {
-					fmt.Printf("  [ok] %-50s inode=%d speech=%v segments=%d\n",
-						filepath.Base(p), tr.Inode, tr.HasSpeech, tr.Segments)
+					fmt.Printf("  [ok] %-50s inode=%d speech=%v segments=%d skipped=%v\n",
+						filepath.Base(p), tr.Inode, tr.HasSpeech, tr.Segments, tr.SkippedFresh)
 				}
 				return
 			}
@@ -271,8 +274,8 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 	progressWG.Wait()
 
 	if po.transcr {
-		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d with-speech (transcribed) — %d total\n",
-			time.Since(start).Round(time.Millisecond), ok, fail, speech, len(targets))
+		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d with-speech (transcribed), %d skipped-current — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, fail, speech, transcriptSkipped, len(targets))
 	} else if po.qlGen {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d ql-previews — %d total\n",
 			time.Since(start).Round(time.Millisecond), ok, fail, qls, len(targets))

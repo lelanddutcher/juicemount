@@ -271,12 +271,75 @@ func isNonSpeechMarker(t string) bool {
 
 // AIResult is the per-file outcome of an AI-generation pass.
 type AIResult struct {
-	Path      string
-	Inode     uint64
-	Hash      string
-	HasSpeech bool
-	Segments  int
-	Err       error
+	Path         string
+	Inode        uint64
+	Hash         string
+	HasSpeech    bool
+	Segments     int
+	SkippedFresh bool
+	Err          error
+}
+
+// transcriptFresh reports whether the shared AI bundle already contains a
+// transcript for these exact source bytes and the requested model. Queue
+// producers are intentionally at-least-once (Manager, watch events and the
+// catch-up scan may all observe the same file), so this gate must run before
+// ffprobe/audio extraction/Whisper or every duplicate event spends the GPU.
+//
+// Worker SQLite stores are private to each node. On a local miss, reconcile the
+// volume sidecar once and repeat the same fail-closed checks. A row alone is not
+// sufficient: the blob is opened through the descriptor-anchored regular-file
+// guard and decoded, and its embedded source hash/model must agree.
+func transcriptFresh(store *derivatives.Store, inode uint64, hash string, size int64, opt Options) bool {
+	if store == nil || opt.RegenerateFresh || opt.Mount == "" || strings.TrimSpace(opt.WhisperModel) == "" {
+		return false
+	}
+	if transcriptFreshIndexed(store, inode, hash, size, opt) {
+		return true
+	}
+	if _, err := ReconcileOneSidecar(store, opt.Mount, inode); err != nil {
+		return false
+	}
+	return transcriptFreshIndexed(store, inode, hash, size, opt)
+}
+
+func transcriptFreshIndexed(store *derivatives.Store, inode uint64, hash string, size int64, opt Options) bool {
+	known, sourceHash := store.Known(inode)
+	if !known || sourceHash == nil || *sourceHash != hash {
+		return false
+	}
+	desiredModel := whisperModelID(opt.WhisperModel)
+	rows, err := store.Manifest(inode)
+	if err != nil {
+		return false
+	}
+	for _, row := range rows {
+		if row.Kind != "ai" || row.Status != "ready" ||
+			row.Hash == nil || *row.Hash != hash ||
+			row.SourceSize == nil || *row.SourceSize != size ||
+			row.Model == nil || *row.Model != desiredModel ||
+			row.BlobRelPath == nil ||
+			(*row.BlobRelPath != derivatives.AIBlobName && *row.BlobRelPath != derivatives.AIBlobNameLegacy) {
+			continue
+		}
+		f, err := derivatives.OpenRegularUnder(opt.Mount, derivatives.DerivBlobRel(inode, *row.BlobRelPath))
+		if err != nil {
+			continue
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(f, maxAIBlobBytes+1))
+		closeErr := f.Close()
+		if readErr != nil || closeErr != nil || len(raw) > maxAIBlobBytes {
+			continue
+		}
+		var doc LoupeJSON
+		if json.Unmarshal(raw, &doc) != nil || doc.Media.HashXXH3 != hash ||
+			doc.AI == nil || doc.AI.Transcript == nil ||
+			doc.AI.Transcript.Model != desiredModel || len(doc.AI.Transcript.Segments) == 0 {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // GenerateTranscript transcribes one file and merges the result into its
@@ -304,6 +367,12 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 		return res
 	}
 	res.Hash = hash
+
+	if transcriptFresh(store, inode, hash, fi.Size(), opt) {
+		res.SkippedFresh = true
+		_ = WriteManifestSidecar(store, opt.Mount, inode)
+		return res
+	}
 
 	tech, err := Probe(opt.FFprobeBin, path, fi.Size())
 	if err != nil {
