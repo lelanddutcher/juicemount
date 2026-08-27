@@ -28,6 +28,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/jmlog"
+
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
@@ -158,6 +160,7 @@ func (l *LinkNode) startDeferredReadiness(status linkStatusFunc, pollEvery time.
 		l.configureReady,
 		l.restartControl,
 		5*time.Second,
+		45*time.Second,
 	)
 }
 
@@ -166,7 +169,7 @@ func (l *LinkNode) startDeferredReadiness(status linkStatusFunc, pollEvery time.
 // Running -> EditPrefs failure is retried instead of permanently poisoning the
 // saved Link identity.
 func (l *LinkNode) startDeferredReadinessWith(status linkStatusFunc, pollEvery time.Duration, configure func(*ipnstate.Status) error) {
-	l.startDeferredReadinessWithRecovery(status, pollEvery, configure, nil, 0)
+	l.startDeferredReadinessWithRecovery(status, pollEvery, configure, nil, 0, 0)
 }
 
 type linkRecoveryFunc func(context.Context, *ipnstate.Status) error
@@ -177,6 +180,7 @@ func (l *LinkNode) startDeferredReadinessWithRecovery(
 	configure func(*ipnstate.Status) error,
 	recoverControl linkRecoveryFunc,
 	recoverAfter time.Duration,
+	startingStuckAfter time.Duration,
 ) {
 	if pollEvery <= 0 {
 		pollEvery = 200 * time.Millisecond
@@ -199,18 +203,30 @@ func (l *LinkNode) startDeferredReadinessWithRecovery(
 	l.readyCancel = cancel
 	l.mu.Unlock()
 	go func() {
-		nextRecovery := time.Now().Add(recoverAfter)
+		now := time.Now()
+		nextRecovery := now.Add(recoverAfter)
 		recoveryBackoff := recoverAfter
+		lastState := ""
+		stateSince := now
 		for {
 			st, err := waitForLinkRunning(ctx, func(ctx context.Context) (*ipnstate.Status, error) {
 				current, statusErr := status(ctx)
 				l.noteReadinessAttempt(current, statusErr)
-				if recoverControl != nil && statusErr == nil && shouldRestartLinkControl(current) && !time.Now().Before(nextRecovery) {
+				now := time.Now()
+				if statusErr == nil && current != nil && current.BackendState != lastState {
+					lastState = current.BackendState
+					stateSince = now
+					jmlog.Info("link control state changed", "state", lastState)
+				}
+				stalledStarting := shouldRestartStalledLinkControl(current, now.Sub(stateSince), startingStuckAfter)
+				if recoverControl != nil && statusErr == nil && (shouldRestartLinkControl(current) || stalledStarting) && !now.Before(nextRecovery) {
+					jmlog.Warn("recovering persisted link control session", "state", current.BackendState)
 					recoveryCtx, recoveryCancel := context.WithTimeout(ctx, 5*time.Second)
 					recoveryErr := recoverControl(recoveryCtx, current)
 					recoveryCancel()
 					if recoveryErr != nil {
 						l.noteReadinessAttempt(current, recoveryErr)
+						jmlog.Warn("persisted link control recovery failed", "state", current.BackendState, "error", recoveryErr.Error())
 					}
 					if recoveryBackoff < 30*time.Second {
 						recoveryBackoff *= 2
@@ -219,6 +235,12 @@ func (l *LinkNode) startDeferredReadinessWithRecovery(
 						}
 					}
 					nextRecovery = time.Now().Add(recoveryBackoff)
+					if stalledStarting {
+						// A restart is a new attempt even when LocalAPI continues to
+						// report Starting. Give it the full settling interval before
+						// considering another restart so recovery cannot thrash.
+						stateSince = time.Now()
+					}
 				}
 				return current, statusErr
 			}, pollEvery)
@@ -252,6 +274,19 @@ func (l *LinkNode) startDeferredReadinessWithRecovery(
 // event, so it remains an explicit re-pair operation.
 func shouldRestartLinkControl(st *ipnstate.Status) bool {
 	return st != nil && st.BackendState == ipn.NoState.String()
+}
+
+// shouldRestartStalledLinkControl recovers the second cold-start failure mode:
+// LocalBackend accepted the persisted profile but never progressed beyond
+// Starting after the host or control server restarted. A generous threshold
+// prevents a legitimately slow cellular login from being interrupted. As with
+// shouldRestartLinkControl, security-significant NeedsLogin states are never
+// restarted automatically.
+func shouldRestartStalledLinkControl(st *ipnstate.Status, unchangedFor, threshold time.Duration) bool {
+	return st != nil &&
+		threshold > 0 &&
+		unchangedFor >= threshold &&
+		st.BackendState == ipn.Starting.String()
 }
 
 // restartControl rebuilds tsnet's control client using the persisted profile.

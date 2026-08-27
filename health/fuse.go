@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -21,6 +22,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
@@ -385,13 +388,21 @@ var kextBlockedFlag atomic.Bool
 // as the macFUSE kext being unloaded (approval loss). Cheap; any goroutine.
 func KextApprovalBlocked() bool { return kextBlockedFlag.Load() }
 
-// noteMountFailure classifies a mount failure. Only latches the blocked flag
-// on high confidence (kmutil ran and macfuse is absent); on kmutil error or
-// timeout it stays quiet — the FUSE identity gate is the safety mechanism,
-// this is diagnosis for the human.
-func noteMountFailure() {
+// noteMountFailure classifies a mount verification failure. A missing kext is
+// actionable only after Redis and object storage both answer their application
+// protocols. A Link proxy can accept a loopback TCP connection while its
+// encrypted route is still unavailable, so TCP-only reachability would falsely
+// blame macFUSE for a backend outage.
+func (fm *FUSEManager) noteMountFailure() {
 	if kextLoaded() {
 		kextBlockedFlag.Store(false)
+		return
+	}
+	redisReady, objectReady := fm.mountBackendsReady()
+	if !shouldClassifyKextApproval(false, redisReady, objectReady) {
+		kextBlockedFlag.Store(false)
+		jmlog.Warn("mount failed before backend readiness; macFUSE approval not inferred",
+			"redis_ready", redisReady, "object_store_ready", objectReady)
 		return
 	}
 	if kextBlockedFlag.CompareAndSwap(false, true) {
@@ -400,6 +411,82 @@ func noteMountFailure() {
 			"USER ACTION: System Settings → Privacy & Security → Allow \"Benjamin Fleischer\" (macFUSE), then reboot if prompted. " +
 			"Until then the FUSE identity gate parks drains and prunes; writes stay safely in the spool.")
 	}
+}
+
+// shouldClassifyKextApproval centralizes the high-confidence gate so regression
+// tests can prove a backend failure is never presented as an approval loss.
+func shouldClassifyKextApproval(kextIsLoaded, redisReady, objectReady bool) bool {
+	return !kextIsLoaded && redisReady && objectReady
+}
+
+func (fm *FUSEManager) mountBackendsReady() (redisReady, objectReady bool) {
+	if fm == nil {
+		return false, false
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		redisReady = redisMountBackendReady(fm.cfg.RedisURL)
+	}()
+	go func() {
+		defer wg.Done()
+		objectReady = objectMountBackendReady(fm.cfg.BucketOverride)
+	}()
+	wg.Wait()
+	return redisReady, objectReady
+}
+
+func redisMountBackendReady(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "redis://" + raw
+	}
+	opts, err := redis.ParseURL(raw)
+	if err != nil || opts.Addr == "" {
+		return false
+	}
+	opts.DialTimeout = 2 * time.Second
+	opts.ReadTimeout = 2 * time.Second
+	opts.WriteTimeout = 2 * time.Second
+	// This is a single compatibility PING, not a long-lived feature client.
+	// RESP2 avoids a HELLO negotiation and identity command on a backend that
+	// may be an older Redis-compatible JuiceFS metadata service.
+	opts.Protocol = 2
+	opts.DisableIdentity = true
+	opts.ContextTimeoutEnabled = true
+	opts.MaxRetries = -1
+	client := redis.NewClient(opts)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return client.Ping(ctx).Err() == nil
+}
+
+func objectMountBackendReady(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	u.Path = "/minio/health/live"
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 // kextLoaded reports whether any macFUSE kext is currently loaded, bounded.
@@ -861,7 +948,8 @@ func (fm *FUSEManager) Mount() error {
 		if juiceFSLog != nil {
 			_ = juiceFSLog.Close()
 		}
-		noteMountFailure()
+		// The process never started, so no kext diagnosis is possible.
+		kextBlockedFlag.Store(false)
 		return fmt.Errorf("juicefs mount start: %w", err)
 	}
 
@@ -878,7 +966,7 @@ func (fm *FUSEManager) Mount() error {
 	// fast child exit and returns its actual final stderr line immediately.
 	if err := fm.waitForMountProcess(fm.mountVerifyTimeout(), processExit); err != nil {
 		_ = cmd.Process.Kill()
-		noteMountFailure()
+		fm.noteMountFailure()
 		if reason := lastNonEmptyLine(readFileTailSince(juiceFSLogPath, juiceFSLogOffset, 64<<10)); reason != "" {
 			return fmt.Errorf("mount verification: %w: %s", err, reason)
 		}
