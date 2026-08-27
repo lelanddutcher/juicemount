@@ -3036,6 +3036,14 @@ func mountNFSWithPrompt(serverAddr, mountPoint string) error {
 //
 // Write size stays at 1 MiB — writes are sequential and the
 // failure mode there is different.
+// [RC-0.5 2026-08-27] dsize=1048576. macOS otherwise keeps its TCP default
+// directory-read size of 32 KiB even though rsize is 1 MiB. A real 5,000-entry
+// Finder fixture then takes dozens of sequential READDIRPLUS round trips and
+// repeatedly missed the 200 ms local/offline listing gate (380-535 ms), while
+// the server spent only ~1 ms in each RPC. mount_nfs documents dsize as bounded
+// by rsize; using the same 1 MiB ceiling lets this loopback-only NFS hop return
+// the listing in one or a few replies without increasing the protocol's
+// existing maximum record size.
 // QA-36 (2026-06-13): bumped timeo=200 -> timeo=400 (~120 s budget). During a
 // heavy OpenLoupe + native-Finder ingest, a CREATE/first-WRITE RPC stalled past
 // the ~60 s budget and Finder aborted with "operation can't be completed
@@ -3116,7 +3124,7 @@ func nfsMountOpts(port string) string {
 	// and [[project_slow_copy_fsetxattr]]. The retry semantics are what we want;
 	// only the alert is wrong. This mutes the alert and changes nothing else.
 	return fmt.Sprintf(
-		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,mutejukebox,nonegnamecache,nolocks,locallocks,rsize=1048576,wsize=1048576,readahead=%d,%s,vers=3,tcp",
+		"port=%s,mountport=%s,hard,intr,timeo=400,retrans=2,mutejukebox,nonegnamecache,nolocks,locallocks,rsize=1048576,wsize=1048576,dsize=1048576,readahead=%d,%s,vers=3,tcp",
 		port, port, ra, acOpts)
 }
 

@@ -35,6 +35,8 @@ func TestNFSMountOptsKeepsIncidentDrivenOptions(t *testing.T) {
 		"nonegnamecache": "a pre-push ENOENT must not mask a child already delivered into the local mirror",
 		"nolocks":        "we do not serve NLM",
 		"locallocks":     "locking is handled client-side",
+		"rsize=1048576":  "the loopback server and connection buffers support 1 MiB data replies",
+		"dsize=1048576":  "large Finder directories must not be fragmented into dozens of 32 KiB READDIRPLUS round trips",
 		"vers=3":         "the server speaks NFSv3",
 		"tcp":            "UDP is not supported by this server",
 	}
