@@ -946,6 +946,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// globalFUSEPath / globalFUSEMetricsAddr) is disjoint from the store lane's
 	// globalStore, and the parent blocks on the join before any other code
 	// reads them, so there is no added race.
+	bootFUSEReady := false
 	mountFUSE := func() {
 		if cfg.FUSEPath == "" {
 			return
@@ -961,6 +962,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 
 		if globalFUSE != nil && fuseLooksHealthy(cfg.FUSEPath) {
 			jmlog.Info("juicefs FUSE already mounted, reusing", "path", cfg.FUSEPath)
+			bootFUSEReady = true
 			return
 		}
 		// Forward the user's configured cache size to JuiceFS. Without this,
@@ -1065,6 +1067,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			jmlog.Error("juicefs FUSE mount failed at launch — continuing startup; watchdog will mount it once the backend is reachable",
 				"error", mountErr.Error())
 		} else {
+			bootFUSEReady = true
 			// Note: FUSEManager.Mount may have auto-expanded CacheSize. Log
 			// the *effective* config from the mount, not the user input —
 			// otherwise the user reads "100 GiB" and is confused why the
@@ -1998,7 +2001,16 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	// the globalMountPath publish; the prompt itself is bounded (180s) in
 	// mountNFSWithPrompt. Boot never waits on a human again.
 	nfsMountReused := false
-	if cfg.MountPoint != "" {
+	if cfg.MountPoint != "" && !bootNFSMountAllowed(cfg.FUSEPath, bootFUSEReady) {
+		// Never publish a loopback NFS volume over an unverified/partial FUSE
+		// mount. A live RC reproduced a cold Link start deferring FUSE while NFS
+		// was mounted seven seconds earlier; Finder and even getfsstat(2) then
+		// entered uninterruptible kernel waits. The NFS listener and health
+		// monitor still start below. Once the FUSE watchdog establishes a
+		// verified mount, the existing absent-NFS recovery publishes the volume.
+		jmlog.Warn("deferring user-visible NFS mount — JuiceFS backing mount is not verified; absent-mount recovery will publish it after FUSE recovers",
+			"mount_point", cfg.MountPoint, "fuse_path", cfg.FUSEPath)
+	} else if cfg.MountPoint != "" {
 		jmlog.Info("BOOT-TRACE: step-4 pre-mount-check")
 		mounted := isMounted(cfg.MountPoint)
 		if mounted && nfsMountResponsive(cfg.MountPoint, 2*time.Second) {
@@ -3445,6 +3457,14 @@ func fuseLooksHealthy(path string) bool {
 	case <-time.After(2 * time.Second):
 		return false
 	}
+}
+
+// bootNFSMountAllowed is the startup publication gate for the user-visible
+// loopback NFS volume. An empty FUSE path preserves the explicit NFS-only
+// configuration used by focused/dev setups; normal desktop configurations
+// must prove that their JuiceFS backing mount is ready first.
+func bootNFSMountAllowed(fusePath string, fuseReady bool) bool {
+	return fusePath == "" || fuseReady
 }
 
 // waitForFUSEResponsive polls fuseLooksHealthy until it succeeds or the

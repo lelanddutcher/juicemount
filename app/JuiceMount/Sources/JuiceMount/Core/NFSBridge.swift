@@ -538,7 +538,14 @@ public enum NFSBridge {
                 appLog("healthProbe decode failed — returning nil: \(error)")
             }
         }.resume()
-        sem.wait()
+        // URLRequest's timeout normally completes the callback, but it is not
+        // a contract that the callback must run. Never let the independent
+        // recovery lane park forever when the embedded control plane is wedged.
+        guard sem.wait(timeout: .now() + 3) == .success else {
+            session.invalidateAndCancel()
+            appLog("healthProbe timed out — returning nil")
+            return nil
+        }
         session.finishTasksAndInvalidate()
         return result
     }

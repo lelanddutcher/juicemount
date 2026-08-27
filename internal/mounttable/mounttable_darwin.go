@@ -3,57 +3,27 @@
 package mounttable
 
 import (
-	"bytes"
 	"context"
-	"fmt"
-
-	"golang.org/x/sys/unix"
+	"os/exec"
 )
 
-// Output returns a non-refreshing Darwin mount-table snapshot in mount(8)'s
-// ordinary text form. MNT_NOWAIT is load-bearing: mount(8) uses a refreshing
-// getfsstat query that can park forever in an uninterruptible kernel call when
-// a dead NFS or macFUSE entry is present. CommandContext cannot bound Wait in
-// that state, which used to hang JuiceMount startup while trying to recover
-// the very stale mount that caused the query to wedge.
+// Output returns mount(8)'s stdout without ever issuing getfsstat from the
+// JuiceMount process itself.
+//
+// MNT_NOWAIT is only a cache-refresh policy; it is not a syscall deadline. A
+// live RC reproduced unix.Getfsstat(..., MNT_NOWAIT) parking the calling
+// thread in an uninterruptible kernel wait while a half-established macFUSE
+// mount existed. Because that call was in-process, the app and its control
+// plane became unresponsive even though every caller carried a context.
+//
+// Put the syscall in a disposable, single-flight child instead. output returns
+// when ctx expires without waiting for an unkillable child, and keeps the gate
+// held until that child really exits so health ticks cannot create a process
+// leak storm. One stuck helper is recoverable at reboot; a stuck app is not.
 func Output(ctx context.Context) ([]byte, error) {
-	if ctx == nil {
-		return nil, fmt.Errorf("mount table: nil context")
-	}
-	select {
-	case <-ctx.Done():
-		return nil, fmt.Errorf("mount table: query canceled: %w", ctx.Err())
-	default:
-	}
-
-	count, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
-	if err != nil {
-		return nil, fmt.Errorf("mount table: getfsstat count: %w", err)
-	}
-	// Leave room for mounts added between the sizing call and the snapshot.
-	stats := make([]unix.Statfs_t, count+16)
-	n, err := unix.Getfsstat(stats, unix.MNT_NOWAIT)
-	if err != nil {
-		return nil, fmt.Errorf("mount table: getfsstat snapshot: %w", err)
-	}
-	if n > len(stats) {
-		return nil, fmt.Errorf("mount table: grew from %d to %d entries during snapshot", count, n)
-	}
-	select {
-	case <-ctx.Done():
-		return nil, fmt.Errorf("mount table: query canceled: %w", ctx.Err())
-	default:
-	}
-	return darwinSnapshotOutput(stats[:n]), nil
+	return output(ctx, queryGate, darwinMountCommand)
 }
 
-func darwinSnapshotOutput(stats []unix.Statfs_t) []byte {
-	var out bytes.Buffer
-	for i := range stats {
-		from := unix.ByteSliceToString(stats[i].Mntfromname[:])
-		on := unix.ByteSliceToString(stats[i].Mntonname[:])
-		fsType := unix.ByteSliceToString(stats[i].Fstypename[:])
-		fmt.Fprintf(&out, "%s on %s (%s)\n", from, on, fsType)
-	}
-	return out.Bytes()
+func darwinMountCommand() *exec.Cmd {
+	return exec.Command("/sbin/mount")
 }
