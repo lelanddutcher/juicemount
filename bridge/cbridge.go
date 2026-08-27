@@ -1477,12 +1477,20 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	globalPresence = pt // already holding globalMu from function entry
 	jmlog.Info("STARTUP-TRACE: E-post-globalMu")
 
+	// This local atomic lets the FUSE watchdog notify the health monitor after
+	// a verified remount without taking globalMu. Taking globalMu here can
+	// deadlock shutdown: Stop holds it while waiting for the watchdog to exit.
+	// The closure owns this pointer for the lifetime of the FUSE manager.
+	var fuseRecoveryMonitor atomic.Pointer[health.HealthMonitor]
 	if globalFUSE != nil {
 		h := srv.Handler()
 		globalFUSE.SetOnRemount(func() {
 			closed, marked := h.FlushStaleFDs()
 			jmlog.Info("fd pool flushed after FUSE remount (#12)",
 				"closed_idle", closed, "marked_stale_held", marked)
+			if mon := fuseRecoveryMonitor.Load(); mon != nil {
+				mon.RecoverAbsentNFSNow()
+			}
 		})
 	}
 	globalServer = srv
@@ -2021,6 +2029,16 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		} else {
 			mountAddr, mountPoint := srv.Addr(), cfg.MountPoint
 			go func() {
+				// Share the same process-wide mount flight as /mount-now and
+				// absent-mount recovery. With immediate recovery enabled, the
+				// first health observation can otherwise race this boot mount and
+				// stack two administrator prompts or two mount_nfs processes.
+				if !mountNowInFlight.CompareAndSwap(false, true) {
+					jmlog.Info("nfs boot mount deferred — another mount is already in flight",
+						"mount_point", mountPoint)
+					return
+				}
+				defer mountNowInFlight.Store(false)
 				if mounted {
 					// A prior process can leave a syntactically valid loopback NFS
 					// mount whose kernel session is still bound to the dead server.
@@ -2188,6 +2206,10 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			return nil
 		})
 	}
+	// Publish only after the server address and remount callback are both
+	// configured. A subsequent verified FUSE recovery can now engage NFS
+	// recovery immediately instead of waiting up to three 10-second ticks.
+	fuseRecoveryMonitor.Store(globalMonitor)
 	globalMonitor.Start()
 	jmlog.Info("BOOT-TRACE: step-8 monitor-started")
 	// The mount runs concurrently so startup never blocks on an admin prompt.

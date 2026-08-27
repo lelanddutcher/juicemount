@@ -35,10 +35,15 @@ package health
 //	(c) our own NFS listener (127.0.0.1:<port>) accepts TCP — a remount
 //	    against a dead server would just wedge the kernel client.
 //
-// After NFSAbsentRemountTicks consecutive such ticks (default 3 ≈ 30s;
-// env JM_NFS_AUTOREMOUNT_TICKS) it re-runs the SAME two-tier mount
+// After NFSAbsentRemountTicks consecutive such observations (default 1;
+// env JM_NFS_AUTOREMOUNT_TICKS may raise it) it re-runs the SAME two-tier mount
 // machinery boot uses (passwordless sudo → bounded 180s admin prompt;
 // wired from bridge via EnableNFSAbsentRemount — no new mount routine).
+// One observation is sufficient because it is already the conjunction of a
+// kernel mount-table absence verdict, a healthy FUSE probe, a live JuiceFS
+// process, and a successful loopback listener connection. Requiring three
+// periodic observations added about 30 seconds to a truthful cold reconnect
+// without protecting against a distinct failure mode.
 // Guards:
 //
 //   - never while the user is in offline mode (pin.IsOffline());
@@ -65,11 +70,13 @@ import (
 )
 
 // Tunables for the absent-mount recovery. Vars so tests can override.
+const defaultNFSAbsentRemountTicks = 1
+
 var (
 	// NFSAbsentRemountTicks is the number of consecutive qualifying ticks
 	// (10s apart) before the recovery fires. Env JM_NFS_AUTOREMOUNT_TICKS
 	// overrides it at monitor construction (New).
-	NFSAbsentRemountTicks = 3
+	NFSAbsentRemountTicks = defaultNFSAbsentRemountTicks
 
 	// NFSAbsentRemountBackoffBase/Cap shape the exponential backoff after
 	// failed attempts: base<<(failures-1), capped. The cap keeps a

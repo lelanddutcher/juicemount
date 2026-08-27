@@ -46,23 +46,40 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 FROM debian:bookworm AS whisper
 ARG WHISPER_CMAKE_FLAGS="-DGGML_VULKAN=ON"
 ARG WHISPER_MODEL=medium.en
+ARG WHISPER_CPP_COMMIT=978113305b2ead22249b881deafa131dc8884911
+ARG WHISPER_MODEL_SHA256=cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356
+ARG SPIRV_HEADERS_COMMIT=496543121ce6419f23d6fa5d7194ba66c36212d2
+ARG VULKAN_HEADERS_COMMIT=b51f6b865c18fc5b33990d12f75e8dfd672cede6
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git cmake build-essential ca-certificates curl \
         libvulkan-dev vulkan-tools glslc glslang-tools spirv-headers \
         vulkan-validationlayers spirv-tools \
     && rm -rf /var/lib/apt/lists/* \
-    && git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers /usr/local/share/spirv-headers \
-    && git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers /usr/local/share/vulkan-headers \
+    && git init /usr/local/share/spirv-headers \
+    && git -C /usr/local/share/spirv-headers remote add origin https://github.com/KhronosGroup/SPIRV-Headers \
+    && git -C /usr/local/share/spirv-headers fetch --depth 1 origin ${SPIRV_HEADERS_COMMIT} \
+    && git -C /usr/local/share/spirv-headers checkout --detach FETCH_HEAD \
+    && test "$(git -C /usr/local/share/spirv-headers rev-parse HEAD)" = "${SPIRV_HEADERS_COMMIT}" \
+    && git init /usr/local/share/vulkan-headers \
+    && git -C /usr/local/share/vulkan-headers remote add origin https://github.com/KhronosGroup/Vulkan-Headers \
+    && git -C /usr/local/share/vulkan-headers fetch --depth 1 origin ${VULKAN_HEADERS_COMMIT} \
+    && git -C /usr/local/share/vulkan-headers checkout --detach FETCH_HEAD \
+    && test "$(git -C /usr/local/share/vulkan-headers rev-parse HEAD)" = "${VULKAN_HEADERS_COMMIT}" \
     && cd /usr/local/share/vulkan-headers && cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local . && cmake --install build
 # GGML_VULKAN needs recent Vulkan headers (vk::LayerSettingEXT requires >=1.3.240;
 # bookworm's 1.3.239 is too old) + SPIRV-Headers + glslangValidator.
 ENV CMAKE_PREFIX_PATH=/usr/local:/usr/local/share/spirv-headers
-RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp /w \
+RUN git init /w \
+    && git -C /w remote add origin https://github.com/ggml-org/whisper.cpp \
+    && git -C /w fetch --depth 1 origin ${WHISPER_CPP_COMMIT} \
+    && git -C /w checkout --detach FETCH_HEAD \
+    && test "$(git -C /w rev-parse HEAD)" = "${WHISPER_CPP_COMMIT}" \
     && cd /w \
     && cmake -B build -DWHISPER_BUILD_TESTS=OFF -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF ${WHISPER_CMAKE_FLAGS} \
     && cmake --build build --config Release -j "$(nproc)" \
     && cp build/bin/whisper-cli /usr/local/bin/whisper-cli
 RUN cd /w && bash ./models/download-ggml-model.sh ${WHISPER_MODEL} \
+    && echo "${WHISPER_MODEL_SHA256}  models/ggml-${WHISPER_MODEL}.bin" | sha256sum -c - \
     && cp models/ggml-${WHISPER_MODEL}.bin /ggml-${WHISPER_MODEL}.bin \
     && cp models/download-ggml-model.sh /download-ggml-model.sh
 

@@ -41,10 +41,16 @@ FROM debian:bullseye AS whisper
 ARG WHISPER_CMAKE_FLAGS=""
 # Default model baked into the image (manager-overridable / fetch-on-demand below).
 ARG WHISPER_MODEL=medium.en
+ARG WHISPER_CPP_COMMIT=978113305b2ead22249b881deafa131dc8884911
+ARG WHISPER_MODEL_SHA256=cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git cmake build-essential ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp /w \
+RUN git init /w \
+    && git -C /w remote add origin https://github.com/ggml-org/whisper.cpp \
+    && git -C /w fetch --depth 1 origin ${WHISPER_CPP_COMMIT} \
+    && git -C /w checkout --detach FETCH_HEAD \
+    && test "$(git -C /w rev-parse HEAD)" = "${WHISPER_CPP_COMMIT}" \
     && cd /w \
     && cmake -B build -DWHISPER_BUILD_TESTS=OFF -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF ${WHISPER_CMAKE_FLAGS} \
     && cmake --build build --config Release -j "$(nproc)" \
@@ -52,6 +58,7 @@ RUN git clone --depth 1 https://github.com/ggml-org/whisper.cpp /w \
 # Bake the default model (medium.en ~1.5GB — good accuracy on the NAS); keep the
 # download script so the entrypoint can fetch a different model on demand.
 RUN cd /w && bash ./models/download-ggml-model.sh ${WHISPER_MODEL} \
+    && echo "${WHISPER_MODEL_SHA256}  models/ggml-${WHISPER_MODEL}.bin" | sha256sum -c - \
     && cp models/ggml-${WHISPER_MODEL}.bin /ggml-${WHISPER_MODEL}.bin \
     && cp models/download-ggml-model.sh /download-ggml-model.sh
 

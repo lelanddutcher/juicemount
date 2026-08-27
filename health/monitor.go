@@ -416,6 +416,22 @@ func (m *HealthMonitor) RefreshNFS() ComponentStatus {
 	return nextNFS
 }
 
+// RecoverAbsentNFSNow performs an out-of-band, fully guarded absent-mount
+// observation. The FUSE watchdog calls this immediately after a verified
+// watchdog remount so the user-visible NFS volume does not wait for the next
+// 10-second health tick. It does not trust the notification by itself: the
+// ordinary raw FUSE probe, kernel mount-table check, JuiceFS process check,
+// loopback listener probe, offline/kill-switch guards, single-flight, and
+// failure backoff all still apply. A qualifying recovery is launched
+// asynchronously by handleNFSAbsentRecovery. The return value reports whether
+// this monitor claimed the absent-mount condition, not whether the asynchronous
+// mount has completed.
+func (m *HealthMonitor) RecoverAbsentNFSNow() bool {
+	fuseStatus := m.checkFUSE()
+	nfsStatus := m.checkNFS()
+	return m.handleNFSAbsentRecovery(nfsStatus, fuseStatus.Healthy)
+}
+
 // InGracePeriod returns true if a network change happened recently enough
 // that transient failures should be suppressed.
 func (m *HealthMonitor) InGracePeriod() bool {

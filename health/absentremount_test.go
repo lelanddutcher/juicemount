@@ -210,6 +210,26 @@ func TestAbsentBackoff(t *testing.T) {
 	}
 }
 
+// TestNFSAbsentRemountProductionDefault prevents the reconnect-latency
+// regression where a condition that already has four independent safety
+// proofs waited for three 10-second polling ticks before remounting NFS.
+func TestNFSAbsentRemountProductionDefault(t *testing.T) {
+	if defaultNFSAbsentRemountTicks != 1 {
+		t.Fatalf("default absent-remount observations = %d, want 1", defaultNFSAbsentRemountTicks)
+	}
+	s := nfsAbsentState{}
+	fire, reason := s.tick(nfsAbsentInputs{
+		Absent:       true,
+		JuiceFSAlive: true,
+		ServerUp:     true,
+		Enabled:      true,
+		Now:          time.Now(),
+	}, defaultNFSAbsentRemountTicks)
+	if !fire {
+		t.Fatalf("first fully-qualified observation did not fire: %s", reason)
+	}
+}
+
 // TestAbsentRemountTicksFromEnv verifies JM_NFS_AUTOREMOUNT_TICKS parsing
 // with fallback to the default on unset/garbage/non-positive values.
 func TestAbsentRemountTicksFromEnv(t *testing.T) {

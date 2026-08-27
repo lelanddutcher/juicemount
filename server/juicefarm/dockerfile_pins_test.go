@@ -1,0 +1,57 @@
+package juicefarm
+
+import (
+	"os"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+var pinnedSHAArg = regexp.MustCompile(`(?m)^ARG ([A-Z_]+_COMMIT)=([0-9a-f]{40})$`)
+
+func dockerfile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func commitArg(t *testing.T, src, name string) string {
+	t.Helper()
+	for _, match := range pinnedSHAArg.FindAllStringSubmatch(src, -1) {
+		if match[1] == name {
+			return match[2]
+		}
+	}
+	t.Fatalf("%s is not pinned to a full commit SHA", name)
+	return ""
+}
+
+func TestWorkerDockerfilesPinSourceAndBakedModel(t *testing.T) {
+	cpu := dockerfile(t, "Dockerfile")
+	gpu := dockerfile(t, "../juicefarm-gpu/Dockerfile")
+
+	cpuWhisper := commitArg(t, cpu, "WHISPER_CPP_COMMIT")
+	gpuWhisper := commitArg(t, gpu, "WHISPER_CPP_COMMIT")
+	if cpuWhisper != gpuWhisper {
+		t.Fatalf("CPU/GPU whisper revisions differ: %s != %s", cpuWhisper, gpuWhisper)
+	}
+	for name, src := range map[string]string{"CPU": cpu, "GPU": gpu} {
+		if strings.Contains(src, "git clone --depth 1 https://github.com/ggml-org/whisper.cpp") {
+			t.Fatalf("%s worker regressed to an unpinned whisper.cpp clone", name)
+		}
+		if !strings.Contains(src, "fetch --depth 1 origin ${WHISPER_CPP_COMMIT}") ||
+			!strings.Contains(src, `test "$(git -C /w rev-parse HEAD)" = "${WHISPER_CPP_COMMIT}"`) {
+			t.Fatalf("%s worker does not fetch and verify its pinned whisper.cpp commit", name)
+		}
+		if !strings.Contains(src, "ARG WHISPER_MODEL_SHA256=") ||
+			!strings.Contains(src, "${WHISPER_MODEL_SHA256}  models/ggml-${WHISPER_MODEL}.bin") {
+			t.Fatalf("%s worker does not checksum its baked speech model", name)
+		}
+	}
+
+	commitArg(t, gpu, "SPIRV_HEADERS_COMMIT")
+	commitArg(t, gpu, "VULKAN_HEADERS_COMMIT")
+}
