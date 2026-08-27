@@ -152,7 +152,13 @@ func StartLinkNodeDeferred(controlURL, authKey, hostname, stateDir string) (*Lin
 type linkStatusFunc func(context.Context) (*ipnstate.Status, error)
 
 func (l *LinkNode) startDeferredReadiness(status linkStatusFunc, pollEvery time.Duration) {
-	l.startDeferredReadinessWith(status, pollEvery, l.configureReady)
+	l.startDeferredReadinessWithRecovery(
+		status,
+		pollEvery,
+		l.configureReady,
+		l.restartControl,
+		5*time.Second,
+	)
 }
 
 // startDeferredReadinessWith separates the long-lived retry loop from tsnet's
@@ -160,8 +166,23 @@ func (l *LinkNode) startDeferredReadiness(status linkStatusFunc, pollEvery time.
 // Running -> EditPrefs failure is retried instead of permanently poisoning the
 // saved Link identity.
 func (l *LinkNode) startDeferredReadinessWith(status linkStatusFunc, pollEvery time.Duration, configure func(*ipnstate.Status) error) {
+	l.startDeferredReadinessWithRecovery(status, pollEvery, configure, nil, 0)
+}
+
+type linkRecoveryFunc func(context.Context, *ipnstate.Status) error
+
+func (l *LinkNode) startDeferredReadinessWithRecovery(
+	status linkStatusFunc,
+	pollEvery time.Duration,
+	configure func(*ipnstate.Status) error,
+	recoverControl linkRecoveryFunc,
+	recoverAfter time.Duration,
+) {
 	if pollEvery <= 0 {
 		pollEvery = 200 * time.Millisecond
+	}
+	if recoverControl != nil && recoverAfter <= 0 {
+		recoverAfter = 5 * time.Second
 	}
 	l.mu.Lock()
 	s := l.srv
@@ -178,10 +199,27 @@ func (l *LinkNode) startDeferredReadinessWith(status linkStatusFunc, pollEvery t
 	l.readyCancel = cancel
 	l.mu.Unlock()
 	go func() {
+		nextRecovery := time.Now().Add(recoverAfter)
+		recoveryBackoff := recoverAfter
 		for {
 			st, err := waitForLinkRunning(ctx, func(ctx context.Context) (*ipnstate.Status, error) {
 				current, statusErr := status(ctx)
 				l.noteReadinessAttempt(current, statusErr)
+				if recoverControl != nil && statusErr == nil && shouldRestartLinkControl(current) && !time.Now().Before(nextRecovery) {
+					recoveryCtx, recoveryCancel := context.WithTimeout(ctx, 5*time.Second)
+					recoveryErr := recoverControl(recoveryCtx, current)
+					recoveryCancel()
+					if recoveryErr != nil {
+						l.noteReadinessAttempt(current, recoveryErr)
+					}
+					if recoveryBackoff < 30*time.Second {
+						recoveryBackoff *= 2
+						if recoveryBackoff > 30*time.Second {
+							recoveryBackoff = 30 * time.Second
+						}
+					}
+					nextRecovery = time.Now().Add(recoveryBackoff)
+				}
 				return current, statusErr
 			}, pollEvery)
 			if err != nil {
@@ -207,6 +245,37 @@ func (l *LinkNode) startDeferredReadinessWith(status linkStatusFunc, pollEvery t
 	}()
 }
 
+// shouldRestartLinkControl is intentionally limited to NoState. That is the
+// state observed when a persisted identity's initial control-key fetch fails
+// during a network transition. NeedsLogin can mean revocation or key expiry;
+// automatically replaying a pairing key there would conceal a real security
+// event, so it remains an explicit re-pair operation.
+func shouldRestartLinkControl(st *ipnstate.Status) bool {
+	return st != nil && st.BackendState == ipn.NoState.String()
+}
+
+// restartControl rebuilds tsnet's control client using the persisted profile.
+// It deliberately supplies no AuthKey: a JuiceMount pairing code is one-off,
+// while the saved machine/node identity is what must survive app and host
+// restarts. LocalBackend.Start preserves the profile's private identity and
+// preferences while reconnecting the control plane.
+func (l *LinkNode) restartControl(ctx context.Context, _ *ipnstate.Status) error {
+	l.mu.Lock()
+	s := l.srv
+	l.mu.Unlock()
+	if s == nil {
+		return fmt.Errorf("link: node is stopped")
+	}
+	lc, err := s.LocalClient()
+	if err != nil {
+		return fmt.Errorf("link: control recovery unavailable: %w", err)
+	}
+	if err := lc.Start(ctx, ipn.Options{}); err != nil {
+		return fmt.Errorf("link: restart persisted control session: %w", err)
+	}
+	return nil
+}
+
 func (l *LinkNode) noteReadinessAttempt(st *ipnstate.Status, err error) {
 	if l == nil {
 		return
@@ -217,7 +286,11 @@ func (l *LinkNode) noteReadinessAttempt(st *ipnstate.Status, err error) {
 		l.readyState = st.BackendState
 		l.readyHealth = append(l.readyHealth[:0], st.Health...)
 	}
-	l.readyAttemptErr = err
+	if err != nil {
+		l.readyAttemptErr = err
+	} else if st != nil && st.BackendState == ipn.Running.String() {
+		l.readyAttemptErr = nil
+	}
 }
 
 func (l *LinkNode) configureReady(st *ipnstate.Status) error {

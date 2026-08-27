@@ -139,3 +139,73 @@ func TestDeferredReadinessCancellationReleasesWaiters(t *testing.T) {
 		t.Fatalf("WaitReady after cancellation = %v, want context canceled", err)
 	}
 }
+
+func TestDeferredReadinessRestartsPersistedControlSessionFromNoState(t *testing.T) {
+	node := &LinkNode{srv: &tsnet.Server{}, readyCh: make(chan struct{})}
+	t.Cleanup(func() {
+		node.mu.Lock()
+		cancel := node.readyCancel
+		node.srv = nil
+		node.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	})
+
+	var recovered atomic.Bool
+	var recoveryCalls atomic.Int64
+	status := func(context.Context) (*ipnstate.Status, error) {
+		if !recovered.Load() {
+			return &ipnstate.Status{BackendState: "NoState", Health: []string{"control fetch failed"}}, nil
+		}
+		return &ipnstate.Status{
+			BackendState: "Running",
+			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.23")},
+		}, nil
+	}
+	recoverControl := func(context.Context, *ipnstate.Status) error {
+		recoveryCalls.Add(1)
+		recovered.Store(true)
+		return nil
+	}
+	configure := func(st *ipnstate.Status) error {
+		node.mu.Lock()
+		node.addrs = []string{st.TailscaleIPs[0].String()}
+		node.mu.Unlock()
+		return nil
+	}
+
+	node.startDeferredReadinessWithRecovery(status, time.Millisecond, configure, recoverControl, 2*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	addrs, err := node.WaitReady(ctx)
+	if err != nil {
+		t.Fatalf("WaitReady after persisted-session restart: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0] != "100.64.0.23" {
+		t.Fatalf("ready addresses = %v", addrs)
+	}
+	if got := recoveryCalls.Load(); got != 1 {
+		t.Fatalf("control recovery calls = %d, want 1", got)
+	}
+}
+
+func TestShouldRestartLinkControlDoesNotHideRevocation(t *testing.T) {
+	cases := []struct {
+		state string
+		want  bool
+	}{
+		{"NoState", true},
+		{"Starting", false},
+		{"NeedsLogin", false},
+		{"NeedsMachineAuth", false},
+		{"Running", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state, func(t *testing.T) {
+			if got := shouldRestartLinkControl(&ipnstate.Status{BackendState: tc.state}); got != tc.want {
+				t.Fatalf("shouldRestartLinkControl(%q) = %v, want %v", tc.state, got, tc.want)
+			}
+		})
+	}
+}
