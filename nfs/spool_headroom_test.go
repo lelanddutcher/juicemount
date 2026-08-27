@@ -237,7 +237,11 @@ func TestRefreshCeiling_CountsReclaimableCacheAsHeadroom(t *testing.T) {
 	// statfs drift between the two samples below is the only source of error.
 	const tol = int64(1) << 30
 
-	assertCeiling := func(label string, in cacheReclaimInputs) int64 {
+	type ceilingSample struct {
+		ceiling int64
+		avail   int64
+	}
+	assertCeiling := func(label string, in cacheReclaimInputs) ceilingSample {
 		t.Helper()
 		setCacheReclaimHookForTest(func() cacheReclaimInputs { return in })
 		s.refreshCeiling()
@@ -251,20 +255,27 @@ func TestRefreshCeiling_CountsReclaimableCacheAsHeadroom(t *testing.T) {
 			t.Errorf("%s: ceiling = %d (%.2f GiB), want ~%d (%.2f GiB)",
 				label, got, float64(got)/float64(gib), want, float64(want)/float64(gib))
 		}
-		return got
+		return ceilingSample{ceiling: got, avail: avail}
 	}
 	t.Cleanup(func() { setCacheReclaimHookForTest(nil) })
 
 	blind := assertCeiling("cache unknown", cacheReclaimInputs{})
 
 	const cache = 100 * gib
-	aware := assertCeiling("100 GiB reclaimable cache", cacheReclaimInputs{
+	awareInputs := cacheReclaimInputs{
 		HaveVerdict: true, VerdictAge: fresh, BlockCacheBytes: cache,
-	})
+	}
+	aware := assertCeiling("100 GiB reclaimable cache", awareInputs)
 
-	// The whole point: the ceiling must actually RISE by the reclaimable amount.
-	wantDelta := cache - spoolCacheFlapMarginBytes
-	if d := aware - blind; d < wantDelta-tol {
+	// The whole point: the ceiling must actually rise by the reclaimable amount.
+	// Normalize each result against its own statfs sample: APFS free space can
+	// move by several GiB while the test process is idle (purgeable snapshots and
+	// concurrent build output), so subtracting the two raw ceilings made this a
+	// host-activity test rather than a refreshCeiling wiring test.
+	blindBase := wantCeiling(s.used.Load(), blind.avail, cacheReclaimInputs{})
+	awareBase := wantCeiling(s.used.Load(), aware.avail, cacheReclaimInputs{})
+	wantDelta := wantCeiling(s.used.Load(), aware.avail, awareInputs) - awareBase
+	if d := (aware.ceiling - awareBase) - (blind.ceiling - blindBase); d < wantDelta-2*tol {
 		t.Errorf("ceiling rose by only %.2f GiB with %d GiB of reclaimable cache — "+
 			"refreshCeiling is still counting free disk alone",
 			float64(d)/float64(gib), cache/gib)
@@ -272,8 +283,8 @@ func TestRefreshCeiling_CountsReclaimableCacheAsHeadroom(t *testing.T) {
 
 	// And admission must follow: a 40 GiB camera file that the free-disk-only
 	// ceiling refused must now be reservable.
-	if aware-s.used.Load() < 40*gib {
-		t.Fatalf("precondition: expected room for a 40 GiB file, ceiling %d used %d", aware, s.used.Load())
+	if aware.ceiling-s.used.Load() < 40*gib {
+		t.Fatalf("precondition: expected room for a 40 GiB file, ceiling %d used %d", aware.ceiling, s.used.Load())
 	}
 	if !s.tryReserveCapacity(40 * gib) {
 		t.Error("a 40 GiB camera file was refused despite a 100 GiB reclaimable cache")
