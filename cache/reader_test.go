@@ -447,6 +447,29 @@ func TestInvalidateSliceCache(t *testing.T) {
 	}
 }
 
+func TestResetRedisConnectionsSwapsPoolAndStopsCleanly(t *testing.T) {
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DB: 3})
+	r := NewReader("/fake", DefaultBlockSize, client)
+	old := r.rdb.Load()
+	if !r.ResetRedisConnections() {
+		t.Fatal("ResetRedisConnections returned false")
+	}
+	next := r.rdb.Load()
+	if next == nil || next == old {
+		t.Fatal("Redis client pool was not replaced")
+	}
+	if next.Options().Addr != old.Options().Addr || next.Options().DB != old.Options().DB {
+		t.Fatal("replacement Redis client did not preserve options")
+	}
+	r.Stop()
+	if r.rdb.Load() != nil {
+		t.Fatal("Stop left an active Redis client")
+	}
+	if r.ResetRedisConnections() {
+		t.Fatal("ResetRedisConnections succeeded after Stop")
+	}
+}
+
 func TestResolveSlicesNewestWins(t *testing.T) {
 	raw := []SliceInfo{
 		{Pos: 0, SliceID: 10, Size: 100, Off: 0, Len: 100},

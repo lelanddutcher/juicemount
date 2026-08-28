@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -43,7 +44,9 @@ type SliceInfo struct {
 type Reader struct {
 	cacheDir  string // e.g. ~/.juicefs/cache/{uuid}/raw/chunks
 	blockSize int64
-	rdb       *redis.Client
+	rdb       atomic.Pointer[redis.Client]
+	stopped   atomic.Bool
+	stopOnce  sync.Once
 
 	// Cached chunk→slice mappings: key = "inode_chunkIndex"
 	sliceMu    sync.RWMutex
@@ -85,11 +88,11 @@ func NewReader(cacheDir string, blockSize int64, rdb *redis.Client) *Reader {
 	r := &Reader{
 		cacheDir:   cacheDir,
 		blockSize:  blockSize,
-		rdb:        rdb,
 		sliceCache: make(map[string][]SliceInfo),
 		inodeEpoch: make(map[uint64]uint64),
 		flights:    make(map[string]*sliceFlight),
 	}
+	r.rdb.Store(rdb)
 	return r
 }
 
@@ -245,14 +248,24 @@ func (r *Reader) getSlicesBounded(ctx context.Context, inode uint64, chunkIndex 
 		r.flightMu.Unlock()
 	}()
 
-	if r.rdb == nil {
+	rdb := r.rdb.Load()
+	if rdb == nil {
 		flight.err = errors.New("no Redis client")
 		return nil, flight.err
 	}
 
 	// Fetch from Redis
 	redisKey := fmt.Sprintf("c%s", key)
-	items, err := r.rdb.LRange(ctx, redisKey, 0, -1).Result()
+	items, err := rdb.LRange(ctx, redisKey, 0, -1).Result()
+	// A Link transport transition deliberately closes the previous pool. If
+	// this lookup was the request that exposed the transition, retry once on
+	// the replacement client instead of turning a healthy local SSD read into
+	// a coherent-FUSE fallback merely because its own old pool was retired.
+	if err != nil {
+		if replacement := r.rdb.Load(); replacement != nil && replacement != rdb {
+			items, err = replacement.LRange(ctx, redisKey, 0, -1).Result()
+		}
+	}
 	if err != nil {
 		flight.err = err
 		return nil, err
@@ -517,9 +530,41 @@ func (r *Reader) putBuffer(buf []byte) {
 	}
 }
 
-// Stop is retained for lifecycle compatibility. Reads use fresh descriptors,
-// so there are no background goroutines or pooled files to close.
-func (r *Reader) Stop() {}
+// ResetRedisConnections swaps in a fresh go-redis pool and closes the previous
+// one. Link calls this when the verified backend transport changes, aborting a
+// socket whose proxy backend still points at the departed LAN instead of making
+// the first cached read wait for the stalled-request watchdog.
+func (r *Reader) ResetRedisConnections() bool {
+	if r == nil || r.stopped.Load() {
+		return false
+	}
+	old := r.rdb.Load()
+	if old == nil {
+		return false
+	}
+	opts := *old.Options()
+	next := redis.NewClient(&opts)
+	if !r.rdb.CompareAndSwap(old, next) {
+		_ = next.Close()
+		return false
+	}
+	_ = old.Close()
+	return true
+}
+
+// Stop closes the active Redis client. Reads themselves use fresh cache-file
+// descriptors and have no background goroutine to stop.
+func (r *Reader) Stop() {
+	if r == nil {
+		return
+	}
+	r.stopOnce.Do(func() {
+		r.stopped.Store(true)
+		if client := r.rdb.Swap(nil); client != nil {
+			_ = client.Close()
+		}
+	})
+}
 
 // DetectCacheDir finds the JuiceFS cache chunks directory.
 func DetectCacheDir() string {

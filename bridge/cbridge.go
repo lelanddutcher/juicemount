@@ -1448,6 +1448,23 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			globalCache = cr
 		}
 	}
+	if linkNode != nil {
+		// The adaptive proxy chooses its outbound leg per connection. A
+		// go-redis pool created on the LAN can therefore retain a socket whose
+		// proxy goroutine is still dialing the departed LAN after a cellular
+		// handoff. Replace only this private metadata pool on a verified
+		// transport transition; cached slice maps and SSD bytes remain valid.
+		if globalCache != nil {
+			cr := globalCache
+			linkNode.SetOnProxyTransportChanged(func(mode string) {
+				if cr.ResetRedisConnections() {
+					jmlog.Info("cache metadata Redis pool reset after Link transport change", "mode", mode)
+				}
+			})
+		} else {
+			linkNode.SetOnProxyTransportChanged(nil)
+		}
+	}
 
 	// NFS server
 	srv := jmnfs.NewServer(jmnfs.Config{

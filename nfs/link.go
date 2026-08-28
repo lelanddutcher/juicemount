@@ -53,6 +53,8 @@ type LinkNode struct {
 	proxyLastMode   atomic.Uint32
 	proxyLANConns   atomic.Uint64
 	proxyLinkConns  atomic.Uint64
+	proxyModeHookMu sync.RWMutex
+	proxyModeHook   func(string)
 }
 
 // contextDialer is deliberately small so proxy behavior can be tested with a
@@ -464,6 +466,19 @@ func (l *LinkNode) ProxyTransportStatus() LinkProxyTransportStatus {
 	}
 }
 
+// SetOnProxyTransportChanged installs a process-local notification for actual
+// adaptive proxy transitions. The callback runs outside Link's locks and must
+// return promptly. Passing nil clears a callback left by a previous NFS server
+// lifetime while the authenticated Link node remains warm.
+func (l *LinkNode) SetOnProxyTransportChanged(fn func(mode string)) {
+	if l == nil {
+		return
+	}
+	l.proxyModeHookMu.Lock()
+	l.proxyModeHook = fn
+	l.proxyModeHookMu.Unlock()
+}
+
 func (l *LinkNode) noteProxyMode(mode uint32, target string) {
 	if mode == proxyModeDirectLAN {
 		l.proxyLANConns.Add(1)
@@ -479,6 +494,17 @@ func (l *LinkNode) noteProxyMode(mode uint32, target string) {
 		label = "direct-lan"
 	}
 	jmlog.Info("JuiceMount Link: backend proxy transport changed", "mode", label, "target", target)
+	// Unknown is initialization, not a handoff. Notifying here could make the
+	// very first client connection retire the pool that is establishing it.
+	if previous == proxyModeUnknown {
+		return
+	}
+	l.proxyModeHookMu.RLock()
+	hook := l.proxyModeHook
+	l.proxyModeHookMu.RUnlock()
+	if hook != nil {
+		hook(label)
+	}
 }
 
 // AdaptiveDialContext establishes the encrypted connection first, then uses a

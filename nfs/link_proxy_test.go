@@ -169,6 +169,35 @@ func TestDirectLANEndpointMatchesOnlyFreshPrivatePeerAddress(t *testing.T) {
 	}
 }
 
+func TestProxyTransportChangeHookFiresOnlyOnTransitions(t *testing.T) {
+	node := &LinkNode{}
+	var got []string
+	node.SetOnProxyTransportChanged(func(mode string) {
+		got = append(got, mode)
+	})
+
+	node.noteProxyMode(proxyModeDirectLAN, "192.168.0.197:6379")
+	node.noteProxyMode(proxyModeDirectLAN, "192.168.0.197:9000")
+	node.noteProxyMode(proxyModeEncryptedLink, "192.168.0.197:6379")
+	node.noteProxyMode(proxyModeEncryptedLink, "192.168.0.197:9000")
+
+	want := []string{"encrypted-link"}
+	if len(got) != len(want) {
+		t.Fatalf("transport notifications = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("transport notification %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	node.SetOnProxyTransportChanged(nil)
+	node.noteProxyMode(proxyModeDirectLAN, "192.168.0.197:6379")
+	if len(got) != len(want) {
+		t.Fatalf("cleared hook received a notification: %v", got)
+	}
+}
+
 func TestAdaptiveBackendDialSelectsVerifiedLANAndClosesLinkProbe(t *testing.T) {
 	linkConn, linkPeer := net.Pipe()
 	directConn, directPeer := net.Pipe()
