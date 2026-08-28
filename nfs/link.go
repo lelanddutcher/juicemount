@@ -64,7 +64,11 @@ type contextDialer func(context.Context, string, string) (net.Conn, error)
 
 type linkRecoveryFunc func(context.Context) error
 
-const linkNoStateRecoveryDelay = 5 * time.Second
+// Headscale can retain the prior streaming map session for roughly ten seconds
+// after tsnet closes locally. Recovering before that release merely replays the
+// same blocked login race, so leave a measured safety margin before the single
+// saved-authorization recovery attempt.
+const linkNoStateRecoveryDelay = 15 * time.Second
 
 // tcpProxy accepts only on loopback and forwards each connection through its
 // supplied dialer. It owns active connections so Link shutdown cannot leave
