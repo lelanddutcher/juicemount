@@ -32,8 +32,27 @@ APP_RES_DIR="$APP_DIR/Contents/Resources"
 SWIFT_PKG="$PROJECT_ROOT/app/JuiceMount"
 PLISTBUDDY="/usr/libexec/PlistBuddy"
 JM_BUILD_VERSION="${JM_VERSION:-0.5.0}"
+GO_BUILD_VCS_ARGS=()
 if [ -n "${JM_COMMIT:-}" ]; then
     JM_BUILD_COMMIT="$JM_COMMIT"
+    if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+        echo "ERROR: JM_COMMIT was supplied, but this source tree has no verifiable git HEAD" >&2
+        exit 1
+    fi
+    SOURCE_HEAD="$(git rev-parse HEAD)"
+    if [ "$JM_BUILD_COMMIT" != "$SOURCE_HEAD" ]; then
+        echo "ERROR: JM_COMMIT ($JM_BUILD_COMMIT) does not match source HEAD ($SOURCE_HEAD)" >&2
+        exit 1
+    fi
+    if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+        echo "ERROR: explicit-commit release builds require a clean tracked source tree" >&2
+        exit 1
+    fi
+    # Go's automatic VCS stamping can report the primary checkout's revision
+    # when building from a linked worktree. The explicit commit validated above
+    # is embedded by ldflags and in both bundle plists, so omit the misleading
+    # automatic stamp for release artifacts.
+    GO_BUILD_VCS_ARGS=(-buildvcs=false)
 elif git rev-parse --verify HEAD >/dev/null 2>&1; then
     JM_BUILD_COMMIT="$(git rev-parse HEAD)"
 else
@@ -61,6 +80,7 @@ MACOSX_DEPLOYMENT_TARGET=14.0 \
 CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=14.0" \
 CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=14.0" \
 CGO_ENABLED=1 go build \
+    "${GO_BUILD_VCS_ARGS[@]}" \
     -ldflags "$GO_BUILD_LDFLAGS" \
     -buildmode=c-archive \
     -o "$BUILD_DIR/libnfsd.a" \
