@@ -79,6 +79,21 @@ func warmupSampler() {
 	}
 }
 
+// warmupServingState returns the process-local serving marker, repairing it
+// from the health monitor's last kernel-verified NFS result when a recovery
+// path restored the volume without passing through the original boot mount
+// branch. The health monitor's NFS verdict is deliberately the only recovery
+// signal accepted here: globalMountPath and a mount-table entry alone can both
+// survive a dead loopback NFS session and must not make the UI claim readiness.
+func warmupServingState(running, nfsHealthy bool) (since int64, serving bool) {
+	since = warmupServingSince.Load()
+	if since == 0 && running && nfsHealthy {
+		warmupMarkServing()
+		since = warmupServingSince.Load()
+	}
+	return since, since > 0
+}
+
 type warmupResponse struct {
 	Phase      string `json:"phase"` // starting | indexing | warming | steady
 	Progress   int    `json:"progress_pct"`
@@ -97,6 +112,7 @@ func handleWarmupHTTP(w http.ResponseWriter, r *http.Request) {
 	globalMu.Lock()
 	rc := globalRC
 	running := globalServer != nil
+	monitor := globalMonitor
 	globalMu.Unlock()
 
 	m := metrics.Default().Snapshot()
@@ -106,9 +122,10 @@ func handleWarmupHTTP(w http.ResponseWriter, r *http.Request) {
 		IndexPct:   100,
 	}
 
-	since := warmupServingSince.Load()
+	nfsHealthy := monitor != nil && monitor.Status().NFS.Healthy
+	since, serving := warmupServingState(running, nfsHealthy)
 	now := time.Now().Unix()
-	if since > 0 {
+	if serving {
 		resp.UptimeSec = now - since
 		resp.Serving = true
 	}

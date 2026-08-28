@@ -2081,14 +2081,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 					if mountErr == nil {
 						jmlog.Info("nfs mounted", "mount_point", mountPoint,
 							"attempt", attempt)
-						warmupMarkServing()
-						globalMu.Lock()
-						globalMountPath = mountPoint
-						mon := globalMonitor
-						globalMu.Unlock()
-						if mon != nil {
-							refreshNFSHealthAfterMount(mon, mountPoint)
-						}
+						recordAndConfirmNFSMount(mountPoint)
 						return
 					}
 					if attempt < 6 {
@@ -2202,9 +2195,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			if err := mountNFSNonInteractive(remountAddr, remountPoint); err != nil {
 				return err
 			}
-			globalMu.Lock()
-			globalMountPath = remountPoint
-			globalMu.Unlock()
+			recordAndConfirmNFSMount(remountPoint)
 			return nil
 		})
 		// #93 NFS-layer absent-mount recovery: when the volume is genuinely
@@ -2221,9 +2212,7 @@ func NFSServerStart(configJSON *C.char) *C.char {
 			if err := mountNFSWithPrompt(remountAddr, remountPoint); err != nil {
 				return err
 			}
-			globalMu.Lock()
-			globalMountPath = remountPoint
-			globalMu.Unlock()
+			recordAndConfirmNFSMount(remountPoint)
 			return nil
 		})
 	}
@@ -2373,6 +2362,7 @@ func refreshNFSHealthAfterMount(mon *health.HealthMonitor, mountPoint string) {
 	for attempt := 1; attempt <= 10; attempt++ {
 		st := mon.RefreshNFS()
 		if st.Healthy {
+			warmupMarkServing()
 			jmlog.Info("nfs health refreshed after mount", "mount_point", mountPoint, "attempt", attempt)
 			return
 		}
@@ -2382,6 +2372,25 @@ func refreshNFSHealthAfterMount(mon *health.HealthMonitor, mountPoint string) {
 	}
 	jmlog.Warn("nfs mount completed but health confirmation is still pending",
 		"mount_point", mountPoint, "hint", "periodic health checks will continue")
+}
+
+// recordAndConfirmNFSMount is the single success path for asynchronous boot,
+// watchdog, absent-mount, and user-triggered mount recovery. It publishes the
+// recovered path immediately, then advances warm-up only if the health
+// monitor's bounded mount-table + stat probe confirms the kernel can actually
+// use it. If confirmation is temporarily late, /warmup self-heals from the
+// monitor's next healthy sample rather than remaining stuck at 5%.
+func recordAndConfirmNFSMount(mountPoint string) {
+	if mountPoint == "" {
+		return
+	}
+	globalMu.Lock()
+	globalMountPath = mountPoint
+	mon := globalMonitor
+	globalMu.Unlock()
+	if mon != nil {
+		refreshNFSHealthAfterMount(mon, mountPoint)
+	}
 }
 
 // NFSServerStop is a *soft* stop: it tears down the NFS server, the
@@ -6178,6 +6187,7 @@ func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mountNowDeps.isMounted(mp) {
+		recordAndConfirmNFSMount(mp)
 		fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_mounted":true}`, mp)
 		return
 	}
@@ -6186,6 +6196,7 @@ func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
 		// Lost a race with a concurrent mount (auto-remount, a second
 		// click): if the volume IS mounted now, that's still success.
 		if mountNowDeps.isMounted(mp) {
+			recordAndConfirmNFSMount(mp)
 			fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_mounted":true}`, mp)
 			return
 		}
@@ -6194,9 +6205,7 @@ func handleMountNowHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"ok":false,"mount_point":%q,"error":%q}`, mp, err.Error())
 		return
 	}
-	globalMu.Lock()
-	globalMountPath = mp
-	globalMu.Unlock()
+	recordAndConfirmNFSMount(mp)
 	jmlog.Info("mount-now: mounted", "mount_point", mp)
 	fmt.Fprintf(w, `{"ok":true,"mount_point":%q,"already_mounted":false}`, mp)
 }
