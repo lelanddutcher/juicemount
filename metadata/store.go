@@ -263,6 +263,16 @@ type Store struct {
 	// Injected via SetOnPathInvalidated; nil when unwired. Guarded by mu.
 	onPathInvalidated func(path string, isDir bool)
 
+	// onContentInvalidated is distinct from onPathInvalidated: create/update
+	// events commonly preserve path identity (so pooled FUSE descriptors stay
+	// valid) while changing the JuiceFS slice mapping behind the inode. The NFS
+	// layer uses this hook to drop byte caches without disturbing write slots.
+	// onContentReset is the coarse companion for a full reconciliation or
+	// subtree prune where missed events make exact path generations unknowable.
+	// Both are injected by the NFS layer and guarded by mu.
+	onContentInvalidated func(path string, isDir bool)
+	onContentReset       func()
+
 	// ftsInitialized is set once the external-content FTS has been built (the
 	// first BulkInsert / initial sync). After that EVERY BulkInsert maintains
 	// FTS incrementally — even a large delta — so it never holds writeMu
@@ -644,6 +654,50 @@ func (s *Store) NotifyPathInvalidated(p string, isDir bool) {
 	s.mu.RUnlock()
 	if fn != nil {
 		fn(p, isDir)
+	}
+}
+
+// SetOnContentInvalidated registers the byte-cache invalidation hook. Unlike
+// SetOnPathInvalidated, this is intentionally fired for create/update too: a
+// same-inode overwrite changes JuiceFS slice IDs without making a pooled FUSE
+// descriptor stale.
+func (s *Store) SetOnContentInvalidated(fn func(path string, isDir bool)) {
+	s.mu.Lock()
+	s.onContentInvalidated = fn
+	s.mu.Unlock()
+}
+
+// NotifyContentInvalidated invokes the byte-cache hook outside s.mu. Callers
+// must fire it before replacing/removing the mirror row so the consumer can
+// resolve the previous inode and invalidate its cached chunk mappings.
+func (s *Store) NotifyContentInvalidated(p string, isDir bool) {
+	if p == "" {
+		return
+	}
+	s.mu.RLock()
+	fn := s.onContentInvalidated
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(p, isDir)
+	}
+}
+
+// SetOnContentReset registers the coarse byte-cache reset hook used when a
+// reconciliation can cover changes whose individual pub/sub events were lost.
+func (s *Store) SetOnContentReset(fn func()) {
+	s.mu.Lock()
+	s.onContentReset = fn
+	s.mu.Unlock()
+}
+
+// NotifyContentReset drops all derived byte mappings through the registered
+// consumer hook. It is nil-safe and, like the targeted hook, runs outside s.mu.
+func (s *Store) NotifyContentReset() {
+	s.mu.RLock()
+	fn := s.onContentReset
+	s.mu.RUnlock()
+	if fn != nil {
+		fn()
 	}
 }
 

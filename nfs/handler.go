@@ -803,6 +803,11 @@ func NewHandler(store *metadata.Store, fusePath string, opts ...HandlerOption) *
 		// the previous inode behind that name. Same hook idiom, same reason
 		// metadata/ can't do it itself.
 		store.SetOnPathInvalidated(h.onRemotePathInvalidated)
+		// Same-inode overwrites keep pooled FUSE descriptors valid but replace
+		// JuiceFS slice IDs, so byte-cache invalidation is a separate seam.
+		// Full reconcile uses the coarse reset to cover missed push events.
+		store.SetOnContentInvalidated(h.onContentInvalidated)
+		store.SetOnContentReset(h.onContentReset)
 	}
 
 	// L5 (2026-08-06): publish the fd pool + memory buffer so /metrics can
@@ -904,6 +909,42 @@ func (h *JuiceMountHandler) onRemotePathInvalidated(inMountPath string, isDir bo
 		return
 	}
 	h.invalidatePooledReadFDs(inMountPath)
+}
+
+// onContentInvalidated drops derived byte caches while leaving pooled FUSE
+// descriptors alone. Metadata fires this BEFORE mutating the mirror, which
+// lets invalidateReadCaches resolve the previous inode for an overwrite,
+// delete, or rename destination. A directory replacement invalidates all slice
+// mappings conservatively because one event can cover an entire subtree.
+func (h *JuiceMountHandler) onContentInvalidated(inMountPath string, isDir bool) {
+	if h == nil || inMountPath == "" {
+		return
+	}
+	if isDir {
+		if h.memBuf != nil {
+			h.memBuf.InvalidateTree(inMountPath)
+		}
+		if cr := h.cacheReader.Load(); cr != nil {
+			cr.InvalidateAll()
+		}
+		return
+	}
+	h.invalidateReadCaches(inMountPath)
+}
+
+// onContentReset is the recovery/backstop seam: after a complete metadata
+// reconciliation (or a targeted subtree prune), no locally cached slice map is
+// trusted to have observed every intervening content event.
+func (h *JuiceMountHandler) onContentReset() {
+	if h == nil {
+		return
+	}
+	if h.memBuf != nil {
+		h.memBuf.InvalidateAll()
+	}
+	if cr := h.cacheReader.Load(); cr != nil {
+		cr.InvalidateAll()
+	}
 }
 
 // invalidatePooledReadFDs / invalidatePooledReadFDTree are the read-slot-only
@@ -4293,30 +4334,18 @@ func (f *cachedFile) LiveSize() (int64, bool) {
 func (f *cachedFile) Name() string { return f.name }
 
 // cacheReaderServeEnabled gates the Priority-2 direct-SSD-cache serving read.
-// DEFAULT OFF. The direct read of JuiceFS's PRIVATE SSD block files is
-// fundamentally incoherent and was proven to SILENTLY corrupt reads:
+// DEFAULT ON after the RC repair. The previous implementation was disabled
+// after measured silent torn reads because it used raw/overlapping Redis slice
+// records, guessed every block was 4 MiB, crossed slice/block boundaries,
+// ignored JuiceFS's checksum trailer, and pooled descriptors across eviction.
 //
-//   - No length clamp: cache.Reader.readFromCache ReadAt's the caller's FULL
-//     buffer at the slice offset but never clamps to the slice's valid Len nor
-//     the block's real data length. JuiceFS block files are variable-length
-//     with a 4-byte CRC trailer and can pack multiple compacted slices, so an
-//     overrunning read returns correct head bytes + FOREIGN tail (CRC /
-//     adjacent slice) — a torn read within one file. The short read is even
-//     swallowed (err=nil when n>0), so onRead accepts it and never retries
-//     through coherent FUSE.
-//   - Incoherent + stale fd: the 5-min-cached block fd can read a block file
-//     mid-rewrite/evict by JuiceFS.
-//
-// Measured 2026-06-15: ~0.5-1.3% of files torn under 12-16-way concurrent NFS
-// reads of a freshly-drained 692-file/22.76GB set; SERIAL and raw-FUSE reads
-// were 100% correct and server read_fails/rpc_errors stayed 0 (silent). The
-// coherent FUSE path (Priority 3) is correct AND fast — JuiceFS serves its own
-// warm cache — and the buggy blockPath made P2 miss (→ FUSE) the vast majority
-// of the time anyway, so disabling it costs almost nothing. Re-enable ONLY
-// after cache.Reader is repaired (clamp to min(len, sliceLen, blockDataLen) +
-// correct on-disk blockPath layout + CRC validation + no-stale-fd). See task
-// "silent torn-read on concurrent NFS reads".
-var cacheReaderServeEnabled = os.Getenv("JM_ENABLE_CACHE_READER") == "1"
+// cache.Reader now mirrors JuiceFS 1.3's newest-wins slice overlay and exact
+// cache filename layout, clamps every segment, opens immutable files per read,
+// verifies CsExtend CRC32C for every touched 32 KiB range, returns all-or-
+// nothing, and invalidates mappings on local/remote mutation plus reconcile.
+// JM_ENABLE_CACHE_READER=0 remains the emergency kill switch: every miss or
+// rejected block falls through to coherent FUSE without surfacing partial data.
+var cacheReaderServeEnabled = os.Getenv("JM_ENABLE_CACHE_READER") != "0"
 
 // memBufServeEnabled gates serving reads from the in-RAM small-file buffer.
 // DISABLED by default (2026-07-05): the RAM buffer can cache a file that it
@@ -4421,18 +4450,32 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		}
 	}
 
-	// Priority 2: Direct SSD cache read (bypasses FUSE). DISABLED by default —
-	// incoherent + unclamped → silent torn reads under concurrency (see
-	// cacheReaderServeEnabled). Falls through to the coherent FUSE path below.
+	// Priority 2: checksum-verified direct SSD cache read (bypasses FUSE and its
+	// remote metadata round trips). Any miss or integrity refusal falls through
+	// to the coherent FUSE path below; see cacheReaderServeEnabled.
 	if f.cacheReader != nil && cacheReaderServeEnabled {
-		n, err := f.cacheReader.ReadBlock(context.Background(), f.inode, off, p)
+		// A mapping already in RAM never observes this deadline. A first read
+		// needs one LRANGE; bound it so an unreachable Redis cannot park an NFS
+		// connection for the client's full soft-mount timeout. Far links get room
+		// for the verified direct→encrypted handoff; explicit offline mode only
+		// admits mappings we already have locally.
+		mappingTimeout := 500 * time.Millisecond
+		if netprofile.Default().HighLatency() {
+			mappingTimeout = 4 * time.Second
+		}
+		if pin.IsOffline() {
+			mappingTimeout = 200 * time.Millisecond
+		}
+		n, err := f.cacheReader.ReadBlockWithMappingTimeout(context.Background(), f.inode, off, p, mappingTimeout)
 		if err == nil && n > 0 {
+			metrics.Default().ObserveDirectSSDCacheHit(int64(n))
 			if f.readahead != nil {
 				f.readahead.OnRead(f.inode, off, n, f.name)
 			}
 			metrics.Default().AddBytesRead(int64(n))
 			return n, nil
 		}
+		metrics.Default().IncDirectSSDCacheMiss()
 	}
 
 	// Offline mode short-circuit: if the user has flipped to offline, we don't

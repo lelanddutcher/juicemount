@@ -223,6 +223,13 @@ type Registry struct {
 	readColdSubread atomic.Uint64
 	readWarmSubread atomic.Uint64
 
+	// directSSDCache* grades the repaired Priority-2 serving path. A hit means
+	// bytes were read from a JuiceFS cache file and CRC32C-verified without a
+	// FUSE/Redis round trip; a miss fell through to coherent FUSE.
+	directSSDCacheHit      atomic.Uint64
+	directSSDCacheHitBytes atomic.Uint64
+	directSSDCacheMiss     atomic.Uint64
+
 	// readQoS* — grades #4 (INSTANT-NAV read-QoS, slow/metered links only).
 	// queued = a read hit a full lane and waited; failOpen = a wait crossed
 	// its bound and proceeded ungated; prefetchShed = a readahead round was
@@ -731,6 +738,17 @@ func (r *Registry) IncReadColdSubread() { r.readColdSubread.Add(1) }
 // IncReadWarmSubread records a FUSE subread served warm (local SSD block cache).
 func (r *Registry) IncReadWarmSubread() { r.readWarmSubread.Add(1) }
 
+// ObserveDirectSSDCacheHit records a complete, checksum-verified direct read.
+func (r *Registry) ObserveDirectSSDCacheHit(n int64) {
+	r.directSSDCacheHit.Add(1)
+	if n > 0 {
+		r.directSSDCacheHitBytes.Add(uint64(n))
+	}
+}
+
+// IncDirectSSDCacheMiss records a direct-cache attempt that safely fell back.
+func (r *Registry) IncDirectSSDCacheMiss() { r.directSSDCacheMiss.Add(1) }
+
 // IncReadQoSQueued records a read that found its QoS lane full and waited.
 func (r *Registry) IncReadQoSQueued() { r.readQoSQueued.Add(1) }
 
@@ -860,6 +878,9 @@ type Snapshot struct {
 	LookupNoent               uint64 `json:"lookup_noent"`
 	ReadColdSubread           uint64 `json:"read_cold_subread"`
 	ReadWarmSubread           uint64 `json:"read_warm_subread"`
+	DirectSSDCacheHit         uint64 `json:"direct_ssd_cache_hit"`
+	DirectSSDCacheHitBytes    uint64 `json:"direct_ssd_cache_hit_bytes"`
+	DirectSSDCacheMiss        uint64 `json:"direct_ssd_cache_miss"`
 	ReadQoSQueued             uint64 `json:"read_qos_queued"`
 	ReadQoSFailOpen           uint64 `json:"read_qos_fail_open"`
 	ReadQoSPrefetchShed       uint64 `json:"read_qos_prefetch_shed"`
@@ -968,6 +989,9 @@ func (r *Registry) Snapshot() Snapshot {
 		LookupNoent:               r.lookupNoent.Load(),
 		ReadColdSubread:           r.readColdSubread.Load(),
 		ReadWarmSubread:           r.readWarmSubread.Load(),
+		DirectSSDCacheHit:         r.directSSDCacheHit.Load(),
+		DirectSSDCacheHitBytes:    r.directSSDCacheHitBytes.Load(),
+		DirectSSDCacheMiss:        r.directSSDCacheMiss.Load(),
 		ReadQoSQueued:             r.readQoSQueued.Load(),
 		ReadQoSFailOpen:           r.readQoSFailOpen.Load(),
 		ReadQoSPrefetchShed:       r.readQoSPrefetchShed.Load(),

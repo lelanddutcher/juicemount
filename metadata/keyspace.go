@@ -1358,6 +1358,12 @@ func (rc *RedisClient) reconcileDir(dirInode uint64) error {
 	// Apply upserts (cache-first, then SQLite) via the applyEvent fast path
 	// equivalent. For large dirs, batch via BulkInsert.
 	if len(toUpsert) > 0 {
+		// Invalidate while the previous mirror rows are still resolvable. A
+		// same-inode, same-path overwrite can replace JuiceFS slice IDs without
+		// making a pooled FUSE descriptor stale.
+		for _, e := range toUpsert {
+			rc.store.NotifyContentInvalidated(e.Path, e.IsDir)
+		}
 		if len(toUpsert) >= 500 {
 			if err := rc.store.BulkInsert(toUpsert, 500); err != nil {
 				return err
@@ -1630,6 +1636,10 @@ func (rc *RedisClient) scopedPrune(parentPath string, freshNames map[string]stru
 		}
 	}
 
+	// A removed directory can cover an arbitrary cached subtree. Reset byte
+	// mappings before mirror deletion; scoped prune is uncommon and correctness
+	// is more important than trying to reconstruct every old inode here.
+	rc.store.NotifyContentReset()
 	if err := rc.store.DeletePaths(toDelete); err != nil {
 		jmlog.Warn("metadata keyspace push: scoped prune delete", "parent", parentPath, "error", err.Error())
 		return

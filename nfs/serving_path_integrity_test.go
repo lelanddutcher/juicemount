@@ -611,3 +611,40 @@ func TestRemotePathInvalidatedHookDropsPooledFDs(t *testing.T) {
 		t.Fatalf("unrelated remote mutations dropped a live pooled fd (pool has %d entries, want 1)", open)
 	}
 }
+
+func TestContentInvalidationHookDropsOnlyAffectedMemoryBytes(t *testing.T) {
+	jfs, store, _ := newIntegrityHarness(t)
+	h := jfs.handler
+
+	seed := func(p string) {
+		t.Helper()
+		h.memBuf.mu.Lock()
+		h.memBuf.entries[p] = &memBufEntry{data: []byte("old"), size: 3}
+		h.memBuf.totalSize += 3
+		h.memBuf.mu.Unlock()
+	}
+	has := func(p string) bool {
+		h.memBuf.mu.Lock()
+		defer h.memBuf.mu.Unlock()
+		_, ok := h.memBuf.entries[p]
+		return ok
+	}
+
+	seed("peer/clip.mov")
+	seed("peer/sub/clip.mov")
+	seed("peer-old/keep.mov")
+	store.NotifyContentInvalidated("peer/clip.mov", false)
+	if has("peer/clip.mov") || !has("peer/sub/clip.mov") || !has("peer-old/keep.mov") {
+		t.Fatal("file content invalidation did not stay exact-path scoped")
+	}
+
+	store.NotifyContentInvalidated("peer", true)
+	if has("peer/sub/clip.mov") || !has("peer-old/keep.mov") {
+		t.Fatal("directory content invalidation crossed a sibling prefix or missed a descendant")
+	}
+
+	store.NotifyContentReset()
+	if has("peer-old/keep.mov") {
+		t.Fatal("content reset left buffered bytes behind")
+	}
+}

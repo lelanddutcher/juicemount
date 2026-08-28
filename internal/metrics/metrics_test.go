@@ -68,6 +68,9 @@ func TestNavLatencyCounters(t *testing.T) {
 	r.IncReadColdSubread()
 	r.IncReadColdSubread()
 	r.IncReadWarmSubread()
+	r.ObserveDirectSSDCacheHit(4096)
+	r.ObserveDirectSSDCacheHit(1024)
+	r.IncDirectSSDCacheMiss()
 	r.IncReadaheadTriggered()
 	r.AddReadaheadPrefetchedBlocks(7)
 	r.AddReadaheadPrefetchedBlocks(0)  // no-op guard
@@ -118,6 +121,9 @@ func TestNavLatencyCounters(t *testing.T) {
 		{"lookup_noent", snap.LookupNoent, 1},
 		{"read_cold_subread", snap.ReadColdSubread, 2},
 		{"read_warm_subread", snap.ReadWarmSubread, 1},
+		{"direct_ssd_cache_hit", snap.DirectSSDCacheHit, 2},
+		{"direct_ssd_cache_hit_bytes", snap.DirectSSDCacheHitBytes, 5120},
+		{"direct_ssd_cache_miss", snap.DirectSSDCacheMiss, 1},
 		{"readahead_triggered", snap.ReadaheadTriggered, 1},
 		{"readahead_prefetched_blocks", snap.ReadaheadPrefetchedBlocks, 7},
 		{"recover_lstat_total", snap.RecoverLstat, 5},
@@ -150,6 +156,9 @@ func TestNavLatencyCounters(t *testing.T) {
 		`"lookup_noent":1`,
 		`"read_cold_subread":2`,
 		`"read_warm_subread":1`,
+		`"direct_ssd_cache_hit":2`,
+		`"direct_ssd_cache_hit_bytes":5120`,
+		`"direct_ssd_cache_miss":1`,
 		`"readahead_triggered":1`,
 		`"readahead_prefetched_blocks":7`,
 		`"recover_lstat_total":5`,

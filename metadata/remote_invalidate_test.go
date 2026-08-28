@@ -132,6 +132,83 @@ func TestApplyEventCreateDoesNotInvalidate(t *testing.T) {
 	}
 }
 
+func TestApplyEventContentInvalidatesBeforeMirrorMutation(t *testing.T) {
+	tests := []struct {
+		name string
+		evt  MetadataEvent
+		seed []*Entry
+		want []invalidation
+	}{
+		{
+			name: "same-inode update",
+			evt:  MetadataEvent{Op: "update", Path: "movies/a.mov", Inode: 42, Size: 101, Mtime: time.Now().Unix()},
+			seed: []*Entry{MakeEntry("movies/a.mov", false, 100, time.Now(), 42)},
+			want: []invalidation{{"movies/a.mov", false}},
+		},
+		{
+			name: "delete",
+			evt:  MetadataEvent{Op: "delete", Path: "movies/a.mov"},
+			seed: []*Entry{MakeEntry("movies/a.mov", false, 100, time.Now(), 42)},
+			want: []invalidation{{"movies/a.mov", false}},
+		},
+		{
+			name: "rename replacement",
+			evt:  MetadataEvent{Op: "rename", OldPath: "movies/a.mov", Path: "movies/b.mov", Inode: 42, Mtime: time.Now().Unix()},
+			seed: []*Entry{
+				MakeEntry("movies/a.mov", false, 100, time.Now(), 42),
+				MakeEntry("movies/b.mov", false, 200, time.Now(), 99),
+			},
+			want: []invalidation{{"movies/a.mov", false}, {"movies/b.mov", false}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStore(t)
+			rc := &RedisClient{store: s}
+			for _, e := range tt.seed {
+				s.InsertToCache(e)
+			}
+
+			var got []invalidation
+			var visibleAtCallback []bool
+			s.SetOnContentInvalidated(func(p string, isDir bool) {
+				got = append(got, invalidation{p, isDir})
+				visibleAtCallback = append(visibleAtCallback, s.LookupByPath(p) != nil)
+			})
+			rc.applyEvent(tt.evt)
+
+			if len(got) != len(tt.want) {
+				t.Fatalf("content invalidations = %+v, want %+v", got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("content invalidation[%d] = %+v, want %+v", i, got[i], tt.want[i])
+				}
+				// Every seeded source/destination must still be visible when the
+				// callback runs so the consumer can resolve its previous inode.
+				if i < len(tt.seed) && !visibleAtCallback[i] {
+					t.Fatalf("%s was removed from the mirror before content invalidation", got[i].path)
+				}
+			}
+		})
+	}
+}
+
+func TestNotifyContentResetIsNilSafeAndReentrant(t *testing.T) {
+	s := newTestStore(t)
+	s.NotifyContentReset()
+	called := 0
+	s.SetOnContentReset(func() {
+		_ = s.LookupByPath("anything") // proves callback runs outside s.mu
+		called++
+	})
+	s.NotifyContentReset()
+	if called != 1 {
+		t.Fatalf("content resets = %d, want 1", called)
+	}
+}
+
 // TestNotifyPathInvalidatedUnwiredAndEmptyAreSafe guards the degenerate inputs
 // the wiring can hand us (no consumer registered; an empty OldPath on a rename
 // event, which is legal on the wire).

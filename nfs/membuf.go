@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -332,6 +333,28 @@ func (mb *MemoryBuffer) Invalidate(path string) {
 		mb.totalSize -= entry.size
 		delete(mb.entries, path)
 	}
+}
+
+// InvalidateTree removes a directory and every buffered descendant without
+// matching sibling prefixes ("reel" does not invalidate "reel-old").
+func (mb *MemoryBuffer) InvalidateTree(path string) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	prefix := strings.TrimSuffix(path, "/") + "/"
+	for cachedPath, entry := range mb.entries {
+		if cachedPath == path || strings.HasPrefix(cachedPath, prefix) {
+			mb.totalSize -= entry.size
+			delete(mb.entries, cachedPath)
+		}
+	}
+}
+
+// InvalidateAll drops all buffered contents after a full metadata repair.
+func (mb *MemoryBuffer) InvalidateAll() {
+	mb.mu.Lock()
+	clear(mb.entries)
+	mb.totalSize = 0
+	mb.mu.Unlock()
 }
 
 // Stats returns buffer statistics.

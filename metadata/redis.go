@@ -1283,6 +1283,10 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		// round trip, and only on the rare shrink — an append-only write stream
 		// (the common case) never takes this path at all.
 		existing := rc.store.LookupByPath(evt.Path)
+		// Byte-cache identity changes even when path + inode do not. Fire before
+		// replacing the mirror row so the consumer can resolve the old inode's
+		// cached JuiceFS slice mapping. Spurious self-echo invalidation is safe.
+		rc.store.NotifyContentInvalidated(evt.Path, evt.IsDir)
 		if existing != nil && !evt.IsDir && evt.Size < existing.Size {
 			rc.reconcileShrunkEntry(evt, existing.Size)
 			return
@@ -1325,6 +1329,9 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		if e := rc.store.LookupByPath(evt.Path); e != nil && e.IsDir {
 			delIsDir = true
 		}
+		// Must precede mirror eviction: the byte-cache consumer resolves the
+		// old inode from this row in order to drop its slice mapping.
+		rc.store.NotifyContentInvalidated(evt.Path, delIsDir)
 		rc.store.DeleteFromCache(evt.Path)
 		if err := rc.store.Delete(evt.Path); err != nil {
 			log.Printf("subscribe apply delete: %v", err)
@@ -1338,6 +1345,14 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		rc.store.NoteDirectoryChanged(path.Dir(evt.Path))
 
 	case "rename":
+		renameIsDir := evt.IsDir
+		if e := rc.store.LookupByPath(evt.OldPath); e != nil && e.IsDir {
+			renameIsDir = true
+		}
+		// Both ends are invalidated before either mirror row changes: the source
+		// carries the old inode and POSIX rename may replace a cached destination.
+		rc.store.NotifyContentInvalidated(evt.OldPath, renameIsDir)
+		rc.store.NotifyContentInvalidated(evt.Path, renameIsDir)
 		// The OldPath removal is UNGATED: a rename INTO .trash is JuiceFS's
 		// delete-to-trash, and the source row must still be dropped.
 		if evt.OldPath != "" {
@@ -1349,8 +1364,8 @@ func (rc *RedisClient) applyEvent(evt MetadataEvent) {
 		// the source name may be recreated and the destination just replaced
 		// whatever POSIX rename unlinked there. evt.IsDir is set by the rename
 		// publisher (it rides along for the symlink/type discriminators).
-		rc.store.NotifyPathInvalidated(evt.OldPath, evt.IsDir)
-		rc.store.NotifyPathInvalidated(evt.Path, evt.IsDir)
+		rc.store.NotifyPathInvalidated(evt.OldPath, renameIsDir)
+		rc.store.NotifyPathInvalidated(evt.Path, renameIsDir)
 		// Task #78: skip mirroring the DESTINATION when it lands in a
 		// scan-filtered namespace (delete-to-trash). A rename OUT of .trash
 		// (restore) has a non-filtered destination and is mirrored normally.
@@ -2096,6 +2111,7 @@ func (rc *RedisClient) syncMetadata() (err error) {
 	// only when the cursor completes, so each attempt advances the scan instead
 	// of repeating it.
 	raws, rev, cursor := rc.takeScanResume()
+	contentReset := false
 	for {
 		res, err := rc.redisDB().Eval(ctx, luaScanBatch, nil, cursor, scanCount).StringSlice()
 		if err != nil {
@@ -2113,6 +2129,15 @@ func (rc *RedisClient) syncMetadata() (err error) {
 					err, scanBudget, context.DeadlineExceeded)
 			}
 			return fmt.Errorf("redis SCAN batch: %w", err)
+		}
+		if !contentReset {
+			// The first successful authoritative round trip proves reconnect.
+			// Drop pre-outage slice mappings now—not minutes later after a large
+			// cellular SCAN—so reads cannot serve a generation changed while
+			// pub/sub was disconnected. A failed/offline attempt preserves the
+			// mappings that make verified cached media available offline.
+			rc.store.NotifyContentReset()
+			contentReset = true
 		}
 		if len(res) == 0 {
 			break
