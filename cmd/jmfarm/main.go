@@ -70,6 +70,9 @@ type passOpts struct {
 	target   string        // human label for the status rollup (root or "files:…")
 	gov      farm.Governor // resolved governor stamp for the status file
 	store    *derivatives.Store
+	// process is an injectable seam for accounting tests. Production callers
+	// leave it nil and use farm.Process.
+	process func(*derivatives.Store, string, farm.Options) farm.Result
 }
 
 // runPasses dispatches one sweep over targets with the worker pool + live
@@ -78,7 +81,7 @@ type passOpts struct {
 // render batch can retry only its failures. The generator dispatch below is the
 // single source of truth: the basic, proxy and transcript modes all funnel
 // through the same internal/farm calls.
-func runPasses(po passOpts, targets []string) (processed, failed int, failedTargets []string) {
+func runPasses(po passOpts, targets []string) (processed, failed int, failedTargets, failureDetails []string) {
 	start := time.Now()
 	var ok, fail, thumbs, strips, waves, speech, transcriptSkipped, proxies, proxySkipped, qls int64
 	// skippedFresh counts assets whose derivatives already matched byte-identical
@@ -87,6 +90,10 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 	var mu sync.Mutex
 	var firstErrs []string
 	var failedPaths []string
+	process := po.process
+	if process == nil {
+		process = farm.Process
+	}
 
 	// Live progress: while the sweep runs, write farm-status.json every ~3s with an
 	// in_progress block {pass, total, done, failed, started_at} so the manager Farm
@@ -222,7 +229,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 				return
 			}
 
-			r := farm.Process(po.store, p, po.opt)
+			r := process(po.store, p, po.opt)
 			if r.Err != nil {
 				atomic.AddInt64(&fail, 1)
 				recordFailure(&mu, &firstErrs, &failedPaths, p, r.Err)
@@ -231,12 +238,12 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 				}
 				return
 			}
-			atomic.AddInt64(&ok, 1)
 			// A move must be VISIBLE as a move. Without its own counter a skipped
 			// asset is indistinguishable from one that generated nothing, and the
 			// whole point of the freshness gate is being able to tell that a
 			// reorganised folder cost no compute.
 			if r.SkippedFresh {
+				atomic.AddInt64(&ok, 1)
 				atomic.AddInt64(&skippedFresh, 1)
 				if r.SidecarRepaired {
 					atomic.AddInt64(&sidecarsRepaired, 1)
@@ -257,9 +264,21 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 			if r.WaveWrote {
 				atomic.AddInt64(&waves, 1)
 			}
-			if r.BlobErr != nil { // non-fatal: tech published, a blob couldn't render
-				recordErr(&mu, &firstErrs, p, r.BlobErr)
+			if r.BlobErr != nil {
+				// The metadata row may have published successfully, but this pass asks
+				// for the blob set too. Counting a partial artifact failure as `ok`
+				// made live progress and the terminal Redis job claim zero failures
+				// while the derivative index accumulated status:"failed" rows.
+				// Preserve the successful metadata, but make the file/job outcome
+				// truthful and retryable.
+				atomic.AddInt64(&fail, 1)
+				recordFailure(&mu, &firstErrs, &failedPaths, p, r.BlobErr)
+				if po.verbose {
+					fmt.Printf("  [PARTIAL FAIL] %-42s inode=%d %v\n", filepath.Base(p), r.Inode, r.BlobErr)
+				}
+				return
 			}
+			atomic.AddInt64(&ok, 1)
 			if po.verbose {
 				fmt.Printf("  [ok] %-50s inode=%d hash=%s %dms vid=%v thumb=%v strip=%v wave=%v\n",
 					filepath.Base(p), r.Inode, r.Hash, r.DurationMS, r.HasVideo, r.ThumbWrote, r.FilmWrote, r.WaveWrote)
@@ -310,7 +329,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 		}
 	}
 	sort.Strings(failedPaths)
-	return int(ok), int(fail), failedPaths
+	return int(ok), int(fail), failedPaths, append([]string(nil), firstErrs...)
 }
 
 func main() {
@@ -595,7 +614,7 @@ func main() {
 	gov := farm.NewGovernor(*wModel, *vcodec, *pPreset, mode,
 		*pCRF, *conc, *pConc, *gNice, *gIONice, *gInterval)
 
-	_, failed, _ := runPasses(passOpts{
+	_, failed, _, _ := runPasses(passOpts{
 		opt: opt, mode: mode, transcr: *transcr, proxyGen: *proxyGen, qlGen: *qlGen,
 		dryRun: *dryRun, verbose: *verbose, effConc: effConc,
 		status: *status, mount: *mount, producer: *producer,
@@ -885,13 +904,11 @@ func runQueue(cfg queueConfig) {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: heartbeat: %v\n", err)
 		}
 
-		if ctl.Paused {
-			select {
-			case <-ctx.Done():
-			case <-time.After(time.Second):
-			}
-			continue
-		}
+		// Queue maintenance is not work execution. It must continue while the farm
+		// is paused so a worker that disappears during a pause cannot strand a
+		// durable processing receipt forever. ClaimForWorker independently checks
+		// the control document atomically, so recovered jobs remain unclaimable
+		// until play/resume.
 		if nextReap.IsZero() || time.Now().After(nextReap) {
 			if recovered, err := q.RecoverAbandonedWorkers(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: recovery scan: %v\n", err)
@@ -904,6 +921,13 @@ func runQueue(cfg queueConfig) {
 				fmt.Printf("jmfarm queue: re-routed %d unserviceable render job(s)\n", recovered)
 			}
 			nextReap = time.Now().Add(15 * time.Second)
+		}
+		if ctl.Paused {
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+			}
+			continue
 		}
 
 		claim, ok, err := q.ClaimForWorker(ctx, 5*time.Second, worker)
@@ -1175,6 +1199,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 	if len(passes) == 0 {
 		return 0, 0, nil, fmt.Errorf("job %s has no runnable kinds (%v)", job.ID, job.Kinds)
 	}
+	var failureDetails []string
 
 	base := farm.Options{
 		Producer: cfg.producer, Version: cfg.version, Mount: cfg.mount,
@@ -1200,7 +1225,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 			break // cancelled between passes → stop cleanly, report what we did
 		}
 		gov := farm.NewGovernor(wModel, vcodec, preset, p.mode, crf, conc, pConc, cfg.gNice, cfg.gIONice, 0)
-		pr, pf, failedPaths := runPasses(passOpts{
+		pr, pf, failedPaths, details := runPasses(passOpts{
 			opt: base, mode: p.mode, transcr: p.transcr, proxyGen: p.proxyGen, qlGen: p.qlGen,
 			dryRun: false, verbose: cfg.verbose, effConc: p.effConc,
 			status: cfg.status, mount: cfg.mount, producer: cfg.producer,
@@ -1209,10 +1234,15 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 		processed += pr
 		failed += pf
 		failedTargets = append(failedTargets, failedPaths...)
+		failureDetails = append(failureDetails, details...)
 	}
 	if failed > 0 {
 		sort.Strings(failedTargets)
-		return processed, failed, uniqueSortedStrings(failedTargets), passFailure(processed, failed)
+		passErr := passFailure(processed, failed)
+		if len(failureDetails) > 0 {
+			passErr = fmt.Errorf("%w; first errors: %s", passErr, strings.Join(failureDetails, "; "))
+		}
+		return processed, failed, uniqueSortedStrings(failedTargets), passErr
 	}
 	return processed, failed, nil, nil
 }

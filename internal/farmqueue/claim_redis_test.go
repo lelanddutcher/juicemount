@@ -197,3 +197,79 @@ func TestRedisClaimRecoveryPrefersAnotherRenderWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A farm-wide pause stops new claims, not durable queue maintenance. This is
+// the exact restart-during-pause case that left a live validation transcript
+// status:"running" on an expired worker receipt indefinitely.
+func TestRedisPausedFarmRecoversAbandonedClaimWithoutExecutingIt(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Worker{ID: "paused-recovery-server", Name: "server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	render := Worker{ID: "paused-recovery-render", Name: "render", Role: QueueClassRender,
+		Capabilities: []string{"encoder:hevc_vaapi"}, Encoders: []string{"hevc_vaapi"}}
+	if err := q.Heartbeat(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Heartbeat(ctx, render); err != nil {
+		t.Fatal(err)
+	}
+	job := NewJob("/jfs/incoming/paused-recovery.mov", []string{KindProxy}, "manager")
+	if err := q.Enqueue(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+	if err != nil || !ok {
+		t.Fatalf("initial render claim: ok=%v err=%v", ok, err)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, render); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.Del(ctx, WorkerPrefix+render.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	control := DefaultFarmControl()
+	control.Paused = true
+	if _, err := q.StoreControl(ctx, control, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+		t.Fatalf("paused recovery = %d, %v; want 1, nil", n, err)
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, server); err != nil || ok {
+		t.Fatalf("paused farm executed recovered work: ok=%v err=%v", ok, err)
+	}
+	status, err := q.rdb.HGetAll(ctx, JobHashPrefix+job.ID).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != StatusQueued || status["attempts"] != "1" || status["backend"] != "libx264" {
+		t.Fatalf("recovered status = %+v, want queued attempt 1 on explicit CPU fallback", status)
+	}
+
+	control.Paused = false
+	if _, err := q.StoreControl(ctx, control, 0); err != nil {
+		t.Fatal(err)
+	}
+	recovered, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok || recovered.Job.ID != job.ID {
+		t.Fatalf("resumed claim = %+v ok=%v err=%v", recovered.Job, ok, err)
+	}
+}

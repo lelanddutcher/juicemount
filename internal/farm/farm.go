@@ -538,6 +538,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 			// sidecar.go's sanitize accepts exactly "ready" and "failed".
 			// WriteFileAt was never called, so there is no blob to clean up and
 			// the row carries no blob path.
+			blobErrs = append(blobErrs, fmt.Errorf("waveform: indexed audio has no decodable samples"))
 			rows = append(rows, derivatives.DerivRow{
 				Kind: "waveform", Status: "failed", Producer: opt.Producer, Version: opt.Version,
 				Hash: &hash, MediaType: &mt,
