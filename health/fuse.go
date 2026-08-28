@@ -527,10 +527,26 @@ func (fm *FUSEManager) Mount() error {
 		return fmt.Errorf("create mount point: %w", err)
 	}
 
-	// Check if already mounted
+	// Check if already mounted. A FUSE daemon can outlive a force-quit or an
+	// interrupted app update. That is normally useful, but Link's loopback
+	// proxy endpoints are owned by the app process: after a relaunch the old
+	// daemon's redis://127.0.0.1:<old-port> points at a listener that no longer
+	// exists. Reusing that mount makes cached/LAN reads look healthy while every
+	// cold remote read returns EIO. Reuse only when the running daemon names the
+	// endpoint this manager is configured to keep alive. If process inspection
+	// is unavailable, preserve the old conservative reuse behavior rather than
+	// destructively replacing a mount whose ownership cannot be proved.
 	if fm.isMountedLocked() {
-		log.Printf("[fuse] already mounted at %s", fm.cfg.MountPoint)
-		return nil
+		known, matches := runningJuiceFSMountEndpointMatches(fm.cfg.MountPoint, fm.cfg.RedisURL)
+		if fm.cfg.RedisURL == "" || !known || matches {
+			log.Printf("[fuse] already mounted at %s", fm.cfg.MountPoint)
+			return nil
+		}
+		jmlog.Warn("existing juicefs mount uses a stale backend endpoint — replacing it before reuse",
+			"mountpoint", fm.cfg.MountPoint)
+		if err := fm.ensureUnmountedLocked(3); err != nil {
+			return fmt.Errorf("replace stale-endpoint juicefs mount: %w", err)
+		}
 	}
 
 	// Unmount any stale mount first — and VERIFY the kernel actually released
@@ -2044,30 +2060,77 @@ func (fm *FUSEManager) monitorLoop() {
 // JuiceFS mount for the exact mount point. Scoping is release-critical: a test
 // mount or a second JuiceMount volume must never convince this manager that its
 // own dead daemon is still alive and suppress recovery forever.
+func parseJuiceFSMountCommand(command string) (redisURL, mountPoint string, ok bool) {
+	fields := strings.Fields(command)
+	if len(fields) < 4 || filepath.Base(fields[0]) != "juicefs" {
+		return "", "", false
+	}
+	// --verbose is a global JuiceFS option and may precede the subcommand.
+	// Keep the scan deliberately tight so an unrelated command containing the
+	// word "mount" cannot be mistaken for the daemon.
+	mountIndex := -1
+	for i := 1; i < len(fields) && i <= 3; i++ {
+		if fields[i] == "mount" {
+			mountIndex = i
+			break
+		}
+	}
+	if mountIndex < 0 || mountIndex+2 >= len(fields) {
+		return "", "", false
+	}
+	return fields[mountIndex+1], fields[mountIndex+2], true
+}
+
 func juiceFSMountCommandTargets(command, mountPoint string) bool {
 	mountPoint = filepath.Clean(strings.TrimSpace(mountPoint))
 	if mountPoint == "." || mountPoint == "" {
 		return false
 	}
-	fields := strings.Fields(command)
-	if len(fields) < 2 || filepath.Base(fields[0]) != "juicefs" || fields[1] != "mount" {
+	_, commandMount, ok := parseJuiceFSMountCommand(command)
+	if !ok {
 		return false
 	}
-	padded := " " + strings.TrimSpace(command) + " "
-	return strings.Contains(padded, " "+mountPoint+" ")
+	return filepath.Clean(commandMount) == mountPoint
 }
 
-// juiceFSMountProcessIDs returns the process IDs for JuiceFS daemons targeting
+type juiceFSMountProcess struct {
+	pid     string
+	command string
+}
+
+// runningJuiceFSMountEndpointMatches reports whether process inspection found
+// the daemon for mountPoint and, if so, whether at least one such daemon uses
+// the exact Redis endpoint this FUSEManager will keep reachable. Exact matching
+// intentionally includes credentials and DB selection without logging either.
+func runningJuiceFSMountEndpointMatches(mountPoint, redisURL string) (known, matches bool) {
+	return juiceFSMountEndpointMatchesProcesses(juiceFSMountProcesses(mountPoint), redisURL)
+}
+
+func juiceFSMountEndpointMatchesProcesses(processes []juiceFSMountProcess, redisURL string) (known, matches bool) {
+	for _, process := range processes {
+		processRedis, _, ok := parseJuiceFSMountCommand(process.command)
+		if !ok {
+			continue
+		}
+		known = true
+		if processRedis == redisURL {
+			return true, true
+		}
+	}
+	return known, false
+}
+
+// juiceFSMountProcesses returns the processes for JuiceFS daemons targeting
 // one exact mount point. The ps call is bounded so a sick host cannot pin the
-// watchdog or shutdown path.
-func juiceFSMountProcessIDs(mountPoint string) []string {
+// watchdog, startup, or shutdown path.
+func juiceFSMountProcesses(mountPoint string) []juiceFSMountProcess {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
 	if err != nil {
 		return nil
 	}
-	var ids []string
+	var processes []juiceFSMountProcess
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -2080,8 +2143,19 @@ func juiceFSMountProcessIDs(mountPoint string) []string {
 		pid := line[:cut]
 		command := strings.TrimSpace(line[cut:])
 		if juiceFSMountCommandTargets(command, mountPoint) {
-			ids = append(ids, pid)
+			processes = append(processes, juiceFSMountProcess{pid: pid, command: command})
 		}
+	}
+	return processes
+}
+
+// juiceFSMountProcessIDs returns the process IDs for JuiceFS daemons targeting
+// one exact mount point.
+func juiceFSMountProcessIDs(mountPoint string) []string {
+	processes := juiceFSMountProcesses(mountPoint)
+	ids := make([]string, 0, len(processes))
+	for _, process := range processes {
+		ids = append(ids, process.pid)
 	}
 	return ids
 }
