@@ -3,6 +3,7 @@ package nfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"strings"
 	"sync/atomic"
@@ -56,6 +57,28 @@ func TestRecoverLinkNoStateStopsAfterRestartFailure(t *testing.T) {
 	}
 	if got := strings.Join(client.calls, ","); got != "start" {
 		t.Fatalf("calls = %q, want start only", got)
+	}
+}
+
+func TestLinkTSNetDiagnosticNeverReturnsRawErrors(t *testing.T) {
+	sensitiveURL := "https://control.example.invalid/register?auth=do-not-log"
+	event, attrs, ok := linkTSNetDiagnostic("[v1] TryLogin: %v", errors.New("request "+sensitiveURL+": context deadline exceeded"))
+	if !ok || event != "auth-try-login-error" {
+		t.Fatalf("diagnostic = %q %v %v", event, attrs, ok)
+	}
+	got := fmt.Sprint(attrs)
+	if strings.Contains(got, sensitiveURL) || !strings.Contains(got, "timeout") {
+		t.Fatalf("diagnostic attributes leaked raw error or lost class: %q", got)
+	}
+}
+
+func TestLinkTSNetDiagnosticAllowlist(t *testing.T) {
+	event, attrs, ok := linkTSNetDiagnostic("Authkey is set; but state is %v. Ignoring authkey.", ipn.NoState)
+	if !ok || event != "initial-auth-trigger-skipped" || !strings.Contains(fmt.Sprint(attrs), "NoState") {
+		t.Fatalf("diagnostic = %q %v %v", event, attrs, ok)
+	}
+	if _, _, ok := linkTSNetDiagnostic("RegisterRequest: %s", "sensitive payload"); ok {
+		t.Fatal("raw registration payload unexpectedly passed diagnostic allowlist")
 	}
 }
 

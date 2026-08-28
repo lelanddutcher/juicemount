@@ -69,6 +69,99 @@ type linkControlClient interface {
 	StartLoginInteractive(context.Context) error
 }
 
+// linkTSNetLogf is an opt-in release diagnostic for the embedded control
+// client. It intentionally allowlists fixed event categories and coarse error
+// classes instead of forwarding tsnet's raw logs, which can contain control
+// URLs, node keys, hostnames, preferences, and registration payloads.
+func linkTSNetLogf(format string, args ...any) {
+	if os.Getenv("JM_LINK_DEBUG") != "1" {
+		return
+	}
+	event, attrs, ok := linkTSNetDiagnostic(format, args...)
+	if !ok {
+		return
+	}
+	fields := []any{"event", event}
+	fields = append(fields, attrs...)
+	jmlog.Info("link tsnet diagnostic", fields...)
+}
+
+func linkTSNetDiagnostic(format string, args ...any) (string, []any, bool) {
+	safeArg := func(i int) string {
+		if i < 0 || i >= len(args) {
+			return "unknown"
+		}
+		return fmt.Sprint(args[i])
+	}
+	switch {
+	case strings.Contains(format, "tsnet running state path"):
+		return "state-store-open", nil, true
+	case strings.Contains(format, "tsnet starting with hostname"):
+		return "backend-created", nil, true
+	case strings.Contains(format, "Authkey is set; but state is"):
+		return "initial-auth-trigger-skipped", []any{"state", safeArg(0)}, true
+	case strings.Contains(format, "LocalBackend state is"):
+		return "initial-auth-triggered", []any{"state", safeArg(0)}, true
+	case strings.Contains(format, "StartLoginInteractiveAs"):
+		return "localapi-login-request", nil, true
+	case strings.Contains(format, "client.Login("):
+		return "control-login-request", nil, true
+	case strings.Contains(format, "authRoutine: loggedIn="):
+		return "auth-routine-state", []any{"logged_in", safeArg(0)}, true
+	case strings.Contains(format, "direct.TryLogin"):
+		return "auth-try-login", nil, true
+	case strings.Contains(format, "doLogin(regen="):
+		return "auth-do-login", []any{"regenerate", safeArg(0), "has_url", safeArg(1)}, true
+	case strings.Contains(format, "control server key from"):
+		return "control-key-loaded", nil, true
+	case strings.Contains(format, "RegisterReq: onode"):
+		return "register-request", nil, true
+	case strings.Contains(format, "RegisterReq: got response"):
+		return "register-response", nil, true
+	case strings.Contains(format, "PollNetMap:"):
+		return "map-poll-start", nil, true
+	case strings.Contains(format, "mapRoutine: netmap received"):
+		return "map-received", nil, true
+	case strings.Contains(format, "Switching ipn state"):
+		return "backend-state-transition", []any{"from", safeArg(0), "to", safeArg(1), "want_running", safeArg(2)}, true
+	case strings.Contains(format, "TryLogin: %v"):
+		return "auth-try-login-error", []any{"kind", linkDiagnosticErrorKind(args)}, true
+	case strings.Contains(format, "failed to save new controlclient state"):
+		return "state-save-error", []any{"kind", linkDiagnosticErrorKind(args)}, true
+	default:
+		return "", nil, false
+	}
+}
+
+func linkDiagnosticErrorKind(args []any) string {
+	if len(args) == 0 {
+		return "unknown"
+	}
+	s := strings.ToLower(fmt.Sprint(args[len(args)-1]))
+	switch {
+	case strings.Contains(s, "context canceled"):
+		return "canceled"
+	case strings.Contains(s, "deadline exceeded") || strings.Contains(s, "timeout"):
+		return "timeout"
+	case strings.Contains(s, "connection refused"):
+		return "refused"
+	case strings.Contains(s, "no such host") || strings.Contains(s, "dns"):
+		return "dns"
+	case strings.Contains(s, "certificate") || strings.Contains(s, "tls") || strings.Contains(s, "x509"):
+		return "tls"
+	case strings.Contains(s, "rate limit"):
+		return "rate-limited"
+	case strings.Contains(s, "unauthorized") || strings.Contains(s, "forbidden"):
+		return "authorization"
+	case strings.Contains(s, "eof"):
+		return "eof"
+	case strings.Contains(s, "network is unreachable") || strings.Contains(s, "no route"):
+		return "unreachable"
+	default:
+		return "other"
+	}
+}
+
 // Headscale can retain the prior streaming map session for roughly ten seconds
 // after tsnet closes locally. Recovering before that release merely replays the
 // same blocked login race, so leave a measured safety margin before the single
@@ -120,7 +213,8 @@ func newLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, lin
 		AuthKey:    authKey,
 		Dir:        stateDir,
 		Ephemeral:  false, // silent rejoin on every launch is the product behavior
-		Logf:       func(string, ...any) {},
+		Logf:       linkTSNetLogf,
+		UserLogf:   linkTSNetLogf,
 	}
 	if err := s.Start(); err != nil {
 		return nil, nil, fmt.Errorf("link: start: %w", err)
