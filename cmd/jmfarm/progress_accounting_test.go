@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"github.com/lelanddutcher/juicemount/internal/farm"
@@ -61,5 +64,59 @@ func TestRunPassesCountsPartialBlobFailure(t *testing.T) {
 	}
 	if status.InProgress != nil {
 		t.Fatalf("terminal status retained in-progress block: %+v", status.InProgress)
+	}
+}
+
+func TestRunPassesPreCanceledDoesNotLaunchTargets(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var calls int64
+	processed, failed, failedTargets, details := runPasses(passOpts{
+		ctx: ctx, mode: "derivatives", effConc: 4,
+		process: func(_ *derivatives.Store, path string, opt farm.Options) farm.Result {
+			atomic.AddInt64(&calls, 1)
+			return farm.Result{Path: path}
+		},
+	}, []string{"one.mov", "two.mov", "three.mov"})
+
+	if calls != 0 {
+		t.Fatalf("process calls = %d, want zero after cancellation", calls)
+	}
+	if processed != 0 || failed != 0 || len(failedTargets) != 0 || len(details) != 0 {
+		t.Fatalf("cancelled counts = %d/%d targets=%v details=%v", processed, failed, failedTargets, details)
+	}
+}
+
+func TestRunPassesCancellationStopsSchedulingAndDoesNotCountFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	result := make(chan [2]int, 1)
+	var calls int64
+	go func() {
+		processed, failed, _, _ := runPasses(passOpts{
+			ctx: ctx, mode: "derivatives", effConc: 1,
+			process: func(_ *derivatives.Store, path string, opt farm.Options) farm.Result {
+				if atomic.AddInt64(&calls, 1) == 1 {
+					close(started)
+				}
+				<-opt.Context.Done()
+				return farm.Result{Path: path, Err: opt.Context.Err()}
+			},
+		}, []string{"one.mov", "two.mov", "three.mov"})
+		result <- [2]int{processed, failed}
+	}()
+	<-started
+	cancel()
+
+	select {
+	case counts := <-result:
+		if counts != [2]int{} {
+			t.Fatalf("cancelled counts = %v, want zero", counts)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runPasses did not return after cancellation")
+	}
+	if calls != 1 {
+		t.Fatalf("process calls = %d, want only the active target", calls)
 	}
 }

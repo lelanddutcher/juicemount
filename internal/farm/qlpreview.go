@@ -1,9 +1,9 @@
 package farm
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"syscall"
 
@@ -102,10 +102,14 @@ func buildQLArgs(srcPath, outPath string, maxDim, maxSeconds int) []string {
 // outPath inside the held derivative-directory descriptor (O_EXCL|O_NOFOLLOW),
 // exactly like Thumbnail/Proxy — this function adds no atomicity of its own.
 func QLPreview(ffmpegBin, srcPath, outPath string, maxDim, maxSeconds int) error {
+	return QLPreviewContext(context.Background(), ffmpegBin, srcPath, outPath, maxDim, maxSeconds)
+}
+
+func QLPreviewContext(ctx context.Context, ffmpegBin, srcPath, outPath string, maxDim, maxSeconds int) error {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
-	cmd := exec.Command(ffmpegBin, buildQLArgs(srcPath, outPath, maxDim, maxSeconds)...)
+	cmd := commandContext(ctx, ffmpegBin, buildQLArgs(srcPath, outPath, maxDim, maxSeconds)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg qlpreview %q: %w: %s", srcPath, err, out)
 	}
@@ -118,6 +122,11 @@ func QLPreview(ffmpegBin, srcPath, outPath string, maxDim, maxSeconds int) error
 // tech/poster/filmstrip/waveform derivatives behind an encode.
 func GenerateQLPreview(store *derivatives.Store, path string, opt Options) QLResult {
 	res := QLResult{Path: path}
+	ctx := optionContext(opt)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		res.Err = err
@@ -138,6 +147,10 @@ func GenerateQLPreview(store *derivatives.Store, path string, opt Options) QLRes
 		return res
 	}
 	res.Hash = hash
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
 	if opt.Mount == "" {
 		res.Err = fmt.Errorf("qlpreview requires Options.Mount")
@@ -163,7 +176,7 @@ func GenerateQLPreview(store *derivatives.Store, path string, opt Options) QLRes
 		}
 	}
 
-	tech, err := Probe(opt.FFprobeBin, path, size)
+	tech, err := ProbeContext(ctx, opt.FFprobeBin, path, size)
 	if err != nil {
 		res.Err = err
 		return res
@@ -198,7 +211,12 @@ func GenerateQLPreview(store *derivatives.Store, path string, opt Options) QLRes
 	}
 	stampSource(&row, fi)
 
-	err = QLPreview(opt.FFmpegBin, path, out, maxDim, maxSec)
+	err = QLPreviewContext(ctx, opt.FFmpegBin, path, out, maxDim, maxSec)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		derivatives.DiscardStagedAt(derivDir, staged)
+		res.Err = ctxErr
+		return res
+	}
 	if err == nil {
 		err = derivatives.CommitStagedAt(derivDir, staged, qlPreviewBlobName)
 	}
@@ -211,6 +229,10 @@ func GenerateQLPreview(store *derivatives.Store, path string, opt Options) QLRes
 	} else {
 		res.Wrote = true
 		row.Status = "ready"
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		res.Err = ctxErr
+		return res
 	}
 
 	if err := store.PutSource(inode, &hash); err != nil {

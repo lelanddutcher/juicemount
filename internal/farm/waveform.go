@@ -1,6 +1,7 @@
 package farm
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -8,7 +9,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"os/exec"
 )
 
 // WaveformJSON is the de-facto-standard BBC audiowaveform / waveform-data.js
@@ -31,6 +31,10 @@ const waveformSampleRate = 48000
 // overview (min,max per pixel-bucket) as a BBC-format JSON blob. Streams the PCM
 // so a feature-length file doesn't buffer in memory. Returns the pixel length.
 func Waveform(ffmpegBin, srcPath string, dir *os.File, outName string, samplesPerPixel int) (int, error) {
+	return WaveformContext(context.Background(), ffmpegBin, srcPath, dir, outName, samplesPerPixel)
+}
+
+func WaveformContext(ctx context.Context, ffmpegBin, srcPath string, dir *os.File, outName string, samplesPerPixel int) (int, error) {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -40,7 +44,7 @@ func Waveform(ffmpegBin, srcPath string, dir *os.File, outName string, samplesPe
 	// Fold ALL audio streams + channels to mono (the silent-data-loss fix —
 	// audioFoldArgs). -v error (not quiet) so a real decode failure surfaces in
 	// stderr + trips the cmd.Wait() error path instead of a silent flatline.
-	foldArgs, hasAudio, ferr := audioFoldArgs(ffmpegBin, srcPath, waveformSampleRate)
+	foldArgs, hasAudio, ferr := audioFoldArgsContext(ctx, ffmpegBin, srcPath, waveformSampleRate)
 	if ferr != nil {
 		return 0, fmt.Errorf("waveform: probe audio %q: %w", srcPath, ferr)
 	}
@@ -54,7 +58,7 @@ func Waveform(ffmpegBin, srcPath string, dir *os.File, outName string, samplesPe
 	cmdArgs = append(cmdArgs, "-vn", "-i", srcPath)
 	cmdArgs = append(cmdArgs, foldArgs...)
 	cmdArgs = append(cmdArgs, "-f", "s16le", "-")
-	cmd := exec.Command(ffmpegBin, cmdArgs...)
+	cmd := commandContext(ctx, ffmpegBin, cmdArgs...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return 0, err

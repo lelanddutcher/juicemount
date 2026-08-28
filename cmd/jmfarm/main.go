@@ -57,8 +57,9 @@ var mediaExts = map[string]bool{
 // the one-shot CLI modes and the queue loop. The booleans select the generator;
 // at most one of Transcript/Proxy/QLPreview is set (else basic derivatives run).
 type passOpts struct {
-	opt      farm.Options // resolved generator options (already merged with job overrides in queue mode)
-	mode     string       // "derivatives" | "proxy" | "ql-preview" | "transcript(AI)" — display + status stamp
+	ctx      context.Context // queue signal context; nil means a non-cancellable one-shot sweep
+	opt      farm.Options    // resolved generator options (already merged with job overrides in queue mode)
+	mode     string          // "derivatives" | "proxy" | "ql-preview" | "transcript(AI)" — display + status stamp
 	transcr  bool
 	proxyGen bool
 	qlGen    bool
@@ -84,6 +85,11 @@ type passOpts struct {
 // through the same internal/farm calls.
 func runPasses(po passOpts, targets []string) (processed, failed int, failedTargets, failureDetails []string) {
 	start := time.Now()
+	ctx := po.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	po.opt.Context = ctx
 	var ok, fail, thumbs, strips, waves, speech, transcriptSkipped, proxies, proxySkipped, qls int64
 	// skippedFresh counts assets whose derivatives already matched byte-identical
 	// source — a moved or re-enqueued file that cost no re-encode.
@@ -115,6 +121,8 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 				select {
 				case <-stopProgress:
 					return
+				case <-ctx.Done():
+					return
 				case <-tick.C:
 					done := atomic.LoadInt64(&ok) + atomic.LoadInt64(&fail)
 					ip := farm.InProgress{
@@ -137,18 +145,35 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 		}()
 	}
 
+	if po.effConc < 1 {
+		po.effConc = 1
+	}
 	sem := make(chan struct{}, po.effConc)
 	var wg sync.WaitGroup
+targetLoop:
 	for _, p := range targets {
+		if ctx.Err() != nil {
+			break
+		}
 		p := p
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break targetLoop
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
 
 			if po.dryRun {
-				tech, e := farm.Probe(po.opt.FFprobeBin, p, 0)
+				tech, e := farm.ProbeContext(ctx, po.opt.FFprobeBin, p, 0)
+				if ctx.Err() != nil {
+					return
+				}
 				if e != nil {
 					atomic.AddInt64(&fail, 1)
 					recordFailure(&mu, &firstErrs, &failedPaths, p, e)
@@ -163,6 +188,9 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 
 			if po.qlGen {
 				qr := farm.GenerateQLPreview(po.store, p, po.opt)
+				if ctx.Err() != nil {
+					return
+				}
 				if qr.Err != nil {
 					atomic.AddInt64(&fail, 1)
 					recordFailure(&mu, &firstErrs, &failedPaths, p, qr.Err)
@@ -184,6 +212,9 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 
 			if po.proxyGen {
 				pr := farm.GenerateProxy(po.store, p, po.opt)
+				if ctx.Err() != nil {
+					return
+				}
 				if pr.Err != nil {
 					atomic.AddInt64(&fail, 1)
 					recordFailure(&mu, &firstErrs, &failedPaths, p, pr.Err)
@@ -208,6 +239,9 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 
 			if po.transcr {
 				tr := farm.GenerateTranscript(po.store, p, po.opt)
+				if ctx.Err() != nil {
+					return
+				}
 				if tr.Err != nil {
 					atomic.AddInt64(&fail, 1)
 					recordFailure(&mu, &firstErrs, &failedPaths, p, tr.Err)
@@ -231,6 +265,9 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 			}
 
 			r := process(po.store, p, po.opt)
+			if ctx.Err() != nil {
+				return
+			}
 			if r.Err != nil {
 				atomic.AddInt64(&fail, 1)
 				recordFailure(&mu, &firstErrs, &failedPaths, p, r.Err)
@@ -293,7 +330,10 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 	close(stopProgress)
 	progressWG.Wait()
 
-	if po.transcr {
+	if ctx.Err() != nil {
+		fmt.Printf("\njmfarm cancelled after %s: %d completed, %d failed — %d total\n",
+			time.Since(start).Round(time.Millisecond), ok, fail, len(targets))
+	} else if po.transcr {
 		fmt.Printf("\njmfarm done in %s: %d ok, %d failed, %d with-speech (transcribed), %d skipped-current — %d total\n",
 			time.Since(start).Round(time.Millisecond), ok, fail, speech, transcriptSkipped, len(targets))
 	} else if po.qlGen {
@@ -320,6 +360,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 			Mode: po.mode, Producer: po.producer, Target: po.target,
 			Processed: int(ok), Failed: int(fail),
 			StartedAt: start.Unix(), DurationMS: time.Since(start).Milliseconds(),
+			Canceled: ctx.Err() != nil,
 		}
 		// Final (idle) write: clears in_progress + measures proxy_economics (stat-
 		// walks the proxy blobs under mount). gov was stamped before the sweep with
@@ -724,7 +765,7 @@ func runQueue(cfg queueConfig) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	profile, profileErr := probeWorkerProfile(cfg)
+	profile, profileErr := probeWorkerProfile(ctx, cfg)
 	if profileErr != nil {
 		fmt.Fprintf(os.Stderr, "jmfarm: worker capability admission failed: %v\n", profileErr)
 		os.Exit(1)
@@ -871,7 +912,11 @@ func runQueue(cfg queueConfig) {
 			}
 		}()
 		go runWatchBackstop(ctx, cfg, q, worker.ID, kinds)
-		defer q.ReleaseWatchLeadership(context.Background(), worker.ID)
+		defer func() {
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer releaseCancel()
+			_ = q.ReleaseWatchLeadership(releaseCtx, worker.ID)
+		}()
 	} else if !farm.WatchEnabled() {
 		fmt.Fprintln(os.Stderr, "farm watch: disabled (JM_FARM_WATCH=0)")
 	} else {
@@ -977,8 +1022,8 @@ func runQueue(cfg queueConfig) {
 				case <-hbCtx.Done():
 					return
 				case <-t.C:
-					_ = q.Heartbeat(context.Background(), hbWorker)
-					_ = q.RenewClaim(context.Background(), claim)
+					_ = q.Heartbeat(hbCtx, hbWorker)
+					_ = q.RenewClaim(hbCtx, claim)
 				}
 			}
 		}()
@@ -1242,6 +1287,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 	var failureDetails []string
 
 	base := farm.Options{
+		Context:  ctx,
 		Producer: cfg.producer, Version: cfg.version, Mount: cfg.mount,
 		Blobs: true, ThumbMaxDim: cfg.thumbDim, Filmstrip: true, FilmstripCell: cfg.filmCell,
 		Waveform: true, WaveformSPP: cfg.waveSPP,
@@ -1266,6 +1312,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 		}
 		gov := farm.NewGovernor(wModel, vcodec, preset, p.mode, crf, conc, pConc, cfg.gNice, cfg.gIONice, 0)
 		pr, pf, failedPaths, details := runPasses(passOpts{
+			ctx: ctx,
 			opt: base, mode: p.mode, transcr: p.transcr, proxyGen: p.proxyGen, qlGen: p.qlGen,
 			dryRun: false, verbose: cfg.verbose, effConc: p.effConc,
 			status: cfg.status, mount: cfg.mount, producer: cfg.producer,

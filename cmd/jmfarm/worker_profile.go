@@ -31,7 +31,7 @@ type hardwareEncoderProbe struct {
 // probeWorkerProfile admits a node from work it actually completes, not device
 // names or container flags. A render node with an exposed-but-broken GPU fails
 // admission instead of silently becoming a CPU worker.
-func probeWorkerProfile(cfg queueConfig) (workerProfile, error) {
+func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, error) {
 	p := workerProfile{
 		Capabilities:       []string{"cpu", "metadata"},
 		TranscriptBackends: []string{"cpu"},
@@ -40,10 +40,10 @@ func probeWorkerProfile(cfg queueConfig) (workerProfile, error) {
 		},
 	}
 	var probeErrs []string
-	encoderProbes, encoderErrs := probeHardwareEncoders()
+	encoderProbes, encoderErrs := probeHardwareEncoders(ctx)
 	probeErrs = append(probeErrs, encoderErrs...)
 	for _, encoder := range encoderProbes {
-		decoder, fps, err := probeHardwareDecode(encoder.Name)
+		decoder, fps, err := probeHardwareDecode(ctx, encoder.Name)
 		if err != nil {
 			probeErrs = append(probeErrs, err.Error())
 			continue
@@ -71,7 +71,7 @@ func probeWorkerProfile(cfg queueConfig) (workerProfile, error) {
 
 	device := strings.ToLower(strings.TrimSpace(cfg.tDevice))
 	if device != "" && device != "cpu" {
-		if ratio, err := probeTranscriptBackend(cfg.wBin, cfg.wModel, device); err == nil {
+		if ratio, err := probeTranscriptBackend(ctx, cfg.wBin, cfg.wModel, device); err == nil {
 			p.TranscriptBackends = append(p.TranscriptBackends, device)
 			p.Capabilities = append(p.Capabilities, "transcript:"+device)
 			p.Benchmarks.TranscriptXReal = ratio
@@ -79,11 +79,14 @@ func probeWorkerProfile(cfg queueConfig) (workerProfile, error) {
 			probeErrs = append(probeErrs, err.Error())
 		}
 	}
-	p.Benchmarks.AccessMBps = benchmarkMountRead(cfg.mount)
+	p.Benchmarks.AccessMBps = benchmarkMountRead(ctx, cfg.mount)
 	if len(probeErrs) > 0 {
 		p.Benchmarks.ProbeError = strings.Join(probeErrs, "; ")
 	}
 
+	if err := ctx.Err(); err != nil {
+		return p, err
+	}
 	requested := strings.ToLower(strings.TrimSpace(cfg.role))
 	if requested == "" {
 		requested = "auto"
@@ -108,8 +111,10 @@ func probeWorkerProfile(cfg queueConfig) (workerProfile, error) {
 	return p, nil
 }
 
-func probeHardwareEncoders() ([]hardwareEncoderProbe, []string) {
-	out, err := exec.Command("ffmpeg", "-hide_banner", "-encoders").CombinedOutput()
+func probeHardwareEncoders(parent context.Context) ([]hardwareEncoderProbe, []string) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-encoders").CombinedOutput()
 	if err != nil {
 		return nil, []string{"ffmpeg encoder inventory unavailable"}
 	}
@@ -121,10 +126,10 @@ func probeHardwareEncoders() ([]hardwareEncoderProbe, []string) {
 	var verified []hardwareEncoderProbe
 	var errs []string
 	for _, enc := range candidates {
-		if !strings.Contains(inventory, enc) || !hardwareDevicePresent(enc) {
+		if !strings.Contains(inventory, enc) || !hardwareDevicePresent(ctx, enc) {
 			continue
 		}
-		fps, err := runEncoderProbe(enc)
+		fps, err := runEncoderProbe(parent, enc)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s probe failed", enc))
 			continue
@@ -134,8 +139,8 @@ func probeHardwareEncoders() ([]hardwareEncoderProbe, []string) {
 	return verified, errs
 }
 
-func runEncoderProbe(encoder string) (float64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+func runEncoderProbe(parent context.Context, encoder string) (float64, error) {
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 	args := []string{"-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-frames:v", "90"}
 	switch hardwareFamily(encoder) {
@@ -163,14 +168,14 @@ func runEncoderProbe(encoder string) (float64, error) {
 // probeHardwareDecode makes a real bitstream with the verified encoder, then
 // requires the same GPU family to decode it. This prevents a node from claiming
 // "GPU proxy" while ffmpeg is quietly decoding on CPU.
-func probeHardwareDecode(encoder string) (string, float64, error) {
+func probeHardwareDecode(parent context.Context, encoder string) (string, float64, error) {
 	tmp, err := os.MkdirTemp("", "jmfarm-decode-probe-")
 	if err != nil {
 		return "", 0, err
 	}
 	defer os.RemoveAll(tmp)
 	sample := filepath.Join(tmp, "sample.mp4")
-	makeCtx, makeCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	makeCtx, makeCancel := context.WithTimeout(parent, 20*time.Second)
 	defer makeCancel()
 	family := hardwareFamily(encoder)
 	makeArgs := []string{"-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-frames:v", "90"}
@@ -203,7 +208,7 @@ func probeHardwareDecode(encoder string) (string, float64, error) {
 		return "", 0, fmt.Errorf("decode probe has no hardware family for %s", encoder)
 	}
 	args = append(args, "-i", sample, "-frames:v", "90", "-f", "null", "-")
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 	started := time.Now()
 	if out, err := exec.CommandContext(ctx, "ffmpeg", args...).CombinedOutput(); err != nil {
@@ -216,7 +221,7 @@ func probeHardwareDecode(encoder string) (string, float64, error) {
 	return codec + "_" + family, 90 / time.Since(started).Seconds(), nil
 }
 
-func probeTranscriptBackend(bin, model, device string) (float64, error) {
+func probeTranscriptBackend(parent context.Context, bin, model, device string) (float64, error) {
 	if bin == "" {
 		bin = "whisper-cli"
 	}
@@ -227,7 +232,7 @@ func probeTranscriptBackend(bin, model, device string) (float64, error) {
 	if fi, err := os.Stat(model); err != nil || fi.IsDir() {
 		return 0, fmt.Errorf("%s transcript probe skipped: model is unavailable", device)
 	}
-	if err := verifyTranscriptAccelerator(device); err != nil {
+	if err := verifyTranscriptAccelerator(parent, device); err != nil {
 		return 0, err
 	}
 	tmp, err := os.MkdirTemp("", "jmfarm-transcript-probe-")
@@ -236,7 +241,7 @@ func probeTranscriptBackend(bin, model, device string) (float64, error) {
 	}
 	defer os.RemoveAll(tmp)
 	wav := filepath.Join(tmp, "probe.wav")
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
 	defer cancel()
 	if out, err := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-ar", "16000", "-ac", "1", wav).CombinedOutput(); err != nil {
 		return 0, fmt.Errorf("transcript audio probe: %w: %s", err, strings.TrimSpace(string(out)))
@@ -259,9 +264,9 @@ func probeTranscriptBackend(bin, model, device string) (float64, error) {
 // admitted when the container can only see a software device. In particular,
 // Mesa's llvmpipe exposes a valid Vulkan API but executes on CPU; advertising
 // that as a render capability would defeat measured scheduling.
-func verifyTranscriptAccelerator(device string) error {
+func verifyTranscriptAccelerator(parent context.Context, device string) error {
 	device = strings.ToLower(strings.TrimSpace(device))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	switch device {
 	case "vulkan":
@@ -295,7 +300,22 @@ func verifyTranscriptAccelerator(device string) error {
 	}
 }
 
-func benchmarkMountRead(root string) float64 {
+func benchmarkMountRead(parent context.Context, root string) float64 {
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
+	defer cancel()
+	result := make(chan float64, 1)
+	go func() {
+		result <- benchmarkMountReadBlocking(root)
+	}()
+	select {
+	case value := <-result:
+		return value
+	case <-ctx.Done():
+		return 0
+	}
+}
+
+func benchmarkMountReadBlocking(root string) float64 {
 	var candidate string
 	visited := 0
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -349,7 +369,7 @@ func hardwareFamily(name string) string {
 	return ""
 }
 
-func hardwareDevicePresent(encoder string) bool {
+func hardwareDevicePresent(ctx context.Context, encoder string) bool {
 	switch hardwareFamily(encoder) {
 	case "vaapi", "qsv":
 		_, err := os.Stat("/dev/dri/renderD128")
@@ -358,7 +378,7 @@ func hardwareDevicePresent(encoder string) bool {
 		if _, err := os.Stat("/dev/nvidia0"); err == nil {
 			return true
 		}
-		return exec.Command("nvidia-smi", "-L").Run() == nil
+		return exec.CommandContext(ctx, "nvidia-smi", "-L").Run() == nil
 	}
 	return false
 }

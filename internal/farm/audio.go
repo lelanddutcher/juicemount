@@ -1,8 +1,8 @@
 package farm
 
 import (
+	"context"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -48,7 +48,11 @@ func ffprobeBinFor(ffmpegBin string) string {
 // addresses the Nth AUDIO stream, so dropping the second of three shifts
 // nothing — the survivors keep the ordinals ffmpeg knows them by.
 func decodableAudioOrdinals(ffmpegBin, srcPath string) ([]int, error) {
-	cmd := exec.Command(ffprobeBinFor(ffmpegBin), "-v", "error",
+	return decodableAudioOrdinalsContext(context.Background(), ffmpegBin, srcPath)
+}
+
+func decodableAudioOrdinalsContext(ctx context.Context, ffmpegBin, srcPath string) ([]int, error) {
+	cmd := commandContext(ctx, ffprobeBinFor(ffmpegBin), "-v", "error",
 		"-select_streams", "a", "-show_entries", "stream=codec_name",
 		"-of", "csv=p=0", srcPath)
 	out, err := cmd.Output()
@@ -109,7 +113,11 @@ func parseDecodableOrdinals(probeOut string) []int {
 // superset, not a rewrite. Persisting per-stream tech (probe.go tech.Audio[]) lets
 // the producer choose fold-vs-discrete per asset later.
 func audioFoldArgs(ffmpegBin, srcPath string, sampleRate int) (args []string, ok bool, err error) {
-	ords, err := decodableAudioOrdinals(ffmpegBin, srcPath)
+	return audioFoldArgsContext(context.Background(), ffmpegBin, srcPath, sampleRate)
+}
+
+func audioFoldArgsContext(ctx context.Context, ffmpegBin, srcPath string, sampleRate int) (args []string, ok bool, err error) {
+	ords, err := decodableAudioOrdinalsContext(ctx, ffmpegBin, srcPath)
 	if err != nil {
 		return nil, false, err
 	}

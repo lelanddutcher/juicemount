@@ -19,6 +19,7 @@ type SweepInfo struct {
 	Failed     int    `json:"failed"`
 	StartedAt  int64  `json:"started_at"`
 	DurationMS int64  `json:"duration_ms"`
+	Canceled   bool   `json:"canceled,omitempty"`
 }
 
 // Governor is the RESOLVED run configuration the farm was launched with — the
@@ -193,8 +194,10 @@ func ComputeProxyEconomics(store *derivatives.Store, mount string) (*ProxyEconom
 // WriteFarmStatus rolls up the index + the just-finished sweep + the resolved
 // governor settings to a JSON file (e.g. /state/farm-status.json) for the manager
 // to display. This is the FINAL (idle) write: it clears in_progress (absent) and
-// measures proxy_economics by stat-walking the proxy blobs under mount. A "" mount
-// (or a measure error) just omits proxy_economics — the rest of the status is still
+// measures proxy_economics by stat-walking the proxy blobs under mount. A canceled
+// sweep deliberately skips that mount walk so shutdown cannot become wedged on
+// remote storage after its media processes have already stopped. A "" mount (or a
+// measure error) just omits proxy_economics — the rest of the status is still
 // written so a measure hiccup never blanks the dashboard.
 func WriteFarmStatus(store *derivatives.Store, path, mount string, sweep SweepInfo, gov Governor) error {
 	st, err := store.Stats()
@@ -203,8 +206,10 @@ func WriteFarmStatus(store *derivatives.Store, path, mount string, sweep SweepIn
 	}
 	fs := FarmStatus{Index: st, LastSweep: sweep, Governor: gov, WrittenAt: time.Now().Unix()}
 	// Best-effort: a stat-walk error or a "" mount just leaves economics absent.
-	if econ, err := ComputeProxyEconomics(store, mount); err == nil {
-		fs.ProxyEconomics = econ
+	if !sweep.Canceled {
+		if econ, err := ComputeProxyEconomics(store, mount); err == nil {
+			fs.ProxyEconomics = econ
+		}
 	}
 	if err := writeStatusFile(path, fs); err != nil {
 		return err

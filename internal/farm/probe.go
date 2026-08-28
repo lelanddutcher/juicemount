@@ -10,10 +10,10 @@
 package farm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
-	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -97,10 +97,14 @@ type ffFormat struct {
 // payload ready to marshal, plus the raw Tech for callers that want fields
 // (e.g. blob generation gated on video presence).
 func Probe(ffprobeBin, path string, fallbackSize int64) (*Tech, error) {
+	return ProbeContext(context.Background(), ffprobeBin, path, fallbackSize)
+}
+
+func ProbeContext(ctx context.Context, ffprobeBin, path string, fallbackSize int64) (*Tech, error) {
 	if ffprobeBin == "" {
 		ffprobeBin = "ffprobe"
 	}
-	out, err := exec.Command(ffprobeBin, "-v", "quiet", "-print_format", "json",
+	out, err := commandContext(ctx, ffprobeBin, "-v", "quiet", "-print_format", "json",
 		"-show_format", "-show_streams", path).Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe %q: %w", path, err)

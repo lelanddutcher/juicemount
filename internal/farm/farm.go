@@ -1,6 +1,7 @@
 package farm
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,12 @@ import (
 
 // Options configures a producer run.
 type Options struct {
+	// Context cancels external media work. Queue workers set it to their signal
+	// context so a container stop interrupts ffmpeg/ffprobe/whisper and leaves
+	// the durable claim for recovery instead of waiting on an orphaned process.
+	// Nil preserves the historical non-cancellable one-shot behavior.
+	Context context.Context
+
 	Producer      string // stamped on every row: "macos-node" | "linux-farm" | "on-device"
 	Version       int    // producer schema/algo version
 	Mount         string // mount point, for resolving the Tier-A blob dir (only used when Blobs/Filmstrip)
@@ -75,6 +82,17 @@ type Options struct {
 	// moves and the asset regenerates. That is the whole discriminator, and the
 	// data it needs was already being stamped on every row by stampSource.
 	RegenerateFresh bool
+}
+
+func optionContext(opt Options) context.Context {
+	if opt.Context != nil {
+		return opt.Context
+	}
+	return context.Background()
+}
+
+func optionContextErr(opt Options) error {
+	return optionContext(opt).Err()
 }
 
 // Result is the per-file outcome (for CLI reporting / JM-15 accounting). Err is a
@@ -346,6 +364,11 @@ func blobsPresent(mount string, inode uint64, rows []derivatives.DerivRow) bool 
 // (every write is an upsert), so re-running re-derives in place.
 func Process(store *derivatives.Store, path string, opt Options) Result {
 	res := Result{Path: path}
+	ctx := optionContext(opt)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -369,6 +392,10 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		return res
 	}
 	res.Hash = hash
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
 	// FRESHNESS GATE — the move-vs-edit discriminator.
 	//
@@ -392,8 +419,12 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		}
 	}
 
-	tech, err := Probe(opt.FFprobeBin, path, size)
+	tech, err := ProbeContext(ctx, opt.FFprobeBin, path, size)
 	if err != nil {
+		res.Err = err
+		return res
+	}
+	if err := ctx.Err(); err != nil {
 		res.Err = err
 		return res
 	}
@@ -454,9 +485,14 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		staged, out, stErr := stageUnder(derivDir, rel)
 		err := stErr
 		if err == nil {
-			if err = Thumbnail(opt.FFmpegBin, path, out, opt.ThumbMaxDim, tech.DurationMS); err == nil {
+			if err = ThumbnailContext(ctx, opt.FFmpegBin, path, out, opt.ThumbMaxDim, tech.DurationMS); err == nil {
 				err = commitStaged(derivDir, staged, rel)
 			}
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			derivatives.DiscardStagedAt(derivDir, staged)
+			res.Err = ctxErr
+			return res
 		}
 		if err != nil {
 			derivatives.DiscardStagedAt(derivDir, staged)
@@ -481,9 +517,14 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		var geo *derivatives.FilmstripGeo
 		err := stErr
 		if err == nil {
-			if geo, err = Filmstrip(opt.FFmpegBin, path, out, tech.DurationMS, tech.Video.Width, tech.Video.Height, opt.FilmstripCell, tech.Video.FPS); err == nil {
+			if geo, err = FilmstripContext(ctx, opt.FFmpegBin, path, out, tech.DurationMS, tech.Video.Width, tech.Video.Height, opt.FilmstripCell, tech.Video.FPS); err == nil {
 				err = commitStaged(derivDir, staged, rel)
 			}
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			derivatives.DiscardStagedAt(derivDir, staged)
+			res.Err = ctxErr
+			return res
 		}
 		if err != nil {
 			derivatives.DiscardStagedAt(derivDir, staged)
@@ -518,9 +559,13 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 			// source changes underneath us, which is the normal condition on a
 			// volume a second app writes. Treat "no samples" as no blob.
 			var n int
-			if n, err = Waveform(opt.FFmpegBin, path, derivDir, rel, opt.WaveformSPP); err == nil && n > 0 {
+			if n, err = WaveformContext(ctx, opt.FFmpegBin, path, derivDir, rel, opt.WaveformSPP); err == nil && n > 0 {
 				wrote = true
 			}
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			res.Err = ctxErr
+			return res
 		}
 		if err == nil && !wrote {
 			// No audio after all. ffprobe said there was an audio stream and the
@@ -561,6 +606,10 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	// Stamp the source size+mtime on every row (consumer read-gate).
 	for i := range rows {
 		stampSource(&rows[i], fi)
+	}
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
 	}
 
 	if err := store.IngestTech(inode, &hash, opt.Producer, opt.Version, payload, rows); err != nil {

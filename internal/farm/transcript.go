@@ -1,11 +1,11 @@
 package farm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -159,7 +159,7 @@ type whisperJSON struct {
 // across lanes (no Apple framework). Returns (nil, nil) when the clip has no
 // audio or no speech.
 func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscript, error) {
-	return TranscribeDevice(ffmpegBin, whisperBin, modelPath, "", srcPath)
+	return TranscribeDeviceContext(context.Background(), ffmpegBin, whisperBin, modelPath, "", srcPath)
 }
 
 // TranscribeDevice is Transcribe with a whisper.cpp backend override ("" = the
@@ -167,6 +167,10 @@ func Transcribe(ffmpegBin, whisperBin, modelPath, srcPath string) (*LoupeTranscr
 // a binary compiled for that backend). Kept as a separate entry point so existing
 // callers (one-shot sweeps, tests) stay source-compatible.
 func TranscribeDevice(ffmpegBin, whisperBin, modelPath, device, srcPath string) (*LoupeTranscript, error) {
+	return TranscribeDeviceContext(context.Background(), ffmpegBin, whisperBin, modelPath, device, srcPath)
+}
+
+func TranscribeDeviceContext(ctx context.Context, ffmpegBin, whisperBin, modelPath, device, srcPath string) (*LoupeTranscript, error) {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -187,7 +191,7 @@ func TranscribeDevice(ffmpegBin, whisperBin, modelPath, device, srcPath string) 
 	// required input). Folding every stream — not just 0:a:0 — is the silent-data-
 	// loss fix (audioFoldArgs): on multi-mono camera clips the first stream is
 	// often the dead mic, so a:0-only transcribed pure silence.
-	foldArgs, hasAudio, ferr := audioFoldArgs(ffmpegBin, srcPath, 16000)
+	foldArgs, hasAudio, ferr := audioFoldArgsContext(ctx, ffmpegBin, srcPath, 16000)
 	if ferr != nil {
 		return nil, fmt.Errorf("transcribe: probe audio %q: %w", srcPath, ferr)
 	}
@@ -196,7 +200,7 @@ func TranscribeDevice(ffmpegBin, whisperBin, modelPath, device, srcPath string) 
 	}
 	extArgs := append([]string{"-v", "error", "-y", "-i", srcPath}, foldArgs...)
 	extArgs = append(extArgs, "-c:a", "pcm_s16le", wav)
-	ext := exec.Command(ffmpegBin, extArgs...)
+	ext := commandContext(ctx, ffmpegBin, extArgs...)
 	if out, err := ext.CombinedOutput(); err != nil {
 		// Belt-and-suspenders: a stream-map miss ⇒ no audio, not an error.
 		if strings.Contains(string(out), "Stream map") || strings.Contains(string(out), "matches no streams") {
@@ -208,7 +212,7 @@ func TranscribeDevice(ffmpegBin, whisperBin, modelPath, device, srcPath string) 
 	prefix := filepath.Join(tmp, "out")
 	asrArgs := []string{"-m", modelPath, "-f", wav, "-oj", "-of", prefix, "-l", "auto", "-np"}
 	asrArgs = append(asrArgs, WhisperDeviceArgs(device)...)
-	asr := exec.Command(whisperBin, asrArgs...)
+	asr := commandContext(ctx, whisperBin, asrArgs...)
 	if out, err := asr.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("transcribe: whisper %q: %w: %s", srcPath, err, out)
 	}
@@ -348,6 +352,11 @@ func transcriptFreshIndexed(store *derivatives.Store, inode uint64, hash string,
 // written through opt.Mount; the manifest row is hash-gated (hash == source_hash).
 func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIResult {
 	res := AIResult{Path: path}
+	ctx := optionContext(opt)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		res.Err = err
@@ -367,26 +376,38 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 		return res
 	}
 	res.Hash = hash
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
 	if transcriptFresh(store, inode, hash, fi.Size(), opt) {
 		res.SkippedFresh = true
 		_ = WriteManifestSidecar(store, opt.Mount, inode)
 		return res
 	}
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
-	tech, err := Probe(opt.FFprobeBin, path, fi.Size())
+	tech, err := ProbeContext(ctx, opt.FFprobeBin, path, fi.Size())
 	if err != nil {
 		res.Err = err
 		return res
 	}
 
-	tr, err := TranscribeDevice(opt.FFmpegBin, opt.WhisperBin, opt.WhisperModel, opt.TranscriptDevice, path)
+	tr, err := TranscribeDeviceContext(ctx, opt.FFmpegBin, opt.WhisperBin, opt.WhisperModel, opt.TranscriptDevice, path)
 	if err != nil {
 		res.Err = fmt.Errorf("transcribe: %w", err)
 		return res
 	}
 	if tr == nil {
 		return res // no speech ⇒ nothing to publish (HasSpeech stays false)
+	}
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
 	}
 	res.HasSpeech = true
 	res.Segments = len(tr.Segments)
@@ -429,6 +450,10 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 	// `logger_version` into a still-legacy-named blob silently breaks a consumer
 	// that decodes only `loupe_version`.
 	doc.SetVersionKeyForBlob(rel)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
 	if err := writeLoupeAt(derivDir, rel, doc); err != nil {
 		res.Err = fmt.Errorf("write %s: %w", rel, err)
@@ -442,6 +467,10 @@ func GenerateTranscript(store *derivatives.Store, path string, opt Options) AIRe
 		Hash: &hash, BlobRelPath: &rel, MediaType: &mt, Model: &model,
 	}
 	stampSource(&row, fi)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 	if err := store.PutSource(inode, &hash); err != nil {
 		res.Err = fmt.Errorf("put source: %w", err)
 		return res

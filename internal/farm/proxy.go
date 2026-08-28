@@ -1,9 +1,9 @@
 package farm
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -100,6 +100,10 @@ func proxyDecodeArgs(vcodec string) []string {
 // GPU/APU NAS — the locked container/pix_fmt/audio stay identical so the blob is
 // still interchangeable. The HTTP Range/206 serving is a SEPARATE lane.
 func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) error {
+	return ProxyContext(context.Background(), ffmpegBin, vcodec, crf, preset, srcPath, outPath)
+}
+
+func ProxyContext(ctx context.Context, ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) error {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -142,7 +146,7 @@ func Proxy(ffmpegBin, vcodec string, crf int, preset, srcPath, outPath string) e
 		args = append(args, "-tag:v", "hvc1")
 	}
 	args = append(args, outPath)
-	cmd := exec.Command(ffmpegBin, args...)
+	cmd := commandContext(ctx, ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg proxy %q: %w: %s", srcPath, err, out)
 	}
@@ -228,7 +232,7 @@ func proxyFreshIndexed(store *derivatives.Store, inode uint64, hash string, size
 			// The preservation exception must validate the bytes, not merely trust
 			// the sidecar's label. manifest.json is consumer-writable; an ffprobe
 			// of the held regular file proves the shared blob is actually HEVC.
-			actual, err := probeProxyBlobCodec(opt.FFprobeBin, opt.Mount, blobRel)
+			actual, err := probeProxyBlobCodecContext(optionContext(opt), opt.FFprobeBin, opt.Mount, blobRel)
 			if err != nil || actual != "hevc" {
 				continue
 			}
@@ -239,6 +243,10 @@ func proxyFreshIndexed(store *derivatives.Store, inode uint64, hash string, size
 }
 
 func probeProxyBlobCodec(ffprobeBin, mount, rel string) (string, error) {
+	return probeProxyBlobCodecContext(context.Background(), ffprobeBin, mount, rel)
+}
+
+func probeProxyBlobCodecContext(ctx context.Context, ffprobeBin, mount, rel string) (string, error) {
 	if ffprobeBin == "" {
 		ffprobeBin = "ffprobe"
 	}
@@ -250,7 +258,7 @@ func probeProxyBlobCodec(ffprobeBin, mount, rel string) (string, error) {
 	// Pass the already-open, O_NOFOLLOW-validated descriptor to ffprobe. Using
 	// the joined path here would reintroduce a check/use race after the anchored
 	// stat above. ExtraFiles exposes f as descriptor 3 in the child on Unix.
-	cmd := exec.Command(ffprobeBin,
+	cmd := commandContext(ctx, ffprobeBin,
 		"-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
 		"-of", "default=nk=1:nw=1", "/dev/fd/3")
 	cmd.ExtraFiles = []*os.File{f}
@@ -275,6 +283,11 @@ func probeProxyBlobCodec(ffprobeBin, mount, rel string) (string, error) {
 // publishing immediately instead of withholding them behind the proxy encode.
 func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResult {
 	res := ProxyResult{Path: path}
+	ctx := optionContext(opt)
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		res.Err = err
@@ -294,6 +307,10 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		return res
 	}
 	res.Hash = hash
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
 	if proxyFresh(store, inode, hash, fi.Size(), opt) {
 		res.SkippedFresh = true
@@ -302,8 +319,12 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		_ = WriteManifestSidecar(store, opt.Mount, inode)
 		return res
 	}
+	if err := ctx.Err(); err != nil {
+		res.Err = err
+		return res
+	}
 
-	tech, err := Probe(opt.FFprobeBin, path, fi.Size())
+	tech, err := ProbeContext(ctx, opt.FFprobeBin, path, fi.Size())
 	if err != nil {
 		res.Err = err
 		return res
@@ -341,7 +362,12 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		Codec: &codec, CodecString: &codecString,
 	}
 	stampSource(&row, fi)
-	err = Proxy(opt.FFmpegBin, opt.ProxyVCodec, opt.ProxyCRF, opt.ProxyPreset, path, out)
+	err = ProxyContext(ctx, opt.FFmpegBin, opt.ProxyVCodec, opt.ProxyCRF, opt.ProxyPreset, path, out)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		derivatives.DiscardStagedAt(derivDir, staged)
+		res.Err = ctxErr
+		return res
+	}
 	if err == nil {
 		err = derivatives.CommitStagedAt(derivDir, staged, rel)
 	}
@@ -360,6 +386,10 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 			sz := bi.Size()
 			row.BlobSize = &sz
 		}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		res.Err = ctxErr
+		return res
 	}
 	if err := store.PutSource(inode, &hash); err != nil {
 		res.Err = fmt.Errorf("put source: %w", err)

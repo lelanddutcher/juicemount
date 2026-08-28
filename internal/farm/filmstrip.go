@@ -1,10 +1,10 @@
 package farm
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
-	"os/exec"
 
 	"github.com/lelanddutcher/juicemount/internal/derivatives"
 )
@@ -51,6 +51,10 @@ func frameTarget(durSec, srcFPS float64) int {
 }
 
 func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH, cellW int, srcFPS float64) (*derivatives.FilmstripGeo, error) {
+	return FilmstripContext(context.Background(), ffmpegBin, srcPath, outPath, durationMS, srcW, srcH, cellW, srcFPS)
+}
+
+func FilmstripContext(ctx context.Context, ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH, cellW int, srcFPS float64) (*derivatives.FilmstripGeo, error) {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -124,8 +128,11 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
 	args = append(args, "-discard", "nokey", "-an", "-i", srcPath,
 		"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", outPath)
-	fastOut, fastErr := runFilmstripPass(ffmpegBin, args, outPath)
+	fastOut, fastErr := runFilmstripPassContext(ctx, ffmpegBin, args, outPath)
 	if fastErr != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		// A sparse-GOP clip can hold fewer keyframes than tile needs to fill its
 		// grid. FFmpeg then exits 0 but writes zero bytes (live reproduced on an
 		// 8 s / 2 s-GOP acceptance clip), leaving a permanently failed filmstrip
@@ -136,7 +143,7 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 		fallbackArgs := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
 		fallbackArgs = append(fallbackArgs, "-an", "-i", srcPath,
 			"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", outPath)
-		fallbackOut, fallbackErr := runFilmstripPass(ffmpegBin, fallbackArgs, outPath)
+		fallbackOut, fallbackErr := runFilmstripPassContext(ctx, ffmpegBin, fallbackArgs, outPath)
 		if fallbackErr != nil {
 			return nil, fmt.Errorf("ffmpeg filmstrip %q: keyframe pass: %v: %s; full-decode fallback: %w: %s",
 				srcPath, fastErr, fastOut, fallbackErr, fallbackOut)
@@ -150,7 +157,11 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 }
 
 func runFilmstripPass(ffmpegBin string, args []string, outPath string) ([]byte, error) {
-	out, err := exec.Command(ffmpegBin, args...).CombinedOutput()
+	return runFilmstripPassContext(context.Background(), ffmpegBin, args, outPath)
+}
+
+func runFilmstripPassContext(ctx context.Context, ffmpegBin string, args []string, outPath string) ([]byte, error) {
+	out, err := commandContext(ctx, ffmpegBin, args...).CombinedOutput()
 	if err != nil {
 		return out, err
 	}

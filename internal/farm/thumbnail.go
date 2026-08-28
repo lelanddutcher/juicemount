@@ -1,8 +1,8 @@
 package farm
 
 import (
+	"context"
 	"fmt"
-	"os/exec"
 )
 
 // Thumbnail writes a single poster-frame JPEG to outPath, fit within maxDim×maxDim
@@ -18,6 +18,10 @@ import (
 // always real content — a fine trade for a preview thumbnail at ~5× the speed.
 // durationMS<=0 (unknown) falls back to the old thumbnail-filter scan.
 func Thumbnail(ffmpegBin, srcPath, outPath string, maxDim int, durationMS int64) error {
+	return ThumbnailContext(context.Background(), ffmpegBin, srcPath, outPath, maxDim, durationMS)
+}
+
+func ThumbnailContext(ctx context.Context, ffmpegBin, srcPath, outPath string, maxDim int, durationMS int64) error {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -53,7 +57,7 @@ func Thumbnail(ffmpegBin, srcPath, outPath string, maxDim int, durationMS int64)
 		args = append(args, "-i", srcPath, "-vf", "thumbnail,"+scale,
 			"-frames:v", "1", "-q:v", "3", "-f", "image2", outPath)
 	}
-	cmd := exec.Command(ffmpegBin, args...)
+	cmd := commandContext(ctx, ffmpegBin, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ffmpeg thumbnail %q: %w: %s", srcPath, err, out)
 	}
