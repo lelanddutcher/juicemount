@@ -55,3 +55,21 @@ func TestWorkerDockerfilesPinSourceAndBakedModel(t *testing.T) {
 	commitArg(t, gpu, "SPIRV_HEADERS_COMMIT")
 	commitArg(t, gpu, "VULKAN_HEADERS_COMMIT")
 }
+
+func TestCPUWorkerUsesModernFFmpegRuntime(t *testing.T) {
+	cpu := dockerfile(t, "Dockerfile")
+
+	for _, required := range []string{
+		"FROM juicedata/mount:ce-v1.3.1 AS juicefs",
+		"FROM debian:trixie-slim",
+		"COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs",
+		"COPY --from=juicefs /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so",
+	} {
+		if !strings.Contains(cpu, required) {
+			t.Fatalf("CPU worker runtime no longer contains %q", required)
+		}
+	}
+	if strings.Contains(cpu, "FROM juicedata/mount:ce-v1.3.1\n") {
+		t.Fatal("CPU worker regressed to the Debian 11 JuiceFS runtime with ffmpeg 4.3")
+	}
+}

@@ -252,8 +252,12 @@ allowing it to claim accelerated AI jobs.
 
 Build gotchas (baked into the Dockerfile):
 
-- The JuiceFS `ce-v1.3.x` runtime is Debian **bullseye / glibc 2.31**; statically link
-  `jmfarm` and build `whisper.cpp` on bullseye so the symbols match.
+- Source the JuiceFS binary and FoundationDB client from the pinned
+  `ce-v1.3.x` image, but run the worker on Debian **trixie**. Its FFmpeg 7.1+
+  decodes modern camera audio such as Sony MOV/MP4 `ipcm`; inheriting the
+  upstream Debian 11 userland strands those tracks on FFmpeg 4.3. `jmfarm`
+  remains statically linked, and the bullseye-built static whisper binary runs
+  on the newer glibc runtime.
 - Use a **dedicated** farm cache dir, never the primary juicefs container's cache.
 - Bind that cache from persistent local storage; do not leave `/jfs-cache` in the
   container writable layer. `JM_FARM_CACHE_DIR` selects the in-container path and

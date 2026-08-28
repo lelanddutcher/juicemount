@@ -62,17 +62,30 @@ RUN cd /w && bash ./models/download-ggml-model.sh ${WHISPER_MODEL} \
     && cp models/ggml-${WHISPER_MODEL}.bin /ggml-${WHISPER_MODEL}.bin \
     && cp models/download-ggml-model.sh /download-ggml-model.sh
 
+# Keep JuiceFS sourced from the pinned upstream image, but do not inherit its
+# Debian 11 userland. That image's ffmpeg 4.3 reports Sony `ipcm` tracks as
+# unknown, so otherwise-valid camera audio is impossible to waveform and every
+# affected derivative shard is marked failed. The GPU worker already uses this
+# copy-forward pattern successfully.
+FROM juicedata/mount:ce-v1.3.1 AS juicefs
+
 # ----- Stage 3: runtime (juicefs + ffmpeg + whisper.cpp + jmfarm) -----
-# juicedata/mount gives /usr/local/bin/juicefs for the in-container FUSE mount.
-FROM juicedata/mount:ce-v1.3.1
+# Debian 13 carries ffmpeg 7.1+, which maps MOV/MP4 `ipcm` to pcm_s24be and can
+# decode the real multi-track Sony footage used by the live RC acceptance run.
+FROM debian:trixie-slim
 ARG WHISPER_MODEL=medium.en
 ARG JM_VERSION
 ARG JM_COMMIT
 LABEL org.opencontainers.image.version="${JM_VERSION}" \
       org.opencontainers.image.revision="${JM_COMMIT}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg ca-certificates libgomp1 util-linux \
+        ffmpeg ca-certificates fuse3 libgomp1 util-linux librados2 libgfapi0 \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
+# JuiceFS dlopens FoundationDB's client library at startup even when Redis is
+# the metadata backend. Carry it from the same pinned upstream image.
+COPY --from=juicefs /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
+RUN ldconfig
 COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
 COPY --from=whisper /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
 COPY --from=whisper /ggml-${WHISPER_MODEL}.bin /models/ggml-${WHISPER_MODEL}.bin
