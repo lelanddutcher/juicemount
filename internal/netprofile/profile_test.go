@@ -63,15 +63,15 @@ func TestBandwidthClassification(t *testing.T) {
 	}
 }
 
-func TestMeteredSuppressesReadahead(t *testing.T) {
+func TestMeteredUsesOneBoundedReadahead(t *testing.T) {
 	p := New()
 	sampleFor(p, 1.5*1024*1024, 6) // 1.5 MB/s → metered
 	ra := p.Readahead()
-	if ra.Enabled {
-		t.Fatalf("metered link must disable server readahead, got %+v", ra)
+	if !ra.Enabled {
+		t.Fatalf("metered link must retain bounded server readahead, got %+v", ra)
 	}
-	if ra.Blocks > 1 {
-		t.Fatalf("metered link must not prefetch ahead, got Blocks=%d", ra.Blocks)
+	if ra.SeqThreshold != 6 || ra.Blocks != 1 || ra.Workers != 1 {
+		t.Fatalf("metered link must use the guarded 1-block/1-worker policy, got %+v", ra)
 	}
 }
 
@@ -229,8 +229,8 @@ func TestForceClass(t *testing.T) {
 	if got := p.Class(); got != ClassMetered {
 		t.Fatalf("ForceClass(metered) → %v, want metered despite fast bandwidth", got)
 	}
-	if p.Readahead().Enabled {
-		t.Fatal("forced metered must disable readahead")
+	if got := p.Readahead(); !got.Enabled || got.Blocks != 1 || got.Workers != 1 {
+		t.Fatalf("forced metered must retain bounded readahead, got %+v", got)
 	}
 	p.ForceClass(nil)
 	if got := p.Class(); got != ClassFast {

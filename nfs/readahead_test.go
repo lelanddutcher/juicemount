@@ -175,6 +175,32 @@ func TestReadaheadShortRunGuard(t *testing.T) {
 	}
 }
 
+// A metered link must not turn a preview-sized run into speculative traffic,
+// but a real sequential read must retain one bounded request in flight. This
+// guards the cellular failure where disabling readahead serialized foreground
+// subreads and used only a fraction of the available pipe.
+func TestMeteredReadaheadStartsOnlyAfterStrongSequentialSignal(t *testing.T) {
+	t.Setenv("JM_SERVER_READAHEAD", "")
+	p := netprofile.New()
+	c := netprofile.ClassMetered
+	p.ForceClass(&c)
+	rm := NewReadaheadManager(testFUSEPath, nil, p)
+	defer rm.Stop()
+
+	inode := uint64(252)
+	for i := 0; i < 6; i++ { // five sequential hits: still below threshold six
+		rm.OnRead(inode, int64(i)*readaheadBlockSize, readaheadBlockSize, "test/preview.mov")
+	}
+	if triggered, _ := rm.Stats(); triggered != 0 {
+		t.Fatalf("metered preview run triggered %d prefetches, want 0", triggered)
+	}
+
+	rm.OnRead(inode, 6*readaheadBlockSize, readaheadBlockSize, "test/reel.mov")
+	if triggered, _ := rm.Stats(); triggered != 1 {
+		t.Fatalf("metered sequential run triggered %d prefetches, want exactly 1", triggered)
+	}
+}
+
 // TestReadaheadGuardOffOnFastLink (S2): the guard is DISABLED on a fast link —
 // a fast-class run trips exactly as before (10GbE behavior unchanged). A short
 // run of SeqThreshold(fast)=2 blocks must trip.

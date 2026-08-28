@@ -58,8 +58,8 @@ func TestLinkDataPlaneSampleSelectsCellularPolicyBeforeMount(t *testing.T) {
 	if snap.Class != netprofile.ClassMetered {
 		t.Fatalf("2 Mbps / 300 ms Link class = %s, want metered", snap.Class)
 	}
-	if got := p.Readahead(); got.Enabled || got.Blocks != 1 || got.Workers != 1 {
-		t.Fatalf("metered read-ahead = %+v, want disabled 1-block/1-worker", got)
+	if got := p.Readahead(); !got.Enabled || got.SeqThreshold != 6 || got.Blocks != 1 || got.Workers != 1 {
+		t.Fatalf("metered read-ahead = %+v, want guarded enabled 1-block/1-worker", got)
 	}
 	if got := p.JuiceFS(); got.BufferSizeMB != 256 || got.Prefetch != 0 {
 		t.Fatalf("metered JuiceFS policy = %+v, want 256 MiB/prefetch 0", got)

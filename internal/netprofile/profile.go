@@ -61,7 +61,7 @@ func (c LinkClass) String() string {
 // kernel NFS client, it can react to every RTT/throughput reclassification
 // without tearing down Finder's open handles.
 type ReadaheadPolicy struct {
-	Enabled      bool // false → suppress our server-side readahead entirely (metered)
+	Enabled      bool // false → suppress our server-side readahead entirely (kill-switch/override)
 	SeqThreshold int  // consecutive sequential reads before triggering
 	Blocks       int  // 4 MB blocks to prefetch ahead once triggered
 	Workers      int  // max concurrent prefetch goroutines
@@ -532,11 +532,13 @@ func (p *Profile) Class() LinkClass {
 func (p *Profile) Readahead() ReadaheadPolicy {
 	switch p.Class() {
 	case ClassMetered:
-		// Cellular / weak / metered: do NOT prefetch ahead. Serve exactly the
-		// block touched (still subject to the 4 MB BlockSize minimum), require a
-		// strong sequential signal so an xattr/Quick-Look probe never escalates
-		// to a whole-file pull, and protect the user's data cap.
-		return ReadaheadPolicy{Enabled: false, SeqThreshold: 6, Blocks: 1, Workers: 1}
+		// Cellular / weak / metered: keep exactly one bounded 4 MiB block in
+		// flight after a strong sequential signal. Disabling this layer entirely
+		// serialized foreground subreads across the tunnel: a live 40 Mbit/s,
+		// 80 ms shaped Link delivered only ~7.9 Mbit/s. One worker fills the
+		// bandwidth-delay product without turning a Quick Look/xattr probe into a
+		// whole-file pull; the six-block guard below still has to be crossed.
+		return ReadaheadPolicy{Enabled: true, SeqThreshold: 6, Blocks: 1, Workers: 1}
 	case ClassSlow:
 		return ReadaheadPolicy{Enabled: true, SeqThreshold: 4, Blocks: 2, Workers: 2}
 	case ClassFast:

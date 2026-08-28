@@ -120,12 +120,11 @@ func serverReadaheadEnabled() bool {
 // the guard.
 //
 // Class-scaled so 10GbE/GbE (Fast/Medium) are UNCHANGED — the guard is DISABLED
-// there (0) so LAN prefetch fires exactly as before; only the slow WAN class
-// tightens, where an over-pull crosses the tunnel and costs seconds. ClassMetered
-// never reaches the trip at all (its policy is Enabled:false — the OnRead early
-// return above), so the guard is moot there. The value is set ABOVE the slow
-// class's SeqThreshold (4) so it actually creates a suppression band (runs of
-// 4–5 blocks are held; 6+ escalate) rather than being inert. nil profile ⇒
+// there (0) so LAN prefetch fires exactly as before; only constrained WAN
+// classes tighten, where an over-pull crosses the tunnel and costs seconds.
+// The value is ABOVE slow's SeqThreshold (4), creating a suppression band at
+// hits 4–5; it equals metered's threshold (6), so metered does not schedule
+// until a genuine run crosses six sequential blocks. nil profile ⇒
 // Medium (0, disabled), so an unwired manager behaves exactly as before.
 func smallPreviewRunBlocks(prof *netprofile.Profile) int {
 	if prof == nil {
@@ -178,10 +177,9 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 	}
 	tracker.lastOffset = offset
 
-	// Metered/weak link: do NOT prefetch ahead at all. We still keep tracking the
-	// pattern (cheap) so that if the link recovers and reclassifies, the very next
-	// read can trigger — but on a metered link an xattr/Quick-Look probe must
-	// never escalate to a whole-file pull (docs/TUNING/01-bandwidth §Read amp).
+	// A disabled policy (operator kill-switch/override) still tracks the pattern
+	// so a live policy change can trigger on the next read. Production's metered
+	// policy is enabled but guarded and limited to one block/one worker.
 	if !policy.Enabled {
 		return
 	}
