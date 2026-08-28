@@ -109,6 +109,12 @@ type warmupResponse struct {
 
 // handleWarmupHTTP serves GET /warmup — the popover's warm-up card source.
 func handleWarmupHTTP(w http.ResponseWriter, r *http.Request) {
+	// This endpoint is polled as live process state. An initial "starting"
+	// response must never survive in a client/proxy cache after the mount has
+	// become healthy; that presents exactly as a progress bar stuck at 5%
+	// while Finder is already usable.
+	w.Header().Set("Cache-Control", "no-store")
+
 	globalMu.Lock()
 	rc := globalRC
 	running := globalServer != nil

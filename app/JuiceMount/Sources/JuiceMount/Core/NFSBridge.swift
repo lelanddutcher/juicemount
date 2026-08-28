@@ -972,9 +972,13 @@ public enum NFSBridge {
     /// the popover hides the card on nil rather than blocking anything.
     public static func warmupStatus(metricsAddr: String = "127.0.0.1:11050") -> WarmupStatus? {
         guard let url = URL(string: "http://\(metricsAddr)/warmup") else { return nil }
-        var req = URLRequest(url: url)
+        // `/warmup` is live process state. Never replay the initial 5%
+        // response from URLCache after the core has confirmed the mount.
+        var req = URLRequest(url: url,
+                             cachePolicy: .reloadIgnoringLocalCacheData,
+                             timeoutInterval: 2)
         req.httpMethod = "GET"
-        req.timeoutInterval = 2
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         let sem = DispatchSemaphore(value: 0)
         var result: WarmupStatus?
         let session = loopbackSession()
