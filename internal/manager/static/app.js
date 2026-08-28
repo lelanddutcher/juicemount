@@ -3872,17 +3872,27 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
   // render live state; PUT saves a patch that workers apply on their next loop
   // tick. All wire values go through textContent — no innerHTML.
   let farmConfigInited = false;
+	let farmWorkerControlInFlight = false;
 
   function initFarmConfigOnce() {
     if (farmConfigInited) return;
     farmConfigInited = true;
     const form = document.getElementById('farm-config-form');
     if (form) form.addEventListener('submit', onFarmConfigSave);
+		const enrollment = document.getElementById('farm-enrollment-form');
+		if (enrollment) enrollment.addEventListener('submit', onFarmEnrollment);
+		document.querySelectorAll('[data-copy-target]').forEach((button) => {
+			button.addEventListener('click', () => copyFarmCommand(button.dataset.copyTarget, button));
+		});
   }
 
   async function loadFarmWorkers() {
     const list = document.getElementById('farm-workers-list');
     if (!list) return;
+		// Keep the live status/button nodes attached while a lifecycle action is
+		// awaiting acknowledgement. The normal five-second poll resumes as soon
+		// as the action reaches a truthful terminal UI state.
+		if (farmWorkerControlInFlight) return;
     let res;
     try { res = await api('GET', '/api/farm/workers'); } catch (e) { return; }
     if (!res || !res.available) { list.textContent = ''; return; }
@@ -3970,9 +3980,171 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 				warning.textContent = bench.probe_error;
 				row.appendChild(warning);
 			}
+			const nodeName = String(w.name || '').trim();
+			const actions = document.createElement('div');
+			actions.className = 'farm-worker-actions';
+			const actionStatus = document.createElement('span');
+			actionStatus.className = 'farm-worker-action-status';
+			actionStatus.setAttribute('role', 'status');
+			if (nodeName) {
+				const disabled = w.state === 'disabled';
+				const admission = document.createElement('button');
+				admission.type = 'button';
+				admission.className = 'btn btn-sm';
+				admission.textContent = disabled ? 'Enable node' : 'Disable node';
+				admission.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', disabled ? 'enable' : 'disable', actionStatus, [admission]));
+				actions.appendChild(admission);
+
+				const restart = document.createElement('button');
+				restart.type = 'button';
+				restart.className = 'btn btn-sm';
+				restart.textContent = 'Restart worker';
+				restart.disabled = disabled;
+				restart.title = disabled ? 'Enable the node before requesting a restart' : 'Acknowledged by the worker before its durable claim is released';
+				restart.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', 'restart', actionStatus, [admission, restart]));
+				actions.appendChild(restart);
+			} else {
+				actionStatus.textContent = 'Set a stable worker name to enable lifecycle controls.';
+			}
+			actions.appendChild(actionStatus);
+			row.appendChild(actions);
 			list.appendChild(row);
     }
   }
+
+	async function controlFarmWorker(name, previousID, action, status, buttons) {
+		const prompt = action === 'restart'
+			? `Restart ${name}? Active work will return to its durable queue before the replacement process claims it.`
+			: `${action === 'disable' ? 'Disable' : 'Enable'} ${name}?`;
+		if (!confirm(prompt)) return;
+		farmWorkerControlInFlight = true;
+		buttons.forEach((button) => { button.disabled = true; });
+		status.classList.remove('ok', 'error');
+		status.textContent = action === 'restart' ? 'Requesting restart…' : `${action === 'disable' ? 'Disabling' : 'Enabling'}…`;
+		try {
+			const result = await api('POST', '/api/farm/workers/control', { name, action });
+			status.classList.add('ok');
+			status.textContent = result.note || `${action} accepted`;
+			if (action === 'restart' && result.command && result.command.id) {
+				let acknowledged = false;
+				for (let attempt = 0; attempt < 12; attempt += 1) {
+					await new Promise((resolve) => setTimeout(resolve, 1000));
+					const ack = await api('GET', '/api/farm/workers/control?command_id=' + encodeURIComponent(result.command.id));
+					if (ack.command && ack.command.state === 'acknowledged') {
+						status.textContent = 'Restart acknowledged · waiting for a fresh heartbeat';
+						acknowledged = true;
+						break;
+					}
+				}
+				if (!acknowledged) {
+					status.classList.remove('ok');
+					status.classList.add('error');
+					status.textContent = 'Restart was requested, but the node did not acknowledge it within 12 seconds.';
+				} else {
+					await waitForFarmWorkerReplacement(name, previousID, status);
+				}
+			}
+		} catch (error) {
+			status.classList.add('error');
+			status.textContent = error && error.message ? error.message : String(error);
+		} finally {
+			buttons.forEach((button) => { button.disabled = false; });
+			farmWorkerControlInFlight = false;
+			loadFarmWorkers();
+		}
+	}
+
+	async function waitForFarmWorkerReplacement(name, previousID, status) {
+		const deadline = Date.now() + 45000;
+		while (Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 1500));
+			let snapshot;
+			try {
+				snapshot = await api('GET', '/api/farm/workers');
+			} catch (_) {
+				continue;
+			}
+			const matches = Array.isArray(snapshot && snapshot.workers)
+				? snapshot.workers.filter((worker) => worker && worker.name === name)
+				: [];
+			if (matches.length === 1 && matches[0].id && matches[0].id !== previousID) {
+				status.classList.remove('error');
+				status.classList.add('ok');
+				status.textContent = 'Restart verified · fresh heartbeat online';
+				return true;
+			}
+		}
+		status.classList.remove('ok');
+		status.classList.add('error');
+		status.textContent = 'Restart was acknowledged, but no replacement heartbeat appeared within 45 seconds.';
+		return false;
+	}
+
+	async function onFarmEnrollment(event) {
+		event.preventDefault();
+		const button = document.getElementById('farm-enroll-create');
+		const status = document.getElementById('farm-enroll-status');
+		const result = document.getElementById('farm-enrollment-result');
+		const name = document.getElementById('farm-enroll-name').value.trim().toLowerCase();
+		const role = document.getElementById('farm-enroll-role').value;
+		const statePath = document.getElementById('farm-enroll-state').value.trim();
+		const cachePath = document.getElementById('farm-enroll-cache').value.trim();
+		button.disabled = true;
+		status.classList.remove('ok', 'error');
+		status.textContent = 'Preparing a no-store install plan…';
+		result.hidden = true;
+		try {
+			const response = await api('POST', '/api/farm/enrollment', {
+				name, role, state_path: statePath, cache_path: cachePath,
+				remote: document.getElementById('farm-enroll-remote').checked,
+			});
+			const plan = response.plan || {};
+			document.getElementById('farm-enroll-plan-title').textContent = `${plan.name || name} · ${plan.role || role} node`;
+			document.getElementById('farm-enroll-plan-commit').textContent = plan.expected_commit ? String(plan.expected_commit).slice(0, 12) : 'unversioned';
+			document.getElementById('farm-enroll-plan-commit').title = plan.expected_commit || '';
+			document.getElementById('farm-enroll-prepare-command').textContent = plan.prepare_command || '';
+			document.getElementById('farm-enroll-docker-command').textContent = plan.docker_command || '';
+			const linkRow = document.getElementById('farm-enroll-link-row');
+			linkRow.hidden = !plan.link_command;
+			document.getElementById('farm-enroll-link-command').textContent = plan.link_command || '';
+			const checks = document.getElementById('farm-enroll-checks');
+			checks.replaceChildren();
+			(plan.checks || []).forEach((text) => {
+				const item = document.createElement('li');
+				item.textContent = text;
+				checks.appendChild(item);
+			});
+			result.hidden = false;
+			status.classList.add('ok');
+			status.textContent = 'Plan ready. Verify each command before running it on the node.';
+		} catch (error) {
+			status.classList.add('error');
+			status.textContent = error && error.message ? error.message : String(error);
+		} finally {
+			button.disabled = false;
+		}
+	}
+
+	async function copyFarmCommand(targetID, button) {
+		const source = document.getElementById(targetID);
+		if (!source) return;
+		const text = source.textContent || '';
+		try {
+			if (navigator.clipboard && navigator.clipboard.writeText) {
+				await navigator.clipboard.writeText(text);
+			} else {
+				const area = document.createElement('textarea');
+				area.value = text; area.setAttribute('readonly', ''); area.style.position = 'fixed'; area.style.opacity = '0';
+				document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove();
+			}
+			const prior = button.textContent;
+			button.textContent = 'Copied';
+			setTimeout(() => { button.textContent = prior; }, 1200);
+		} catch {
+			button.textContent = 'Copy failed';
+			setTimeout(() => { button.textContent = 'Copy'; }, 1600);
+		}
+	}
 
   async function onFarmConfigSave(ev) {
     ev.preventDefault();

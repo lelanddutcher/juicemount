@@ -194,14 +194,11 @@ func (a *API) handlePair(w http.ResponseWriter, r *http.Request) {
 	reusable := r.URL.Query().Get("multi") == "1"
 	device := sanitizeDeviceName(r.URL.Query().Get("device"))
 
-	args := append([]string{"--config", headscaleConfig()}, PreauthKeyArgs(reusable)...)
-	args = append(args, "--expiration", "1h")
-	out, err := exec.Command(headscaleBin(), args...).CombinedOutput()
+	key, err := mintLinkPreauthKey(reusable)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "reusable": reusable, "error": fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out)))})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "reusable": reusable, "error": err.Error()})
 		return
 	}
-	key := lastNonEmptyLine(string(out))
 	resp := map[string]any{
 		"ok":         key != "",
 		"code":       key,
@@ -212,6 +209,23 @@ func (a *API) handlePair(w http.ResponseWriter, r *http.Request) {
 		resp["device"] = device
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// mintLinkPreauthKey is shared by Mac pairing and Farm node enrollment. It
+// never logs or persists the returned one-time credential; callers must mark
+// their HTTP response no-store and show it only to an authenticated operator.
+func mintLinkPreauthKey(reusable bool) (string, error) {
+	args := append([]string{"--config", headscaleConfig()}, PreauthKeyArgs(reusable)...)
+	args = append(args, "--expiration", "1h")
+	out, err := exec.Command(headscaleBin(), args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	key := lastNonEmptyLine(string(out))
+	if key == "" {
+		return "", fmt.Errorf("headscale returned no pairing code")
+	}
+	return key, nil
 }
 
 // handlePairedNodes lists all registered tailnet nodes.

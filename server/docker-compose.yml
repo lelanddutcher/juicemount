@@ -200,6 +200,13 @@ services:
       JM_STATE_FILE: "/var/lib/manager/state.json"   # persists job history + future control-plane state across container restart
       JM_MINIO_URL: "http://minio:9000"              # SLICE 2: Overview MinIO liveness probe target (internal docker DNS)
       JM_FARM_STATUS: "/farmstate/farm-status.json"  # Farm tab: the juicefarm rollup (juicefarm-state mounted read-only below)
+      # Processing-node enrollment fails closed until this is set to the Redis
+      # endpoint a node can actually reach. Never use the docker-only `redis`
+      # hostname here. The optional image overrides are useful with a registry;
+      # when blank, Manager derives the exact rc-0.5-<commit> local image tag.
+      JM_FARM_NODE_META_URL: "${JM_FARM_NODE_META_URL:-}"
+      JM_FARM_SERVER_IMAGE: "${JM_FARM_SERVER_IMAGE:-}"
+      JM_FARM_RENDER_IMAGE: "${JM_FARM_RENDER_IMAGE:-}"
       # JuiceMount Link is opt-in. To enable it, set all three values, then
       # redeploy: a stable external URL is mandatory because linked Macs must
       # reach Headscale when away from the NAS. JM_NET_NAS_ROUTE must be the

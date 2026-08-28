@@ -196,6 +196,7 @@ docker run -d --name juicefarm-worker \
   --restart unless-stopped \
   -e JM_META=redis://redis:6379/1 \
   -e JM_FARM_QUEUE=1 \
+  -e JM_WORKER_NAME=nas-server-01 \
   -e JM_WORKER_ROLE=server \
   -e JM_FARM_PRODUCER=linux-farm \
   -e JM_FARM_MODEL=/models/ggml-medium.en.bin \
@@ -203,6 +204,14 @@ docker run -d --name juicefarm-worker \
   -v /path/to/juicefarm-state:/state \
 juicefarm:local
 ```
+
+Every standing worker should set a unique lowercase `JM_WORKER_NAME` and use a
+persistent `/state`, persistent `/jfs-cache`, and `--restart unless-stopped`. Those
+are the contracts behind Manager's disable/enable/restart controls. Disable is a
+durable admission gate: the worker returns active work to its original queue,
+releases discovery leadership, keeps heartbeating as `disabled`, and cannot claim
+again until enabled. Restart is one-shot and is reported as successful only after
+the command is acknowledged and a replacement runtime ID heartbeats.
 
 Run render workers separately with `JM_WORKER_ROLE=render` and the GPU device(s)
 passed into the container. Render admission fails closed if the configured
@@ -227,6 +236,7 @@ docker run -d --name juicefarm-gpu-worker \
   -v /path/to/juicefarm-state:/state \
   -e JM_META=redis://redis:6379/1 \
   -e JM_FARM_QUEUE=1 \
+  -e JM_WORKER_NAME=studio-render-01 \
   -e JM_WORKER_ROLE=render \
   -e JM_FARM_TRANSCRIPT_DEVICE=vulkan \
   -e JM_FARM_VCODEC=hevc_vaapi \
@@ -273,12 +283,21 @@ the render node; a failed/offline render node produces a visible reroute instead
 
 The `juicemount-manager` web UI exposes a **Farm tab** with play/pause, automatic
 discovery control, queue depth and history, live worker roles/capabilities, measured
-throughput, selected backend, attempts, and advanced manual repair sweeps. The manager
-is CGO-free: farm coverage is relayed from `/state/farm-status.json`, while queue,
-control, and worker state are read from Redis through bounded probes. Live sweep
-progress is freshness-checked: if a killed worker leaves an old `in_progress`
-record behind, Manager presents it as interrupted work instead of claiming that it
-is still running. Stable coverage and last-sweep history remain available.
+throughput, selected backend, attempts, node lifecycle, commit-pinned node enrollment,
+and advanced manual repair sweeps. Set `JM_FARM_NODE_META_URL` to the Redis URL that
+new nodes can reach; Manager deliberately does not reuse a docker-internal Redis
+hostname for enrollment. Optional `JM_FARM_SERVER_IMAGE` and
+`JM_FARM_RENDER_IMAGE` values select registry images; otherwise the Manager derives
+the exact `rc-0.5-<commit>` tag from its own build. Remote enrollment additionally
+requires JuiceMount Link and returns a one-time Headscale command in an authenticated,
+`no-store` response.
+
+The manager is CGO-free: farm coverage is relayed from
+`/state/farm-status.json`, while queue, control, and worker state are read from Redis
+through bounded probes. Live sweep progress is freshness-checked: if a killed worker
+leaves an old `in_progress` record behind, Manager presents it as interrupted work
+instead of claiming that it is still running. Stable coverage and last-sweep history
+remain available.
 
 ---
 

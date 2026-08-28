@@ -23,16 +23,19 @@ var staticFS embed.FS
 
 // API holds the HTTP handlers and their shared state.
 type API struct {
-	jobs           *JobManager
-	sourceRoots    []string // allowable host paths under /browse
-	destMount      string   // user-facing prefix used in destination paths (e.g. /jfs)
-	adminKey       string   // empty = no auth
-	prefix         string   // route-mount prefix (e.g. "/manager"); empty for standalone
-	fuseMount      string   // for ModeEmbedded dest-traversal check; empty in standalone
-	volName        string   // for ModeStandalone dest-validation
-	farmStatusPath string   // juicefarm rollup JSON path (farm-status.json); empty = Farm tab shows "not configured"
-	linkMetaURL    string   // backend endpoint used for Link readiness (never returned to clients)
-	linkMinIOURL   string   // object-store endpoint used for Link readiness (never returned to clients)
+	jobs            *JobManager
+	sourceRoots     []string // allowable host paths under /browse
+	destMount       string   // user-facing prefix used in destination paths (e.g. /jfs)
+	adminKey        string   // empty = no auth
+	prefix          string   // route-mount prefix (e.g. "/manager"); empty for standalone
+	fuseMount       string   // for ModeEmbedded dest-traversal check; empty in standalone
+	volName         string   // for ModeStandalone dest-validation
+	farmStatusPath  string   // juicefarm rollup JSON path (farm-status.json); empty = Farm tab shows "not configured"
+	linkMetaURL     string   // backend endpoint used for Link readiness (never returned to clients)
+	linkMinIOURL    string   // object-store endpoint used for Link readiness (never returned to clients)
+	farmNodeMetaURL string   // explicit worker-bootstrap endpoint; returned only by authenticated no-store enrollment
+	farmServerImage string   // worker image advertised by enrollment
+	farmRenderImage string   // accelerated worker image advertised by enrollment
 
 	// farmChangesPath is the farm's pre-aggregated /derivatives/changes feed
 	// (JM-15 #56): the contract changes-array the farm writes next to
@@ -188,6 +191,9 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	}
 	a.linkMetaURL = overviewMeta
 	a.linkMinIOURL = cfg.MinIOURL
+	a.farmNodeMetaURL = strings.TrimSpace(os.Getenv("JM_FARM_NODE_META_URL"))
+	a.farmServerImage = strings.TrimSpace(os.Getenv("JM_FARM_SERVER_IMAGE"))
+	a.farmRenderImage = strings.TrimSpace(os.Getenv("JM_FARM_RENDER_IMAGE"))
 	a.overview = newOverviewSource(mgr, cfg.JuiceFSBin, overviewMeta, cfg.MinIOURL)
 	// JM-16: dial the shared juicefarm: job queue on the volume's Redis so
 	// the Farm tab can enqueue server-side generation work + read job
@@ -242,6 +248,8 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// Farm node config (FARM-NODE-CONFIG spec): manager-owned worker settings.
 	mux.HandleFunc(prefix+"/api/farm/config", a.auth(a.handleFarmConfig))
 	mux.HandleFunc(prefix+"/api/farm/workers", a.auth(a.handleFarmWorkers))
+	mux.HandleFunc(prefix+"/api/farm/workers/control", a.auth(a.handleFarmWorkerControl))
+	mux.HandleFunc(prefix+"/api/farm/enrollment", a.auth(a.handleFarmEnrollment))
 	// JM-15 #56 (server half): relay the farm's pre-aggregated
 	// /derivatives/changes feed (contract derivatives-changes.schema.json,
 	// filtered by ?since=&limit=) so the Mac client learns farm-generated

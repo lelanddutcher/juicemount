@@ -123,6 +123,60 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 	}
 }
 
+func TestManagerRCFarmNodeLifecycleAndEnrollmentSurface(t *testing.T) {
+	indexRaw, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := string(indexRaw)
+	for _, marker := range []string{
+		`id="farm-enrollment"`,
+		`id="farm-enrollment-form"`,
+		`id="farm-enroll-remote"`,
+		`id="farm-enroll-docker-command"`,
+		`role="status"`,
+		`Credentials are shown once and this response is never cached.`,
+	} {
+		if !strings.Contains(index, marker) {
+			t.Errorf("Manager Farm enrollment markup lost %q", marker)
+		}
+	}
+
+	appRaw, err := staticFS.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := string(appRaw)
+	for _, marker := range []string{
+		"/api/farm/enrollment",
+		"/api/farm/workers/control",
+		"Restart verified · fresh heartbeat online",
+		"no replacement heartbeat appeared within 45 seconds",
+		"navigator.clipboard.writeText",
+	} {
+		if !strings.Contains(app, marker) {
+			t.Errorf("Manager Farm lifecycle client lost %q", marker)
+		}
+	}
+
+	cssRaw, err := staticFS.ReadFile("static/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssRaw)
+	for _, marker := range []string{
+		".farm-enrollment-card",
+		".farm-worker-actions",
+		".farm-worker-action-status.error",
+		".farm-command-block code",
+		"white-space: pre-wrap",
+	} {
+		if !strings.Contains(css, marker) {
+			t.Errorf("Manager Farm lifecycle CSS lost %q", marker)
+		}
+	}
+}
+
 func TestManagerRCThemeTokensMeetWCAGContrast(t *testing.T) {
 	cssRaw, err := staticFS.ReadFile("static/style.css")
 	if err != nil {

@@ -133,11 +133,9 @@
         </div>
       </section>
 
-      <!-- Farm tab (Phase 1, read-only) — the server-side juicefarm's
-           generation coverage + last sweep, read from the farm's
-           farm-status.json rollup via /api/farm. No farm control here
-           yet (throttle/trigger come later); this is the "what has the
-           farm produced" glance. -->
+      <!-- Farm operations tab — combines the server-side farm-status.json
+           rollup with durable queue transport, node enrollment/lifecycle,
+           measured routing telemetry, and recent job history. -->
       <section data-tab="farm" class="tab-pane farm-pane" hidden>
         <div class="overview-header farm-page-header">
           <p class="section-kicker">Compute fabric</p>
@@ -198,6 +196,59 @@
             </button>
             <p id="farm-control-status" class="farm-control-status" role="status">Loading queue controls…</p>
           </div>
+
+          <details id="farm-enrollment" class="farm-enrollment-card">
+            <summary>
+              <span><strong>Add a processing node</strong><em>Generate an exact, persistent worker install plan</em></span>
+            </summary>
+            <form id="farm-enrollment-form" class="farm-enrollment-form">
+              <p class="farm-config-hint">The plan pins the RC image, stable node identity, local state/cache,
+                restart policy, and hardware role. Remote plans also mint a one-time JuiceMount Link authorization.
+                Credentials are shown once and this response is never cached.</p>
+              <div class="farm-config-grid">
+                <label class="field"><span>Node name</span>
+                  <input id="farm-enroll-name" type="text" placeholder="studio-render-01"
+                         autocomplete="off" spellcheck="false" required></label>
+                <label class="field"><span>Node role</span>
+                  <select id="farm-enroll-role">
+                    <option value="render">Intel GPU render</option>
+                    <option value="server">Server / metadata</option>
+                  </select></label>
+                <label class="field"><span>Persistent state path</span>
+                  <input id="farm-enroll-state" type="text" placeholder="Auto: /var/lib/juicemount/&lt;name&gt;/state"
+                         autocomplete="off" spellcheck="false"></label>
+                <label class="field"><span>SSD cache path</span>
+                  <input id="farm-enroll-cache" type="text" placeholder="Auto: /var/cache/juicemount/&lt;name&gt;"
+                         autocomplete="off" spellcheck="false"></label>
+              </div>
+              <label class="opt farm-enroll-remote"><input id="farm-enroll-remote" type="checkbox">
+                <span><strong>Node is outside this LAN</strong><em>Include a one-time Headscale/Tailscale join command.</em></span>
+              </label>
+              <div class="farm-enrollment-actions">
+                <button id="farm-enroll-create" type="submit">Create install plan</button>
+                <span id="farm-enroll-status" class="farm-config-status" role="status"></span>
+              </div>
+            </form>
+            <div id="farm-enrollment-result" class="farm-enrollment-result" hidden>
+              <div class="farm-enrollment-result-head">
+                <div><p class="section-kicker">Prepared plan</p><h4 id="farm-enroll-plan-title">Processing node</h4></div>
+                <span id="farm-enroll-plan-commit" class="farm-worker-build"></span>
+              </div>
+              <div id="farm-enroll-link-row" class="farm-command-block" hidden>
+                <div><strong>Join JuiceMount Link</strong><button type="button" class="btn btn-sm" data-copy-target="farm-enroll-link-command">Copy</button></div>
+                <code id="farm-enroll-link-command"></code>
+              </div>
+              <div class="farm-command-block">
+                <div><strong>Prepare persistent storage</strong><button type="button" class="btn btn-sm" data-copy-target="farm-enroll-prepare-command">Copy</button></div>
+                <code id="farm-enroll-prepare-command"></code>
+              </div>
+              <div class="farm-command-block">
+                <div><strong>Start the exact worker</strong><button type="button" class="btn btn-sm" data-copy-target="farm-enroll-docker-command">Copy</button></div>
+                <code id="farm-enroll-docker-command"></code>
+              </div>
+              <ul id="farm-enroll-checks" class="farm-enrollment-checks"></ul>
+            </div>
+          </details>
 
           <section class="farm-node-section" aria-labelledby="farm-node-title">
             <div class="farm-jobs-header">

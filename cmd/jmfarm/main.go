@@ -762,8 +762,10 @@ func runQueue(cfg queueConfig) {
 	defer store.Close()
 
 	// Cancel the loop on SIGTERM/SIGINT (container stop) for a clean exit.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	ctx, cancelLifecycle := context.WithCancel(signalCtx)
+	defer cancelLifecycle()
 
 	profile, profileErr := probeWorkerProfile(ctx, cfg)
 	if profileErr != nil {
@@ -788,6 +790,76 @@ func runQueue(cfg queueConfig) {
 	fmt.Printf("jmfarm queue: worker %s (name=%q role=%s encoders=%v transcript=%v caps=%v) draining %s (db=%s mount=%s producer=%s)\n",
 		worker.ID, worker.Name, worker.Role, worker.Encoders, worker.TranscriptBackends,
 		worker.Capabilities, cfg.meta, cfg.dbPath, cfg.mount, cfg.producer)
+
+	// Stable-name lifecycle control is independent of quality/config updates.
+	// Disable is a durable admission gate: the worker stays visible with a
+	// disabled heartbeat but never claims work. Restart is a one-shot command:
+	// acknowledge first, then cancel the process so an unless-stopped container
+	// starts a fresh exact artifact. A job-specific cancel lets disable drain an
+	// active claim back to its same lane without killing the whole process.
+	var nodeDisabled atomic.Bool
+	var restartRequested atomic.Bool
+	var currentJobMu sync.Mutex
+	var cancelCurrentJob context.CancelFunc
+	var lifecycleDone chan struct{}
+	if farmqueue.ValidWorkerControlName(cfg.name) {
+		if disabled, err := q.WorkerDisabled(ctx, cfg.name); err != nil {
+			fmt.Fprintf(os.Stderr, "jmfarm queue: lifecycle admission check: %v\n", err)
+		} else {
+			nodeDisabled.Store(disabled)
+		}
+		lifecycleDone = make(chan struct{})
+		go func() {
+			defer close(lifecycleDone)
+			for ctx.Err() == nil {
+				disabled, err := q.WorkerDisabled(ctx, cfg.name)
+				if err != nil && ctx.Err() == nil {
+					fmt.Fprintf(os.Stderr, "jmfarm queue: lifecycle admission poll: %v\n", err)
+				} else if err == nil {
+					wasDisabled := nodeDisabled.Swap(disabled)
+					if disabled && !wasDisabled {
+						fmt.Printf("jmfarm queue: node %q disabled; returning active work to its lane\n", cfg.name)
+						currentJobMu.Lock()
+						cancel := cancelCurrentJob
+						currentJobMu.Unlock()
+						if cancel != nil {
+							cancel()
+						}
+					} else if !disabled && wasDisabled {
+						fmt.Printf("jmfarm queue: node %q enabled; compatible claiming resumed\n", cfg.name)
+					}
+				}
+
+				cmd, ok, err := q.WaitWorkerCommand(ctx, cfg.name, 2*time.Second)
+				if err != nil {
+					if ctx.Err() == nil {
+						fmt.Fprintf(os.Stderr, "jmfarm queue: lifecycle command poll: %v\n", err)
+					}
+					continue
+				}
+				if !ok {
+					continue
+				}
+				ackCtx, ackCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				ackErr := q.AcknowledgeWorkerCommand(ackCtx, cmd, worker.ID)
+				ackCancel()
+				if ackErr != nil {
+					fmt.Fprintf(os.Stderr, "jmfarm queue: lifecycle command ack %s: %v\n", cmd.ID, ackErr)
+					continue
+				}
+				restartRequested.Store(true)
+				fmt.Printf("jmfarm queue: acknowledged manager restart command %s\n", cmd.ID)
+				cancelLifecycle()
+				return
+			}
+		}()
+		defer func() {
+			cancelLifecycle()
+			<-lifecycleDone
+		}()
+	} else {
+		fmt.Fprintln(os.Stderr, "jmfarm queue: lifecycle controls unavailable; set a lowercase stable JM_WORKER_NAME")
+	}
 
 	// Manager-config state: last revision applied + restart-class drift. The
 	// config doc is polled every loop iteration (idle or post-job); hot knobs
@@ -879,7 +951,7 @@ func runQueue(cfg queueConfig) {
 			defer ticker.Stop()
 			for {
 				ctl, ctlErr := q.GetControl(ctx)
-				if ctlErr == nil && !ctl.Paused && ctl.WatchEnabled {
+				if ctlErr == nil && !nodeDisabled.Load() && !ctl.Paused && ctl.WatchEnabled {
 					leader, leaderErr := q.AcquireWatchLeadership(ctx, worker.ID, 45*time.Second)
 					watchLeader.Store(leaderErr == nil && leader)
 				} else {
@@ -944,7 +1016,9 @@ func runQueue(cfg queueConfig) {
 		// healthy paused node from an offline one.
 		worker.CurrentJob = ""
 		worker.State = "idle"
-		if ctl.Paused {
+		if nodeDisabled.Load() {
+			worker.State = "disabled"
+		} else if ctl.Paused {
 			worker.State = "paused"
 		}
 		setHeartbeatExtras(&worker)
@@ -970,7 +1044,7 @@ func runQueue(cfg queueConfig) {
 			}
 			nextReap = time.Now().Add(15 * time.Second)
 		}
-		if ctl.Paused {
+		if nodeDisabled.Load() || ctl.Paused {
 			select {
 			case <-ctx.Done():
 			case <-time.After(time.Second):
@@ -1033,8 +1107,17 @@ func runQueue(cfg queueConfig) {
 		cfgMu.Lock()
 		jobCfg := cfg
 		cfgMu.Unlock()
+		jobCtx, jobCancel := context.WithCancel(ctx)
+		currentJobMu.Lock()
+		cancelCurrentJob = jobCancel
+		currentJobMu.Unlock()
 		jobStarted := time.Now()
-		processed, failed, failedTargets, runErr := runJob(ctx, q, store, jobCfg, worker, job)
+		processed, failed, failedTargets, runErr := runJob(jobCtx, q, store, jobCfg, worker, job)
+		currentJobMu.Lock()
+		cancelCurrentJob = nil
+		currentJobMu.Unlock()
+		jobWasCancelled := jobCtx.Err() != nil
+		jobCancel()
 		hbStop()
 		<-hbDone
 		recordCompletedJobBenchmark(&worker, job, processed, failed, time.Since(jobStarted))
@@ -1042,6 +1125,17 @@ func runQueue(cfg queueConfig) {
 			// Leave the durable processing receipt intact. A live worker will
 			// recover it after this heartbeat expires.
 			break
+		}
+		if nodeDisabled.Load() && jobWasCancelled {
+			if len(failedTargets) > 0 {
+				claim.Job.RetryTargets = failedTargets
+			}
+			claim.Job.ProcessedOffset += processed
+			if err := q.RequeueClaimSameRoute(context.Background(), claim, "worker disabled by Manager; claim returned without changing backend admission"); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: disable requeue %s: %v; stopping with durable claim intact\n", job.ID, err)
+				return
+			}
+			continue
 		}
 		if errors.Is(runErr, errJobDispatched) {
 			if err := q.MarkDispatched(context.Background(), job.ID); err != nil {
@@ -1100,7 +1194,11 @@ func runQueue(cfg queueConfig) {
 		}
 	}
 
-	fmt.Printf("jmfarm queue: worker %s stopping (signal)\n", worker.ID)
+	if restartRequested.Load() {
+		fmt.Printf("jmfarm queue: worker %s stopping (manager restart acknowledged)\n", worker.ID)
+	} else {
+		fmt.Printf("jmfarm queue: worker %s stopping (signal)\n", worker.ID)
+	}
 }
 
 var (

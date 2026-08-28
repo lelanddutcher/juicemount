@@ -13,11 +13,13 @@ import (
 // fakeFarmQ provides the config-method surface handleFarmConfig uses, without
 // a live Redis.
 type fakeFarmQ struct {
-	cfg     *farmqueue.FarmConfig
-	stored  int
-	deleted int
-	workers []farmqueue.Worker
-	control farmqueue.FarmControl
+	cfg      *farmqueue.FarmConfig
+	stored   int
+	deleted  int
+	workers  []farmqueue.Worker
+	control  farmqueue.FarmControl
+	disabled map[string]bool
+	commands map[string]farmqueue.WorkerCommandStatus
 }
 
 func (f *fakeFarmQ) Enqueue(ctx context.Context, j farmqueue.Job) error { return nil }
@@ -64,6 +66,36 @@ func (f *fakeFarmQ) DeleteConfig(ctx context.Context) error {
 	f.deleted++
 	f.cfg = nil
 	return nil
+}
+
+func (f *fakeFarmQ) RequestWorkerRestart(_ context.Context, name, requestedBy string) (farmqueue.WorkerCommand, error) {
+	if f.commands == nil {
+		f.commands = map[string]farmqueue.WorkerCommandStatus{}
+	}
+	cmd := farmqueue.WorkerCommand{ID: "cmd-test", Name: name, Action: farmqueue.WorkerActionRestart, RequestedAt: "requested-at", RequestedBy: requestedBy}
+	f.commands[cmd.ID] = farmqueue.WorkerCommandStatus{ID: cmd.ID, Name: name, Action: cmd.Action, State: "requested", RequestedAt: cmd.RequestedAt, RequestedBy: requestedBy}
+	return cmd, nil
+}
+
+func (f *fakeFarmQ) WorkerCommandStatusByID(_ context.Context, id string) (farmqueue.WorkerCommandStatus, bool, error) {
+	status, ok := f.commands[id]
+	return status, ok, nil
+}
+
+func (f *fakeFarmQ) SetWorkerDisabled(_ context.Context, name string, disabled bool) error {
+	if f.disabled == nil {
+		f.disabled = map[string]bool{}
+	}
+	if disabled {
+		f.disabled[name] = true
+	} else {
+		delete(f.disabled, name)
+	}
+	return nil
+}
+
+func (f *fakeFarmQ) WorkerDisabled(_ context.Context, name string) (bool, error) {
+	return f.disabled[name], nil
 }
 
 // Compile-time proof the fake satisfies the API's farmQueue seam.

@@ -300,7 +300,7 @@ type Worker struct {
 	Decoders           []string          `json:"decoders,omitempty"`        // verified/listed hardware decoders
 	TranscriptBackends []string          `json:"transcript_backends,omitempty"`
 	Benchmarks         WorkerBenchmarks  `json:"benchmarks,omitempty"`
-	State              string            `json:"state,omitempty"` // idle|working|paused
+	State              string            `json:"state,omitempty"` // idle|working|paused|disabled
 }
 
 // FarmConfig is the manager-owned desired state published at ConfigKey. The

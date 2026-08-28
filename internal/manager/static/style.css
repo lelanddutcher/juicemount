@@ -2263,6 +2263,106 @@ footer a:hover { text-decoration: underline; }
 .farm-worker-probe-error { color: var(--running); }
 .farm-worker-rev { display: inline-block; margin-top: 0.45rem; }
 .farm-worker-badge { background: color-mix(in srgb, var(--running) 12%, var(--panel)); color: var(--running); border-color: color-mix(in srgb, var(--running) 45%, var(--border)); }
+.farm-worker-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.75rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--border);
+}
+.farm-worker-action-status {
+  flex: 1 1 180px;
+  color: var(--text-muted);
+  font: 0.68rem/1.4 var(--font-mono);
+}
+.farm-worker-action-status.ok { color: var(--success); }
+.farm-worker-action-status.error { color: var(--danger); }
+.farm-enrollment-card {
+  margin: 0.7rem 0;
+  border: 1px solid var(--border);
+  border-top: 2px solid var(--accent);
+  border-radius: 2px;
+  background: var(--panel);
+}
+.farm-enrollment-card > summary {
+  min-height: 4rem;
+  display: flex;
+  align-items: center;
+  padding: 0.75rem 0.9rem;
+  cursor: pointer;
+  color: var(--text);
+  user-select: none;
+}
+.farm-enrollment-card > summary::marker { color: var(--accent-text); }
+.farm-enrollment-card > summary span { display: flex; flex-direction: column; gap: 0.15rem; }
+.farm-enrollment-card > summary strong { font-size: 0.9rem; }
+.farm-enrollment-card > summary em { color: var(--text-muted); font-size: 0.73rem; font-style: normal; font-weight: 400; }
+.farm-enrollment-card[open] > summary {
+  color: var(--accent-text);
+  border-bottom: 1px solid var(--border);
+}
+.farm-enrollment-form,
+.farm-enrollment-result { padding: 0.9rem; }
+.farm-enrollment-form .farm-config-grid { margin-bottom: 0.75rem; }
+.farm-enroll-remote {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.farm-enroll-remote input { margin-top: 0.2rem; }
+.farm-enroll-remote span { display: flex; flex-direction: column; gap: 0.12rem; }
+.farm-enroll-remote strong { color: var(--text); font-size: 0.8rem; }
+.farm-enroll-remote em { color: var(--text-muted); font-size: 0.72rem; font-style: normal; }
+.farm-enrollment-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 0.8rem;
+}
+.farm-enrollment-result {
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+.farm-enrollment-result-head,
+.farm-command-block > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+.farm-enrollment-result-head h4 { margin: 0.12rem 0 0; color: var(--text); }
+.farm-command-block {
+  margin-top: 0.7rem;
+  padding: 0.7rem;
+  border-left: 2px solid var(--accent);
+  background: var(--card);
+}
+.farm-command-block > div strong { color: var(--text); font-size: 0.76rem; }
+.farm-command-block code {
+  display: block;
+  max-height: 11rem;
+  margin-top: 0.55rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 0.69rem;
+  line-height: 1.5;
+}
+.farm-enrollment-checks {
+  margin: 0.8rem 0 0;
+  padding-left: 1.15rem;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  line-height: 1.55;
+}
+.farm-config-status.error { color: var(--danger); }
 .farm-config-drawer, .farm-manual-drawer {
   margin: 0.7rem 0;
   padding: 0.7rem 0.85rem;
@@ -2296,6 +2396,9 @@ footer a:hover { text-decoration: underline; }
   .farm-control-deck { grid-template-columns: 1fr; }
   .farm-control-status { grid-column: 1; }
   .farm-routing-note { display: none; }
+  .farm-worker-actions > button { flex: 1 1 9rem; }
+  .farm-enrollment-result-head,
+  .farm-command-block > div { align-items: flex-start; }
 }
 
 /* Public-site cohesion pass. The Manager stays information-dense, but uses
@@ -2376,6 +2479,7 @@ main h3,
 .farm-worker-card,
 .farm-node-section,
 .farm-config-drawer,
+.farm-enrollment-card,
 .farm-manual-drawer,
 .farm-job-row { border-radius: 2px; }
 
