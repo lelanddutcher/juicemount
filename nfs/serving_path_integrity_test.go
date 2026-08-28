@@ -31,6 +31,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
@@ -646,5 +647,38 @@ func TestContentInvalidationHookDropsOnlyAffectedMemoryBytes(t *testing.T) {
 	store.NotifyContentReset()
 	if has("peer-old/keep.mov") {
 		t.Fatal("content reset left buffered bytes behind")
+	}
+}
+
+func TestReadOpenDefersFUSEUntilDirectCacheMiss(t *testing.T) {
+	jfs, store, fuseRoot := newIntegrityHarness(t)
+	h := jfs.handler
+	cr := cache.NewReader(t.TempDir(), cache.DefaultBlockSize, nil)
+	h.SetCacheReader(cr)
+
+	seedFile(t, jfs, store, fuseRoot, "media/clip.mov", []byte("coherent-fallback"))
+	f, err := jfs.OpenFile("media/clip.mov", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("lazy OpenFile: %v", err)
+	}
+	cf, ok := f.(*cachedFile)
+	if !ok {
+		t.Fatalf("OpenFile returned %T, want *cachedFile", f)
+	}
+	if cf.fuseFD != nil {
+		t.Fatal("read-only OpenFile eagerly acquired FUSE despite an attached direct-cache reader")
+	}
+	buf := make([]byte, len("coherent-fallback"))
+	if n, err := cf.ReadAt(buf, 0); err != nil || n != len(buf) {
+		t.Fatalf("fallback ReadAt = %d, %v", n, err)
+	}
+	if string(buf) != "coherent-fallback" {
+		t.Fatalf("fallback bytes = %q", buf)
+	}
+	if cf.fuseFD == nil {
+		t.Fatal("direct-cache miss did not lazily acquire the coherent FUSE descriptor")
+	}
+	if err := cf.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

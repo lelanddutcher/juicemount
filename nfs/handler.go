@@ -3192,6 +3192,42 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 	// For read-only opens, try to use fd pool + cache reader
 	if !isWrite && e != nil {
 		fusePath := jfs.fullPath(filename)
+		newCachedFile := func(fd *os.File) *cachedFile {
+			return &cachedFile{
+				name:        filename,
+				fuseFD:      fd,
+				fusePath:    fusePath,
+				fdPool:      jfs.handler.fdPool,
+				handler:     jfs.handler,
+				cacheReader: jfs.handler.cacheReader.Load(),
+				readahead:   jfs.handler.readahead,
+				memBuf:      jfs.handler.memBuf,
+				inode:       e.Inode,
+				fileSize:    e.Size,
+				pinned:      isPinned,
+				// QA-31 + HIGH-1 fix: value-copy snapshot, NOT a pointer
+				// to the live Entry. The Entry can be mutated in-place by
+				// concurrent UpdateSize on writeback paths.
+				cachedInfo: &snapshotFileInfo{
+					name:  e.Name,
+					size:  e.Size,
+					mode:  e.Mode,
+					mtime: e.Mtime,
+					isDir: e.IsDir,
+					inode: e.Inode,
+				},
+			}
+		}
+		// Do not eagerly open JuiceFS/FUSE when the verified SSD reader is
+		// available. NFSv3 has no stateful OPEN operation: this OpenFile call is
+		// part of the READ RPC, and an eager FUSE open paid remote metadata before
+		// ReadAt had a chance to prove the requested bytes were local (measured
+		// 6.7s on the first cellular read despite 128/128 direct SSD hits). A cache
+		// miss lazily acquires the same pooled FUSE descriptor inside ReadAt, so
+		// cold/error semantics stay on the same RPC while cache hits avoid FUSE.
+		if cr := jfs.handler.cacheReader.Load(); cr != nil && cacheReaderServeEnabled {
+			return newCachedFile(nil), nil
+		}
 		fd, err := jfs.handler.fdPool.Get(fusePath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -3270,30 +3306,7 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 			}
 			return nil, err
 		}
-		return &cachedFile{
-			name:        filename,
-			fuseFD:      fd,
-			fusePath:    fusePath,
-			fdPool:      jfs.handler.fdPool,
-			handler:     jfs.handler,
-			cacheReader: jfs.handler.cacheReader.Load(),
-			readahead:   jfs.handler.readahead,
-			memBuf:      jfs.handler.memBuf,
-			inode:       e.Inode,
-			fileSize:    e.Size,
-			pinned:      isPinned,
-			// QA-31 + HIGH-1 fix: value-copy snapshot, NOT a pointer
-			// to the live Entry. The Entry can be mutated in-place by
-			// concurrent UpdateSize on writeback paths.
-			cachedInfo: &snapshotFileInfo{
-				name:  e.Name,
-				size:  e.Size,
-				mode:  e.Mode,
-				mtime: e.Mtime,
-				isDir: e.IsDir,
-				inode: e.Inode,
-			},
-		}, nil
+		return newCachedFile(fd), nil
 	}
 
 	// For writes, use fd pool to avoid re-opening on every NFS WRITE RPC.
@@ -4210,6 +4223,7 @@ type cachedFile struct {
 	memBuf      *MemoryBuffer
 	inode       uint64
 	fileSize    int64
+	fdMu        sync.Mutex // guards lazy fuseFD acquisition and Close
 	closed      bool
 
 	// Decided at OpenFile time: whether this file passed the pin check.
@@ -4235,6 +4249,34 @@ type cachedFile struct {
 	// per NFS post-op-attrs semantics (advisory; clients revalidate via
 	// GETATTR).
 	cachedInfo *snapshotFileInfo
+}
+
+// ensureFuseFD lazily acquires the pooled JuiceFS descriptor only after the
+// direct SSD and RAM serving paths miss. This is the seam that keeps a verified
+// cache hit from paying remote metadata merely to construct cachedFile.
+func (f *cachedFile) ensureFuseFD() error {
+	f.fdMu.Lock()
+	defer f.fdMu.Unlock()
+	if f.closed {
+		return os.ErrClosed
+	}
+	if f.fuseFD != nil {
+		return nil
+	}
+	if f.fdPool == nil {
+		fd, err := os.Open(f.fusePath)
+		if err != nil {
+			return err
+		}
+		f.fuseFD = fd
+		return nil
+	}
+	fd, err := f.fdPool.Get(f.fusePath)
+	if err != nil {
+		return err
+	}
+	f.fuseFD = fd
+	return nil
 }
 
 // snapshotFileInfo is a frozen-at-construction os.FileInfo for cachedFile.
@@ -4479,6 +4521,18 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		metrics.Default().IncDirectSSDCacheMiss()
 	}
 
+	// Priority 2.5: `._` AppleDouble sidecar cache (nav crux). Keep this before
+	// the offline/FUSE branch: a complete RAM hit needs neither a backend nor a
+	// lazily-opened JuiceFS descriptor.
+	if f.handler != nil {
+		if sn, ok := f.handler.sidecarServe(f.name, p, off); ok {
+			if sn == 0 {
+				return 0, io.EOF
+			}
+			return sn, nil
+		}
+	}
+
 	// Offline mode short-circuit: if the user has flipped to offline, we don't
 	// fall through to an UNBOUNDED FUSE read. JuiceFS would otherwise try to GET
 	// a missing block from S3, which on cellular can take 30+ seconds and
@@ -4498,6 +4552,9 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	// avoid false-refusing a slow-but-local read under load). A genuinely-cached
 	// pinned block still returns in well under the bound → served, no regression.
 	if pin.IsOffline() {
+		if err := f.ensureFuseFD(); err != nil {
+			return 0, pin.ErrOfflineNotAvailable
+		}
 		// The bytes MIGHT be local — JuiceFS's own LRU has them (recently
 		// read/written/just-copied/pinned-and-warm), or the user toggled offline
 		// while the network is actually up (Redis/JuiceFS reachable, just don't
@@ -4539,25 +4596,14 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		return bn, berr
 	}
 
-	// Priority 2.5: `._` AppleDouble sidecar cache (nav crux). A Finder listing
-	// of a `._`-heavy folder reads every sidecar over the tunnel (~700ms each);
-	// serve the complete body from RAM instead. Mirror-validated + writer-
-	// bypassed inside sidecarServe, so a changed/being-written sidecar never
-	// serves stale. Skips the QoS lane entirely on a hit.
-	if f.handler != nil {
-		if sn, ok := f.handler.sidecarServe(f.name, p, off); ok {
-			if sn == 0 {
-				return 0, io.EOF
-			}
-			return sn, nil
-		}
-	}
-
 	// Priority 3: JuiceFS FUSE read (populates SSD cache for next time).
 	// Read-QoS (#4, INSTANT-NAV): on slow/metered links, admit through the
 	// two-lane gate so a bulk/preview storm can't starve the first-block
 	// probes Finder browsing depends on. The token spans the retry loop
 	// below (a retrying read must not re-queue). Inert on medium/fast.
+	if err := f.ensureFuseFD(); err != nil {
+		return 0, f.handler.classifyBlipError(err)
+	}
 	releaseQoS := defaultReadQoS.acquire(off, len(p))
 	defer releaseQoS()
 	// FUSE data ceiling (2026-08-05 double kernel panic). readQoS above is inert
@@ -4702,9 +4748,22 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 	return n, f.handler.classifyBlipError(err)
 }
 
-func (f *cachedFile) Read(p []byte) (int, error)  { return f.fuseFD.Read(p) }
-func (f *cachedFile) Write(p []byte) (int, error) { return f.fuseFD.Write(p) }
+func (f *cachedFile) Read(p []byte) (int, error) {
+	if err := f.ensureFuseFD(); err != nil {
+		return 0, err
+	}
+	return f.fuseFD.Read(p)
+}
+func (f *cachedFile) Write(p []byte) (int, error) {
+	if err := f.ensureFuseFD(); err != nil {
+		return 0, err
+	}
+	return f.fuseFD.Write(p)
+}
 func (f *cachedFile) Seek(offset int64, whence int) (int64, error) {
+	if err := f.ensureFuseFD(); err != nil {
+		return 0, err
+	}
 	return f.fuseFD.Seek(offset, whence)
 }
 func (f *cachedFile) Lock() error   { return nil }
@@ -4718,15 +4777,28 @@ func (f *cachedFile) Truncate(size int64) error {
 	if f.handler != nil {
 		f.handler.clampWriteSize(f.name, size)
 	}
+	if err := f.ensureFuseFD(); err != nil {
+		return err
+	}
 	return f.fuseFD.Truncate(size)
 }
 
 func (f *cachedFile) Close() error {
+	f.fdMu.Lock()
+	defer f.fdMu.Unlock()
 	if f.closed {
 		return nil
 	}
 	f.closed = true
-	f.fdPool.Release(f.fusePath)
+	if f.fuseFD == nil {
+		return nil
+	}
+	if f.fdPool != nil {
+		f.fdPool.Release(f.fusePath)
+	} else {
+		_ = f.fuseFD.Close()
+	}
+	f.fuseFD = nil
 	return nil
 }
 
