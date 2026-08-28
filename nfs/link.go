@@ -124,6 +124,11 @@ func linkTSNetDiagnostic(format string, args ...any) (string, []any, bool) {
 		return "map-received", nil, true
 	case strings.Contains(format, "Switching ipn state"):
 		return "backend-state-transition", []any{"from", safeArg(0), "to", safeArg(1), "want_running", safeArg(2)}, true
+	case strings.Contains(format, "[v1] %s: %v") && len(args) >= 2 && fmt.Sprint(args[0]) == "TryLogin":
+		// controlclient emits the asynchronous login failure through a generic
+		// versioned wrapper. Only retain the operation name and a coarse class;
+		// the raw error can contain the control URL and authorization material.
+		return "auth-try-login-error", []any{"kind", linkDiagnosticErrorKind(args[1:])}, true
 	case strings.Contains(format, "TryLogin: %v"):
 		return "auth-try-login-error", []any{"kind", linkDiagnosticErrorKind(args)}, true
 	case strings.Contains(format, "failed to save new controlclient state"):
@@ -157,6 +162,16 @@ func linkDiagnosticErrorKind(args []any) string {
 		return "eof"
 	case strings.Contains(s, "network is unreachable") || strings.Contains(s, "no route"):
 		return "unreachable"
+	case strings.Contains(s, "permission denied") || strings.Contains(s, "operation not permitted"):
+		return "permission"
+	case strings.Contains(s, "connection reset"):
+		return "reset"
+	case strings.Contains(s, "missing protocol scheme") || strings.Contains(s, "invalid url") || strings.Contains(s, "malformed url"):
+		return "malformed-url"
+	case strings.Contains(s, "status code 4") || strings.Contains(s, "status=4") || strings.Contains(s, "http 4"):
+		return "http-4xx"
+	case strings.Contains(s, "status code 5") || strings.Contains(s, "status=5") || strings.Contains(s, "http 5"):
+		return "http-5xx"
 	default:
 		return "other"
 	}

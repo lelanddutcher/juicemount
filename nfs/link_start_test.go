@@ -72,6 +72,35 @@ func TestLinkTSNetDiagnosticNeverReturnsRawErrors(t *testing.T) {
 	}
 }
 
+func TestLinkTSNetDiagnosticVersionedLoginWrapperNeverReturnsRawErrors(t *testing.T) {
+	sensitiveURL := "https://control.example.invalid/key?auth=do-not-log"
+	event, attrs, ok := linkTSNetDiagnostic("[v1] %s: %v", "TryLogin", errors.New("GET "+sensitiveURL+": operation not permitted"))
+	if !ok || event != "auth-try-login-error" {
+		t.Fatalf("diagnostic = %q %v %v", event, attrs, ok)
+	}
+	got := fmt.Sprint(attrs)
+	if strings.Contains(got, sensitiveURL) || !strings.Contains(got, "permission") {
+		t.Fatalf("diagnostic attributes leaked raw error or lost class: %q", got)
+	}
+	if _, _, ok := linkTSNetDiagnostic("[v1] %s: %v", "RegisterReq", errors.New("payload "+sensitiveURL)); ok {
+		t.Fatal("unapproved versioned operation unexpectedly passed diagnostic allowlist")
+	}
+}
+
+func TestLinkDiagnosticErrorKind(t *testing.T) {
+	tests := map[string]string{
+		"dial tcp: connection reset by peer":     "reset",
+		"parse request: missing protocol scheme": "malformed-url",
+		"control returned status code 403":       "http-4xx",
+		"control returned HTTP 503":              "http-5xx",
+	}
+	for raw, want := range tests {
+		if got := linkDiagnosticErrorKind([]any{errors.New(raw)}); got != want {
+			t.Errorf("linkDiagnosticErrorKind(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestLinkTSNetDiagnosticAllowlist(t *testing.T) {
 	event, attrs, ok := linkTSNetDiagnostic("Authkey is set; but state is %v. Ignoring authkey.", ipn.NoState)
 	if !ok || event != "initial-auth-trigger-skipped" || !strings.Contains(fmt.Sprint(attrs), "NoState") {
