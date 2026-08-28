@@ -80,9 +80,6 @@ func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, er
 		}
 	}
 	p.Benchmarks.AccessMBps = benchmarkMountRead(ctx, cfg.mount)
-	if len(probeErrs) > 0 {
-		p.Benchmarks.ProbeError = strings.Join(probeErrs, "; ")
-	}
 
 	if err := ctx.Err(); err != nil {
 		return p, err
@@ -92,6 +89,7 @@ func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, er
 		requested = "auto"
 	}
 	accelerated := len(p.Encoders) > 0 || len(p.TranscriptBackends) > 1
+	p.Benchmarks.ProbeError = workerProbeFailure(probeErrs, accelerated)
 	switch requested {
 	case "auto":
 		p.Role = farmqueue.QueueClassServer
@@ -109,6 +107,19 @@ func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, er
 		return p, fmt.Errorf("unknown worker role %q (want auto, server, or render)", cfg.role)
 	}
 	return p, nil
+}
+
+// workerProbeFailure distinguishes a failed worker admission from unavailable
+// alternatives. Intel ffmpeg commonly lists both QSV and VAAPI even when only
+// VAAPI is usable inside Docker. If verified VAAPI decode+encode succeeds, a
+// failed QSV experiment is not a worker error and must not paint the healthy
+// node red in Manager. The exact admitted Encoders/Decoders lists remain the
+// truthful capability record used by scheduling.
+func workerProbeFailure(probeErrs []string, accelerated bool) string {
+	if accelerated || len(probeErrs) == 0 {
+		return ""
+	}
+	return strings.Join(probeErrs, "; ")
 }
 
 func probeHardwareEncoders(parent context.Context) ([]hardwareEncoderProbe, []string) {
