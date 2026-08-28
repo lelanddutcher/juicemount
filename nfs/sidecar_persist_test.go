@@ -1,6 +1,8 @@
 package nfs
 
 import (
+	"encoding/gob"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,6 +36,60 @@ func TestSidecarPersistRoundTrip(t *testing.T) {
 	// Mirror meta moved while the app was down → loaded entry must MISS.
 	if _, ok := c2.get("d/._clip.mov", 101, int64(len(body))); ok {
 		t.Fatal("stale loaded entry served after mtime change — validation hole")
+	}
+}
+
+func TestSidecarPersistLoadsVersionOneSnapshot(t *testing.T) {
+	snap := filepath.Join(t.TempDir(), "sidecars-v1.gob")
+	f, err := os.Create(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("legacy-appledouble")
+	legacy := sidecarPersistFile{
+		Version: 1,
+		Entries: []sidecarPersistEntry{{
+			Path: "d/._legacy.mov", Mtime: 42, Size: int64(len(body)), Data: body,
+		}},
+	}
+	if err := gob.NewEncoder(f).Encode(legacy); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &sidecarCache{enabled: true, m: map[string]*sidecarEntry{}, maxBytes: 1 << 20}
+	c.persistPath = snap
+	c.loadFromDisk()
+	if got, ok := c.get("d/._legacy.mov", 42, int64(len(body))); !ok || string(got) != string(body) {
+		t.Fatalf("v1 snapshot migration failed: ok=%v bytes=%q", ok, got)
+	}
+}
+
+func TestSidecarPersistVersionTwoDeduplicatesBodies(t *testing.T) {
+	snap := filepath.Join(t.TempDir(), "sidecars-v2.gob")
+	c := &sidecarCache{enabled: true, m: map[string]*sidecarEntry{}, maxBytes: 1 << 20, maxFiles: 1000}
+	c.persistPath = snap
+	body := make([]byte, 4096)
+	for i := 0; i < 100; i++ {
+		c.put(filepath.Join("d", fmt.Sprintf("._same-%03d", i)), body, int64(i+1), int64(len(body)))
+	}
+	c.saveToDisk()
+
+	f, err := os.Open(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var persisted sidecarPersistFile
+	if err := gob.NewDecoder(f).Decode(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Version != sidecarPersistVersion || len(persisted.Entries) != 100 || len(persisted.Blobs) != 1 {
+		t.Fatalf("v2 snapshot = version %d, %d entries, %d blobs; want %d/100/1",
+			persisted.Version, len(persisted.Entries), len(persisted.Blobs), sidecarPersistVersion)
 	}
 }
 

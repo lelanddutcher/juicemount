@@ -2,6 +2,7 @@ package nfs
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -41,13 +42,13 @@ func TestSidecarCacheRefusesPartial(t *testing.T) {
 
 func TestSidecarCacheLRUEviction(t *testing.T) {
 	c := &sidecarCache{enabled: true, m: map[string]*sidecarEntry{}, maxBytes: 300}
-	mk := func(n int) []byte { return make([]byte, n) }
-	c.put("a", mk(100), 1, 100)
-	c.put("b", mk(100), 1, 100)
-	c.put("c", mk(100), 1, 100)
+	mk := func(n int, fill byte) []byte { return bytes.Repeat([]byte{fill}, n) }
+	c.put("a", mk(100, 'a'), 1, 100)
+	c.put("b", mk(100, 'b'), 1, 100)
+	c.put("c", mk(100, 'c'), 1, 100)
 	// Touch a (most-recent), then insert d forcing eviction of the LRU (b).
 	c.get("a", 1, 100)
-	c.put("d", mk(100), 1, 100)
+	c.put("d", mk(100, 'd'), 1, 100)
 	if _, ok := c.get("b", 1, 100); ok {
 		t.Fatal("LRU victim b survived; a was touched so b was oldest")
 	}
@@ -56,6 +57,23 @@ func TestSidecarCacheLRUEviction(t *testing.T) {
 	}
 	if files, bytesN := c.stats(); int64(bytesN) > c.maxBytes || files == 0 {
 		t.Fatalf("cap violated: files=%d bytes=%d max=%d", files, bytesN, c.maxBytes)
+	}
+}
+
+func TestSidecarCacheDeduplicatesIdenticalBodies(t *testing.T) {
+	c := &sidecarCache{enabled: true, m: map[string]*sidecarEntry{}, maxBytes: 8 << 10, maxFiles: 1000}
+	body := bytes.Repeat([]byte{0x5a}, 4096)
+	for i := 0; i < 100; i++ {
+		c.put(fmt.Sprintf("d/._%03d", i), body, int64(i+1), int64(len(body)))
+	}
+	files, uniqueBytes := c.stats()
+	if files != 100 || uniqueBytes != int64(len(body)) {
+		t.Fatalf("deduplicated cache = %d files/%d bytes, want 100/%d", files, uniqueBytes, len(body))
+	}
+	for i := 0; i < 100; i++ {
+		if got, ok := c.get(fmt.Sprintf("d/._%03d", i), int64(i+1), int64(len(body))); !ok || !bytes.Equal(got, body) {
+			t.Fatalf("deduplicated entry %d missing or corrupt", i)
+		}
 	}
 }
 

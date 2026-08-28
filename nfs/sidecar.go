@@ -43,16 +43,24 @@ import (
 // are eligible — real media never enters this cache.
 const (
 	sidecarMaxFile   = 128 << 10 // only cache `._` files this small (they are ~4KB)
-	sidecarCacheCap  = 128 << 20 // total RAM cap for the sidecar cache
+	sidecarCacheCap  = 128 << 20 // unique body bytes; identical AppleDouble bodies are interned
+	sidecarEntryCap  = 262144    // bound path/metadata overhead even when every body deduplicates
 	sidecarNamePfx   = "._"
 	sidecarNamePfxLn = 2
 )
 
 type sidecarEntry struct {
-	data     []byte
-	mtime    int64
-	size     int64
-	lastUsed int64
+	data       []byte
+	contentKey string
+	mtime      int64
+	size       int64
+	lastUsed   int64
+}
+
+type sidecarBlob struct {
+	key  string
+	data []byte
+	refs int
 }
 
 // sidecarCache is a bounded, mtime-validated LRU of complete `._` bodies.
@@ -60,8 +68,10 @@ type sidecarCache struct {
 	enabled  bool
 	mu       sync.Mutex
 	m        map[string]*sidecarEntry
-	bytes    int64
+	blobs    map[string]*sidecarBlob
+	bytes    int64 // unique body bytes, not logical bytes across paths
 	maxBytes int64
+	maxFiles int
 	tick     int64
 
 	// Disk persistence (sidecar_persist.go). persistPath is set once by
@@ -83,7 +93,9 @@ func newSidecarCache() *sidecarCache {
 	return &sidecarCache{
 		enabled:  os.Getenv("JM_SIDECAR_CACHE") != "0",
 		m:        make(map[string]*sidecarEntry),
+		blobs:    make(map[string]*sidecarBlob),
 		maxBytes: max,
+		maxFiles: sidecarEntryCap,
 	}
 }
 
@@ -131,21 +143,87 @@ func (c *sidecarCache) put(path string, data []byte, mtime, size int64) {
 	if c == nil || !c.enabled || size <= 0 || size > sidecarMaxFile || int64(len(data)) != size {
 		return
 	}
-	buf := make([]byte, len(data)) // own the bytes (caller's p is pooled/reused)
-	copy(buf, data)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if old, ok := c.m[path]; ok {
-		c.bytes -= int64(len(old.data))
-	}
-	c.tick++
-	c.m[path] = &sidecarEntry{data: buf, mtime: mtime, size: size, lastUsed: c.tick}
-	c.bytes += int64(len(buf))
-	for c.bytes > c.maxBytes && len(c.m) > 1 {
+	c.putLocked(path, data, mtime, size)
+	for (c.bytes > c.maxBytes || len(c.m) > c.fileLimitLocked()) && len(c.m) > 1 {
 		c.evictOneLRULocked()
 	}
 	atomic.AddInt64(&c.dirty, 1)
 	metrics.Default().IncSidecarCachePut()
+}
+
+// ensureInternLocked upgrades test fixtures and legacy persistence entries that
+// were constructed before body interning existed. Exact body strings are the
+// map key, so deduplication never relies on a probabilistic hash for bytes that
+// may contain real Finder tags or resource forks.
+func (c *sidecarCache) ensureInternLocked() {
+	if c.blobs != nil {
+		return
+	}
+	c.blobs = make(map[string]*sidecarBlob)
+	c.bytes = 0
+	for _, e := range c.m {
+		key := string(e.data)
+		if blob := c.blobs[key]; blob != nil {
+			blob.refs++
+			e.data = blob.data
+			e.contentKey = blob.key
+			continue
+		}
+		blob := &sidecarBlob{key: key, data: e.data, refs: 1}
+		c.blobs[key] = blob
+		e.contentKey = blob.key
+		c.bytes += int64(len(blob.data))
+	}
+}
+
+func (c *sidecarCache) fileLimitLocked() int {
+	if c.maxFiles > 0 {
+		return c.maxFiles
+	}
+	return sidecarEntryCap
+}
+
+// putLocked stores one validated complete body and owns/canonicalizes its
+// bytes. The caller holds c.mu. Dirty/metrics accounting belongs to the caller
+// so persistence restore can remain observationally quiet.
+func (c *sidecarCache) putLocked(path string, data []byte, mtime, size int64) {
+	c.ensureInternLocked()
+	if old := c.m[path]; old != nil {
+		c.releaseEntryLocked(old)
+	}
+	key := string(data)
+	blob := c.blobs[key]
+	if blob == nil {
+		buf := append([]byte(nil), data...) // caller's read buffer is pooled/reused
+		blob = &sidecarBlob{key: key, data: buf, refs: 1}
+		c.blobs[key] = blob
+		c.bytes += int64(len(buf))
+	} else {
+		blob.refs++
+	}
+	c.tick++
+	c.m[path] = &sidecarEntry{
+		data: blob.data, contentKey: blob.key,
+		mtime: mtime, size: size, lastUsed: c.tick,
+	}
+}
+
+func (c *sidecarCache) releaseEntryLocked(e *sidecarEntry) {
+	if e == nil {
+		return
+	}
+	c.ensureInternLocked()
+	blob := c.blobs[e.contentKey]
+	if blob == nil {
+		return
+	}
+	blob.refs--
+	if blob.refs <= 0 {
+		delete(c.blobs, blob.key)
+		c.bytes -= int64(len(blob.data))
+	}
 }
 
 // invalidate drops a path (used when a writer opens the sidecar for write).
@@ -156,7 +234,7 @@ func (c *sidecarCache) invalidate(path string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.m[path]; ok {
-		c.bytes -= int64(len(e.data))
+		c.releaseEntryLocked(e)
 		delete(c.m, path)
 		atomic.AddInt64(&c.dirty, 1)
 	}
@@ -171,7 +249,7 @@ func (c *sidecarCache) evictOneLRULocked() {
 		}
 	}
 	if victim != "" {
-		c.bytes -= int64(len(c.m[victim].data))
+		c.releaseEntryLocked(c.m[victim])
 		delete(c.m, victim)
 	}
 }
