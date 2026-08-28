@@ -18,6 +18,33 @@ func classQueue(kind, class string) string {
 	return QueueKey + ":" + kind + ":" + class
 }
 
+// RouteInitialJob separates recursive discovery from accelerated execution.
+// A fresh proxy/transcript request has not yet proven whether Path is one file
+// or a directory containing thousands, so it first goes to the server's
+// metadata lane. Bounded children (ShardCount > 0), exact retry subsets, and
+// explicit fallback jobs bypass this planner and are routed for execution.
+func (c *Client) RouteInitialJob(ctx context.Context, j *Job) {
+	if j == nil {
+		return
+	}
+	if j.PlanOnly || shouldPlanOnServer(*j) {
+		j.PlanOnly = true
+		j.QueueClass = QueueClassServer
+		j.SelectedBackend = "server-dispatch"
+		j.SelectedWorker = ""
+		j.RequiredCapabilities = []string{"metadata"}
+		return
+	}
+	c.RouteJob(ctx, j)
+}
+
+func shouldPlanOnServer(j Job) bool {
+	if len(j.Kinds) != 1 || j.ShardCount > 0 || len(j.RetryTargets) > 0 {
+		return false
+	}
+	return j.Kinds[0] == KindProxy || j.Kinds[0] == KindTranscript
+}
+
 // RouteJob selects a concrete execution lane from verified live worker
 // profiles. Hardware HEVC wins, then hardware H.264; software H.264 is the
 // fallback only when no render worker reports a working encoder.
@@ -283,6 +310,8 @@ func WorkerQueueKeys(w Worker) []string {
 	case QueueClassServer:
 		keys = append(keys,
 			classQueue(KindDerivatives, QueueClassServer),
+			classQueue(KindProxy, QueueClassServer),
+			classQueue(KindTranscript, QueueClassServer),
 			classQueue(KindProxy, QueueClassCPU),
 			classQueue(KindTranscript, QueueClassCPU))
 	case QueueClassRender:

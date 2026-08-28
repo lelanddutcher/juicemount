@@ -43,6 +43,11 @@ func TestRedisClaimRecovery(t *testing.T) {
 	}
 
 	job := NewJob("/jfs/incoming/clip.mov", []string{KindProxy}, "manager")
+	// This test exercises execution-claim recovery, not parent discovery.
+	// Model the bounded child that the server planner publishes.
+	job.ShardIndex, job.ShardCount = 1, 1
+	job.RetryTargets = []string{job.Path}
+	q.RouteJob(ctx, &job)
 	if err := q.Enqueue(ctx, job); err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +157,9 @@ func TestRedisClaimRecoveryPrefersAnotherRenderWorker(t *testing.T) {
 	}
 
 	job := NewJob("/jfs/incoming/recover-to-gpu.mov", []string{KindProxy}, "manager")
+	job.ShardIndex, job.ShardCount = 1, 1
+	job.RetryTargets = []string{job.Path}
+	q.RouteJob(ctx, &job)
 	if err := q.Enqueue(ctx, job); err != nil {
 		t.Fatal(err)
 	}
@@ -231,6 +239,9 @@ func TestRedisPausedFarmRecoversAbandonedClaimWithoutExecutingIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := NewJob("/jfs/incoming/paused-recovery.mov", []string{KindProxy}, "manager")
+	job.ShardIndex, job.ShardCount = 1, 1
+	job.RetryTargets = []string{job.Path}
+	q.RouteJob(ctx, &job)
 	if err := q.Enqueue(ctx, job); err != nil {
 		t.Fatal(err)
 	}

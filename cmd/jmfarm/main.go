@@ -1212,7 +1212,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 			job.ID, job.Path)
 		return 0, 0, nil, nil
 	}
-	if shardSize := targetShardSize(job); q != nil && shardSize > 0 && len(targets) > shardSize {
+	if shardSize := targetShardSize(job); q != nil && shardSize > 0 && (job.PlanOnly || len(targets) > shardSize) {
 		children, created, splitErr := q.EnqueueTargetShards(ctx, job, targets, shardSize)
 		if splitErr != nil {
 			return 0, 0, nil, fmt.Errorf("%w: enqueue bounded target shards: %v", errJobDispatchRetry, splitErr)

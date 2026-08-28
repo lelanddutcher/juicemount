@@ -237,7 +237,7 @@ func (c *Client) RequeueClaim(ctx context.Context, claim Claim, fallbackCPU bool
 		job.RequiredCapabilities = nil
 		job.SelectedBackend = ""
 		job.SelectedWorker = ""
-		c.RouteJob(ctx, &job)
+		c.RouteInitialJob(ctx, &job)
 	}
 	return c.requeueClaimAs(ctx, claim, job, reason)
 }

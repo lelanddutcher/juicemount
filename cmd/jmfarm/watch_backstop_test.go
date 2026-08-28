@@ -161,12 +161,16 @@ func TestWatchBackstopSaturationQueuesLosslessRootCatchup(t *testing.T) {
 		t.Fatalf("saturated scan cursor = %v, %v; want advancement after root catch-up enqueue", advanced, err)
 	}
 
-	claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+	server := farmqueue.Worker{ID: "plan-server", Name: "plan-server", Role: farmqueue.QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
 	if err != nil || !ok {
-		t.Fatalf("claim saturated root catch-up: ok=%v err=%v", ok, err)
+		t.Fatalf("server claim saturated root catch-up planner: ok=%v err=%v", ok, err)
 	}
-	if claim.Job.Path != mount || claim.Job.Producer != "farm-watch-catchup" || claim.Job.Kinds[0] != farmqueue.KindProxy {
-		t.Fatalf("saturated catch-up job = %+v, want one recursive GPU proxy root job", claim.Job)
+	if claim.Job.Path != mount || claim.Job.Producer != "farm-watch-catchup" ||
+		claim.Job.Kinds[0] != farmqueue.KindProxy || !claim.Job.PlanOnly ||
+		claim.Job.QueueClass != farmqueue.QueueClassServer {
+		t.Fatalf("saturated catch-up job = %+v, want one recursive server-planned proxy root job", claim.Job)
 	}
 	if err := q.AckClaim(ctx, claim); err != nil {
 		t.Fatal(err)

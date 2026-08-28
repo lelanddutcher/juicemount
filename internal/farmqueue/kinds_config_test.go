@@ -49,11 +49,35 @@ func TestWorkerQueueKeysAreDisjointByRole(t *testing.T) {
 			t.Fatalf("server/render both drain %q; accelerator jobs could race CPU", key)
 		}
 	}
-	if !serverSet[classQueue(KindProxy, QueueClassCPU)] || !serverSet[QueueKey] {
-		t.Fatalf("server queues = %v, want CPU fallback and legacy catch-all", server)
+	if !serverSet[classQueue(KindProxy, QueueClassServer)] ||
+		!serverSet[classQueue(KindTranscript, QueueClassServer)] ||
+		!serverSet[classQueue(KindProxy, QueueClassCPU)] || !serverSet[QueueKey] {
+		t.Fatalf("server queues = %v, want planning, CPU fallback, and legacy catch-all lanes", server)
 	}
 	if len(render) != 2 || render[0] != classQueue(KindProxy, QueueClassRender) || render[1] != classQueue(KindTranscript, QueueClassRender) {
 		t.Fatalf("render queues = %v", render)
+	}
+}
+
+func TestInitialProxyAndTranscriptRouteThroughServerPlanner(t *testing.T) {
+	for _, kind := range []string{KindProxy, KindTranscript} {
+		job := Job{ID: "parent", Path: "/jfs/library", Kinds: []string{kind}}
+		(&Client{}).RouteInitialJob(t.Context(), &job)
+		if !job.PlanOnly || job.QueueClass != QueueClassServer || job.SelectedBackend != "server-dispatch" {
+			t.Fatalf("initial %s route = %+v, want server planner", kind, job)
+		}
+		if !WorkerSupports(Worker{Role: QueueClassServer}, job.RequiredCapabilities) {
+			t.Fatalf("server cannot satisfy %s planner capabilities %v", kind, job.RequiredCapabilities)
+		}
+	}
+
+	child := Job{ID: "child", Path: "/jfs/library", Kinds: []string{KindProxy}, ShardIndex: 1, ShardCount: 2}
+	if shouldPlanOnServer(child) {
+		t.Fatal("bounded execution child was routed back through the planner")
+	}
+	fallback := Job{ID: "fallback", Path: "/jfs/library", Kinds: []string{KindProxy}, RetryTargets: []string{"clip.mov"}}
+	if shouldPlanOnServer(fallback) {
+		t.Fatal("exact retry subset was routed back through the planner")
 	}
 }
 

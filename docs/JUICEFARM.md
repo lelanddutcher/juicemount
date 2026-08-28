@@ -93,15 +93,23 @@ Key properties:
 - **Durable claims.** Claiming a job atomically moves it to a per-worker processing
   list with a renewable lease. If the worker disappears, another worker requeues the
   receipt instead of losing work between a Redis pop and execution.
+- **Server-planned render batches.** Fresh proxy and transcript requests first enter
+  a metadata-only server lane. The server recursively discovers targets and publishes
+  deterministic bounded children (one file for transcripts, small groups for proxy
+  work); only those children enter measured GPU/CPU execution lanes. A render node
+  therefore never burns accelerator time walking an entire directory, and one
+  incompatible source cannot demote or block a directory-sized batch.
 
 ---
 
 ## How a job flows (queue mode)
 
 The worker runs `jmfarm -queue` against the same metadata Redis (db 1). Producers
-create one independently routed job per requested kind. The scheduler chooses a
-server, render, or CPU-fallback lane from the live, verified worker profiles. A job
-is a small JSON document; scheduler annotations are additive:
+create one job per requested kind. Derivative work goes directly to the server. A
+fresh proxy/transcript request first becomes a server planning job; after recursive
+discovery, each bounded child is routed from the live, verified worker profiles to a
+render or explicit CPU-fallback lane. A job is a small JSON document; scheduler
+annotations are additive. The planning parent looks like:
 
 ```json
 {
@@ -110,20 +118,24 @@ is a small JSON document; scheduler annotations are additive:
   "kinds": ["proxy"],
   "producer": "manager",
   "enqueued_at": "<RFC-3339>",
-  "crf": 21, "preset": "slow", "vcodec": "hevc_vaapi",
-  "queue_class": "render",
-  "required_capabilities": ["encoder:hevc_vaapi"],
-  "selected_backend": "hevc_vaapi",
-  "selected_worker": "intel-render-1",
+  "crf": 21, "preset": "slow",
+  "plan_only": true,
+  "queue_class": "server",
+  "required_capabilities": ["metadata"],
+  "selected_backend": "server-dispatch",
   "model": "", "workers": 0, "proxy_workers": 0
 }
 ```
+
+Its bounded children carry `parent_id`, `shard_index`, `shard_count`, exact
+`retry_targets`, and the measured execution admission such as
+`selected_backend: "hevc_vaapi"`. Planner admission is never copied to a child.
 
 Jobs arrive automatically from the recursive discovery watcher and its cursored
 backstop. The Manager's advanced path sweep and OpenLoupe remain repair/manual
 producers. Do not push raw JSON directly to a class queue: using the Manager API or
 `farmqueue.Enqueue` is what applies routing, status, dedupe, and recovery metadata.
-The worker:
+The execution worker:
 
 1. stats the source on its `/jfs` mount → inode + sampled hash,
 2. runs the requested generators,

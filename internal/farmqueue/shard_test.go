@@ -149,3 +149,85 @@ func TestNewTargetShardsRejectsNestedOrInvalidSplit(t *testing.T) {
 		t.Fatal("unnecessary split accepted")
 	}
 }
+
+func TestPlanOnlyParentCreatesOneBoundedChildForOneFile(t *testing.T) {
+	parent := Job{
+		ID: "directory-transcript", Path: "/jfs/incoming", Kinds: []string{KindTranscript},
+		QueueClass: QueueClassServer, SelectedBackend: "server-dispatch",
+		RequiredCapabilities: []string{"metadata"}, PlanOnly: true,
+	}
+	children, err := newTargetShards(parent, []string{"/jfs/incoming/one.mov"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("children=%d, want one execution child", len(children))
+	}
+	child := children[0]
+	if child.PlanOnly || child.QueueClass != "" || child.SelectedBackend != "" || len(child.RequiredCapabilities) != 0 {
+		t.Fatalf("planner admission leaked into execution child: %+v", child)
+	}
+	if child.ShardIndex != 1 || child.ShardCount != 1 || !reflect.DeepEqual(child.RetryTargets, []string{"/jfs/incoming/one.mov"}) {
+		t.Fatalf("one-file child is not bounded and exact: %+v", child)
+	}
+}
+
+func TestRedisServerPlannerPublishesClaimableRenderChildren(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Worker{ID: "server", Name: "server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	render := Worker{ID: "render", Name: "render", Role: QueueClassRender,
+		Capabilities: []string{"encoder:hevc_vaapi"}, Encoders: []string{"hevc_vaapi"}}
+	if err := q.Heartbeat(ctx, render); err != nil {
+		t.Fatal(err)
+	}
+	parent := NewJob("/jfs/incoming", []string{KindProxy}, "manager")
+	if err := q.Enqueue(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, render); err != nil || ok {
+		t.Fatalf("render claimed unplanned directory parent: ok=%v err=%v", ok, err)
+	}
+	plan, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok || !plan.Job.PlanOnly {
+		t.Fatalf("server planner claim = %+v ok=%v err=%v", plan.Job, ok, err)
+	}
+	targets := []string{"/jfs/incoming/a.mov", "/jfs/incoming/b.mov", "/jfs/incoming/c.mov"}
+	children, created, err := q.EnqueueTargetShards(ctx, plan.Job, targets, 2)
+	if err != nil || created != 2 || len(children) != 2 {
+		t.Fatalf("plan split: children=%d created=%d err=%v", len(children), created, err)
+	}
+	if err := q.MarkDispatched(ctx, parent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.AckClaim(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	for _, child := range children {
+		if child.PlanOnly || child.QueueClass != QueueClassRender || child.SelectedBackend != "hevc_vaapi" ||
+			!reflect.DeepEqual(child.RequiredCapabilities, []string{"encoder:hevc_vaapi"}) {
+			t.Fatalf("planned execution child = %+v", child)
+		}
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+	if err != nil || !ok {
+		t.Fatalf("render did not claim planned child: ok=%v err=%v", ok, err)
+	}
+	if claim.Job.ParentID != parent.ID || claim.Job.PlanOnly || len(claim.Job.RetryTargets) > 2 {
+		t.Fatalf("render child claim = %+v", claim.Job)
+	}
+}

@@ -23,6 +23,24 @@ func (c *Client) EnqueueTargetShards(ctx context.Context, parent Job, targets []
 	if err != nil {
 		return nil, 0, err
 	}
+	if parent.PlanOnly {
+		for i := range children {
+			c.RouteJob(ctx, &children[i])
+			// A bounded render child is portable across workers with the same
+			// verified backend. Do not recreate the directory parent's exact-node
+			// pin or one offline node can strand every already-planned child.
+			if children[i].QueueClass == QueueClassRender {
+				children[i].SelectedWorker = ""
+				caps := children[i].RequiredCapabilities[:0]
+				for _, capability := range children[i].RequiredCapabilities {
+					if !strings.HasPrefix(capability, "worker:") {
+						caps = append(caps, capability)
+					}
+				}
+				children[i].RequiredCapabilities = caps
+			}
+		}
+	}
 	created, err := c.enqueueTargetShardsAtomic(ctx, children)
 	return children, created, err
 }
@@ -37,7 +55,10 @@ func newTargetShards(parent Job, targets []string, maxTargets int) ([]Job, error
 	if maxTargets < 1 {
 		return nil, fmt.Errorf("target-shard size must be positive")
 	}
-	if len(targets) <= maxTargets {
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("target-shard split has no targets")
+	}
+	if len(targets) <= maxTargets && !parent.PlanOnly {
 		return nil, fmt.Errorf("target-shard split needs more than %d target(s), got %d", maxTargets, len(targets))
 	}
 
@@ -62,6 +83,15 @@ func newTargetShards(parent Job, targets []string, maxTargets int) ([]Job, error
 		child.ShardCount = count
 		child.RetryTargets = append([]string(nil), targets[start:end]...)
 		child.RequiredCapabilities = append([]string(nil), parent.RequiredCapabilities...)
+		if parent.PlanOnly {
+			// Execution routing is selected after target expansion from current
+			// measured worker profiles. Clear the server planner admission first.
+			child.PlanOnly = false
+			child.QueueClass = ""
+			child.RequiredCapabilities = nil
+			child.SelectedBackend = ""
+			child.SelectedWorker = ""
+		}
 		if child.QueueClass == QueueClassRender {
 			child.SelectedWorker = ""
 			caps := child.RequiredCapabilities[:0]

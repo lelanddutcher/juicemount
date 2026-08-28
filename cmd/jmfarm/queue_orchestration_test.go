@@ -62,3 +62,10 @@ func TestTargetShardSizeBoundsLeaseWithoutDiscardingParallelism(t *testing.T) {
 		t.Fatalf("multi-kind compatibility job was split: %d", got)
 	}
 }
+
+func TestPlanOnlyParentDispatchesEvenOneTarget(t *testing.T) {
+	job := farmqueue.Job{Kinds: []string{farmqueue.KindTranscript}, PlanOnly: true}
+	if got := targetShardSize(job); got != 1 {
+		t.Fatalf("planner transcript shard size=%d, want one", got)
+	}
+}

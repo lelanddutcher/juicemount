@@ -188,6 +188,13 @@ type Job struct {
 	// hold at most one small work set instead of an entire directory lease.
 	ShardIndex int `json:"shard_index,omitempty"`
 	ShardCount int `json:"shard_count,omitempty"`
+	// PlanOnly keeps recursive filesystem discovery on the server worker. Fresh
+	// proxy/transcript requests first enter a metadata-capable server lane; that
+	// worker expands the path into deterministic bounded children, then routes
+	// only those children to measured render/CPU execution lanes. This prevents
+	// a GPU from spending an hour walking a directory before it can accelerate a
+	// single file.
+	PlanOnly bool `json:"plan_only,omitempty"`
 	// RetryTargets is worker-authored after a partially successful batch. It
 	// narrows the next hardware retry or CPU fallback to the exact files that
 	// failed, so a directory-shaped job can never recompute successful GPU
@@ -337,7 +344,7 @@ func (c *Client) Enqueue(ctx context.Context, j Job) error {
 		j.EnqueuedAt = nowISO()
 	}
 	if j.QueueClass == "" {
-		c.RouteJob(ctx, &j)
+		c.RouteInitialJob(ctx, &j)
 	}
 	raw, err := json.Marshal(j)
 	if err != nil {
