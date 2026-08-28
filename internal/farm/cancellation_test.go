@@ -47,7 +47,11 @@ echo '{"streams":[{"codec_type":"video","codec_name":"prores","width":1920,"heig
 	}
 	started := filepath.Join(dir, "ffmpeg.started")
 	ffmpeg := filepath.Join(dir, "ffmpeg")
-	ffmpegScript := "#!/bin/sh\necho started > " + started + "\nwhile :; do :; done\n"
+	// Replace the shell with a single blocking process after publishing the
+	// start marker. The former busy loop could starve its own 2-second observer
+	// when `go test ./...` ran all packages under release-build load, producing a
+	// false cancellation failure before the test ever called cancel.
+	ffmpegScript := "#!/bin/sh\necho started > " + started + "\nexec tail -f /dev/null\n"
 	if err := os.WriteFile(ffmpeg, []byte(ffmpegScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +69,7 @@ echo '{"streams":[{"codec_type":"video","codec_name":"prores","width":1920,"heig
 			Producer: "test", Version: 1,
 		})
 	}()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(started); err == nil {
 			break
