@@ -79,6 +79,10 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 		"split from ",
 		"partial: 'Partial'",
 		"Recovery note: ",
+		"function renderFarmInterruptedSentence",
+		"It is not reported as running",
+		"sweepTxt = 'paused'",
+		"sweepTxt = 'interrupted — '",
 	} {
 		if !strings.Contains(app, marker) {
 			t.Errorf("Manager client lost truthful/progressive behavior %q", marker)

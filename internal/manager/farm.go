@@ -38,6 +38,14 @@ var _ farmQueue = (*farmqueue.Client)(nil)
 // snappy even when the backend is sick.
 const farmQueueProbeTimeout = 3 * time.Second
 
+// farmProgressStaleAfter is deliberately much larger than jmfarm's three-second
+// progress-write cadence. If an in_progress record has not been refreshed for
+// this long, the producing process is no longer a trustworthy source of live
+// activity (hard stop, container restart, lost mount, etc.). Last-sweep and
+// coverage data remain useful indefinitely; only the live-progress assertion is
+// time-sensitive.
+const farmProgressStaleAfter = 30 * time.Second
+
 // farmRecentJobsLimit caps how many recent job-status records GET /api/farm/jobs
 // returns. Matches the contract's documented default (ListJobs(50)).
 const farmRecentJobsLimit = 50
@@ -54,10 +62,12 @@ var validFarmKinds = map[string]bool{
 
 // handleFarm serves GET /api/farm — the juicefarm operator rollup. The farm
 // pre-aggregates its index into farm-status.json (coverage per kind + last
-// sweep), so the manager (CGO-free, no sqlite, standalone) just relays the file
-// verbatim. Read-only, no backend probe. Returns {available:false} when the path
-// isn't configured or no sweep has produced the file yet — the Farm tab renders an
-// empty-state hint rather than erroring.
+// sweep), so the manager (CGO-free, no sqlite, standalone) relays that JSON.
+// The one exception is live progress: a hard-killed worker cannot perform its
+// final write that removes in_progress. We therefore suppress an in_progress
+// record older than farmProgressStaleAfter and return it as stale_progress for
+// truthful interrupted-work UI. Read-only, no backend probe. Returns
+// {available:false} when the path isn't configured, absent, or unreadable.
 func (a *API) handleFarm(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
@@ -77,12 +87,70 @@ func (a *API) handleFarm(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// Relay the farm's JSON verbatim under `status` so the schema stays owned by
-	// the producer (internal/farm FarmStatus) — the manager doesn't re-model it.
-	_ = enc.Encode(map[string]any{
+	status, staleProgress, err := prepareFarmStatus(raw, time.Now())
+	if err != nil {
+		_ = enc.Encode(map[string]any{
+			"available": false,
+			"reason":    "farm status is unreadable",
+		})
+		return
+	}
+	response := map[string]any{
 		"available": true,
-		"status":    json.RawMessage(raw),
-	})
+		"status":    status,
+	}
+	if staleProgress != nil {
+		response["stale_progress"] = staleProgress
+	}
+	_ = enc.Encode(response)
+}
+
+// staleFarmProgress preserves the producer's last live-progress record without
+// presenting it as current. The age is useful to operators and makes the
+// Manager's inference explicit rather than silently rewriting history.
+type staleFarmProgress struct {
+	Progress   json.RawMessage `json:"progress"`
+	LastSeenAt int64           `json:"last_seen_at,omitempty"`
+	AgeSeconds int64           `json:"age_seconds,omitempty"`
+	Reason     string          `json:"reason"`
+}
+
+// prepareFarmStatus keeps the producer-owned schema as raw JSON fields. This
+// avoids importing internal/farm (and its sqlite dependency) into the CGO-free
+// Manager while still allowing the time-sensitive in_progress field to be
+// validated. Stable coverage and last-sweep fields are preserved byte-for-byte
+// at the field-value level.
+func prepareFarmStatus(raw []byte, now time.Time) (map[string]json.RawMessage, *staleFarmProgress, error) {
+	var status map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return nil, nil, err
+	}
+	progress, ok := status["in_progress"]
+	if !ok || len(progress) == 0 || string(progress) == "null" {
+		return status, nil, nil
+	}
+
+	var writtenAt int64
+	if rawWrittenAt, ok := status["written_at"]; ok {
+		_ = json.Unmarshal(rawWrittenAt, &writtenAt)
+	}
+	age := int64(0)
+	if writtenAt > 0 && now.Unix() > writtenAt {
+		age = now.Unix() - writtenAt
+	}
+	// A missing/invalid timestamp cannot substantiate a live assertion. Future
+	// timestamps are allowed for bounded clock skew and will age normally.
+	if writtenAt > 0 && now.Sub(time.Unix(writtenAt, 0)) <= farmProgressStaleAfter {
+		return status, nil, nil
+	}
+
+	delete(status, "in_progress")
+	return status, &staleFarmProgress{
+		Progress:   progress,
+		LastSeenAt: writtenAt,
+		AgeSeconds: age,
+		Reason:     "worker stopped refreshing live progress",
+	}, nil
 }
 
 // farmSweepOptions are the optional per-job overrides a producer may set. Every

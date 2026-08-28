@@ -1464,6 +1464,7 @@
     const sweep = s.last_sweep || {};
     const governor = s.governor || null;
     const inProgress = s.in_progress || null;
+    const staleProgress = res.stale_progress || null;
     const economics = s.proxy_economics || null;
 
     // P2: when a sweep is live, the banner takes over and we hide the
@@ -1472,6 +1473,9 @@
     const sentenceEl = $('#farm-sweep-sentence');
     if (inProgress) {
       sentenceEl.hidden = true;
+    } else if (staleProgress && staleProgress.progress) {
+      sentenceEl.hidden = false;
+      renderFarmInterruptedSentence(staleProgress);
     } else {
       sentenceEl.hidden = false;
       renderFarmSweepSentence(sweep);
@@ -1644,6 +1648,21 @@
       txt += ', ' + failed.toLocaleString() + ' failed';
     }
     txt += '.';
+    el.textContent = txt;
+  }
+
+  // A worker can be terminated before its final idle-status write. The API
+  // removes that stale record from status.in_progress and supplies it here so
+  // we can report the interrupted work without ever calling it "running".
+  function renderFarmInterruptedSentence(stale) {
+    const el = $('#farm-sweep-sentence');
+    const ip = (stale && stale.progress) || {};
+    const done = ip.done != null ? ip.done : 0;
+    const total = ip.total != null ? ip.total : 0;
+    let txt = 'Previous ' + farmModePhrase(ip.pass) + ' stopped reporting at ' +
+      done.toLocaleString() + ' of ' + total.toLocaleString() + ' files';
+    if (stale.age_seconds > 0) txt += ' (' + formatEta(stale.age_seconds) + ' ago)';
+    txt += '. It is not reported as running; review Recent jobs before retrying.';
     el.textContent = txt;
   }
 
@@ -1881,10 +1900,12 @@
     if (!card) return;
     let workers = null;
     let depth = null;
+    let paused = false;
     let errMsg = '';
     if (jobsSettled.status === 'fulfilled' && jobsSettled.value) {
       workers = Array.isArray(jobsSettled.value.workers) ? jobsSettled.value.workers.length : 0;
       depth = jobsSettled.value.queue_depth != null ? jobsSettled.value.queue_depth : 0;
+      paused = !!(jobsSettled.value.control && jobsSettled.value.control.paused);
     } else {
       errMsg = jobsSettled.status === 'rejected'
         ? String((jobsSettled.reason && jobsSettled.reason.message) || jobsSettled.reason)
@@ -1894,8 +1915,14 @@
     if (farmSettled.status === 'fulfilled' && farmSettled.value && farmSettled.value.available) {
       const s = farmSettled.value.status || {};
       const ip = s.in_progress;
-      if (ip) {
+      const stale = farmSettled.value.stale_progress;
+      if (paused) {
+        sweepTxt = 'paused';
+      } else if (ip) {
         sweepTxt = 'running — ' + (ip.done || 0).toLocaleString() + ' of ' + (ip.total || 0).toLocaleString();
+      } else if (stale && stale.progress) {
+        sweepTxt = 'interrupted — ' + (stale.progress.done || 0).toLocaleString() + ' of ' +
+          (stale.progress.total || 0).toLocaleString();
       } else {
         const sw = s.last_sweep;
         if (sw && (sw.mode || sw.target || sw.processed != null)) {
@@ -1917,8 +1944,8 @@
     if (!errMsg) {
       const stateEl = card.querySelector('.overview-card-state');
       const ok = (workers || 0) > 0;
-      stateEl.textContent = ok ? 'ok' : 'down';
-      stateEl.className = ok ? 'overview-card-state ok' : 'overview-card-state warn';
+      stateEl.textContent = paused ? 'paused' : (ok ? 'ok' : 'down');
+      stateEl.className = (!paused && ok) ? 'overview-card-state ok' : 'overview-card-state warn';
     }
   }
 

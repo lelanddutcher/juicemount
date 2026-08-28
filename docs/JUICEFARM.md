@@ -259,7 +259,10 @@ The `juicemount-manager` web UI exposes a **Farm tab** with play/pause, automati
 discovery control, queue depth and history, live worker roles/capabilities, measured
 throughput, selected backend, attempts, and advanced manual repair sweeps. The manager
 is CGO-free: farm coverage is relayed from `/state/farm-status.json`, while queue,
-control, and worker state are read from Redis through bounded probes.
+control, and worker state are read from Redis through bounded probes. Live sweep
+progress is freshness-checked: if a killed worker leaves an old `in_progress`
+record behind, Manager presents it as interrupted work instead of claiming that it
+is still running. Stable coverage and last-sweep history remain available.
 
 ---
 
