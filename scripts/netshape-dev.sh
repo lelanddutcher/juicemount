@@ -3,6 +3,8 @@
 #
 #   netshape-dev.sh on  --rtt 300 --bw-down 2 --bw-up 1 --ip 192.168.0.197 \
 #     --link-udp-port 63296
+#   netshape-dev.sh on  --rtt 80 --bw-down 40 --bw-up 10 --force-link \
+#     --link-udp-port 63296 --proxy-redis-port 60299
 #   netshape-dev.sh on  --loss 1 --ip 192.168.0.197 --link-udp-port 63296
 #   netshape-dev.sh off
 #   netshape-dev.sh status
@@ -30,6 +32,7 @@ MARKER="${STATE_DIR}/netshape-ACTIVE.json"
 ANCHOR_RULES="/etc/pf.anchors/jum-netshape.conf"
 PIPE_IN=4241
 PIPE_OUT=4242
+PIPE_BLOCK=4243
 
 usage() { sed -n '2,10p' "$0"; exit 2; }
 
@@ -37,6 +40,7 @@ cmd="${1:-status}"; shift || true
 
 RTT_MS=300; BW_DOWN=2; BW_UP=1; LOSS_RATE=0; NAS_IP="192.168.0.197"
 REDIS_PORT=30179; OBJECT_PORT=30151; PROBE_PORT=""; LINK_UDP_PORT=""
+PROXY_REDIS_PORT=""; FORCE_LINK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --rtt) RTT_MS="$2"; shift 2;;
@@ -48,6 +52,8 @@ while [ $# -gt 0 ]; do
     --object-port) OBJECT_PORT="$2"; shift 2;;
     --probe-port) PROBE_PORT="$2"; shift 2;;
     --link-udp-port) LINK_UDP_PORT="$2"; shift 2;;
+	--proxy-redis-port) PROXY_REDIS_PORT="$2"; shift 2;;
+	--force-link) FORCE_LINK=1; shift;;
     *) usage;;
   esac
 done
@@ -58,41 +64,56 @@ PROBE_PORT="${PROBE_PORT:-$REDIS_PORT}"
 
 # These values are interpolated into a root-loaded PF ruleset. Reject anything
 # except a literal address and numeric scalar values before generating it.
-python3 - "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$PROBE_PORT" "${LINK_UDP_PORT:-0}" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$LOSS_RATE" <<'PY'
+python3 - "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$PROBE_PORT" "${LINK_UDP_PORT:-0}" "${PROXY_REDIS_PORT:-0}" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$LOSS_RATE" "$FORCE_LINK" <<'PY'
 import ipaddress
 import sys
 
 try:
     ipaddress.ip_address(sys.argv[1])
     ports = [int(value) for value in sys.argv[2:5]]
-    link_port = int(sys.argv[5])
-    rtt, down, up = [int(value) for value in sys.argv[6:9]]
-    loss = float(sys.argv[9])
+    link_port, proxy_port = [int(value) for value in sys.argv[5:7]]
+    rtt, down, up = [int(value) for value in sys.argv[7:10]]
+    loss = float(sys.argv[10])
+    force_link = int(sys.argv[11])
 except ValueError as exc:
     raise SystemExit(f"invalid netshape argument: {exc}")
 if any(port < 1 or port > 65535 for port in ports):
     raise SystemExit("invalid netshape argument: port must be 1..65535")
-if link_port < 0 or link_port > 65535:
-    raise SystemExit("invalid netshape argument: link UDP port must be 1..65535")
-if any(port in {22, 137, 138, 139, 445} for port in ports + [link_port] if port):
+if any(port < 0 or port > 65535 for port in (link_port, proxy_port)):
+    raise SystemExit("invalid netshape argument: optional ports must be 1..65535")
+if any(port in {22, 137, 138, 139, 445} for port in ports + [link_port, proxy_port] if port):
     raise SystemExit("invalid netshape argument: refusing an SSH/SMB/NetBIOS port")
 if rtt < 0 or down < 1 or up < 1:
     raise SystemExit("invalid netshape argument: rtt must be nonnegative and bandwidth positive")
 if loss < 0 or loss > 1:
     raise SystemExit("invalid netshape argument: loss must be between 0 and 1")
+if force_link not in (0, 1):
+    raise SystemExit("invalid netshape argument: force-link must be boolean")
+if force_link and (not link_port or not proxy_port):
+    raise SystemExit("invalid netshape argument: --force-link requires --link-udp-port and --proxy-redis-port")
 PY
 
 render_shape_rules() {
   local port
-  for port in "$REDIS_PORT" "$OBJECT_PORT"; do
-    echo "dummynet in  quick proto tcp from ${NAS_IP} port ${port} to any pipe ${PIPE_IN}"
-    echo "dummynet out quick proto tcp from any to ${NAS_IP} port ${port} pipe ${PIPE_OUT}"
-  done
+  if [ "$FORCE_LINK" != "1" ]; then
+	for port in "$REDIS_PORT" "$OBJECT_PORT"; do
+	  echo "dummynet in  quick proto tcp from ${NAS_IP} port ${port} to any pipe ${PIPE_IN}"
+	  echo "dummynet out quick proto tcp from any to ${NAS_IP} port ${port} pipe ${PIPE_OUT}"
+	done
+  fi
   if [ -n "$LINK_UDP_PORT" ]; then
     # Match the app-owned local UDP socket in both directions. This covers the
     # encrypted tsnet/WireGuard data plane without shaping other NAS traffic.
     echo "dummynet in  quick proto udp from any to any port ${LINK_UDP_PORT} pipe ${PIPE_IN}"
-    echo "dummynet out quick proto udp from any port ${LINK_UDP_PORT} to any pipe ${PIPE_OUT}"
+	echo "dummynet out quick proto udp from any port ${LINK_UDP_PORT} to any pipe ${PIPE_OUT}"
+  fi
+  if [ "$FORCE_LINK" = "1" ]; then
+	# Route direct backend SYNs and packets into a 100%-loss pipe. Keeping these
+	# as queueing rules avoids mixing a new filter section ahead of macOS's saved
+	# normalization rules, which PF correctly rejects as an invalid ruleset.
+	for port in "$REDIS_PORT" "$OBJECT_PORT"; do
+	  echo "dummynet out quick proto tcp from any to ${NAS_IP} port ${port} pipe ${PIPE_BLOCK}"
+	done
   fi
 }
 
@@ -101,9 +122,14 @@ self_test() {
   local expected
   rules=$(render_shape_rules)
   expected=4
-  [ -z "$LINK_UDP_PORT" ] || expected=6
+  if [ "$FORCE_LINK" = "1" ]; then expected=2; fi
+  [ -z "$LINK_UDP_PORT" ] || expected=$(( expected + 2 ))
   [ "$(printf '%s\n' "$rules" | wc -l | tr -d ' ')" = "$expected" ]
-  [ "$(printf '%s\n' "$rules" | grep -Ec '^dummynet (in|out) +quick proto tcp .* port [0-9][0-9]*.* pipe [0-9][0-9]*$')" = "4" ]
+  if [ "$FORCE_LINK" = "1" ]; then
+	[ "$(printf '%s\n' "$rules" | grep -Ec "^dummynet out quick proto tcp .* port [0-9][0-9]* pipe ${PIPE_BLOCK}$")" = "2" ]
+  else
+	[ "$(printf '%s\n' "$rules" | grep -Ec '^dummynet (in|out) +quick proto tcp .* port [0-9][0-9]*.* pipe [0-9][0-9]*$')" = "4" ]
+  fi
   if [ -n "$LINK_UDP_PORT" ]; then
     [ "$(printf '%s\n' "$rules" | grep -Ec "^dummynet (in|out) +quick proto udp .* port ${LINK_UDP_PORT}.* pipe [0-9][0-9]*$")" = "2" ]
   fi
@@ -140,7 +166,7 @@ restore_state() {
   grep -v '^#' "$STATE_FILE" | grep -v '^ENABLED=' > "$restore_tmp"
   # Delete only JuiceMount's reserved pipes. Never flush another developer's
   # dummynet setup while removing this scoped shaper.
-  sudo -n dnctl pipe delete "$PIPE_IN" "$PIPE_OUT" 2>/dev/null || true
+  sudo -n dnctl pipe delete "$PIPE_IN" "$PIPE_OUT" "$PIPE_BLOCK" 2>/dev/null || true
   sudo -n pfctl -f "$restore_tmp"
   if [ "${want_enabled:-1}" = "0" ]; then
     # `pfctl -d` exits non-zero when PF is already disabled. That state is the
@@ -156,7 +182,10 @@ verify_shape() {
   local rules
   local probe_code
   local probe_ms
+	local link_probe_code=0
+	local link_probe_ms=0
   local min_probe_ms
+	local direct_rules_ok=0
   pipes=$(sudo -n dnctl pipe show 2>/dev/null)
   # macOS omits dummynet rules from `-sr` even though it includes ordinary
   # filter rules there; `-s all` is the only read-only view that renders the
@@ -182,18 +211,50 @@ print(code, int((time.monotonic() - started) * 1000))
 PY
   )"
   min_probe_ms=$(( RTT_MS * 3 / 4 ))
+	if [ "$FORCE_LINK" = "1" ]; then
+	  read -r link_probe_code link_probe_ms <<< "$(python3 - "$PROXY_REDIS_PORT" "$RTT_MS" <<'PY'
+import socket, sys, time
+port, rtt = int(sys.argv[1]), int(sys.argv[2])
+s = socket.socket()
+s.settimeout(max(5.0, rtt / 1000.0 * 8.0))
+started = time.monotonic()
+code = 1
+try:
+    s.connect(("127.0.0.1", port))
+    s.sendall(b"*1\r\n$4\r\nPING\r\n")
+    reply = s.recv(64)
+    code = 0 if reply.startswith(b"+PONG") else 2
+except OSError:
+    pass
+finally:
+    s.close()
+print(code, int((time.monotonic() - started) * 1000))
+PY
+	  )"
+	  if echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${REDIS_PORT} .*pipe 0*${PIPE_BLOCK}" &&
+	    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${OBJECT_PORT} .*pipe 0*${PIPE_BLOCK}"; then
+		direct_rules_ok=1
+	  fi
+	else
+	  if echo "$rules" | grep -Eq "dummynet in .*from ${NAS_IP} port (= )?${REDIS_PORT} .*pipe 0*${PIPE_IN}" &&
+	    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${REDIS_PORT} .*pipe 0*${PIPE_OUT}" &&
+	    echo "$rules" | grep -Eq "dummynet in .*from ${NAS_IP} port (= )?${OBJECT_PORT} .*pipe 0*${PIPE_IN}" &&
+	    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${OBJECT_PORT} .*pipe 0*${PIPE_OUT}"; then
+		direct_rules_ok=1
+	  fi
+	fi
   echo "$pipes" | grep -Eq "(^|[[:space:]])0*${PIPE_IN}:" &&
-    sudo -n pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' &&
-    echo "$rules" | grep -Eq "dummynet in .*from ${NAS_IP} port (= )?${REDIS_PORT} .*pipe 0*${PIPE_IN}" &&
-    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${REDIS_PORT} .*pipe 0*${PIPE_OUT}" &&
-    echo "$rules" | grep -Eq "dummynet in .*from ${NAS_IP} port (= )?${OBJECT_PORT} .*pipe 0*${PIPE_IN}" &&
-    echo "$rules" | grep -Eq "dummynet out .*to ${NAS_IP} port (= )?${OBJECT_PORT} .*pipe 0*${PIPE_OUT}" &&
+	sudo -n pfctl -s info 2>/dev/null | grep -q 'Status: Enabled' &&
+	[ "$direct_rules_ok" = "1" ] &&
     { [ -z "$LINK_UDP_PORT" ] || {
       echo "$rules" | grep -Eq "dummynet in .*proto udp .*to any port (= )?${LINK_UDP_PORT} .*pipe 0*${PIPE_IN}" &&
       echo "$rules" | grep -Eq "dummynet out .*proto udp .*from any port (= )?${LINK_UDP_PORT} .*pipe 0*${PIPE_OUT}";
     }; } &&
     ! echo "$rules" | grep -Eq "dummynet .*${NAS_IP} port (= )?(22|139|445)([^0-9]|$)" &&
-    { if [ "$LOSS_RATE" = "1" ] || [ "$LOSS_RATE" = "1.0" ]; then
+	{ if [ "$FORCE_LINK" = "1" ]; then
+		[ "$probe_code" -ne 0 ] && [ "$link_probe_code" -eq 0 ] && [ "$link_probe_ms" -ge "$min_probe_ms" ] &&
+		  echo "wire probe: direct backend blocked; encrypted proxy PING ${link_probe_ms}ms (minimum ${min_probe_ms}ms)"
+	  elif [ "$LOSS_RATE" = "1" ] || [ "$LOSS_RATE" = "1.0" ]; then
         [ "$probe_code" -ne 0 ] && [ "$probe_ms" -ge 1000 ] &&
           echo "wire probe: blocked for ${probe_ms}ms (100% loss verified)"
       else
@@ -218,24 +279,33 @@ ports = [int(marker[key]) for key in ("redis_port", "object_port", "probe_port")
 link_port = marker.get("link_udp_port")
 if link_port is not None:
     link_port = int(link_port)
+proxy_port = marker.get("proxy_redis_port")
+if proxy_port is not None:
+    proxy_port = int(proxy_port)
+force_link = bool(marker.get("force_link", False))
 rtt = int(marker["rtt_ms"])
 down = int(marker["bw_down_mb"])
 up = int(marker["bw_up_mb"])
 loss = float(marker["loss_rate"])
 if any(port < 1 or port > 65535 for port in ports):
     raise SystemExit("invalid port in netshape marker")
-if link_port is not None and (link_port < 1 or link_port > 65535):
-    raise SystemExit("invalid Link UDP port in netshape marker")
+if any(port is not None and (port < 1 or port > 65535) for port in (link_port, proxy_port)):
+    raise SystemExit("invalid optional port in netshape marker")
 if rtt < 0 or down < 1 or up < 1 or loss < 0 or loss > 1:
     raise SystemExit("invalid impairment value in netshape marker")
+if force_link and (link_port is None or proxy_port is None):
+    raise SystemExit("force-link marker is missing its Link or proxy port")
 print("\t".join(str(value) for value in (
     marker["ip"], ports[0], ports[1], ports[2],
-    link_port if link_port is not None else "-", rtt, down, up, loss,
+    link_port if link_port is not None else "-",
+    proxy_port if proxy_port is not None else "-",
+    1 if force_link else 0, rtt, down, up, loss,
 )))
 PY
   )
-  IFS=$'\t' read -r NAS_IP REDIS_PORT OBJECT_PORT PROBE_PORT LINK_UDP_PORT RTT_MS BW_DOWN BW_UP LOSS_RATE <<< "$marker_values"
-  [ "$LINK_UDP_PORT" != "-" ] || LINK_UDP_PORT=""
+	IFS=$'\t' read -r NAS_IP REDIS_PORT OBJECT_PORT PROBE_PORT LINK_UDP_PORT PROXY_REDIS_PORT FORCE_LINK RTT_MS BW_DOWN BW_UP LOSS_RATE <<< "$marker_values"
+	[ "$LINK_UDP_PORT" != "-" ] || LINK_UDP_PORT=""
+	[ "$PROXY_REDIS_PORT" != "-" ] || PROXY_REDIS_PORT=""
 }
 
 activate_shape() {
@@ -255,10 +325,13 @@ activate_shape() {
   # while the script continued and falsely wrote an ACTIVE marker.
   sudo -n dnctl pipe "$PIPE_IN" config delay "${half}ms" bw "${BW_DOWN}Mbit/s" plr "$LOSS_RATE"
   sudo -n dnctl pipe "$PIPE_OUT" config delay "${half}ms" bw "${BW_UP}Mbit/s" plr "$LOSS_RATE"
+  if [ "$FORCE_LINK" = "1" ]; then
+    sudo -n dnctl pipe "$PIPE_BLOCK" config plr 1
+  fi
 
   rules_tmp=$(mktemp -t jum-netshape.XXXXXX)
   {
-    echo "# JuiceMount dev shaping -> ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} (rtt=${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s loss=${LOSS_RATE})"
+	  echo "# JuiceMount dev shaping -> ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} (rtt=${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s loss=${LOSS_RATE} force_link=${FORCE_LINK})"
     # Dummynet rules are queueing rules, so PF requires all of them before any
     # saved filtering rules. Exact service ports are safer than broad rules plus
     # exemptions: SMB/SSH cannot enter either pipe in the first place.
@@ -296,12 +369,14 @@ case "$cmd" in
       restore_state
       exit 1
     fi
-    now=$(date +%s)
-    link_json=null
-    [ -z "$LINK_UDP_PORT" ] || link_json="$LINK_UDP_PORT"
-    printf '{"active":true,"ip":"%s","redis_port":%s,"object_port":%s,"link_udp_port":%s,"probe_port":%s,"rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"loss_rate":%s,"since":%s}\n' \
-      "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$link_json" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$LOSS_RATE" "$now" > "$MARKER"
-    echo "SHAPING ACTIVE -> backend ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} link_udp=${LINK_UDP_PORT:-off} rtt≈${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s loss=${LOSS_RATE}"
+	now=$(date +%s)
+	link_json=null
+	proxy_json=null
+	[ -z "$LINK_UDP_PORT" ] || link_json="$LINK_UDP_PORT"
+	[ -z "$PROXY_REDIS_PORT" ] || proxy_json="$PROXY_REDIS_PORT"
+	printf '{"active":true,"ip":"%s","redis_port":%s,"object_port":%s,"link_udp_port":%s,"proxy_redis_port":%s,"force_link":%s,"probe_port":%s,"rtt_ms":%s,"bw_down_mb":%s,"bw_up_mb":%s,"loss_rate":%s,"since":%s}\n' \
+	  "$NAS_IP" "$REDIS_PORT" "$OBJECT_PORT" "$link_json" "$proxy_json" "$FORCE_LINK" "$PROBE_PORT" "$RTT_MS" "$BW_DOWN" "$BW_UP" "$LOSS_RATE" "$now" > "$MARKER"
+	echo "SHAPING ACTIVE -> backend ${NAS_IP}:{${REDIS_PORT},${OBJECT_PORT}} link_udp=${LINK_UDP_PORT:-off} force_link=${FORCE_LINK} rtt≈${RTT_MS}ms down=${BW_DOWN}Mb/s up=${BW_UP}Mb/s loss=${LOSS_RATE}"
     echo "marker: $MARKER  ('off' to remove; survives until then)"
     ;;
   off)

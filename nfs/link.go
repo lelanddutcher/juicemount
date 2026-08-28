@@ -71,6 +71,11 @@ type tcpProxy struct {
 	// 30-second S3 attempt and aborts the mount. Zero preserves long-lived idle
 	// connections such as Redis subscriptions.
 	idleTimeout time.Duration
+	// responseTimeout is armed only after bytes travel from the loopback client
+	// toward the backend and is disarmed by the next backend response. Adaptive
+	// Redis uses it to evict a pooled direct-LAN socket promptly after a
+	// LAN-to-cellular handoff without closing healthy idle subscriptions.
+	responseTimeout time.Duration
 
 	mu     sync.Mutex
 	closed bool
@@ -618,7 +623,9 @@ func (l *LinkNode) proxyEndpoint(raw, defaultPort, mode string, dial contextDial
 		return raw, err
 	}
 
-	proxyKey := mode + "\x00" + target + "\x00" + proxyIdleTimeout(raw).String()
+	idleTimeout := proxyIdleTimeout(raw)
+	responseTimeout := proxyResponseTimeout(raw, defaultPort, mode)
+	proxyKey := mode + "\x00" + target + "\x00" + idleTimeout.String() + "\x00" + responseTimeout.String()
 	l.mu.Lock()
 	s := l.srv
 	if addr := l.proxyEndpoints[proxyKey]; addr != "" {
@@ -630,7 +637,7 @@ func (l *LinkNode) proxyEndpoint(raw, defaultPort, mode string, dial contextDial
 		return raw, fmt.Errorf("link: node is stopped")
 	}
 
-	p, err := newTCPProxyWithIdleTimeout(target, dial, proxyIdleTimeout(raw))
+	p, err := newTCPProxyWithTimeouts(target, dial, idleTimeout, responseTimeout)
 	if err != nil {
 		return raw, err
 	}
@@ -784,10 +791,16 @@ func proxyEndpointTarget(raw, defaultPort string) (string, func(string) string, 
 }
 
 func newTCPProxy(target string, dial contextDialer) (*tcpProxy, error) {
-	return newTCPProxyWithIdleTimeout(target, dial, 0)
+	return newTCPProxyWithTimeouts(target, dial, 0, 0)
 }
 
 const objectProxyIdleTimeout = 10 * time.Second
+
+// Two seconds is long enough for a small Redis command across the supported
+// high-latency Link profiles, but short enough to keep a stale LAN socket from
+// pinning Finder behind go-redis/JuiceFS's larger command timeout during a
+// network handoff. The watchdog is request-armed, so idle pub/sub stays open.
+const adaptiveRedisResponseTimeout = 2 * time.Second
 
 func proxyIdleTimeout(raw string) time.Duration {
 	u, err := url.Parse(raw)
@@ -802,7 +815,22 @@ func proxyIdleTimeout(raw string) time.Duration {
 	}
 }
 
+func proxyResponseTimeout(raw, defaultPort, mode string) time.Duration {
+	if mode != "adaptive" || defaultPort != "6379" {
+		return 0
+	}
+	u, err := url.Parse(raw)
+	if err == nil && (strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https")) {
+		return 0
+	}
+	return adaptiveRedisResponseTimeout
+}
+
 func newTCPProxyWithIdleTimeout(target string, dial contextDialer, idleTimeout time.Duration) (*tcpProxy, error) {
+	return newTCPProxyWithTimeouts(target, dial, idleTimeout, 0)
+}
+
+func newTCPProxyWithTimeouts(target string, dial contextDialer, idleTimeout, responseTimeout time.Duration) (*tcpProxy, error) {
 	if dial == nil {
 		return nil, fmt.Errorf("link: proxy dialer is nil")
 	}
@@ -811,11 +839,12 @@ func newTCPProxyWithIdleTimeout(target string, dial contextDialer, idleTimeout t
 		return nil, fmt.Errorf("link: listen loopback proxy: %w", err)
 	}
 	p := &tcpProxy{
-		listener:    listener,
-		target:      target,
-		dial:        dial,
-		idleTimeout: idleTimeout,
-		conns:       make(map[net.Conn]struct{}),
+		listener:        listener,
+		target:          target,
+		dial:            dial,
+		idleTimeout:     idleTimeout,
+		responseTimeout: responseTimeout,
+		conns:           make(map[net.Conn]struct{}),
 	}
 	go p.serve()
 	return p, nil
@@ -854,6 +883,7 @@ func (p *tcpProxy) forward(local net.Conn) {
 	remoteWriter := io.Writer(remote)
 	localWriter := io.Writer(local)
 	var watchdogStop chan struct{}
+	var responseWatchdogStop chan struct{}
 	if p.idleTimeout > 0 {
 		// tsnet connections can remain blocked past a socket deadline while a
 		// userspace path is wedged. Track byte-level progress and close both legs
@@ -869,6 +899,13 @@ func (p *tcpProxy) forward(local net.Conn) {
 		watchdogStop = make(chan struct{})
 		go closeProxyAfterIdle(local, remote, activity, p.idleTimeout, watchdogStop)
 	}
+	if p.responseTimeout > 0 {
+		activity := &proxyResponseActivity{}
+		localReader = &requestActivityReader{Reader: localReader, activity: activity}
+		remoteReader = &responseActivityReader{Reader: remoteReader, activity: activity}
+		responseWatchdogStop = make(chan struct{})
+		go closeProxyAfterResponseStall(local, remote, activity, p.responseTimeout, responseWatchdogStop)
+	}
 	done := make(chan struct{}, 2)
 	go func() { _, _ = io.Copy(remoteWriter, localReader); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(localWriter, remoteReader); done <- struct{}{} }()
@@ -876,9 +913,48 @@ func (p *tcpProxy) forward(local net.Conn) {
 	if watchdogStop != nil {
 		close(watchdogStop)
 	}
+	if responseWatchdogStop != nil {
+		close(responseWatchdogStop)
+	}
 	_ = local.Close()
 	_ = remote.Close()
 	<-done
+}
+
+// proxyResponseActivity uses monotonically increasing request generations so
+// a backend byte acknowledges precisely the request bytes observed before it.
+// An idle connection has requestGen == responseGen and is never timed out.
+type proxyResponseActivity struct {
+	requestGen  atomic.Uint64
+	responseGen atomic.Uint64
+	lastRequest atomic.Int64
+}
+
+type requestActivityReader struct {
+	io.Reader
+	activity *proxyResponseActivity
+}
+
+func (r *requestActivityReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 {
+		r.activity.lastRequest.Store(time.Now().UnixNano())
+		r.activity.requestGen.Add(1)
+	}
+	return n, err
+}
+
+type responseActivityReader struct {
+	io.Reader
+	activity *proxyResponseActivity
+}
+
+func (r *responseActivityReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 {
+		r.activity.responseGen.Store(r.activity.requestGen.Load())
+	}
+	return n, err
 }
 
 type proxyActivity struct {
@@ -932,6 +1008,36 @@ func closeProxyAfterIdle(local, remote net.Conn, activity *proxyActivity, idleTi
 		case now := <-ticker.C:
 			last := time.Unix(0, activity.lastProgress.Load())
 			if now.Sub(last) < idleTimeout {
+				continue
+			}
+			_ = local.Close()
+			_ = remote.Close()
+			return
+		}
+	}
+}
+
+func closeProxyAfterResponseStall(local, remote net.Conn, activity *proxyResponseActivity, timeout time.Duration, stop <-chan struct{}) {
+	interval := timeout / 4
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	if interval > time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-ticker.C:
+			requestGen := activity.requestGen.Load()
+			if requestGen == 0 || activity.responseGen.Load() >= requestGen {
+				continue
+			}
+			last := time.Unix(0, activity.lastRequest.Load())
+			if now.Sub(last) < timeout {
 				continue
 			}
 			_ = local.Close()

@@ -402,6 +402,120 @@ func TestProxyIdleTimeoutOnlyAppliesToHTTP(t *testing.T) {
 	}
 }
 
+func TestProxyResponseTimeoutOnlyAppliesToAdaptiveRedis(t *testing.T) {
+	if got := proxyResponseTimeout("redis://nas.example/1", "6379", "adaptive"); got != adaptiveRedisResponseTimeout {
+		t.Fatalf("adaptive Redis response timeout = %v", got)
+	}
+	for _, tc := range []struct {
+		raw, port, mode string
+	}{
+		{"redis://nas.example/1", "6379", "encrypted"},
+		{"http://nas.example/bucket", "80", "adaptive"},
+		{"nas.example:9000", "9000", "adaptive"},
+	} {
+		if got := proxyResponseTimeout(tc.raw, tc.port, tc.mode); got != 0 {
+			t.Fatalf("proxyResponseTimeout(%q, %q, %q) = %v, want zero", tc.raw, tc.port, tc.mode, got)
+		}
+	}
+}
+
+func TestRedisResponseWatchdogPreservesIdleThenClosesStalledRequest(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	accepted := make(chan struct{})
+	requestSeen := make(chan struct{})
+	go func() {
+		conn, err := backend.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		close(accepted)
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err == nil && string(buf) == "PING" {
+			close(requestSeen)
+		}
+		// Deliberately never reply. The response watchdog must close this flow.
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	p, err := newTCPProxyWithTimeouts(backend.Addr().String(), (&net.Dialer{}).DialContext, 0, 75*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	conn, err := net.DialTimeout("tcp", p.listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not establish backend flow")
+	}
+	// The request-armed watchdog must not churn a healthy idle subscription.
+	time.Sleep(150 * time.Millisecond)
+	started := time.Now()
+	if _, err := conn.Write([]byte("PING")); err != nil {
+		t.Fatalf("idle Redis flow was closed before a request: %v", err)
+	}
+	select {
+	case <-requestSeen:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("backend did not receive request after idle period")
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("stalled Redis response remained open")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("stalled Redis response closed after %v, expected under 500ms", elapsed)
+	}
+}
+
+func TestRedisResponseWatchdogDisarmsAfterReply(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	go func() {
+		conn, err := backend.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(conn, conn)
+	}()
+
+	p, err := newTCPProxyWithTimeouts(backend.Addr().String(), (&net.Dialer{}).DialContext, 0, 75*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	conn, err := net.DialTimeout("tcp", p.listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for i := 0; i < 2; i++ {
+		if _, err := conn.Write([]byte("PONG")); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, 4)
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "PONG" {
+			t.Fatalf("reply %d = %q, %v", i, got, err)
+		}
+		// A completed response disarms the watchdog until the next request.
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
 func TestProxyEndpointTargetRejectsMissingHost(t *testing.T) {
 	for _, raw := range []string{"", "://nope", "redis:///1"} {
 		t.Run(strings.ReplaceAll(raw, "/", "_"), func(t *testing.T) {
