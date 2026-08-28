@@ -4492,9 +4492,23 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		}
 	}
 
-	// Priority 2: checksum-verified direct SSD cache read (bypasses FUSE and its
-	// remote metadata round trips). Any miss or integrity refusal falls through
-	// to the coherent FUSE path below; see cacheReaderServeEnabled.
+	// Priority 2: complete `._` AppleDouble/.DS_Store RAM cache (navigation
+	// crux). Keep this ahead of the direct SSD reader: the latter needs a Redis
+	// LRANGE the first time it sees each inode. Paying that remote metadata RTT
+	// before consulting an already-validated 4 KiB RAM entry turned Finder's
+	// per-file xattr crawl into a serial cellular stall even on repeat visits.
+	if f.handler != nil {
+		if sn, ok := f.handler.sidecarServe(f.name, p, off); ok {
+			if sn == 0 {
+				return 0, io.EOF
+			}
+			return sn, nil
+		}
+	}
+
+	// Priority 2.5: checksum-verified direct SSD cache read (bypasses FUSE and
+	// its remote metadata round trips). Any miss or integrity refusal falls
+	// through to the coherent FUSE path below; see cacheReaderServeEnabled.
 	if f.cacheReader != nil && cacheReaderServeEnabled {
 		// A mapping already in RAM never observes this deadline. A first read
 		// needs one LRANGE; bound it so an unreachable Redis cannot park an NFS
@@ -4519,18 +4533,6 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 			return n, nil
 		}
 		metrics.Default().IncDirectSSDCacheMiss()
-	}
-
-	// Priority 2.5: `._` AppleDouble sidecar cache (nav crux). Keep this before
-	// the offline/FUSE branch: a complete RAM hit needs neither a backend nor a
-	// lazily-opened JuiceFS descriptor.
-	if f.handler != nil {
-		if sn, ok := f.handler.sidecarServe(f.name, p, off); ok {
-			if sn == 0 {
-				return 0, io.EOF
-			}
-			return sn, nil
-		}
 	}
 
 	// Offline mode short-circuit: if the user has flipped to offline, we don't

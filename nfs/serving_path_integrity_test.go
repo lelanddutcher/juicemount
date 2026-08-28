@@ -33,6 +33,7 @@ import (
 
 	"github.com/lelanddutcher/juicemount/cache"
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
+	"github.com/lelanddutcher/juicemount/internal/metrics"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -680,5 +681,45 @@ func TestReadOpenDefersFUSEUntilDirectCacheMiss(t *testing.T) {
 	}
 	if err := cf.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSidecarRAMHitPrecedesDirectCacheMetadataLookup(t *testing.T) {
+	jfs, store, fuseRoot := newIntegrityHarness(t)
+	h := jfs.handler
+	h.SetCacheReader(cache.NewReader(t.TempDir(), cache.DefaultBlockSize, nil))
+
+	rel := "media/._clip.mov"
+	body := []byte("validated-appledouble")
+	seedFile(t, jfs, store, fuseRoot, rel, body)
+	entry := store.LookupByPath(rel)
+	if entry == nil {
+		t.Fatal("sidecar missing from mirror")
+	}
+	h.sidecar.put(rel, body, entry.Mtime.Unix(), entry.Size)
+
+	before := metrics.Default().Snapshot()
+	f, err := jfs.OpenFile(rel, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cf, ok := f.(*cachedFile)
+	if !ok {
+		t.Fatalf("OpenFile returned %T, want *cachedFile", f)
+	}
+	buf := make([]byte, len(body))
+	if n, err := cf.ReadAt(buf, 0); err != nil || n != len(body) || !bytes.Equal(buf, body) {
+		t.Fatalf("sidecar ReadAt = %d, %v, bytes=%q", n, err, buf)
+	}
+	after := metrics.Default().Snapshot()
+	if after.SidecarCacheHit != before.SidecarCacheHit+1 {
+		t.Fatalf("sidecar cache hits = %d -> %d, want +1", before.SidecarCacheHit, after.SidecarCacheHit)
+	}
+	if after.DirectSSDCacheMiss != before.DirectSSDCacheMiss {
+		t.Fatalf("RAM hit paid a direct-cache metadata lookup: misses = %d -> %d", before.DirectSSDCacheMiss, after.DirectSSDCacheMiss)
+	}
+	if cf.fuseFD != nil {
+		t.Fatal("RAM sidecar hit acquired a FUSE descriptor")
 	}
 }
