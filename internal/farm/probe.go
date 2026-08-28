@@ -34,6 +34,7 @@ type Tech struct {
 // pointers so they serialize as JSON null (not "") when ffprobe omits them.
 type VideoTrack struct {
 	Codec          string  `json:"codec"`
+	Profile        string  `json:"profile,omitempty"`
 	Width          int     `json:"width"`
 	Height         int     `json:"height"`
 	FPS            float64 `json:"fps"`
@@ -67,6 +68,7 @@ type ffProbe struct {
 type ffStream struct {
 	CodecType        string            `json:"codec_type"`
 	CodecName        string            `json:"codec_name"`
+	Profile          string            `json:"profile"`
 	Width            int               `json:"width"`
 	Height           int               `json:"height"`
 	PixFmt           string            `json:"pix_fmt"`
@@ -145,6 +147,7 @@ func mapTech(p *ffProbe, fallbackSize int64) *Tech {
 func mapVideo(s *ffStream) *VideoTrack {
 	v := &VideoTrack{
 		Codec:          s.CodecName,
+		Profile:        s.Profile,
 		Width:          s.Width,
 		Height:         s.Height,
 		FPS:            parseFPS(s.RFrameRate, s.AvgFrameRate),

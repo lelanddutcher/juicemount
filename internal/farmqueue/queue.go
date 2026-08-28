@@ -208,11 +208,12 @@ type Job struct {
 	// planner. Keeping Kinds=["derivatives"] preserves API compatibility while
 	// preventing a metadata-capable server from silently full-decoding video.
 	DerivativePass string `json:"derivative_pass,omitempty"`
-	// SourceVideoCodec/SourceBitDepth carry the server's live ffprobe result into
+	// SourceVideoCodec/SourceVideoProfile/SourceBitDepth carry the server's live ffprobe result into
 	// a bounded preview child. They let recovery reroute the child to another
-	// verified decoder family without rescanning a directory.
-	SourceVideoCodec string `json:"source_video_codec,omitempty"`
-	SourceBitDepth   int    `json:"source_bit_depth,omitempty"`
+	// verified decoder family/profile without rescanning a directory.
+	SourceVideoCodec   string `json:"source_video_codec,omitempty"`
+	SourceVideoProfile string `json:"source_video_profile,omitempty"`
+	SourceBitDepth     int    `json:"source_bit_depth,omitempty"`
 	// RoutingReason makes an intentional CPU decode fallback inspectable in the
 	// same Recent Jobs error/note surface used by retry recovery.
 	RoutingReason string `json:"routing_reason,omitempty"`

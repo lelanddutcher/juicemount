@@ -16,6 +16,10 @@ func TestUnsupportedHardwareDecodeReason(t *testing.T) {
 	worker := farmqueue.Worker{
 		Role:     farmqueue.QueueClassRender,
 		Decoders: []string{"h264_vaapi", "hevc_vaapi"},
+		Capabilities: []string{
+			"decoder:h264_vaapi:profile:main",
+			"decoder:h264_vaapi:profile:high",
+		},
 	}
 	tests := []struct {
 		name    string
@@ -24,6 +28,8 @@ func TestUnsupportedHardwareDecodeReason(t *testing.T) {
 		want    string
 	}{
 		{name: "ordinary H264", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", PixFmt: "yuv420p", BitDepth: 8}},
+		{name: "H264 main profile", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", Profile: "Main", PixFmt: "yuv420p", BitDepth: 8}},
+		{name: "H264 baseline profile", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", Profile: "Baseline", PixFmt: "yuv420p", BitDepth: 8}, want: "profile baseline"},
 		{name: "HEVC main10", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "hevc", PixFmt: "yuv420p10le", BitDepth: 10}},
 		{name: "camera H264 422", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", PixFmt: "yuv422p10le", BitDepth: 10}, want: "4:2:0"},
 		{name: "H264 high10", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", PixFmt: "yuv420p10le", BitDepth: 10}, want: "10-bit"},
@@ -70,7 +76,10 @@ func TestPartitionRenderProxyTargetsWithLiveH264AndProRes(t *testing.T) {
 		}
 	}
 
-	worker := farmqueue.Worker{Role: farmqueue.QueueClassRender, Decoders: []string{"h264_vaapi", "hevc_vaapi"}}
+	worker := farmqueue.Worker{
+		Role: farmqueue.QueueClassRender, Decoders: []string{"h264_vaapi", "hevc_vaapi"},
+		Capabilities: []string{"decoder:h264_vaapi:profile:high"},
+	}
 	hardware, fallback := partitionRenderProxyTargets(worker, "hevc_vaapi", []string{h264, prores}, probeRenderVideoTrack)
 	if !reflect.DeepEqual(hardware, []string{h264}) {
 		t.Fatalf("live hardware targets = %v, want only H.264", hardware)

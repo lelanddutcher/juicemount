@@ -97,11 +97,14 @@ func TestMapTechDiverse(t *testing.T) {
 		{
 			name: "h264_8bit_no_color",
 			probe: `{"streams":[
-				{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"pix_fmt":"yuv420p","r_frame_rate":"30/1"},
+				{"codec_type":"video","codec_name":"h264","profile":"Baseline","width":1920,"height":1080,"pix_fmt":"yuv420p","r_frame_rate":"30/1"},
 				{"codec_type":"audio","codec_name":"aac","channels":2,"sample_rate":"44100","sample_fmt":"fltp"}
 			],"format":{"format_name":"mp4","duration":"60.0","size":"5000000"}}`,
 			check: func(t *testing.T, tech *Tech) {
 				v := tech.Video
+				if v.Profile != "Baseline" {
+					t.Errorf("profile = %q, want Baseline", v.Profile)
+				}
 				if v.BitDepth != 8 {
 					t.Errorf("yuv420p must be 8-bit, got %d", v.BitDepth)
 				}

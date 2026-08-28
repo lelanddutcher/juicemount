@@ -97,11 +97,11 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 	switch kind {
 	case KindDerivatives:
 		if j.DerivativePass == DerivativePassPreviews {
-			if selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, j.SourceVideoCodec, loads); ok {
+			if selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, j.SourceVideoCodec, j.SourceVideoProfile, loads); ok {
 				j.QueueClass = QueueClassRender
 				j.SelectedBackend = decoder
 				j.SelectedWorker = workerDisplayName(selected)
-				j.RequiredCapabilities = []string{"decoder:" + decoder, "worker:" + selected.ID}
+				j.RequiredCapabilities = append(DecoderRequirements(decoder, j.SourceVideoCodec, j.SourceVideoProfile), "worker:"+selected.ID)
 				j.RoutingReason = ""
 				return
 			}
@@ -110,7 +110,7 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 			j.SelectedWorker = ""
 			j.RequiredCapabilities = []string{"cpu"}
 			if j.RoutingReason == "" {
-				j.RoutingReason = "no verified hardware decoder is online for " + displayCodec(j.SourceVideoCodec)
+				j.RoutingReason = "no verified hardware decoder is online for " + displayCodecProfile(j.SourceVideoCodec, j.SourceVideoProfile)
 			}
 			return
 		}
@@ -146,7 +146,7 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 	}
 }
 
-func preferredHardwareDecoderWorkerWithLoad(workers []Worker, codec string, loads map[string]int) (Worker, string, bool) {
+func preferredHardwareDecoderWorkerWithLoad(workers []Worker, codec, profile string, loads map[string]int) (Worker, string, bool) {
 	codec = strings.ToLower(strings.TrimSpace(codec))
 	if codec != "h264" && codec != "hevc" {
 		return Worker{}, "", false
@@ -162,7 +162,7 @@ func preferredHardwareDecoderWorkerWithLoad(workers []Worker, codec string, load
 			continue
 		}
 		for _, decoder := range w.Decoders {
-			if strings.HasPrefix(decoder, codec+"_") {
+			if strings.HasPrefix(decoder, codec+"_") && WorkerSupports(w, DecoderRequirements(decoder, codec, profile)) {
 				candidates = append(candidates, candidate{
 					worker: w, decoder: decoder,
 					cost: workerQueueCost(w, KindDerivatives, loads[w.ID]),
@@ -182,6 +182,60 @@ func displayCodec(codec string) string {
 		return codec
 	}
 	return "this source codec"
+}
+
+func displayCodecProfile(codec, profile string) string {
+	codec = displayCodec(codec)
+	if profile = NormalizeVideoProfile(codec, profile); profile != "" {
+		return codec + " profile " + profile
+	}
+	return codec
+}
+
+// NormalizeVideoProfile converts ffprobe's display labels into stable queue
+// capability terms. Unknown non-empty profiles remain a normalized token so
+// they fail closed unless a worker has explicitly proved that exact profile.
+func NormalizeVideoProfile(codec, profile string) string {
+	codec = strings.ToLower(strings.TrimSpace(codec))
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	profile = strings.NewReplacer("_", " ", "-", " ").Replace(profile)
+	profile = strings.Join(strings.Fields(profile), " ")
+	if profile == "" {
+		return ""
+	}
+	switch codec {
+	case "h264", "avc1":
+		switch {
+		case profile == "constrained baseline":
+			return "constrained_baseline"
+		case profile == "baseline":
+			return "baseline"
+		case profile == "main":
+			return "main"
+		case strings.HasPrefix(profile, "high"):
+			return "high"
+		}
+	case "hevc", "h265", "hev1", "hvc1":
+		switch strings.ReplaceAll(profile, " ", "") {
+		case "main":
+			return "main"
+		case "main10":
+			return "main10"
+		}
+	}
+	return strings.ReplaceAll(profile, " ", "_")
+}
+
+// DecoderRequirements is the durable, portable capability contract for one
+// source. A profile token is additive: legacy jobs without source profile keep
+// their codec-level behavior, while newly probed jobs fail closed on a worker
+// that never completed that exact hardware decode probe.
+func DecoderRequirements(decoder, codec, profile string) []string {
+	required := []string{"decoder:" + decoder}
+	if profile = NormalizeVideoProfile(codec, profile); profile != "" {
+		required = append(required, "decoder:"+decoder+":profile:"+profile)
+	}
+	return required
 }
 
 func preferredHardwareWorker(workers []Worker) (Worker, string, bool) {

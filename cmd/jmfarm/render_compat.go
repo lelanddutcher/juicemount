@@ -73,6 +73,10 @@ func unsupportedHardwareDecodeReason(worker farmqueue.Worker, encoder string, tr
 	if !containsString(worker.Decoders, required) {
 		return fmt.Sprintf("decoder %s was not verified", required)
 	}
+	profile := farmqueue.NormalizeVideoProfile(codec, track.Profile)
+	if profile != "" && !farmqueue.WorkerSupports(worker, farmqueue.DecoderRequirements(required, codec, profile)) {
+		return fmt.Sprintf("decoder %s profile %s was not verified", required, profile)
+	}
 
 	pixFmt := strings.ToLower(strings.TrimSpace(track.PixFmt))
 	if pixFmt == "" {

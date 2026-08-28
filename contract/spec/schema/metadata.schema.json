@@ -26,6 +26,7 @@
           "additionalProperties": true,
           "properties": {
             "codec": { "type": "string" },
+            "profile": { "type": "string", "description": "ffprobe video profile, e.g. Baseline, Main, High, or Main 10." },
             "width": { "type": "integer" },
             "height": { "type": "integer" },
             "fps": { "type": "number" },

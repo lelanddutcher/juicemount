@@ -29,11 +29,15 @@ func dispatchDerivativePlan(ctx context.Context, q *farmqueue.Client, store *der
 		return 0, 0, fmt.Errorf("snapshot live worker routes: %w", err)
 	}
 	planned, err := buildDerivativePlan(ctx, func(_ context.Context, job *farmqueue.Job) { snapshotRoute(job) }, parent, targets, func(path string) (*farm.VideoTrack, error) {
-		// Existing tech is sufficient for initial placement. The render worker
-		// repeats a live byte-level probe immediately before execution; stale
-		// metadata can therefore cost one reroute, never admit CPU decode as GPU.
+		// Existing tech is sufficient only when it includes the source profile.
+		// Rows written before profile-aware admission must be refreshed from the
+		// live bytes here, otherwise Baseline/Main/High collapse into the same
+		// H.264 queue and the render node discovers the mismatch too late.
 		if track := knownVideoTrack(store, path); track != nil {
-			return track, nil
+			codec := normalizedDecodeCodec(track.Codec)
+			if codec == "" || strings.TrimSpace(track.Profile) != "" {
+				return track, nil
+			}
 		}
 		return probeRenderVideoTrack(path)
 	})
@@ -100,6 +104,7 @@ func buildDerivativePlan(ctx context.Context, route derivativeRouter, parent far
 			continue
 		}
 		child.SourceVideoCodec = normalizedDecodeCodec(track.Codec)
+		child.SourceVideoProfile = farmqueue.NormalizeVideoProfile(child.SourceVideoCodec, track.Profile)
 		child.SourceBitDepth = track.BitDepth
 		route(ctx, &child)
 		if child.QueueClass != farmqueue.QueueClassRender {
@@ -114,14 +119,17 @@ func buildDerivativePlan(ctx context.Context, route derivativeRouter, parent far
 
 		// RouteJob proves a live worker advertised this decoder. Enforce the
 		// source's pixel-format/bit-depth contract before publishing the claim.
-		admission := farmqueue.Worker{Role: farmqueue.QueueClassRender, Decoders: []string{child.SelectedBackend}}
+		admission := farmqueue.Worker{
+			Role: farmqueue.QueueClassRender, Decoders: []string{child.SelectedBackend},
+			Capabilities: append([]string(nil), child.RequiredCapabilities...),
+		}
 		if reason := unsupportedHardwareDecodeReason(admission, child.SelectedBackend, track); reason != "" {
 			routePreviewCPU(&child, reason)
 		} else {
 			// The backend capability is portable; never pin a directory plan to
 			// one ephemeral worker identity.
 			child.SelectedWorker = ""
-			child.RequiredCapabilities = []string{"decoder:" + child.SelectedBackend}
+			child.RequiredCapabilities = farmqueue.DecoderRequirements(child.SelectedBackend, child.SourceVideoCodec, child.SourceVideoProfile)
 		}
 		children = append(children, child)
 	}

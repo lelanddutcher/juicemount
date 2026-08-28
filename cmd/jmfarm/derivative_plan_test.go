@@ -110,4 +110,35 @@ func TestPreviewLiveAdmissionFallsStraightToVisibleCPU(t *testing.T) {
 	}
 }
 
+func TestDerivativePlanCarriesMeasuredProfileAdmission(t *testing.T) {
+	parent := farmqueue.Job{
+		ID: "profile-parent", Path: "/jfs/incoming", Kinds: []string{farmqueue.KindDerivatives},
+		Producer: "manager", PlanOnly: true, QueueClass: farmqueue.QueueClassServer,
+	}
+	route := func(_ context.Context, job *farmqueue.Job) {
+		job.QueueClass = farmqueue.QueueClassRender
+		job.SelectedBackend = "h264_vaapi"
+		job.SelectedWorker = "intel"
+		job.RequiredCapabilities = append(
+			farmqueue.DecoderRequirements("h264_vaapi", job.SourceVideoCodec, job.SourceVideoProfile),
+			"worker:intel",
+		)
+	}
+	children, err := buildDerivativePlan(context.Background(), route, parent, []string{"/jfs/incoming/main.mp4"}, func(string) (*farm.VideoTrack, error) {
+		return &farm.VideoTrack{Codec: "h264", Profile: "Main", PixFmt: "yuv420p", BitDepth: 8}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("children=%d, want metadata + preview", len(children))
+	}
+	preview := children[1]
+	want := []string{"decoder:h264_vaapi", "decoder:h264_vaapi:profile:main"}
+	if preview.SourceVideoProfile != "main" || preview.SelectedWorker != "" ||
+		!reflect.DeepEqual(preview.RequiredCapabilities, want) {
+		t.Fatalf("profile-aware preview=%+v, want capabilities %v", preview, want)
+	}
+}
+
 func fmtError(cause error) error { return errors.Join(errors.New("preview admission"), cause) }

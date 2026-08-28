@@ -126,12 +126,12 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 			targetClass := QueueClassCPU
 			reason := "render capability went offline before claim; queued CPU fallback"
 			if kind == KindDerivatives && job.DerivativePass == DerivativePassPreviews {
-				if _, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, job.SourceVideoCodec, nil); ok {
+				if _, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, job.SourceVideoCodec, job.SourceVideoProfile, nil); ok {
 					targetClass = QueueClassRender
 					job.QueueClass = QueueClassRender
 					job.SelectedBackend = decoder
 					job.SelectedWorker = ""
-					job.RequiredCapabilities = []string{"decoder:" + decoder}
+					job.RequiredCapabilities = DecoderRequirements(decoder, job.SourceVideoCodec, job.SourceVideoProfile)
 					reason = "selected decoder went offline; re-routed to active verified hardware"
 				} else {
 					job.QueueClass = QueueClassCPU

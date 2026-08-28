@@ -89,8 +89,11 @@ Key properties:
   sources enter an explicit `cpu-decode` lane instead of demoting the rest of a batch.
   Proxy transcode and Whisper transcript remain separate passes.
 - **Observed capability, not advertised hardware.** A render worker is admitted only
-  after it completes real encode and hardware-decode probes. Its measured encode,
-  decode, transcript, and mount-read rates are published in the Manager.
+  after it completes real encode and hardware-decode probes. H.264 Constrained
+  Baseline/Main/High and HEVC Main/Main10 are probed independently; plain H.264
+  Baseline remains distinct and is not inferred from Constrained Baseline. A worker may
+  claim only the source profiles it actually decoded in hardware. Its measured
+  encode, decode, transcript, and mount-read rates are published in the Manager.
 - **Durable claims.** Claiming a job atomically moves it to a per-worker processing
   list with a renewable lease. If the worker disappears, another worker requeues the
   receipt instead of losing work between a Redis pop and execution.
@@ -132,8 +135,11 @@ Its bounded children carry `parent_id`, `shard_index`, `shard_count`, exact
 `retry_targets`, and the measured execution admission such as
 `selected_backend: "hevc_vaapi"` or `selected_backend: "h264_vaapi"` for a preview
 decoder. Derivative children also carry `derivative_pass: "metadata"|"previews"`;
-intentional software decode is visible as `cpu-decode`. Planner admission is never
-copied to a child.
+`source_video_codec`, `source_video_profile`, and `source_bit_depth` preserve the
+server's live ffprobe result through retry/recovery. A profile-aware render child
+requires both `decoder:h264_vaapi` and (for example)
+`decoder:h264_vaapi:profile:high`. Intentional software decode is visible as
+`cpu-decode`. Planner admission is never copied to a child.
 
 Jobs arrive automatically from the recursive discovery watcher and its cursored
 backstop. The Manager's advanced path sweep and OpenLoupe remain repair/manual

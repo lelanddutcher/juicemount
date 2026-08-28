@@ -2,6 +2,7 @@ package farmqueue
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -94,12 +95,54 @@ func TestPreviewDecoderSelectionUsesMeasuredDecodeAndCodec(t *testing.T) {
 		{ID: "fast-h264", Role: QueueClassRender, Decoders: []string{"h264_qsv"}, Benchmarks: WorkerBenchmarks{DecodeFPS: 240, AccessMBps: 500}},
 		{ID: "hevc-only", Role: QueueClassRender, Decoders: []string{"hevc_vaapi"}, Benchmarks: WorkerBenchmarks{DecodeFPS: 500, AccessMBps: 500}},
 	}
-	selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, "h264", nil)
+	selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, "h264", "", nil)
 	if !ok || selected.ID != "fast-h264" || decoder != "h264_qsv" {
 		t.Fatalf("H.264 decoder selection=%q/%q/%v", selected.ID, decoder, ok)
 	}
-	if _, _, ok := preferredHardwareDecoderWorkerWithLoad(workers, "prores", nil); ok {
+	if _, _, ok := preferredHardwareDecoderWorkerWithLoad(workers, "prores", "", nil); ok {
 		t.Fatal("unverified ProRes decoder was admitted")
+	}
+}
+
+func TestPreviewDecoderSelectionRequiresMeasuredSourceProfile(t *testing.T) {
+	intel := Worker{
+		ID: "intel", Role: QueueClassRender, Decoders: []string{"h264_vaapi"},
+		Capabilities: []string{
+			"decoder:h264_vaapi:profile:main",
+			"decoder:h264_vaapi:profile:high",
+		},
+	}
+	if _, _, ok := preferredHardwareDecoderWorkerWithLoad([]Worker{intel}, "h264", "Baseline", nil); ok {
+		t.Fatal("H.264 Baseline was admitted without a successful profile probe")
+	}
+	selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad([]Worker{intel}, "h264", "Main", nil)
+	if !ok || selected.ID != intel.ID || decoder != "h264_vaapi" {
+		t.Fatalf("H.264 Main selection=%q/%q/%v, want measured Intel decoder", selected.ID, decoder, ok)
+	}
+
+	job := Job{
+		Kinds: []string{KindDerivatives}, DerivativePass: DerivativePassPreviews,
+		SourceVideoCodec: "h264", SourceVideoProfile: "Baseline",
+	}
+	routeJobWithWorkers(&job, []Worker{intel}, nil)
+	if job.QueueClass != QueueClassCPU || job.SelectedBackend != "cpu-decode" ||
+		!strings.Contains(job.RoutingReason, "profile baseline") {
+		t.Fatalf("Baseline route=%+v, want visible CPU fallback", job)
+	}
+}
+
+func TestNormalizeVideoProfile(t *testing.T) {
+	tests := map[string]string{
+		"Baseline": "baseline", "Constrained Baseline": "constrained_baseline", "Main": "main",
+		"High": "high", "High 10": "high", "Extended": "extended",
+	}
+	for input, want := range tests {
+		if got := NormalizeVideoProfile("h264", input); got != want {
+			t.Errorf("NormalizeVideoProfile(h264, %q)=%q, want %q", input, got, want)
+		}
+	}
+	if got := NormalizeVideoProfile("hevc", "Main 10"); got != "main10" {
+		t.Fatalf("NormalizeVideoProfile(hevc, Main 10)=%q", got)
 	}
 }
 
