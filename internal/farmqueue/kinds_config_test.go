@@ -57,6 +57,23 @@ func TestWorkerQueueKeysAreDisjointByRole(t *testing.T) {
 		!serverSet[classQueue(KindProxy, QueueClassCPU)] || !serverSet[QueueKey] {
 		t.Fatalf("server queues = %v, want planning, CPU fallback, and legacy catch-all lanes", server)
 	}
+	wantServerOrder := []string{
+		classQueue(KindDerivatives, QueueClassServer),
+		classQueue(KindProxy, QueueClassServer),
+		classQueue(KindTranscript, QueueClassServer),
+		classQueue(KindDerivatives, QueueClassCPU),
+		classQueue(KindProxy, QueueClassCPU),
+		classQueue(KindTranscript, QueueClassCPU),
+		QueueKey,
+	}
+	if len(server) != len(wantServerOrder) {
+		t.Fatalf("server queues = %v, want planning lanes before CPU lanes: %v", server, wantServerOrder)
+	}
+	for i := range wantServerOrder {
+		if server[i] != wantServerOrder[i] {
+			t.Fatalf("server queues = %v, want planning lanes before CPU lanes: %v", server, wantServerOrder)
+		}
+	}
 	if len(render) != 3 || render[0] != classQueue(KindDerivatives, QueueClassRender) ||
 		render[1] != classQueue(KindProxy, QueueClassRender) || render[2] != classQueue(KindTranscript, QueueClassRender) {
 		t.Fatalf("render queues = %v", render)

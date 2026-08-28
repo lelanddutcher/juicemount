@@ -461,11 +461,16 @@ func WorkerQueueKeys(w Worker) []string {
 	var keys []string
 	switch w.Role {
 	case QueueClassServer:
+		// Planning is intentionally ahead of every CPU execution lane. A fresh
+		// Manager request only needs a short filesystem expansion before its
+		// bounded children can run on independent render/CPU workers. Putting a
+		// large CPU derivative backlog between planning kinds leaves an idle GPU
+		// even though compatible proxy/transcript work is waiting to be routed.
 		keys = append(keys,
 			classQueue(KindDerivatives, QueueClassServer),
-			classQueue(KindDerivatives, QueueClassCPU),
 			classQueue(KindProxy, QueueClassServer),
 			classQueue(KindTranscript, QueueClassServer),
+			classQueue(KindDerivatives, QueueClassCPU),
 			classQueue(KindProxy, QueueClassCPU),
 			classQueue(KindTranscript, QueueClassCPU))
 	case QueueClassRender:
