@@ -182,6 +182,7 @@ func TestHandleFarmConfigGetPutDelete(t *testing.T) {
 func TestHandleFarmWorkersEnriched(t *testing.T) {
 	fake := &fakeFarmQ{workers: []farmqueue.Worker{{
 		ID: "w1", Name: "b70-gpu", ConfigRevision: 2,
+		BuildVersion: "0.5.0", BuildCommit: "0123456789abcdef",
 		PendingRestart: []string{"nice"},
 		Capabilities:   []string{"cpu", "vulkan", "vaapi"},
 	}}}
@@ -196,7 +197,7 @@ func TestHandleFarmWorkersEnriched(t *testing.T) {
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	if len(out.Workers) != 1 || out.Workers[0].Name != "b70-gpu" ||
-		len(out.Workers[0].PendingRestart) != 1 {
+		len(out.Workers[0].PendingRestart) != 1 || out.Workers[0].BuildCommit != "0123456789abcdef" {
 		t.Fatalf("enriched workers lost: %+v", out)
 	}
 }

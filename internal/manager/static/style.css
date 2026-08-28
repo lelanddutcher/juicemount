@@ -2178,6 +2178,7 @@ footer a:hover { text-decoration: underline; }
 .farm-worker-role.render { color: var(--accent-text); border-color: color-mix(in srgb, var(--accent) 44%, var(--border)); background: var(--accent-bg); }
 .farm-worker-state.working { color: var(--success); }
 .farm-worker-state.paused { color: var(--running); }
+.farm-worker-build { color: var(--text-muted); font: 0.64rem/1.2 var(--font-mono); }
 .farm-worker-route { margin: 0.6rem 0; color: var(--text-muted); font: 0.73rem/1.45 var(--font-mono); overflow-wrap: anywhere; }
 .farm-worker-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 0.4rem; }
 .farm-worker-metrics > span { padding: 0.45rem; background: var(--panel); border-left: 2px solid var(--accent); }

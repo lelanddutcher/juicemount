@@ -3776,6 +3776,13 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 			state.className = 'farm-worker-state ' + (w.state || 'idle');
 			state.textContent = w.state || (w.current_job ? 'working' : 'idle');
 			head.appendChild(state);
+			if (w.build_commit) {
+				const build = document.createElement('span');
+				build.className = 'farm-worker-build';
+				build.textContent = (w.build_version ? ('v' + w.build_version + ' · ') : '') + String(w.build_commit).slice(0, 7);
+				build.title = 'Worker artifact commit ' + w.build_commit;
+				head.appendChild(build);
+			}
 			row.appendChild(head);
 
 			const route = document.createElement('p');

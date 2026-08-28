@@ -238,6 +238,8 @@ type oldWorker struct {
 func TestWorkerHeartbeatAdditiveFields(t *testing.T) {
 	w := Worker{
 		ID:             "w1",
+		BuildVersion:   "0.5.0",
+		BuildCommit:    "0123456789abcdef",
 		Name:           "b70-gpu",
 		ConfigRevision: 3,
 		PendingRestart: []string{"nice"},
@@ -251,5 +253,12 @@ func TestWorkerHeartbeatAdditiveFields(t *testing.T) {
 	}
 	if legacy.ID != "w1" {
 		t.Errorf("legacy decode lost id")
+	}
+	var current Worker
+	if err := json.Unmarshal(raw, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.BuildVersion != "0.5.0" || current.BuildCommit != "0123456789abcdef" {
+		t.Fatalf("build provenance lost: version=%q commit=%q", current.BuildVersion, current.BuildCommit)
 	}
 }

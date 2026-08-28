@@ -252,6 +252,12 @@ type Worker struct {
 	StartedAt  string `json:"started_at"`
 	LastSeen   string `json:"last_seen"`
 	CurrentJob string `json:"current_job,omitempty"`
+	// BuildVersion/BuildCommit make release admission observable from Manager.
+	// A worker can report perfect benchmark numbers while still running an old
+	// scheduler or fallback implementation; exact provenance prevents that node
+	// from being mistaken for the artifact under test.
+	BuildVersion string `json:"build_version,omitempty"`
+	BuildCommit  string `json:"build_commit,omitempty"`
 
 	// Manager-config feedback (FARM-NODE-CONFIG spec):
 	Name               string            `json:"name,omitempty"`            // JM_WORKER_NAME (stable identity)

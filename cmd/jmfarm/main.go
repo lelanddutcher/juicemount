@@ -773,6 +773,8 @@ func runQueue(cfg queueConfig) {
 	worker := farmqueue.Worker{
 		ID:                 farmqueue.NewID(),
 		StartedAt:          time.Now().UTC().Format(time.RFC3339),
+		BuildVersion:       buildversion.Version,
+		BuildCommit:        buildversion.Commit,
 		Name:               cfg.name,
 		Kinds:              farmqueue.DrainKinds(cfg.kinds),
 		Capabilities:       profile.Capabilities,

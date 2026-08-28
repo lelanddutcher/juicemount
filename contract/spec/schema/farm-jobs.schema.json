@@ -18,6 +18,8 @@
           "started_at": { "type": "string" },
           "last_seen": { "type": "string" },
           "current_job": { "type": ["string", "null"] }
+          ,"build_version": { "type": "string" }
+          ,"build_commit": { "type": "string" }
           ,"name": { "type": "string" }
           ,"role": { "type": "string", "enum": ["server", "render"] }
           ,"state": { "type": "string", "enum": ["idle", "working", "paused"] }
