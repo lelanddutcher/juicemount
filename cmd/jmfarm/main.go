@@ -23,6 +23,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -995,6 +996,27 @@ func runQueue(cfg queueConfig) {
 			// recover it after this heartbeat expires.
 			break
 		}
+		if errors.Is(runErr, errJobDispatched) {
+			if err := q.MarkDispatched(context.Background(), job.ID); err != nil {
+				// Children are idempotently durable, but the parent receipt is our
+				// recovery proof until its truthful state is committed. Stop and let
+				// another worker replay the claim instead of acknowledging ambiguity.
+				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-dispatched %s: %v; stopping with durable claim intact\n", job.ID, err)
+				return
+			}
+			if err := q.AckClaim(context.Background(), claim); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: ack dispatched parent %s: %v; stopping with durable claim intact\n", job.ID, err)
+				return
+			}
+			continue
+		}
+		if errors.Is(runErr, errJobDispatchRetry) {
+			if err := q.RequeueClaimSameRoute(context.Background(), claim, runErr.Error()); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: dispatch retry %s: %v; stopping with durable claim intact\n", job.ID, err)
+				return
+			}
+			continue
+		}
 		if requeue, fallbackCPU, reason := renderFailureDisposition(worker, job, runErr); requeue {
 			if len(failedTargets) > 0 {
 				claim.Job.RetryTargets = failedTargets
@@ -1033,6 +1055,12 @@ func runQueue(cfg queueConfig) {
 
 	fmt.Printf("jmfarm queue: worker %s stopping (signal)\n", worker.ID)
 }
+
+var (
+	errJobDispatched    = errors.New("job dispatched into bounded target shards")
+	errJobDispatchRetry = errors.New("job target dispatch needs same-route retry")
+	errRenderExecution  = errors.New("verified render execution failed")
+)
 
 func workerRunsDiscovery(worker farmqueue.Worker) bool {
 	return farm.WatchEnabled() && worker.Role == farmqueue.QueueClassServer
@@ -1137,6 +1165,18 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 			job.ID, job.Path)
 		return 0, 0, nil, nil
 	}
+	if shardSize := targetShardSize(job); q != nil && shardSize > 0 && len(targets) > shardSize {
+		children, created, splitErr := q.EnqueueTargetShards(ctx, job, targets, shardSize)
+		if splitErr != nil {
+			return 0, 0, nil, fmt.Errorf("%w: enqueue bounded target shards: %v", errJobDispatchRetry, splitErr)
+		}
+		fmt.Printf("jmfarm queue: job %s released directory claim into %d bounded shard(s), %d newly queued, max %d files each\n",
+			job.ID, len(children), created, shardSize)
+		// The durable children now own every target. A distinct non-failure result
+		// lets the queue loop mark the parent as dispatched rather than falsely
+		// claiming it processed zero files successfully.
+		return 0, 0, nil, errJobDispatched
+	}
 	if len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindProxy && worker.Role == farmqueue.QueueClassRender {
 		hardwareTargets, fallbackTargets := partitionRenderProxyTargets(worker, vcodec, targets, probeRenderVideoTrack)
 		if len(fallbackTargets) > 0 {
@@ -1148,7 +1188,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 				len(fallbackTargets), fallbackTargets[0].Reason)
 			fallbackJob, created, splitErr := q.EnqueueCPUFallbackSubset(ctx, job, paths, reason)
 			if splitErr != nil {
-				return 0, 0, nil, fmt.Errorf("enqueue CPU fallback subset: %w", splitErr)
+				return 0, 0, nil, fmt.Errorf("%w: enqueue CPU fallback subset: %v", errJobDispatchRetry, splitErr)
 			}
 			state := "already present in"
 			if created {
@@ -1242,9 +1282,51 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 		if len(failureDetails) > 0 {
 			passErr = fmt.Errorf("%w; first errors: %s", passErr, strings.Join(failureDetails, "; "))
 		}
+		if worker.Role == farmqueue.QueueClassRender {
+			passErr = fmt.Errorf("%w: %v", errRenderExecution, passErr)
+		}
 		return processed, failed, uniqueSortedStrings(failedTargets), passErr
 	}
 	return processed, failed, nil, nil
+}
+
+// targetShardSize caps one durable lease while preserving each worker's useful
+// in-process parallelism. Proxy/transcript work is latency-heavy and gets small
+// shards; cheap server derivatives amortize queue overhead across a larger set.
+// A child carries ShardCount and is never split recursively.
+func targetShardSize(job farmqueue.Job) int {
+	if job.ShardCount > 0 || len(job.Kinds) != 1 {
+		return 0
+	}
+	clamp := func(value, low, high int) int {
+		if value < low {
+			return low
+		}
+		if value > high {
+			return high
+		}
+		return value
+	}
+	switch job.Kinds[0] {
+	case farmqueue.KindProxy:
+		// Use only immutable job fields: a crash replay on a differently sized
+		// worker must produce identical boundaries for the same child IDs.
+		effective := job.ProxyWorkers
+		if effective <= 0 {
+			effective = 2
+		}
+		return clamp(effective*2, 2, 8)
+	case farmqueue.KindTranscript:
+		return 1
+	case farmqueue.KindDerivatives:
+		effective := job.Workers
+		if effective <= 0 {
+			effective = 8
+		}
+		return clamp(effective*4, 16, 64)
+	default:
+		return 0
+	}
 }
 
 const renderHardwareRetries = 1
@@ -1256,7 +1338,7 @@ const renderHardwareRetries = 1
 // freshness gate, so retrying a partially successful batch only recomputes the
 // files that did not publish a valid proxy.
 func renderFailureDisposition(worker farmqueue.Worker, job farmqueue.Job, runErr error) (requeue, fallbackCPU bool, reason string) {
-	if worker.Role != farmqueue.QueueClassRender || runErr == nil {
+	if worker.Role != farmqueue.QueueClassRender || !errors.Is(runErr, errRenderExecution) {
 		return false, false, ""
 	}
 	if job.Attempts < renderHardwareRetries {

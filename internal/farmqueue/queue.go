@@ -14,6 +14,7 @@
 //	producer:  Enqueue(job)                        → route + LPUSH lane + HSET queued
 //	worker:    ClaimForWorker() → run              → durable processing list + lease
 //	           MarkDone/MarkFailed → AckClaim       → terminal status + remove receipt
+//	           MarkDispatched      → AckClaim       → bounded children own the work
 //	worker:    Heartbeat() every loop              → SET worker:<id> EX 30
 //	reader:    ListJobs() / ActiveWorkers()        → ZREVRANGE + HGETALL / SCAN
 package farmqueue
@@ -83,10 +84,11 @@ func allQueueKeys() []string {
 
 // Job lifecycle status values.
 const (
-	StatusQueued  = "queued"
-	StatusRunning = "running"
-	StatusDone    = "done"
-	StatusFailed  = "failed"
+	StatusQueued     = "queued"
+	StatusRunning    = "running"
+	StatusDispatched = "dispatched"
+	StatusDone       = "done"
+	StatusFailed     = "failed"
 )
 
 // Kinds the worker understands. "all" expands to the full pipeline.
@@ -181,6 +183,11 @@ type Job struct {
 	// terminal status adds the retry's results so partial GPU success is not
 	// erased when only failed targets move to another worker or the CPU lane.
 	ProcessedOffset int `json:"processed_offset,omitempty"`
+	// ShardIndex/ShardCount mark a bounded child created from a directory-sized
+	// claim. Workers never shard an already-bounded child, so one slow file can
+	// hold at most one small work set instead of an entire directory lease.
+	ShardIndex int `json:"shard_index,omitempty"`
+	ShardCount int `json:"shard_count,omitempty"`
 	// RetryTargets is worker-authored after a partially successful batch. It
 	// narrows the next hardware retry or CPU fallback to the exact files that
 	// failed, so a directory-shaped job can never recompute successful GPU
@@ -192,7 +199,7 @@ type Job struct {
 // flat Redis HASH (all string fields) so HGETALL round-trips without a codec.
 type JobStatus struct {
 	ID           string `json:"id"`
-	Status       string `json:"status"` // queued|running|done|failed
+	Status       string `json:"status"` // queued|running|dispatched|done|failed
 	Path         string `json:"path"`
 	Kinds        string `json:"kinds"` // comma-joined for display
 	Producer     string `json:"producer"`
@@ -401,6 +408,16 @@ func (c *Client) MarkRunning(ctx context.Context, id string) error {
 	}).Err()
 }
 
+// MarkDispatched records that a directory-sized parent released its durable
+// claim after atomically enqueueing bounded children. It deliberately has no
+// finished_at: the parent did not process the media and its children may still
+// be queued or running. ParentID on each child keeps the relationship visible.
+func (c *Client) MarkDispatched(ctx context.Context, id string) error {
+	return c.rdb.HSet(ctx, JobHashPrefix+id, map[string]any{
+		"status": StatusDispatched,
+	}).Err()
+}
+
 // MarkDone records a successful finish + counts.
 func (c *Client) MarkDone(ctx context.Context, id string, processed, failed int) error {
 	st := StatusDone
@@ -477,9 +494,9 @@ func (c *Client) ListJobs(ctx context.Context, n int) ([]JobStatus, error) {
 // the Recent-jobs list can be cleared and the JobIndexKey ZSET does not
 // grow without bound over the lifetime of the shared metadata Redis.
 //
-// Queued/running jobs are NEVER removed: dropping a job a worker is about
-// to (or is actively) processing would orphan it. Returns the number of
-// index entries removed.
+// Queued/running/dispatched jobs are NEVER removed: dropping a job a worker is
+// about to process, is actively processing, or whose children are still active
+// would orphan or hide work. Returns the number of index entries removed.
 func (c *Client) ClearFinished(ctx context.Context) (int, error) {
 	ids, err := c.rdb.ZRange(ctx, JobIndexKey, 0, -1).Result()
 	if err != nil {

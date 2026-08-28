@@ -1957,6 +1957,7 @@ footer a:hover { text-decoration: underline; }
 }
 .farm-job-chip.queued  { background: rgba(155, 155, 155, 0.20); color: var(--text-muted); }
 .farm-job-chip.running { background: var(--accent-bg); color: var(--accent-text); animation: farm-chip-pulse 1.6s ease-in-out infinite; }
+.farm-job-chip.dispatched { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent-text); }
 .farm-job-chip.done    { background: rgba(0, 135, 90, 0.18); color: var(--success); }
 .farm-job-chip.partial { background: color-mix(in srgb, var(--running) 14%, transparent); color: var(--running); }
 .farm-job-chip.failed  { background: rgba(215, 0, 21, 0.18); color: var(--danger); }

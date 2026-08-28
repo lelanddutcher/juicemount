@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,7 +24,7 @@ func TestPassFailureRejectsPartialSuccess(t *testing.T) {
 func TestRenderFailureRetriesHardwareBeforeCPUFallback(t *testing.T) {
 	worker := farmqueue.Worker{Role: farmqueue.QueueClassRender}
 	job := farmqueue.Job{Kinds: []string{farmqueue.KindProxy}, Attempts: 0}
-	runErr := errors.New("vaapi admission failed")
+	runErr := fmt.Errorf("%w: vaapi admission failed", errRenderExecution)
 
 	requeue, cpu, reason := renderFailureDisposition(worker, job, runErr)
 	if !requeue || cpu || !strings.Contains(reason, "verified hardware worker") {
@@ -43,6 +44,9 @@ func TestRenderFailureRetriesHardwareBeforeCPUFallback(t *testing.T) {
 	worker.Role = farmqueue.QueueClassRender
 	if requeue, _, _ := renderFailureDisposition(worker, job, nil); requeue {
 		t.Fatal("successful render entered failure retry policy")
+	}
+	if requeue, _, _ := renderFailureDisposition(worker, job, errors.New("Redis unavailable while sharding")); requeue {
+		t.Fatal("queue infrastructure failure entered codec fallback policy")
 	}
 }
 

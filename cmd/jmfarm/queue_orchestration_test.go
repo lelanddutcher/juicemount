@@ -39,3 +39,26 @@ func TestNoMediaJobDoesNotPolluteBenchmarks(t *testing.T) {
 		t.Fatalf("failed transcript sample not recorded: %+v", w.Benchmarks)
 	}
 }
+
+func TestTargetShardSizeBoundsLeaseWithoutDiscardingParallelism(t *testing.T) {
+	proxy := farmqueue.Job{Kinds: []string{farmqueue.KindProxy}}
+	if got := targetShardSize(proxy); got != 4 {
+		t.Fatalf("proxy shard size = %d, want 4", got)
+	}
+	proxy.ProxyWorkers = 32
+	if got := targetShardSize(proxy); got != 8 {
+		t.Fatalf("proxy shard cap = %d, want 8", got)
+	}
+	if got := targetShardSize(farmqueue.Job{Kinds: []string{farmqueue.KindTranscript}}); got != 1 {
+		t.Fatalf("transcript shard size = %d, want 1", got)
+	}
+	if got := targetShardSize(farmqueue.Job{Kinds: []string{farmqueue.KindDerivatives}}); got != 32 {
+		t.Fatalf("derivative shard size = %d, want 32", got)
+	}
+	if got := targetShardSize(farmqueue.Job{Kinds: []string{farmqueue.KindProxy}, ShardIndex: 1, ShardCount: 5}); got != 0 {
+		t.Fatalf("existing shard was split recursively: %d", got)
+	}
+	if got := targetShardSize(farmqueue.Job{Kinds: []string{farmqueue.KindProxy, farmqueue.KindDerivatives}}); got != 0 {
+		t.Fatalf("multi-kind compatibility job was split: %d", got)
+	}
+}

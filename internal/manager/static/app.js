@@ -1195,7 +1195,7 @@
 
   // FARM_JOB_STATUS_LABEL maps a queue status to readable chip copy.
   const FARM_JOB_STATUS_LABEL = {
-    queued: 'Queued', running: 'Running', done: 'Done', partial: 'Partial', failed: 'Failed',
+    queued: 'Queued', running: 'Running', dispatched: 'Dispatched', done: 'Done', partial: 'Partial', failed: 'Failed',
   };
 
   // renderFarmJobsList renders one row per JobStatus, newest first (the backend

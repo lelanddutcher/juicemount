@@ -239,6 +239,18 @@ func (c *Client) RequeueClaim(ctx context.Context, claim Claim, fallbackCPU bool
 		job.SelectedWorker = ""
 		c.RouteJob(ctx, &job)
 	}
+	return c.requeueClaimAs(ctx, claim, job, reason)
+}
+
+// RequeueClaimSameRoute releases a durable claim without consuming a hardware
+// retry or changing its proven backend. It is reserved for queue-orchestration
+// failures (for example, a transient Redis error while publishing target
+// shards), which say nothing about the render node's codec capability.
+func (c *Client) RequeueClaimSameRoute(ctx context.Context, claim Claim, reason string) error {
+	return c.requeueClaimAs(ctx, claim, claim.Job, reason)
+}
+
+func (c *Client) requeueClaimAs(ctx context.Context, claim Claim, job Job, reason string) error {
 	raw, err := json.Marshal(job)
 	if err != nil {
 		return err
