@@ -201,6 +201,34 @@ func TestMeteredReadaheadStartsOnlyAfterStrongSequentialSignal(t *testing.T) {
 	}
 }
 
+// Production NFS reads reach ReadaheadManager as 256 KiB subreads, not as the
+// 4 MiB synthetic blocks used by the original tests. A real 1 MiB sequential
+// demand must start one bounded WAN prefetch even though the historical six-hit
+// guard has not fired; a smaller Finder-style probe must remain speculative-
+// traffic-free.
+func TestMeteredReadaheadRecognizesSubdividedOneMiBRun(t *testing.T) {
+	t.Setenv("JM_SERVER_READAHEAD", "")
+	p := netprofile.New()
+	c := netprofile.ClassMetered
+	p.ForceClass(&c)
+	rm := NewReadaheadManager(testFUSEPath, nil, p)
+	defer rm.Stop()
+
+	const chunk = 256 << 10
+	inode := uint64(253)
+	for i := 0; i < 3; i++ {
+		rm.OnRead(inode, int64(i)*chunk, chunk, "test/preview.mov")
+	}
+	if triggered, _ := rm.Stats(); triggered != 0 {
+		t.Fatalf("sub-1MiB preview triggered %d prefetches, want 0", triggered)
+	}
+
+	rm.OnRead(inode, 3*chunk, chunk, "test/reel.mov")
+	if triggered, _ := rm.Stats(); triggered != 1 {
+		t.Fatalf("1MiB sequential WAN run triggered %d prefetches, want exactly 1", triggered)
+	}
+}
+
 // TestReadaheadGuardOffOnFastLink (S2): the guard is DISABLED on a fast link —
 // a fast-class run trips exactly as before (10GbE behavior unchanged). A short
 // run of SeqThreshold(fast)=2 blocks must trip.

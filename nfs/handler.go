@@ -4525,10 +4525,14 @@ func (f *cachedFile) ReadAt(p []byte, off int64) (int, error) {
 		n, err := f.cacheReader.ReadBlockWithMappingTimeout(context.Background(), f.inode, off, p, mappingTimeout)
 		if err == nil && n > 0 {
 			metrics.Default().ObserveDirectSSDCacheHit(int64(n))
-			// Do not ask FUSE to prefetch bytes the verified SSD path just proved
-			// are already local. That redundant call generated one JuiceFS cache
-			// read plus remote metadata work per foreground hit; over cellular it
-			// recreated the latency/bandwidth tax this path exists to remove.
+			// Preserve the sequential-read signal across a mixed local/cold run.
+			// OnRead prefetches strictly AFTER this range, so it never asks FUSE
+			// for the bytes this verified SSD hit just served. Without this call,
+			// alternating cache hits and cold blocks reset the WAN detector and
+			// serialize every miss across the Link.
+			if f.readahead != nil {
+				f.readahead.OnRead(f.inode, off, n, f.name)
+			}
 			metrics.Default().AddBytesRead(int64(n))
 			return n, nil
 		}

@@ -32,6 +32,16 @@ const (
 
 	// Stale tracker entries are cleaned up after this duration.
 	trackerTTL = 30 * time.Second
+
+	// wanBulkSignalBytes is the amount of contiguous foreground demand that is
+	// strong enough to distinguish an actual file read from Finder's small
+	// metadata/preview probes. NFS subdivides each 1 MiB READ into 256 KiB
+	// ReadAt calls, so the historical hit-count-only guard could not recognize
+	// the user's intent reliably when some of those calls were served by the
+	// direct SSD cache. One MiB is bounded enough for cellular while allowing a
+	// single 4 MiB block to overlap the next foreground reads.
+	wanBulkSignalBytes = 1 << 20
+	wanBulkSubreadMax  = 256 << 10
 )
 
 // ReadaheadManager detects sequential read patterns and triggers
@@ -81,10 +91,12 @@ func (rm *ReadaheadManager) effectivePolicy() netprofile.ReadaheadPolicy {
 }
 
 type readTracker struct {
-	lastOffset     int64
-	sequentialHits int
-	lastAccess     time.Time
-	prefetchedTo   int64 // highest offset we've already prefetched to
+	lastOffset      int64
+	sequentialHits  int
+	sequentialBytes int64
+	wanSubreadRun   bool
+	lastAccess      time.Time
+	prefetchedTo    int64 // highest offset we've already prefetched to
 }
 
 func NewReadaheadManager(fusePath string, fdPool *FDPool, profile *netprofile.Profile) *ReadaheadManager {
@@ -159,7 +171,10 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 
 	tracker, ok := rm.trackers[inode]
 	if !ok {
-		tracker = &readTracker{}
+		tracker = &readTracker{
+			sequentialBytes: int64(size),
+			wanSubreadRun:   size > 0 && size <= wanBulkSubreadMax,
+		}
 		rm.trackers[inode] = tracker
 	}
 
@@ -172,8 +187,14 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 
 	if isSequential && offset > tracker.lastOffset {
 		tracker.sequentialHits++
+		tracker.sequentialBytes += int64(size)
+		tracker.wanSubreadRun = tracker.wanSubreadRun && size > 0 && size <= wanBulkSubreadMax
 	} else {
 		tracker.sequentialHits = 0
+		if ok {
+			tracker.sequentialBytes = int64(size)
+			tracker.wanSubreadRun = size > 0 && size <= wanBulkSubreadMax
+		}
 	}
 	tracker.lastOffset = offset
 
@@ -184,8 +205,18 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 		return
 	}
 
-	// Trigger readahead after the link-aware threshold of consecutive sequential reads
-	if tracker.sequentialHits >= policy.SeqThreshold {
+	// On WAN, a contiguous 1 MiB foreground run is itself a strong signal even
+	// when NFS's 256 KiB subdivision has not reached the historical hit count.
+	// Medium/Fast links retain the hit-count-only policy exactly.
+	strongWANRun := false
+	if rm.profile != nil && tracker.wanSubreadRun && tracker.sequentialBytes >= wanBulkSignalBytes {
+		class := rm.profile.Class()
+		strongWANRun = class == netprofile.ClassMetered || class == netprofile.ClassSlow
+	}
+
+	// Trigger readahead after the link-aware hit threshold or a bounded WAN
+	// bulk signal.
+	if tracker.sequentialHits >= policy.SeqThreshold || strongWANRun {
 		// S2 short-run guard (WAVE 1, RC-4): a SHORT sequential run on a WAN link
 		// is a Finder preview probe (a few 256KiB subreads of one file), not a
 		// real large sequential reel read. Escalating it to the policy's 64MB
@@ -195,7 +226,7 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 		// read still escalates once it grows past the threshold. This is a plain
 		// comparison on the already-tracked sequentialHits — NO new syscall.
 		// Disabled (threshold 0) on Fast/Medium, so 10GbE/GbE are unchanged.
-		if guard := smallPreviewRunBlocks(rm.profile); guard > 0 && tracker.sequentialHits < guard {
+		if guard := smallPreviewRunBlocks(rm.profile); !strongWANRun && guard > 0 && tracker.sequentialHits < guard {
 			metrics.Default().IncReadaheadSuppressed()
 			return
 		}

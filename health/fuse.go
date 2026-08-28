@@ -1449,8 +1449,12 @@ func runBoundedCommand(timeout time.Duration, name string, args ...string) {
 	}
 }
 
-// waitForMountProcess polls until the mount is live, the directly supervised
-// JuiceFS process exits, the manager stops, or the verification budget expires.
+// waitForMountProcess polls until the kernel mount and its exact directly
+// supervised JuiceFS process both exist, the process exits, the manager stops,
+// or the verification budget expires. Launch readiness deliberately uses the
+// backend-free steady probe: a root ReadDir can legitimately block behind a
+// high-latency object read, and using it here caused a healthy service to be
+// killed at the verification deadline during a LAN-to-cellular handoff.
 // A nil processExit preserves the old polling behavior for focused tests.
 func (fm *FUSEManager) waitForMountProcess(timeout time.Duration, processExit <-chan error) error {
 	deadline := time.Now().Add(timeout)
@@ -1463,7 +1467,7 @@ func (fm *FUSEManager) waitForMountProcess(timeout time.Duration, processExit <-
 			return fmt.Errorf("juicefs service exited before mount became ready: %w", err)
 		default:
 		}
-		if fm.isMountedLocked() {
+		if fm.isMountedSteadyLocked() {
 			return nil
 		}
 		// U5 review fix: with class-widened budgets (45s/90s) a failing

@@ -35,6 +35,22 @@ func TestSteadyFUSEHealthDoesNotTouchFUSEPaths(t *testing.T) {
 	}
 }
 
+// Launch verification has the same no-backend-I/O contract as periodic health.
+// A root ReadDir here used to sit behind a legitimate cellular object read until
+// the verification budget expired; Mount then killed the healthy JuiceFS
+// service and left Finder on a zombie FUSE session.
+func TestMountLaunchVerificationUsesSteadyProbe(t *testing.T) {
+	calls := functionCalls(t, "fuse.go", "waitForMountProcess")
+	for _, forbidden := range []string{"fm.isMountedLocked", "os.Stat", "os.Lstat", "os.ReadDir", "os.ReadFile"} {
+		if calls[forbidden] {
+			t.Fatalf("mount launch verification calls %s; this can block on backend I/O during a cellular handoff", forbidden)
+		}
+	}
+	if !calls["fm.isMountedSteadyLocked"] {
+		t.Fatal("mount launch verification no longer requires mount-table ownership plus the exact JuiceFS process")
+	}
+}
+
 func functionCalls(t *testing.T, filename, function string) map[string]bool {
 	t.Helper()
 	path := filepath.Join(".", filename)
