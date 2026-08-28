@@ -177,6 +177,7 @@
   };
 
   let authPromptDeclined = false;
+  let authRequestPromise = null;
 
   function updateAuthState(message) {
     const el = $('#auth-state');
@@ -186,6 +187,107 @@
   updateAuthState(state.adminKey
     ? 'Admin key stored · verification pending'
     : 'Authentication not yet verified');
+
+  function storeAdminKey(key) {
+    state.adminKey = key;
+    localStorage.setItem('jm-admin-key', key);
+    authPromptDeclined = false;
+    updateAuthState('Admin key stored · verification pending');
+  }
+
+  function clearAdminKey(key) {
+    // A newer key may have arrived from the shared dialog while this request
+    // was in flight. Never erase it in response to an older request's 401.
+    if (key !== undefined && state.adminKey !== key) return;
+    state.adminKey = '';
+    localStorage.removeItem('jm-admin-key');
+  }
+
+  // All concurrent 401 responses await one in-page dialog. Native modal
+  // prompts are unavailable in embedded browsers and can also multiply when Farm,
+  // Overview and Link poll at the same time. Cancelling suppresses background
+  // re-opening until the operator explicitly uses the footer recovery button.
+  function requestAdminKey({ message = '', force = false } = {}) {
+    if (authRequestPromise) return authRequestPromise;
+    if (authPromptDeclined && !force) return Promise.resolve(null);
+
+    const dialog = $('#auth-dialog');
+    const form = $('#auth-form');
+    const input = $('#auth-key-input');
+    const status = $('#auth-dialog-status');
+    const cancelButton = $('#auth-dialog-cancel');
+    if (!dialog || !form || !input || !status || !cancelButton || typeof dialog.showModal !== 'function') {
+      authPromptDeclined = true;
+      updateAuthState('Authentication required · use a supported browser');
+      return Promise.resolve(null);
+    }
+
+    authPromptDeclined = false;
+    status.textContent = message;
+    status.hidden = !message;
+    input.value = '';
+
+    authRequestPromise = new Promise((resolve) => {
+      let settled = false;
+
+      const cleanup = () => {
+        form.removeEventListener('submit', onSubmit);
+        cancelButton.removeEventListener('click', onCancel);
+        dialog.removeEventListener('cancel', onDialogCancel);
+        dialog.removeEventListener('close', onUnexpectedClose);
+      };
+      const finish = (key) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (dialog.open) dialog.close();
+        input.value = '';
+        authRequestPromise = null;
+        resolve(key);
+      };
+      const onSubmit = (event) => {
+        event.preventDefault();
+        const key = input.value.trim();
+        if (!key) {
+          status.textContent = 'Enter the admin key to continue.';
+          status.hidden = false;
+          input.focus();
+          return;
+        }
+        finish(key);
+      };
+      const onCancel = () => {
+        authPromptDeclined = true;
+        updateAuthState('Authentication required · key entry cancelled');
+        finish(null);
+      };
+      const onDialogCancel = (event) => {
+        event.preventDefault();
+        onCancel();
+      };
+      const onUnexpectedClose = () => {
+        if (!settled) onCancel();
+      };
+
+      form.addEventListener('submit', onSubmit);
+      cancelButton.addEventListener('click', onCancel);
+      dialog.addEventListener('cancel', onDialogCancel);
+      dialog.addEventListener('close', onUnexpectedClose);
+      // Defer opening until authRequestPromise has been assigned, so another
+      // 401 arriving in the same turn observes and reuses this request.
+      queueMicrotask(() => {
+        try {
+          if (!dialog.open) dialog.showModal();
+          input.focus();
+        } catch {
+          authPromptDeclined = true;
+          updateAuthState('Authentication required · dialog unavailable');
+          finish(null);
+        }
+      });
+    });
+    return authRequestPromise;
+  }
 
   // -------- Fetch helpers --------
   function authHeaders() {
@@ -230,27 +332,24 @@
         return api(method, path, body, true);
       }
       if (authRetry) {
-        if (state.adminKey === sentKey) {
-          state.adminKey = '';
-          localStorage.removeItem('jm-admin-key');
-        }
+        clearAdminKey(sentKey);
         authPromptDeclined = true;
-        updateAuthState('Admin key rejected');
+        updateAuthState('Admin key rejected · enter the correct key to retry');
         throw new Error('authentication failed');
       }
+      const rejectedStoredKey = Boolean(sentKey && state.adminKey === sentKey);
+      if (rejectedStoredKey) clearAdminKey(sentKey);
       // Background Farm/Overview polls often fail together. Once the user
-      // declines, suppress repeat prompts until reload instead of nagging on
-      // every interval tick.
+      // declines, suppress the dialog until they explicitly reopen it instead
+      // of nagging on every interval tick.
       if (authPromptDeclined) throw new Error('authentication required');
-      const key = prompt('X-JuiceMount-Admin-Key (will be saved locally):');
+      const key = await requestAdminKey({
+        message: rejectedStoredKey ? 'The saved admin key was rejected. Enter the current server key.' : '',
+      });
       if (key) {
-        state.adminKey = key;
-        localStorage.setItem('jm-admin-key', key);
-        authPromptDeclined = false;
-        updateAuthState('Admin key stored · verification pending');
+        storeAdminKey(key);
         return api(method, path, body, true); // retry once
       }
-      authPromptDeclined = true;
       throw new Error('authentication required');
     }
     if (!r.ok) {
@@ -3895,6 +3994,19 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
   }
 
   // -------- Boot --------
+  const authKeyButton = $('#auth-key-button');
+  if (authKeyButton) {
+    authKeyButton.addEventListener('click', async () => {
+      authPromptDeclined = false;
+      const key = await requestAdminKey({ force: true });
+      if (!key) return;
+      storeAdminKey(key);
+      // Re-run every lazy initializer cleanly after an explicit key change.
+      // This also clears any visible initialization errors from the old key.
+      location.reload();
+    });
+  }
+
   // Keep this after every top-level `let`/`const` initializer. A deep link such
   // as #/farm immediately calls the tab's lazy initializer; booting earlier
   // would hit the temporal dead zone for state declared later in this file.

@@ -56,6 +56,11 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 		`id="farm-jobs-more"`,
 		`id="farm-jobs-collapse"`,
 		`Authentication not yet verified`,
+		`id="auth-dialog"`,
+		`aria-labelledby="auth-dialog-title"`,
+		`id="auth-key-input"`,
+		`id="auth-dialog-status" class="auth-dialog-status" role="alert"`,
+		`id="auth-key-button"`,
 	} {
 		if !strings.Contains(index, marker) {
 			t.Errorf("Manager RC markup lost truthful/progressive UI marker %q", marker)
@@ -73,6 +78,9 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 	for _, marker := range []string{
 		"const FARM_JOBS_PAGE_SIZE = 12",
 		"authPromptDeclined",
+		"authRequestPromise",
+		"function requestAdminKey",
+		"if (authRequestPromise) return authRequestPromise",
 		"Admin key verified",
 		"Authentication disabled",
 		"CPU H.264 fallback",
@@ -88,6 +96,9 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 			t.Errorf("Manager client lost truthful/progressive behavior %q", marker)
 		}
 	}
+	if strings.Contains(app, "prompt(") {
+		t.Fatal("Manager client must use the accessible in-page auth dialog, not prompt()")
+	}
 
 	cssRaw, err := staticFS.ReadFile("static/style.css")
 	if err != nil {
@@ -96,6 +107,8 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 	css := string(cssRaw)
 	for _, marker := range []string{
 		"min-height: 2.75rem",
+		".auth-dialog::backdrop",
+		".auth-dialog-actions button[type=\"submit\"]",
 		".farm-job-chip.partial",
 		".farm-job-count.fallback",
 		".farm-job-notice",

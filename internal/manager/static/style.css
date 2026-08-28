@@ -1471,6 +1471,80 @@ footer {
 footer a { color: var(--accent-text); text-decoration: none; }
 footer a:hover { text-decoration: underline; }
 
+.auth-key-button {
+  min-height: 0;
+  margin: 0 0.35rem;
+  padding: 0.12rem 0.35rem;
+  color: var(--accent-text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom-color: currentColor;
+  border-radius: 2px;
+  font-size: inherit;
+  cursor: pointer;
+}
+.auth-key-button:hover { background: var(--accent-bg); border-color: var(--accent-text); }
+
+.auth-dialog {
+  width: min(30rem, calc(100vw - 2rem));
+  max-width: none;
+  padding: 0;
+  color: var(--text);
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+}
+.auth-dialog::backdrop {
+  background: color-mix(in srgb, var(--pulp-ink) 68%, transparent);
+  backdrop-filter: blur(4px);
+}
+.auth-dialog-card { padding: clamp(1.25rem, 4vw, 2rem); }
+.auth-dialog-card h2 {
+  margin: 0.2rem 0 0.65rem;
+  font-family: var(--font-display);
+  font-size: clamp(1.65rem, 5vw, 2.25rem);
+  line-height: 1.08;
+  letter-spacing: -0.04em;
+}
+.auth-dialog-description { margin: 0 0 1.25rem; color: var(--text-muted); }
+.auth-dialog-field { display: grid; gap: 0.4rem; }
+.auth-dialog-field input {
+  width: 100%;
+  padding: 0.62rem 0.7rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--control-border);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+}
+.auth-dialog-status {
+  margin: 0.75rem 0 0;
+  color: var(--danger);
+  font-size: 0.86rem;
+}
+.auth-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 1.25rem;
+}
+.auth-dialog-actions button {
+  padding: 0.48rem 0.9rem;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--control-border);
+  border-radius: 2px;
+  cursor: pointer;
+}
+.auth-dialog-actions button[type="submit"] {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 700;
+}
+.auth-dialog-actions button:hover { filter: brightness(1.06); }
+
 /* Farm tab (Phase 1) — education UI. Reuses the .overview-card / .overview-grid
    vocabulary so the Farm pane reads like the rest of the dark dashboard. The
    pieces below add: a dismissible explainer, plain-English sweep + coverage,

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>JuiceMount Manager</title>
-  <link rel="stylesheet" href="style.css?v=0.5.0-rc3">
+  <link rel="stylesheet" href="style.css?v=0.5.0-rc4">
 </head>
 <body>
   <header class="app-header">
@@ -1101,13 +1101,33 @@
     </main>
   </div>
 
+  <dialog id="auth-dialog" class="auth-dialog" aria-labelledby="auth-dialog-title" aria-describedby="auth-dialog-description">
+    <form id="auth-form" class="auth-dialog-card" method="dialog">
+      <p class="section-kicker">Secure administration</p>
+      <h2 id="auth-dialog-title">Connect to this Manager</h2>
+      <p id="auth-dialog-description" class="auth-dialog-description">
+        Enter the admin key configured on this JuiceMount server. It is saved only in this browser's local storage.
+      </p>
+      <label class="field auth-dialog-field" for="auth-key-input">
+        <span>Admin key</span>
+        <input id="auth-key-input" name="admin-key" type="password" autocomplete="off" spellcheck="false" required>
+      </label>
+      <p id="auth-dialog-status" class="auth-dialog-status" role="alert" aria-live="assertive" hidden></p>
+      <div class="auth-dialog-actions">
+        <button id="auth-dialog-cancel" type="button">Cancel</button>
+        <button id="auth-dialog-connect" type="submit">Connect</button>
+      </div>
+    </form>
+  </dialog>
+
   <footer>
     <small>
-      <span id="auth-state">Authentication not yet verified</span> ·
+      <span id="auth-state" aria-live="polite">Authentication not yet verified</span>
+      <button id="auth-key-button" class="auth-key-button" type="button">Enter or change admin key</button> ·
       <a href="https://github.com/lelanddutcher/juicemount" rel="noopener">github.com/lelanddutcher/juicemount</a>
     </small>
   </footer>
 
-  <script src="app.js?v=0.5.0-rc1"></script>
+  <script src="app.js?v=0.5.0-rc2"></script>
 </body>
 </html>
