@@ -93,10 +93,19 @@ const (
 
 // Kinds the worker understands. "all" expands to the full pipeline.
 const (
-	KindDerivatives = "derivatives" // tech + thumbnail/poster + filmstrip + waveform (the cheap passes)
+	KindDerivatives = "derivatives" // public composite; planner splits metadata from video previews
 	KindProxy       = "proxy"       // faststart playback proxy (HEVC-first GPU, H.264 fallback)
 	KindTranscript  = "transcript"  // whisper.cpp speech-to-text
 	KindAll         = "all"
+)
+
+// DerivativePass splits the historical composite "derivatives" kind at the
+// scheduling boundary without changing the Manager/watch wire vocabulary.
+// Empty marks the composite planning request, including legacy queued work;
+// workers never execute that shape directly.
+const (
+	DerivativePassMetadata = "metadata" // tech probe + audio waveform on the server
+	DerivativePassPreviews = "previews" // poster + filmstrip on a verified video decoder
 )
 
 // AllKinds returns the dedicated job kinds supported by this worker protocol.
@@ -195,6 +204,18 @@ type Job struct {
 	// a GPU from spending an hour walking a directory before it can accelerate a
 	// single file.
 	PlanOnly bool `json:"plan_only,omitempty"`
+	// DerivativePass is set only on bounded children emitted by the server
+	// planner. Keeping Kinds=["derivatives"] preserves API compatibility while
+	// preventing a metadata-capable server from silently full-decoding video.
+	DerivativePass string `json:"derivative_pass,omitempty"`
+	// SourceVideoCodec/SourceBitDepth carry the server's live ffprobe result into
+	// a bounded preview child. They let recovery reroute the child to another
+	// verified decoder family without rescanning a directory.
+	SourceVideoCodec string `json:"source_video_codec,omitempty"`
+	SourceBitDepth   int    `json:"source_bit_depth,omitempty"`
+	// RoutingReason makes an intentional CPU decode fallback inspectable in the
+	// same Recent Jobs error/note surface used by retry recovery.
+	RoutingReason string `json:"routing_reason,omitempty"`
 	// RetryTargets is worker-authored after a partially successful batch. It
 	// narrows the next hardware retry or CPU fallback to the exact files that
 	// failed, so a directory-shaped job can never recompute successful GPU
@@ -205,23 +226,24 @@ type Job struct {
 // JobStatus is the worker-maintained record a producer reads back. Stored as a
 // flat Redis HASH (all string fields) so HGETALL round-trips without a codec.
 type JobStatus struct {
-	ID           string `json:"id"`
-	Status       string `json:"status"` // queued|running|dispatched|done|failed
-	Path         string `json:"path"`
-	Kinds        string `json:"kinds"` // comma-joined for display
-	Producer     string `json:"producer"`
-	EnqueuedAt   string `json:"enqueued_at"`
-	StartedAt    string `json:"started_at,omitempty"`
-	FinishedAt   string `json:"finished_at,omitempty"`
-	Processed    int    `json:"processed"`
-	Failed       int    `json:"failed"`
-	Error        string `json:"error,omitempty"`
-	Worker       string `json:"worker,omitempty"`
-	TargetWorker string `json:"target_worker,omitempty"`
-	Backend      string `json:"backend,omitempty"`
-	QueueClass   string `json:"queue_class,omitempty"`
-	Attempts     int    `json:"attempts"`
-	ParentID     string `json:"parent_id,omitempty"`
+	ID             string `json:"id"`
+	Status         string `json:"status"` // queued|running|dispatched|done|failed
+	Path           string `json:"path"`
+	Kinds          string `json:"kinds"` // comma-joined for display
+	Producer       string `json:"producer"`
+	EnqueuedAt     string `json:"enqueued_at"`
+	StartedAt      string `json:"started_at,omitempty"`
+	FinishedAt     string `json:"finished_at,omitempty"`
+	Processed      int    `json:"processed"`
+	Failed         int    `json:"failed"`
+	Error          string `json:"error,omitempty"`
+	Worker         string `json:"worker,omitempty"`
+	TargetWorker   string `json:"target_worker,omitempty"`
+	Backend        string `json:"backend,omitempty"`
+	QueueClass     string `json:"queue_class,omitempty"`
+	Attempts       int    `json:"attempts"`
+	ParentID       string `json:"parent_id,omitempty"`
+	DerivativePass string `json:"derivative_pass,omitempty"`
 }
 
 // WorkerBenchmarks records observed rather than advertised capability. Startup
@@ -601,6 +623,9 @@ func (s JobStatus) toMap() map[string]any {
 		"processed": strconv.Itoa(s.Processed), "failed": strconv.Itoa(s.Failed),
 		"attempts": strconv.Itoa(s.Attempts),
 	}
+	if s.DerivativePass != "" {
+		m["derivative_pass"] = s.DerivativePass
+	}
 	if s.StartedAt != "" {
 		m["started_at"] = s.StartedAt
 	}
@@ -635,6 +660,6 @@ func jobStatusFromMap(m map[string]string) JobStatus {
 		Producer: m["producer"], EnqueuedAt: m["enqueued_at"],
 		StartedAt: m["started_at"], FinishedAt: m["finished_at"],
 		Processed: atoi(m["processed"]), Failed: atoi(m["failed"]), Error: m["error"],
-		Worker: m["worker"], TargetWorker: m["target_worker"], Backend: m["backend"], QueueClass: m["queue_class"], Attempts: atoi(m["attempts"]), ParentID: m["parent_id"],
+		Worker: m["worker"], TargetWorker: m["target_worker"], Backend: m["backend"], QueueClass: m["queue_class"], Attempts: atoi(m["attempts"]), ParentID: m["parent_id"], DerivativePass: m["derivative_pass"],
 	}
 }

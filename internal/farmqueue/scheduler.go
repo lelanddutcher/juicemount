@@ -19,8 +19,8 @@ func classQueue(kind, class string) string {
 }
 
 // RouteInitialJob separates recursive discovery from accelerated execution.
-// A fresh proxy/transcript request has not yet proven whether Path is one file
-// or a directory containing thousands, so it first goes to the server's
+// A fresh derivative/proxy/transcript request has not yet proven whether Path
+// is one file or a directory containing thousands, so it first goes to the server's
 // metadata lane. Bounded children (ShardCount > 0), exact retry subsets, and
 // explicit fallback jobs bypass this planner and are routed for execution.
 func (c *Client) RouteInitialJob(ctx context.Context, j *Job) {
@@ -42,7 +42,10 @@ func shouldPlanOnServer(j Job) bool {
 	if len(j.Kinds) != 1 || j.ShardCount > 0 || len(j.RetryTargets) > 0 {
 		return false
 	}
-	return j.Kinds[0] == KindProxy || j.Kinds[0] == KindTranscript
+	if j.Kinds[0] == KindDerivatives && j.DerivativePass != "" {
+		return false
+	}
+	return j.Kinds[0] == KindDerivatives || j.Kinds[0] == KindProxy || j.Kinds[0] == KindTranscript
 }
 
 // RouteJob selects a concrete execution lane from verified live worker
@@ -52,17 +55,67 @@ func (c *Client) RouteJob(ctx context.Context, j *Job) {
 	if j == nil || len(j.Kinds) != 1 {
 		return
 	}
-	kind := j.Kinds[0]
+	route, err := c.SnapshotRouter(ctx)
+	if err != nil {
+		// Direct legacy callers cannot return a routing error. Keep their old
+		// explicit CPU behavior, but make the uncertainty visible. Server planner
+		// paths use SnapshotRouter directly and retry instead of mass-demoting.
+		routeJobWithWorkers(j, nil, nil)
+		j.RoutingReason = "worker discovery unavailable while routing: " + err.Error()
+		return
+	}
+	route(j)
+}
+
+// SnapshotRouter reads live worker profiles and queued load once, then returns
+// a plan-local router. Directory planning may create thousands of one-file
+// children; re-reading Redis for every source would make the metadata lane the
+// bottleneck. The closure increments its private load estimate after each
+// assignment so measured batching still spreads work across eligible nodes.
+func (c *Client) SnapshotRouter(ctx context.Context) (func(*Job), error) {
 	workers, err := c.ActiveWorkers(ctx)
 	if err != nil {
-		workers = nil
+		return nil, err
 	}
 	loads := c.queuedWorkerLoads(ctx, workers)
+	return func(j *Job) {
+		if j == nil || len(j.Kinds) != 1 {
+			return
+		}
+		routeJobWithWorkers(j, workers, loads)
+		for _, capability := range j.RequiredCapabilities {
+			if id, ok := strings.CutPrefix(capability, "worker:"); ok && id != "" {
+				loads[id]++
+				break
+			}
+		}
+	}, nil
+}
 
+func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
+	kind := j.Kinds[0]
 	switch kind {
 	case KindDerivatives:
+		if j.DerivativePass == DerivativePassPreviews {
+			if selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, j.SourceVideoCodec, loads); ok {
+				j.QueueClass = QueueClassRender
+				j.SelectedBackend = decoder
+				j.SelectedWorker = workerDisplayName(selected)
+				j.RequiredCapabilities = []string{"decoder:" + decoder, "worker:" + selected.ID}
+				j.RoutingReason = ""
+				return
+			}
+			j.QueueClass = QueueClassCPU
+			j.SelectedBackend = "cpu-decode"
+			j.SelectedWorker = ""
+			j.RequiredCapabilities = []string{"cpu"}
+			if j.RoutingReason == "" {
+				j.RoutingReason = "no verified hardware decoder is online for " + displayCodec(j.SourceVideoCodec)
+			}
+			return
+		}
 		j.QueueClass = QueueClassServer
-		j.SelectedBackend = "server-cpu"
+		j.SelectedBackend = "server-metadata"
 		j.RequiredCapabilities = []string{"metadata"}
 	case KindProxy:
 		if selected, enc, ok := preferredHardwareWorkerWithLoad(workers, loads); ok {
@@ -91,6 +144,44 @@ func (c *Client) RouteJob(ctx context.Context, j *Job) {
 		j.SelectedWorker = ""
 		j.RequiredCapabilities = []string{"cpu"}
 	}
+}
+
+func preferredHardwareDecoderWorkerWithLoad(workers []Worker, codec string, loads map[string]int) (Worker, string, bool) {
+	codec = strings.ToLower(strings.TrimSpace(codec))
+	if codec != "h264" && codec != "hevc" {
+		return Worker{}, "", false
+	}
+	type candidate struct {
+		worker  Worker
+		decoder string
+		cost    float64
+	}
+	var candidates []candidate
+	for _, w := range workers {
+		if w.Role != QueueClassRender {
+			continue
+		}
+		for _, decoder := range w.Decoders {
+			if strings.HasPrefix(decoder, codec+"_") {
+				candidates = append(candidates, candidate{
+					worker: w, decoder: decoder,
+					cost: workerQueueCost(w, KindDerivatives, loads[w.ID]),
+				})
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return Worker{}, "", false
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].cost < candidates[j].cost })
+	return candidates[0].worker, candidates[0].decoder, true
+}
+
+func displayCodec(codec string) string {
+	if codec = strings.TrimSpace(codec); codec != "" {
+		return codec
+	}
+	return "this source codec"
 }
 
 func preferredHardwareWorker(workers []Worker) (Worker, string, bool) {
@@ -206,6 +297,13 @@ func workerQueueCost(w Worker, kind string, queued int) float64 {
 			}
 			seconds = 60 / rate // one reference minute of source audio
 		}
+	case KindDerivatives:
+		throughput := w.Benchmarks.DecodeFPS
+		if throughput <= 0 {
+			throughput = 1
+		}
+		// A 300-frame reference strip turns measured decoder FPS into time.
+		seconds = 300 / throughput
 	default:
 		seconds = w.Benchmarks.LastJobSeconds
 		if seconds <= 0 {
@@ -266,6 +364,7 @@ func positiveMax(values ...float64) float64 {
 func (c *Client) queuedWorkerLoads(ctx context.Context, workers []Worker) map[string]int {
 	loads := make(map[string]int, len(workers))
 	for _, key := range []string{
+		classQueue(KindDerivatives, QueueClassRender),
 		classQueue(KindProxy, QueueClassRender),
 		classQueue(KindTranscript, QueueClassRender),
 	} {
@@ -310,11 +409,15 @@ func WorkerQueueKeys(w Worker) []string {
 	case QueueClassServer:
 		keys = append(keys,
 			classQueue(KindDerivatives, QueueClassServer),
+			classQueue(KindDerivatives, QueueClassCPU),
 			classQueue(KindProxy, QueueClassServer),
 			classQueue(KindTranscript, QueueClassServer),
 			classQueue(KindProxy, QueueClassCPU),
 			classQueue(KindTranscript, QueueClassCPU))
 	case QueueClassRender:
+		if len(w.Decoders) > 0 {
+			keys = append(keys, classQueue(KindDerivatives, QueueClassRender))
+		}
 		if len(w.Encoders) > 0 {
 			keys = append(keys, classQueue(KindProxy, QueueClassRender))
 		}
@@ -344,6 +447,9 @@ func workerCapabilitySet(w Worker) map[string]bool {
 	}
 	for _, enc := range w.Encoders {
 		set["encoder:"+enc] = true
+	}
+	for _, decoder := range w.Decoders {
+		set["decoder:"+decoder] = true
 	}
 	for _, backend := range w.TranscriptBackends {
 		set["transcript:"+backend] = true

@@ -1,6 +1,7 @@
 package farm
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -116,5 +117,43 @@ printf 'fast-jpeg' > "$out"
 	}
 	if !strings.Contains(lines[0], "-discard nokey") {
 		t.Fatalf("fast path lost keyframe optimization: %q", lines[0])
+	}
+}
+
+func TestFilmstripHardwareFallbackNeverDropsDecoder(t *testing.T) {
+	dir := t.TempDir()
+	ffmpeg := filepath.Join(dir, "fake-ffmpeg")
+	logPath := filepath.Join(dir, "calls.log")
+	t.Setenv("JM_FILMSTRIP_TEST_LOG", logPath)
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$JM_FILMSTRIP_TEST_LOG"
+out=""
+for arg in "$@"; do out="$arg"; done
+case " $* " in
+  *" -discard nokey "*) : > "$out"; exit 0 ;;
+esac
+printf 'hardware-jpeg' > "$out"
+`
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outPath := filepath.Join(dir, "strip.jpg")
+	if _, err := FilmstripDecodeContext(context.Background(), ffmpeg, "hevc_vaapi", 10,
+		filepath.Join(dir, "main10.mp4"), outPath, 60_000, 1920, 1080, 320, 30); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("calls=%d, want sparse + full decode: %q", len(lines), raw)
+	}
+	for i, line := range lines {
+		if !strings.Contains(line, "-hwaccel vaapi") || !strings.Contains(line, "-hwaccel_output_format vaapi") ||
+			!strings.Contains(line, "hwdownload,format=p010le") {
+			t.Fatalf("pass %d silently left hardware decode: %q", i+1, line)
+		}
 	}
 }

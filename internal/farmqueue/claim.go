@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -100,7 +101,7 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 		return workers[i].Benchmarks.EncodeFPS > workers[j].Benchmarks.EncodeFPS
 	})
 	recovered := 0
-	for _, kind := range []string{KindProxy, KindTranscript} {
+	for _, kind := range []string{KindDerivatives, KindProxy, KindTranscript} {
 		key := classQueue(kind, QueueClassRender)
 		raws, err := c.rdb.LRange(ctx, key, 0, -1).Result()
 		if err != nil {
@@ -124,7 +125,22 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 			job.Attempts++
 			targetClass := QueueClassCPU
 			reason := "render capability went offline before claim; queued CPU fallback"
-			if kind == KindProxy {
+			if kind == KindDerivatives && job.DerivativePass == DerivativePassPreviews {
+				if _, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, job.SourceVideoCodec, nil); ok {
+					targetClass = QueueClassRender
+					job.QueueClass = QueueClassRender
+					job.SelectedBackend = decoder
+					job.SelectedWorker = ""
+					job.RequiredCapabilities = []string{"decoder:" + decoder}
+					reason = "selected decoder went offline; re-routed to active verified hardware"
+				} else {
+					job.QueueClass = QueueClassCPU
+					job.RequiredCapabilities = []string{"cpu"}
+					job.SelectedBackend = "cpu-decode"
+					job.SelectedWorker = ""
+					reason = "verified video decoder went offline before claim; queued explicit CPU decode fallback"
+				}
+			} else if kind == KindProxy {
 				if selected, encoder, ok := preferredHardwareWorker(workers); ok {
 					targetClass = QueueClassRender
 					job.QueueClass = QueueClassRender
@@ -231,6 +247,8 @@ func (c *Client) RequeueClaim(ctx context.Context, claim Claim, fallbackCPU bool
 			job.SelectedBackend = "libx264"
 		case len(job.Kinds) == 1 && job.Kinds[0] == KindTranscript:
 			job.SelectedBackend = "cpu"
+		case len(job.Kinds) == 1 && job.Kinds[0] == KindDerivatives && job.DerivativePass == DerivativePassPreviews:
+			job.SelectedBackend = "cpu-decode"
 		}
 	} else {
 		job.QueueClass = ""
@@ -238,6 +256,17 @@ func (c *Client) RequeueClaim(ctx context.Context, claim Claim, fallbackCPU bool
 		job.SelectedBackend = ""
 		job.SelectedWorker = ""
 		c.RouteInitialJob(ctx, &job)
+		if len(job.Kinds) == 1 && job.Kinds[0] == KindDerivatives &&
+			job.DerivativePass == DerivativePassPreviews && job.QueueClass == QueueClassRender {
+			job.SelectedWorker = ""
+			caps := job.RequiredCapabilities[:0]
+			for _, capability := range job.RequiredCapabilities {
+				if !strings.HasPrefix(capability, "worker:") {
+					caps = append(caps, capability)
+				}
+			}
+			job.RequiredCapabilities = caps
+		}
 	}
 	return c.requeueClaimAs(ctx, claim, job, reason)
 }

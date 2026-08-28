@@ -30,8 +30,13 @@ type Options struct {
 	WaveformSPP   int    // waveform samples-per-pixel; 0 → 1024
 	FFprobeBin    string // override; "" → "ffprobe" on PATH
 	FFmpegBin     string // override; "" → "ffmpeg" on PATH
-	WhisperBin    string // whisper.cpp CLI; "" → "whisper-cli" on PATH (transcripts)
-	WhisperModel  string // path to a ggml whisper model (required for transcripts)
+	// VideoDecoder is a worker-admitted hardware decoder such as h264_vaapi.
+	// Empty means the explicit CPU path. A non-empty value is never silently
+	// removed after ffmpeg failure; the queue owns any visible CPU fallback.
+	VideoDecoder        string
+	VideoDecodeBitDepth int
+	WhisperBin          string // whisper.cpp CLI; "" → "whisper-cli" on PATH (transcripts)
+	WhisperModel        string // path to a ggml whisper model (required for transcripts)
 	// TranscriptDevice selects whisper.cpp's compute backend ("" / "cpu" =
 	// default CPU; "vulkan"/"cuda"/"sycl" → compiled backend, GPU device 0). A property
 	// of the WORKER hardware, set via JM_FARM_TRANSCRIPT_DEVICE or farm config.
@@ -485,7 +490,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		staged, out, stErr := stageUnder(derivDir, rel)
 		err := stErr
 		if err == nil {
-			if err = ThumbnailContext(ctx, opt.FFmpegBin, path, out, opt.ThumbMaxDim, tech.DurationMS); err == nil {
+			if err = ThumbnailDecodeContext(ctx, opt.FFmpegBin, opt.VideoDecoder, opt.VideoDecodeBitDepth, path, out, opt.ThumbMaxDim, tech.DurationMS); err == nil {
 				err = commitStaged(derivDir, staged, rel)
 			}
 		}
@@ -517,7 +522,7 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 		var geo *derivatives.FilmstripGeo
 		err := stErr
 		if err == nil {
-			if geo, err = FilmstripContext(ctx, opt.FFmpegBin, path, out, tech.DurationMS, tech.Video.Width, tech.Video.Height, opt.FilmstripCell, tech.Video.FPS); err == nil {
+			if geo, err = FilmstripDecodeContext(ctx, opt.FFmpegBin, opt.VideoDecoder, opt.VideoDecodeBitDepth, path, out, tech.DurationMS, tech.Video.Width, tech.Video.Height, opt.FilmstripCell, tech.Video.FPS); err == nil {
 				err = commitStaged(derivDir, staged, rel)
 			}
 		}

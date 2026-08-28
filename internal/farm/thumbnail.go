@@ -22,6 +22,13 @@ func Thumbnail(ffmpegBin, srcPath, outPath string, maxDim int, durationMS int64)
 }
 
 func ThumbnailContext(ctx context.Context, ffmpegBin, srcPath, outPath string, maxDim int, durationMS int64) error {
+	return ThumbnailDecodeContext(ctx, ffmpegBin, "", 0, srcPath, outPath, maxDim, durationMS)
+}
+
+// ThumbnailDecodeContext uses decoder when the queue admitted a verified
+// hardware path. It never retries without those input arguments; the caller
+// must publish any CPU fallback as a separate, visible queue transition.
+func ThumbnailDecodeContext(ctx context.Context, ffmpegBin, decoder string, bitDepth int, srcPath, outPath string, maxDim int, durationMS int64) error {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -43,8 +50,13 @@ func ThumbnailContext(ctx context.Context, ffmpegBin, srcPath, outPath string, m
 	// the volume. Reader visibility is unaffected: the staged name is dot-
 	// prefixed and is never the blob's real name, so a reader only ever sees the
 	// final name appear atomically at the caller's renameat.
-	scale := fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=decrease", maxDim, maxDim)
+	decodeArgs, filterPrefix, err := videoDecodePlan(decoder, bitDepth)
+	if err != nil {
+		return fmt.Errorf("thumbnail decode admission: %w", err)
+	}
+	scale := filterPrefix + fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=decrease", maxDim, maxDim)
 	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
+	args = append(args, decodeArgs...)
 	if durationMS > 0 {
 		// Input-seek (before -i): fast index seek, decodes only the target
 		// keyframe. Seek to 10% in (skips leaders/slates).

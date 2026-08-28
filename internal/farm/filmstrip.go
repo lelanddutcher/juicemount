@@ -55,6 +55,13 @@ func Filmstrip(ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH,
 }
 
 func FilmstripContext(ctx context.Context, ffmpegBin, srcPath, outPath string, durationMS int64, srcW, srcH, cellW int, srcFPS float64) (*derivatives.FilmstripGeo, error) {
+	return FilmstripDecodeContext(ctx, ffmpegBin, "", 0, srcPath, outPath, durationMS, srcW, srcH, cellW, srcFPS)
+}
+
+// FilmstripDecodeContext keeps an admitted decoder on both the sparse-keyframe
+// pass and the full-decode retry. Falling back from hardware to CPU inside this
+// function would make the Manager's worker/backend status untruthful.
+func FilmstripDecodeContext(ctx context.Context, ffmpegBin, decoder string, bitDepth int, srcPath, outPath string, durationMS int64, srcW, srcH, cellW int, srcFPS float64) (*derivatives.FilmstripGeo, error) {
 	if ffmpegBin == "" {
 		ffmpegBin = "ffmpeg"
 	}
@@ -112,7 +119,11 @@ func FilmstripContext(ctx context.Context, ffmpegBin, srcPath, outPath string, d
 	// the volume. Reader visibility is unaffected: the staged name is dot-
 	// prefixed and is never the blob's real name, so a reader only ever sees the
 	// final name appear atomically at the caller's renameat.
-	vf := fmt.Sprintf("fps=%.6f,scale=%d:%d,tile=%dx%d", fps, cellW, cellH, cols, rows)
+	decodeArgs, filterPrefix, decodeErr := videoDecodePlan(decoder, bitDepth)
+	if decodeErr != nil {
+		return nil, fmt.Errorf("filmstrip decode admission: %w", decodeErr)
+	}
+	vf := filterPrefix + fmt.Sprintf("fps=%.6f,scale=%d:%d,tile=%dx%d", fps, cellW, cellH, cols, rows)
 	// -skip_frame nokey (THE farm-throughput fix, 2026-07-14): the fps= filter
 	// sits DOWNSTREAM of the decoder, so without this ffmpeg fully reconstructs
 	// every frame (a 5-min 25fps proxy = ~7,500 frames) just to keep 144 — the
@@ -126,6 +137,7 @@ func FilmstripContext(ctx context.Context, ffmpegBin, srcPath, outPath string, d
 	// Live-benchmarked 9-16× faster with byte-identical sprite dimensions.
 	// -an: never demux/decode the audio track for a video-only sprite.
 	args := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
+	args = append(args, decodeArgs...)
 	args = append(args, "-discard", "nokey", "-an", "-i", srcPath,
 		"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", outPath)
 	fastOut, fastErr := runFilmstripPassContext(ctx, ffmpegBin, args, outPath)
@@ -141,6 +153,7 @@ func FilmstripContext(ctx context.Context, ffmpegBin, srcPath, outPath string, d
 		// result. The output path is the caller's already-anchored staged file, and
 		// ffmpeg -y safely replaces the failed pass in place.
 		fallbackArgs := append([]string{"-y", "-loglevel", "error"}, ffmpegThreadArgs()...)
+		fallbackArgs = append(fallbackArgs, decodeArgs...)
 		fallbackArgs = append(fallbackArgs, "-an", "-i", srcPath,
 			"-vf", vf, "-frames:v", "1", "-q:v", "4", "-f", "image2", outPath)
 		fallbackOut, fallbackErr := runFilmstripPassContext(ctx, ffmpegBin, fallbackArgs, outPath)

@@ -1104,9 +1104,10 @@ func runQueue(cfg queueConfig) {
 }
 
 var (
-	errJobDispatched    = errors.New("job dispatched into bounded target shards")
-	errJobDispatchRetry = errors.New("job target dispatch needs same-route retry")
-	errRenderExecution  = errors.New("verified render execution failed")
+	errJobDispatched      = errors.New("job dispatched into bounded target shards")
+	errJobDispatchRetry   = errors.New("job target dispatch needs same-route retry")
+	errRenderExecution    = errors.New("verified render execution failed")
+	errRenderIncompatible = errors.New("source cannot stay on the verified hardware decoder")
 )
 
 func workerRunsDiscovery(worker farmqueue.Worker) bool {
@@ -1212,6 +1213,15 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 			job.ID, job.Path)
 		return 0, 0, nil, nil
 	}
+	if shouldDispatchDerivativePlan(job) {
+		children, created, planErr := dispatchDerivativePlan(ctx, q, store, job, targets)
+		if planErr != nil {
+			return 0, 0, nil, fmt.Errorf("%w: publish derivative execution plan: %v", errJobDispatchRetry, planErr)
+		}
+		fmt.Printf("jmfarm queue: job %s released composite derivatives into %d bounded child job(s), %d newly queued\n",
+			job.ID, children, created)
+		return 0, 0, nil, errJobDispatched
+	}
 	if shardSize := targetShardSize(job); q != nil && shardSize > 0 && (job.PlanOnly || len(targets) > shardSize) {
 		children, created, splitErr := q.EnqueueTargetShards(ctx, job, targets, shardSize)
 		if splitErr != nil {
@@ -1249,6 +1259,22 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 			// The CPU child owns every source. Completing this render parent frees
 			// the accelerator immediately and leaves an inspectable split record.
 			return 0, 0, nil, nil
+		}
+	}
+	liveDecodeBitDepth := job.SourceBitDepth
+	if len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindDerivatives &&
+		job.DerivativePass == farmqueue.DerivativePassPreviews && worker.Role == farmqueue.QueueClassRender {
+		for _, target := range targets {
+			track, probeErr := probeRenderVideoTrack(target)
+			if probeErr != nil {
+				return 0, 1, []string{target}, fmt.Errorf("%w: live preview probe failed: %v", errRenderIncompatible, probeErr)
+			}
+			if reason := unsupportedHardwareDecodeReason(worker, job.SelectedBackend, track); reason != "" {
+				return 0, 1, []string{target}, fmt.Errorf("%w: %s", errRenderIncompatible, reason)
+			}
+			if track != nil {
+				liveDecodeBitDepth = track.BitDepth
+			}
 		}
 	}
 
@@ -1304,6 +1330,22 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 		PosterAlways:           cfg.postAlways,
 		QLMaxDim:               cfg.qlMaxDim, QLSeconds: cfg.qlSecs,
 	}
+	if len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindDerivatives {
+		switch job.DerivativePass {
+		case farmqueue.DerivativePassMetadata:
+			base.Blobs = false
+			base.Filmstrip = false
+			base.Waveform = true
+		case farmqueue.DerivativePassPreviews:
+			base.Blobs = true
+			base.Filmstrip = true
+			base.Waveform = false
+			if worker.Role == farmqueue.QueueClassRender {
+				base.VideoDecoder = job.SelectedBackend
+				base.VideoDecodeBitDepth = liveDecodeBitDepth
+			}
+		}
+	}
 
 	fmt.Printf("jmfarm queue: job %s path=%q kinds=%v files=%d\n",
 		job.ID, job.Path, job.Kinds, len(targets))
@@ -1339,9 +1381,14 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 	return processed, failed, nil, nil
 }
 
+func shouldDispatchDerivativePlan(job farmqueue.Job) bool {
+	return len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindDerivatives && job.DerivativePass == ""
+}
+
 // targetShardSize caps one durable lease while preserving each worker's useful
 // in-process parallelism. Proxy/transcript work is latency-heavy and gets small
-// shards; cheap server derivatives amortize queue overhead across a larger set.
+// shards. The derivative size remains only for migration of composite legacy
+// jobs; current derivative planning owns metadata and previews separately.
 // A child carries ShardCount and is never split recursively.
 func targetShardSize(job farmqueue.Job) int {
 	if job.ShardCount > 0 || len(job.Kinds) != 1 {
@@ -1387,7 +1434,13 @@ const renderHardwareRetries = 1
 // freshness gate, so retrying a partially successful batch only recomputes the
 // files that did not publish a valid proxy.
 func renderFailureDisposition(worker farmqueue.Worker, job farmqueue.Job, runErr error) (requeue, fallbackCPU bool, reason string) {
-	if worker.Role != farmqueue.QueueClassRender || !errors.Is(runErr, errRenderExecution) {
+	if worker.Role != farmqueue.QueueClassRender {
+		return false, false, ""
+	}
+	if errors.Is(runErr, errRenderIncompatible) {
+		return true, true, fmt.Sprintf("live source admission rejected the selected hardware decoder; queued explicit CPU decode fallback: %v", runErr)
+	}
+	if !errors.Is(runErr, errRenderExecution) {
 		return false, false, ""
 	}
 	if job.Attempts < renderHardwareRetries {

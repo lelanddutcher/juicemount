@@ -4,11 +4,42 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// EnqueuePlannedChildren atomically publishes a server planner's complete set
+// of bounded execution children. Child IDs must be deterministic: if the
+// planner's durable claim is replayed after a crash, existing status hashes
+// suppress duplicate work even when the currently preferred device changed.
+func (c *Client) EnqueuePlannedChildren(ctx context.Context, children []Job) (int, error) {
+	if len(children) == 0 {
+		return 0, fmt.Errorf("planned child set is empty")
+	}
+	seen := make(map[string]bool, len(children))
+	for _, child := range children {
+		if strings.TrimSpace(child.ID) == "" || strings.TrimSpace(child.ParentID) == "" {
+			return 0, fmt.Errorf("planned child is missing id or parent_id")
+		}
+		if seen[child.ID] {
+			return 0, fmt.Errorf("duplicate planned child id %s", child.ID)
+		}
+		seen[child.ID] = true
+		if child.PlanOnly || child.ShardCount < 1 || child.ShardIndex < 1 || len(child.RetryTargets) == 0 {
+			return 0, fmt.Errorf("planned child %s is not a bounded execution job", child.ID)
+		}
+		if child.QueueClass == "" || len(child.RequiredCapabilities) == 0 {
+			return 0, fmt.Errorf("planned child %s has no execution route", child.ID)
+		}
+	}
+	// Stable status-key order avoids needless WATCH conflicts if a replay built
+	// the same children by iterating a map in a different order.
+	sort.SliceStable(children, func(i, j int) bool { return children[i].ID < children[j].ID })
+	return c.enqueueTargetShardsAtomic(ctx, children)
+}
 
 // EnqueueTargetShards replaces one directory-sized ownership unit with
 // deterministic, bounded children. It is idempotent across worker crashes:
@@ -24,8 +55,12 @@ func (c *Client) EnqueueTargetShards(ctx context.Context, parent Job, targets []
 		return nil, 0, err
 	}
 	if parent.PlanOnly {
+		route, routeErr := c.SnapshotRouter(ctx)
+		if routeErr != nil {
+			return nil, 0, fmt.Errorf("snapshot live worker routes: %w", routeErr)
+		}
 		for i := range children {
-			c.RouteJob(ctx, &children[i])
+			route(&children[i])
 			// A bounded render child is portable across workers with the same
 			// verified backend. Do not recreate the directory parent's exact-node
 			// pin or one offline node can strand every already-planned child.
@@ -122,7 +157,7 @@ func (c *Client) enqueueTargetShardsAtomic(ctx context.Context, children []Job) 
 			ID: child.ID, Status: StatusQueued, Path: child.Path, Kinds: strings.Join(child.Kinds, ","),
 			Producer: child.Producer, EnqueuedAt: child.EnqueuedAt, Backend: child.SelectedBackend,
 			TargetWorker: child.SelectedWorker, QueueClass: child.QueueClass, Attempts: child.Attempts,
-			ParentID: child.ParentID,
+			ParentID: child.ParentID, DerivativePass: child.DerivativePass, Error: child.RoutingReason,
 		}
 	}
 	for attempt := 0; attempt < splitTransactionRetries; attempt++ {

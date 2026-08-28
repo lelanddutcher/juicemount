@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -135,6 +136,76 @@ func TestNewTargetShardsPreservesExplicitCPUFallback(t *testing.T) {
 		if child.QueueClass != QueueClassCPU || child.VCodec != "libx264" || !reflect.DeepEqual(child.RequiredCapabilities, []string{"cpu"}) {
 			t.Fatalf("CPU child was promoted or rerouted: %+v", child)
 		}
+	}
+}
+
+func TestRedisPlannedDerivativeChildrenAreAtomicVisibleAndClaimable(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	children := []Job{
+		{ID: "p-metadata", ParentID: "p", Path: "/jfs", Kinds: []string{KindDerivatives}, Producer: "manager",
+			DerivativePass: DerivativePassMetadata, QueueClass: QueueClassServer, SelectedBackend: "server-metadata",
+			RequiredCapabilities: []string{"metadata"}, RetryTargets: []string{"/jfs/a.mp4"}, ShardIndex: 1, ShardCount: 3},
+		{ID: "p-render", ParentID: "p", Path: "/jfs", Kinds: []string{KindDerivatives}, Producer: "manager",
+			DerivativePass: DerivativePassPreviews, QueueClass: QueueClassRender, SelectedBackend: "h264_vaapi",
+			RequiredCapabilities: []string{"decoder:h264_vaapi"}, RetryTargets: []string{"/jfs/a.mp4"}, ShardIndex: 2, ShardCount: 3},
+		{ID: "p-cpu", ParentID: "p", Path: "/jfs", Kinds: []string{KindDerivatives}, Producer: "manager",
+			DerivativePass: DerivativePassPreviews, QueueClass: QueueClassCPU, SelectedBackend: "cpu-decode",
+			RequiredCapabilities: []string{"cpu"}, RetryTargets: []string{"/jfs/b.mov"}, ShardIndex: 3, ShardCount: 3,
+			RoutingReason: "ProRes has no verified hardware decoder"},
+	}
+	if created, err := q.EnqueuePlannedChildren(ctx, children); err != nil || created != 3 {
+		t.Fatalf("first plan publish=%d, %v", created, err)
+	}
+	if created, err := q.EnqueuePlannedChildren(ctx, children); err != nil || created != 0 {
+		t.Fatalf("replayed plan publish=%d, %v", created, err)
+	}
+	server := Worker{ID: "server", Role: QueueClassServer, Capabilities: []string{"metadata"}}
+	render := Worker{ID: "render", Role: QueueClassRender, Decoders: []string{"h264_vaapi"}}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+	if err != nil || !ok || claim.Job.ID != "p-render" || claim.Job.SelectedBackend != "h264_vaapi" {
+		t.Fatalf("render derivative claim=%+v ok=%v err=%v", claim.Job, ok, err)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, render); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.RequeueClaim(ctx, claim, true, "verified decoder failed; explicit CPU fallback"); err != nil {
+		t.Fatal(err)
+	}
+	claimed := map[string]bool{}
+	for len(claimed) < 3 {
+		claim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+		if err != nil || !ok {
+			t.Fatalf("server derivative claim=%+v ok=%v err=%v", claim.Job, ok, err)
+		}
+		claimed[claim.Job.ID] = true
+		if err := q.AckClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !claimed["p-metadata"] || !claimed["p-cpu"] || !claimed["p-render"] {
+		t.Fatalf("server claims=%v", claimed)
+	}
+	status, err := q.rdb.HGetAll(ctx, JobHashPrefix+"p-cpu").Result()
+	if err != nil || status["backend"] != "cpu-decode" || status["error"] == "" || status["derivative_pass"] != DerivativePassPreviews {
+		t.Fatalf("visible CPU fallback status=%v err=%v", status, err)
+	}
+	requeued, err := q.rdb.HGetAll(ctx, JobHashPrefix+"p-render").Result()
+	if err != nil || requeued["backend"] != "cpu-decode" || requeued["queue_class"] != QueueClassCPU ||
+		!strings.Contains(requeued["error"], "explicit CPU fallback") {
+		t.Fatalf("failed render preview fallback status=%v err=%v", requeued, err)
 	}
 }
 

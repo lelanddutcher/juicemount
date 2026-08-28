@@ -37,7 +37,7 @@ func TestQueueKeyFor(t *testing.T) {
 func TestWorkerQueueKeysAreDisjointByRole(t *testing.T) {
 	server := WorkerQueueKeys(Worker{Role: QueueClassServer})
 	render := WorkerQueueKeys(Worker{
-		Role: QueueClassRender, Encoders: []string{"hevc_vaapi"},
+		Role: QueueClassRender, Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi", "hevc_vaapi"},
 		TranscriptBackends: []string{"cpu", "vulkan"},
 	})
 	serverSet := map[string]bool{}
@@ -49,18 +49,21 @@ func TestWorkerQueueKeysAreDisjointByRole(t *testing.T) {
 			t.Fatalf("server/render both drain %q; accelerator jobs could race CPU", key)
 		}
 	}
-	if !serverSet[classQueue(KindProxy, QueueClassServer)] ||
+	if !serverSet[classQueue(KindDerivatives, QueueClassServer)] ||
+		!serverSet[classQueue(KindDerivatives, QueueClassCPU)] ||
+		!serverSet[classQueue(KindProxy, QueueClassServer)] ||
 		!serverSet[classQueue(KindTranscript, QueueClassServer)] ||
 		!serverSet[classQueue(KindProxy, QueueClassCPU)] || !serverSet[QueueKey] {
 		t.Fatalf("server queues = %v, want planning, CPU fallback, and legacy catch-all lanes", server)
 	}
-	if len(render) != 2 || render[0] != classQueue(KindProxy, QueueClassRender) || render[1] != classQueue(KindTranscript, QueueClassRender) {
+	if len(render) != 3 || render[0] != classQueue(KindDerivatives, QueueClassRender) ||
+		render[1] != classQueue(KindProxy, QueueClassRender) || render[2] != classQueue(KindTranscript, QueueClassRender) {
 		t.Fatalf("render queues = %v", render)
 	}
 }
 
-func TestInitialProxyAndTranscriptRouteThroughServerPlanner(t *testing.T) {
-	for _, kind := range []string{KindProxy, KindTranscript} {
+func TestInitialCompositeKindsRouteThroughServerPlanner(t *testing.T) {
+	for _, kind := range []string{KindDerivatives, KindProxy, KindTranscript} {
 		job := Job{ID: "parent", Path: "/jfs/library", Kinds: []string{kind}}
 		(&Client{}).RouteInitialJob(t.Context(), &job)
 		if !job.PlanOnly || job.QueueClass != QueueClassServer || job.SelectedBackend != "server-dispatch" {
@@ -70,6 +73,10 @@ func TestInitialProxyAndTranscriptRouteThroughServerPlanner(t *testing.T) {
 			t.Fatalf("server cannot satisfy %s planner capabilities %v", kind, job.RequiredCapabilities)
 		}
 	}
+	preview := Job{ID: "preview", Path: "/jfs/library", Kinds: []string{KindDerivatives}, DerivativePass: DerivativePassPreviews}
+	if shouldPlanOnServer(preview) {
+		t.Fatal("bounded derivative execution pass was routed back through the planner")
+	}
 
 	child := Job{ID: "child", Path: "/jfs/library", Kinds: []string{KindProxy}, ShardIndex: 1, ShardCount: 2}
 	if shouldPlanOnServer(child) {
@@ -78,6 +85,21 @@ func TestInitialProxyAndTranscriptRouteThroughServerPlanner(t *testing.T) {
 	fallback := Job{ID: "fallback", Path: "/jfs/library", Kinds: []string{KindProxy}, RetryTargets: []string{"clip.mov"}}
 	if shouldPlanOnServer(fallback) {
 		t.Fatal("exact retry subset was routed back through the planner")
+	}
+}
+
+func TestPreviewDecoderSelectionUsesMeasuredDecodeAndCodec(t *testing.T) {
+	workers := []Worker{
+		{ID: "slow-h264", Role: QueueClassRender, Decoders: []string{"h264_vaapi"}, Benchmarks: WorkerBenchmarks{DecodeFPS: 90, AccessMBps: 500}},
+		{ID: "fast-h264", Role: QueueClassRender, Decoders: []string{"h264_qsv"}, Benchmarks: WorkerBenchmarks{DecodeFPS: 240, AccessMBps: 500}},
+		{ID: "hevc-only", Role: QueueClassRender, Decoders: []string{"hevc_vaapi"}, Benchmarks: WorkerBenchmarks{DecodeFPS: 500, AccessMBps: 500}},
+	}
+	selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, "h264", nil)
+	if !ok || selected.ID != "fast-h264" || decoder != "h264_qsv" {
+		t.Fatalf("H.264 decoder selection=%q/%q/%v", selected.ID, decoder, ok)
+	}
+	if _, _, ok := preferredHardwareDecoderWorkerWithLoad(workers, "prores", nil); ok {
+		t.Fatal("unverified ProRes decoder was admitted")
 	}
 }
 

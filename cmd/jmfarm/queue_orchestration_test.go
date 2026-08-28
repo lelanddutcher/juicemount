@@ -69,3 +69,17 @@ func TestPlanOnlyParentDispatchesEvenOneTarget(t *testing.T) {
 		t.Fatalf("planner transcript shard size=%d, want one", got)
 	}
 }
+
+func TestLegacyDerivativeShardIsReplannedInsteadOfCPUDecoded(t *testing.T) {
+	legacy := farmqueue.Job{
+		Kinds: []string{farmqueue.KindDerivatives}, ShardIndex: 101, ShardCount: 377,
+		RetryTargets: []string{"/jfs/long-camera-master.mp4"}, QueueClass: farmqueue.QueueClassServer,
+	}
+	if !shouldDispatchDerivativePlan(legacy) {
+		t.Fatal("legacy composite derivative shard would still full-decode video on the server")
+	}
+	legacy.DerivativePass = farmqueue.DerivativePassMetadata
+	if shouldDispatchDerivativePlan(legacy) {
+		t.Fatal("already split metadata child was recursively replanned")
+	}
+}

@@ -57,9 +57,9 @@ camera originals over a shared volume. Two problems the farm solves:
         │        │ juicefs mount (its OWN client) │                           │
         │   ┌────┴───────────────────────────────┐  ┌──────────────────────┐ │
         │   │ server worker                      │  │ render worker        │ │
-        │   │ • metadata + cheap derivatives     │  │ • verified GPU only  │ │
+        │   │ • tech + waveform metadata lane    │  │ • verified GPU only  │ │
         │   │ • discovery leader + backstop      │  │ • HEVC/H.264 proxy   │ │
-        │   │ • CPU fallback when no GPU exists  │  │ • accelerated AI     │ │
+        │   │ • visible CPU fallback lane        │  │ • video previews/AI  │ │
         │   └─────────────────────────────────────┘  └──────────────────────┘ │
         └─────────────────────────────────────────────────────────────────────┘
                                    │  derivatives land on the shared volume at
@@ -83,20 +83,21 @@ Key properties:
   It is **byte-stable across macOS and Linux**, so a farm-generated blob passes a
   consumer's hash-freshness gate directly — a client trusts a derivative only when
   `hash == live source_hash`.
-- **Two passes, decoupled.** Cheap derivatives (tech/poster/filmstrip/waveform) commit
-  atomically and fast; the slow `-preset slow` proxy transcode and the whisper
-  transcript run as **separate** passes so a long encode never withholds the fast
-  results.
+- **Compute-aware derivative passes.** The public `derivatives` kind is planned into
+  server metadata/audio children and one-file video preview children. Poster and
+  filmstrip decoding uses a verified hardware decoder when available; unsupported
+  sources enter an explicit `cpu-decode` lane instead of demoting the rest of a batch.
+  Proxy transcode and Whisper transcript remain separate passes.
 - **Observed capability, not advertised hardware.** A render worker is admitted only
   after it completes real encode and hardware-decode probes. Its measured encode,
   decode, transcript, and mount-read rates are published in the Manager.
 - **Durable claims.** Claiming a job atomically moves it to a per-worker processing
   list with a renewable lease. If the worker disappears, another worker requeues the
   receipt instead of losing work between a Redis pop and execution.
-- **Server-planned render batches.** Fresh proxy and transcript requests first enter
+- **Server-planned render batches.** Fresh derivatives, proxy, and transcript requests first enter
   a metadata-only server lane. The server recursively discovers targets and publishes
-  deterministic bounded children (one file for transcripts, small groups for proxy
-  work); only those children enter measured GPU/CPU execution lanes. A render node
+  deterministic bounded children (one file for transcripts and video previews, small
+  groups for proxy work); only those children enter measured GPU/CPU execution lanes. A render node
   therefore never burns accelerator time walking an entire directory, and one
   incompatible source cannot demote or block a directory-sized batch.
 
@@ -105,10 +106,10 @@ Key properties:
 ## How a job flows (queue mode)
 
 The worker runs `jmfarm -queue` against the same metadata Redis (db 1). Producers
-create one job per requested kind. Derivative work goes directly to the server. A
-fresh proxy/transcript request first becomes a server planning job; after recursive
-discovery, each bounded child is routed from the live, verified worker profiles to a
-render or explicit CPU-fallback lane. A job is a small JSON document; scheduler
+create one job per requested kind. Fresh derivatives/proxy/transcript requests first
+become server planning jobs; after recursive discovery, each bounded child is routed
+from the live, verified worker profiles to a server-metadata, render, or explicit
+CPU-fallback lane. A job is a small JSON document; scheduler
 annotations are additive. The planning parent looks like:
 
 ```json
@@ -129,7 +130,10 @@ annotations are additive. The planning parent looks like:
 
 Its bounded children carry `parent_id`, `shard_index`, `shard_count`, exact
 `retry_targets`, and the measured execution admission such as
-`selected_backend: "hevc_vaapi"`. Planner admission is never copied to a child.
+`selected_backend: "hevc_vaapi"` or `selected_backend: "h264_vaapi"` for a preview
+decoder. Derivative children also carry `derivative_pass: "metadata"|"previews"`;
+intentional software decode is visible as `cpu-decode`. Planner admission is never
+copied to a child.
 
 Jobs arrive automatically from the recursive discovery watcher and its cursored
 backstop. The Manager's advanced path sweep and OpenLoupe remain repair/manual
@@ -282,7 +286,8 @@ is still running. Stable coverage and last-sweep history remain available.
 
 - **RC:** automatic recursive discovery + persistent catch-up; durable queue claims;
   farm-wide pause/play; server/render lane separation; benchmarked GPU admission;
-  HEVC-first proxy routing with explicit H.264 fallback; live Manager control and node
+  hardware-decoded poster/filmstrip routing with per-file CPU fallback; HEVC-first
+  proxy routing with explicit H.264 fallback; live Manager control and node
   telemetry; tech/poster/filmstrip/waveform/proxy/transcript generation; JM-15
   discovery; `/blob` byte ranges; and portable assertion sidecars.
 - **Not in this RC:** richer AI (faces/OCR/framing), historical benchmark models,
