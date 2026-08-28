@@ -179,7 +179,7 @@ func (rm *ReadaheadManager) OnRead(inode uint64, offset int64, size int, filePat
 
 	// A disabled policy (operator kill-switch/override) still tracks the pattern
 	// so a live policy change can trigger on the next read. Production's metered
-	// policy is enabled but guarded and limited to one block/one worker.
+	// policy is enabled but guarded and limited to one block per worker.
 	if !policy.Enabled {
 		return
 	}

@@ -532,13 +532,14 @@ func (p *Profile) Class() LinkClass {
 func (p *Profile) Readahead() ReadaheadPolicy {
 	switch p.Class() {
 	case ClassMetered:
-		// Cellular / weak / metered: keep exactly one bounded 4 MiB block in
+		// Cellular / weak / metered: keep at most two bounded 4 MiB blocks in
 		// flight after a strong sequential signal. Disabling this layer entirely
 		// serialized foreground subreads across the tunnel: a live 40 Mbit/s,
-		// 80 ms shaped Link delivered only ~7.9 Mbit/s. One worker fills the
-		// bandwidth-delay product without turning a Quick Look/xattr probe into a
-		// whole-file pull; the six-block guard below still has to be crossed.
-		return ReadaheadPolicy{Enabled: true, SeqThreshold: 6, Blocks: 1, Workers: 1}
+		// 80 ms shaped Link delivered only ~7.9 Mbit/s. Two one-block workers can
+		// overlap tunnel round trips without turning a Quick Look/xattr probe into
+		// a whole-file pull; the six-block guard below still has to be crossed and
+		// caps speculative exposure at 8 MiB.
+		return ReadaheadPolicy{Enabled: true, SeqThreshold: 6, Blocks: 1, Workers: 2}
 	case ClassSlow:
 		return ReadaheadPolicy{Enabled: true, SeqThreshold: 4, Blocks: 2, Workers: 2}
 	case ClassFast:

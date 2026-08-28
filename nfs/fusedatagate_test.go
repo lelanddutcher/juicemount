@@ -36,7 +36,7 @@ func TestFUSEDataGateBoundsConcurrency(t *testing.T) {
 // THE NO-OP THIS TEST EXISTS TO CATCH. The first implementation narrowed the
 // ceiling on slow links by testing `len(g) >= w` before a send on a channel of
 // cap 16 — which admits instantly while 14 slots are free. Metered links got 16
-// instead of 2, and the commit message advertised protection that did not
+// instead of 3, and the commit message advertised protection that did not
 // exist. It shipped because nothing tested the narrowed path.
 func TestFUSEDataGateNarrowsOnSlowLinks(t *testing.T) {
 	for _, tc := range []struct {
@@ -44,7 +44,7 @@ func TestFUSEDataGateNarrowsOnSlowLinks(t *testing.T) {
 		class netprofile.LinkClass
 		want  int
 	}{
-		{"metered", netprofile.ClassMetered, 2},
+		{"metered", netprofile.ClassMetered, 3},
 		{"slow", netprofile.ClassSlow, 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
