@@ -25,6 +25,7 @@ package netprofile
 
 import (
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -174,17 +175,24 @@ type Profile struct {
 	// 105-349ms, stddev 86ms — a single threshold would oscillate every probe).
 	highLatency bool
 
-	// Windowed throughput accumulator. Bandwidth is measured as AGGREGATE bytes
-	// over WALL-CLOCK time within an active read window — not per-read bytes/dur,
-	// which underestimates badly under concurrency (8 parallel 1 MB reads each
-	// look like 1 MB/s when the link is really doing 8 MB/s). All bytes that land
-	// in the same wall-clock window are summed, so concurrency is captured.
-	winStart   time.Time
-	winLastEnd time.Time
-	winBytes   int64
+	// Windowed throughput accumulator. Bytes are divided by the UNION of active
+	// transfer intervals, not the span between the first and last completion.
+	// That preserves concurrent aggregate throughput while excluding Finder or
+	// an NLE's think time between otherwise-fast reads. The old wall-span
+	// denominator turned 256 KiB LAN reads arriving 300 ms apart into a 1.6 MiB/s
+	// "metered" link even when each transfer itself sustained 50 MiB/s.
+	winStart     time.Time
+	winLastEnd   time.Time
+	winBytes     int64
+	winIntervals []throughputInterval
 
 	// now is the clock (injectable for tests). Production uses time.Now.
 	now func() time.Time
+}
+
+type throughputInterval struct {
+	start time.Time
+	end   time.Time
 }
 
 // New builds a fresh profile in the "unknown → medium-safe" state: until a
@@ -350,11 +358,12 @@ const (
 )
 
 // ObserveThroughput folds a measured backend transfer into the bandwidth
-// estimate using an AGGREGATE bytes-over-wall-time window (not per-read
-// bytes/dur, which under-counts under concurrency). Cache hits (sub-threshold
-// bytes/dur) are ignored so only wire transfers move the estimate. The windowed
-// rate is EWMA-smoothed (alpha=1/4) so it tracks link changes within a few
-// windows without thrashing.
+// estimate using aggregate bytes divided by the union of active transfer time.
+// Overlapping reads therefore retain their aggregate throughput, while idle
+// application think time between reads cannot dilute a fast wire into the
+// metered bucket. Cache hits (sub-threshold bytes/dur) are ignored so only wire
+// transfers move the estimate. The windowed rate is EWMA-smoothed (alpha=1/4)
+// so it tracks link changes within a few windows without thrashing.
 //
 // `dur` is the read's own duration, used both as the cache-hit filter and to
 // anchor a fresh window's start (the read began ~dur before now).
@@ -363,32 +372,44 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 		return
 	}
 	now := p.now()
+	started := now.Add(-dur)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	// Start a fresh window if this is the first sample or the link went idle.
 	if p.winStart.IsZero() || now.Sub(p.winLastEnd) > bwIdleGap {
-		p.winStart = now.Add(-dur)
+		p.winStart = started
+		p.winLastEnd = time.Time{}
 		p.winBytes = 0
+		p.winIntervals = p.winIntervals[:0]
+	}
+	if started.Before(p.winStart) {
+		p.winStart = started
 	}
 	p.winBytes += bytes
-	p.winLastEnd = now
+	if now.After(p.winLastEnd) {
+		p.winLastEnd = now
+	}
+	p.winIntervals = append(p.winIntervals, throughputInterval{start: started, end: now})
 
-	elapsed := now.Sub(p.winStart)
-	if elapsed < bwWindowFlush && p.winBytes < bwWindowFlushBytes {
+	span := p.winLastEnd.Sub(p.winStart)
+	if span < bwWindowFlush && p.winBytes < bwWindowFlushBytes {
 		return // keep accumulating; not enough wall-time or bytes yet
 	}
-	if elapsed <= 0 {
+	active := activeTransferDuration(p.winIntervals)
+	if active <= 0 {
 		return // guard against a zero divisor (clock didn't advance)
 	}
-	rate := float64(p.winBytes) / elapsed.Seconds()
+	rate := float64(p.winBytes) / active.Seconds()
 	if fl := FakeLinkSpec(); fl != nil && fl.BWDown > 0 {
 		rate = fl.BWDown
 	}
 	// Tumble the window so concurrent reads in the next interval aren't
 	// double-counted against this one's already-folded bytes.
-	p.winStart = now
+	p.winStart = time.Time{}
+	p.winLastEnd = time.Time{}
 	p.winBytes = 0
+	p.winIntervals = p.winIntervals[:0]
 
 	p.bwSamples++
 	if !p.haveBW {
@@ -397,6 +418,35 @@ func (p *Profile) ObserveThroughput(bytes int64, dur time.Duration) {
 		return
 	}
 	p.bwBps += (rate - p.bwBps) / 4
+}
+
+// activeTransferDuration returns the union of the supplied intervals. The
+// window is capped by bwWindowFlushBytes (at most 32 minimum-sized samples), so
+// sorting this tiny slice keeps the accounting exact without putting a
+// persistent timer or probe on the read path.
+func activeTransferDuration(intervals []throughputInterval) time.Duration {
+	if len(intervals) == 0 {
+		return 0
+	}
+	sort.Slice(intervals, func(i, j int) bool {
+		if intervals[i].start.Equal(intervals[j].start) {
+			return intervals[i].end.Before(intervals[j].end)
+		}
+		return intervals[i].start.Before(intervals[j].start)
+	})
+	start, end := intervals[0].start, intervals[0].end
+	var total time.Duration
+	for _, interval := range intervals[1:] {
+		if interval.start.After(end) {
+			total += end.Sub(start)
+			start, end = interval.start, interval.end
+			continue
+		}
+		if interval.end.After(end) {
+			end = interval.end
+		}
+	}
+	return total + end.Sub(start)
 }
 
 // ForceClass pins the link class (e.g. when the OS reports a metered/expensive

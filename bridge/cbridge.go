@@ -323,9 +323,11 @@ func linkStateDir(cfg ServerConfig) string {
 }
 
 // startLinkIfConfigured brings up the embedded tailnet node and rewrites
-// backend URLs to loopback proxies backed by tsnet. It returns the live node
-// so startup can probe the actual route rather than treating a local listener
-// as proof that the NAS is reachable.
+// backend URLs to stable adaptive loopback proxies. Each outbound connection
+// authenticates through Link first, then uses direct LAN only when the paired
+// NAS's fresh private peer endpoint exactly matches that backend. It returns
+// the live node so startup can prove the encrypted route rather than treating
+// a local listener as proof that the NAS is reachable.
 func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
 	configured, err := validateLinkConfig(*cfg)
 	if err != nil {
@@ -347,7 +349,7 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
 		}
 		owned = true
 	}
-	redisURL, err := node.ProxyEndpoint(cfg.RedisURL, "6379")
+	redisURL, err := node.AdaptiveProxyEndpoint(cfg.RedisURL, "6379")
 	if err != nil {
 		if owned {
 			node.Stop()
@@ -355,7 +357,7 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
 		return nil, false, fmt.Errorf("JuiceMount Link Redis proxy failed: %w", err)
 	}
 	bucketURL := cfg.BucketOverride
-	bucketURL, err = node.ProxyEndpoint(bucketURL, "")
+	bucketURL, err = node.AdaptiveProxyEndpoint(bucketURL, "")
 	if err != nil {
 		if owned {
 			node.Stop()
@@ -375,7 +377,7 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
 	} else {
 		jmlog.Info("JuiceMount Link: node started; registration and route acceptance continuing in background")
 	}
-	jmlog.Info("JuiceMount Link: backend endpoints now use loopback proxies")
+	jmlog.Info("JuiceMount Link: backend endpoints now use authenticated adaptive loopback proxies")
 	return node, owned, nil
 }
 
@@ -2273,19 +2275,30 @@ func NFSServerStart(configJSON *C.char) *C.char {
 	metrics.Default().SetNetworkProvider(func() *metrics.NetworkSnapshot {
 		s := netprofile.Default().Snapshot()
 		ra := netprofile.Default().Readahead()
+		backendTransport := "system-direct"
+		var directLANConnections, encryptedConnections uint64
+		if linkNode != nil {
+			proxyStatus := linkNode.ProxyTransportStatus()
+			backendTransport = proxyStatus.Mode
+			directLANConnections = proxyStatus.DirectLANConns
+			encryptedConnections = proxyStatus.LinkConns
+		}
 		return &metrics.NetworkSnapshot{
-			Class:            s.Class.String(),
-			RTTMs:            float64(s.RTT.Microseconds()) / 1000.0,
-			BandwidthMBps:    s.BytesPerSec / (1024 * 1024),
-			HaveRTT:          s.HaveRTT,
-			HaveBandwidth:    s.HaveBW,
-			ThroughputN:      s.ThroughputN,
-			BootstrappedRTT:  s.BootstrappedRTT,
-			HighLatency:      netprofile.Default().HighLatency(),
-			ReadaheadEnabled: ra.Enabled,
-			ReadaheadSeq:     ra.SeqThreshold,
-			ReadaheadBlocks:  ra.Blocks,
-			ReadaheadWorkers: ra.Workers,
+			Class:                s.Class.String(),
+			RTTMs:                float64(s.RTT.Microseconds()) / 1000.0,
+			BandwidthMBps:        s.BytesPerSec / (1024 * 1024),
+			HaveRTT:              s.HaveRTT,
+			HaveBandwidth:        s.HaveBW,
+			ThroughputN:          s.ThroughputN,
+			BootstrappedRTT:      s.BootstrappedRTT,
+			HighLatency:          netprofile.Default().HighLatency(),
+			ReadaheadEnabled:     ra.Enabled,
+			ReadaheadSeq:         ra.SeqThreshold,
+			ReadaheadBlocks:      ra.Blocks,
+			ReadaheadWorkers:     ra.Workers,
+			BackendTransport:     backendTransport,
+			DirectLANConnections: directLANConnections,
+			EncryptedConnections: encryptedConnections,
 		}
 	})
 

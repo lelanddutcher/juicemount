@@ -50,6 +50,9 @@ type LinkNode struct {
 	readyState      string
 	readyHealth     []string
 	readyAttemptErr error
+	proxyLastMode   atomic.Uint32
+	proxyLANConns   atomic.Uint64
+	proxyLinkConns  atomic.Uint64
 }
 
 // contextDialer is deliberately small so proxy behavior can be tested with a
@@ -420,6 +423,143 @@ func (l *LinkNode) DialContext(ctx context.Context, network, address string) (ne
 	return conn, nil
 }
 
+const (
+	proxyModeUnknown uint32 = iota
+	proxyModeEncryptedLink
+	proxyModeDirectLAN
+)
+
+// LinkProxyTransportStatus describes the final outbound leg selected by the
+// adaptive backend proxies. Link is always authenticated first; DirectLAN is
+// selected only when that fresh encrypted connection reports the paired NAS at
+// the backend's exact private address.
+type LinkProxyTransportStatus struct {
+	Mode           string
+	DirectLANConns uint64
+	LinkConns      uint64
+}
+
+// ProxyTransportStatus is a lock-free observability snapshot for /metrics and
+// diagnostics. Counts are cumulative for this LinkNode lifetime.
+func (l *LinkNode) ProxyTransportStatus() LinkProxyTransportStatus {
+	if l == nil {
+		return LinkProxyTransportStatus{}
+	}
+	mode := "unknown"
+	switch l.proxyLastMode.Load() {
+	case proxyModeEncryptedLink:
+		mode = "encrypted-link"
+	case proxyModeDirectLAN:
+		mode = "direct-lan"
+	}
+	return LinkProxyTransportStatus{
+		Mode:           mode,
+		DirectLANConns: l.proxyLANConns.Load(),
+		LinkConns:      l.proxyLinkConns.Load(),
+	}
+}
+
+func (l *LinkNode) noteProxyMode(mode uint32, target string) {
+	if mode == proxyModeDirectLAN {
+		l.proxyLANConns.Add(1)
+	} else {
+		l.proxyLinkConns.Add(1)
+	}
+	previous := l.proxyLastMode.Swap(mode)
+	if previous == mode {
+		return
+	}
+	label := "encrypted-link"
+	if mode == proxyModeDirectLAN {
+		label = "direct-lan"
+	}
+	jmlog.Info("JuiceMount Link: backend proxy transport changed", "mode", label, "target", target)
+}
+
+// AdaptiveDialContext establishes the encrypted connection first, then uses a
+// freshly observed paired-peer endpoint to decide whether the same private
+// target is also safe to dial directly on the LAN. The live Link connection is
+// retained as the fallback, so leaving the LAN never turns into an unencrypted
+// Internet or hotel-network dial.
+func (l *LinkNode) AdaptiveDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if l == nil {
+		return nil, fmt.Errorf("link: node is nil")
+	}
+	conn, err := adaptiveBackendDial(ctx, network, address, l.DialContext, l.TransportStatus,
+		(&net.Dialer{Timeout: 750 * time.Millisecond, KeepAlive: 30 * time.Second}).DialContext)
+	if err != nil {
+		return nil, err
+	}
+	l.noteProxyMode(conn.mode, address)
+	return conn.Conn, nil
+}
+
+type selectedBackendConn struct {
+	net.Conn
+	mode uint32
+}
+
+type linkTransportStatusFunc func(context.Context) (LinkTransportStatus, error)
+
+func adaptiveBackendDial(
+	ctx context.Context,
+	network, address string,
+	linkDial contextDialer,
+	status linkTransportStatusFunc,
+	directDial contextDialer,
+) (selectedBackendConn, error) {
+	if linkDial == nil {
+		return selectedBackendConn{}, fmt.Errorf("link: adaptive proxy Link dialer is nil")
+	}
+	linkConn, err := linkDial(ctx, network, address)
+	if err != nil {
+		return selectedBackendConn{}, err
+	}
+	keepLink := func() selectedBackendConn {
+		return selectedBackendConn{Conn: linkConn, mode: proxyModeEncryptedLink}
+	}
+	if status == nil || directDial == nil {
+		return keepLink(), nil
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	transport, statusErr := status(statusCtx)
+	cancel()
+	if statusErr != nil || !directLANEndpointMatches(address, transport) {
+		return keepLink(), nil
+	}
+	directCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+	directConn, directErr := directDial(directCtx, network, address)
+	cancel()
+	if directErr != nil {
+		return keepLink(), nil
+	}
+	_ = linkConn.Close()
+	return selectedBackendConn{Conn: directConn, mode: proxyModeDirectLAN}, nil
+}
+
+// directLANEndpointMatches is the fail-closed identity gate. Public targets,
+// hostnames, tailnet addresses, relays, and stale/mismatched peer endpoints all
+// remain on Link. A literal private target is eligible only when the encrypted
+// subnet-router peer reports that exact IP as its current direct endpoint.
+func directLANEndpointMatches(address string, transport LinkTransportStatus) bool {
+	if transport.Mode != "direct" || transport.Endpoint == "" {
+		return false
+	}
+	targetHost, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	targetIP, err := netip.ParseAddr(strings.Trim(targetHost, "[]"))
+	if err != nil || !targetIP.IsPrivate() {
+		return false
+	}
+	peerEndpoint, err := netip.ParseAddrPort(transport.Endpoint)
+	if err != nil {
+		return false
+	}
+	return peerEndpoint.Addr().Unmap() == targetIP.Unmap()
+}
+
 type tailscaleDialPlanner func(context.Context, string, string) (netip.AddrPort, bool, error)
 
 func waitForTailscaleDialPlan(ctx context.Context, network, address string, plan tailscaleDialPlanner) (netip.AddrPort, error) {
@@ -460,12 +600,25 @@ func linkConnUsesTailnet(conn net.Conn) bool {
 // the Link node. The URL scheme, credentials, path (including Redis DB), and
 // query are unchanged. raw may also be a bare host:port value.
 func (l *LinkNode) ProxyEndpoint(raw, defaultPort string) (string, error) {
+	return l.proxyEndpoint(raw, defaultPort, "encrypted", l.DialContext)
+}
+
+// AdaptiveProxyEndpoint returns a stable loopback endpoint whose outbound leg
+// automatically uses verified direct LAN transport when the paired NAS is
+// physically present, and the encrypted Link transport everywhere else. It is
+// intentionally separate from ProxyEndpoint so diagnostics that promise a
+// Link-only proof can never reuse an adaptive listener.
+func (l *LinkNode) AdaptiveProxyEndpoint(raw, defaultPort string) (string, error) {
+	return l.proxyEndpoint(raw, defaultPort, "adaptive", l.AdaptiveDialContext)
+}
+
+func (l *LinkNode) proxyEndpoint(raw, defaultPort, mode string, dial contextDialer) (string, error) {
 	target, rewrite, err := proxyEndpointTarget(raw, defaultPort)
 	if err != nil {
 		return raw, err
 	}
 
-	proxyKey := target + "\x00" + proxyIdleTimeout(raw).String()
+	proxyKey := mode + "\x00" + target + "\x00" + proxyIdleTimeout(raw).String()
 	l.mu.Lock()
 	s := l.srv
 	if addr := l.proxyEndpoints[proxyKey]; addr != "" {
@@ -477,7 +630,7 @@ func (l *LinkNode) ProxyEndpoint(raw, defaultPort string) (string, error) {
 		return raw, fmt.Errorf("link: node is stopped")
 	}
 
-	p, err := newTCPProxyWithIdleTimeout(target, l.DialContext, proxyIdleTimeout(raw))
+	p, err := newTCPProxyWithIdleTimeout(target, dial, proxyIdleTimeout(raw))
 	if err != nil {
 		return raw, err
 	}
@@ -854,7 +1007,7 @@ func (l *LinkNode) acceptRoutes() error {
 // LinkEndpointOverride is retained for callers that need a pure URL rewrite.
 // Deprecated for Link transport: changing a host to a tailnet address does
 // not help a normal OS socket reach tsnet's userspace network stack. The
-// desktop bridge uses ProxyEndpoint instead.
+// desktop bridge uses AdaptiveProxyEndpoint instead.
 //
 // Scheme, port, userinfo, path and query survive untouched — only the host
 // swaps. Empty nasAddr or an unparseable input returns the input unchanged,

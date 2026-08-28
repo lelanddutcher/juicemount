@@ -131,6 +131,111 @@ func TestProxyEndpointReusesStableListener(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("proxy listener count = %d, want 1", count)
 	}
+	adaptive, err := node.AdaptiveProxyEndpoint(raw, "6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adaptive == first {
+		t.Fatal("adaptive endpoint reused the Link-only diagnostic listener")
+	}
+	node.mu.Lock()
+	count = len(node.proxies)
+	node.mu.Unlock()
+	if count != 2 {
+		t.Fatalf("strict + adaptive proxy listener count = %d, want 2", count)
+	}
+}
+
+func TestDirectLANEndpointMatchesOnlyFreshPrivatePeerAddress(t *testing.T) {
+	direct := LinkTransportStatus{Mode: "direct", Endpoint: "192.168.0.197:41641"}
+	for _, tc := range []struct {
+		name      string
+		address   string
+		transport LinkTransportStatus
+		want      bool
+	}{
+		{"matching private IPv4", "192.168.0.197:30179", direct, true},
+		{"mismatched private IPv4", "192.168.0.198:30179", direct, false},
+		{"hostname fails closed", "nas.example:30179", direct, false},
+		{"public target fails closed", "203.0.113.7:30179", LinkTransportStatus{Mode: "direct", Endpoint: "203.0.113.7:41641"}, false},
+		{"DERP fails closed", "192.168.0.197:30179", LinkTransportStatus{Mode: "derp", Relay: "mia"}, false},
+		{"malformed peer endpoint", "192.168.0.197:30179", LinkTransportStatus{Mode: "direct", Endpoint: "192.168.0.197"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := directLANEndpointMatches(tc.address, tc.transport); got != tc.want {
+				t.Fatalf("directLANEndpointMatches(%q, %+v) = %v, want %v", tc.address, tc.transport, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAdaptiveBackendDialSelectsVerifiedLANAndClosesLinkProbe(t *testing.T) {
+	linkConn, linkPeer := net.Pipe()
+	directConn, directPeer := net.Pipe()
+	defer linkPeer.Close()
+	defer directPeer.Close()
+	got, err := adaptiveBackendDial(context.Background(), "tcp", "192.168.0.197:30151",
+		func(context.Context, string, string) (net.Conn, error) { return linkConn, nil },
+		func(context.Context) (LinkTransportStatus, error) {
+			return LinkTransportStatus{Mode: "direct", Endpoint: "192.168.0.197:41641"}, nil
+		},
+		func(context.Context, string, string) (net.Conn, error) { return directConn, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Close()
+	if got.Conn != directConn || got.mode != proxyModeDirectLAN {
+		t.Fatalf("selected connection = (%T, %d), want direct LAN", got.Conn, got.mode)
+	}
+	_ = linkPeer.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, err := linkPeer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("encrypted proof connection remained open after LAN selection")
+	}
+}
+
+func TestAdaptiveBackendDialKeepsEncryptedConnectionOffLAN(t *testing.T) {
+	linkConn, linkPeer := net.Pipe()
+	defer linkPeer.Close()
+	directCalls := 0
+	got, err := adaptiveBackendDial(context.Background(), "tcp", "192.168.0.197:30151",
+		func(context.Context, string, string) (net.Conn, error) { return linkConn, nil },
+		func(context.Context) (LinkTransportStatus, error) {
+			return LinkTransportStatus{Mode: "derp", Relay: "mia"}, nil
+		},
+		func(context.Context, string, string) (net.Conn, error) {
+			directCalls++
+			return nil, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Close()
+	if got.Conn != linkConn || got.mode != proxyModeEncryptedLink || directCalls != 0 {
+		t.Fatalf("off-LAN selection = (%T, %d, direct calls %d), want encrypted/no direct attempt", got.Conn, got.mode, directCalls)
+	}
+}
+
+func TestAdaptiveBackendDialFallsBackToEstablishedLinkWhenLANDialFails(t *testing.T) {
+	linkConn, linkPeer := net.Pipe()
+	defer linkPeer.Close()
+	got, err := adaptiveBackendDial(context.Background(), "tcp", "192.168.0.197:30179",
+		func(context.Context, string, string) (net.Conn, error) { return linkConn, nil },
+		func(context.Context) (LinkTransportStatus, error) {
+			return LinkTransportStatus{Mode: "direct", Endpoint: "192.168.0.197:41641"}, nil
+		},
+		func(context.Context, string, string) (net.Conn, error) {
+			return nil, context.DeadlineExceeded
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Close()
+	if got.Conn != linkConn || got.mode != proxyModeEncryptedLink {
+		t.Fatalf("failed LAN dial selected (%T, %d), want established Link", got.Conn, got.mode)
+	}
 }
 
 func TestTCPProxyForwardsAndCloses(t *testing.T) {

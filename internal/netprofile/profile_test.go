@@ -194,6 +194,33 @@ func TestWindowedAggregatesConcurrentReads(t *testing.T) {
 	}
 }
 
+func TestWindowExcludesApplicationThinkTime(t *testing.T) {
+	// Finder and an NLE do not issue one continuous read stream. Two 256 KiB
+	// transfers can each sustain 50 MiB/s while their callers pause 300 ms
+	// between completions. The old first-to-last wall span divided 512 KiB by
+	// ~305 ms and permanently mislabeled this as a ~1.6 MiB/s metered link.
+	p := New()
+	c := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	p.now = c.now
+	const bytes = int64(256 * 1024)
+	dur := 5 * time.Millisecond // 50 MiB/s active transfer rate
+	for i := 0; i < 2; i++ {
+		c.advance(300 * time.Millisecond)
+		p.ObserveThroughput(bytes, dur)
+	}
+	snap := p.Snapshot()
+	if !snap.HaveBW {
+		t.Fatal("sparse transfer window did not produce a bandwidth sample")
+	}
+	want := float64(50 * 1024 * 1024)
+	if snap.BytesPerSec < want*0.99 || snap.BytesPerSec > want*1.01 {
+		t.Fatalf("sparse active-transfer estimate = %.1f MiB/s, want 50 MiB/s", snap.BytesPerSec/(1024*1024))
+	}
+	if snap.Class != ClassMedium {
+		t.Fatalf("50 MiB/s sparse LAN transfers classified %s, want medium", snap.Class)
+	}
+}
+
 func TestForceClass(t *testing.T) {
 	p := New()
 	sampleFor(p, 800*1024*1024, 8) // would be fast

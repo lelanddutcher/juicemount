@@ -449,6 +449,13 @@ type NetworkSnapshot struct {
 	ReadaheadSeq     int  `json:"readahead_seq_threshold"`
 	ReadaheadBlocks  int  `json:"readahead_blocks_ahead"`
 	ReadaheadWorkers int  `json:"readahead_workers"`
+	// BackendTransport is the actual most-recent backend proxy selection, not
+	// merely the tailnet peer's control-plane state. direct-lan is admitted only
+	// after encrypted peer/address verification; encrypted-link is the fail-
+	// closed remote path. system-direct means Link is not configured.
+	BackendTransport     string `json:"backend_transport"`
+	DirectLANConnections uint64 `json:"direct_lan_connections"`
+	EncryptedConnections uint64 `json:"encrypted_link_connections"`
 }
 
 // BackendSnapshot reports how much of a session actually crossed the link,

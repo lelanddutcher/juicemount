@@ -202,6 +202,42 @@ PY
       fi; }
 }
 
+load_marker_shape() {
+  local marker_values
+  marker_values=$(python3 - "$MARKER" <<'PY'
+import ipaddress
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    marker = json.load(handle)
+if marker.get("active") is not True:
+    raise SystemExit("netshape marker does not describe an active shaper")
+ipaddress.ip_address(marker["ip"])
+ports = [int(marker[key]) for key in ("redis_port", "object_port", "probe_port")]
+link_port = marker.get("link_udp_port")
+if link_port is not None:
+    link_port = int(link_port)
+rtt = int(marker["rtt_ms"])
+down = int(marker["bw_down_mb"])
+up = int(marker["bw_up_mb"])
+loss = float(marker["loss_rate"])
+if any(port < 1 or port > 65535 for port in ports):
+    raise SystemExit("invalid port in netshape marker")
+if link_port is not None and (link_port < 1 or link_port > 65535):
+    raise SystemExit("invalid Link UDP port in netshape marker")
+if rtt < 0 or down < 1 or up < 1 or loss < 0 or loss > 1:
+    raise SystemExit("invalid impairment value in netshape marker")
+print("\t".join(str(value) for value in (
+    marker["ip"], ports[0], ports[1], ports[2],
+    link_port if link_port is not None else "-", rtt, down, up, loss,
+)))
+PY
+  )
+  IFS=$'\t' read -r NAS_IP REDIS_PORT OBJECT_PORT PROBE_PORT LINK_UDP_PORT RTT_MS BW_DOWN BW_UP LOSS_RATE <<< "$marker_values"
+  [ "$LINK_UDP_PORT" != "-" ] || LINK_UDP_PORT=""
+}
+
 activate_shape() {
   local half="$1"
   local rules_tmp
@@ -275,6 +311,10 @@ case "$cmd" in
   status)
     if [ -f "$MARKER" ]; then
       cat "$MARKER"
+      # Re-validate against the exact active profile. Using this invocation's
+      # defaults made `status` demand a 225 ms probe after `on --rtt 80`, even
+      # though activation had correctly proved the requested 80 ms wire delay.
+      load_marker_shape
       if ! sudo_ok || ! verify_shape; then
         echo "ERROR: marker exists but verified PF/dummynet shaping is not active" >&2
         exit 1
