@@ -1452,18 +1452,20 @@ func NFSServerStart(configJSON *C.char) *C.char {
 		// The adaptive proxy chooses its outbound leg per connection. A
 		// go-redis pool created on the LAN can therefore retain a socket whose
 		// proxy goroutine is still dialing the departed LAN after a cellular
-		// handoff. Replace only this private metadata pool on a verified
-		// transport transition; cached slice maps and SSD bytes remain valid.
-		if globalCache != nil {
-			cr := globalCache
-			linkNode.SetOnProxyTransportChanged(func(mode string) {
+		// handoff. The passive link estimator's RTT/bandwidth samples describe
+		// that departed physical path too. On a verified transport transition,
+		// invalidate those samples and replace only this private metadata pool;
+		// cached slice maps and SSD bytes remain valid.
+		cr := globalCache
+		linkNode.SetOnProxyTransportChanged(func(mode string) {
+			netprofile.Default().ResetForTransportChange()
+			jmlog.Info("network profile reset after Link transport change", "mode", mode)
+			if cr != nil {
 				if cr.ResetRedisConnections() {
 					jmlog.Info("cache metadata Redis pool reset after Link transport change", "mode", mode)
 				}
-			})
-		} else {
-			linkNode.SetOnProxyTransportChanged(nil)
-		}
+			}
+		})
 	}
 
 	// NFS server

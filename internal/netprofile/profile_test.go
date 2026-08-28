@@ -238,6 +238,45 @@ func TestForceClass(t *testing.T) {
 	}
 }
 
+func TestTransportChangeInvalidatesStaleMeasurements(t *testing.T) {
+	p := New()
+	p.ObserveRTT(180 * time.Millisecond)
+	sampleFor(p, 1.5*1024*1024, 6)
+	before := p.Snapshot()
+	if before.Class != ClassMetered || !before.HaveRTT || !before.HaveBW || before.ThroughputN == 0 {
+		t.Fatalf("precondition stale cellular profile = %+v", before)
+	}
+
+	p.ResetForTransportChange()
+	after := p.Snapshot()
+	if after.HaveRTT || after.HaveBW || after.ThroughputN != 0 || after.RTT != 0 || after.BytesPerSec != 0 {
+		t.Fatalf("transport reset retained prior-path measurements: %+v", after)
+	}
+	if after.Class != ClassMedium || after.BootstrappedRTT {
+		t.Fatalf("fresh transport class = %s boot=%v, want transition-safe medium/unbootstrapped",
+			after.Class, after.BootstrappedRTT)
+	}
+
+	// A fresh direct-LAN sample must immediately replace the old cellular RTT;
+	// it must not take many EWMA periods to decay from 180 ms.
+	p.ObserveRTT(500 * time.Microsecond)
+	if got := p.Snapshot(); got.Class != ClassFast || got.RTT != 500*time.Microsecond || !got.BootstrappedRTT {
+		t.Fatalf("fresh LAN sample after handoff = %+v, want fast 500us bootstrap", got)
+	}
+}
+
+func TestTransportChangePreservesForcedClass(t *testing.T) {
+	p := New()
+	forced := ClassMetered
+	p.ForceClass(&forced)
+	p.ObserveRTT(time.Millisecond)
+	sampleFor(p, 300*1024*1024, 4)
+	p.ResetForTransportChange()
+	if got := p.Class(); got != ClassMetered {
+		t.Fatalf("transport reset cleared explicit forced class: %s", got)
+	}
+}
+
 // TestSamplerObservabilityFloor pins the RATE CEILING the per-sample filter
 // imposes on each producer, and the fact that it differs between the two.
 //

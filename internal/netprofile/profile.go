@@ -457,6 +457,33 @@ func (p *Profile) ForceClass(c *LinkClass) {
 	p.mu.Unlock()
 }
 
+// ResetForTransportChange invalidates every passive measurement tied to the
+// previous physical path. An adaptive Link proxy can move between an encrypted
+// tunnel and a verified direct-LAN connection without restarting the process;
+// carrying the old path's bandwidth EWMA across that boundary made the first
+// LAN cold read retain cellular readahead (and the reverse handoff could retain
+// LAN optimism). With no fresh samples Class() returns the transition-safe
+// medium policy until the existing RTT/read observers classify the new path.
+//
+// Explicit operator/OS ForceClass state is deliberately preserved. A forced
+// metered interface remains metered across proxy reconnects, while automatic
+// mode forgets only measurements, not configuration.
+func (p *Profile) ResetForTransportChange() {
+	p.mu.Lock()
+	p.rtt = 0
+	p.rttvar = 0
+	p.haveRTT = false
+	p.bwBps = 0
+	p.haveBW = false
+	p.bwSamples = 0
+	p.highLatency = false
+	p.winStart = time.Time{}
+	p.winLastEnd = time.Time{}
+	p.winBytes = 0
+	p.winIntervals = p.winIntervals[:0]
+	p.mu.Unlock()
+}
+
 // class computes the current class under the read lock held by the caller.
 func (p *Profile) classLocked() (LinkClass, bool) {
 	if p.forcedClass != nil {
