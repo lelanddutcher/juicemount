@@ -383,7 +383,14 @@ public final class ServerController {
                     guard let self else { return }
                     self.linkTestInFlight = false
                     self.linkTestResult = result
-                    if result.ok && shouldRestart {
+                    // Apply & Test temporarily tears down Link's shared tsnet
+                    // identity and loopback proxies. Restore the service when
+                    // it was running before the test even on failure; leaving
+                    // the app stopped after a denied permission or bad pairing
+                    // made a diagnostic action itself cause an outage. A failed
+                    // Link restarts into the existing truthful offline/cache
+                    // path and keeps the failure result visible above.
+                    if shouldRestart {
                         self.start()
                     }
                 }

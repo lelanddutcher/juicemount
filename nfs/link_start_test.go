@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -98,6 +100,32 @@ func TestLinkDiagnosticErrorKind(t *testing.T) {
 		if got := linkDiagnosticErrorKind([]any{errors.New(raw)}); got != want {
 			t.Errorf("linkDiagnosticErrorKind(%q) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+func TestPreflightLinkControl(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	var dialed string
+	err := preflightLinkControl(context.Background(), "http://192.0.2.10:30193", func(_ context.Context, network, address string) (net.Conn, error) {
+		dialed = network + " " + address
+		return client, nil
+	})
+	if err != nil || dialed != "tcp 192.0.2.10:30193" {
+		t.Fatalf("preflight = %q, %v", dialed, err)
+	}
+	if err := preflightLinkControl(context.Background(), "not-a-url", nil); err == nil || !strings.Contains(err.Error(), "http://") {
+		t.Fatalf("malformed URL error = %v", err)
+	}
+}
+
+func TestPreflightLinkControlNamesLocalNetworkRemedy(t *testing.T) {
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EHOSTUNREACH}
+	}
+	err := preflightLinkControl(context.Background(), "http://192.0.2.10:30193", dial)
+	if err == nil || !strings.Contains(err.Error(), "Privacy & Security > Local Network") {
+		t.Fatalf("local-network preflight error = %v", err)
 	}
 }
 

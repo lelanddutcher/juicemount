@@ -15,6 +15,7 @@ package nfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lelanddutcher/juicemount/internal/jmlog"
@@ -182,6 +184,42 @@ func linkDiagnosticErrorKind(args []any) string {
 // same blocked login race, so leave a measured safety margin before the single
 // saved-authorization recovery attempt.
 const linkNoStateRecoveryDelay = 15 * time.Second
+const linkControlPreflightTimeout = 3 * time.Second
+
+// preflightLinkControl performs the user's Apply/Test control connection while
+// the Settings action is in the foreground. Besides avoiding a 45-second
+// NoState wait for an address that cannot be dialed, this is the connection
+// macOS uses to request Local Network consent for LAN-hosted Headscale.
+func preflightLinkControl(ctx context.Context, rawURL string, dial contextDialer) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return fmt.Errorf("link: server URL must include http:// or https:// and a host")
+	}
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		default:
+			return fmt.Errorf("link: unsupported server URL scheme %q", u.Scheme)
+		}
+	}
+	if dial == nil {
+		return fmt.Errorf("link: control preflight is unavailable")
+	}
+	conn, err := dial(ctx, "tcp", net.JoinHostPort(u.Hostname(), port))
+	if err != nil {
+		if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) ||
+			errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
+			return fmt.Errorf("link: macOS blocked Local Network access; enable JuiceMount in System Settings > Privacy & Security > Local Network, then relaunch and test again")
+		}
+		return fmt.Errorf("link: control server is unreachable: %w", err)
+	}
+	_ = conn.Close()
+	return nil
+}
 
 // tcpProxy accepts only on loopback and forwards each connection through its
 // supplied dialer. It owns active connections so Link shutdown cannot leave
@@ -270,6 +308,12 @@ func recoverLinkNoState(ctx context.Context, lc linkControlClient, authKey strin
 // registration. Apply/Test uses this synchronous contract so success means the
 // encrypted route is ready now, not merely retrying in the background.
 func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, []string, error) {
+	preflightCtx, preflightCancel := context.WithTimeout(context.Background(), linkControlPreflightTimeout)
+	preflightErr := preflightLinkControl(preflightCtx, controlURL, (&net.Dialer{Timeout: linkControlPreflightTimeout}).DialContext)
+	preflightCancel()
+	if preflightErr != nil {
+		return nil, nil, preflightErr
+	}
 	node, status, err := newLinkNode(controlURL, authKey, hostname, stateDir)
 	if err != nil {
 		return nil, nil, err
