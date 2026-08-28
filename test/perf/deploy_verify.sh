@@ -22,19 +22,64 @@ CP=http://127.0.0.1:11050
 FI="$HOME/.juicemount/fuse-internal"
 LOG(){ echo "[deploy $(date +%H:%M:%S)] $*"; }
 bounded(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
+proc_count(){ pgrep -f "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+# Match the product executable rather than one bundle name. Release validation
+# deliberately launches versioned copies (for example "JuiceMount RC abc.app")
+# next to the installed app; matching only "JuiceMount.app" leaves those copies
+# alive during rollback, holding ports and the shared tsnet state directory.
+product_app_pids(){
+  local pid command
+  while read -r pid command; do
+    case "$command" in
+      */Contents/MacOS/JuiceMount) echo "$pid" ;;
+    esac
+  done < <(ps -axo pid=,command=)
+}
+
+product_app_count(){
+  local pids
+  pids="$(product_app_pids)"
+  [ -z "$pids" ] && { echo 0; return; }
+  printf '%s\n' "$pids" | wc -l | tr -d ' '
+}
+
+app_pids_for(){
+  local app="$1" want="$1/Contents/MacOS/JuiceMount" pid command
+  while read -r pid command; do
+    [ "$command" = "$want" ] && echo "$pid"
+  done < <(ps -axo pid=,command=)
+}
 
 clean_stop(){
   LOG "clean stop: graceful quit"
-  osascript -e 'tell application "JuiceMount" to quit' >/dev/null 2>&1
-  for i in $(seq 1 12); do pgrep -f 'JuiceMount.app/Contents/MacOS' >/dev/null || break; sleep 1; done
-  pgrep -f 'JuiceMount.app/Contents/MacOS' >/dev/null && { LOG "force kill app"; pkill -9 -f 'JuiceMount.app/Contents/MacOS'; sleep 2; }
+  # Apple Events can block forever when the app's main thread is trapped behind
+  # a wedged Finder/NFS request. The rollback harness itself must remain bounded.
+  bounded 8 osascript -e 'tell application id "com.juicemount.app" to quit' >/dev/null 2>&1 || true
+  for i in $(seq 1 12); do [ "$(product_app_count)" -eq 0 ] && break; sleep 1; done
+  local app_pids
+  app_pids="$(product_app_pids)"
+  if [ -n "$app_pids" ]; then
+    LOG "terminate surviving app pids: $(echo "$app_pids" | tr '\n' ' ')"
+    kill -TERM $app_pids 2>/dev/null || true
+    for i in $(seq 1 10); do [ "$(product_app_count)" -eq 0 ] && break; sleep 1; done
+  fi
+  app_pids="$(product_app_pids)"
+  if [ -n "$app_pids" ]; then
+    LOG "force kill surviving app pids: $(echo "$app_pids" | tr '\n' ' ')"
+    kill -KILL $app_pids 2>/dev/null || true
+    sleep 2
+  fi
   # juicefs must die too or the next launch hangs on a stale FUSE session
   pgrep -f 'juicefs.*mount' >/dev/null && { LOG "kill juicefs"; pkill -f 'juicefs.*mount'; sleep 2; }
   mount | grep -q 'zpool on /Volumes' && { LOG "umount NFS"; bounded 10 umount /Volumes/zpool 2>/dev/null || bounded 10 umount -f /Volumes/zpool 2>/dev/null; }
   [ -n "${ALT_MOUNT:-}" ] && mount | grep -q "$ALT_MOUNT" && { LOG "umount ALT $ALT_MOUNT"; bounded 10 umount "$ALT_MOUNT" 2>/dev/null || bounded 10 umount -f "$ALT_MOUNT" 2>/dev/null; }
   mount | grep -q "$FI" && { LOG "umount FUSE"; bounded 10 umount "$FI" 2>/dev/null || bounded 10 umount -f "$FI" 2>/dev/null; }
   sleep 1
-  LOG "stopped: app=$(pgrep -cf 'JuiceMount.app/Contents/MacOS' || echo 0) juicefs=$(pgrep -cf 'juicefs.*mount' || echo 0) mounts=$(mount | grep -c -e 'zpool on /Volumes' -e "$FI")"
+  local remaining_apps
+  remaining_apps="$(product_app_count)"
+  LOG "stopped: app=$remaining_apps juicefs=$(proc_count 'juicefs.*mount') mounts=$(mount | grep -c -e 'zpool on /Volumes' -e "$FI")"
+  [ "$remaining_apps" -eq 0 ]
 }
 
 verify(){ # verify <budget-seconds> → 0 ok / 1 fail
@@ -79,31 +124,31 @@ verify(){ # verify <budget-seconds> → 0 ok / 1 fail
 
 launch(){
   LOG "launch $1"
-  open -a "$1" 2>/dev/null
-  # 07-10 hardening: `open -a` can silently no-op right after a kill -9 of
+  open -na "$1" 2>/dev/null
+  # 07-10 hardening: LaunchServices can silently no-op right after a kill -9 of
   # the prior instance (stale LaunchServices running-state) — Batch D never
   # started and the whole deploy "failed" with a healthy binary. Verify the
   # process EXISTS within 10s; fall back to launching the naked binary.
   for i in $(seq 1 10); do
-    pgrep -f "$1/Contents/MacOS" >/dev/null && { LOG "launch confirmed (open)"; return 0; }
+    [ -n "$(app_pids_for "$1")" ] && { LOG "launch confirmed (open)"; return 0; }
     sleep 1
   done
-  LOG "open -a did not start the app — naked-binary fallback"
+  LOG "open -na did not start the app — naked-binary fallback"
   nohup "$1/Contents/MacOS/JuiceMount" >/dev/null 2>&1 &
   disown
   sleep 3
-  pgrep -f "$1/Contents/MacOS" >/dev/null && LOG "launch confirmed (naked)" || LOG "LAUNCH FAILED ENTIRELY"
+  [ -n "$(app_pids_for "$1")" ] && LOG "launch confirmed (naked)" || LOG "LAUNCH FAILED ENTIRELY"
 }
 
 LOG "=== DEPLOY $NEW_APP (rollback: $GOOD_APP) ==="
-clean_stop
+clean_stop || { LOG "!!!!! CLEAN STOP FAILED — refusing to launch a second app instance"; exit 2; }
 launch "$NEW_APP"
 if verify "${VERIFY_BUDGET:-180}"; then
   LOG "=== NEW BUILD LIVE + VERIFIED ==="
   exit 0
 fi
 LOG "!!! new build FAILED verification — ROLLING BACK"
-clean_stop
+clean_stop || { LOG "!!!!! ROLLBACK CLEAN STOP FAILED — refusing to launch a second app instance"; exit 2; }
 launch "$GOOD_APP"
 if verify "${VERIFY_BUDGET:-180}"; then
   LOG "=== ROLLBACK OK — known-good restored ==="

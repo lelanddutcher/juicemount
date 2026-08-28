@@ -40,6 +40,7 @@ type LinkNode struct {
 	srv             *tsnet.Server
 	mu              sync.Mutex
 	hostname        string
+	recoverNoState  linkRecoveryFunc
 	proxies         []*tcpProxy
 	proxyEndpoints  map[string]string
 	addrs           []string
@@ -60,6 +61,10 @@ type LinkNode struct {
 // contextDialer is deliberately small so proxy behavior can be tested with a
 // normal TCP dialer; production passes tsnet.Server.Dial.
 type contextDialer func(context.Context, string, string) (net.Conn, error)
+
+type linkRecoveryFunc func(context.Context) error
+
+const linkNoStateRecoveryDelay = 5 * time.Second
 
 // tcpProxy accepts only on loopback and forwards each connection through its
 // supplied dialer. It owns active connections so Link shutdown cannot leave
@@ -117,9 +122,10 @@ func newLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, lin
 		return nil, nil, fmt.Errorf("link: local client: %w", err)
 	}
 	node := &LinkNode{
-		srv:      s,
-		hostname: hostname,
-		readyCh:  make(chan struct{}),
+		srv:            s,
+		hostname:       hostname,
+		recoverNoState: lc.StartLoginInteractive,
+		readyCh:        make(chan struct{}),
 	}
 	return node, lc.StatusWithoutPeers, nil
 }
@@ -134,7 +140,7 @@ func StartLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, [
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	st, err := waitForLinkRunning(ctx, status, 200*time.Millisecond)
+	st, err := waitForLinkRunningWithRecovery(ctx, status, 200*time.Millisecond, linkNoStateRecoveryDelay, node.recoverNoState)
 	if err == nil {
 		err = node.configureReady(st)
 	}
@@ -192,7 +198,7 @@ func (l *LinkNode) startDeferredReadinessWith(status linkStatusFunc, pollEvery t
 	go func() {
 		lastState := ""
 		for {
-			st, err := waitForLinkRunning(ctx, func(ctx context.Context) (*ipnstate.Status, error) {
+			st, err := waitForLinkRunningWithRecovery(ctx, func(ctx context.Context) (*ipnstate.Status, error) {
 				current, statusErr := status(ctx)
 				l.noteReadinessAttempt(current, statusErr)
 				if statusErr == nil && current != nil && current.BackendState != lastState {
@@ -200,7 +206,7 @@ func (l *LinkNode) startDeferredReadinessWith(status linkStatusFunc, pollEvery t
 					jmlog.Info("link control state changed", "state", lastState)
 				}
 				return current, statusErr
-			}, pollEvery)
+			}, pollEvery, linkNoStateRecoveryDelay, l.recoverNoState)
 			if err != nil {
 				l.completeReady(err)
 				return
@@ -324,13 +330,26 @@ func (l *LinkNode) WaitReady(ctx context.Context) ([]string, error) {
 }
 
 func waitForLinkRunning(ctx context.Context, status linkStatusFunc, pollEvery time.Duration) (*ipnstate.Status, error) {
+	return waitForLinkRunningWithRecovery(ctx, status, pollEvery, 0, nil)
+}
+
+// waitForLinkRunningWithRecovery handles a tsnet startup race documented by
+// tsnet itself: LocalBackend.Start can still report NoState when tsnet decides
+// whether to trigger login, causing an otherwise valid auth key to be left
+// unused forever. Normal persisted-identity startup gets a grace period. Only
+// a continuously observed NoState receives one StartLoginInteractive request,
+// which is the same recovery tsnet uses for TSNET_FORCE_LOGIN without making
+// every app launch re-enrol the node.
+func waitForLinkRunningWithRecovery(ctx context.Context, status linkStatusFunc, pollEvery, recoverAfter time.Duration, recover linkRecoveryFunc) (*ipnstate.Status, error) {
 	if pollEvery <= 0 {
 		pollEvery = 200 * time.Millisecond
 	}
 	var (
-		lastState  = "unknown"
-		lastHealth []string
-		lastErr    error
+		lastState         = "unknown"
+		lastHealth        []string
+		lastErr           error
+		noStateSince      time.Time
+		recoveryAttempted bool
 	)
 	for {
 		st, err := status(ctx)
@@ -341,6 +360,25 @@ func waitForLinkRunning(ctx context.Context, status linkStatusFunc, pollEvery ti
 			lastHealth = append(lastHealth[:0], st.Health...)
 			if st.BackendState == ipn.Running.String() && len(st.TailscaleIPs) > 0 {
 				return st, nil
+			}
+			if st.BackendState == ipn.NoState.String() {
+				if noStateSince.IsZero() {
+					noStateSince = time.Now()
+				}
+				if recover != nil && recoverAfter > 0 && !recoveryAttempted && time.Since(noStateSince) >= recoverAfter {
+					recoveryAttempted = true
+					recoveryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					recoveryErr := recover(recoveryCtx)
+					cancel()
+					if recoveryErr != nil {
+						lastErr = fmt.Errorf("NoState recovery: %w", recoveryErr)
+						jmlog.Warn("link control remained NoState; authorization recovery request failed", "error", recoveryErr)
+					} else {
+						jmlog.Warn("link control remained NoState; requested saved-authorization recovery")
+					}
+				}
+			} else {
+				noStateSince = time.Time{}
 			}
 		}
 

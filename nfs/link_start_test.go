@@ -53,6 +53,66 @@ func TestWaitForLinkRunningRequiresAssignedAddress(t *testing.T) {
 	}
 }
 
+func TestWaitForLinkRunningRecoversPersistentNoStateOnce(t *testing.T) {
+	var recoveryCalls atomic.Int64
+	recovered := false
+	status := func(context.Context) (*ipnstate.Status, error) {
+		if !recovered {
+			return &ipnstate.Status{BackendState: "NoState", Health: []string{"login trigger pending"}}, nil
+		}
+		return &ipnstate.Status{
+			BackendState: "Running",
+			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.24")},
+		}, nil
+	}
+	recover := func(context.Context) error {
+		recoveryCalls.Add(1)
+		recovered = true
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	st, err := waitForLinkRunningWithRecovery(ctx, status, time.Millisecond, time.Millisecond, recover)
+	if err != nil {
+		t.Fatalf("waitForLinkRunningWithRecovery: %v", err)
+	}
+	if st.BackendState != "Running" {
+		t.Fatalf("backend state = %q, want Running", st.BackendState)
+	}
+	if got := recoveryCalls.Load(); got != 1 {
+		t.Fatalf("recovery calls = %d, want exactly 1", got)
+	}
+}
+
+func TestWaitForLinkRunningDoesNotRecoverBriefNoState(t *testing.T) {
+	statuses := []*ipnstate.Status{
+		{BackendState: "NoState"},
+		{BackendState: "Starting"},
+		{BackendState: "Running", TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.25")}},
+	}
+	call := 0
+	status := func(context.Context) (*ipnstate.Status, error) {
+		st := statuses[call]
+		call++
+		return st, nil
+	}
+	var recoveryCalls atomic.Int64
+	recover := func(context.Context) error {
+		recoveryCalls.Add(1)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := waitForLinkRunningWithRecovery(ctx, status, time.Millisecond, 100*time.Millisecond, recover); err != nil {
+		t.Fatalf("waitForLinkRunningWithRecovery: %v", err)
+	}
+	if got := recoveryCalls.Load(); got != 0 {
+		t.Fatalf("recovery calls = %d, want 0 for a normal transition", got)
+	}
+}
+
 func TestDeferredReadinessRetriesTransientConfigurationFailure(t *testing.T) {
 	node := &LinkNode{srv: &tsnet.Server{}, readyCh: make(chan struct{})}
 	t.Cleanup(func() {
