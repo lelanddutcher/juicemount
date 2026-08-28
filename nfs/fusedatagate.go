@@ -83,12 +83,8 @@ func effectiveFUSEDataWidth() int64 {
 	base := int64(fuseDataGateWidth())
 	switch netprofile.Default().Class() {
 	case netprofile.ClassMetered:
-		// One foreground read plus the metered policy's two tightly bounded
-		// prefetch workers. A width of two serialized one of those streams and
-		// left a shaped 40 Mbit/s Link mostly idle; three remains far below the
-		// 62 concurrent FUSE calls that killed the macFUSE session.
-		if base > 3 {
-			return 3
+		if base > 2 {
+			return 2
 		}
 	case netprofile.ClassSlow:
 		if base > 4 {

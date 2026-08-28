@@ -141,8 +141,8 @@ func TestDrainFUSESlotPreservesForegroundReservation(t *testing.T) {
 	}
 	defer releaseDrain()
 
-	if inUse, width := fuseDataGateDepth(); inUse != 1 || width != 3 {
-		t.Fatalf("gate depth=%d/%d, want 1/3 with one metered drain", inUse, width)
+	if inUse, width := fuseDataGateDepth(); inUse != 1 || width != 2 {
+		t.Fatalf("gate depth=%d/%d, want 1/2 with one metered drain", inUse, width)
 	}
 	if release, admitted := tryAcquireFUSEDataBackground(); admitted {
 		release()
