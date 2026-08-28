@@ -64,6 +64,11 @@ type contextDialer func(context.Context, string, string) (net.Conn, error)
 
 type linkRecoveryFunc func(context.Context) error
 
+type linkControlClient interface {
+	Start(context.Context, ipn.Options) error
+	StartLoginInteractive(context.Context) error
+}
+
 // Headscale can retain the prior streaming map session for roughly ten seconds
 // after tsnet closes locally. Recovering before that release merely replays the
 // same blocked login race, so leave a measured safety margin before the single
@@ -126,12 +131,30 @@ func newLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, lin
 		return nil, nil, fmt.Errorf("link: local client: %w", err)
 	}
 	node := &LinkNode{
-		srv:            s,
-		hostname:       hostname,
-		recoverNoState: lc.StartLoginInteractive,
-		readyCh:        make(chan struct{}),
+		srv:      s,
+		hostname: hostname,
+		recoverNoState: func(ctx context.Context) error {
+			return recoverLinkNoState(ctx, lc, authKey)
+		},
+		readyCh: make(chan struct{}),
 	}
 	return node, lc.StatusWithoutPeers, nil
+}
+
+// recoverLinkNoState replaces the control client that was created while the
+// prior Headscale map session was still draining. Restarting with nil prefs
+// retains the durable profile and node keys; the auth key is supplied only so
+// a legitimately expired/revoked profile can re-authorize instead of hanging.
+// The login request then kicks the newly-created control client, not the stale
+// one that produced the persistent NoState.
+func recoverLinkNoState(ctx context.Context, lc linkControlClient, authKey string) error {
+	if err := lc.Start(ctx, ipn.Options{AuthKey: authKey}); err != nil {
+		return fmt.Errorf("restart control client: %w", err)
+	}
+	if err := lc.StartLoginInteractive(ctx); err != nil {
+		return fmt.Errorf("request login after control restart: %w", err)
+	}
+	return nil
 }
 
 // StartLinkNode brings up the embedded tailnet node and waits (bounded) for
@@ -341,9 +364,8 @@ func waitForLinkRunning(ctx context.Context, status linkStatusFunc, pollEvery ti
 // tsnet itself: LocalBackend.Start can still report NoState when tsnet decides
 // whether to trigger login, causing an otherwise valid auth key to be left
 // unused forever. Normal persisted-identity startup gets a grace period. Only
-// a continuously observed NoState receives one StartLoginInteractive request,
-// which is the same recovery tsnet uses for TSNET_FORCE_LOGIN without making
-// every app launch re-enrol the node.
+// a continuously observed NoState receives one control-client restart and
+// login request, without making every app launch re-enrol the node.
 func waitForLinkRunningWithRecovery(ctx context.Context, status linkStatusFunc, pollEvery, recoverAfter time.Duration, recover linkRecoveryFunc) (*ipnstate.Status, error) {
 	if pollEvery <= 0 {
 		pollEvery = 200 * time.Millisecond

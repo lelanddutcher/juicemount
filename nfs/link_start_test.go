@@ -9,9 +9,55 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
+
+type fakeLinkControlClient struct {
+	startErr error
+	loginErr error
+	options  []ipn.Options
+	calls    []string
+}
+
+func (f *fakeLinkControlClient) Start(_ context.Context, opts ipn.Options) error {
+	f.calls = append(f.calls, "start")
+	f.options = append(f.options, opts)
+	return f.startErr
+}
+
+func (f *fakeLinkControlClient) StartLoginInteractive(context.Context) error {
+	f.calls = append(f.calls, "login")
+	return f.loginErr
+}
+
+func TestRecoverLinkNoStateRestartsThenRequestsLogin(t *testing.T) {
+	client := &fakeLinkControlClient{}
+	if err := recoverLinkNoState(context.Background(), client, "test-auth-key"); err != nil {
+		t.Fatalf("recoverLinkNoState: %v", err)
+	}
+	if got := strings.Join(client.calls, ","); got != "start,login" {
+		t.Fatalf("calls = %q, want start,login", got)
+	}
+	if len(client.options) != 1 || client.options[0].AuthKey != "test-auth-key" {
+		t.Fatalf("restart did not receive saved authorization")
+	}
+	if client.options[0].UpdatePrefs != nil {
+		t.Fatalf("restart unexpectedly replaced persisted preferences")
+	}
+}
+
+func TestRecoverLinkNoStateStopsAfterRestartFailure(t *testing.T) {
+	client := &fakeLinkControlClient{startErr: errors.New("restart failed")}
+	err := recoverLinkNoState(context.Background(), client, "test-auth-key")
+	if err == nil || !strings.Contains(err.Error(), "restart control client") {
+		t.Fatalf("recoverLinkNoState error = %v", err)
+	}
+	if got := strings.Join(client.calls, ","); got != "start" {
+		t.Fatalf("calls = %q, want start only", got)
+	}
+}
 
 func TestWaitForLinkRunningPollsCurrentState(t *testing.T) {
 	statuses := []*ipnstate.Status{
