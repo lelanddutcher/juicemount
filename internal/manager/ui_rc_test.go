@@ -38,6 +38,8 @@ func TestManagerRCUIKeepsAccessibilityAndBoundedErrors(t *testing.T) {
 		"function compactHTTPError",
 		"detail.length > 240",
 		"r.headers.get('content-type')",
+		"a.setAttribute('aria-current', 'page')",
+		"a.removeAttribute('aria-current')",
 	} {
 		if !strings.Contains(app, marker) {
 			t.Errorf("Manager client lost bounded transport-error behavior %q", marker)

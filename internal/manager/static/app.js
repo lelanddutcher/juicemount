@@ -74,7 +74,16 @@
       el.hidden = el.dataset.tab !== name;
     });
     $$('.sidebar a[data-tab-link]').forEach((a) => {
-      a.classList.toggle('active', a.dataset.tabLink === name);
+      const active = a.dataset.tabLink === name;
+      a.classList.toggle('active', active);
+      // The active route was previously communicated by color alone. Keep the
+      // visual state and expose the same single-current-page contract to screen
+      // readers and other assistive technology.
+      if (active) {
+        a.setAttribute('aria-current', 'page');
+      } else {
+        a.removeAttribute('aria-current');
+      }
     });
     if (name === 'migrations') {
       initMigrationsOnce();
