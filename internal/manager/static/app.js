@@ -1305,6 +1305,12 @@
 			meta.appendChild(fallback);
 			li.classList.add('fallback');
 		}
+		if (j.parent_id) {
+			const parent = document.createElement('span');
+			parent.className = 'farm-job-count telemetry';
+			parent.textContent = 'split from ' + j.parent_id;
+			meta.appendChild(parent);
+		}
 		for (const [label, value] of [['backend', j.backend], ['target', j.target_worker], ['running on', j.worker]]) {
 			if (!value || (label === 'target' && value === j.worker)) continue;
 			const detail = document.createElement('span');

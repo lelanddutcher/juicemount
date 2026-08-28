@@ -10,6 +10,7 @@ func TestJobStatusRoundTrip(t *testing.T) {
 		Producer: "manager", EnqueuedAt: "2026-06-25T12:00:00Z",
 		StartedAt: "2026-06-25T12:00:05Z", Processed: 7, Failed: 1, Error: "boom",
 		Worker: "gpu-1", TargetWorker: "gpu-1", Backend: "hevc_vaapi", QueueClass: QueueClassRender, Attempts: 1,
+		ParentID: "parent-123",
 	}
 	// toMap stores ints as strings (Redis HASH is all-strings); reconstitute
 	// via a string map mirroring HGETALL.
@@ -33,7 +34,7 @@ func TestJobStatusRoundTrip(t *testing.T) {
 func TestJobStatusOptionalFieldsOmitted(t *testing.T) {
 	in := JobStatus{ID: "x", Status: StatusQueued, Path: "/jfs/x", Producer: "manager"}
 	m := in.toMap()
-	for _, k := range []string{"started_at", "finished_at", "error"} {
+	for _, k := range []string{"started_at", "finished_at", "error", "parent_id"} {
 		if _, present := m[k]; present {
 			t.Errorf("optional field %q should be omitted when empty", k)
 		}

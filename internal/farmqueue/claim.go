@@ -253,7 +253,8 @@ redis.call('LPUSH', KEYS[2], ARGV[2])
 redis.call('ZREM', KEYS[3], ARGV[3])
 redis.call('HSET', KEYS[4],
   'status', 'queued', 'worker', '', 'backend', ARGV[4],
-  'target_worker', ARGV[5], 'queue_class', ARGV[6], 'attempts', ARGV[7], 'error', ARGV[8])
+  'target_worker', ARGV[5], 'queue_class', ARGV[6], 'attempts', ARGV[7], 'error', ARGV[8],
+  'processed', ARGV[10], 'failed', '0')
 redis.call('HDEL', KEYS[4], 'lease_owner', 'lease_expires_at', 'finished_at')
 if redis.call('LLEN', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[5], ARGV[9])
@@ -262,7 +263,7 @@ return 1`
 	n, err := c.rdb.Eval(ctx, script, []string{
 		processingKey, target, LeaseIndexKey, JobHashPrefix + job.ID, ProcessingIndexKey,
 	}, claim.Raw, string(raw), job.ID, job.SelectedBackend, job.SelectedWorker, job.QueueClass,
-		strconv.Itoa(job.Attempts), reason, claim.WorkerID).Int()
+		strconv.Itoa(job.Attempts), reason, claim.WorkerID, strconv.Itoa(job.ProcessedOffset)).Int()
 	if err != nil {
 		return err
 	}

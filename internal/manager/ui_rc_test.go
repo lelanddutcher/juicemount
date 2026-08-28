@@ -76,6 +76,7 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 		"Admin key verified",
 		"Authentication disabled",
 		"CPU H.264 fallback",
+		"split from ",
 		"partial: 'Partial'",
 		"Recovery note: ",
 	} {

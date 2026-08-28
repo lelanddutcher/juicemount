@@ -176,6 +176,11 @@ type Job struct {
 	SelectedBackend      string   `json:"selected_backend,omitempty"`
 	SelectedWorker       string   `json:"selected_worker,omitempty"`
 	Attempts             int      `json:"attempts,omitempty"`
+	ParentID             string   `json:"parent_id,omitempty"`
+	// ProcessedOffset carries successful work across a narrowed retry. The
+	// terminal status adds the retry's results so partial GPU success is not
+	// erased when only failed targets move to another worker or the CPU lane.
+	ProcessedOffset int `json:"processed_offset,omitempty"`
 	// RetryTargets is worker-authored after a partially successful batch. It
 	// narrows the next hardware retry or CPU fallback to the exact files that
 	// failed, so a directory-shaped job can never recompute successful GPU
@@ -202,6 +207,7 @@ type JobStatus struct {
 	Backend      string `json:"backend,omitempty"`
 	QueueClass   string `json:"queue_class,omitempty"`
 	Attempts     int    `json:"attempts"`
+	ParentID     string `json:"parent_id,omitempty"`
 }
 
 // WorkerBenchmarks records observed rather than advertised capability. Startup
@@ -327,7 +333,7 @@ func (c *Client) Enqueue(ctx context.Context, j Job) error {
 	st := JobStatus{
 		ID: j.ID, Status: StatusQueued, Path: j.Path, Kinds: strings.Join(j.Kinds, ","),
 		Producer: j.Producer, EnqueuedAt: j.EnqueuedAt, Backend: j.SelectedBackend,
-		TargetWorker: j.SelectedWorker, QueueClass: j.QueueClass, Attempts: j.Attempts,
+		TargetWorker: j.SelectedWorker, QueueClass: j.QueueClass, Attempts: j.Attempts, ParentID: j.ParentID,
 	}
 	pipe := c.rdb.TxPipeline()
 	pipe.LPush(ctx, QueueKeyFor(&j), raw)
@@ -411,6 +417,16 @@ func (c *Client) MarkDone(ctx context.Context, id string, processed, failed int)
 func (c *Client) MarkFailed(ctx context.Context, id, errMsg string) error {
 	return c.rdb.HSet(ctx, JobHashPrefix+id, map[string]any{
 		"status": StatusFailed, "finished_at": nowISO(), "error": errMsg,
+	}).Err()
+}
+
+// MarkFailedWithCounts retains partial success when the final narrowed retry
+// still fails. Without this, a large GPU batch could publish thousands of
+// proxies and then appear as 0/0 merely because its small CPU subset failed.
+func (c *Client) MarkFailedWithCounts(ctx context.Context, id string, processed, failed int, errMsg string) error {
+	return c.rdb.HSet(ctx, JobHashPrefix+id, map[string]any{
+		"status": StatusFailed, "finished_at": nowISO(), "error": errMsg,
+		"processed": strconv.Itoa(processed), "failed": strconv.Itoa(failed),
 	}).Err()
 }
 
@@ -576,6 +592,9 @@ func (s JobStatus) toMap() map[string]any {
 	if s.QueueClass != "" {
 		m["queue_class"] = s.QueueClass
 	}
+	if s.ParentID != "" {
+		m["parent_id"] = s.ParentID
+	}
 	return m
 }
 
@@ -586,6 +605,6 @@ func jobStatusFromMap(m map[string]string) JobStatus {
 		Producer: m["producer"], EnqueuedAt: m["enqueued_at"],
 		StartedAt: m["started_at"], FinishedAt: m["finished_at"],
 		Processed: atoi(m["processed"]), Failed: atoi(m["failed"]), Error: m["error"],
-		Worker: m["worker"], TargetWorker: m["target_worker"], Backend: m["backend"], QueueClass: m["queue_class"], Attempts: atoi(m["attempts"]),
+		Worker: m["worker"], TargetWorker: m["target_worker"], Backend: m["backend"], QueueClass: m["queue_class"], Attempts: atoi(m["attempts"]), ParentID: m["parent_id"],
 	}
 }

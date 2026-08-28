@@ -9,37 +9,52 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/farmqueue"
 )
 
-// validateRenderProxyTargets admits a claimed proxy batch only when every
-// source can stay on the worker's verified hardware decode+encode path. A
-// directory may contain a mix of cameras; failing the batch before rendering
-// lets the durable queue visibly move it to the server CPU lane instead of
-// leaving failed derivative rows or silently decoding on CPU.
-func validateRenderProxyTargets(worker farmqueue.Worker, encoder string, targets []string) error {
+type renderFallbackTarget struct {
+	Path   string
+	Reason string
+}
+
+type renderTrackProbe func(string) (*farm.VideoTrack, error)
+
+// partitionRenderProxyTargets applies hardware-path admission per file. A
+// mixed camera directory is therefore two independent work sets: sources that
+// can stay on verified GPU decode+encode, and the exact sources that need an
+// explicit CPU fallback. One ProRes clip must never demote thousands of H.264
+// or HEVC clips to libx264.
+func partitionRenderProxyTargets(worker farmqueue.Worker, encoder string, targets []string, probe renderTrackProbe) (hardware []string, fallback []renderFallbackTarget) {
 	if worker.Role != farmqueue.QueueClassRender || encoder == "" {
-		return nil
+		return append([]string(nil), targets...), nil
 	}
 	for _, path := range targets {
-		// Admission must describe the bytes about to be rendered. Stored
-		// metadata may predate a file replacement or an earlier probe and is
-		// useful for ordering, but cannot prove that the current source is safe
-		// for the worker's verified hardware-only path.
-		info, err := os.Stat(path)
+		track, err := probe(path)
 		if err != nil {
-			return fmt.Errorf("render compatibility stat: %w", err)
-		}
-		tech, err := farm.Probe("", path, info.Size())
-		if err != nil {
-			return fmt.Errorf("render compatibility probe: %w", err)
-		}
-		track := tech.Video
-		if track == nil {
+			// No live proof means this file cannot enter a hardware-only job. Keep
+			// the uncertainty scoped to this source instead of poisoning the batch.
+			fallback = append(fallback, renderFallbackTarget{Path: path, Reason: "live compatibility probe failed: " + err.Error()})
 			continue
 		}
 		if reason := unsupportedHardwareDecodeReason(worker, encoder, track); reason != "" {
-			return fmt.Errorf("render worker cannot keep source on verified hardware path (%s); queued explicit CPU/H.264 fallback", reason)
+			fallback = append(fallback, renderFallbackTarget{Path: path, Reason: reason})
+			continue
 		}
+		hardware = append(hardware, path)
 	}
-	return nil
+	return hardware, fallback
+}
+
+// probeRenderVideoTrack describes the bytes about to be rendered. Stored
+// metadata can order work, but it may predate a file replacement and cannot
+// admit a source to the hardware-only path by itself.
+func probeRenderVideoTrack(path string) (*farm.VideoTrack, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat: %w", err)
+	}
+	tech, err := farm.Probe("", path, info.Size())
+	if err != nil {
+		return nil, err
+	}
+	return tech.Video, nil
 }
 
 func unsupportedHardwareDecodeReason(worker farmqueue.Worker, encoder string, track *farm.VideoTrack) string {

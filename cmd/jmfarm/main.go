@@ -962,7 +962,7 @@ func runQueue(cfg queueConfig) {
 		jobCfg := cfg
 		cfgMu.Unlock()
 		jobStarted := time.Now()
-		processed, failed, failedTargets, runErr := runJob(ctx, store, jobCfg, worker, job)
+		processed, failed, failedTargets, runErr := runJob(ctx, q, store, jobCfg, worker, job)
 		hbStop()
 		<-hbDone
 		recordCompletedJobBenchmark(&worker, job, processed, failed, time.Since(jobStarted))
@@ -975,6 +975,7 @@ func runQueue(cfg queueConfig) {
 			if len(failedTargets) > 0 {
 				claim.Job.RetryTargets = failedTargets
 			}
+			claim.Job.ProcessedOffset += processed
 			if err := q.RequeueClaim(context.Background(), claim, fallbackCPU, reason); err != nil {
 				// The durable receipt is still intact. Stop this worker so its
 				// heartbeat expires and another worker's reaper can recover it;
@@ -987,13 +988,13 @@ func runQueue(cfg queueConfig) {
 		terminalWritten := false
 		if runErr != nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: job %s failed: %v\n", job.ID, runErr)
-			if err := q.MarkFailed(context.Background(), job.ID, runErr.Error()); err != nil {
+			if err := q.MarkFailedWithCounts(context.Background(), job.ID, job.ProcessedOffset+processed, failed, runErr.Error()); err != nil {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-failed %s: %v\n", job.ID, err)
 			} else {
 				terminalWritten = true
 			}
 		} else {
-			if err := q.MarkDone(context.Background(), job.ID, processed, failed); err != nil {
+			if err := q.MarkDone(context.Background(), job.ID, job.ProcessedOffset+processed, failed); err != nil {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-done %s: %v\n", job.ID, err)
 			} else {
 				terminalWritten = true
@@ -1046,7 +1047,7 @@ func recordCompletedJobBenchmark(worker *farmqueue.Worker, job farmqueue.Job, pr
 // the job's non-zero options overriding the container run-defaults. It returns
 // the summed processed/failed across the selected passes; a non-nil error is a
 // HARD failure (couldn't collect targets / nothing usable) → MarkFailed.
-func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, worker farmqueue.Worker, job farmqueue.Job) (processed, failed int, failedTargets []string, err error) {
+func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, cfg queueConfig, worker farmqueue.Worker, job farmqueue.Job) (processed, failed int, failedTargets []string, err error) {
 	if !farmqueue.WorkerSupports(worker, job.RequiredCapabilities) {
 		return 0, 0, nil, fmt.Errorf("worker %s does not satisfy job capabilities %v", worker.Name, job.RequiredCapabilities)
 	}
@@ -1112,9 +1113,31 @@ func runJob(ctx context.Context, store *derivatives.Store, cfg queueConfig, work
 			job.ID, job.Path)
 		return 0, 0, nil, nil
 	}
-	if len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindProxy {
-		if err := validateRenderProxyTargets(worker, vcodec, targets); err != nil {
-			return 0, 0, nil, err
+	if len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindProxy && worker.Role == farmqueue.QueueClassRender {
+		hardwareTargets, fallbackTargets := partitionRenderProxyTargets(worker, vcodec, targets, probeRenderVideoTrack)
+		if len(fallbackTargets) > 0 {
+			paths := make([]string, 0, len(fallbackTargets))
+			for _, target := range fallbackTargets {
+				paths = append(paths, target.Path)
+			}
+			reason := fmt.Sprintf("%d source(s) partitioned to explicit CPU/H.264 fallback; first reason: %s",
+				len(fallbackTargets), fallbackTargets[0].Reason)
+			fallbackJob, created, splitErr := q.EnqueueCPUFallbackSubset(ctx, job, paths, reason)
+			if splitErr != nil {
+				return 0, 0, nil, fmt.Errorf("enqueue CPU fallback subset: %w", splitErr)
+			}
+			state := "already present in"
+			if created {
+				state = "queued as"
+			}
+			fmt.Printf("jmfarm queue: job %s kept %d source(s) on %s; %d source(s) %s CPU child %s\n",
+				job.ID, len(hardwareTargets), vcodec, len(fallbackTargets), state, fallbackJob.ID)
+		}
+		targets = hardwareTargets
+		if len(targets) == 0 {
+			// The CPU child owns every source. Completing this render parent frees
+			// the accelerator immediately and leaves an inspectable split record.
+			return 0, 0, nil, nil
 		}
 	}
 
