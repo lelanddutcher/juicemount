@@ -17,7 +17,17 @@
 #      re-verify (same gates). Exit 0 = new build live; 1 = rolled back OK;
 #      2 = rollback ALSO failed (mount left stopped — human needed).
 set -u
-NEW_APP="$1"; GOOD_APP="$2"
+
+# LaunchServices must receive a bundle path, not an application name. Keep both
+# inputs absolute so the process-identity check below matches the command path
+# macOS records for a persistently launched bundle.
+absolute_app_path(){
+  local app="$1"
+  (cd "$(dirname "$app")" && printf '%s/%s\n' "$PWD" "$(basename "$app")")
+}
+
+NEW_APP="$(absolute_app_path "$1")"
+GOOD_APP="$(absolute_app_path "$2")"
 CP=http://127.0.0.1:11050
 FI="$HOME/.juicemount/fuse-internal"
 LOG(){ echo "[deploy $(date +%H:%M:%S)] $*"; }
@@ -122,9 +132,20 @@ verify(){ # verify <budget-seconds> → 0 ok / 1 fail
   return 1
 }
 
+verify_stable(){ # verify_stable <app-path> -> 0 only if bundle stays live
+  local app="$1" settle="${STABILITY_SECONDS:-20}"
+  LOG "stability gate: waiting ${settle}s for persistent bundle process"
+  sleep "$settle"
+  if [ -z "$(app_pids_for "$app")" ]; then
+    LOG "stability gate: app process disappeared"
+    return 1
+  fi
+  verify 12
+}
+
 launch(){
   LOG "launch $1"
-  open -na "$1" 2>/dev/null
+  open -n "$1" 2>/dev/null
   # 07-10 hardening: LaunchServices can silently no-op right after a kill -9 of
   # the prior instance (stale LaunchServices running-state) — Batch D never
   # started and the whole deploy "failed" with a healthy binary. Verify the
@@ -143,14 +164,14 @@ launch(){
 LOG "=== DEPLOY $NEW_APP (rollback: $GOOD_APP) ==="
 clean_stop || { LOG "!!!!! CLEAN STOP FAILED — refusing to launch a second app instance"; exit 2; }
 launch "$NEW_APP"
-if verify "${VERIFY_BUDGET:-180}"; then
+if verify "${VERIFY_BUDGET:-180}" && verify_stable "$NEW_APP"; then
   LOG "=== NEW BUILD LIVE + VERIFIED ==="
   exit 0
 fi
 LOG "!!! new build FAILED verification — ROLLING BACK"
 clean_stop || { LOG "!!!!! ROLLBACK CLEAN STOP FAILED — refusing to launch a second app instance"; exit 2; }
 launch "$GOOD_APP"
-if verify "${VERIFY_BUDGET:-180}"; then
+if verify "${VERIFY_BUDGET:-180}" && verify_stable "$GOOD_APP"; then
   LOG "=== ROLLBACK OK — known-good restored ==="
   exit 1
 fi
