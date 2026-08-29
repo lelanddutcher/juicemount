@@ -148,16 +148,40 @@ func reclaimableCacheBytes(in cacheReclaimInputs) int64 {
 }
 
 // spoolHeadroomBytes is the number of bytes the spool may still consume on this
-// volume: free disk PLUS the reclaimable JuiceFS cache, minus the floor the
-// spool leaves for the OS. Never negative.
+// volume. Above the preferred floor it is free disk PLUS reclaimable JuiceFS
+// cache minus SpoolFreeFloorBytes.
 //
-// With every gate closed this is exactly the historical `avail -
-// SpoolFreeFloorBytes`, which is the required degradation: an unknown cache must
-// make the spool smaller, never bigger.
+// A machine may already be slightly below that preferred floor for reasons the
+// spool did not cause (Time Machine snapshots, Xcode builds, user files). The
+// historical formula returned zero there, which becomes a 1-byte sentinel in
+// refreshCeiling: even a tiny Finder write then parks for the full two-minute
+// wedge backstop. Below the preferred floor we therefore expose a bounded
+// 512 MiB working window, but only from bytes above the independent 10 GiB OS
+// hard floor. This is not fail-open: large writes still backpressure, and no
+// admission can push the disk through SpoolHardFreeFloorBytes.
+//
+// Never negative. An unknown cache still makes the normal-mode number smaller,
+// never bigger; the low-disk window depends only on statfs, not on cache data.
 func spoolHeadroomBytes(avail int64, in cacheReclaimInputs) int64 {
+	// Physical free space is authoritative at the hard floor. A cache verdict
+	// describes reclaimable copies, not bytes that have already been returned to
+	// the filesystem; admitting against it while statfs is at/below 10 GiB could
+	// consume the OS reserve before JuiceFS eviction catches up.
+	if avail <= SpoolHardFreeFloorBytes {
+		return 0
+	}
+
 	headroom := avail + reclaimableCacheBytes(in) - SpoolFreeFloorBytes
 	if headroom < 0 {
 		headroom = 0
+	}
+
+	emergency := avail - SpoolHardFreeFloorBytes
+	if emergency > spoolLowDiskWorkingSetBytes {
+		emergency = spoolLowDiskWorkingSetBytes
+	}
+	if emergency > headroom {
+		return emergency
 	}
 	return headroom
 }

@@ -379,7 +379,7 @@ struct PreferencesWindowView: View {
             } header: {
                 Text("Write spool (background uploads)")
             } footer: {
-                footnote("Writes land on the local SSD and are acknowledged immediately, then upload in the background — large copies feel local even over a slow link. Auto-size lets the buffer grow to nearly all free disk (keeping a 20 GB safety floor) so a big offline ingest fits; you can set a fixed cap instead. When the buffer fills, copies PAUSE (not fail) and resume as space frees or you reconnect. Pending uploads show in the menu-bar popover. Capacity changes apply on the next start.")
+                footnote("Writes land on the local SSD and are acknowledged immediately, then upload in the background — large copies feel local even over a slow link. Auto-size normally keeps a 20 GB safety floor. If the Mac is already below it, a small working window remains available without crossing the 10 GB OS floor, so ordinary writes do not wedge. You can set a fixed cap instead. When the buffer fills, copies pause and resume as space frees or you reconnect. Pending uploads show in the menu-bar popover. Capacity changes apply on the next start.")
             }
 
             Section {

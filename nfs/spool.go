@@ -176,12 +176,30 @@ func (s *SpoolStore) unlockAllShards() {
 	}
 }
 
-// SpoolFreeFloorBytes is the disk space the spool leaves free when
-// auto-sizing or clamping its capacity, so the OS and the JuiceFS cache that
-// shares the same SSD always have headroom. Mirrors the 10 GiB cache floor in
-// health/fuse.go but is larger because the spool can hold an entire un-drained
-// SD-card burst.
-const SpoolFreeFloorBytes = int64(20) << 30 // 20 GiB
+const (
+	// SpoolFreeFloorBytes is the PREFERRED disk space the spool leaves free when
+	// auto-sizing or clamping its capacity, so the OS and the JuiceFS cache that
+	// shares the same SSD have headroom. It is larger than the OS hard floor
+	// because the spool can hold an entire un-drained SD-card burst.
+	SpoolFreeFloorBytes = int64(20) << 30 // 20 GiB
+
+	// SpoolHardFreeFloorBytes is the floor the write path never crosses, even on
+	// a machine that was already below the preferred 20 GiB floor when the app
+	// started. It mirrors health/cacheFreeFloorBytesConst. Keeping the two at
+	// 10 GiB prevents the mount from consuming the operating system's last free
+	// space while still leaving a bounded working window for ordinary writes.
+	// TestSpoolHardFloorMirrorHasNotDrifted guards the mirror.
+	SpoolHardFreeFloorBytes = int64(10) << 30 // 10 GiB
+
+	// spoolLowDiskWorkingSetBytes is the maximum instantaneous admission window
+	// below the preferred floor. Without it, 19.9 GiB free becomes the 1-byte
+	// sentinel and a 58-byte Finder write parks for the full capacity backstop.
+	// A 512 MiB window lets metadata and ordinary documents close and drain; it
+	// is small enough that a low-disk machine remains protected. Re-sampling may
+	// move this window as completed entries drain, but admission still stops at
+	// SpoolHardFreeFloorBytes.
+	spoolLowDiskWorkingSetBytes = int64(512) << 20 // 512 MiB
+)
 
 // spoolDiskAvail returns the bytes available to this user on the filesystem
 // backing dir. dir may not exist yet (NewSpoolStore creates it after the

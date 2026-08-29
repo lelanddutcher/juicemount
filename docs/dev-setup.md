@@ -145,7 +145,9 @@ End users configure everything through the app's Preferences window
 - **SSD cache:** the configured size is respected; it grows only as far
   as needed to keep the pinned set fully cached, and is clamped so the
   boot disk always keeps ≥10 GiB free. Normally `--free-space-ratio` keeps
-  JuiceFS eviction 10 GiB above the write spool's 20 GiB admission floor.
+  JuiceFS eviction 10 GiB above the write spool's preferred 20 GiB admission
+  floor. When the host is already below that preferred floor, the spool exposes
+  only a 512 MiB working window and never crosses its 10 GiB hard OS floor.
   On an already-constrained disk it may reduce only that extra cushion while
   preserving both a 512 MiB ordering margin and a 512 MiB usable cache window;
   if both cannot fit, caching suspends rather than starving writes. The effective

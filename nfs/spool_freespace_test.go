@@ -85,11 +85,19 @@ func TestEffectiveCapacity_TracksFreeDiskAfterConstruction(t *testing.T) {
 		}
 	})
 
-	t.Run("at the floor there is zero headroom, so admission stops", func(t *testing.T) {
+	t.Run("at the preferred floor a bounded working window remains", func(t *testing.T) {
 		s.used.Store(12 * gib)
-		seedDiskAvail(s, SpoolFreeFloorBytes) // exactly at the floor
+		seedDiskAvail(s, SpoolFreeFloorBytes)
+		if got, want := s.effectiveCapacity(), 12*gib+spoolLowDiskWorkingSetBytes; got != want {
+			t.Errorf("got %d, want %d (used + bounded low-disk working window)", got, want)
+		}
+	})
+
+	t.Run("at the hard floor there is zero headroom, so admission stops", func(t *testing.T) {
+		s.used.Store(12 * gib)
+		seedDiskAvail(s, SpoolHardFreeFloorBytes)
 		if got, want := s.effectiveCapacity(), 12*gib; got != want {
-			t.Errorf("got %d, want %d (== used: no new bytes may be admitted)", got, want)
+			t.Errorf("got %d, want %d (== used: hard OS floor forbids new bytes)", got, want)
 		}
 	})
 
@@ -232,12 +240,12 @@ func TestTryReserveCapacity_CumulativeAdmissionIsBoundedWithinOneSample(t *testi
 // cap at all, at the worst possible moment.
 func TestEffectiveCapacity_ZeroCeilingDoesNotReadAsUnlimited(t *testing.T) {
 	s := newFixedCapSpool(t, 100*gib)
-	s.used.Store(0)                       // empty spool
-	seedDiskAvail(s, SpoolFreeFloorBytes) // exactly at the floor -> headroom 0
+	s.used.Store(0)                           // empty spool
+	seedDiskAvail(s, SpoolHardFreeFloorBytes) // exactly at hard floor -> headroom 0
 
 	ec := s.effectiveCapacity()
 	if ec <= 0 {
-		t.Fatalf("effectiveCapacity()=%d reads as the 'unlimited' sentinel at the floor", ec)
+		t.Fatalf("effectiveCapacity()=%d reads as the 'unlimited' sentinel at the hard floor", ec)
 	}
 	if s.tryReserveCapacity(50 * gib) {
 		t.Error("admitted 50 GiB with an empty spool on a floor-constrained disk — sentinel collision is back")
@@ -262,7 +270,7 @@ func TestDiskConstrained_OnlyWhenTheDiskIsTheBlocker(t *testing.T) {
 
 	// Disk at the floor: constrained.
 	s.used.Store(1 * gib)
-	seedDiskAvail(s, SpoolFreeFloorBytes)
+	seedDiskAvail(s, SpoolHardFreeFloorBytes)
 	if !s.DiskConstrained() {
 		t.Error("disk at the floor must report disk-constrained")
 	}
@@ -287,11 +295,11 @@ func pinConstrained(t *testing.T, s *SpoolStore) {
 	t.Helper()
 	go func() {
 		for i := 0; i < 4000; i++ { // outlive the test; refreshes every ~1s TTL
-			seedDiskAvail(s, SpoolFreeFloorBytes)
+			seedDiskAvail(s, SpoolHardFreeFloorBytes)
 			time.Sleep(2 * time.Millisecond)
 		}
 	}()
-	seedDiskAvail(s, SpoolFreeFloorBytes)
+	seedDiskAvail(s, SpoolHardFreeFloorBytes)
 	if !s.DiskConstrained() {
 		t.Fatal("precondition: store should be disk-constrained")
 	}
@@ -391,7 +399,7 @@ func TestWaitForCapacity_FlappingDiskConstrainedStillTimesOut(t *testing.T) {
 			if roomy {
 				seedDiskAvail(s, 900*gib) // not constrained
 			} else {
-				seedDiskAvail(s, SpoolFreeFloorBytes) // constrained
+				seedDiskAvail(s, SpoolHardFreeFloorBytes) // constrained
 			}
 			roomy = !roomy
 			time.Sleep(2 * time.Millisecond)

@@ -205,3 +205,11 @@ func TestSpoolFloorMirrorHasNotDrifted(t *testing.T) {
 			spoolFreeFloorBytesConst, nfs.SpoolFreeFloorBytes)
 	}
 }
+
+func TestSpoolHardFloorMirrorHasNotDrifted(t *testing.T) {
+	if cacheFreeFloorBytesConst != nfs.SpoolHardFreeFloorBytes {
+		t.Fatalf("health.cacheFreeFloorBytesConst = %d but nfs.SpoolHardFreeFloorBytes = %d — "+
+			"the low-disk write window could consume the operating system's hard reserve",
+			cacheFreeFloorBytesConst, nfs.SpoolHardFreeFloorBytes)
+	}
+}

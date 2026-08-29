@@ -88,10 +88,11 @@ public final class Preferences {
         didSet { save() }
     }
     /// Local-SSD spool capacity in GB (`JM_SPOOL_SIZE_GB`). 0 = Auto: the Go
-    /// core sizes the buffer to free disk minus a 20 GB safety floor, so a large
-    /// offline ingest can absorb far more before pausing. Once full, writes no
-    /// longer fail — they PAUSE (stall to zero speed) and resume when the drain
-    /// frees space (online) or the user reconnects (offline). Default Auto.
+    /// core normally sizes the buffer to free disk minus a 20 GB preferred
+    /// safety floor. If the machine is already below that floor, a bounded
+    /// working window keeps small writes functional while preserving a hard
+    /// 10 GB OS floor. Once full, writes pause until the drain frees space or
+    /// the user reconnects. Default Auto.
     public var spoolCapacityGB: Int {
         didSet { save() }
     }

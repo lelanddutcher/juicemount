@@ -176,10 +176,12 @@ func TestSpoolHeadroomBytes_LiveIncidentShape(t *testing.T) {
 		t.Errorf("headroom = %d, want %d (avail + cache - margin - floor)", aware, want)
 	}
 
-	// The earlier documented incident: 14 GiB free, so free disk alone is BELOW
-	// the floor and the old formula produced zero headroom (a 1-byte ceiling).
-	if h := spoolHeadroomBytes(14*gib, cacheReclaimInputs{}); h != 0 {
-		t.Errorf("precondition: 14 GiB free must give 0 headroom under the old formula, got %d", h)
+	// The earlier documented incident: 14 GiB free is below the preferred floor.
+	// It must retain only the bounded low-disk working set instead of collapsing
+	// to the 1-byte sentinel that wedges even a tiny write.
+	if h := spoolHeadroomBytes(14*gib, cacheReclaimInputs{}); h != spoolLowDiskWorkingSetBytes {
+		t.Errorf("14 GiB free gave %d headroom, want the bounded %d-byte low-disk window",
+			h, spoolLowDiskWorkingSetBytes)
 	}
 	if h := spoolHeadroomBytes(14*gib, cacheReclaimInputs{
 		HaveVerdict: true, VerdictAge: fresh, BlockCacheBytes: cache,
@@ -200,10 +202,41 @@ func TestSpoolHeadroomBytes_LiveIncidentShape(t *testing.T) {
 	}
 }
 
+// A machine already below the preferred 20 GiB floor must still accept small
+// writes, but it must never spend through the independent 10 GiB OS hard floor.
+// This is the exact live RC incident: 19.6 GiB free made a 58-byte write wait in
+// nfs.Write because the old effective capacity was the 1-byte sentinel.
+func TestSpoolHeadroomBytes_LowDiskWorkingWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		avail int64
+		want  int64
+	}{
+		{name: "below hard floor", avail: SpoolHardFreeFloorBytes - 1, want: 0},
+		{name: "at hard floor", avail: SpoolHardFreeFloorBytes, want: 0},
+		{name: "partial window", avail: SpoolHardFreeFloorBytes + 128*(1<<20), want: 128 * (1 << 20)},
+		{name: "live incident shape", avail: 19*gib + 600*(1<<20), want: spoolLowDiskWorkingSetBytes},
+		{name: "at preferred floor", avail: SpoolFreeFloorBytes, want: spoolLowDiskWorkingSetBytes},
+		{name: "normal formula overtakes window", avail: SpoolFreeFloorBytes + 2*gib, want: 2 * gib},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := spoolHeadroomBytes(tc.avail, cacheReclaimInputs{}); got != tc.want {
+				t.Errorf("spoolHeadroomBytes(%d) = %d, want %d", tc.avail, got, tc.want)
+			}
+		})
+	}
+
+	if got := spoolHeadroomBytes(SpoolHardFreeFloorBytes, cacheReclaimInputs{
+		HaveVerdict: true, VerdictAge: fresh, BlockCacheBytes: 100 * gib,
+	}); got != 0 {
+		t.Errorf("hard floor with a large cache verdict admitted %d bytes; physical OS reserve must win", got)
+	}
+}
+
 // Headroom must never go negative regardless of inputs — a negative would
 // underflow into the ceiling arithmetic in refreshCeiling.
 func TestSpoolHeadroomBytes_NeverNegative(t *testing.T) {
-	for _, avail := range []int64{0, 1, 1 * gib, SpoolFreeFloorBytes, 900 * gib} {
+	for _, avail := range []int64{0, 1, 1 * gib, SpoolHardFreeFloorBytes, SpoolFreeFloorBytes, 900 * gib} {
 		for _, in := range []cacheReclaimInputs{
 			{},
 			{WritebackOn: true},
