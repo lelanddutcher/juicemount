@@ -98,6 +98,8 @@ declare -a FIXES=(
     "main.stopInProgress|/stop concurrent-POST gate (same commit)"
     "main.NFSServerStopMount|Middle-ground stop semantic for QA-7 (2026-05-17)"
     "main.handleCacheClearHTTP|POST /cache-clear admin endpoint for QA-3 (d09be09, 2026-05-17)"
+    "main.prepareLinkStateDir|Pairing-specific Link identity migration for reliable re-pairing (RC 0.5)"
+    "nfs.recoverLinkNoState|Saved-profile Link recovery without one-time-key replay (RC 0.5)"
 )
 
 FAILURES=0

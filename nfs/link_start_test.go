@@ -35,9 +35,9 @@ func (f *fakeLinkControlClient) StartLoginInteractive(context.Context) error {
 	return f.loginErr
 }
 
-func TestRecoverLinkNoStateRestartsThenRequestsLogin(t *testing.T) {
+func TestRecoverLinkNoStateFreshEnrollmentRestartsThenRequestsLogin(t *testing.T) {
 	client := &fakeLinkControlClient{}
-	if err := recoverLinkNoState(context.Background(), client, "test-auth-key"); err != nil {
+	if err := recoverLinkNoState(context.Background(), client, "test-auth-key", true); err != nil {
 		t.Fatalf("recoverLinkNoState: %v", err)
 	}
 	if got := strings.Join(client.calls, ","); got != "start,login" {
@@ -51,9 +51,25 @@ func TestRecoverLinkNoStateRestartsThenRequestsLogin(t *testing.T) {
 	}
 }
 
+func TestRecoverLinkNoStatePersistedIdentityNeverReplaysPairingCode(t *testing.T) {
+	client := &fakeLinkControlClient{}
+	if err := recoverLinkNoState(context.Background(), client, "consumed-one-time-key", false); err != nil {
+		t.Fatalf("recoverLinkNoState: %v", err)
+	}
+	if got := strings.Join(client.calls, ","); got != "start" {
+		t.Fatalf("calls = %q, want saved-profile restart only", got)
+	}
+	if len(client.options) != 1 || client.options[0].AuthKey != "" {
+		t.Fatalf("persisted restart replayed pairing authorization: %+v", client.options)
+	}
+	if client.options[0].UpdatePrefs != nil {
+		t.Fatal("persisted restart unexpectedly replaced saved preferences")
+	}
+}
+
 func TestRecoverLinkNoStateStopsAfterRestartFailure(t *testing.T) {
 	client := &fakeLinkControlClient{startErr: errors.New("restart failed")}
-	err := recoverLinkNoState(context.Background(), client, "test-auth-key")
+	err := recoverLinkNoState(context.Background(), client, "test-auth-key", true)
 	if err == nil || !strings.Contains(err.Error(), "restart control client") {
 		t.Fatalf("recoverLinkNoState error = %v", err)
 	}

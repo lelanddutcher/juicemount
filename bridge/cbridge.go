@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -233,6 +234,7 @@ func (c ServerConfig) reconcileInterval() time.Duration {
 var (
 	linkMu         sync.Mutex
 	linkTestMu     sync.Mutex
+	linkStateMu    sync.Mutex
 	globalLinkNode *jmnfs.LinkNode
 	globalLinkID   linkNodeIdentity
 )
@@ -307,10 +309,7 @@ type linkTestResult struct {
 	Error                string   `json:"error,omitempty"`
 }
 
-// linkStateDir keeps the tsnet machine identity next to the app's metadata
-// mirror. /tmp made every launch look like a new device and required another
-// pairing code after a restart.
-func linkStateDir(cfg ServerConfig) string {
+func linkStateRoot(cfg ServerConfig) string {
 	if cfg.DBPath != "" {
 		if parent := filepath.Dir(cfg.DBPath); parent != "." && parent != "" {
 			return filepath.Join(parent, "link")
@@ -320,6 +319,78 @@ func linkStateDir(cfg ServerConfig) string {
 		return filepath.Join(home, "Library", "Application Support", "JuiceMount", "link")
 	}
 	return ""
+}
+
+// linkStateDir isolates each one-time pairing authorization. Keeping every
+// pairing code in the old shared directory made tsnet prefer the previous
+// durable profile and silently ignore a newly entered code after revocation.
+// The hash is non-secret, stable for identical settings, and lets a new code
+// enroll cleanly while preserving restart identity for the active code.
+func linkStateDir(cfg ServerConfig) string {
+	root := linkStateRoot(cfg)
+	if root == "" {
+		return ""
+	}
+	// Hostname is intentionally excluded: it is mutable profile metadata and
+	// setHostname applies it after reconnect. Requiring another one-time code
+	// just to rename the same Mac would make hostname assignment unreliable.
+	sum := sha256.Sum256([]byte(strings.TrimRight(strings.TrimSpace(cfg.NetControlURL), "/") + "\x00" +
+		strings.TrimSpace(cfg.NetAuthKey)))
+	return filepath.Join(root, "identities", hex.EncodeToString(sum[:12]))
+}
+
+// prepareLinkStateDir performs a one-time, recoverable migration from the
+// pre-RC shared state directory into the current pairing-specific directory.
+// Old pairing directories are retained so a failed re-pair never destroys the
+// last known machine identity.
+func prepareLinkStateDir(cfg ServerConfig) error {
+	root, desired := linkStateRoot(cfg), linkStateDir(cfg)
+	if root == "" || desired == "" {
+		return nil
+	}
+	linkStateMu.Lock()
+	defer linkStateMu.Unlock()
+
+	if _, err := os.Stat(filepath.Join(desired, "tailscaled.state")); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("link: inspect pairing state: %w", err)
+	}
+	legacyState := filepath.Join(root, "tailscaled.state")
+	if _, err := os.Stat(legacyState); errors.Is(err, os.ErrNotExist) {
+		return os.MkdirAll(desired, 0o700)
+	} else if err != nil {
+		return fmt.Errorf("link: inspect legacy pairing state: %w", err)
+	}
+
+	identitiesRoot := filepath.Join(root, "identities")
+	identities, err := os.ReadDir(identitiesRoot)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("link: inspect pairing identities: %w", err)
+	}
+	// If a prior launch created only this desired directory and stopped before
+	// moving the legacy files, resume the migration. Any different identity is
+	// proof that pairing-specific state is already established and the legacy
+	// profile must not be adopted by a newer code.
+	if len(identities) > 1 || (len(identities) == 1 && identities[0].Name() != filepath.Base(desired)) {
+		return os.MkdirAll(desired, 0o700)
+	}
+	if err := os.MkdirAll(desired, 0o700); err != nil {
+		return fmt.Errorf("link: create pairing state: %w", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("link: read legacy pairing state: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "identities" {
+			continue
+		}
+		if err := os.Rename(filepath.Join(root, entry.Name()), filepath.Join(desired, entry.Name())); err != nil {
+			return fmt.Errorf("link: migrate legacy pairing state %q: %w", entry.Name(), err)
+		}
+	}
+	return nil
 }
 
 // startLinkIfConfigured brings up the embedded tailnet node and rewrites
@@ -335,6 +406,9 @@ func startLinkIfConfigured(cfg *ServerConfig) (*jmnfs.LinkNode, bool, error) {
 	}
 	if !configured {
 		return nil, false, nil
+	}
+	if err := prepareLinkStateDir(*cfg); err != nil {
+		return nil, false, err
 	}
 	node, err := reusableLinkNode(*cfg)
 	if err != nil {
@@ -632,6 +706,10 @@ func NFSServerLinkTest(configJSON *C.char) *C.char {
 	}
 	if cfg.BucketOverride == "" {
 		result.Error = "Object storage endpoint is required to prove all mount traffic uses JuiceMount Link"
+		return encode()
+	}
+	if err := prepareLinkStateDir(cfg); err != nil {
+		result.Error = err.Error()
 		return encode()
 	}
 

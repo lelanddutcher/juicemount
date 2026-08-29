@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -104,7 +105,7 @@ func TestLinkIdentityChangesWithEveryPairingInput(t *testing.T) {
 		DBPath:        "/tmp/jm-test/metadata.db",
 	}
 	want := identityForLink(base)
-	if want.ControlURL != "https://link.example.test" || want.StateDir != "/tmp/jm-test/link" {
+	if want.ControlURL != "https://link.example.test" || !strings.HasPrefix(want.StateDir, "/tmp/jm-test/link/identities/") {
 		t.Fatalf("normalized identity = %+v", want)
 	}
 	for _, edit := range []func(*ServerConfig){
@@ -118,6 +119,64 @@ func TestLinkIdentityChangesWithEveryPairingInput(t *testing.T) {
 		if got := identityForLink(changed); got == want {
 			t.Fatalf("pairing input change reused identity: %+v", changed)
 		}
+	}
+	renamed := base
+	renamed.NetHostname = "color-mac"
+	if linkStateDir(renamed) != linkStateDir(base) {
+		t.Fatal("hostname-only edit required a new one-time pairing identity")
+	}
+}
+
+func TestPrepareLinkStateDirMigratesLegacyOnceAndIsolatesNewPairing(t *testing.T) {
+	root := t.TempDir()
+	cfg := ServerConfig{
+		NetControlURL: "https://link.example.test/",
+		NetAuthKey:    "one-off-key-a",
+		NetHostname:   "editing-mac",
+		DBPath:        filepath.Join(root, "metadata.db"),
+	}
+	legacyRoot := linkStateRoot(cfg)
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"tailscaled.state":    "saved-profile",
+		"tailscaled.log.conf": "saved-log-config",
+	} {
+		if err := os.WriteFile(filepath.Join(legacyRoot, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Simulate an interrupted first launch that made the destination directory
+	// but had not yet moved the legacy state. Preparation must resume safely.
+	if err := os.MkdirAll(linkStateDir(cfg), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareLinkStateDir(cfg); err != nil {
+		t.Fatalf("prepareLinkStateDir: %v", err)
+	}
+	first := linkStateDir(cfg)
+	if got, err := os.ReadFile(filepath.Join(first, "tailscaled.state")); err != nil || string(got) != "saved-profile" {
+		t.Fatalf("migrated state = %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(legacyRoot, "tailscaled.state")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy state still active after migration: %v", err)
+	}
+
+	changed := cfg
+	changed.NetAuthKey = "one-off-key-b"
+	if err := prepareLinkStateDir(changed); err != nil {
+		t.Fatalf("prepare changed pairing: %v", err)
+	}
+	second := linkStateDir(changed)
+	if second == first {
+		t.Fatal("new pairing code reused the previous tsnet identity directory")
+	}
+	if _, err := os.Stat(filepath.Join(second, "tailscaled.state")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("new pairing unexpectedly inherited old state: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(first, "tailscaled.state")); err != nil || string(got) != "saved-profile" {
+		t.Fatalf("previous identity was not preserved: %q, %v", got, err)
 	}
 }
 

@@ -263,6 +263,15 @@ func newLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, lin
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("link: create state directory: %w", err)
 	}
+	// Capture this before tsnet.Start creates its state file. A persisted
+	// identity must restart from its saved node/profile keys without replaying
+	// the one-time pairing code. A genuinely new identity still needs the auth
+	// key if tsnet's initial login trigger wedges in NoState.
+	_, stateErr := os.Stat(filepath.Join(stateDir, "tailscaled.state"))
+	persistedIdentity := stateErr == nil
+	if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("link: inspect persisted identity: %w", stateErr)
+	}
 	s := &tsnet.Server{
 		Hostname:   hostname,
 		ControlURL: controlURL,
@@ -284,7 +293,7 @@ func newLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, lin
 		srv:      s,
 		hostname: hostname,
 		recoverNoState: func(ctx context.Context) error {
-			return recoverLinkNoState(ctx, lc, authKey)
+			return recoverLinkNoState(ctx, lc, authKey, !persistedIdentity)
 		},
 		readyCh: make(chan struct{}),
 	}
@@ -292,17 +301,23 @@ func newLinkNode(controlURL, authKey, hostname, stateDir string) (*LinkNode, lin
 }
 
 // recoverLinkNoState replaces the control client that was created while the
-// prior Headscale map session was still draining. Restarting with nil prefs
-// retains the durable profile and node keys; the auth key is supplied only so
-// a legitimately expired/revoked profile can re-authorize instead of hanging.
-// The login request then kicks the newly-created control client, not the stale
-// one that produced the persistent NoState.
-func recoverLinkNoState(ctx context.Context, lc linkControlClient, authKey string) error {
-	if err := lc.Start(ctx, ipn.Options{AuthKey: authKey}); err != nil {
+// prior Headscale map session was still draining. Persisted identities restart
+// with nil options: LocalBackend then retains the saved profile/node keys and
+// resumes its map session without replaying a consumed one-time pairing code.
+// Only a genuinely fresh state directory may reuse the supplied auth key and
+// explicitly kick login when tsnet's initial trigger never ran.
+func recoverLinkNoState(ctx context.Context, lc linkControlClient, authKey string, freshEnrollment bool) error {
+	opts := ipn.Options{}
+	if freshEnrollment {
+		opts.AuthKey = authKey
+	}
+	if err := lc.Start(ctx, opts); err != nil {
 		return fmt.Errorf("restart control client: %w", err)
 	}
-	if err := lc.StartLoginInteractive(ctx); err != nil {
-		return fmt.Errorf("request login after control restart: %w", err)
+	if freshEnrollment {
+		if err := lc.StartLoginInteractive(ctx); err != nil {
+			return fmt.Errorf("request login after control restart: %w", err)
+		}
 	}
 	return nil
 }
