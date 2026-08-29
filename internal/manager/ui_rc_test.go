@@ -23,9 +23,30 @@ func TestManagerRCUIKeepsAccessibilityAndBoundedErrors(t *testing.T) {
 		"@media (prefers-reduced-motion: reduce)",
 		"min-height: 2.25rem",
 		".sidebar-list a { min-height: 2.75rem",
+		".skip-link:focus-visible { transform: translateY(0); }",
+		".sr-only {",
+		"text-underline-offset: 0.15em",
 	} {
 		if !strings.Contains(css, marker) {
 			t.Errorf("Manager CSS lost RC accessibility contract %q", marker)
+		}
+	}
+
+	indexRaw, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := string(indexRaw)
+	for _, marker := range []string{
+		`<a class="skip-link" href="#app">Skip to Manager content</a>`,
+		`<main id="app" tabindex="-1">`,
+		`<caption class="sr-only">Derivative generation tools and purposes</caption>`,
+		`<caption class="sr-only">Paired JuiceMount Link devices</caption>`,
+		`<th scope="col">Hostname</th>`,
+		`<span class="sr-only">Actions</span>`,
+	} {
+		if !strings.Contains(index, marker) {
+			t.Errorf("Manager markup lost RC accessibility contract %q", marker)
 		}
 	}
 
@@ -40,6 +61,9 @@ func TestManagerRCUIKeepsAccessibilityAndBoundedErrors(t *testing.T) {
 		"r.headers.get('content-type')",
 		"a.setAttribute('aria-current', 'page')",
 		"a.removeAttribute('aria-current')",
+		"setAttribute('aria-label', `Select ${e.original_path || e.path}`)",
+		"setAttribute('aria-label', `Revoke remote access for ${hostname || id}`)",
+		"setAttribute('aria-label', `Restart farm node ${nodeName}`)",
 	} {
 		if !strings.Contains(app, marker) {
 			t.Errorf("Manager client lost bounded transport-error behavior %q", marker)

@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="style.css?v=0.5.0-rc4">
 </head>
 <body>
+  <a class="skip-link" href="#app">Skip to Manager content</a>
   <header class="app-header">
     <div class="brand-lockup">
       <span class="brand-mark" aria-hidden="true">JM</span>
@@ -43,7 +44,7 @@
       </ul>
     </nav>
 
-    <main id="app">
+    <main id="app" tabindex="-1">
       <!-- Overview tab (SLICE 2). Read-only at-a-glance dashboard.
            Polls /api/overview every 10s while the tab is visible
            (paused on document visibilitychange when hidden). Each
@@ -424,7 +425,8 @@
                 nothing is invented. Here is what runs for each kind.
               </p>
               <table class="farm-table farm-provenance-table">
-                <thead><tr><th>Derivative</th><th>Tool</th><th>What it does</th></tr></thead>
+                <caption class="sr-only">Derivative generation tools and purposes</caption>
+                <thead><tr><th scope="col">Derivative</th><th scope="col">Tool</th><th scope="col">What it does</th></tr></thead>
                 <tbody id="farm-provenance"></tbody>
               </table>
             </article>
@@ -1050,8 +1052,9 @@
           <div class="link-devices-head"><div><p class="section-kicker">Tailnet presence</p><h3>Paired devices</h3></div>
           <button id="btn-refresh-devices" class="btn">Refresh</button></div>
           <div class="link-table-wrap"><table id="devices-table" class="link-devices-table">
+            <caption class="sr-only">Paired JuiceMount Link devices</caption>
             <thead><tr>
-              <th>Hostname</th><th>IP</th><th>Status</th><th>Last seen</th><th></th>
+              <th scope="col">Hostname</th><th scope="col">IP</th><th scope="col">Status</th><th scope="col">Last seen</th><th scope="col"><span class="sr-only">Actions</span></th>
             </tr></thead>
             <tbody id="devices-body"></tbody>
           </table></div>

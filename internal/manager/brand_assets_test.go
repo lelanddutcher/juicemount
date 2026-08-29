@@ -39,5 +39,11 @@ func TestManagerBrandAssetContentTypes(t *testing.T) {
 		if got := res.Header().Get("Content-Type"); got != tc.want {
 			t.Fatalf("GET %s: content type %q, want %q", tc.path, got, tc.want)
 		}
+		if got := res.Header().Get("Cache-Control"); got != "no-cache" {
+			t.Fatalf("GET %s: cache control %q, want no-cache", tc.path, got)
+		}
+		if got := res.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Fatalf("GET %s: X-Content-Type-Options %q, want nosniff", tc.path, got)
+		}
 	}
 }

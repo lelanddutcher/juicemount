@@ -1388,6 +1388,11 @@ func (a *API) handleStatic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	// Manager assets are embedded into the release binary and can change at
+	// every candidate commit. Require revalidation so a browser cannot keep a
+	// previous RC's CSS or client logic after the container is replaced.
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	switch filepath.Ext(path) {
 	case ".html":
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

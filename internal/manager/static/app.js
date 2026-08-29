@@ -2397,6 +2397,7 @@
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.checked = trashState.selected.has(e.path);
+        cb.setAttribute('aria-label', `Select ${e.original_path || e.path}`);
         cb.addEventListener('click', (evt) => onTrashRowSelect(e, li, evt));
         li.appendChild(cb);
 
@@ -2416,10 +2417,12 @@
         const restore = document.createElement('button');
         restore.type = 'button';
         restore.textContent = 'Restore';
+        restore.setAttribute('aria-label', `Restore ${e.original_path || e.path}`);
         restore.addEventListener('click', () => restoreOne(e));
         const del = document.createElement('button');
         del.type = 'button';
         del.textContent = 'Delete';
+        del.setAttribute('aria-label', `Permanently delete ${e.original_path || e.path}`);
         del.className = 'danger';
         del.addEventListener('click', () => deleteOne(e));
         actions.appendChild(restore);
@@ -3046,14 +3049,17 @@
       const edit = document.createElement('button');
       edit.type = 'button';
       edit.textContent = 'Edit';
+      edit.setAttribute('aria-label', `Edit destination ${d.name}`);
       edit.addEventListener('click', () => beginEditDest(d));
       const test = document.createElement('button');
       test.type = 'button';
       test.textContent = 'Test';
+      test.setAttribute('aria-label', `Test destination ${d.name}`);
       test.addEventListener('click', () => testDestination(d.name, test));
       const del = document.createElement('button');
       del.type = 'button';
       del.textContent = 'Delete';
+      del.setAttribute('aria-label', `Delete destination ${d.name}`);
       del.className = 'danger';
       del.addEventListener('click', () => deleteDestination(d.name));
       actions.appendChild(edit);
@@ -3335,18 +3341,22 @@
       const edit = document.createElement('button');
       edit.type = 'button';
       edit.textContent = 'Edit';
+      edit.setAttribute('aria-label', `Edit backup schedule ${s.name}`);
       edit.addEventListener('click', () => beginEditBackup(s));
       const runNow = document.createElement('button');
       runNow.type = 'button';
       runNow.textContent = 'Run now';
+      runNow.setAttribute('aria-label', `Run backup schedule ${s.name} now`);
       runNow.addEventListener('click', () => runBackupNow(s.name, runNow));
       const toggle = document.createElement('button');
       toggle.type = 'button';
       toggle.textContent = s.paused ? 'Resume' : 'Pause';
+      toggle.setAttribute('aria-label', `${s.paused ? 'Resume' : 'Pause'} backup schedule ${s.name}`);
       toggle.addEventListener('click', () => togglePauseBackup(s));
       const del = document.createElement('button');
       del.type = 'button';
       del.textContent = 'Delete';
+      del.setAttribute('aria-label', `Delete backup schedule ${s.name}`);
       del.className = 'danger';
       del.addEventListener('click', () => deleteBackup(s.name));
       actions.appendChild(edit);
@@ -3850,6 +3860,7 @@ async function refreshDevices() {
       const actions = document.createElement('td');
       const revoke = document.createElement('button');
       revoke.type = 'button'; revoke.className = 'btn btn-sm'; revoke.textContent = 'Revoke';
+      revoke.setAttribute('aria-label', `Revoke remote access for ${hostname || id}`);
       revoke.addEventListener('click', () => revokeNode(id));
       actions.appendChild(revoke); tr.appendChild(actions);
       body.appendChild(tr);
@@ -3992,6 +4003,7 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 				admission.type = 'button';
 				admission.className = 'btn btn-sm';
 				admission.textContent = disabled ? 'Enable node' : 'Disable node';
+				admission.setAttribute('aria-label', `${disabled ? 'Enable' : 'Disable'} farm node ${nodeName}`);
 				admission.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', disabled ? 'enable' : 'disable', actionStatus, [admission]));
 				actions.appendChild(admission);
 
@@ -3999,6 +4011,7 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 				restart.type = 'button';
 				restart.className = 'btn btn-sm';
 				restart.textContent = 'Restart worker';
+				restart.setAttribute('aria-label', `Restart farm node ${nodeName}`);
 				restart.disabled = disabled;
 				restart.title = disabled ? 'Enable the node before requesting a restart' : 'Acknowledged by the worker before its durable claim is released';
 				restart.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', 'restart', actionStatus, [admission, restart]));
