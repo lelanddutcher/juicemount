@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -50,5 +53,38 @@ func TestHardwareDecodeProofFilterForcesHardwareFrameDownload(t *testing.T) {
 	}
 	if got := hardwareDecodeProofFilter(10); got != "hwdownload,format=p010le" {
 		t.Fatalf("10-bit proof filter=%q", got)
+	}
+}
+
+func TestBenchmarkMountReadUsesMediaWithoutRecursiveDirectoryBudgetTax(t *testing.T) {
+	root := t.TempDir()
+	mediaDir := filepath.Join(root, "one", "two")
+	if err := os.MkdirAll(mediaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	media := filepath.Join(mediaDir, "sample.mov")
+	f, err := os.Create(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(5 << 20); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := benchmarkMountReadBlocking(context.Background(), root, nil); got <= 0 {
+		t.Fatalf("mount benchmark = %f, want positive", got)
+	}
+}
+
+func TestBenchmarkVolumePathParser(t *testing.T) {
+	got, ok := benchmarkVolumePathFromInfoLine("   path: /Film Projects/clip.mov")
+	if !ok || got != "/Film Projects/clip.mov" {
+		t.Fatalf("parsed path = %q, %v", got, ok)
+	}
+	if got, ok := benchmarkVolumePathFromInfoLine("length: 16 MiB"); ok || got != "" {
+		t.Fatalf("non-path line parsed as %q, %v", got, ok)
 	}
 }

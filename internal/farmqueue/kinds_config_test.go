@@ -174,7 +174,7 @@ func TestProxySelectionRequiresVerifiedEndToEndHardwarePath(t *testing.T) {
 	job = Job{Kinds: []string{KindProxy}, SourceVideoCodec: "h264", SourceVideoProfile: "High"}
 	routeJobWithWorkers(&job, []Worker{verified}, nil)
 	wantCaps := []string{
-		"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high", "worker:verified",
+		"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high", "worker-name:verified",
 	}
 	if job.QueueClass != QueueClassRender || job.SelectedBackend != "hevc_vaapi" ||
 		!reflect.DeepEqual(job.RequiredCapabilities, wantCaps) {
@@ -249,7 +249,7 @@ func TestProxySelectionUsesMeasuredAV1AndRextDecodeCapabilities(t *testing.T) {
 			want := []string{
 				"encoder:hevc_vaapi", "decoder:" + tc.decoder,
 				"decoder:" + tc.decoder + ":profile:" + NormalizeVideoProfile(tc.codec, tc.profile),
-				DecoderPixelFormatRequirement(tc.decoder, tc.pixelFormat), "worker:arc",
+				DecoderPixelFormatRequirement(tc.decoder, tc.pixelFormat), "worker-name:arc",
 			}
 			if job.QueueClass != QueueClassRender || job.SelectedBackend != "hevc_vaapi" || !reflect.DeepEqual(job.RequiredCapabilities, want) {
 				t.Fatalf("route=%+v, want measured full path %v", job, want)

@@ -15,6 +15,7 @@ import (
 const claimLeaseTTL = 45 * time.Second
 
 const maxReadyPromotionsPerScan = 512
+const maxReadyRecoveryInspectionsPerLane = 128
 
 const (
 	// A single missed 30s heartbeat must not dump an entire render backlog onto
@@ -63,10 +64,19 @@ for i = 4, #KEYS do
     local raw = redis.call('RPOP', KEYS[i])
     if raw then
       local eligible = true
+      local staleRuntimePin = false
       local ok, job = pcall(cjson.decode, raw)
       if ok and job and job.required_capabilities then
         for _, required in ipairs(job.required_capabilities) do
-          if not caps[required] then eligible = false; break end
+          if not caps[required] then
+            local pinned = string.match(required, '^worker:(.+)$')
+            if pinned and redis.call('EXISTS', 'juicefarm:worker:' .. pinned) == 0 then
+              staleRuntimePin = true
+            else
+              eligible = false
+              break
+            end
+          end
         end
       end
       if eligible and job and job.required_capabilities and
@@ -88,6 +98,24 @@ for i = 4, #KEYS do
         end
       end
 		if eligible then
+			if staleRuntimePin and job then
+				local requirements = {}
+				for _, required in ipairs(job.required_capabilities or {}) do
+					local pinned = string.match(required, '^worker:(.+)$')
+					if pinned and not caps[required] and
+						redis.call('EXISTS', 'juicefarm:worker:' .. pinned) == 0 then
+						if ARGV[4] ~= '' then table.insert(requirements, ARGV[4]) end
+					else
+						table.insert(requirements, required)
+					end
+				end
+				job.required_capabilities = requirements
+				job.selected_worker = ARGV[5]
+				raw = cjson.encode(job)
+				if job.id then
+					redis.call('HSET', 'juicefarm:job:' .. job.id, 'target_worker', ARGV[5])
+				end
+			end
 			redis.call('LPUSH', KEYS[3], raw)
 			redis.call('SADD', KEYS[2], ARGV[1])
         return {raw, KEYS[i]}
@@ -99,7 +127,8 @@ end
 return {}`
 	scriptKeys := append([]string{ControlKey, ProcessingIndexKey, processingKey}, keys...)
 	for {
-		res, err := c.rdb.Eval(ctx, script, scriptKeys, w.ID, string(capabilities), string(decodeLimits)).StringSlice()
+		res, err := c.rdb.Eval(ctx, script, scriptKeys, w.ID, string(capabilities), string(decodeLimits),
+			workerPinCapability(w), workerDisplayName(w)).StringSlice()
 		if err != nil && err != redis.Nil {
 			return Claim{}, false, err
 		}
@@ -133,10 +162,17 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 	sort.SliceStable(workers, func(i, j int) bool {
 		return workers[i].Benchmarks.EncodeFPS > workers[j].Benchmarks.EncodeFPS
 	})
+	activeWorkerIDs := make(map[string]bool, len(workers))
+	for _, worker := range workers {
+		activeWorkerIDs[worker.ID] = true
+	}
 	recovered := 0
 	for _, kind := range []string{KindDerivatives, KindProxy, KindTranscript} {
 		key := classQueue(kind, QueueClassRender)
-		raws, err := c.rdb.LRange(ctx, key, 0, -1).Result()
+		// Claims pop from the right. Inspect only the jobs that can block the next
+		// claim, rather than rewriting an entire multi-thousand-item backlog when
+		// one container restarts with a new legacy runtime ID.
+		raws, err := c.rdb.LRange(ctx, key, -maxReadyRecoveryInspectionsPerLane, -1).Result()
 		if err != nil {
 			return recovered, err
 		}
@@ -147,7 +183,8 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 			}
 			serviceable := false
 			for _, worker := range workers {
-				if worker.Role == QueueClassRender && workerCanClaimJob(worker, job) {
+				if worker.Role == QueueClassRender &&
+					workerCanClaimOrAdoptStaleRuntimePin(worker, job, activeWorkerIDs) {
 					serviceable = true
 					break
 				}
@@ -200,7 +237,7 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 				job.QueueClass = QueueClassRender
 				job.SelectedBackend = backend
 				job.SelectedWorker = workerDisplayName(selected)
-				job.RequiredCapabilities = []string{"transcript:" + backend, "worker:" + selected.ID}
+				job.RequiredCapabilities = []string{"transcript:" + backend, workerPinCapability(selected)}
 				reason = "selected render capability went offline; re-routed to active hardware"
 			} else {
 				job.QueueClass = QueueClassCPU
@@ -373,7 +410,7 @@ return 0`
 			if n == 1 {
 				promoted++
 				for _, capability := range candidate.RequiredCapabilities {
-					if id, ok := strings.CutPrefix(capability, "worker:"); ok && id != "" {
+					if id := workerIDForPin(workers, capability); id != "" {
 						loads[id]++
 						break
 					}
@@ -515,7 +552,7 @@ func (c *Client) RequeueClaim(ctx context.Context, claim Claim, fallbackCPU bool
 			job.SelectedWorker = ""
 			caps := job.RequiredCapabilities[:0]
 			for _, capability := range job.RequiredCapabilities {
-				if !strings.HasPrefix(capability, "worker:") {
+				if !IsWorkerPinCapability(capability) {
 					caps = append(caps, capability)
 				}
 			}
@@ -616,7 +653,32 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 			}
 			claim := Claim{Job: job, Raw: raw, WorkerID: workerID}
 			reason := "recovered after worker " + workerID + " disappeared; compatible worker selection rerun"
-			if err := c.RequeueClaim(ctx, claim, false, reason); err != nil {
+			statusReason, statusErr := c.rdb.HGet(ctx, JobHashPrefix+job.ID, "error").Result()
+			if statusErr != nil && statusErr != redis.Nil {
+				_ = c.rdb.Del(ctx, lock).Err()
+				return total, statusErr
+			}
+			// An interrupted explicit CPU compatibility fallback must remain on
+			// that lane. Re-running initial routing here previously promoted it to
+			// the restarted GPU, whose live admission split the same sources into
+			// a nested -cpu-cpu-cpu child. Worker loss is not new codec evidence.
+			if job.QueueClass == QueueClassCPU && legacyCPUFallbackLocked(job, statusReason) &&
+				!temporaryAvailabilityFallback(job, statusReason) {
+				job.Attempts++
+				job.CPUFallbackLocked = true
+				provenance := strings.TrimSpace(job.RoutingReason)
+				if provenance == "" {
+					provenance = strings.TrimSpace(statusReason)
+				}
+				if provenance != "" {
+					reason = provenance + "; recovered after worker " + workerID +
+						" disappeared; preserved explicit CPU route"
+				}
+				if err := c.requeueClaimAs(ctx, claim, job, reason); err != nil {
+					_ = c.rdb.Del(ctx, lock).Err()
+					return total, err
+				}
+			} else if err := c.RequeueClaim(ctx, claim, false, reason); err != nil {
 				_ = c.rdb.Del(ctx, lock).Err()
 				return total, err
 			}

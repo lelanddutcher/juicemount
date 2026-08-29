@@ -595,3 +595,161 @@ func TestRedisClaimEnforcesMeasuredDecodeGeometry(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRedisRestartAdoptsLegacyRuntimePinWithoutBulkRewrite(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	old := Worker{ID: "ephemeral-old", Name: "stable-render", Role: QueueClassRender,
+		Capabilities: []string{"encoder:hevc_vaapi"}, Encoders: []string{"hevc_vaapi"}}
+	if err := q.Heartbeat(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	const jobs = 150
+	for i := 0; i < jobs; i++ {
+		job := NewJob("/jfs/incoming/restart.mov", []string{KindProxy}, "manager")
+		job.ShardIndex, job.ShardCount = i+1, jobs
+		job.RetryTargets = []string{job.Path}
+		job.QueueClass = QueueClassRender
+		job.VCodec = "hevc_vaapi"
+		job.SelectedBackend = "hevc_vaapi"
+		job.SelectedWorker = old.Name
+		job.RequiredCapabilities = []string{"encoder:hevc_vaapi", "worker:" + old.ID}
+		if err := q.Enqueue(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.rdb.Del(ctx, WorkerPrefix+old.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	restarted := old
+	restarted.ID = "ephemeral-new"
+	if err := q.Heartbeat(ctx, restarted); err != nil {
+		t.Fatal(err)
+	}
+	fresh := NewJob("/jfs/incoming/fresh-after-restart.mov", []string{KindProxy}, "manager")
+	fresh.ShardIndex, fresh.ShardCount = 1, 1
+	fresh.RetryTargets = []string{fresh.Path}
+	q.RouteJob(ctx, &fresh)
+	if !containsString(fresh.RequiredCapabilities, "worker-name:"+restarted.Name) ||
+		containsString(fresh.RequiredCapabilities, "worker:"+restarted.ID) {
+		t.Fatalf("fresh route did not use stable worker pin: %v", fresh.RequiredCapabilities)
+	}
+
+	if n, err := q.RecoverUnserviceableReady(ctx); err != nil || n != 0 {
+		t.Fatalf("restart ready recovery = %d, %v; compatible stale pins must stay in place", n, err)
+	}
+	if got, err := q.rdb.LLen(ctx, classQueue(KindProxy, QueueClassRender)).Result(); err != nil || got != jobs {
+		t.Fatalf("render queue after restart = %d, %v; want %d untouched jobs", got, err, jobs)
+	}
+	if got, err := q.rdb.LLen(ctx, classQueue(KindProxy, QueueClassCPU)).Result(); err != nil || got != 0 {
+		t.Fatalf("CPU queue after restart = %d, %v; want zero demotions", got, err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, restarted)
+	if err != nil || !ok {
+		t.Fatalf("restarted worker did not adopt stale pin: ok=%v err=%v", ok, err)
+	}
+	if !WorkerSupports(restarted, claim.Job.RequiredCapabilities) ||
+		!containsString(claim.Job.RequiredCapabilities, "worker-name:"+restarted.Name) ||
+		containsString(claim.Job.RequiredCapabilities, "worker:"+old.ID) {
+		t.Fatalf("adopted requirements = %v", claim.Job.RequiredCapabilities)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisAbandonedExplicitCPUFallbackPreservesRoute(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	serverA := Worker{ID: "cpu-before-restart", Name: "nas-a", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	serverB := Worker{ID: "cpu-after-restart", Name: "nas-b", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	render := Worker{ID: "render-online", Name: "render", Role: QueueClassRender,
+		Capabilities: []string{"encoder:hevc_vaapi", "decoder:h264_vaapi"},
+		Encoders:     []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"}}
+	if err := q.Heartbeat(ctx, serverA); err != nil {
+		t.Fatal(err)
+	}
+	parent := NewJob("/jfs/incoming/baseline.mov", []string{KindProxy}, "manager")
+	child, err := newCPUFallbackSubset(parent, []string{parent.Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.RoutingReason = "1 source(s) partitioned to explicit CPU/H.264 fallback; first reason: baseline profile was not verified"
+	if err := q.Enqueue(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, serverA)
+	if err != nil || !ok {
+		t.Fatalf("initial CPU claim: ok=%v err=%v", ok, err)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, serverA); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Heartbeat(ctx, serverB); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Heartbeat(ctx, render); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.Del(ctx, WorkerPrefix+serverA.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+		t.Fatalf("abandoned CPU recovery = %d, %v; want one", n, err)
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, render); err != nil || ok {
+		t.Fatalf("render worker claimed explicit CPU fallback: ok=%v err=%v", ok, err)
+	}
+	recovered, ok, err := q.ClaimForWorker(ctx, time.Second, serverB)
+	if err != nil || !ok {
+		t.Fatalf("replacement CPU worker did not recover claim: ok=%v err=%v", ok, err)
+	}
+	if recovered.Job.ID != child.ID || recovered.Job.ParentID != parent.ID ||
+		recovered.Job.QueueClass != QueueClassCPU || recovered.Job.SelectedBackend != "libx264" ||
+		!recovered.Job.CPUFallbackLocked || recovered.Job.Attempts != 1 {
+		t.Fatalf("recovered explicit CPU route = %+v", recovered.Job)
+	}
+	if strings.Count(recovered.Job.ID, "-cpu") != 1 {
+		t.Fatalf("recovery created nested CPU identity %q", recovered.Job.ID)
+	}
+	if err := q.AckClaim(ctx, recovered); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

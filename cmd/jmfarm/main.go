@@ -767,7 +767,7 @@ func runQueue(cfg queueConfig) {
 	ctx, cancelLifecycle := context.WithCancel(signalCtx)
 	defer cancelLifecycle()
 
-	profile, profileErr := probeWorkerProfile(ctx, cfg)
+	profile, profileErr := probeWorkerProfile(ctx, cfg, store)
 	if profileErr != nil {
 		fmt.Fprintf(os.Stderr, "jmfarm: worker capability admission failed: %v\n", profileErr)
 		os.Exit(1)

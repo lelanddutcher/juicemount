@@ -84,7 +84,7 @@ func (c *Client) SnapshotRouter(ctx context.Context) (func(*Job), error) {
 		}
 		routeJobWithWorkers(j, workers, loads)
 		for _, capability := range j.RequiredCapabilities {
-			if id, ok := strings.CutPrefix(capability, "worker:"); ok && id != "" {
+			if id := workerIDForPin(workers, capability); id != "" {
 				loads[id]++
 				break
 			}
@@ -105,7 +105,7 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 				j.SelectedWorker = workerDisplayName(selected)
 				j.RequiredCapabilities = append(
 					DecoderSourceRequirements(decoder, j.SourceVideoCodec, j.SourceVideoProfile, j.SourcePixelFormat),
-					"worker:"+selected.ID,
+					workerPinCapability(selected),
 				)
 				j.RoutingReason = ""
 				return
@@ -138,7 +138,7 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 				j.SelectedBackend = enc
 				j.SelectedWorker = workerDisplayName(selected)
 				j.RequiredCapabilities = append([]string{"encoder:" + enc}, DecoderSourceRequirements(decoder, j.SourceVideoCodec, j.SourceVideoProfile, j.SourcePixelFormat)...)
-				j.RequiredCapabilities = append(j.RequiredCapabilities, "worker:"+selected.ID)
+				j.RequiredCapabilities = append(j.RequiredCapabilities, workerPinCapability(selected))
 				j.RoutingReason = ""
 				return
 			}
@@ -157,7 +157,7 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 			j.VCodec = enc
 			j.SelectedBackend = enc
 			j.SelectedWorker = workerDisplayName(selected)
-			j.RequiredCapabilities = []string{"encoder:" + enc, "worker:" + selected.ID}
+			j.RequiredCapabilities = []string{"encoder:" + enc, workerPinCapability(selected)}
 			return
 		}
 		j.QueueClass = QueueClassCPU
@@ -170,7 +170,7 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 			j.QueueClass = QueueClassRender
 			j.SelectedBackend = backend
 			j.SelectedWorker = workerDisplayName(selected)
-			j.RequiredCapabilities = []string{"transcript:" + backend, "worker:" + selected.ID}
+			j.RequiredCapabilities = []string{"transcript:" + backend, workerPinCapability(selected)}
 			return
 		}
 		j.QueueClass = QueueClassCPU
@@ -305,6 +305,34 @@ func workerCanClaimJob(worker Worker, job Job) bool {
 		return true
 	}
 	return WorkerSupportsDecodeSize(worker, decoder, job.SourceVideoWidth, job.SourceVideoHeight)
+}
+
+// workerCanClaimOrAdoptStaleRuntimePin is used by ready-lane maintenance.
+// Before stable-name pins shipped, queued work targeted a random process ID.
+// A replacement process may adopt that work only after the old heartbeat is
+// gone and only when every portable codec/profile/geometry requirement still
+// passes. A live worker's pin and every stable-name pin remain strict.
+func workerCanClaimOrAdoptStaleRuntimePin(worker Worker, job Job, activeWorkerIDs map[string]bool) bool {
+	if workerCanClaimJob(worker, job) {
+		return true
+	}
+	required := make([]string, 0, len(job.RequiredCapabilities))
+	adopted := false
+	for _, capability := range job.RequiredCapabilities {
+		if id, ok := strings.CutPrefix(capability, "worker:"); ok && id != "" && id != worker.ID {
+			if activeWorkerIDs[id] {
+				return false
+			}
+			adopted = true
+			continue
+		}
+		required = append(required, capability)
+	}
+	if !adopted || !WorkerSupports(worker, required) {
+		return false
+	}
+	decoder := requiredDecoder(required)
+	return decoder == "" || WorkerSupportsDecodeSize(worker, decoder, job.SourceVideoWidth, job.SourceVideoHeight)
 }
 
 func requiredDecoder(capabilities []string) string {
@@ -580,6 +608,9 @@ func positiveMax(values ...float64) float64 {
 }
 
 // queuedWorkerLoads counts ready jobs already pinned to each exact worker.
+// New jobs use the stable Manager worker name, while legacy ready work can
+// still carry the process-local runtime ID used before RC 0.5. Both map back
+// to the current runtime ID consumed by workerQueueCost.
 // Running work is represented by Worker.CurrentJob in workerQueueCost. The
 // count is best-effort: a Redis read error falls back to live benchmark-only
 // routing, never to an unverified worker or a different codec class.
@@ -599,10 +630,23 @@ func (c *Client) queuedWorkerLoads(ctx context.Context, workers []Worker) map[st
 			if json.Unmarshal([]byte(raw), &job) != nil {
 				continue
 			}
+			counted := false
 			for _, required := range job.RequiredCapabilities {
-				if id, ok := strings.CutPrefix(required, "worker:"); ok && id != "" {
+				if id := workerIDForPin(workers, required); id != "" {
 					loads[id]++
+					counted = true
 					break
+				}
+			}
+			// A pre-stable-pin job names the durable node separately from its
+			// stale runtime capability. Count it against the restarted process so
+			// measured scheduling does not treat a large inherited backlog as zero.
+			if !counted && strings.TrimSpace(job.SelectedWorker) != "" {
+				for _, worker := range workers {
+					if strings.EqualFold(strings.TrimSpace(job.SelectedWorker), strings.TrimSpace(worker.Name)) {
+						loads[worker.ID]++
+						break
+					}
 				}
 			}
 		}
@@ -669,6 +713,9 @@ func workerCapabilitySet(w Worker) map[string]bool {
 	if w.ID != "" {
 		set["worker:"+w.ID] = true
 	}
+	if pin := stableWorkerPinCapability(w); pin != "" {
+		set[pin] = true
+	}
 	for _, cap := range w.Capabilities {
 		set[cap] = true
 	}
@@ -685,6 +732,48 @@ func workerCapabilitySet(w Worker) map[string]bool {
 		set["metadata"] = true
 	}
 	return set
+}
+
+const stableWorkerPinPrefix = "worker-name:"
+
+// workerPinCapability returns the durable scheduling identity for a node.
+// Manager-controlled workers have a stable, unique name that survives a
+// container restart; legacy unnamed workers retain their process-local ID.
+func workerPinCapability(w Worker) string {
+	if pin := stableWorkerPinCapability(w); pin != "" {
+		return pin
+	}
+	if w.ID != "" {
+		return "worker:" + w.ID
+	}
+	return ""
+}
+
+func stableWorkerPinCapability(w Worker) string {
+	name := strings.ToLower(strings.TrimSpace(w.Name))
+	if !ValidWorkerControlName(name) {
+		return ""
+	}
+	return stableWorkerPinPrefix + name
+}
+
+// IsWorkerPinCapability lets execution planners deliberately make a bounded
+// child portable while retaining its codec/profile/geometry contract.
+func IsWorkerPinCapability(capability string) bool {
+	if id, ok := strings.CutPrefix(capability, "worker:"); ok && id != "" {
+		return true
+	}
+	name, ok := strings.CutPrefix(capability, stableWorkerPinPrefix)
+	return ok && name != ""
+}
+
+func workerIDForPin(workers []Worker, capability string) string {
+	for _, worker := range workers {
+		if capability == "worker:"+worker.ID || capability == stableWorkerPinCapability(worker) {
+			return worker.ID
+		}
+	}
+	return ""
 }
 
 func WorkerSupports(w Worker, required []string) bool {

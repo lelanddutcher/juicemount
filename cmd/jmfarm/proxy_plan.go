@@ -151,7 +151,7 @@ func buildProxyPlan(ctx context.Context, route derivativeRouter, parent farmqueu
 			child.SelectedWorker = ""
 			caps := child.RequiredCapabilities[:0]
 			for _, capability := range child.RequiredCapabilities {
-				if !strings.HasPrefix(capability, "worker:") {
+				if !farmqueue.IsWorkerPinCapability(capability) {
 					caps = append(caps, capability)
 				}
 			}

@@ -442,6 +442,40 @@ func (s *Store) ListProxyRows() ([]ProxyRow, error) {
 	return out, rows.Err()
 }
 
+// ListAccessBenchmarkInodes returns recent, sufficiently large source assets
+// that still have derivative provenance. A worker can reverse-resolve one of
+// these JuiceFS inodes without recursively walking a production volume merely
+// to find a representative file for its mount-access benchmark.
+func (s *Store) ListAccessBenchmarkInodes(limit int) ([]uint64, error) {
+	if limit <= 0 {
+		return []uint64{}, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT inode
+		FROM derivatives
+		WHERE source_size >= ?
+		GROUP BY inode
+		ORDER BY MAX(updated_at) DESC
+		LIMIT ?`, int64(4<<20), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]uint64, 0, limit)
+	for rows.Next() {
+		var inode int64
+		if err := rows.Scan(&inode); err != nil {
+			return nil, err
+		}
+		if inode > 0 {
+			out = append(out, uint64(inode))
+		}
+	}
+	return out, rows.Err()
+}
+
 // ChangeRow is one entry in the /derivatives/changes delta feed.
 type ChangeRow struct {
 	Inode     uint64  `json:"inode"`

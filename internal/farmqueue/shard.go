@@ -68,7 +68,7 @@ func (c *Client) EnqueueTargetShards(ctx context.Context, parent Job, targets []
 				children[i].SelectedWorker = ""
 				caps := children[i].RequiredCapabilities[:0]
 				for _, capability := range children[i].RequiredCapabilities {
-					if !strings.HasPrefix(capability, "worker:") {
+					if !IsWorkerPinCapability(capability) {
 						caps = append(caps, capability)
 					}
 				}
@@ -132,7 +132,7 @@ func newTargetShards(parent Job, targets []string, maxTargets int) ([]Job, error
 			child.SelectedWorker = ""
 			caps := child.RequiredCapabilities[:0]
 			for _, capability := range child.RequiredCapabilities {
-				if !strings.HasPrefix(capability, "worker:") {
+				if !IsWorkerPinCapability(capability) {
 					caps = append(caps, capability)
 				}
 			}

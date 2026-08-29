@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/derivatives"
 	"github.com/lelanddutcher/juicemount/internal/farm"
 	"github.com/lelanddutcher/juicemount/internal/farmqueue"
 )
@@ -32,7 +35,7 @@ type hardwareEncoderProbe struct {
 // probeWorkerProfile admits a node from work it actually completes, not device
 // names or container flags. A render node with an exposed-but-broken GPU fails
 // admission instead of silently becoming a CPU worker.
-func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, error) {
+func probeWorkerProfile(ctx context.Context, cfg queueConfig, store *derivatives.Store) (workerProfile, error) {
 	p := workerProfile{
 		Capabilities:       []string{"cpu", "metadata"},
 		DecodeLimits:       make(map[string]farmqueue.VideoDecodeLimit),
@@ -100,7 +103,11 @@ func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, er
 			probeErrs = append(probeErrs, err.Error())
 		}
 	}
-	p.Benchmarks.AccessMBps = benchmarkMountRead(ctx, cfg.mount)
+	var benchmarkInodes []uint64
+	if store != nil {
+		benchmarkInodes, _ = store.ListAccessBenchmarkInodes(16)
+	}
+	p.Benchmarks.AccessMBps = benchmarkMountRead(ctx, cfg.mount, benchmarkInodes)
 
 	if err := ctx.Err(); err != nil {
 		return p, err
@@ -556,12 +563,12 @@ func verifyTranscriptAccelerator(parent context.Context, device string) error {
 	}
 }
 
-func benchmarkMountRead(parent context.Context, root string) float64 {
+func benchmarkMountRead(parent context.Context, root string, indexedInodes []uint64) float64 {
 	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 	result := make(chan float64, 1)
 	go func() {
-		result <- benchmarkMountReadBlocking(root)
+		result <- benchmarkMountReadBlocking(ctx, root, indexedInodes)
 	}()
 	select {
 	case value := <-result:
@@ -571,22 +578,38 @@ func benchmarkMountRead(parent context.Context, root string) float64 {
 	}
 }
 
-func benchmarkMountReadBlocking(root string) float64 {
-	var candidate string
-	visited := 0
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || candidate != "" {
-			return nil
+func benchmarkMountReadBlocking(ctx context.Context, root string, indexedInodes []uint64) float64 {
+	for _, inode := range indexedInodes {
+		candidate, ok := benchmarkPathForInode(ctx, root, inode)
+		if !ok {
+			continue
 		}
-		visited++
-		if visited > 2000 {
+		if mbps := benchmarkCandidateRead(candidate); mbps > 0 {
+			return mbps
+		}
+	}
+
+	var candidate string
+	visitedFiles := 0
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
 			return filepath.SkipAll
+		}
+		if candidate != "" {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			return nil
 		}
 		if d.IsDir() {
 			if path != root && strings.HasPrefix(d.Name(), ".") {
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		visitedFiles++
+		if visitedFiles > 5000 {
+			return filepath.SkipAll
 		}
 		if !mediaExts[strings.ToLower(filepath.Ext(path))] {
 			return nil
@@ -599,12 +622,73 @@ func benchmarkMountReadBlocking(root string) float64 {
 	if candidate == "" {
 		return 0
 	}
+	return benchmarkCandidateRead(candidate)
+}
+
+func benchmarkPathForInode(parent context.Context, root string, inode uint64) (string, bool) {
+	if inode == 0 || strings.TrimSpace(root) == "" {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "juicefs", "info", "-i", strconv.FormatUint(inode, 10))
+	cmd.Dir = root
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", false
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return "", false
+	}
+	var volumePath string
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		if path, ok := benchmarkVolumePathFromInfoLine(scanner.Text()); ok {
+			volumePath = path
+			break
+		}
+	}
+	// `juicefs info` prints the path before a potentially very large object
+	// table. Stop it as soon as the reverse lookup has succeeded.
+	cancel()
+	_ = cmd.Wait()
+	if volumePath == "" {
+		return "", false
+	}
+	rel := strings.TrimPrefix(filepath.Clean("/"+volumePath), string(filepath.Separator))
+	if rel == "" || rel == "." {
+		return "", false
+	}
+	candidate := filepath.Join(root, rel)
+	within, err := filepath.Rel(root, candidate)
+	if err != nil || within == ".." || strings.HasPrefix(within, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return candidate, true
+}
+
+func benchmarkVolumePathFromInfoLine(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	if i := strings.Index(line, "path: /"); i >= 0 {
+		path := strings.TrimSpace(line[i+len("path: "):])
+		return path, path != ""
+	}
+	return "", false
+}
+
+func benchmarkCandidateRead(candidate string) float64 {
+	started := time.Now()
+	fi, err := os.Stat(candidate)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() < 4<<20 ||
+		!mediaExts[strings.ToLower(filepath.Ext(candidate))] {
+		return 0
+	}
 	f, err := os.Open(candidate)
 	if err != nil {
 		return 0
 	}
 	defer f.Close()
-	started := time.Now()
 	n, err := io.CopyN(io.Discard, f, 16<<20)
 	if err != nil && err != io.EOF {
 		return 0
