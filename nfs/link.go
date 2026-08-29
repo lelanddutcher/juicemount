@@ -181,9 +181,12 @@ func linkDiagnosticErrorKind(args []any) string {
 
 // Headscale can retain the prior streaming map session for roughly ten seconds
 // after tsnet closes locally. Recovering before that release merely replays the
-// same blocked login race, so leave a measured safety margin before the single
-// saved-authorization recovery attempt.
+// same blocked login race, so leave a measured safety margin before the first
+// saved-authorization recovery attempt. A control-plane outage can outlast that
+// first attempt, so persistent NoState recovery backs off to this ceiling
+// rather than permanently giving up or repeatedly re-enrolling in a hot loop.
 const linkNoStateRecoveryDelay = 15 * time.Second
+const linkNoStateRecoveryMaxDelay = time.Minute
 const linkControlPreflightTimeout = 3 * time.Second
 
 // preflightLinkControl performs the user's Apply/Test control connection while
@@ -517,18 +520,20 @@ func waitForLinkRunning(ctx context.Context, status linkStatusFunc, pollEvery ti
 // tsnet itself: LocalBackend.Start can still report NoState when tsnet decides
 // whether to trigger login, causing an otherwise valid auth key to be left
 // unused forever. Normal persisted-identity startup gets a grace period. Only
-// a continuously observed NoState receives one control-client restart and
-// login request, without making every app launch re-enrol the node.
+// a continuously observed NoState receives paced control-client restart/login
+// requests. The delay doubles after each attempt up to one minute, so a control
+// plane that was unavailable during the first recovery can still come back
+// without making normal app launches re-enrol the node or creating a hot loop.
 func waitForLinkRunningWithRecovery(ctx context.Context, status linkStatusFunc, pollEvery, recoverAfter time.Duration, recover linkRecoveryFunc) (*ipnstate.Status, error) {
 	if pollEvery <= 0 {
 		pollEvery = 200 * time.Millisecond
 	}
 	var (
-		lastState         = "unknown"
-		lastHealth        []string
-		lastErr           error
-		noStateSince      time.Time
-		recoveryAttempted bool
+		lastState     = "unknown"
+		lastHealth    []string
+		lastErr       error
+		noStateSince  time.Time
+		recoveryDelay = recoverAfter
 	)
 	for {
 		st, err := status(ctx)
@@ -544,11 +549,16 @@ func waitForLinkRunningWithRecovery(ctx context.Context, status linkStatusFunc, 
 				if noStateSince.IsZero() {
 					noStateSince = time.Now()
 				}
-				if recover != nil && recoverAfter > 0 && !recoveryAttempted && time.Since(noStateSince) >= recoverAfter {
-					recoveryAttempted = true
+				if recover != nil && recoveryDelay > 0 && time.Since(noStateSince) >= recoveryDelay {
 					recoveryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 					recoveryErr := recover(recoveryCtx)
 					cancel()
+					// Start a fresh grace period even when recovery fails. This keeps
+					// an unavailable control plane from turning the status loop into
+					// repeated LocalBackend.Start calls while still guaranteeing that
+					// a later return is observed without restarting the application.
+					noStateSince = time.Now()
+					recoveryDelay = nextLinkNoStateRecoveryDelay(recoveryDelay)
 					if recoveryErr != nil {
 						lastErr = fmt.Errorf("NoState recovery: %w", recoveryErr)
 						jmlog.Warn("link control remained NoState; authorization recovery request failed", "error", recoveryErr)
@@ -558,6 +568,7 @@ func waitForLinkRunningWithRecovery(ctx context.Context, status linkStatusFunc, 
 				}
 			} else {
 				noStateSince = time.Time{}
+				recoveryDelay = recoverAfter
 			}
 		}
 
@@ -574,6 +585,16 @@ func waitForLinkRunningWithRecovery(ctx context.Context, status linkStatusFunc, 
 		case <-time.After(pollEvery):
 		}
 	}
+}
+
+func nextLinkNoStateRecoveryDelay(current time.Duration) time.Duration {
+	if current <= 0 {
+		return 0
+	}
+	if current >= linkNoStateRecoveryMaxDelay || current > linkNoStateRecoveryMaxDelay/2 {
+		return linkNoStateRecoveryMaxDelay
+	}
+	return current * 2
 }
 
 func (l *LinkNode) setHostname(hostname string) error {

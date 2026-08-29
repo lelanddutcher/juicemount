@@ -211,6 +211,48 @@ func TestWaitForLinkRunningRecoversPersistentNoStateOnce(t *testing.T) {
 	}
 }
 
+func TestWaitForLinkRunningRetriesRecoveryWhenControlPlaneReturnsLater(t *testing.T) {
+	var recoveryCalls atomic.Int64
+	status := func(context.Context) (*ipnstate.Status, error) {
+		if recoveryCalls.Load() < 2 {
+			return &ipnstate.Status{BackendState: "NoState", Health: []string{"control unavailable"}}, nil
+		}
+		return &ipnstate.Status{
+			BackendState: "Running",
+			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.26")},
+		}, nil
+	}
+	recover := func(context.Context) error {
+		recoveryCalls.Add(1)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	st, err := waitForLinkRunningWithRecovery(ctx, status, time.Millisecond, time.Millisecond, recover)
+	if err != nil {
+		t.Fatalf("waitForLinkRunningWithRecovery: %v", err)
+	}
+	if st.BackendState != "Running" {
+		t.Fatalf("backend state = %q, want Running", st.BackendState)
+	}
+	if got := recoveryCalls.Load(); got != 2 {
+		t.Fatalf("recovery calls = %d, want a second paced attempt", got)
+	}
+}
+
+func TestNextLinkNoStateRecoveryDelayBacksOffAndCaps(t *testing.T) {
+	if got := nextLinkNoStateRecoveryDelay(15 * time.Second); got != 30*time.Second {
+		t.Fatalf("first retry delay = %v, want 30s", got)
+	}
+	if got := nextLinkNoStateRecoveryDelay(30 * time.Second); got != time.Minute {
+		t.Fatalf("second retry delay = %v, want 1m", got)
+	}
+	if got := nextLinkNoStateRecoveryDelay(time.Minute); got != time.Minute {
+		t.Fatalf("capped retry delay = %v, want 1m", got)
+	}
+}
+
 func TestWaitForLinkRunningDoesNotRecoverBriefNoState(t *testing.T) {
 	statuses := []*ipnstate.Status{
 		{BackendState: "NoState"},
