@@ -87,6 +87,9 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 		`id="auth-key-input"`,
 		`id="auth-dialog-status" class="auth-dialog-status" role="alert"`,
 		`id="auth-key-button"`,
+		`<h3>Server-local coverage</h3>`,
+		`<header><h3>Server worker defaults</h3></header>`,
+		`Active Nodes above is authoritative`,
 	} {
 		if !strings.Contains(index, marker) {
 			t.Errorf("Manager RC markup lost truthful/progressive UI marker %q", marker)
@@ -113,6 +116,8 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 		"split from ",
 		"partial: 'Partial'",
 		"Recovery note: ",
+		"ffmpeg (server fallback: ",
+		"whisper.cpp · server-local ",
 		"function renderFarmInterruptedSentence",
 		"It is not reported as running",
 		"sweepTxt = 'paused'",

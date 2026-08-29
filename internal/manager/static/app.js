@@ -1484,7 +1484,8 @@
 
   // FARM_PROVENANCE maps each derivative kind to the real process that produces
   // it. Static knowledge (the farm always uses these tools); the proxy + ai rows
-  // get LIVE governor values spliced in by farmToolLabel when present.
+  // show server-local governor values with explicit fallback scope. Live routing
+  // is authoritative in Active Nodes and Recent Jobs, not this rollup.
   const FARM_PROVENANCE = [
     { kind: 'tech',      label: 'Tech metadata', tool: 'ffprobe',
       desc: 'Reads codec, resolution, duration and bitrate. Read-only — never touches the file.' },
@@ -1889,8 +1890,10 @@
     });
   }
 
-  // farmToolLabel returns the tool-column text, enriched with live governor
-  // settings for proxy/ai when the governor object reports them.
+  // farmToolLabel returns the tool-column text, enriched with server-local
+  // governor settings for proxy/ai when the rollup reports them. The scope is
+  // visible so libx264 here cannot be mistaken for the scheduler's farm-wide
+  // route while a HEVC render node is online.
   function farmToolLabel(row, governor) {
     if (!governor) return row.tool;
     if (row.kind === 'proxy') {
@@ -1898,12 +1901,12 @@
       const bits = [];
       if (governor.crf != null && governor.crf !== 0) bits.push('CRF ' + governor.crf);
       if (governor.preset) bits.push(governor.preset);
-      let t = 'ffmpeg (' + codec + ')';
+      let t = 'ffmpeg (server fallback: ' + codec + ')';
       if (bits.length) t += ' · ' + bits.join(', ');
       return t;
     }
     if (row.kind === 'ai' && governor.model) {
-      return 'whisper.cpp · ' + governor.model;
+      return 'whisper.cpp · server-local ' + governor.model;
     }
     return row.tool;
   }

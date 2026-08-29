@@ -44,6 +44,9 @@ func TestHandleFarmSuppressesStaleLiveProgress(t *testing.T) {
 		"written_at":`+jsonInt(old)+`
 	}`)
 	body := getFarmStatus(t, &API{farmStatusPath: path})
+	if body["scope"] != "server_local" {
+		t.Fatalf("farm rollup scope = %#v, want server_local", body["scope"])
+	}
 	status := body["status"].(map[string]any)
 	if _, ok := status["in_progress"]; ok {
 		t.Fatal("stale in_progress was still presented as live")

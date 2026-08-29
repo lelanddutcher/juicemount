@@ -97,7 +97,13 @@ func (a *API) handleFarm(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]any{
 		"available": true,
-		"status":    status,
+		// farm-status.json is written beside this Manager by the server/NAS
+		// worker. Remote workers keep their own derivative indexes and publish
+		// portable sidecar manifests, so this rollup must never be presented as
+		// a farm-wide aggregate until the Manager actually reconciles those
+		// indexes. Keep the scope explicit in the wire contract.
+		"scope":  "server_local",
+		"status": status,
 	}
 	if staleProgress != nil {
 		response["stale_progress"] = staleProgress

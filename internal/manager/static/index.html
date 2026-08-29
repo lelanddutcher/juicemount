@@ -409,9 +409,13 @@
                  progress bar, derived from index.by_kind + total_assets. -->
             <article class="overview-card overview-card-wide" data-card="farm-coverage">
               <header>
-                <h3>Coverage</h3>
+                <h3>Server-local coverage</h3>
                 <span class="overview-card-state" id="farm-assets"></span>
               </header>
+              <p class="farm-card-sub">
+                This rollup comes from the server worker's local index. Remote-node outputs remain portable through
+                derivative sidecars and appear here after the server reconciles them.
+              </p>
               <ul id="farm-coverage-list" class="farm-coverage-list"></ul>
             </article>
 
@@ -419,10 +423,10 @@
                  process that produces it. Static knowledge; the proxy + ai
                  rows show live governor values when present. -->
             <article class="overview-card overview-card-wide" data-card="farm-provenance">
-              <header><h3>How each derivative is made</h3></header>
+              <header><h3>How farm work is produced</h3></header>
               <p class="farm-card-sub">
-                Every preview is produced by a real, inspectable tool on the NAS —
-                nothing is invented. Here is what runs for each kind.
+                Lightweight metadata stays on the server; heavy video and AI work route to verified processing nodes.
+                Server-local fallback values below are not the farm-wide routing decision.
               </p>
               <table class="farm-table farm-provenance-table">
                 <caption class="sr-only">Derivative generation tools and purposes</caption>
@@ -434,10 +438,10 @@
             <!-- Knob inspector: read-only view of status.governor. Degrades
                  to a "settings not yet reported" hint when governor absent. -->
             <article class="overview-card overview-card-wide" data-card="farm-governor">
-              <header><h3>Farm settings</h3></header>
+              <header><h3>Server worker defaults</h3></header>
               <p class="farm-card-sub">
-                Read-only. These are the knobs the farm is running with right now
-                (set on the NAS, not editable here). Hover a label for what it means.
+                Read-only defaults reported by the server-local rollup. Active Nodes above is authoritative for each
+                worker's live encoder, AI device, capacity, and measured route.
               </p>
               <p id="farm-governor-empty" class="hint" hidden>Settings not yet reported by the farm.</p>
               <dl id="farm-governor" class="farm-governor-grid"></dl>
