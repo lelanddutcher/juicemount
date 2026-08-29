@@ -100,6 +100,9 @@ func TestRedisCPUFallbackSplitIsIdempotent(t *testing.T) {
 	if claim.Job.ParentID != parent.ID || !reflect.DeepEqual(claim.Job.RetryTargets, targets) {
 		t.Fatalf("claimed CPU child = %+v", claim.Job)
 	}
+	if claim.Job.RoutingReason != "ProRes decoder unavailable" {
+		t.Fatalf("CPU child lost immutable fallback provenance: %q", claim.Job.RoutingReason)
+	}
 	if n, err := q.rdb.LLen(ctx, ProcessingPrefix+render.ID).Result(); err != nil || n != 1 {
 		t.Fatalf("render parent processing receipts = %d, %v; want 1 while CPU child runs", n, err)
 	}

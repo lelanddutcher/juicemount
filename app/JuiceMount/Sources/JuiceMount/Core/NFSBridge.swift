@@ -288,12 +288,16 @@ public enum NFSBridge {
         public var shortfall_bytes: Int64 = 0
         public var disk_free_bytes: Int64 = 0
         public var cache_usage_bytes: Int64 = 0
+        /// Effective JuiceFS eviction floor selected by the Go mount policy.
+        /// Zero means an older core omitted the additive field.
+        public var cache_free_floor_bytes: Int64 = 0
 
         public init() {}
 
         private enum CodingKeys: String, CodingKey {
             case over_capacity, pinned_bytes, cache_capacity_bytes
             case shortfall_bytes, disk_free_bytes, cache_usage_bytes
+            case cache_free_floor_bytes
         }
 
         // Absence-tolerant: an older Go core (or the no-pinstore branch) omits
@@ -307,6 +311,7 @@ public enum NFSBridge {
             self.shortfall_bytes = try c.decodeIfPresent(Int64.self, forKey: .shortfall_bytes) ?? 0
             self.disk_free_bytes = try c.decodeIfPresent(Int64.self, forKey: .disk_free_bytes) ?? 0
             self.cache_usage_bytes = try c.decodeIfPresent(Int64.self, forKey: .cache_usage_bytes) ?? 0
+            self.cache_free_floor_bytes = try c.decodeIfPresent(Int64.self, forKey: .cache_free_floor_bytes) ?? 0
         }
     }
 

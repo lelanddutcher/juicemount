@@ -40,7 +40,7 @@
     "capacity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["over_capacity", "pinned_bytes", "cache_capacity_bytes", "shortfall_bytes", "disk_free_bytes", "cache_usage_bytes", "computed_sec"],
+      "required": ["over_capacity", "pinned_bytes", "cache_capacity_bytes", "shortfall_bytes", "disk_free_bytes", "cache_usage_bytes", "cache_free_floor_bytes", "computed_sec"],
       "description": "pin.CapacityVerdict (capacity.go:46) — always present, snake_case already.",
       "properties": {
         "over_capacity": { "type": "boolean" },
@@ -49,6 +49,7 @@
         "shortfall_bytes": { "type": "integer", "minimum": 0 },
         "disk_free_bytes": { "type": "integer", "minimum": 0 },
         "cache_usage_bytes": { "type": "integer", "minimum": 0 },
+        "cache_free_floor_bytes": { "type": "integer", "minimum": 0, "description": "Effective JuiceFS free-space eviction floor selected at mount time; clients use this instead of a hard-coded percentage when reporting cache suspension or pressure." },
         "computed_sec": { "type": "integer", "description": "Unix seconds the verdict was computed." }
       }
     },

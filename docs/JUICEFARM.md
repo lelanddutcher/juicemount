@@ -324,9 +324,13 @@ remain available.
 - **RC:** automatic recursive discovery + persistent catch-up; durable queue claims;
   farm-wide pause/play; server/render lane separation; benchmarked GPU admission;
   hardware-decoded poster/filmstrip routing with per-file CPU fallback; HEVC-first
-  proxy routing with explicit H.264 fallback; live Manager control and node
-  telemetry; tech/poster/filmstrip/waveform/proxy/transcript generation; JM-15
-  discovery; `/blob` byte ranges; and portable assertion sidecars.
+  proxy routing with explicit H.264 fallback; a two-heartbeat render-outage grace
+  that prevents a brief node restart from dumping the ready backlog onto CPU;
+  automatic promotion of availability-only CPU fallbacks when compatible hardware
+  returns while source-incompatible and exhausted-hardware fallbacks stay locked;
+  live Manager control and node telemetry; tech/poster/filmstrip/waveform/proxy/
+  transcript generation; JM-15 discovery; `/blob` byte ranges; and portable
+  assertion sidecars.
 - **Not in this RC:** richer AI (faces/OCR/framing), historical benchmark models,
   cross-volume locality scheduling, and the incomplete Teams/seats authorization UI.
 

@@ -16,6 +16,14 @@ const claimLeaseTTL = 45 * time.Second
 
 const maxReadyPromotionsPerScan = 512
 
+const (
+	// A single missed 30s heartbeat must not dump an entire render backlog onto
+	// the slow CPU lane. Preserve ready work for two worker TTLs, then perform
+	// the visible fallback if no compatible hardware has returned.
+	readyFallbackGrace      = 2 * WorkerTTL
+	readyFallbackSinceField = "unserviceable_since"
+)
+
 // Claim is the durable receipt for a job atomically moved from a ready lane to
 // a worker processing list. Raw is retained so acknowledgement can remove the
 // exact list entry without trusting mutable job fields.
@@ -145,9 +153,11 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 				}
 			}
 			if serviceable {
+				// A prior miss recovered before the grace expired. Clear the durable
+				// timer so a later independent outage receives its own full window.
+				_ = c.rdb.HDel(ctx, JobHashPrefix+job.ID, readyFallbackSinceField).Err()
 				continue
 			}
-			job.Attempts++
 			targetClass := QueueClassCPU
 			reason := "render capability went offline before claim; queued CPU fallback"
 			if kind == KindDerivatives && job.DerivativePass == DerivativePassPreviews {
@@ -198,6 +208,29 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 				job.SelectedBackend = "cpu"
 				job.SelectedWorker = ""
 			}
+			if targetClass == QueueClassCPU {
+				elapsed, err := c.readyFallbackGraceElapsed(ctx, JobHashPrefix+job.ID)
+				if err != nil {
+					return recovered, err
+				}
+				if !elapsed {
+					continue
+				}
+			}
+			job.Attempts++
+			// Losing the selected worker before claim is an availability event,
+			// never proof that the source cannot use hardware. Clear any stale
+			// terminal bit carried by a previously promoted legacy child so the
+			// queued CPU fallback can be promoted again when hardware returns.
+			job.CPUFallbackLocked = false
+			if targetClass == QueueClassCPU {
+				job.CPUFallbackLocked = false
+				if strings.TrimSpace(job.RoutingReason) == "" {
+					job.RoutingReason = reason
+				} else {
+					reason = job.RoutingReason
+				}
+			}
 			nextRaw, err := json.Marshal(job)
 			if err != nil {
 				continue
@@ -207,6 +240,7 @@ if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[2])
   redis.call('HSET', KEYS[3], 'status', 'queued', 'backend', ARGV[3],
     'target_worker', ARGV[4], 'queue_class', ARGV[5], 'attempts', ARGV[6], 'error', ARGV[7])
+	redis.call('HDEL', KEYS[3], 'unserviceable_since')
   return 1
 end
 return 0`
@@ -220,6 +254,25 @@ return 0`
 		}
 	}
 	return recovered, nil
+}
+
+func (c *Client) readyFallbackGraceElapsed(ctx context.Context, statusKey string) (bool, error) {
+	since, err := c.rdb.HGet(ctx, statusKey, readyFallbackSinceField).Result()
+	if err == redis.Nil || strings.TrimSpace(since) == "" {
+		_, setErr := c.rdb.HSetNX(ctx, statusKey, readyFallbackSinceField, time.Now().UTC().Format(time.RFC3339Nano)).Result()
+		return false, setErr
+	}
+	if err != nil {
+		return false, err
+	}
+	started, parseErr := time.Parse(time.RFC3339Nano, since)
+	if parseErr != nil {
+		// A malformed maintenance marker is not evidence of a long outage. Reset
+		// it rather than immediately spilling work onto CPU.
+		return false, c.rdb.HSet(ctx, statusKey, readyFallbackSinceField,
+			time.Now().UTC().Format(time.RFC3339Nano)).Err()
+	}
+	return time.Since(started) >= readyFallbackGrace, nil
 }
 
 // PromoteServiceableReady moves only temporary CPU fallbacks back onto a
@@ -258,7 +311,20 @@ func (c *Client) PromoteServiceableReady(ctx context.Context) (int, error) {
 				return promoted, nil
 			}
 			var original Job
-			if json.Unmarshal([]byte(raw), &original) != nil || original.ID == "" || original.CPUFallbackLocked {
+			if json.Unmarshal([]byte(raw), &original) != nil || original.ID == "" {
+				continue
+			}
+			statusKey := JobHashPrefix + original.ID
+			previousReason, err := c.rdb.HGet(ctx, statusKey, "error").Result()
+			if err != nil && err != redis.Nil {
+				return promoted, err
+			}
+			// Compatibility and exhausted-render fallbacks are terminal. A stale
+			// lock whose durable provenance says only that a worker disappeared is
+			// repairable: the returning worker will perform live source admission
+			// before touching user media and split only truly incompatible files.
+			if legacyCPUFallbackLocked(original, previousReason) &&
+				!temporaryAvailabilityFallback(original, previousReason) {
 				continue
 			}
 
@@ -268,6 +334,7 @@ func (c *Client) PromoteServiceableReady(ctx context.Context) (int, error) {
 			candidate.SelectedBackend = ""
 			candidate.SelectedWorker = ""
 			candidate.RoutingReason = ""
+			candidate.CPUFallbackLocked = false
 			if kind == KindProxy {
 				candidate.VCodec = ""
 			}
@@ -276,14 +343,6 @@ func (c *Client) PromoteServiceableReady(ctx context.Context) (int, error) {
 				continue
 			}
 
-			statusKey := JobHashPrefix + original.ID
-			previousReason, err := c.rdb.HGet(ctx, statusKey, "error").Result()
-			if err != nil && err != redis.Nil {
-				return promoted, err
-			}
-			if legacyCPUFallbackLocked(original, previousReason) {
-				continue
-			}
 			promotionReason := "verified render capability returned; promoted queued CPU fallback to " + candidate.SelectedBackend
 			if strings.TrimSpace(previousReason) != "" {
 				promotionReason = previousReason + "; " + promotionReason
@@ -344,6 +403,37 @@ func legacyCPUFallbackLocked(job Job, statusReason string) bool {
 		if routing != "" && !strings.HasPrefix(routing, "no verified hardware decoder is online for ") &&
 			!strings.Contains(routing, "decoder went offline") &&
 			!strings.Contains(routing, "worker discovery unavailable") {
+			return true
+		}
+	}
+	return false
+}
+
+// temporaryAvailabilityFallback recognizes CPU routing caused only by worker
+// availability. Raw job provenance wins over the mutable status note: a new
+// source-incompatible child carries its terminal reason in RoutingReason, while
+// a legacy child whose old lock survived an outage can carry the exact outage
+// reason shown in the deployed RC queue. Returning hardware will still run its
+// live admission probe, so repairing the stale lock cannot silently execute an
+// unsupported source on CPU inside a GPU worker.
+func temporaryAvailabilityFallback(job Job, statusReason string) bool {
+	routing := strings.ToLower(strings.TrimSpace(job.RoutingReason))
+	if routing != "" {
+		return containsAvailabilityFallbackMarker(routing)
+	}
+	return containsAvailabilityFallbackMarker(strings.ToLower(strings.TrimSpace(statusReason)))
+}
+
+func containsAvailabilityFallbackMarker(reason string) bool {
+	for _, marker := range []string{
+		"render capability went offline before claim",
+		"video decoder went offline before claim",
+		"selected render capability went offline",
+		"no verified hardware decode+encode path is online",
+		"no verified hardware decoder is online",
+		"worker discovery unavailable",
+	} {
+		if strings.Contains(reason, marker) {
 			return true
 		}
 	}

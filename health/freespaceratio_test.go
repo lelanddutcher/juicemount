@@ -1,6 +1,7 @@
 package health
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/lelanddutcher/juicemount/nfs"
@@ -20,7 +21,7 @@ var realisticDiskSizes = []int64{128 * gib, 256 * gib, 500 * gib, 512 * gib,
 // actually returned. This is the property that inverts the ordering.
 func TestFreeSpaceRatioKeepsJuicefsFloorAboveTheSpoolFloor(t *testing.T) {
 	for _, total := range realisticDiskSizes {
-		ratio := resolveFreeSpaceRatio(total)
+		ratio := resolveFreeSpaceRatio(total, 0)
 		juicefsFloor := int64(ratio * float64(total))
 		if juicefsFloor <= spoolFreeFloorBytesConst {
 			t.Errorf("total=%d GiB: ratio %.4f keeps only %d GiB free — at or below the spool's "+
@@ -38,9 +39,9 @@ func TestFreeSpaceRatio_OldFormulaWasBelowTheSpoolFloor(t *testing.T) {
 		if int64(old*float64(total)) > spoolFreeFloorBytesConst {
 			t.Fatalf("premise wrong: the old ratio on a %d GiB disk already cleared the spool floor", total/gib)
 		}
-		if resolveFreeSpaceRatio(total) <= old {
+		if resolveFreeSpaceRatio(total, 0) <= old {
 			t.Errorf("total=%d GiB: derived ratio %.4f did not raise the old %.4f",
-				total/gib, resolveFreeSpaceRatio(total), old)
+				total/gib, resolveFreeSpaceRatio(total, 0), old)
 		}
 	}
 }
@@ -52,7 +53,7 @@ func TestFreeSpaceRatioNeverWeakensThe10GiBFloor(t *testing.T) {
 	sizes := append([]int64{4 * gib, 8 * gib, 16 * gib, 32 * gib, 40 * gib, 64 * gib, 80 * gib},
 		realisticDiskSizes...)
 	for _, total := range sizes {
-		ratio := resolveFreeSpaceRatio(total)
+		ratio := resolveFreeSpaceRatio(total, 0)
 		if kept := int64(ratio * float64(total)); kept < cacheFreeFloorBytesConst {
 			t.Errorf("total=%d GiB: ratio %.4f keeps only %d GiB free, below the %d GiB hard floor",
 				total/gib, ratio, kept/gib, cacheFreeFloorBytesConst/gib)
@@ -64,17 +65,17 @@ func TestFreeSpaceRatioNeverWeakensThe10GiBFloor(t *testing.T) {
 // 10 GiB hard floor doesn't have to override them.
 func TestFreeSpaceRatioStaysWithinBounds(t *testing.T) {
 	for _, total := range append([]int64{64 * gib}, realisticDiskSizes...) {
-		ratio := resolveFreeSpaceRatio(total)
+		ratio := resolveFreeSpaceRatio(total, 0)
 		if ratio < minFreeSpaceRatio || ratio > maxFreeSpaceRatio {
 			t.Errorf("total=%d GiB: ratio %.4f outside [%.2f, %.2f]",
 				total/gib, ratio, minFreeSpaceRatio, maxFreeSpaceRatio)
 		}
 	}
 	// An unknown disk yields 0 — the caller then leaves the config untouched.
-	if got := resolveFreeSpaceRatio(0); got != 0 {
+	if got := resolveFreeSpaceRatio(0, 0); got != 0 {
 		t.Errorf("unknown disk: got %.4f, want 0", got)
 	}
-	if got := resolveFreeSpaceRatio(-1); got != 0 {
+	if got := resolveFreeSpaceRatio(-1, 0); got != 0 {
 		t.Errorf("negative total: got %.4f, want 0", got)
 	}
 }
@@ -93,14 +94,14 @@ func TestResolveFreeSpaceRatioArg(t *testing.T) {
 			// The common case: nothing configured, a 1 TB disk. 30 GiB / 1000 GiB.
 			name:       "unconfigured gets the derived floor",
 			configured: "", total: 1000 * gib,
-			want: "0.0300", wantReplace: true,
+			want: "0.030000", wantReplace: true,
 		},
 		{
 			// The OLD value, still in a config file. It must be raised: 0.01 of a
 			// 1 TB disk is 10 GiB, i.e. below the spool's 20 GiB floor.
 			name:       "the old 0.01 is raised",
 			configured: "0.01", total: 1000 * gib,
-			want: "0.0300", wantReplace: true,
+			want: "0.030000", wantReplace: true,
 		},
 		{
 			name:       "a stricter configured ratio is never weakened",
@@ -122,11 +123,11 @@ func TestResolveFreeSpaceRatioArg(t *testing.T) {
 			// still 80 GiB free — comfortably above the spool floor.
 			name:       "a very large disk clamps to the minimum ratio",
 			configured: "", total: 8192 * gib,
-			want: "0.0100", wantReplace: true,
+			want: "0.010000", wantReplace: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, replace := resolveFreeSpaceRatioArg(tc.configured, tc.total)
+			got, replace := resolveFreeSpaceRatioArg(tc.configured, tc.total, 0)
 			if replace != tc.wantReplace {
 				t.Fatalf("replace = %v, want %v (got %q)", replace, tc.wantReplace, got)
 			}
@@ -137,6 +138,60 @@ func TestResolveFreeSpaceRatioArg(t *testing.T) {
 				t.Errorf("no replacement expected but got %q", got)
 			}
 		})
+	}
+}
+
+// A real RC Mac had 21.58 GiB available on a ~926 GiB APFS volume. The old
+// fixed 30 GiB floor disabled the block cache completely, making every read a
+// network read. There is enough space to preserve the spool ordering and leave
+// a small useful cache, so the adaptive policy must use it rather than pretend
+// the machine has no safe cache capacity.
+func TestFreeSpaceRatioAdaptsWithoutDisablingAConstrainedCache(t *testing.T) {
+	total := int64(926) * gib
+	free := int64(22626540) * 1024 // field observation from df -k
+	ratio := resolveFreeSpaceRatio(total, free)
+	floor := int64(ratio * float64(total))
+	minimumOrderedFloor := spoolFreeFloorBytesConst + cacheMinimumYieldHeadroomBytes
+	if floor < minimumOrderedFloor {
+		t.Fatalf("adaptive floor = %d MiB, below ordered minimum %d MiB",
+			floor>>20, minimumOrderedFloor>>20)
+	}
+	if floor >= free {
+		t.Fatalf("adaptive floor = %d MiB with only %d MiB free: cache still disabled",
+			floor>>20, free>>20)
+	}
+	if window := free - floor; window < cacheMinimumWorkingSetBytes-(1<<20) {
+		t.Fatalf("adaptive cache window = %d MiB, want approximately at least %d MiB",
+			window>>20, cacheMinimumWorkingSetBytes>>20)
+	}
+
+	arg, replace := resolveFreeSpaceRatioArg("0.01", total, free)
+	if !replace {
+		t.Fatal("adaptive ratio did not replace the unsafe historical 0.01")
+	}
+	var wireRatio float64
+	if _, err := fmt.Sscanf(arg, "%f", &wireRatio); err != nil {
+		t.Fatalf("parse adaptive wire ratio %q: %v", arg, err)
+	}
+	wireFloor := int64(wireRatio * float64(total))
+	if wireFloor < minimumOrderedFloor || wireFloor >= free {
+		t.Fatalf("wire floor = %d MiB, want [%d, %d) MiB (arg=%s)",
+			wireFloor>>20, minimumOrderedFloor>>20, free>>20, arg)
+	}
+}
+
+// If the disk cannot simultaneously preserve the minimum ordering gap and a
+// useful cache window, weakening the floor would let the cache starve writes.
+// Keep the preferred floor and visibly suspend caching until space is freed.
+func TestFreeSpaceRatioFailsClosedWhenBothWindowsCannotFit(t *testing.T) {
+	total := int64(926) * gib
+	free := spoolFreeFloorBytesConst + cacheMinimumYieldHeadroomBytes + cacheMinimumWorkingSetBytes - 1
+	ratio := resolveFreeSpaceRatio(total, free)
+	floor := int64(ratio * float64(total))
+	preferred := spoolFreeFloorBytesConst + cacheYieldHeadroomBytes
+	if floor < preferred-1 {
+		t.Fatalf("floor = %d GiB, want preferred fail-closed floor near %d GiB",
+			floor>>30, preferred>>30)
 	}
 }
 

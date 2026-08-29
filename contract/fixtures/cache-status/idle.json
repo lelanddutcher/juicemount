@@ -23,6 +23,7 @@
     "shortfall_bytes": 0,
     "disk_free_bytes": 64424509440,
     "cache_usage_bytes": 0,
+    "cache_free_floor_bytes": 10737418240,
     "computed_sec": 0
   },
   "scanning": []

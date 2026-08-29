@@ -25,6 +25,11 @@ func (c *Client) EnqueueCPUFallbackSubset(ctx context.Context, parent Job, targe
 	if err != nil {
 		return Job{}, false, err
 	}
+	// Persist the terminal source-admission/render-failure provenance in the
+	// immutable queue payload as well as the mutable status hash. Maintenance
+	// may rewrite status notes during recovery; the raw reason prevents a later
+	// outage from making a deliberate compatibility fallback look temporary.
+	child.RoutingReason = strings.TrimSpace(reason)
 
 	raw, err := json.Marshal(child)
 	if err != nil {

@@ -33,6 +33,19 @@ const (
 	// against a reading JuiceFS has not yet reacted to.
 	cacheYieldHeadroomBytes = int64(10) << 30 // 10 GiB
 
+	// cacheMinimumYieldHeadroomBytes is the smallest gap we allow between
+	// JuiceFS's eviction floor and the write spool's admission floor when the
+	// disk is already constrained. It preserves ordering and covers at least one
+	// disk-space sample plus a bounded burst instead of collapsing both guards
+	// onto the same byte.
+	cacheMinimumYieldHeadroomBytes = int64(512) << 20 // 512 MiB
+
+	// cacheMinimumWorkingSetBytes is the smallest useful cache window we will
+	// deliberately leave above the eviction floor. Without it, deriving a floor
+	// a few bytes below current free space technically enables caching while
+	// functionally forcing every read back to the network.
+	cacheMinimumWorkingSetBytes = int64(512) << 20 // 512 MiB
+
 	// minFreeSpaceRatio / maxFreeSpaceRatio bound the derived ratio. The lower
 	// bound preserves the historical ~1% behaviour on very large disks; the
 	// upper bound stops a small disk from reserving an absurd fraction of itself
@@ -57,20 +70,35 @@ const (
 // actually coming back, so without this the other half of the fix is a promise
 // nothing keeps.
 //
-// The fix is ordering, not new machinery: put JuiceFS's eviction floor ABOVE the
-// spool's admission floor by the yield headroom and let JuiceFS's own LRU do the
-// work.
+// The normal fix is ordering, not new machinery: put JuiceFS's eviction floor
+// ABOVE the spool's admission floor by the preferred yield headroom and let
+// JuiceFS's own LRU do the work. A machine that starts with less than that
+// preferred 30 GiB floor used to have caching disabled outright, even when it
+// still had safe space above the spool floor. When current free space is known,
+// we may reduce only the EXTRA yield headroom while preserving both a 512 MiB
+// gap above the spool and a 512 MiB usable cache window. If those cannot coexist
+// we keep the preferred floor and fail closed.
 //
 // KNOWN LIMIT: on a disk small enough for maxFreeSpaceRatio to bite (below ~80
 // GiB total) the resulting floor lands under the spool's 20 GiB and the ordering
 // is not achieved. That disk cannot host both a 20 GiB spool floor and a cache
 // anyway; the clamp keeps the failure sane rather than reserving a third of the
 // volume. Returns 0 for an unknown disk (caller leaves the config untouched).
-func resolveFreeSpaceRatio(totalBytes int64) float64 {
+// freeBytes <= 0 means current free space is unknown and retains the preferred
+// 30 GiB policy.
+func resolveFreeSpaceRatio(totalBytes, freeBytes int64) float64 {
 	if totalBytes <= 0 {
 		return 0
 	}
-	ratio := float64(spoolFreeFloorBytesConst+cacheYieldHeadroomBytes) / float64(totalBytes)
+	floorBytes := spoolFreeFloorBytesConst + cacheYieldHeadroomBytes
+	if freeBytes > 0 && freeBytes < floorBytes+cacheMinimumWorkingSetBytes {
+		adaptiveFloor := freeBytes - cacheMinimumWorkingSetBytes
+		minimumOrderedFloor := spoolFreeFloorBytesConst + cacheMinimumYieldHeadroomBytes
+		if adaptiveFloor >= minimumOrderedFloor {
+			floorBytes = adaptiveFloor
+		}
+	}
+	ratio := float64(floorBytes) / float64(totalBytes)
 	if ratio < minFreeSpaceRatio {
 		ratio = minFreeSpaceRatio
 	}
@@ -98,8 +126,8 @@ func resolveFreeSpaceRatio(totalBytes int64) float64 {
 // Returns (value, true) when the derived floor is stricter than what is
 // configured and the config should be replaced, or ("", false) to leave the
 // configured value untouched.
-func resolveFreeSpaceRatioArg(configured string, totalBytes int64) (string, bool) {
-	derived := resolveFreeSpaceRatio(totalBytes)
+func resolveFreeSpaceRatioArg(configured string, totalBytes, freeBytes int64) (string, bool) {
+	derived := resolveFreeSpaceRatio(totalBytes, freeBytes)
 	if derived <= 0 {
 		return "", false // unknown disk: leave the config alone
 	}
@@ -108,7 +136,10 @@ func resolveFreeSpaceRatioArg(configured string, totalBytes int64) (string, bool
 	if derived <= cur {
 		return "", false // an already-stricter configured ratio is never weakened
 	}
-	return fmt.Sprintf("%.4f", derived), true
+	// Six decimals keep the adaptive 512 MiB working window honest on a 1 TB
+	// disk. Four decimals can round the floor by roughly 50 MiB in either
+	// direction, material when the whole constrained window is only 512 MiB.
+	return fmt.Sprintf("%.6f", derived), true
 }
 
 // resolveCacheSizeMiB decides the --cache-size (in MiB) to pass to juicefs.

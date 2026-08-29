@@ -312,12 +312,18 @@ struct MenuPopoverView: View {
     private var diskSpaceRow: some View {
         let purgeable = max(0, diskImportantGB - diskFreeGB)
 
-        // JuiceFS is launched with --free-space-ratio 0.01 — it skips cache
-        // writes when free < 1% of total disk. Surface that operational
-        // reality, not theoretical concerns.
+        // Use the backend's ACTUAL mount-time eviction floor. The old 1% mirror
+        // became false when the Go policy raised or adaptively reduced the
+        // floor to keep cache eviction ahead of the write spool.
         let freeRatio = diskTotalGB > 0 ? diskFreeGB / diskTotalGB : 1.0
-        let cacheOff = freeRatio < 0.01     // hard cutoff: JuiceFS already refusing
-        let cacheCutoffSoon = freeRatio < 0.03 && !cacheOff
+        let freeBytes = max(0, diskFreeGB * 1e9)
+        let floorBytes = Double(cacheStatus.capacity.cache_free_floor_bytes)
+        let hasEffectiveFloor = floorBytes > 0
+        let cacheHeadroomBytes = hasEffectiveFloor ? freeBytes - floorBytes : 0
+        let cacheOff = hasEffectiveFloor ? cacheHeadroomBytes <= 0 : freeRatio < 0.01
+        let cacheCutoffSoon = !cacheOff && (hasEffectiveFloor
+            ? cacheHeadroomBytes < 2e9
+            : freeRatio < 0.03)
         // R-1: the backend's capacity verdict is the accurate signal. It
         // compares the pinned set against what the cache can sustainably hold
         // (free disk + space the cache already occupies − the 10 GiB floor) —
@@ -365,12 +371,16 @@ struct MenuPopoverView: View {
             if cacheOff {
                 pressureBanner(
                     color: .red,
-                    text: "Disk under 1% free — JuiceFS has stopped caching. Reads fall back to network until you free space (try Reclaim)."
+                    text: hasEffectiveFloor
+                        ? String(format: "Cache paused at the %.1f GB safety floor — reads use the network until you free space (try Reclaim).", floorBytes / 1e9)
+                        : "Disk under 1% free — JuiceFS has stopped caching. Reads fall back to network until you free space (try Reclaim)."
                 )
             } else if cacheCutoffSoon {
                 pressureBanner(
                     color: .orange,
-                    text: "Disk under 3% free — JuiceFS will stop caching at 1% free. Reclaim or unpin large folders to keep caching alive."
+                    text: hasEffectiveFloor
+                        ? String(format: "Cache has %.1f GB before its safety floor — reclaim space or unpin large folders to keep SSD-speed reads available.", max(0, cacheHeadroomBytes) / 1e9)
+                        : "Disk under 3% free — JuiceFS will stop caching at 1% free. Reclaim or unpin large folders to keep caching alive."
                 )
             } else if overCapacity {
                 pressureBanner(

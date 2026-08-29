@@ -326,6 +326,25 @@ func TestRedisReadyCPUPromotionWhenVerifiedRenderReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Deployed-RC migration case: an old deterministic -cpu child was promoted,
+	// retained its stale lock bit, then moved back to CPU when that ephemeral
+	// render identity disappeared. Availability provenance must repair the stale
+	// lock; the returning worker's live admission probe remains the safety gate.
+	staleOutageLock := temporaryProxy
+	staleOutageLock.ID = NewID() + "-cpu"
+	staleOutageLock.ParentID = strings.TrimSuffix(staleOutageLock.ID, "-cpu")
+	staleOutageLock.Path = "/jfs/incoming/stale-outage-lock.mp4"
+	staleOutageLock.RetryTargets = []string{staleOutageLock.Path}
+	staleOutageLock.QueueClass = QueueClassCPU
+	staleOutageLock.SelectedBackend = "libx264"
+	staleOutageLock.SelectedWorker = ""
+	staleOutageLock.RequiredCapabilities = []string{"cpu"}
+	staleOutageLock.CPUFallbackLocked = true
+	staleOutageLock.RoutingReason = "render capability went offline before claim; queued CPU fallback"
+	if err := q.Enqueue(ctx, staleOutageLock); err != nil {
+		t.Fatal(err)
+	}
+
 	parent := NewJob("/jfs/incoming/incompatible.mov", []string{KindProxy}, "manager")
 	lockedProxy, err := newCPUFallbackSubset(parent, []string{parent.Path})
 	if err != nil {
@@ -373,20 +392,22 @@ func TestRedisReadyCPUPromotionWhenVerifiedRenderReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 2 {
-		t.Fatalf("promote ready CPU = %d, %v; want 2, nil", n, err)
+	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 3 {
+		t.Fatalf("promote ready CPU = %d, %v; want 3, nil", n, err)
 	}
 	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 0 {
 		t.Fatalf("idempotent promotion = %d, %v; want 0, nil", n, err)
 	}
 
-	wantRender := map[string]bool{temporaryProxy.ID: true, temporaryPreview.ID: true}
-	for i := 0; i < 2; i++ {
+	wantRender := map[string]bool{
+		temporaryProxy.ID: true, temporaryPreview.ID: true, staleOutageLock.ID: true,
+	}
+	for i := 0; i < 3; i++ {
 		claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
 		if err != nil || !ok {
 			t.Fatalf("render claim after promotion: ok=%v err=%v", ok, err)
 		}
-		if !wantRender[claim.Job.ID] || claim.Job.QueueClass != QueueClassRender {
+		if !wantRender[claim.Job.ID] || claim.Job.QueueClass != QueueClassRender || claim.Job.CPUFallbackLocked {
 			t.Fatalf("unexpected promoted claim: %+v", claim.Job)
 		}
 		delete(wantRender, claim.Job.ID)
@@ -503,6 +524,16 @@ func TestRedisClaimEnforcesMeasuredDecodeGeometry(t *testing.T) {
 	if err := q.Enqueue(ctx, fallback); err != nil {
 		t.Fatal(err)
 	}
+	if n, err := q.RecoverUnserviceableReady(ctx); err != nil || n != 0 {
+		t.Fatalf("first geometry recovery=%d, %v; want grace hold", n, err)
+	}
+	if class, err := q.rdb.HGet(ctx, JobHashPrefix+fallback.ID, "queue_class").Result(); err != nil || class != QueueClassRender {
+		t.Fatalf("grace moved render work early: class=%q err=%v", class, err)
+	}
+	if err := q.rdb.HSet(ctx, JobHashPrefix+fallback.ID, readyFallbackSinceField,
+		time.Now().Add(-readyFallbackGrace-time.Second).UTC().Format(time.RFC3339Nano)).Err(); err != nil {
+		t.Fatal(err)
+	}
 	if n, err := q.RecoverUnserviceableReady(ctx); err != nil || n != 1 {
 		t.Fatalf("geometry recovery=%d, %v; want one CPU reroute", n, err)
 	}
@@ -510,8 +541,12 @@ func TestRedisClaimEnforcesMeasuredDecodeGeometry(t *testing.T) {
 	if err != nil || !ok || cpuClaim.Job.ID != fallback.ID {
 		t.Fatalf("CPU fallback claim=%+v ok=%v err=%v", cpuClaim.Job, ok, err)
 	}
-	if cpuClaim.Job.QueueClass != QueueClassCPU || cpuClaim.Job.SelectedBackend != "libx264" {
+	if cpuClaim.Job.QueueClass != QueueClassCPU || cpuClaim.Job.SelectedBackend != "libx264" ||
+		cpuClaim.Job.CPUFallbackLocked {
 		t.Fatalf("geometry fallback route=%+v", cpuClaim.Job)
+	}
+	if !temporaryAvailabilityFallback(cpuClaim.Job, "") {
+		t.Fatalf("geometry outage lost temporary provenance: %+v", cpuClaim.Job)
 	}
 	if err := q.AckClaim(ctx, cpuClaim); err != nil {
 		t.Fatal(err)

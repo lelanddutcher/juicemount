@@ -144,8 +144,12 @@ End users configure everything through the app's Preferences window
   `/pin`, `/offline`, `/spool`, `/spool-recover`, `/reclaim`, `/mount-now`)
 - **SSD cache:** the configured size is respected; it grows only as far
   as needed to keep the pinned set fully cached, and is clamped so the
-  boot disk always keeps ≥10 GiB free (`--free-space-ratio` is raised to
-  enforce the floor dynamically).
+  boot disk always keeps ≥10 GiB free. Normally `--free-space-ratio` keeps
+  JuiceFS eviction 10 GiB above the write spool's 20 GiB admission floor.
+  On an already-constrained disk it may reduce only that extra cushion while
+  preserving both a 512 MiB ordering margin and a 512 MiB usable cache window;
+  if both cannot fit, caching suspends rather than starving writes. The effective
+  floor is exposed as `capacity.cache_free_floor_bytes` in `/cache-status`.
 - **Memory buffer:** 2 GiB budget, files <128 MiB (tunable in
   Preferences since Phase 3b).
 - **Write spool:** enabled via Preferences → Cache & Storage in the app.

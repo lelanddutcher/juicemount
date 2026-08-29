@@ -584,6 +584,10 @@ func (fm *FUSEManager) Mount() error {
 	//      mount, which a static cap cannot).
 	const cacheFreeFloorBytes = cacheFreeFloorBytesConst
 	if total, err := volumeTotalBytes("/"); err == nil && total > 0 {
+		free, freeErr := volumeFreeBytes("/")
+		if freeErr != nil {
+			free = 0
+		}
 		var configuredMiB int64
 		fmt.Sscanf(fm.cfg.CacheSize, "%d", &configuredMiB)
 
@@ -605,7 +609,7 @@ func (fm *FUSEManager) Mount() error {
 		// CapacityLoop) surfaces this to the user; logging it here makes the
 		// condition obvious at mount time. Compares against FREE disk, not
 		// total — the prior policy's blind spot.
-		if free, ferr := volumeFreeBytes("/"); ferr == nil {
+		if free > 0 {
 			if sustainable := free - cacheFreeFloorBytes; sustainable > 0 && fm.cfg.PinnedBytes > sustainable {
 				jmlog.Warn("pinned set exceeds free disk — cannot stay fully cached offline",
 					"pinned_gb", fm.cfg.PinnedBytes>>30,
@@ -624,19 +628,30 @@ func (fm *FUSEManager) Mount() error {
 		// the space back. resolveFreeSpaceRatio still guarantees the >= 10 GiB
 		// free floor this line originally existed for. max() so we never weaken
 		// an already-stricter configured ratio.
-		if ratioArg, replace := resolveFreeSpaceRatioArg(fm.cfg.FreeSpaceRatio, total); replace {
+		derivedRatio := resolveFreeSpaceRatio(total, free)
+		if ratioArg, replace := resolveFreeSpaceRatioArg(fm.cfg.FreeSpaceRatio, total, free); replace {
 			fm.cfg.FreeSpaceRatio = ratioArg
-			// PUBLISH the floor we are actually mounting with. The pin capacity
-			// verdict used to read a hard-coded 10 GiB, so once this ratio moved
-			// the floor to ~30 GiB the verdict OVER-stated sustainable capacity by
-			// the difference — the over-capacity banner under-warned, and
-			// IsOverCapacity() gates the prefetcher re-warm, so the futile-churn
-			// guard released late. Both errors were in the unsafe direction.
-			pin.SetCacheFreeFloorBytes(int64(resolveFreeSpaceRatio(total) * float64(total)))
-			jmlog.Info("free-space-ratio derived to keep the JuiceFS eviction floor above the spool floor",
-				"ratio", ratioArg,
-				"keeps_free_gb", int64(resolveFreeSpaceRatio(total)*float64(total))>>30,
+		}
+		// PUBLISH the floor we are actually mounting with, including a stricter
+		// configured value. The UI and pin-capacity guard must agree with the
+		// exact JuiceFS argument rather than a historical constant or the raw
+		// derived value before wire rounding.
+		var effectiveRatio float64
+		fmt.Sscanf(fm.cfg.FreeSpaceRatio, "%f", &effectiveRatio)
+		if effectiveRatio <= 0 {
+			effectiveRatio = derivedRatio
+		}
+		effectiveFloor := int64(effectiveRatio * float64(total))
+		if effectiveFloor > 0 {
+			pin.SetCacheFreeFloorBytes(effectiveFloor)
+			preferredFloor := spoolFreeFloorBytesConst + cacheYieldHeadroomBytes
+			jmlog.Info("free-space-ratio resolved to keep the JuiceFS eviction floor above the spool floor",
+				"ratio", fm.cfg.FreeSpaceRatio,
+				"keeps_free_gb", effectiveFloor>>30,
+				"current_free_gb", free>>30,
+				"cache_window_mb", max(int64(0), free-effectiveFloor)>>20,
 				"spool_floor_gb", spoolFreeFloorBytesConst>>30,
+				"adaptive", free > 0 && effectiveFloor < preferredFloor,
 				"disk_total_gb", total>>30)
 		}
 	}

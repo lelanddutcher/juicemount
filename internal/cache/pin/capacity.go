@@ -95,6 +95,11 @@ type CapacityVerdict struct {
 	// and for debugging the verdict.
 	DiskFreeBytes   int64 `json:"disk_free_bytes"`
 	CacheUsageBytes int64 `json:"cache_usage_bytes"`
+	// CacheFreeFloorBytes is the effective JuiceFS eviction floor selected at
+	// mount time. It is surfaced so clients can report the real caching cutoff;
+	// a hard-coded 1% UI became false once the floor was made disk- and
+	// spool-aware.
+	CacheFreeFloorBytes int64 `json:"cache_free_floor_bytes"`
 	// BlockCacheBytes is JuiceFS's own `juicefs_blockcache_bytes` gauge — the
 	// AUTHORITATIVE on-disk block-cache size — as of Computed. 0 when the gauge
 	// is unavailable (no metrics addr, daemon not up, never scraped), in which
@@ -221,7 +226,9 @@ func evaluateCapacity(v *CapacityVerdict) {
 	// The cache can sustainably hold what's free now PLUS what it already
 	// occupies (JuiceFS reuses its own blocks via LRU), minus the floor it must
 	// keep free on the volume.
-	capacity := v.DiskFreeBytes + v.CacheUsageBytes - CacheFreeFloorBytes()
+	floor := CacheFreeFloorBytes()
+	v.CacheFreeFloorBytes = floor
+	capacity := v.DiskFreeBytes + v.CacheUsageBytes - floor
 	if capacity < 0 {
 		capacity = 0
 	}
