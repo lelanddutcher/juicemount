@@ -214,6 +214,9 @@ type Job struct {
 	SourceVideoCodec   string `json:"source_video_codec,omitempty"`
 	SourceVideoProfile string `json:"source_video_profile,omitempty"`
 	SourceBitDepth     int    `json:"source_bit_depth,omitempty"`
+	SourcePixelFormat  string `json:"source_pixel_format,omitempty"`
+	SourceVideoWidth   int    `json:"source_video_width,omitempty"`
+	SourceVideoHeight  int    `json:"source_video_height,omitempty"`
 	// RoutingReason makes an intentional CPU decode fallback inspectable in the
 	// same Recent Jobs error/note surface used by retry recovery.
 	RoutingReason string `json:"routing_reason,omitempty"`
@@ -276,6 +279,14 @@ type WorkerBenchmarks struct {
 	ProbeError               string  `json:"probe_error,omitempty"`
 }
 
+// VideoDecodeLimit is the largest frame geometry a decoder completed during
+// the worker's startup probes. It is measured from real encoded bitstreams and
+// hardware-frame output; inventory strings alone never populate this field.
+type VideoDecodeLimit struct {
+	MaxWidth  int `json:"max_width"`
+	MaxHeight int `json:"max_height"`
+}
+
 // Worker is the heartbeat a draining worker publishes so producers can tell the
 // farm is alive + accepting work (the `farm-queue` capability signal).
 // Extra fields (all optional/omitted when empty) carry the manager-config
@@ -295,18 +306,19 @@ type Worker struct {
 	BuildCommit  string `json:"build_commit,omitempty"`
 
 	// Manager-config feedback (FARM-NODE-CONFIG spec):
-	Name               string            `json:"name,omitempty"`            // JM_WORKER_NAME (stable identity)
-	Kinds              []string          `json:"kinds,omitempty"`           // dedicated queues this worker drains
-	ConfigRevision     int64             `json:"config_revision,omitempty"` // 0 = unmanaged
-	PendingRestart     []string          `json:"pending_restart,omitempty"` // knobs needing container restart
-	Capabilities       []string          `json:"capabilities,omitempty"`    // e.g. ["vulkan","vaapi","cuda"]
-	Effective          map[string]string `json:"effective,omitempty"`       // resolved hot settings
-	Role               string            `json:"role,omitempty"`            // server|render
-	Encoders           []string          `json:"encoders,omitempty"`        // successfully probed ffmpeg encoders
-	Decoders           []string          `json:"decoders,omitempty"`        // verified/listed hardware decoders
-	TranscriptBackends []string          `json:"transcript_backends,omitempty"`
-	Benchmarks         WorkerBenchmarks  `json:"benchmarks,omitempty"`
-	State              string            `json:"state,omitempty"` // idle|working|paused|disabled
+	Name               string                      `json:"name,omitempty"`            // JM_WORKER_NAME (stable identity)
+	Kinds              []string                    `json:"kinds,omitempty"`           // dedicated queues this worker drains
+	ConfigRevision     int64                       `json:"config_revision,omitempty"` // 0 = unmanaged
+	PendingRestart     []string                    `json:"pending_restart,omitempty"` // knobs needing container restart
+	Capabilities       []string                    `json:"capabilities,omitempty"`    // e.g. ["vulkan","vaapi","cuda"]
+	Effective          map[string]string           `json:"effective,omitempty"`       // resolved hot settings
+	Role               string                      `json:"role,omitempty"`            // server|render
+	Encoders           []string                    `json:"encoders,omitempty"`        // successfully probed ffmpeg encoders
+	Decoders           []string                    `json:"decoders,omitempty"`        // verified/listed hardware decoders
+	DecodeLimits       map[string]VideoDecodeLimit `json:"decode_limits,omitempty"`
+	TranscriptBackends []string                    `json:"transcript_backends,omitempty"`
+	Benchmarks         WorkerBenchmarks            `json:"benchmarks,omitempty"`
+	State              string                      `json:"state,omitempty"` // idle|working|paused|disabled
 }
 
 // FarmConfig is the manager-owned desired state published at ConfigKey. The

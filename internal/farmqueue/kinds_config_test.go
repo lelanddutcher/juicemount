@@ -2,6 +2,7 @@ package farmqueue
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -148,6 +149,115 @@ func TestPreviewDecoderSelectionRequiresMeasuredSourceProfile(t *testing.T) {
 	}
 }
 
+func TestProxySelectionRequiresVerifiedEndToEndHardwarePath(t *testing.T) {
+	mismatched := Worker{
+		ID: "mismatched", Name: "mismatched", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi", "decoder:h264_qsv", "decoder:h264_qsv:profile:high",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_qsv"},
+	}
+	job := Job{Kinds: []string{KindProxy}, SourceVideoCodec: "h264", SourceVideoProfile: "High"}
+	routeJobWithWorkers(&job, []Worker{mismatched}, nil)
+	if job.QueueClass != QueueClassCPU || job.SelectedBackend != "libx264" ||
+		!strings.Contains(job.RoutingReason, "decode+encode") {
+		t.Fatalf("mismatched-family route=%+v, want explicit CPU fallback", job)
+	}
+
+	verified := Worker{
+		ID: "verified", Name: "verified", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+	}
+	job = Job{Kinds: []string{KindProxy}, SourceVideoCodec: "h264", SourceVideoProfile: "High"}
+	routeJobWithWorkers(&job, []Worker{verified}, nil)
+	wantCaps := []string{
+		"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high", "worker:verified",
+	}
+	if job.QueueClass != QueueClassRender || job.SelectedBackend != "hevc_vaapi" ||
+		!reflect.DeepEqual(job.RequiredCapabilities, wantCaps) {
+		t.Fatalf("verified route=%+v, want full path capabilities %v", job, wantCaps)
+	}
+}
+
+func TestMeasuredDecodeLimitRejectsOversizedSourceBeforeQueue(t *testing.T) {
+	worker := Worker{
+		ID: "intel", Name: "intel", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+		DecodeLimits: map[string]VideoDecodeLimit{
+			"h264_vaapi": {MaxWidth: 4096, MaxHeight: 4096},
+		},
+	}
+	if !WorkerSupportsDecodeSize(worker, "h264_vaapi", 4096, 2160) {
+		t.Fatal("verified 4096x2160 source was rejected")
+	}
+	if WorkerSupportsDecodeSize(worker, "h264_vaapi", 5760, 2880) {
+		t.Fatal("5760x2880 source exceeded measured decoder limit but was admitted")
+	}
+	job := Job{
+		Kinds: []string{KindProxy}, SourceVideoCodec: "h264", SourceVideoProfile: "High",
+		SourceVideoWidth: 5760, SourceVideoHeight: 2880,
+	}
+	routeJobWithWorkers(&job, []Worker{worker}, nil)
+	if job.QueueClass != QueueClassCPU || job.SelectedBackend != "libx264" {
+		t.Fatalf("oversized proxy route=%+v, want explicit CPU lane", job)
+	}
+	job = Job{
+		Kinds: []string{KindProxy}, SourceVideoCodec: "h264", SourceVideoProfile: "High",
+		SourceVideoWidth: 4096, SourceVideoHeight: 2160,
+	}
+	routeJobWithWorkers(&job, []Worker{worker}, nil)
+	if job.QueueClass != QueueClassRender || job.SelectedBackend != "hevc_vaapi" {
+		t.Fatalf("verified-size proxy route=%+v, want HEVC render lane", job)
+	}
+}
+
+func TestProxySelectionUsesMeasuredAV1AndRextDecodeCapabilities(t *testing.T) {
+	worker := Worker{
+		ID: "arc", Name: "arc", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi",
+			"decoder:av1_vaapi", "decoder:av1_vaapi:profile:main", "decoder:av1_vaapi:pixfmt:yuv420p10le",
+			"decoder:hevc_vaapi", "decoder:hevc_vaapi:profile:rext", "decoder:hevc_vaapi:pixfmt:yuv422p10le",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"av1_vaapi", "hevc_vaapi"},
+		DecodeLimits: map[string]VideoDecodeLimit{
+			"av1_vaapi":  {MaxWidth: 7680, MaxHeight: 4320},
+			"hevc_vaapi": {MaxWidth: 7680, MaxHeight: 4320},
+		},
+	}
+	tests := []struct {
+		name, codec, profile, pixelFormat, decoder string
+		bitDepth, width, height                    int
+	}{
+		{name: "AV1 Main 10", codec: "av1", profile: "Main", pixelFormat: "yuv420p10le", decoder: "av1_vaapi", bitDepth: 10, width: 3840, height: 2160},
+		{name: "HEVC Rext 422", codec: "hevc", profile: "Rext", pixelFormat: "yuv422p10le", decoder: "hevc_vaapi", bitDepth: 10, width: 4096, height: 2160},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := Job{
+				Kinds: []string{KindProxy}, SourceVideoCodec: tc.codec, SourceVideoProfile: tc.profile,
+				SourcePixelFormat: tc.pixelFormat, SourceBitDepth: tc.bitDepth,
+				SourceVideoWidth: tc.width, SourceVideoHeight: tc.height,
+			}
+			routeJobWithWorkers(&job, []Worker{worker}, nil)
+			want := []string{
+				"encoder:hevc_vaapi", "decoder:" + tc.decoder,
+				"decoder:" + tc.decoder + ":profile:" + NormalizeVideoProfile(tc.codec, tc.profile),
+				DecoderPixelFormatRequirement(tc.decoder, tc.pixelFormat), "worker:arc",
+			}
+			if job.QueueClass != QueueClassRender || job.SelectedBackend != "hevc_vaapi" || !reflect.DeepEqual(job.RequiredCapabilities, want) {
+				t.Fatalf("route=%+v, want measured full path %v", job, want)
+			}
+		})
+	}
+}
+
 func TestNormalizeVideoProfile(t *testing.T) {
 	tests := map[string]string{
 		"Baseline": "baseline", "Constrained Baseline": "constrained_baseline", "Main": "main",
@@ -160,6 +270,12 @@ func TestNormalizeVideoProfile(t *testing.T) {
 	}
 	if got := NormalizeVideoProfile("hevc", "Main 10"); got != "main10" {
 		t.Fatalf("NormalizeVideoProfile(hevc, Main 10)=%q", got)
+	}
+	if got := NormalizeVideoProfile("av1", "Profile 0"); got != "main" {
+		t.Fatalf("NormalizeVideoProfile(av1, Profile 0)=%q", got)
+	}
+	if got := NormalizePixelFormat(" YUV422P10LE "); got != "yuv422p10le" {
+		t.Fatalf("NormalizePixelFormat=%q", got)
 	}
 }
 

@@ -106,6 +106,9 @@ func buildDerivativePlan(ctx context.Context, route derivativeRouter, parent far
 		child.SourceVideoCodec = normalizedDecodeCodec(track.Codec)
 		child.SourceVideoProfile = farmqueue.NormalizeVideoProfile(child.SourceVideoCodec, track.Profile)
 		child.SourceBitDepth = track.BitDepth
+		child.SourcePixelFormat = farmqueue.NormalizePixelFormat(track.PixFmt)
+		child.SourceVideoWidth = track.Width
+		child.SourceVideoHeight = track.Height
 		route(ctx, &child)
 		if child.QueueClass != farmqueue.QueueClassRender {
 			reason := child.RoutingReason
@@ -121,7 +124,11 @@ func buildDerivativePlan(ctx context.Context, route derivativeRouter, parent far
 		// source's pixel-format/bit-depth contract before publishing the claim.
 		admission := farmqueue.Worker{
 			Role: farmqueue.QueueClassRender, Decoders: []string{child.SelectedBackend},
-			Capabilities: append([]string(nil), child.RequiredCapabilities...),
+			Capabilities: append(append([]string(nil), child.RequiredCapabilities...),
+				farmqueue.DecoderPixelFormatRequirement(child.SelectedBackend, child.SourcePixelFormat)),
+			DecodeLimits: map[string]farmqueue.VideoDecodeLimit{
+				child.SelectedBackend: {MaxWidth: track.Width, MaxHeight: track.Height},
+			},
 		}
 		if reason := unsupportedHardwareDecodeReason(admission, child.SelectedBackend, track); reason != "" {
 			routePreviewCPU(&child, reason)
@@ -129,7 +136,9 @@ func buildDerivativePlan(ctx context.Context, route derivativeRouter, parent far
 			// The backend capability is portable; never pin a directory plan to
 			// one ephemeral worker identity.
 			child.SelectedWorker = ""
-			child.RequiredCapabilities = farmqueue.DecoderRequirements(child.SelectedBackend, child.SourceVideoCodec, child.SourceVideoProfile)
+			child.RequiredCapabilities = farmqueue.DecoderSourceRequirements(
+				child.SelectedBackend, child.SourceVideoCodec, child.SourceVideoProfile, child.SourcePixelFormat,
+			)
 		}
 		children = append(children, child)
 	}

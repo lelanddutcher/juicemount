@@ -19,6 +19,8 @@ func TestUnsupportedHardwareDecodeReason(t *testing.T) {
 		Capabilities: []string{
 			"decoder:h264_vaapi:profile:main",
 			"decoder:h264_vaapi:profile:high",
+			"decoder:h264_vaapi:pixfmt:yuv420p",
+			"decoder:hevc_vaapi:pixfmt:yuv420p10le",
 		},
 	}
 	tests := []struct {
@@ -31,11 +33,12 @@ func TestUnsupportedHardwareDecodeReason(t *testing.T) {
 		{name: "H264 main profile", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", Profile: "Main", PixFmt: "yuv420p", BitDepth: 8}},
 		{name: "H264 baseline profile", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", Profile: "Baseline", PixFmt: "yuv420p", BitDepth: 8}, want: "profile baseline"},
 		{name: "HEVC main10", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "hevc", PixFmt: "yuv420p10le", BitDepth: 10}},
-		{name: "camera H264 422", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", PixFmt: "yuv422p10le", BitDepth: 10}, want: "4:2:0"},
+		{name: "camera H264 422", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", PixFmt: "yuv422p10le", BitDepth: 10}, want: "10-bit"},
 		{name: "H264 high10", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", PixFmt: "yuv420p10le", BitDepth: 10}, want: "10-bit"},
 		{name: "unverified ProRes", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "prores", PixFmt: "yuv422p10le", BitDepth: 10}, want: "no verified"},
 		{name: "missing codec decoder", encoder: "hevc_qsv", track: farm.VideoTrack{Codec: "h264", PixFmt: "yuv420p", BitDepth: 8}, want: "h264_qsv"},
 		{name: "software encoder", encoder: "libx264", track: farm.VideoTrack{Codec: "h264", PixFmt: "yuv420p", BitDepth: 8}, want: "not a hardware"},
+		{name: "oversized source", encoder: "hevc_vaapi", track: farm.VideoTrack{Codec: "h264", PixFmt: "yuv420p", BitDepth: 8, Width: 5760, Height: 2880}, want: "no verified frame-size limit"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -78,7 +81,11 @@ func TestPartitionRenderProxyTargetsWithLiveH264AndProRes(t *testing.T) {
 
 	worker := farmqueue.Worker{
 		Role: farmqueue.QueueClassRender, Decoders: []string{"h264_vaapi", "hevc_vaapi"},
-		Capabilities: []string{"decoder:h264_vaapi:profile:high"},
+		Capabilities: []string{"decoder:h264_vaapi:profile:high", "decoder:h264_vaapi:pixfmt:yuv420p"},
+		DecodeLimits: map[string]farmqueue.VideoDecodeLimit{
+			"h264_vaapi": {MaxWidth: 4096, MaxHeight: 4096},
+			"hevc_vaapi": {MaxWidth: 4096, MaxHeight: 4096},
+		},
 	}
 	hardware, fallback := partitionRenderProxyTargets(worker, "hevc_vaapi", []string{h264, prores}, probeRenderVideoTrack)
 	if !reflect.DeepEqual(hardware, []string{h264}) {
@@ -93,6 +100,9 @@ func TestPartitionRenderProxyTargetsKeepsCompatibleMajorityOnGPU(t *testing.T) {
 	worker := farmqueue.Worker{
 		Role:     farmqueue.QueueClassRender,
 		Decoders: []string{"h264_vaapi", "hevc_vaapi"},
+		Capabilities: []string{
+			"decoder:h264_vaapi:pixfmt:yuv420p", "decoder:hevc_vaapi:pixfmt:yuv420p10le",
+		},
 	}
 	targets := []string{"camera-h264.mxf", "camera-prores.mov", "camera-hevc.mp4", "unprobeable.mov", "audio.wav"}
 	probe := func(path string) (*farm.VideoTrack, error) {
@@ -130,7 +140,7 @@ func TestPartitionRenderProxyTargetsKeepsCompatibleMajorityOnGPU(t *testing.T) {
 
 func TestNormalizedDecodeCodec(t *testing.T) {
 	for input, want := range map[string]string{
-		"h264": "h264", "AVC1": "h264", "hevc": "hevc", "hvc1": "hevc", "prores": "",
+		"h264": "h264", "AVC1": "h264", "hevc": "hevc", "hvc1": "hevc", "AV1": "av1", "av01": "av1", "prores": "",
 	} {
 		if got := normalizedDecodeCodec(input); got != want {
 			t.Errorf("normalizedDecodeCodec(%q) = %q, want %q", input, got, want)

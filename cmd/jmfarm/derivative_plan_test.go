@@ -68,7 +68,7 @@ func TestDerivativePlanSeparatesMetadataFromVerifiedPreviewDecode(t *testing.T) 
 			if child.QueueClass == farmqueue.QueueClassRender {
 				render++
 				if child.SelectedBackend != "h264_vaapi" || child.SelectedWorker != "" ||
-					!reflect.DeepEqual(child.RequiredCapabilities, []string{"decoder:h264_vaapi"}) {
+					!reflect.DeepEqual(child.RequiredCapabilities, []string{"decoder:h264_vaapi", "decoder:h264_vaapi:pixfmt:yuv420p"}) {
 					t.Fatalf("render preview retained a CPU path or exact worker pin: %+v", child)
 				}
 			} else {
@@ -149,7 +149,7 @@ func TestDerivativePlanCarriesMeasuredProfileAdmission(t *testing.T) {
 		t.Fatalf("children=%d, want metadata + preview", len(children))
 	}
 	preview := children[1]
-	want := []string{"decoder:h264_vaapi", "decoder:h264_vaapi:profile:main"}
+	want := []string{"decoder:h264_vaapi", "decoder:h264_vaapi:profile:main", "decoder:h264_vaapi:pixfmt:yuv420p"}
 	if preview.SourceVideoProfile != "main" || preview.SelectedWorker != "" ||
 		!reflect.DeepEqual(preview.RequiredCapabilities, want) {
 		t.Fatalf("profile-aware preview=%+v, want capabilities %v", preview, want)

@@ -783,6 +783,7 @@ func runQueue(cfg queueConfig) {
 		Role:               profile.Role,
 		Encoders:           profile.Encoders,
 		Decoders:           profile.Decoders,
+		DecodeLimits:       profile.DecodeLimits,
 		TranscriptBackends: profile.TranscriptBackends,
 		Benchmarks:         profile.Benchmarks,
 		State:              "idle",
@@ -1322,6 +1323,19 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 			return 0, 0, nil, fmt.Errorf("%w: publish derivative execution plan: %v", errJobDispatchRetry, planErr)
 		}
 		fmt.Printf("jmfarm queue: job %s released composite derivatives into %d bounded child job(s), %d newly queued\n",
+			job.ID, children, created)
+		return 0, 0, nil, errJobDispatched
+	}
+	if shouldDispatchProxyPlan(job) {
+		children, created, planErr := dispatchProxyPlan(ctx, q, store, job, targets, targetShardSize(job))
+		if planErr != nil {
+			return 0, 0, nil, fmt.Errorf("%w: publish proxy execution plan: %v", errJobDispatchRetry, planErr)
+		}
+		if children == 0 {
+			fmt.Printf("jmfarm queue: job %s found no video sources requiring proxies; nothing to dispatch\n", job.ID)
+			return 0, 0, nil, nil
+		}
+		fmt.Printf("jmfarm queue: job %s released source-aware proxy plan into %d bounded child job(s), %d newly queued\n",
 			job.ID, children, created)
 		return 0, 0, nil, errJobDispatched
 	}

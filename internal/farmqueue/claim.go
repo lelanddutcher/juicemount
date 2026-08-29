@@ -37,6 +37,10 @@ func (c *Client) ClaimForWorker(ctx context.Context, timeout time.Duration, w Wo
 	deadline := time.Now().Add(timeout)
 	processingKey := ProcessingPrefix + w.ID
 	capabilities, _ := json.Marshal(workerCapabilitySet(w))
+	decodeLimits, _ := json.Marshal(w.DecodeLimits)
+	if string(decodeLimits) == "null" {
+		decodeLimits = []byte("{}")
+	}
 	const script = `
 local controlRaw = redis.call('GET', KEYS[1])
 if controlRaw then
@@ -44,6 +48,7 @@ if controlRaw then
   if controlOK and control and control.paused then return {} end
 end
 local caps = cjson.decode(ARGV[2])
+local decodeLimits = cjson.decode(ARGV[3])
 for i = 4, #KEYS do
   local count = redis.call('LLEN', KEYS[i])
   for n = 1, count do
@@ -54,6 +59,24 @@ for i = 4, #KEYS do
       if ok and job and job.required_capabilities then
         for _, required in ipairs(job.required_capabilities) do
           if not caps[required] then eligible = false; break end
+        end
+      end
+      if eligible and job and job.required_capabilities and
+          job.source_video_width and job.source_video_height then
+        local decoder = nil
+        for _, required in ipairs(job.required_capabilities) do
+          decoder = string.match(required, '^decoder:([^:]+)$')
+          if decoder then break end
+        end
+        if decoder then
+          local limit = decodeLimits[decoder]
+          local width = tonumber(job.source_video_width) or 0
+          local height = tonumber(job.source_video_height) or 0
+          if width > 0 and height > 0 and
+              (not limit or (tonumber(limit.max_width) or 0) < width or
+               (tonumber(limit.max_height) or 0) < height) then
+            eligible = false
+          end
         end
       end
 		if eligible then
@@ -68,7 +91,7 @@ end
 return {}`
 	scriptKeys := append([]string{ControlKey, ProcessingIndexKey, processingKey}, keys...)
 	for {
-		res, err := c.rdb.Eval(ctx, script, scriptKeys, w.ID, string(capabilities)).StringSlice()
+		res, err := c.rdb.Eval(ctx, script, scriptKeys, w.ID, string(capabilities), string(decodeLimits)).StringSlice()
 		if err != nil && err != redis.Nil {
 			return Claim{}, false, err
 		}
@@ -116,7 +139,7 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 			}
 			serviceable := false
 			for _, worker := range workers {
-				if worker.Role == QueueClassRender && WorkerSupports(worker, job.RequiredCapabilities) {
+				if worker.Role == QueueClassRender && workerCanClaimJob(worker, job) {
 					serviceable = true
 					break
 				}
@@ -128,12 +151,16 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 			targetClass := QueueClassCPU
 			reason := "render capability went offline before claim; queued CPU fallback"
 			if kind == KindDerivatives && job.DerivativePass == DerivativePassPreviews {
-				if _, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, job.SourceVideoCodec, job.SourceVideoProfile, nil); ok {
+				if _, decoder, ok := preferredHardwareDecoderWorkerForSourceWithLoad(
+					workers, job.SourceVideoCodec, job.SourceVideoProfile, job.SourcePixelFormat, job.SourceVideoWidth, job.SourceVideoHeight, nil,
+				); ok {
 					targetClass = QueueClassRender
 					job.QueueClass = QueueClassRender
 					job.SelectedBackend = decoder
 					job.SelectedWorker = ""
-					job.RequiredCapabilities = DecoderRequirements(decoder, job.SourceVideoCodec, job.SourceVideoProfile)
+					job.RequiredCapabilities = DecoderSourceRequirements(
+						decoder, job.SourceVideoCodec, job.SourceVideoProfile, job.SourcePixelFormat,
+					)
 					reason = "selected decoder went offline; re-routed to active verified hardware"
 				} else {
 					job.QueueClass = QueueClassCPU
@@ -143,20 +170,20 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 					reason = "verified video decoder went offline before claim; queued explicit CPU decode fallback"
 				}
 			} else if kind == KindProxy {
-				if selected, encoder, ok := preferredHardwareWorker(workers); ok {
+				candidate := job
+				candidate.QueueClass = ""
+				candidate.RequiredCapabilities = nil
+				candidate.SelectedBackend = ""
+				candidate.SelectedWorker = ""
+				candidate.RoutingReason = ""
+				candidate.VCodec = ""
+				routeJobWithWorkers(&candidate, workers, nil)
+				if candidate.QueueClass == QueueClassRender {
 					targetClass = QueueClassRender
-					job.QueueClass = QueueClassRender
-					job.VCodec = encoder
-					job.SelectedBackend = encoder
-					job.SelectedWorker = workerDisplayName(selected)
-					job.RequiredCapabilities = []string{"encoder:" + encoder, "worker:" + selected.ID}
+					job = candidate
 					reason = "selected render capability went offline; re-routed to active hardware"
 				} else {
-					job.QueueClass = QueueClassCPU
-					job.RequiredCapabilities = []string{"cpu"}
-					job.VCodec = "libx264"
-					job.SelectedBackend = "libx264"
-					job.SelectedWorker = ""
+					job = candidate
 				}
 			} else if selected, backend, ok := preferredTranscriptWorker(workers); ok {
 				targetClass = QueueClassRender

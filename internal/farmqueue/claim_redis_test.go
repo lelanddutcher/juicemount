@@ -417,3 +417,103 @@ func TestRedisReadyCPUPromotionWhenVerifiedRenderReturns(t *testing.T) {
 		}
 	}
 }
+
+// Portable source-aware jobs intentionally omit a worker pin so another
+// compatible accelerator can take over. Capability names alone are not enough:
+// the atomic claim must also enforce that worker's measured frame envelope.
+func TestRedisClaimEnforcesMeasuredDecodeGeometry(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	capabilities := []string{
+		"encoder:hevc_vaapi", "decoder:h264_vaapi",
+		"decoder:h264_vaapi:profile:high", "decoder:h264_vaapi:pixfmt:yuv420p",
+	}
+	server := Worker{ID: "geometry-server", Name: "server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	low := Worker{ID: "geometry-low", Name: "low", Role: QueueClassRender,
+		Capabilities: capabilities, Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+		DecodeLimits: map[string]VideoDecodeLimit{"h264_vaapi": {MaxWidth: 4096, MaxHeight: 4096}}}
+	high := Worker{ID: "geometry-high", Name: "high", Role: QueueClassRender,
+		Capabilities: capabilities, Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+		DecodeLimits: map[string]VideoDecodeLimit{"h264_vaapi": {MaxWidth: 7680, MaxHeight: 4320}}}
+	for _, worker := range []Worker{server, low, high} {
+		if err := q.Heartbeat(ctx, worker); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	newOversizedJob := func(path string) Job {
+		job := NewJob(path, []string{KindProxy}, "manager")
+		job.ShardIndex, job.ShardCount = 1, 1
+		job.RetryTargets = []string{path}
+		job.QueueClass = QueueClassRender
+		job.VCodec = "hevc_vaapi"
+		job.SelectedBackend = "hevc_vaapi"
+		job.RequiredCapabilities = append([]string(nil), capabilities...)
+		job.SourceVideoCodec = "h264"
+		job.SourceVideoProfile = "high"
+		job.SourcePixelFormat = "yuv420p"
+		job.SourceVideoWidth, job.SourceVideoHeight = 5760, 2880
+		return job
+	}
+
+	job := newOversizedJob("/jfs/incoming/geometry-portable.mp4")
+	if !WorkerSupports(low, job.RequiredCapabilities) || workerCanClaimJob(low, job) {
+		t.Fatal("lower-capacity worker was not distinguished by measured geometry")
+	}
+	if !workerCanClaimJob(high, job) {
+		t.Fatal("verified 8K worker rejected the source")
+	}
+	if err := q.Enqueue(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, low); err != nil || ok {
+		t.Fatalf("lower-capacity worker claimed 5760-wide source: ok=%v err=%v", ok, err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, high)
+	if err != nil || !ok || claim.Job.ID != job.ID {
+		t.Fatalf("verified worker claim=%+v ok=%v err=%v", claim.Job, ok, err)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	// With the high-capacity worker gone, ready-queue recovery must observe
+	// geometry too and move the source to an explicit, visible CPU route.
+	if err := q.rdb.Del(ctx, WorkerPrefix+high.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	fallback := newOversizedJob("/jfs/incoming/geometry-fallback.mp4")
+	if err := q.Enqueue(ctx, fallback); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverUnserviceableReady(ctx); err != nil || n != 1 {
+		t.Fatalf("geometry recovery=%d, %v; want one CPU reroute", n, err)
+	}
+	cpuClaim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok || cpuClaim.Job.ID != fallback.ID {
+		t.Fatalf("CPU fallback claim=%+v ok=%v err=%v", cpuClaim.Job, ok, err)
+	}
+	if cpuClaim.Job.QueueClass != QueueClassCPU || cpuClaim.Job.SelectedBackend != "libx264" {
+		t.Fatalf("geometry fallback route=%+v", cpuClaim.Job)
+	}
+	if err := q.AckClaim(ctx, cpuClaim); err != nil {
+		t.Fatal(err)
+	}
+}

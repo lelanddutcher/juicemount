@@ -22,11 +22,22 @@
           ,"build_commit": { "type": "string" }
           ,"name": { "type": "string" }
           ,"role": { "type": "string", "enum": ["server", "render"] }
-          ,"state": { "type": "string", "enum": ["idle", "working", "paused"] }
+          ,"state": { "type": "string", "enum": ["idle", "working", "paused", "disabled"] }
           ,"kinds": { "type": "array", "items": { "type": "string" } }
           ,"capabilities": { "type": "array", "items": { "type": "string" } }
           ,"encoders": { "type": "array", "items": { "type": "string" } }
           ,"decoders": { "type": "array", "items": { "type": "string" } }
+          ,"decode_limits": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "required": ["max_width", "max_height"],
+              "properties": {
+                "max_width": { "type": "integer", "minimum": 1 },
+                "max_height": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
           ,"transcript_backends": { "type": "array", "items": { "type": "string" } }
           ,"benchmarks": {
             "type": "object",
@@ -52,7 +63,7 @@
         "required": ["id", "status", "path", "kinds", "producer"],
         "properties": {
           "id": { "type": "string" },
-          "status": { "type": "string", "enum": ["queued", "running", "done", "failed"] },
+          "status": { "type": "string", "enum": ["queued", "running", "dispatched", "done", "failed"] },
           "path": { "type": "string" },
           "kinds": { "type": "string", "description": "Comma-joined request set." },
           "producer": { "type": "string", "enum": ["openloupe", "manager", "farm-watch", "farm-watch-backstop"] },

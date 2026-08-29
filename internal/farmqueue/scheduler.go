@@ -97,11 +97,16 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 	switch kind {
 	case KindDerivatives:
 		if j.DerivativePass == DerivativePassPreviews {
-			if selected, decoder, ok := preferredHardwareDecoderWorkerWithLoad(workers, j.SourceVideoCodec, j.SourceVideoProfile, loads); ok {
+			if selected, decoder, ok := preferredHardwareDecoderWorkerForSourceWithLoad(
+				workers, j.SourceVideoCodec, j.SourceVideoProfile, j.SourcePixelFormat, j.SourceVideoWidth, j.SourceVideoHeight, loads,
+			); ok {
 				j.QueueClass = QueueClassRender
 				j.SelectedBackend = decoder
 				j.SelectedWorker = workerDisplayName(selected)
-				j.RequiredCapabilities = append(DecoderRequirements(decoder, j.SourceVideoCodec, j.SourceVideoProfile), "worker:"+selected.ID)
+				j.RequiredCapabilities = append(
+					DecoderSourceRequirements(decoder, j.SourceVideoCodec, j.SourceVideoProfile, j.SourcePixelFormat),
+					"worker:"+selected.ID,
+				)
 				j.RoutingReason = ""
 				return
 			}
@@ -118,6 +123,35 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 		j.SelectedBackend = "server-metadata"
 		j.RequiredCapabilities = []string{"metadata"}
 	case KindProxy:
+		// Source-aware proxy children are planned from live ffprobe data on the
+		// server. Admit them only when one worker has proved both halves of the
+		// hardware path: decoding this source codec/profile and encoding the
+		// preferred HEVC (or, if unavailable, H.264) output. Legacy bounded jobs
+		// without source metadata retain encoder-only routing and are rechecked by
+		// the render worker's live admission probe before user media is touched.
+		if strings.TrimSpace(j.SourceVideoCodec) != "" {
+			if selected, enc, decoder, ok := preferredProxyWorkerForSourceWithLoad(
+				workers, j.SourceVideoCodec, j.SourceVideoProfile, j.SourcePixelFormat, j.SourceVideoWidth, j.SourceVideoHeight, loads,
+			); ok {
+				j.QueueClass = QueueClassRender
+				j.VCodec = enc
+				j.SelectedBackend = enc
+				j.SelectedWorker = workerDisplayName(selected)
+				j.RequiredCapabilities = append([]string{"encoder:" + enc}, DecoderSourceRequirements(decoder, j.SourceVideoCodec, j.SourceVideoProfile, j.SourcePixelFormat)...)
+				j.RequiredCapabilities = append(j.RequiredCapabilities, "worker:"+selected.ID)
+				j.RoutingReason = ""
+				return
+			}
+			j.QueueClass = QueueClassCPU
+			j.VCodec = "libx264"
+			j.SelectedBackend = "libx264"
+			j.SelectedWorker = ""
+			j.RequiredCapabilities = []string{"cpu"}
+			if j.RoutingReason == "" {
+				j.RoutingReason = "no verified hardware decode+encode path is online for " + displayCodecProfile(j.SourceVideoCodec, j.SourceVideoProfile)
+			}
+			return
+		}
 		if selected, enc, ok := preferredHardwareWorkerWithLoad(workers, loads); ok {
 			j.QueueClass = QueueClassRender
 			j.VCodec = enc
@@ -146,9 +180,77 @@ func routeJobWithWorkers(j *Job, workers []Worker, loads map[string]int) {
 	}
 }
 
-func preferredHardwareDecoderWorkerWithLoad(workers []Worker, codec, profile string, loads map[string]int) (Worker, string, bool) {
+// preferredProxyWorkerWithLoad selects one end-to-end hardware path. Encoder
+// preference remains HEVC then H.264, but an encoder cannot admit a source by
+// itself: the same worker must expose the matching-family decoder and the exact
+// measured source profile capability.
+func preferredProxyWorkerWithLoad(workers []Worker, codec, profile string, loads map[string]int) (Worker, string, string, bool) {
+	return preferredProxyWorkerForSourceWithLoad(workers, codec, profile, "", 0, 0, loads)
+}
+
+func preferredProxyWorkerForSourceWithLoad(workers []Worker, codec, profile, pixelFormat string, width, height int, loads map[string]int) (Worker, string, string, bool) {
 	codec = strings.ToLower(strings.TrimSpace(codec))
-	if codec != "h264" && codec != "hevc" {
+	switch codec {
+	case "avc1":
+		codec = "h264"
+	case "h265", "hev1", "hvc1":
+		codec = "hevc"
+	case "av01":
+		codec = "av1"
+	}
+	if codec != "h264" && codec != "hevc" && codec != "av1" {
+		return Worker{}, "", "", false
+	}
+	type candidate struct {
+		worker  Worker
+		encoder string
+		decoder string
+		cost    float64
+	}
+	for _, encoderPrefix := range []string{"hevc_", "h264_"} {
+		var candidates []candidate
+		for _, w := range workers {
+			if w.Role != QueueClassRender {
+				continue
+			}
+			for _, encoder := range w.Encoders {
+				if !strings.HasPrefix(encoder, encoderPrefix) || encoder == "libx265" || encoder == "libx264" {
+					continue
+				}
+				_, family, ok := strings.Cut(encoder, "_")
+				if !ok || family == "" {
+					continue
+				}
+				decoder := codec + "_" + family
+				required := append([]string{"encoder:" + encoder}, DecoderSourceRequirements(decoder, codec, profile, pixelFormat)...)
+				if !WorkerSupports(w, required) || !WorkerSupportsDecodeSize(w, decoder, width, height) {
+					continue
+				}
+				candidates = append(candidates, candidate{
+					worker: w, encoder: encoder, decoder: decoder,
+					cost: workerQueueCost(w, KindProxy, loads[w.ID]),
+				})
+			}
+		}
+		if len(candidates) > 0 {
+			sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].cost < candidates[j].cost })
+			selected := candidates[0]
+			return selected.worker, selected.encoder, selected.decoder, true
+		}
+	}
+	return Worker{}, "", "", false
+}
+
+func preferredHardwareDecoderWorkerWithLoad(workers []Worker, codec, profile string, loads map[string]int) (Worker, string, bool) {
+	return preferredHardwareDecoderWorkerForSourceWithLoad(workers, codec, profile, "", 0, 0, loads)
+}
+
+func preferredHardwareDecoderWorkerForSourceWithLoad(workers []Worker, codec, profile, pixelFormat string, width, height int, loads map[string]int) (Worker, string, bool) {
+	codec = strings.ToLower(strings.TrimSpace(codec))
+	if codec == "av01" {
+		codec = "av1"
+	}
+	if codec != "h264" && codec != "hevc" && codec != "av1" {
 		return Worker{}, "", false
 	}
 	type candidate struct {
@@ -162,7 +264,8 @@ func preferredHardwareDecoderWorkerWithLoad(workers []Worker, codec, profile str
 			continue
 		}
 		for _, decoder := range w.Decoders {
-			if strings.HasPrefix(decoder, codec+"_") && WorkerSupports(w, DecoderRequirements(decoder, codec, profile)) {
+			if strings.HasPrefix(decoder, codec+"_") && WorkerSupports(w, DecoderSourceRequirements(decoder, codec, profile, pixelFormat)) &&
+				WorkerSupportsDecodeSize(w, decoder, width, height) {
 				candidates = append(candidates, candidate{
 					worker: w, decoder: decoder,
 					cost: workerQueueCost(w, KindDerivatives, loads[w.ID]),
@@ -175,6 +278,43 @@ func preferredHardwareDecoderWorkerWithLoad(workers []Worker, codec, profile str
 	}
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].cost < candidates[j].cost })
 	return candidates[0].worker, candidates[0].decoder, true
+}
+
+// WorkerSupportsDecodeSize fails closed for newly planned media with known
+// geometry. A legacy job without dimensions retains its live worker-side
+// admission check, but a source-aware planner cannot schedule 6K/8K work from
+// an unmeasured device inventory claim.
+func WorkerSupportsDecodeSize(worker Worker, decoder string, width, height int) bool {
+	if width <= 0 || height <= 0 {
+		return true
+	}
+	limit, ok := worker.DecodeLimits[decoder]
+	return ok && limit.MaxWidth >= width && limit.MaxHeight >= height
+}
+
+// workerCanClaimJob applies the portable capability contract and the measured
+// decoder envelope together. The same predicate is mirrored inside the atomic
+// Redis claim script so a differently sized GPU cannot race a job after the
+// scheduler deliberately removes the original worker pin.
+func workerCanClaimJob(worker Worker, job Job) bool {
+	if !WorkerSupports(worker, job.RequiredCapabilities) {
+		return false
+	}
+	decoder := requiredDecoder(job.RequiredCapabilities)
+	if decoder == "" {
+		return true
+	}
+	return WorkerSupportsDecodeSize(worker, decoder, job.SourceVideoWidth, job.SourceVideoHeight)
+}
+
+func requiredDecoder(capabilities []string) string {
+	for _, capability := range capabilities {
+		if !strings.HasPrefix(capability, "decoder:") || strings.Count(capability, ":") != 1 {
+			continue
+		}
+		return strings.TrimPrefix(capability, "decoder:")
+	}
+	return ""
 }
 
 func displayCodec(codec string) string {
@@ -222,6 +362,15 @@ func NormalizeVideoProfile(codec, profile string) string {
 		case "main10":
 			return "main10"
 		}
+	case "av1", "av01":
+		switch strings.ReplaceAll(profile, " ", "") {
+		case "main", "profile0":
+			return "main"
+		case "high", "profile1":
+			return "high"
+		case "professional", "profile2":
+			return "professional"
+		}
 	}
 	return strings.ReplaceAll(profile, " ", "_")
 }
@@ -234,6 +383,25 @@ func DecoderRequirements(decoder, codec, profile string) []string {
 	required := []string{"decoder:" + decoder}
 	if profile = NormalizeVideoProfile(codec, profile); profile != "" {
 		required = append(required, "decoder:"+decoder+":profile:"+profile)
+	}
+	return required
+}
+
+func NormalizePixelFormat(pixelFormat string) string {
+	return strings.ToLower(strings.TrimSpace(pixelFormat))
+}
+
+func DecoderPixelFormatRequirement(decoder, pixelFormat string) string {
+	return "decoder:" + decoder + ":pixfmt:" + NormalizePixelFormat(pixelFormat)
+}
+
+// DecoderSourceRequirements is the exact source admission contract used by
+// newly planned video work. DecoderRequirements remains the compatibility
+// helper for older jobs that predate pixel-format probing.
+func DecoderSourceRequirements(decoder, codec, profile, pixelFormat string) []string {
+	required := DecoderRequirements(decoder, codec, profile)
+	if pixelFormat = NormalizePixelFormat(pixelFormat); pixelFormat != "" {
+		required = append(required, DecoderPixelFormatRequirement(decoder, pixelFormat))
 	}
 	return required
 }

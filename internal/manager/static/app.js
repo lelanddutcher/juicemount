@@ -3953,6 +3953,19 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 				: 'Metadata and CPU fallback lane';
 			if (transcript.length) route.textContent += '  /  AI: ' + transcript.join(' · ');
 			row.appendChild(route);
+			const decodeLimits = w.decode_limits && typeof w.decode_limits === 'object' ? w.decode_limits : {};
+			const limitLabels = Object.keys(decodeLimits).sort().map((decoder) => {
+				const limit = decodeLimits[decoder] || {};
+				const width = Number(limit.max_width || 0);
+				const height = Number(limit.max_height || 0);
+				return width > 0 && height > 0 ? `${decoder} ≤ ${width}×${height}` : '';
+			}).filter(Boolean);
+			if (limitLabels.length) {
+				const limits = document.createElement('p');
+				limits.className = 'farm-worker-route';
+				limits.textContent = 'Measured decode: ' + limitLabels.join(' · ');
+				row.appendChild(limits);
+			}
 
 			const bench = w.benchmarks || {};
 			const metrics = document.createElement('div');

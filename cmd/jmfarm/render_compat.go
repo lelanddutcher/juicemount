@@ -77,22 +77,52 @@ func unsupportedHardwareDecodeReason(worker farmqueue.Worker, encoder string, tr
 	if profile != "" && !farmqueue.WorkerSupports(worker, farmqueue.DecoderRequirements(required, codec, profile)) {
 		return fmt.Sprintf("decoder %s profile %s was not verified", required, profile)
 	}
+	if reason := unsupportedHardwareVideoFormatReason(codec, track); reason != "" {
+		return reason
+	}
+	pixelFormat := farmqueue.NormalizePixelFormat(track.PixFmt)
+	if pixelFormat == "" {
+		return "pixel format is unknown"
+	}
+	if !farmqueue.WorkerSupports(worker, []string{farmqueue.DecoderPixelFormatRequirement(required, pixelFormat)}) {
+		return fmt.Sprintf("decoder %s pixel format %s was not verified", required, pixelFormat)
+	}
+	if !farmqueue.WorkerSupportsDecodeSize(worker, required, track.Width, track.Height) {
+		limit := worker.DecodeLimits[required]
+		if limit.MaxWidth > 0 && limit.MaxHeight > 0 {
+			return fmt.Sprintf("decoder %s was verified only through %dx%d, source is %dx%d",
+				required, limit.MaxWidth, limit.MaxHeight, track.Width, track.Height)
+		}
+		return fmt.Sprintf("decoder %s has no verified frame-size limit for %dx%d source",
+			required, track.Width, track.Height)
+	}
+	return ""
+}
 
-	pixFmt := strings.ToLower(strings.TrimSpace(track.PixFmt))
+// unsupportedHardwareVideoFormatReason rejects source properties that are
+// independent of which live worker is selected. The server planner uses this
+// before publishing proxy children, preventing known 4:2:2/4:4:4 or excessive
+// bit-depth media from bouncing through the render queue just to be demoted.
+func unsupportedHardwareVideoFormatReason(codec string, track *farm.VideoTrack) string {
+	if track == nil {
+		return ""
+	}
+	pixFmt := farmqueue.NormalizePixelFormat(track.PixFmt)
 	if pixFmt == "" {
 		return "pixel format is unknown"
 	}
-	if strings.Contains(pixFmt, "422") || strings.Contains(pixFmt, "444") {
-		return fmt.Sprintf("pixel format %s requires a non-4:2:0 decode path", pixFmt)
-	}
-	if !strings.Contains(pixFmt, "420") && pixFmt != "nv12" && !strings.HasPrefix(pixFmt, "p010") {
-		return fmt.Sprintf("pixel format %s is outside the verified 4:2:0 decode path", pixFmt)
+	if !strings.Contains(pixFmt, "420") && !strings.Contains(pixFmt, "422") && !strings.Contains(pixFmt, "444") &&
+		pixFmt != "nv12" && !strings.HasPrefix(pixFmt, "p010") {
+		return fmt.Sprintf("pixel format %s is outside the supported hardware decode classes", pixFmt)
 	}
 	if codec == "h264" && track.BitDepth > 8 {
 		return fmt.Sprintf("H.264 %d-bit decode was not verified", track.BitDepth)
 	}
 	if codec == "hevc" && track.BitDepth > 10 {
 		return fmt.Sprintf("HEVC %d-bit decode was not verified", track.BitDepth)
+	}
+	if codec == "av1" && track.BitDepth > 10 {
+		return fmt.Sprintf("AV1 %d-bit decode was not verified", track.BitDepth)
 	}
 	return ""
 }
@@ -103,6 +133,8 @@ func normalizedDecodeCodec(codec string) string {
 		return "h264"
 	case "hevc", "h265", "hev1", "hvc1":
 		return "hevc"
+	case "av1", "av01":
+		return "av1"
 	default:
 		return ""
 	}

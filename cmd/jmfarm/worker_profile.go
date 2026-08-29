@@ -19,6 +19,7 @@ type workerProfile struct {
 	Capabilities       []string
 	Encoders           []string
 	Decoders           []string
+	DecodeLimits       map[string]farmqueue.VideoDecodeLimit
 	TranscriptBackends []string
 	Benchmarks         farmqueue.WorkerBenchmarks
 }
@@ -34,6 +35,7 @@ type hardwareEncoderProbe struct {
 func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, error) {
 	p := workerProfile{
 		Capabilities:       []string{"cpu", "metadata"},
+		DecodeLimits:       make(map[string]farmqueue.VideoDecodeLimit),
 		TranscriptBackends: []string{"cpu"},
 		Benchmarks: farmqueue.WorkerBenchmarks{
 			ProbedAt: time.Now().UTC().Format(time.RFC3339),
@@ -48,7 +50,7 @@ func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, er
 			probeErrs = append(probeErrs, err.Error())
 			continue
 		}
-		profiles, profileErrs := probeHardwareDecodeProfiles(ctx, decoder)
+		profiles, pixelFormats, profileErrs := probeHardwareDecodeProfiles(ctx, decoder)
 		probeErrs = append(probeErrs, profileErrs...)
 		if len(profiles) == 0 {
 			// A codec-level smoke test is insufficient admission proof. If none
@@ -62,6 +64,7 @@ func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, er
 		// reverse) and then burning CPU without Manager knowing.
 		p.Encoders = append(p.Encoders, encoder.Name)
 		p.Decoders = appendUnique(p.Decoders, decoder)
+		p.DecodeLimits[decoder] = probeHardwareDecodeLimit(ctx, decoder)
 		p.Capabilities = appendUnique(p.Capabilities, "decoder:"+decoder)
 		codec := strings.SplitN(decoder, "_", 2)[0]
 		for _, profile := range profiles {
@@ -69,6 +72,9 @@ func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, er
 			if len(required) > 1 {
 				p.Capabilities = appendUnique(p.Capabilities, required[1])
 			}
+		}
+		for _, pixelFormat := range pixelFormats {
+			p.Capabilities = appendUnique(p.Capabilities, farmqueue.DecoderPixelFormatRequirement(decoder, pixelFormat))
 		}
 		if encoder.FPS > p.Benchmarks.EncodeFPS {
 			p.Benchmarks.EncodeFPS = encoder.FPS
@@ -124,6 +130,84 @@ func probeWorkerProfile(ctx context.Context, cfg queueConfig) (workerProfile, er
 	return p, nil
 }
 
+// probeHardwareDecodeLimit measures the usable frame envelope with actual
+// bitstreams and hardware-frame output. The 640x360 floor was already proved
+// by probeHardwareDecode; larger standard camera geometries advance the limit
+// until the device or driver rejects one. A rejected larger candidate is a
+// truthful ceiling, not a worker-health error.
+func probeHardwareDecodeLimit(parent context.Context, decoder string) farmqueue.VideoDecodeLimit {
+	limit := farmqueue.VideoDecodeLimit{MaxWidth: 640, MaxHeight: 360}
+	for _, size := range [][2]int{
+		{1920, 1080}, {3840, 2160}, {4096, 2160}, {4096, 4096}, {5760, 2880}, {7680, 4320},
+	} {
+		if err := probeHardwareDecodeSize(parent, decoder, size[0], size[1]); err != nil {
+			break
+		}
+		if size[0] > limit.MaxWidth {
+			limit.MaxWidth = size[0]
+		}
+		if size[1] > limit.MaxHeight {
+			limit.MaxHeight = size[1]
+		}
+	}
+	return limit
+}
+
+func probeHardwareDecodeSize(parent context.Context, decoder string, width, height int) error {
+	parts := strings.SplitN(strings.ToLower(strings.TrimSpace(decoder)), "_", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid decoder %q", decoder)
+	}
+	codec, family := parts[0], parts[1]
+	encoder := "libx264"
+	ext := ".mp4"
+	switch codec {
+	case "hevc":
+		encoder = "libx265"
+	case "av1":
+		encoder = "libaom-av1"
+	}
+	tmp, err := os.MkdirTemp("", "jmfarm-size-probe-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	sample := filepath.Join(tmp, fmt.Sprintf("%dx%d%s", width, height, ext))
+	makeCtx, makeCancel := context.WithTimeout(parent, 20*time.Second)
+	makeArgs := []string{
+		"-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+		fmt.Sprintf("color=c=black:s=%dx%d:r=1", width, height),
+		"-frames:v", "1", "-an", "-c:v", encoder, "-pix_fmt", "yuv420p",
+	}
+	switch codec {
+	case "h264":
+		makeArgs = append(makeArgs, "-preset", "ultrafast")
+	case "hevc":
+		makeArgs = append(makeArgs, "-preset", "ultrafast")
+		makeArgs = append(makeArgs, "-x265-params", "log-level=error", "-tag:v", "hvc1")
+	case "av1":
+		makeArgs = append(makeArgs, "-cpu-used", "8", "-row-mt", "1")
+	}
+	makeArgs = append(makeArgs, sample)
+	out, makeErr := exec.CommandContext(makeCtx, "ffmpeg", makeArgs...).CombinedOutput()
+	makeCancel()
+	if makeErr != nil {
+		return fmt.Errorf("generate %s %dx%d fixture: %s", codec, width, height, conciseProbeError(makeErr, out))
+	}
+	args, err := hardwareDecodeArgs(family)
+	if err != nil {
+		return err
+	}
+	args = append(args, "-i", sample, "-frames:v", "1", "-vf", hardwareDecodeProofFilter(8), "-f", "null", "-")
+	decodeCtx, decodeCancel := context.WithTimeout(parent, 20*time.Second)
+	out, decodeErr := exec.CommandContext(decodeCtx, "ffmpeg", args...).CombinedOutput()
+	decodeCancel()
+	if decodeErr != nil {
+		return fmt.Errorf("decode %s %dx%d fixture: %s", decoder, width, height, conciseProbeError(decodeErr, out))
+	}
+	return nil
+}
+
 // workerProbeFailure distinguishes a failed worker admission from unavailable
 // alternatives. Intel ffmpeg commonly lists both QSV and VAAPI even when only
 // VAAPI is usable inside Docker. If verified VAAPI decode+encode succeeds, a
@@ -148,6 +232,7 @@ func probeHardwareEncoders(parent context.Context) ([]hardwareEncoderProbe, []st
 	candidates := []string{
 		"hevc_vaapi", "hevc_qsv", "hevc_nvenc",
 		"h264_vaapi", "h264_qsv", "h264_nvenc",
+		"av1_vaapi", "av1_qsv", "av1_nvenc",
 	}
 	var verified []hardwareEncoderProbe
 	var errs []string
@@ -226,39 +311,45 @@ func probeHardwareDecode(parent context.Context, encoder string) (string, float6
 	if err != nil {
 		return "", 0, err
 	}
-	args = append(args, "-i", sample, "-frames:v", "90", "-f", "null", "-")
+	args = append(args, "-i", sample, "-frames:v", "90", "-vf", hardwareDecodeProofFilter(8), "-f", "null", "-")
 	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 	started := time.Now()
 	if out, err := exec.CommandContext(ctx, "ffmpeg", args...).CombinedOutput(); err != nil {
 		return "", 0, fmt.Errorf("%s hardware decode probe failed: %w: %s", family, err, strings.TrimSpace(string(out)))
 	}
-	codec := "h264"
-	if strings.HasPrefix(encoder, "hevc_") {
-		codec = "hevc"
-	}
+	codec, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(encoder)), "_")
 	return codec + "_" + family, 90 / time.Since(started).Seconds(), nil
 }
 
 type decodeProfileFixture struct {
-	Name          string
-	Encoder       string
-	FFmpegProfile string
-	PixFmt        string
+	Name              string
+	Encoder           string
+	FFmpegProfile     string
+	ExpectedProfile   string
+	CapabilityProfile string
+	PixFmt            string
 }
 
 func standardDecodeProfileFixtures(codec string) []decodeProfileFixture {
 	switch strings.ToLower(strings.TrimSpace(codec)) {
 	case "h264":
 		return []decodeProfileFixture{
-			{Name: "constrained_baseline", Encoder: "libx264", FFmpegProfile: "baseline", PixFmt: "yuv420p"},
-			{Name: "main", Encoder: "libx264", FFmpegProfile: "main", PixFmt: "yuv420p"},
-			{Name: "high", Encoder: "libx264", FFmpegProfile: "high", PixFmt: "yuv420p"},
+			{Name: "constrained_baseline", Encoder: "libx264", FFmpegProfile: "baseline", ExpectedProfile: "constrained_baseline", CapabilityProfile: "constrained_baseline", PixFmt: "yuv420p"},
+			{Name: "main", Encoder: "libx264", FFmpegProfile: "main", ExpectedProfile: "main", CapabilityProfile: "main", PixFmt: "yuv420p"},
+			{Name: "high", Encoder: "libx264", FFmpegProfile: "high", ExpectedProfile: "high", CapabilityProfile: "high", PixFmt: "yuv420p"},
 		}
 	case "hevc":
 		return []decodeProfileFixture{
-			{Name: "main", Encoder: "libx265", FFmpegProfile: "main", PixFmt: "yuv420p"},
-			{Name: "main10", Encoder: "libx265", FFmpegProfile: "main10", PixFmt: "yuv420p10le"},
+			{Name: "main", Encoder: "libx265", FFmpegProfile: "main", ExpectedProfile: "main", CapabilityProfile: "main", PixFmt: "yuv420p"},
+			{Name: "main10", Encoder: "libx265", FFmpegProfile: "main10", ExpectedProfile: "main10", CapabilityProfile: "main10", PixFmt: "yuv420p10le"},
+			{Name: "rext_422_10", Encoder: "libx265", FFmpegProfile: "main422-10", ExpectedProfile: "rext", CapabilityProfile: "rext", PixFmt: "yuv422p10le"},
+			{Name: "rext_444_10", Encoder: "libx265", FFmpegProfile: "main444-10", ExpectedProfile: "rext", CapabilityProfile: "rext", PixFmt: "yuv444p10le"},
+		}
+	case "av1":
+		return []decodeProfileFixture{
+			{Name: "main_8", Encoder: "libaom-av1", FFmpegProfile: "main", ExpectedProfile: "main", CapabilityProfile: "main", PixFmt: "yuv420p"},
+			{Name: "main_10", Encoder: "libaom-av1", FFmpegProfile: "main", ExpectedProfile: "main", CapabilityProfile: "main", PixFmt: "yuv420p10le"},
 		}
 	default:
 		return nil
@@ -269,36 +360,41 @@ func standardDecodeProfileFixtures(codec string) []decodeProfileFixture {
 // bitstreams, then requires the selected device family to decode each one. The
 // CPU is used only to create disposable startup fixtures; no user media is
 // processed and no capability is inferred from the encoder inventory.
-func probeHardwareDecodeProfiles(parent context.Context, decoder string) ([]string, []string) {
+func probeHardwareDecodeProfiles(parent context.Context, decoder string) ([]string, []string, []string) {
 	parts := strings.SplitN(strings.ToLower(strings.TrimSpace(decoder)), "_", 2)
 	if len(parts) != 2 {
-		return nil, []string{fmt.Sprintf("invalid decoder capability %q", decoder)}
+		return nil, nil, []string{fmt.Sprintf("invalid decoder capability %q", decoder)}
 	}
 	codec, family := parts[0], parts[1]
 	fixtures := standardDecodeProfileFixtures(codec)
 	if len(fixtures) == 0 {
-		return nil, []string{fmt.Sprintf("%s has no profile probe fixtures", decoder)}
+		return nil, nil, []string{fmt.Sprintf("%s has no profile probe fixtures", decoder)}
 	}
 	tmp, err := os.MkdirTemp("", "jmfarm-profile-probe-")
 	if err != nil {
-		return nil, []string{fmt.Sprintf("%s profile probe tempdir failed", decoder)}
+		return nil, nil, []string{fmt.Sprintf("%s profile probe tempdir failed", decoder)}
 	}
 	defer os.RemoveAll(tmp)
 
-	var verified, failures []string
+	var verifiedProfiles, verifiedPixelFormats, failures []string
 	for _, fixture := range fixtures {
 		sample := filepath.Join(tmp, codec+"-"+fixture.Name+".mp4")
 		makeCtx, makeCancel := context.WithTimeout(parent, 15*time.Second)
 		makeArgs := []string{
 			"-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30",
 			"-frames:v", "30", "-an", "-c:v", fixture.Encoder, "-profile:v", fixture.FFmpegProfile,
-			// libx264 ultrafast disables the profile-defining tools and reports
-			// even requested Main/High fixtures as Constrained Baseline. Medium is
-			// still sub-second at this size and preserves the profile under test.
-			"-pix_fmt", fixture.PixFmt, "-preset", "medium",
+			"-pix_fmt", fixture.PixFmt,
 		}
-		if fixture.Encoder == "libx265" {
+		switch fixture.Encoder {
+		case "libx264":
+			// ultrafast disables profile-defining tools and reports requested
+			// Main/High fixtures as Constrained Baseline.
+			makeArgs = append(makeArgs, "-preset", "medium")
+		case "libx265":
+			makeArgs = append(makeArgs, "-preset", "medium")
 			makeArgs = append(makeArgs, "-x265-params", "log-level=error", "-tag:v", "hvc1")
+		case "libaom-av1":
+			makeArgs = append(makeArgs, "-cpu-used", "8", "-row-mt", "1")
 		}
 		makeArgs = append(makeArgs, sample)
 		out, makeErr := exec.CommandContext(makeCtx, "ffmpeg", makeArgs...).CombinedOutput()
@@ -316,7 +412,7 @@ func probeHardwareDecodeProfiles(parent context.Context, decoder string) ([]stri
 			continue
 		}
 		actualProfile := farmqueue.NormalizeVideoProfile(codec, string(profileOut))
-		if actualProfile != fixture.Name {
+		if actualProfile != fixture.ExpectedProfile {
 			failures = append(failures, fmt.Sprintf("%s %s fixture reported profile %s", decoder, fixture.Name, actualProfile))
 			continue
 		}
@@ -326,7 +422,11 @@ func probeHardwareDecodeProfiles(parent context.Context, decoder string) ([]stri
 			failures = append(failures, argsErr.Error())
 			continue
 		}
-		args = append(args, "-i", sample, "-frames:v", "30", "-f", "null", "-")
+		bitDepth := 8
+		if strings.Contains(fixture.PixFmt, "10") {
+			bitDepth = 10
+		}
+		args = append(args, "-i", sample, "-frames:v", "30", "-vf", hardwareDecodeProofFilter(bitDepth), "-f", "null", "-")
 		decodeCtx, decodeCancel := context.WithTimeout(parent, 15*time.Second)
 		out, decodeErr := exec.CommandContext(decodeCtx, "ffmpeg", args...).CombinedOutput()
 		decodeCancel()
@@ -334,9 +434,10 @@ func probeHardwareDecodeProfiles(parent context.Context, decoder string) ([]stri
 			failures = append(failures, fmt.Sprintf("%s profile %s hardware decode failed: %s", decoder, fixture.Name, conciseProbeError(decodeErr, out)))
 			continue
 		}
-		verified = append(verified, fixture.Name)
+		verifiedProfiles = appendUnique(verifiedProfiles, fixture.CapabilityProfile)
+		verifiedPixelFormats = appendUnique(verifiedPixelFormats, farmqueue.NormalizePixelFormat(fixture.PixFmt))
 	}
-	return verified, failures
+	return verifiedProfiles, verifiedPixelFormats, failures
 }
 
 func hardwareDecodeArgs(family string) ([]string, error) {
@@ -351,6 +452,19 @@ func hardwareDecodeArgs(family string) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("decode probe has no hardware family for %s", family)
 	}
+}
+
+// hardwareDecodeProofFilter makes silent software fallback impossible. Some
+// FFmpeg hardware decoders log an initialization failure and continue on the
+// CPU with exit status 0. Requiring a hardware-frame download makes a software
+// frame type-incompatible with the graph, turning that fallback into the hard
+// failure required for render-node admission.
+func hardwareDecodeProofFilter(bitDepth int) string {
+	format := "nv12"
+	if bitDepth > 8 {
+		format = "p010le"
+	}
+	return "hwdownload,format=" + format
 }
 
 func conciseProbeError(err error, output []byte) string {
