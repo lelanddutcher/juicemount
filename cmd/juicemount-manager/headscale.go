@@ -33,8 +33,9 @@ import (
 )
 
 const (
-	hsListen = "0.0.0.0:8091" // in-container; compose maps 30193 → 8091
-	hsBinary = "/usr/local/bin/headscale"
+	hsListen         = "0.0.0.0:8091" // in-container; compose maps 30193 → 8091
+	hsBinary         = "/usr/local/bin/headscale"
+	hsStartupTimeout = 45 * time.Second
 )
 
 // hsDataDir is a var (not const) solely so tests can redirect config
@@ -181,7 +182,13 @@ func (h *headscaleSupervisor) Start() error {
 	}
 	h.mu.Unlock()
 	go h.supervise(cfg)
-	if err := waitForHeadscaleListener(10 * time.Second); err != nil {
+	// A cold Headscale start opens and validates its durable SQLite state
+	// before binding the coordination listener. The release NAS measured just
+	// over the old ten-second budget while its ZFS pool was busy, so a healthy
+	// child was killed and Link stayed disabled until the whole Manager was
+	// restarted. Keep startup bounded, but leave enough room for real storage
+	// latency rather than treating it as a control-plane failure.
+	if err := waitForHeadscaleListener(hsStartupTimeout); err != nil {
 		h.Stop()
 		return err
 	}

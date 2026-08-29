@@ -1,6 +1,18 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+func TestHeadscaleStartupTimeoutCoversColdPersistentState(t *testing.T) {
+	// The release NAS took more than ten seconds to open its persisted state
+	// while the ZFS pool was under load. Pin a real cold-start margin so this
+	// cannot regress to the former kill-before-listen behavior.
+	if hsStartupTimeout < 30*time.Second {
+		t.Fatalf("headscale startup timeout = %s, want at least 30s", hsStartupTimeout)
+	}
+}
 
 func TestHeadscaleUserAlreadyExists(t *testing.T) {
 	for _, tc := range []struct {

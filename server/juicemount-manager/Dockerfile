@@ -64,8 +64,17 @@ ENV JM_LISTEN=0.0.0.0:8080 \
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS -H "X-JuiceMount-Admin-Key: $JM_ADMIN_KEY" http://localhost:8080/api/sources || exit 1
+# Manager liveness alone is not release readiness when Link is enabled. The
+# prior check stayed green after the supervised Headscale child missed its
+# startup deadline, leaving paired Macs with listening loopback proxies that
+# could not forward Redis or object-store traffic. Keep Link optional, but
+# require its complete control/route/data plane in opted-in deployments.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS -H "X-JuiceMount-Admin-Key: $JM_ADMIN_KEY" http://localhost:8080/api/sources >/dev/null \
+      && { [ "$JM_NET_HEADSCALE" != "on" ] \
+        || curl -fsS -H "X-JuiceMount-Admin-Key: $JM_ADMIN_KEY" http://localhost:8080/api/net/link \
+          | grep -q '"data_plane_ready":true'; } \
+      || exit 1
 
 # Default invocation: standalone mode. JM_META is REQUIRED at runtime
 # (e.g. JM_META=redis://<server-ip>:30179/1). To switch to embedded
