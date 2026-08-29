@@ -426,6 +426,7 @@ func temporaryAvailabilityFallback(job Job, statusReason string) bool {
 
 func containsAvailabilityFallbackMarker(reason string) bool {
 	for _, marker := range []string{
+		"recovered after worker",
 		"render capability went offline before claim",
 		"video decoder went offline before claim",
 		"selected render capability went offline",

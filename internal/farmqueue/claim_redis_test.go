@@ -345,6 +345,30 @@ func TestRedisReadyCPUPromotionWhenVerifiedRenderReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A live worker-loss recovery keeps the bounded child's historical -cpu
+	// suffix but clears the terminal lock and records availability only in the
+	// mutable status hash. This is the exact deployed shape produced by
+	// RecoverAbandonedWorkers when the sole render node restarts. The suffix
+	// must not override that explicit availability provenance.
+	recoveredLegacySuffix := temporaryProxy
+	recoveredLegacySuffix.ID = NewID() + "-cpu"
+	recoveredLegacySuffix.ParentID = strings.TrimSuffix(recoveredLegacySuffix.ID, "-cpu")
+	recoveredLegacySuffix.Path = "/jfs/incoming/recovered-worker-loss.mp4"
+	recoveredLegacySuffix.RetryTargets = []string{recoveredLegacySuffix.Path}
+	recoveredLegacySuffix.QueueClass = QueueClassCPU
+	recoveredLegacySuffix.SelectedBackend = "libx264"
+	recoveredLegacySuffix.SelectedWorker = ""
+	recoveredLegacySuffix.RequiredCapabilities = []string{"cpu"}
+	recoveredLegacySuffix.CPUFallbackLocked = false
+	recoveredLegacySuffix.RoutingReason = ""
+	if err := q.Enqueue(ctx, recoveredLegacySuffix); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.HSet(ctx, JobHashPrefix+recoveredLegacySuffix.ID,
+		"error", "recovered after worker vanished-render disappeared; compatible worker selection rerun").Err(); err != nil {
+		t.Fatal(err)
+	}
+
 	parent := NewJob("/jfs/incoming/incompatible.mov", []string{KindProxy}, "manager")
 	lockedProxy, err := newCPUFallbackSubset(parent, []string{parent.Path})
 	if err != nil {
@@ -392,8 +416,8 @@ func TestRedisReadyCPUPromotionWhenVerifiedRenderReturns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 3 {
-		t.Fatalf("promote ready CPU = %d, %v; want 3, nil", n, err)
+	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 4 {
+		t.Fatalf("promote ready CPU = %d, %v; want 4, nil", n, err)
 	}
 	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 0 {
 		t.Fatalf("idempotent promotion = %d, %v; want 0, nil", n, err)
@@ -401,8 +425,9 @@ func TestRedisReadyCPUPromotionWhenVerifiedRenderReturns(t *testing.T) {
 
 	wantRender := map[string]bool{
 		temporaryProxy.ID: true, temporaryPreview.ID: true, staleOutageLock.ID: true,
+		recoveredLegacySuffix.ID: true,
 	}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
 		if err != nil || !ok {
 			t.Fatalf("render claim after promotion: ok=%v err=%v", ok, err)
