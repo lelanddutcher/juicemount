@@ -199,7 +199,11 @@ services:
       JM_ADMIN_KEY: ""               # REQUIRED (32+ chars) before enabling JuiceMount Link
       JM_STATE_FILE: "/var/lib/manager/state.json"   # persists job history + future control-plane state across container restart
       JM_MINIO_URL: "http://minio:9000"              # SLICE 2: Overview MinIO liveness probe target (internal docker DNS)
-      JM_FARM_STATUS: "/farmstate/farm-status.json"  # Farm tab: the juicefarm rollup (juicefarm-state mounted read-only below)
+      # Farm tab rollup. Its parent mount also provides a read-only StatFS view
+      # of the zSSD pool for the farm storage safety interlock.
+      JM_FARM_STATUS: "/farmstate/farm-status.json"
+      # Optional explicit override; zero keeps max(64 GiB, 1% of filesystem).
+      JM_FARM_MIN_FREE_BYTES: "0"
       # Processing-node enrollment fails closed until this is set to the Redis
       # endpoint a node can actually reach. Never use the docker-only `redis`
       # hostname here. The optional image overrides are useful with a registry;
@@ -242,7 +246,8 @@ services:
       # remove this after pairing Macs: doing so invalidates the tailnet.
       - /mnt/zSSD/juicemount/headscale:/data/headscale
       # Read-only view of the juicefarm's state so the Farm tab can read
-      # farm-status.json. Additive; safe if juicefarm hasn't run yet.
+      # farm-status.json and reject new work/resume below the physical-pool
+      # reserve. Additive; safe if juicefarm hasn't run yet.
       - /mnt/zSSD/juicemount/juicefarm-state:/farmstate:ro
 
   # ── juicefarm: server-side derivative + AI generation farm ───────

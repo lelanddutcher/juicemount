@@ -227,6 +227,14 @@ func (a *API) handleFarmSweep(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), farmQueueProbeTimeout)
 	defer cancel()
+	storage := a.enforceFarmStorageGuard(ctx)
+	if storage.Configured && !storage.Safe {
+		writeJSON(w, http.StatusInsufficientStorage, map[string]any{
+			"error":   storage.Reason,
+			"storage": storage,
+		})
+		return
+	}
 	kinds := req.Kinds
 	for _, kind := range req.Kinds {
 		if kind == farmqueue.KindAll {
@@ -308,6 +316,7 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), farmQueueProbeTimeout)
 	defer cancel()
+	storage := a.enforceFarmStorageGuard(ctx)
 	workers, _ := a.farmQ.ActiveWorkers(ctx)
 	depth, _ := a.farmQ.QueueDepth(ctx)
 	jobs, _ := a.farmQ.ListJobs(ctx, farmRecentJobsLimit)
@@ -330,6 +339,7 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 		"queue_depth": depth,
 		"jobs":        jobs,
 		"control":     control,
+		"storage":     storage,
 	})
 }
 

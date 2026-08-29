@@ -88,8 +88,23 @@
         "revision": { "type": "integer" },
         "paused": { "type": "boolean" },
         "watch_enabled": { "type": "boolean" },
+        "auto_paused": { "type": "boolean" },
+        "pause_code": { "type": "string" },
+        "pause_reason": { "type": "string" },
         "updated_at": { "type": "string" },
         "updated_by": { "type": "string" }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "required": ["configured", "safe"],
+      "properties": {
+        "configured": { "type": "boolean" },
+        "safe": { "type": "boolean" },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "available_bytes": { "type": "integer", "minimum": 0 },
+        "required_bytes": { "type": "integer", "minimum": 0 },
+        "reason": { "type": "string" }
       }
     }
   }

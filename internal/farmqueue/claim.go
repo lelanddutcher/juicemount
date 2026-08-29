@@ -652,11 +652,28 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 				continue
 			}
 			claim := Claim{Job: job, Raw: raw, WorkerID: workerID}
-			reason := "recovered after worker " + workerID + " disappeared; compatible worker selection rerun"
-			statusReason, statusErr := c.rdb.HGet(ctx, JobHashPrefix+job.ID, "error").Result()
+			status, statusErr := c.rdb.HGet(ctx, JobHashPrefix+job.ID, "status").Result()
 			if statusErr != nil && statusErr != redis.Nil {
 				_ = c.rdb.Del(ctx, lock).Err()
 				return total, statusErr
+			}
+			if status == StatusDone || status == StatusFailed || status == StatusDispatched {
+				// Terminal/dispatched status was committed before the original
+				// worker lost its ACK response or heartbeat. The status is the
+				// durable execution proof; requeueing this receipt would run or
+				// recount already-completed work. Finish only the orphaned ACK.
+				if err := c.AckClaim(ctx, claim); err != nil {
+					_ = c.rdb.Del(ctx, lock).Err()
+					return total, err
+				}
+				total++
+				continue
+			}
+			reason := "recovered after worker " + workerID + " disappeared; compatible worker selection rerun"
+			statusReason, reasonErr := c.rdb.HGet(ctx, JobHashPrefix+job.ID, "error").Result()
+			if reasonErr != nil && reasonErr != redis.Nil {
+				_ = c.rdb.Del(ctx, lock).Err()
+				return total, reasonErr
 			}
 			// An interrupted explicit CPU compatibility fallback must remain on
 			// that lane. Re-running initial routing here previously promoted it to

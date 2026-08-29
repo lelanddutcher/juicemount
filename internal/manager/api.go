@@ -31,11 +31,14 @@ type API struct {
 	fuseMount       string   // for ModeEmbedded dest-traversal check; empty in standalone
 	volName         string   // for ModeStandalone dest-validation
 	farmStatusPath  string   // juicefarm rollup JSON path (farm-status.json); empty = Farm tab shows "not configured"
-	linkMetaURL     string   // backend endpoint used for Link readiness (never returned to clients)
-	linkMinIOURL    string   // object-store endpoint used for Link readiness (never returned to clients)
-	farmNodeMetaURL string   // explicit worker-bootstrap endpoint; returned only by authenticated no-store enrollment
-	farmServerImage string   // worker image advertised by enrollment
-	farmRenderImage string   // accelerated worker image advertised by enrollment
+	farmStoragePath string   // local path on the farm backend pool used for free-space safety admission
+	farmMinFree     uint64   // explicit reserve; 0 derives max(64 GiB, 1% of filesystem)
+	farmStorageStat func(string) (farmStorageSnapshot, error)
+	linkMetaURL     string // backend endpoint used for Link readiness (never returned to clients)
+	linkMinIOURL    string // object-store endpoint used for Link readiness (never returned to clients)
+	farmNodeMetaURL string // explicit worker-bootstrap endpoint; returned only by authenticated no-store enrollment
+	farmServerImage string // worker image advertised by enrollment
+	farmRenderImage string // accelerated worker image advertised by enrollment
 
 	// farmChangesPath is the farm's pre-aggregated /derivatives/changes feed
 	// (JM-15 #56): the contract changes-array the farm writes next to
@@ -116,6 +119,14 @@ type Config struct {
 	AdminKey       string   // empty = no auth (LAN-only)
 	StateFile      string   // optional JSON path for job-history persistence (empty = ephemeral)
 	FarmStatusPath string   // optional path to the juicefarm rollup (farm-status.json) for the Farm tab
+	// FarmStoragePath is a local directory on the same physical pool as JuiceFS
+	// object/metadata storage. Empty derives the parent of FarmStatusPath. The
+	// Manager uses it to auto-pause the shared farm before proxy writes exhaust
+	// the backend; remote workers cannot infer backend headroom from local cache.
+	FarmStoragePath string
+	// FarmMinFreeBytes overrides the safety reserve. Zero derives the larger of
+	// 64 GiB and 1% of the probed filesystem, which scales with the pool.
+	FarmMinFreeBytes uint64
 	// FarmChangesPath optionally overrides where the farm's pre-aggregated
 	// derivatives-changes.json feed is read from (JM-15 #56). Normally left
 	// empty: it falls back to the JM_FARM_CHANGES env var, then to the
@@ -171,11 +182,15 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		jobs:           mgr,
 		sourceRoots:    cfg.SourceRoots,
 		farmStatusPath: cfg.FarmStatusPath,
-		destMount:      cfg.DestMount,
-		adminKey:       cfg.AdminKey,
-		prefix:         prefix,
-		fuseMount:      cfg.FUSEMount,
-		volName:        cfg.VolName,
+		farmStoragePath: deriveFarmStoragePath(
+			cfg.FarmStoragePath, cfg.FarmStatusPath),
+		farmMinFree:     cfg.FarmMinFreeBytes,
+		farmStorageStat: readFarmStorageSnapshot,
+		destMount:       cfg.DestMount,
+		adminKey:        cfg.AdminKey,
+		prefix:          prefix,
+		fuseMount:       cfg.FUSEMount,
+		volName:         cfg.VolName,
 		farmChangesPath: deriveFarmChangesPath(
 			cfg.FarmChangesPath, os.Getenv("JM_FARM_CHANGES"), cfg.FarmStatusPath),
 	}
@@ -212,6 +227,9 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 		} else {
 			a.farmQ = fq
 		}
+	}
+	if a.farmQ != nil && a.farmStoragePath != "" {
+		go a.runFarmStorageGuard()
 	}
 	mux.HandleFunc(prefix+"/api/sources", a.auth(a.handleSources))
 	mux.HandleFunc(prefix+"/api/browse", a.auth(a.handleBrowse))

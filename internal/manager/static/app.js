@@ -1247,6 +1247,8 @@
 		farmControlState = {
 			paused: !!(control && control.paused),
 			watch_enabled: !(control && control.watch_enabled === false),
+			auto_paused: !!(control && control.auto_paused),
+			pause_reason: (control && control.pause_reason) || '',
 		};
 		const queueBtn = $('#farm-queue-toggle');
 		const watchBtn = $('#farm-watch-toggle');
@@ -1257,7 +1259,7 @@
 			queueBtn.querySelector('.farm-transport-icon').textContent = farmControlState.paused ? '▶' : 'Ⅱ';
 			queueBtn.querySelector('strong').textContent = farmControlState.paused ? 'Resume queue' : 'Pause queue';
 			queueBtn.querySelector('em').textContent = farmControlState.paused
-				? 'Continue claiming queued work across all nodes'
+				? (farmControlState.auto_paused ? 'Restore backend headroom before resuming' : 'Continue claiming queued work across all nodes')
 				: 'Finish active work, then stop claiming jobs';
 		}
 		if (watchBtn) {
@@ -1270,7 +1272,7 @@
 		}
 		if (status && !farmControlInFlight) {
 			status.textContent = farmControlState.paused
-				? 'Queue paused. Active atomic jobs may still be finishing.'
+				? (farmControlState.pause_reason || 'Queue paused. Active atomic jobs may still be finishing.')
 				: (farmControlState.watch_enabled ? 'Queue playing · automatic discovery active' : 'Queue playing · automatic discovery disabled');
 		}
 	}
@@ -1287,7 +1289,9 @@
 		banner.classList.toggle('offline', !available);
 		banner.classList.toggle('paused', !!control.paused);
 		if (control.paused) {
-			text.textContent = 'Queue paused — ' + workerCount + ' node' + (workerCount === 1 ? '' : 's') + ' standing by';
+			text.textContent = control.pause_reason
+				? 'Safety pause — ' + control.pause_reason
+				: 'Queue paused — ' + workerCount + ' node' + (workerCount === 1 ? '' : 's') + ' standing by';
 		} else if (available) {
 			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') + ' online — routing by measured capability';
     } else {

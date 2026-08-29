@@ -317,6 +317,23 @@ leaves an old `in_progress` record behind, Manager presents it as interrupted wo
 instead of claiming that it is still running. Stable coverage and last-sweep history
 remain available.
 
+The same read-only state mount is also the Manager's physical-pool headroom probe.
+Before admitting a manual sweep or farm-wide resume, Manager requires the larger of
+64 GiB and 1% of that filesystem to remain available. The server worker performs the
+same check before claiming output work. An unprobeable or undersized backend engages
+an atomic Redis safety pause for every worker; it never auto-resumes, and the Manager
+shows the reason until an operator restores space and explicitly presses Play.
+`JM_FARM_STORAGE_PATH` may name a more representative server-side path and
+`JM_FARM_MIN_FREE_BYTES` may override the worker reserve for a deliberately sized
+deployment.
+
+Proxy publication uses a durable, byte-bound receipt next to `proxy.mp4`. The worker
+writes and fsyncs that receipt before the final blob rename. If the blob commits but
+the worker loses its private index or the shared manifest write fails, any later
+worker validates the exact blob, repairs registration, and skips re-encoding. This
+keeps retries idempotent across nodes and prevents overwritten JuiceFS slices from
+multiplying physical storage during an outage.
+
 ---
 
 ## Status & roadmap
@@ -328,6 +345,7 @@ remain available.
   that prevents a brief node restart from dumping the ready backlog onto CPU;
   automatic promotion of availability-only CPU fallbacks when compatible hardware
   returns while source-incompatible and exhausted-hardware fallbacks stay locked;
+  backend-headroom safety pause; cross-worker proxy commit recovery;
   live Manager control and node telemetry; tech/poster/filmstrip/waveform/proxy/
   transcript generation; JM-15 discovery; `/blob` byte ranges; and portable
   assertion sidecars.

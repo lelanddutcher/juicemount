@@ -27,7 +27,7 @@ func TestRunPassesCountsPartialBlobFailure(t *testing.T) {
 	bad := filepath.Join(dir, "bad.mov")
 	fresh := filepath.Join(dir, "fresh.mov")
 	statusPath := filepath.Join(dir, "farm-status.json")
-	processed, failed, failedTargets, details := runPasses(passOpts{
+	processed, failed, failedTargets, details, safetyErr := runPasses(passOpts{
 		mode: "derivatives", effConc: 2, status: statusPath,
 		producer: "test", target: dir, store: store,
 		process: func(_ *derivatives.Store, path string, _ farm.Options) farm.Result {
@@ -40,6 +40,9 @@ func TestRunPassesCountsPartialBlobFailure(t *testing.T) {
 			return farm.Result{Path: path, Inode: 1, ThumbWrote: true}
 		},
 	}, []string{good, bad, fresh})
+	if safetyErr != nil {
+		t.Fatalf("unexpected safety error: %v", safetyErr)
+	}
 
 	if processed != 2 || failed != 1 {
 		t.Fatalf("counts = processed %d failed %d, want 2/1", processed, failed)
@@ -71,13 +74,16 @@ func TestRunPassesPreCanceledDoesNotLaunchTargets(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var calls int64
-	processed, failed, failedTargets, details := runPasses(passOpts{
+	processed, failed, failedTargets, details, safetyErr := runPasses(passOpts{
 		ctx: ctx, mode: "derivatives", effConc: 4,
 		process: func(_ *derivatives.Store, path string, opt farm.Options) farm.Result {
 			atomic.AddInt64(&calls, 1)
 			return farm.Result{Path: path}
 		},
 	}, []string{"one.mov", "two.mov", "three.mov"})
+	if safetyErr != nil {
+		t.Fatalf("unexpected safety error: %v", safetyErr)
+	}
 
 	if calls != 0 {
 		t.Fatalf("process calls = %d, want zero after cancellation", calls)
@@ -87,13 +93,60 @@ func TestRunPassesPreCanceledDoesNotLaunchTargets(t *testing.T) {
 	}
 }
 
+func TestRunPassesSurfacesStorageSafetySeparatelyFromMediaFailure(t *testing.T) {
+	broken := filepath.Join(t.TempDir(), "storage.mov")
+	processed, failed, failedTargets, _, safetyErr := runPasses(passOpts{
+		mode: "derivatives", effConc: 1,
+		process: func(_ *derivatives.Store, path string, _ farm.Options) farm.Result {
+			return farm.Result{Path: path, BlobErr: errors.New("ffmpeg: Error writing trailer: Input/output error")}
+		},
+	}, []string{broken})
+	if processed != 0 || failed != 1 || len(failedTargets) != 1 || failedTargets[0] != broken {
+		t.Fatalf("counts=%d/%d targets=%v", processed, failed, failedTargets)
+	}
+	if safetyErr == nil || !isFarmStoragePressure(safetyErr) {
+		t.Fatalf("safety error = %v", safetyErr)
+	}
+}
+
+func TestRunPassesStorageSafetyRetriesEveryUnfinishedTarget(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.mov")
+	broken := filepath.Join(dir, "broken.mov")
+	pending := filepath.Join(dir, "pending.mov")
+	var calls int64
+	processed, failed, failedTargets, _, safetyErr := runPasses(passOpts{
+		mode: "derivatives", effConc: 1,
+		process: func(_ *derivatives.Store, path string, _ farm.Options) farm.Result {
+			atomic.AddInt64(&calls, 1)
+			if path == broken {
+				return farm.Result{Path: path, BlobErr: errors.New("ffmpeg: Error writing trailer: Input/output error")}
+			}
+			return farm.Result{Path: path}
+		},
+	}, []string{good, broken, pending})
+	if processed != 1 || failed != 1 {
+		t.Fatalf("counts=%d/%d, want 1/1", processed, failed)
+	}
+	if calls != 2 {
+		t.Fatalf("process calls=%d, want completed target plus triggering failure only", calls)
+	}
+	wantTargets := []string{broken, pending}
+	if len(failedTargets) != len(wantTargets) || failedTargets[0] != wantTargets[0] || failedTargets[1] != wantTargets[1] {
+		t.Fatalf("retry targets=%v, want unfinished %v", failedTargets, wantTargets)
+	}
+	if safetyErr == nil || !isFarmStoragePressure(safetyErr) {
+		t.Fatalf("safety error = %v", safetyErr)
+	}
+}
+
 func TestRunPassesCancellationStopsSchedulingAndDoesNotCountFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})
 	result := make(chan [2]int, 1)
 	var calls int64
 	go func() {
-		processed, failed, _, _ := runPasses(passOpts{
+		processed, failed, _, _, _ := runPasses(passOpts{
 			ctx: ctx, mode: "derivatives", effConc: 1,
 			process: func(_ *derivatives.Store, path string, opt farm.Options) farm.Result {
 				if atomic.AddInt64(&calls, 1) == 1 {

@@ -247,9 +247,6 @@ func probeProxyBlobCodec(ffprobeBin, mount, rel string) (string, error) {
 }
 
 func probeProxyBlobCodecContext(ctx context.Context, ffprobeBin, mount, rel string) (string, error) {
-	if ffprobeBin == "" {
-		ffprobeBin = "ffprobe"
-	}
 	f, err := derivatives.OpenRegularUnder(mount, rel)
 	if err != nil {
 		return "", err
@@ -258,22 +255,7 @@ func probeProxyBlobCodecContext(ctx context.Context, ffprobeBin, mount, rel stri
 	// Pass the already-open, O_NOFOLLOW-validated descriptor to ffprobe. Using
 	// the joined path here would reintroduce a check/use race after the anchored
 	// stat above. ExtraFiles exposes f as descriptor 3 in the child on Unix.
-	cmd := commandContext(ctx, ffprobeBin,
-		"-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name",
-		"-of", "default=nk=1:nw=1", "/dev/fd/3")
-	cmd.ExtraFiles = []*os.File{f}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("ffprobe proxy codec: %w: %s", err, out)
-	}
-	codec := strings.ToLower(strings.TrimSpace(string(out)))
-	if line, _, ok := strings.Cut(codec, "\n"); ok {
-		codec = strings.TrimSpace(line)
-	}
-	if codec == "h265" {
-		codec = "hevc"
-	}
-	return codec, nil
+	return probeProxyFileCodecContext(ctx, ffprobeBin, f)
 }
 
 // GenerateProxy renders the OL-3 proxy for one file and commits a single `proxy`
@@ -313,10 +295,23 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 	}
 
 	if proxyFresh(store, inode, hash, fi.Size(), opt) {
+		// A valid row+blob can predate or outlive its transport sidecar. Proxy
+		// registration is now part of successful completion: private GPU SQLite
+		// state is not visible to the server/client, and the durable receipt makes
+		// a failed repair safely retryable without another encode.
+		if err := WriteManifestSidecar(store, opt.Mount, inode); err != nil {
+			res.Err = fmt.Errorf("repair current proxy manifest: %w", err)
+			return res
+		}
 		res.SkippedFresh = true
-		// A valid row+blob can predate or outlive its transport sidecar. Keep the
-		// skip cheap while repairing that index boundary best-effort.
-		_ = WriteManifestSidecar(store, opt.Mount, inode)
+		return res
+	}
+	if recovered, recoverErr := recoverProxyCommitReceipt(store, fi, inode, hash, opt); recovered {
+		if recoverErr != nil {
+			res.Err = recoverErr
+			return res
+		}
+		res.SkippedFresh = true
 		return res
 	}
 	if err := ctx.Err(); err != nil {
@@ -369,6 +364,18 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		return res
 	}
 	if err == nil {
+		// Persist a byte-bound recovery receipt before the final rename. If any
+		// later private-store/manifest write fails, another worker can prove the
+		// committed blob and repair indexes without replacing it.
+		receipt, receiptErr := proxyReceiptFromStaged(
+			derivDir, staged, inode, hash, fi.Size(), codec, codecString)
+		if receiptErr != nil {
+			err = receiptErr
+		} else if receiptErr = writeProxyCommitReceipt(derivDir, receipt); receiptErr != nil {
+			err = fmt.Errorf("persist proxy commit receipt: %w", receiptErr)
+		}
+	}
+	if err == nil {
 		err = derivatives.CommitStagedAt(derivDir, staged, rel)
 	}
 	if err != nil {
@@ -400,7 +407,10 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		return res
 	}
 	if opt.Mount != "" {
-		_ = WriteManifestSidecar(store, opt.Mount, inode) // JM-15: best-effort
+		if err := WriteManifestSidecar(store, opt.Mount, inode); err != nil {
+			res.Err = fmt.Errorf("publish proxy manifest: %w", err)
+			return res
+		}
 	}
 	return res
 }

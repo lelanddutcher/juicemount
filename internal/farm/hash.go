@@ -3,7 +3,6 @@ package farm
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 
 	"github.com/zeebo/xxh3"
@@ -30,6 +29,20 @@ func SampleHash(path string, size int64) (string, error) {
 		return "", err
 	}
 	defer f.Close()
+	return SampleHashFile(f, size)
+}
+
+// SampleHashFile applies the portable derivative hash recipe to an already
+// opened regular file. Keeping the descriptor held lets commit journals bind a
+// receipt to the exact staged/final proxy bytes without re-resolving a path
+// that another process could replace between validation and hashing.
+func SampleHashFile(f *os.File, size int64) (string, error) {
+	if f == nil {
+		return "", fmt.Errorf("samplehash: nil file")
+	}
+	if size < 0 {
+		return "", fmt.Errorf("samplehash: negative size %d", size)
+	}
 
 	h := xxh3.New()
 	var sz [8]byte
@@ -47,18 +60,15 @@ func SampleHash(path string, size int64) (string, error) {
 		// bytes, which then fails the consumer's hash==source_hash gate on a
 		// perfectly valid derivative. ErrUnexpectedEOF here means the file
 		// shrank between Stat and read (TOCTOU) — also an error worth surfacing.
-		if _, err := io.ReadFull(f, buf); err != nil {
+		if _, err := f.ReadAt(buf, 0); err != nil {
 			return "", fmt.Errorf("samplehash read head: %w", err)
 		}
 		_, _ = h.Write(buf)
 	}
 	// Tail only when it wouldn't overlap the head (file bigger than 2 windows).
 	if size > int64(2*sampleWindow) {
-		if _, err := f.Seek(-int64(sampleWindow), io.SeekEnd); err != nil {
-			return "", fmt.Errorf("samplehash seek tail: %w", err)
-		}
 		buf := make([]byte, sampleWindow)
-		if _, err := io.ReadFull(f, buf); err != nil {
+		if _, err := f.ReadAt(buf, size-int64(sampleWindow)); err != nil {
 			return "", fmt.Errorf("samplehash read tail: %w", err)
 		}
 		_, _ = h.Write(buf)

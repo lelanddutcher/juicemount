@@ -42,11 +42,18 @@ func (c *Client) EnqueueDiscovered(ctx context.Context, path string, kinds []str
 // work; discovery keeps its dirty set in memory and resumes enqueueing when the
 // control plane is played again.
 type FarmControl struct {
-	Revision     int64  `json:"revision"`
-	Paused       bool   `json:"paused"`
-	WatchEnabled bool   `json:"watch_enabled"`
-	UpdatedAt    string `json:"updated_at,omitempty"`
-	UpdatedBy    string `json:"updated_by,omitempty"`
+	Revision     int64 `json:"revision"`
+	Paused       bool  `json:"paused"`
+	WatchEnabled bool  `json:"watch_enabled"`
+	// AutoPaused distinguishes a safety interlock from an operator pause. The
+	// reason/code are deliberately in the shared control document so every
+	// worker stops claiming atomically and Manager can explain why Play is
+	// blocked instead of showing a generic paused state.
+	AutoPaused  bool   `json:"auto_paused,omitempty"`
+	PauseCode   string `json:"pause_code,omitempty"`
+	PauseReason string `json:"pause_reason,omitempty"`
+	UpdatedAt   string `json:"updated_at,omitempty"`
+	UpdatedBy   string `json:"updated_by,omitempty"`
 }
 
 // DefaultFarmControl is intentionally active. Existing deployments without a
@@ -109,6 +116,63 @@ func (c *Client) StoreControl(ctx context.Context, ctl FarmControl, forceRevisio
 		return ctl.Revision, err
 	}
 	return 0, fmt.Errorf("farm control store: contention after 3 attempts")
+}
+
+// PauseForSafety atomically engages the whole-farm safety interlock while
+// preserving discovery configuration. It is idempotent for an unchanged
+// code/reason so many workers observing the same backend fault do not churn the
+// control revision. Safety pauses never auto-resume; an operator must restore
+// headroom and explicitly press Play, at which point Manager clears the fields.
+func (c *Client) PauseForSafety(ctx context.Context, code, reason string) (FarmControl, error) {
+	if code == "" {
+		code = "safety"
+	}
+	if reason == "" {
+		reason = "farm safety interlock engaged"
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		var stored FarmControl
+		err := c.rdb.Watch(ctx, func(tx *redis.Tx) error {
+			ctl := DefaultFarmControl()
+			raw, err := tx.Get(ctx, ControlKey).Result()
+			if err != nil && err != redis.Nil {
+				return err
+			}
+			if err == nil {
+				if err := json.Unmarshal([]byte(raw), &ctl); err != nil {
+					return err
+				}
+			}
+			if ctl.Paused && ctl.AutoPaused && ctl.PauseCode == code && ctl.PauseReason == reason {
+				stored = ctl
+				return nil
+			}
+			ctl.Revision++
+			ctl.Paused = true
+			ctl.AutoPaused = true
+			ctl.PauseCode = code
+			ctl.PauseReason = reason
+			ctl.UpdatedAt = nowISO()
+			ctl.UpdatedBy = "safety-interlock"
+			blob, err := json.Marshal(ctl)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+				p.Set(ctx, ControlKey, blob, 0)
+				return nil
+			}); err != nil {
+				return err
+			}
+			stored = ctl
+			return nil
+		}, ControlKey)
+		if err == redis.TxFailedErr {
+			continue
+		}
+		return stored, err
+	}
+	return FarmControl{}, fmt.Errorf("farm safety pause: contention after 3 attempts")
 }
 
 // AcquireWatchLeadership elects exactly one currently-running worker to turn

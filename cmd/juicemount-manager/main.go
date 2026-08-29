@@ -54,6 +54,8 @@ func main() {
 	stateFile := flag.String("state-file", os.Getenv("JM_STATE_FILE"), "Optional JSON path for job-history persistence (empty = jobs lost on restart). Bind-mount the dir to make history survive container churn.")
 	minioURL := flag.String("minio-url", envOr("JM_MINIO_URL", ""), "SLICE 2: MinIO base URL the Overview dashboard pings via /minio/health/live. Empty disables the MinIO probe (Overview card shows an actionable hint). Use the same URL Mac clients connect to so the dashboard reflects what they see.")
 	farmStatus := flag.String("farm-status", envOr("JM_FARM_STATUS", ""), "Path to the juicefarm rollup (farm-status.json) for the Farm tab. Empty = Farm tab shows an empty state. Mount the juicefarm-state volume read-only to enable.")
+	farmStorage := flag.String("farm-storage-path", envOr("JM_FARM_STORAGE_PATH", ""), "Local path on the JuiceFS backend pool used for the farm headroom safety interlock. Empty derives the parent of --farm-status.")
+	farmMinFree := flag.Uint64("farm-min-free-bytes", envUint64Or("JM_FARM_MIN_FREE_BYTES", 0), "Minimum backend bytes required before farm enqueue/resume. Zero uses max(64 GiB, 1% of the probed filesystem).")
 	mountOwner := flag.String("mount-owner", envOr("JM_MOUNT_OWNER", ""), "POSIX owner (uid[:gid], e.g. 501:20) that migrated data is chowned to after an embedded-mode sync, so the CLIENT mounting the volume can WRITE it — not just read it. The manager runs as root on the NAS, so without this, `juicefs sync` leaves migrated files root:wheel and a uid-501 Mac client can only read them. Empty = leave raw sync ownership. Set to the uid your Mac client mounts as (usually 501:20).")
 	overviewMeta := flag.String("overview-meta", envOr("JM_OVERVIEW_META", ""), "Redis URL for the Overview tab's `juicefs status` + Redis INFO probes. Use this in EMBEDDED mode (--fuse-mount), where --meta is unavailable (mutually exclusive), so Overview still works. In standalone mode --meta already serves both and this can stay empty.")
 	flag.Parse()
@@ -83,19 +85,21 @@ func main() {
 
 	mux := http.NewServeMux()
 	cfg := manager.Config{
-		JuiceFSBin:      *juicefsBin,
-		FUSEMount:       *fuseMount, // embedded mode if non-empty
-		MetaURL:         *metaURL,   // standalone mode if non-empty
-		VolName:         *volName,
-		SourceRoots:     roots,
-		DestMount:       *destMount,
-		AdminKey:        *adminKey,
-		StateFile:       *stateFile,
-		MinIOURL:        *minioURL,
-		FarmStatusPath:  *farmStatus,
-		MountOwnerUID:   ownerUID,
-		MountOwnerGID:   ownerGID,
-		OverviewMetaURL: *overviewMeta,
+		JuiceFSBin:       *juicefsBin,
+		FUSEMount:        *fuseMount, // embedded mode if non-empty
+		MetaURL:          *metaURL,   // standalone mode if non-empty
+		VolName:          *volName,
+		SourceRoots:      roots,
+		DestMount:        *destMount,
+		AdminKey:         *adminKey,
+		StateFile:        *stateFile,
+		MinIOURL:         *minioURL,
+		FarmStatusPath:   *farmStatus,
+		FarmStoragePath:  *farmStorage,
+		FarmMinFreeBytes: *farmMinFree,
+		MountOwnerUID:    ownerUID,
+		MountOwnerGID:    ownerGID,
+		OverviewMetaURL:  *overviewMeta,
 	}
 	mgr := manager.Register(mux, "", cfg)
 
@@ -192,6 +196,18 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envUint64Or(name string, fallback uint64) uint64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		log.Fatalf("%s must be an unsigned byte count: %v", name, err)
+	}
+	return n
 }
 
 // parseOwner parses a "uid[:gid]" mount-owner string into numeric ids.

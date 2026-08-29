@@ -121,6 +121,110 @@ func TestRedisClaimRecovery(t *testing.T) {
 	}
 }
 
+func TestRedisSafetyPauseIsAtomicAndIdempotent(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	control := DefaultFarmControl()
+	control.WatchEnabled = false
+	revision, err := q.StoreControl(ctx, control, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused, err := q.PauseForSafety(ctx, "storage-pressure", "backend reserve exhausted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !paused.Paused || !paused.AutoPaused || paused.WatchEnabled ||
+		paused.PauseCode != "storage-pressure" || paused.Revision != revision+1 {
+		t.Fatalf("safety control = %+v", paused)
+	}
+
+	again, err := q.PauseForSafety(ctx, "storage-pressure", "backend reserve exhausted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Revision != paused.Revision {
+		t.Fatalf("idempotent pause changed revision %d -> %d", paused.Revision, again.Revision)
+	}
+	changed, err := q.PauseForSafety(ctx, "storage-probe-failed", "backend headroom unverified")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Revision != paused.Revision+1 || changed.PauseCode != "storage-probe-failed" || changed.WatchEnabled {
+		t.Fatalf("changed safety control = %+v", changed)
+	}
+}
+
+func TestRedisRecoveryOnlyAcknowledgesTerminalClaim(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Worker{ID: "terminal-ack-server", Name: "terminal-ack-server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	if err := q.Heartbeat(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	job := NewJob("/jfs/terminal.mov", []string{KindDerivatives}, "manager")
+	job.DerivativePass = DerivativePassMetadata
+	job.QueueClass = QueueClassServer
+	job.RequiredCapabilities = []string{"metadata"}
+	if err := q.Enqueue(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if err := q.MarkClaimRunning(ctx, claim, server); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.MarkDone(ctx, job.ID, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Model a lost ACK response: terminal status is durable, the processing
+	// receipt remains, and the worker heartbeat then expires.
+	if err := q.rdb.Del(ctx, WorkerPrefix+server.ID).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RecoverAbandonedWorkers(ctx); err != nil || n != 1 {
+		t.Fatalf("terminal recovery = %d, %v; want one orphaned ACK cleaned", n, err)
+	}
+	if n, err := q.rdb.LLen(ctx, ProcessingPrefix+server.ID).Result(); err != nil || n != 0 {
+		t.Fatalf("processing depth = %d, %v; want 0", n, err)
+	}
+	if depth, err := q.QueueDepth(ctx); err != nil || depth != 0 {
+		t.Fatalf("queue depth = %d, %v; terminal job was requeued", depth, err)
+	}
+	if status, err := q.rdb.HGet(ctx, JobHashPrefix+job.ID, "status").Result(); err != nil || status != StatusDone {
+		t.Fatalf("terminal status = %q, %v", status, err)
+	}
+}
+
 func TestRedisClaimRecoveryPrefersAnotherRenderWorker(t *testing.T) {
 	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
 	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {

@@ -83,12 +83,19 @@ type passOpts struct {
 // render batch can retry only its failures. The generator dispatch below is the
 // single source of truth: the basic, proxy and transcript modes all funnel
 // through the same internal/farm calls.
-func runPasses(po passOpts, targets []string) (processed, failed int, failedTargets, failureDetails []string) {
+func runPasses(po passOpts, targets []string) (processed, failed int, failedTargets, failureDetails []string, safetyErr error) {
 	start := time.Now()
-	ctx := po.ctx
-	if ctx == nil {
-		ctx = context.Background()
+	parentCtx := po.ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
 	}
+	// A backend storage fault is a farm-wide safety event, not an ordinary
+	// per-media failure. Cancel this pass immediately so work that has not yet
+	// started cannot consume more of the exhausted pool. Keep this child context
+	// separate from the durable job context: the queue loop still needs to
+	// distinguish an operator cancellation from an internally-triggered pause.
+	ctx, cancelPass := context.WithCancel(parentCtx)
+	defer cancelPass()
 	po.opt.Context = ctx
 	var ok, fail, thumbs, strips, waves, speech, transcriptSkipped, proxies, proxySkipped, qls int64
 	// skippedFresh counts assets whose derivatives already matched byte-identical
@@ -97,6 +104,30 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 	var mu sync.Mutex
 	var firstErrs []string
 	var failedPaths []string
+	completedPaths := make(map[string]bool, len(targets))
+	captureSafety := func(err error) {
+		if isFarmStoragePressure(err) {
+			firstStorageFault := false
+			mu.Lock()
+			if safetyErr == nil {
+				safetyErr = err
+				firstStorageFault = true
+			}
+			mu.Unlock()
+			if firstStorageFault {
+				cancelPass()
+			}
+		}
+	}
+	captureFailure := func(path string, err error) {
+		recordFailure(&mu, &firstErrs, &failedPaths, path, err)
+		captureSafety(err)
+	}
+	captureSuccess := func(path string) {
+		mu.Lock()
+		completedPaths[path] = true
+		mu.Unlock()
+	}
 	process := po.process
 	if process == nil {
 		process = farm.Process
@@ -139,6 +170,7 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 					}
 					if err := farm.WriteFarmProgress(po.store, po.status, po.mount, sweep, po.gov, ip); err != nil {
 						fmt.Fprintf(os.Stderr, "jmfarm: progress write: %v\n", err)
+						captureSafety(err)
 					}
 				}
 			}
@@ -176,10 +208,11 @@ targetLoop:
 				}
 				if e != nil {
 					atomic.AddInt64(&fail, 1)
-					recordFailure(&mu, &firstErrs, &failedPaths, p, e)
+					captureFailure(p, e)
 					return
 				}
 				atomic.AddInt64(&ok, 1)
+				captureSuccess(p)
 				if po.verbose {
 					fmt.Printf("  [dry] %-50s %s %dms\n", filepath.Base(p), tech.Container, tech.DurationMS)
 				}
@@ -193,13 +226,14 @@ targetLoop:
 				}
 				if qr.Err != nil {
 					atomic.AddInt64(&fail, 1)
-					recordFailure(&mu, &firstErrs, &failedPaths, p, qr.Err)
+					captureFailure(p, qr.Err)
 					if po.verbose {
 						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), qr.Inode, qr.Err)
 					}
 					return
 				}
 				atomic.AddInt64(&ok, 1)
+				captureSuccess(p)
 				if qr.Wrote {
 					atomic.AddInt64(&qls, 1)
 				}
@@ -217,13 +251,14 @@ targetLoop:
 				}
 				if pr.Err != nil {
 					atomic.AddInt64(&fail, 1)
-					recordFailure(&mu, &firstErrs, &failedPaths, p, pr.Err)
+					captureFailure(p, pr.Err)
 					if po.verbose {
 						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), pr.Inode, pr.Err)
 					}
 					return
 				}
 				atomic.AddInt64(&ok, 1)
+				captureSuccess(p)
 				if pr.Wrote {
 					atomic.AddInt64(&proxies, 1)
 				}
@@ -244,13 +279,14 @@ targetLoop:
 				}
 				if tr.Err != nil {
 					atomic.AddInt64(&fail, 1)
-					recordFailure(&mu, &firstErrs, &failedPaths, p, tr.Err)
+					captureFailure(p, tr.Err)
 					if po.verbose {
 						fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), tr.Inode, tr.Err)
 					}
 					return
 				}
 				atomic.AddInt64(&ok, 1)
+				captureSuccess(p)
 				if tr.HasSpeech {
 					atomic.AddInt64(&speech, 1)
 				}
@@ -270,7 +306,7 @@ targetLoop:
 			}
 			if r.Err != nil {
 				atomic.AddInt64(&fail, 1)
-				recordFailure(&mu, &firstErrs, &failedPaths, p, r.Err)
+				captureFailure(p, r.Err)
 				if po.verbose {
 					fmt.Printf("  [FAIL] %-50s inode=%d %v\n", filepath.Base(p), r.Inode, r.Err)
 				}
@@ -282,6 +318,7 @@ targetLoop:
 			// reorganised folder cost no compute.
 			if r.SkippedFresh {
 				atomic.AddInt64(&ok, 1)
+				captureSuccess(p)
 				atomic.AddInt64(&skippedFresh, 1)
 				if r.SidecarRepaired {
 					atomic.AddInt64(&sidecarsRepaired, 1)
@@ -310,13 +347,14 @@ targetLoop:
 				// Preserve the successful metadata, but make the file/job outcome
 				// truthful and retryable.
 				atomic.AddInt64(&fail, 1)
-				recordFailure(&mu, &firstErrs, &failedPaths, p, r.BlobErr)
+				captureFailure(p, r.BlobErr)
 				if po.verbose {
 					fmt.Printf("  [PARTIAL FAIL] %-42s inode=%d %v\n", filepath.Base(p), r.Inode, r.BlobErr)
 				}
 				return
 			}
 			atomic.AddInt64(&ok, 1)
+			captureSuccess(p)
 			if po.verbose {
 				fmt.Printf("  [ok] %-50s inode=%d hash=%s %dms vid=%v thumb=%v strip=%v wave=%v\n",
 					filepath.Base(p), r.Inode, r.Hash, r.DurationMS, r.HasVideo, r.ThumbWrote, r.FilmWrote, r.WaveWrote)
@@ -368,10 +406,30 @@ targetLoop:
 		// real values (nice/ionice/interval are applied by the entrypoint).
 		if err := farm.WriteFarmStatus(po.store, po.status, po.mount, sweep, po.gov); err != nil {
 			fmt.Fprintf(os.Stderr, "jmfarm: status write: %v\n", err)
+			captureSafety(err)
+		}
+	}
+	// Once storage safety aborts a pass, retry every target that did not reach a
+	// proven successful return. This includes the triggering failure, work that
+	// was canceled in flight, and work that was never launched. Successfully
+	// committed targets stay out of the retry list so ProcessedOffset remains
+	// exact instead of counting a freshness skip twice on the resumed claim.
+	if safetyErr != nil {
+		mu.Lock()
+		successful := make(map[string]bool, len(completedPaths))
+		for path := range completedPaths {
+			successful[path] = true
+		}
+		mu.Unlock()
+		failedPaths = failedPaths[:0]
+		for _, path := range targets {
+			if !successful[path] {
+				failedPaths = append(failedPaths, path)
+			}
 		}
 	}
 	sort.Strings(failedPaths)
-	return int(ok), int(fail), failedPaths, append([]string(nil), firstErrs...)
+	return int(ok), int(fail), failedPaths, append([]string(nil), firstErrs...), safetyErr
 }
 
 func main() {
@@ -550,33 +608,43 @@ func main() {
 
 	if *queue {
 		runQueue(queueConfig{
-			meta:       *meta,
-			dbPath:     *dbPath,
-			mount:      *mount,
-			producer:   *producer,
-			version:    *version,
-			status:     *status,
-			verbose:    *verbose,
-			conc:       *conc,
-			pConc:      *pConc,
-			vcodec:     *vcodec,
-			crf:        *pCRF,
-			preset:     *pPreset,
-			wModel:     *wModel,
-			wBin:       *wBin,
-			thumbDim:   *thumbDim,
-			filmCell:   *filmCell,
-			waveSPP:    *waveSPP,
-			minSize:    minSizeBytes,
-			gNice:      *gNice,
-			gIONice:    *gIONice,
-			qlMaxDim:   *qlDim,
-			qlSecs:     *qlSecs,
-			postAlways: *postAlways,
-			name:       *wName,
-			kinds:      splitKinds(*wKinds),
-			role:       strings.ToLower(strings.TrimSpace(*wRole)),
-			tDevice:    *wDevice,
+			meta:     *meta,
+			dbPath:   *dbPath,
+			mount:    *mount,
+			producer: *producer,
+			version:  *version,
+			status:   *status,
+			storagePath: func() string {
+				if explicit := strings.TrimSpace(os.Getenv("JM_FARM_STORAGE_PATH")); explicit != "" {
+					return explicit
+				}
+				if *status != "" {
+					return filepath.Dir(*status)
+				}
+				return ""
+			}(),
+			storageMinFree: farmEnvUint64("JM_FARM_MIN_FREE_BYTES", 0),
+			verbose:        *verbose,
+			conc:           *conc,
+			pConc:          *pConc,
+			vcodec:         *vcodec,
+			crf:            *pCRF,
+			preset:         *pPreset,
+			wModel:         *wModel,
+			wBin:           *wBin,
+			thumbDim:       *thumbDim,
+			filmCell:       *filmCell,
+			waveSPP:        *waveSPP,
+			minSize:        minSizeBytes,
+			gNice:          *gNice,
+			gIONice:        *gIONice,
+			qlMaxDim:       *qlDim,
+			qlSecs:         *qlSecs,
+			postAlways:     *postAlways,
+			name:           *wName,
+			kinds:          splitKinds(*wKinds),
+			role:           strings.ToLower(strings.TrimSpace(*wRole)),
+			tDevice:        *wDevice,
 		})
 		return
 	}
@@ -656,7 +724,7 @@ func main() {
 	gov := farm.NewGovernor(*wModel, *vcodec, *pPreset, mode,
 		*pCRF, *conc, *pConc, *gNice, *gIONice, *gInterval)
 
-	_, failed, _, _ := runPasses(passOpts{
+	_, failed, _, _, _ := runPasses(passOpts{
 		opt: opt, mode: mode, transcr: *transcr, proxyGen: *proxyGen, qlGen: *qlGen,
 		dryRun: *dryRun, verbose: *verbose, effConc: effConc,
 		status: *status, mount: *mount, producer: *producer,
@@ -672,29 +740,31 @@ func main() {
 // queueConfig carries the run-default flags into the standing worker loop. A
 // drained job's options override the matching field where it is non-zero.
 type queueConfig struct {
-	meta       string
-	dbPath     string
-	mount      string
-	producer   string
-	version    int
-	status     string
-	verbose    bool
-	conc       int
-	pConc      int
-	vcodec     string
-	crf        int
-	preset     string
-	wModel     string
-	wBin       string
-	thumbDim   int
-	filmCell   int
-	waveSPP    int
-	minSize    int64 // skip media smaller than this (bytes); 0 = no minimum
-	gNice      int
-	gIONice    int
-	qlMaxDim   int // QL preview fit box px (T1.1/F4)
-	qlSecs     int // QL preview duration cap s (<=0 → default 20)
-	postAlways bool
+	meta           string
+	dbPath         string
+	mount          string
+	producer       string
+	version        int
+	status         string
+	storagePath    string
+	storageMinFree uint64
+	verbose        bool
+	conc           int
+	pConc          int
+	vcodec         string
+	crf            int
+	preset         string
+	wModel         string
+	wBin           string
+	thumbDim       int
+	filmCell       int
+	waveSPP        int
+	minSize        int64 // skip media smaller than this (bytes); 0 = no minimum
+	gNice          int
+	gIONice        int
+	qlMaxDim       int // QL preview fit box px (T1.1/F4)
+	qlSecs         int // QL preview duration cap s (<=0 → default 20)
+	postAlways     bool
 
 	// Manager-config integration (FARM-NODE-CONFIG spec):
 	name    string   // stable worker identity (JM_WORKER_NAME / -name)
@@ -1012,6 +1082,30 @@ func runQueue(cfg queueConfig) {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: control poll: %v\n", ctlErr)
 			ctl = farmqueue.DefaultFarmControl()
 		}
+		// Only the server/control-plane worker probes physical backend
+		// headroom. A render node's /state and cache are local disks and cannot
+		// tell whether the NAS object/metadata pool is about to exhaust. The
+		// resulting Redis interlock is shared, so every remote worker stops
+		// atomically before claiming more output work.
+		if worker.Role == farmqueue.QueueClassServer && cfg.storagePath != "" && !ctl.Paused {
+			headroom, probeErr := checkWorkerStorageHeadroom(cfg.storagePath, cfg.storageMinFree)
+			unsafe := probeErr != nil || headroom.Available < headroom.Required
+			if unsafe {
+				code := "storage-pressure"
+				reason := "backend free space is below the farm safety reserve; reclaim storage before resuming"
+				if probeErr != nil {
+					code = "storage-probe-failed"
+					reason = "backend storage headroom could not be verified"
+				}
+				stored, pauseErr := q.PauseForSafety(ctx, code, reason)
+				if pauseErr != nil {
+					fmt.Fprintf(os.Stderr, "jmfarm queue: storage safety check: %v (pause failed: %v)\n", probeErr, pauseErr)
+				} else {
+					ctl = stored
+					fmt.Fprintf(os.Stderr, "jmfarm queue: safety pause: %s\n", reason)
+				}
+			}
+		}
 
 		// Heartbeat (idle/paused): publish presence so Manager can distinguish a
 		// healthy paused node from an offline one.
@@ -1126,7 +1220,12 @@ func runQueue(cfg queueConfig) {
 		jobCancel()
 		hbStop()
 		<-hbDone
-		recordCompletedJobBenchmark(&worker, job, processed, failed, time.Since(jobStarted))
+		// Backend writeback failure says nothing about codec/device speed or
+		// reliability. Do not poison measured scheduling history with a storage
+		// outage that every worker would have hit.
+		if !errors.Is(runErr, errFarmStoragePressure) {
+			recordCompletedJobBenchmark(&worker, job, processed, failed, time.Since(jobStarted))
+		}
 		if ctx.Err() != nil {
 			// Leave the durable processing receipt intact. A live worker will
 			// recover it after this heartbeat expires.
@@ -1162,6 +1261,40 @@ func runQueue(cfg queueConfig) {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: dispatch retry %s: %v; stopping with durable claim intact\n", job.ID, err)
 				return
 			}
+			continue
+		}
+		if errors.Is(runErr, errFarmStoragePressure) {
+			reason := "storage pressure interrupted durable output; farm auto-paused and job retained on its proven route: " + runErr.Error()
+			if _, err := q.PauseForSafety(context.Background(), "storage-pressure", reason); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: safety pause %s: %v; stopping with durable claim intact\n", job.ID, err)
+				return
+			}
+			if len(failedTargets) == 0 {
+				// Every requested media output completed; only the auxiliary status
+				// rollup exposed the backend fault. Finish this claim exactly once
+				// while leaving the global safety pause engaged. Requeueing an empty
+				// retry set would re-walk the directory and double-count freshness
+				// skips after the operator restores headroom.
+				if err := q.MarkDone(context.Background(), job.ID, job.ProcessedOffset+processed, failed); err != nil {
+					fmt.Fprintf(os.Stderr, "jmfarm queue: mark storage-complete %s: %v; stopping with durable claim intact\n", job.ID, err)
+					return
+				}
+				if err := q.AckClaim(context.Background(), claim); err != nil {
+					fmt.Fprintf(os.Stderr, "jmfarm queue: ack storage-complete %s: %v; stopping with durable claim intact\n", job.ID, err)
+					return
+				}
+				fmt.Fprintf(os.Stderr, "jmfarm queue: %s (media complete; claim acknowledged)\n", reason)
+				continue
+			}
+			if len(failedTargets) > 0 {
+				claim.Job.RetryTargets = failedTargets
+			}
+			claim.Job.ProcessedOffset += processed
+			if err := q.RequeueClaimSameRoute(context.Background(), claim, reason); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: storage requeue %s: %v; stopping with durable claim intact\n", job.ID, err)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "jmfarm queue: %s\n", reason)
 			continue
 		}
 		if requeue, fallbackCPU, reason := renderFailureDisposition(worker, job, runErr); requeue {
@@ -1430,6 +1563,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 		return 0, 0, nil, fmt.Errorf("job %s has no runnable kinds (%v)", job.ID, job.Kinds)
 	}
 	var failureDetails []string
+	var storageFailure error
 
 	base := farm.Options{
 		Context:  ctx,
@@ -1472,7 +1606,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 			break // cancelled between passes → stop cleanly, report what we did
 		}
 		gov := farm.NewGovernor(wModel, vcodec, preset, p.mode, crf, conc, pConc, cfg.gNice, cfg.gIONice, 0)
-		pr, pf, failedPaths, details := runPasses(passOpts{
+		pr, pf, failedPaths, details, safetyErr := runPasses(passOpts{
 			ctx: ctx,
 			opt: base, mode: p.mode, transcr: p.transcr, proxyGen: p.proxyGen, qlGen: p.qlGen,
 			dryRun: false, verbose: cfg.verbose, effConc: p.effConc,
@@ -1483,6 +1617,16 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 		failed += pf
 		failedTargets = append(failedTargets, failedPaths...)
 		failureDetails = append(failureDetails, details...)
+		if storageFailure == nil && safetyErr != nil {
+			storageFailure = safetyErr
+		}
+		if safetyErr != nil {
+			break
+		}
+	}
+	if storageFailure != nil {
+		return processed, failed, uniqueSortedStrings(failedTargets),
+			fmt.Errorf("%w: %v", errFarmStoragePressure, storageFailure)
 	}
 	if failed > 0 {
 		sort.Strings(failedTargets)
@@ -1913,6 +2057,18 @@ func farmEnvInt(name string, def int) int {
 		}
 	}
 	return def
+}
+
+func farmEnvUint64(name string, def uint64) uint64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 func defaultDBPath() string {

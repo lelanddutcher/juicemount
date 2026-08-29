@@ -40,6 +40,16 @@ func (a *API) handleFarmControl(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "paused or watch_enabled is required", http.StatusBadRequest)
 			return
 		}
+		if patch.Paused != nil && !*patch.Paused {
+			storage := a.enforceFarmStorageGuard(ctx)
+			if storage.Configured && !storage.Safe {
+				writeJSON(w, http.StatusInsufficientStorage, map[string]any{
+					"error":   storage.Reason,
+					"storage": storage,
+				})
+				return
+			}
+		}
 		ctl, err := a.farmQ.GetControl(ctx)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
@@ -47,6 +57,12 @@ func (a *API) handleFarmControl(w http.ResponseWriter, r *http.Request) {
 		}
 		if patch.Paused != nil {
 			ctl.Paused = *patch.Paused
+			// Any explicit operator transport action takes ownership of the
+			// state. Resume is admitted only after the storage guard above, so
+			// clearing the interlock fields cannot mask an unsafe backend.
+			ctl.AutoPaused = false
+			ctl.PauseCode = ""
+			ctl.PauseReason = ""
 		}
 		if patch.WatchEnabled != nil {
 			ctl.WatchEnabled = *patch.WatchEnabled
