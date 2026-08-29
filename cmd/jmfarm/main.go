@@ -1042,6 +1042,11 @@ func runQueue(cfg queueConfig) {
 			} else if recovered > 0 {
 				fmt.Printf("jmfarm queue: re-routed %d unserviceable render job(s)\n", recovered)
 			}
+			if promoted, err := q.PromoteServiceableReady(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: ready-lane promotion: %v\n", err)
+			} else if promoted > 0 {
+				fmt.Printf("jmfarm queue: promoted %d temporary CPU fallback job(s) to verified hardware\n", promoted)
+			}
 			nextReap = time.Now().Add(15 * time.Second)
 		}
 		if nodeDisabled.Load() || ctl.Paused {

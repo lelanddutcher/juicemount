@@ -14,6 +14,8 @@ import (
 
 const claimLeaseTTL = 45 * time.Second
 
+const maxReadyPromotionsPerScan = 512
+
 // Claim is the durable receipt for a job atomically moved from a ready lane to
 // a worker processing list. Raw is retained so acknowledgement can remove the
 // exact list entry without trusting mutable job fields.
@@ -193,6 +195,134 @@ return 0`
 	return recovered, nil
 }
 
+// PromoteServiceableReady moves only temporary CPU fallbacks back onto a
+// verified render lane when compatible hardware returns. Jobs explicitly
+// locked to CPU because their source failed hardware admission or exhausted
+// its retry budget stay on CPU; active durable claims are never inspected.
+//
+// The Redis mutation is compare-and-move on the exact serialized list value,
+// making concurrent maintenance scans idempotent. A bounded scan limit avoids
+// letting a large historical CPU queue monopolize the worker heartbeat loop.
+func (c *Client) PromoteServiceableReady(ctx context.Context) (int, error) {
+	workers, err := c.ActiveWorkers(ctx)
+	if err != nil {
+		return 0, err
+	}
+	hasRender := false
+	for _, worker := range workers {
+		if worker.Role == QueueClassRender {
+			hasRender = true
+			break
+		}
+	}
+	if !hasRender {
+		return 0, nil
+	}
+	loads := c.queuedWorkerLoads(ctx, workers)
+	promoted := 0
+	for _, kind := range []string{KindDerivatives, KindProxy, KindTranscript} {
+		sourceKey := classQueue(kind, QueueClassCPU)
+		raws, err := c.rdb.LRange(ctx, sourceKey, 0, -1).Result()
+		if err != nil {
+			return promoted, err
+		}
+		for _, raw := range raws {
+			if promoted >= maxReadyPromotionsPerScan {
+				return promoted, nil
+			}
+			var original Job
+			if json.Unmarshal([]byte(raw), &original) != nil || original.ID == "" || original.CPUFallbackLocked {
+				continue
+			}
+
+			candidate := original
+			candidate.QueueClass = ""
+			candidate.RequiredCapabilities = nil
+			candidate.SelectedBackend = ""
+			candidate.SelectedWorker = ""
+			candidate.RoutingReason = ""
+			if kind == KindProxy {
+				candidate.VCodec = ""
+			}
+			routeJobWithWorkers(&candidate, workers, loads)
+			if candidate.QueueClass != QueueClassRender {
+				continue
+			}
+
+			statusKey := JobHashPrefix + original.ID
+			previousReason, err := c.rdb.HGet(ctx, statusKey, "error").Result()
+			if err != nil && err != redis.Nil {
+				return promoted, err
+			}
+			if legacyCPUFallbackLocked(original, previousReason) {
+				continue
+			}
+			promotionReason := "verified render capability returned; promoted queued CPU fallback to " + candidate.SelectedBackend
+			if strings.TrimSpace(previousReason) != "" {
+				promotionReason = previousReason + "; " + promotionReason
+			}
+			candidate.RoutingReason = promotionReason
+			nextRaw, err := json.Marshal(candidate)
+			if err != nil {
+				continue
+			}
+			const script = `
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
+  redis.call('LPUSH', KEYS[2], ARGV[2])
+  redis.call('HSET', KEYS[3], 'status', 'queued', 'worker', '',
+    'backend', ARGV[3], 'target_worker', ARGV[4], 'queue_class', ARGV[5], 'error', ARGV[6])
+  redis.call('HDEL', KEYS[3], 'lease_owner', 'lease_expires_at', 'finished_at')
+  return 1
+end
+return 0`
+			n, err := c.rdb.Eval(ctx, script, []string{
+				sourceKey, classQueue(kind, QueueClassRender), statusKey,
+			}, raw, string(nextRaw), candidate.SelectedBackend, candidate.SelectedWorker,
+				candidate.QueueClass, promotionReason).Int()
+			if err != nil {
+				return promoted, err
+			}
+			if n == 1 {
+				promoted++
+				for _, capability := range candidate.RequiredCapabilities {
+					if id, ok := strings.CutPrefix(capability, "worker:"); ok && id != "" {
+						loads[id]++
+						break
+					}
+				}
+			}
+		}
+	}
+	return promoted, nil
+}
+
+// Old queued records predate CPUFallbackLocked. Preserve the terminal intent
+// encoded in their deterministic split ID and visible status reason so an RC
+// upgrade cannot create a retry loop for known-incompatible media.
+func legacyCPUFallbackLocked(job Job, statusReason string) bool {
+	if job.CPUFallbackLocked || (strings.HasSuffix(job.ID, "-cpu") && job.ParentID != "") {
+		return true
+	}
+	reason := strings.ToLower(strings.TrimSpace(statusReason))
+	for _, marker := range []string{
+		"queued explicit cpu", "explicit cpu/h.264 fallback", "render backend failed after",
+		"live source admission rejected", "source(s) partitioned to explicit cpu",
+	} {
+		if strings.Contains(reason, marker) {
+			return true
+		}
+	}
+	if len(job.Kinds) == 1 && job.Kinds[0] == KindDerivatives {
+		routing := strings.ToLower(strings.TrimSpace(job.RoutingReason))
+		if routing != "" && !strings.HasPrefix(routing, "no verified hardware decoder is online for ") &&
+			!strings.Contains(routing, "decoder went offline") &&
+			!strings.Contains(routing, "worker discovery unavailable") {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) MarkClaimRunning(ctx context.Context, claim Claim, worker Worker) error {
 	expires := time.Now().Add(claimLeaseTTL)
 	pipe := c.rdb.TxPipeline()
@@ -241,6 +371,7 @@ func (c *Client) RequeueClaim(ctx context.Context, claim Claim, fallbackCPU bool
 		job.QueueClass = QueueClassCPU
 		job.RequiredCapabilities = []string{"cpu"}
 		job.SelectedWorker = ""
+		job.CPUFallbackLocked = true
 		switch {
 		case len(job.Kinds) == 1 && job.Kinds[0] == KindProxy:
 			job.VCodec = "libx264"

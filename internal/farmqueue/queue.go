@@ -222,6 +222,11 @@ type Job struct {
 	// failed, so a directory-shaped job can never recompute successful GPU
 	// outputs. Workers validate every path remains under Path and the mount.
 	RetryTargets []string `json:"retry_targets,omitempty"`
+	// CPUFallbackLocked distinguishes a terminal, deliberate CPU route (source
+	// incompatibility or exhausted hardware retries) from a temporary CPU route
+	// selected only because no compatible accelerator was online. Maintenance may
+	// promote only the latter when verified hardware returns.
+	CPUFallbackLocked bool `json:"cpu_fallback_locked,omitempty"`
 }
 
 // JobStatus is the worker-maintained record a producer reads back. Stored as a

@@ -150,6 +150,13 @@ func routePreviewCPU(child *farmqueue.Job, reason string) {
 	child.SelectedWorker = ""
 	child.RequiredCapabilities = []string{"cpu"}
 	child.RoutingReason = strings.TrimSpace(reason)
+	// A lack of live hardware is temporary and can be re-evaluated when a node
+	// returns. A source/probe/pixel-format rejection is durable and must not loop
+	// back through the accelerator on every maintenance scan.
+	normalizedReason := strings.ToLower(child.RoutingReason)
+	child.CPUFallbackLocked = normalizedReason != "" &&
+		!strings.HasPrefix(normalizedReason, "no verified hardware decoder is online for ") &&
+		!strings.Contains(normalizedReason, "worker discovery unavailable")
 }
 
 func plannedDerivativeID(parentID, pass string, targets []string) string {

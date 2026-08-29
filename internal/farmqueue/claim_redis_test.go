@@ -3,6 +3,7 @@ package farmqueue
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -282,5 +283,137 @@ func TestRedisPausedFarmRecoversAbandonedClaimWithoutExecutingIt(t *testing.T) {
 	recovered, ok, err := q.ClaimForWorker(ctx, time.Second, server)
 	if err != nil || !ok || recovered.Job.ID != job.ID {
 		t.Fatalf("resumed claim = %+v ok=%v err=%v", recovered.Job, ok, err)
+	}
+}
+
+func TestRedisReadyCPUPromotionWhenVerifiedRenderReturns(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Worker{ID: "promotion-server", Name: "server", Role: QueueClassServer,
+		Capabilities: []string{"cpu", "metadata"}}
+	if err := q.Heartbeat(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+
+	temporaryProxy := NewJob("/jfs/incoming/temporary.mp4", []string{KindProxy}, "manager")
+	temporaryProxy.ShardIndex, temporaryProxy.ShardCount = 1, 1
+	temporaryProxy.RetryTargets = []string{temporaryProxy.Path}
+	q.RouteJob(ctx, &temporaryProxy)
+	if temporaryProxy.QueueClass != QueueClassCPU || temporaryProxy.CPUFallbackLocked {
+		t.Fatalf("temporary proxy route = %+v, want promotable CPU", temporaryProxy)
+	}
+	if err := q.Enqueue(ctx, temporaryProxy); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.HSet(ctx, JobHashPrefix+temporaryProxy.ID,
+		"error", "recovered after worker old-render disappeared; compatible worker selection rerun").Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := NewJob("/jfs/incoming/incompatible.mov", []string{KindProxy}, "manager")
+	lockedProxy, err := newCPUFallbackSubset(parent, []string{parent.Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lockedProxy.CPUFallbackLocked {
+		t.Fatal("source-incompatible CPU subset was not locked")
+	}
+	if err := q.Enqueue(ctx, lockedProxy); err != nil {
+		t.Fatal(err)
+	}
+
+	temporaryPreview := NewJob("/jfs/incoming/temporary-high.mp4", []string{KindDerivatives}, "manager")
+	temporaryPreview.ShardIndex, temporaryPreview.ShardCount = 1, 1
+	temporaryPreview.DerivativePass = DerivativePassPreviews
+	temporaryPreview.SourceVideoCodec = "h264"
+	temporaryPreview.SourceVideoProfile = "high"
+	temporaryPreview.SourceBitDepth = 8
+	temporaryPreview.RetryTargets = []string{temporaryPreview.Path}
+	q.RouteJob(ctx, &temporaryPreview)
+	if temporaryPreview.QueueClass != QueueClassCPU || temporaryPreview.CPUFallbackLocked {
+		t.Fatalf("temporary preview route = %+v, want promotable CPU", temporaryPreview)
+	}
+	if err := q.Enqueue(ctx, temporaryPreview); err != nil {
+		t.Fatal(err)
+	}
+
+	lockedPreview := temporaryPreview
+	lockedPreview.ID = NewID()
+	lockedPreview.Path = "/jfs/incoming/yuv422.mp4"
+	lockedPreview.RetryTargets = []string{lockedPreview.Path}
+	lockedPreview.RoutingReason = "pixel format yuv422p10le requires a non-4:2:0 decode path"
+	lockedPreview.CPUFallbackLocked = true
+	if err := q.Enqueue(ctx, lockedPreview); err != nil {
+		t.Fatal(err)
+	}
+
+	render := Worker{ID: "promotion-render", Name: "render", Role: QueueClassRender,
+		Capabilities: []string{
+			"encoder:hevc_vaapi", "decoder:h264_vaapi", "decoder:h264_vaapi:profile:high",
+		},
+		Encoders: []string{"hevc_vaapi"}, Decoders: []string{"h264_vaapi"},
+		Benchmarks: WorkerBenchmarks{EncodeFPS: 200, DecodeFPS: 300}}
+	if err := q.Heartbeat(ctx, render); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 2 {
+		t.Fatalf("promote ready CPU = %d, %v; want 2, nil", n, err)
+	}
+	if n, err := q.PromoteServiceableReady(ctx); err != nil || n != 0 {
+		t.Fatalf("idempotent promotion = %d, %v; want 0, nil", n, err)
+	}
+
+	wantRender := map[string]bool{temporaryProxy.ID: true, temporaryPreview.ID: true}
+	for i := 0; i < 2; i++ {
+		claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+		if err != nil || !ok {
+			t.Fatalf("render claim after promotion: ok=%v err=%v", ok, err)
+		}
+		if !wantRender[claim.Job.ID] || claim.Job.QueueClass != QueueClassRender {
+			t.Fatalf("unexpected promoted claim: %+v", claim.Job)
+		}
+		delete(wantRender, claim.Job.ID)
+		status, err := q.rdb.HGetAll(ctx, JobHashPrefix+claim.Job.ID).Result()
+		if err != nil || !strings.Contains(status["error"], "promoted queued CPU fallback") {
+			t.Fatalf("promotion status = %+v, %v", status, err)
+		}
+		if err := q.AckClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(wantRender) != 0 {
+		t.Fatalf("promoted render jobs not claimed: %v", wantRender)
+	}
+
+	wantCPU := map[string]bool{lockedProxy.ID: true, lockedPreview.ID: true}
+	for i := 0; i < 2; i++ {
+		claim, ok, err := q.ClaimForWorker(ctx, time.Second, server)
+		if err != nil || !ok {
+			t.Fatalf("server claim for locked fallback: ok=%v err=%v", ok, err)
+		}
+		if !wantCPU[claim.Job.ID] || claim.Job.QueueClass != QueueClassCPU || !claim.Job.CPUFallbackLocked {
+			t.Fatalf("unexpected locked CPU claim: %+v", claim.Job)
+		}
+		delete(wantCPU, claim.Job.ID)
+		if err := q.AckClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

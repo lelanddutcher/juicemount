@@ -73,7 +73,8 @@ func TestDerivativePlanSeparatesMetadataFromVerifiedPreviewDecode(t *testing.T) 
 				}
 			} else {
 				cpu++
-				if child.QueueClass != farmqueue.QueueClassCPU || child.SelectedBackend != "cpu-decode" || child.RoutingReason == "" {
+				if child.QueueClass != farmqueue.QueueClassCPU || child.SelectedBackend != "cpu-decode" ||
+					child.RoutingReason == "" || !child.CPUFallbackLocked {
 					t.Fatalf("CPU preview fallback is not explicit: %+v", child)
 				}
 			}
@@ -98,6 +99,20 @@ func TestDerivativePlanSeparatesMetadataFromVerifiedPreviewDecode(t *testing.T) 
 	}
 	if !reflect.DeepEqual(ids, replayedIDs) {
 		t.Fatalf("replay IDs changed with route availability: first=%v replay=%v", ids, replayedIDs)
+	}
+}
+
+func TestPreviewCPURouteOnlyLocksSourceIncompatibility(t *testing.T) {
+	temporary := farmqueue.Job{}
+	routePreviewCPU(&temporary, "no verified hardware decoder is online for h264 profile high")
+	if temporary.CPUFallbackLocked {
+		t.Fatalf("temporary hardware outage was locked to CPU: %+v", temporary)
+	}
+
+	incompatible := farmqueue.Job{}
+	routePreviewCPU(&incompatible, "pixel format yuv422p10le requires a non-4:2:0 decode path")
+	if !incompatible.CPUFallbackLocked {
+		t.Fatalf("source-incompatible fallback remained promotable: %+v", incompatible)
 	}
 }
 

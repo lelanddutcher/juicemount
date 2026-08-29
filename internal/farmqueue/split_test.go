@@ -28,6 +28,9 @@ func TestNewCPUFallbackSubsetIsExactAndIndependent(t *testing.T) {
 	if child.QueueClass != QueueClassCPU || child.VCodec != "libx264" || child.SelectedBackend != "libx264" {
 		t.Fatalf("child route = class=%q codec=%q backend=%q", child.QueueClass, child.VCodec, child.SelectedBackend)
 	}
+	if !child.CPUFallbackLocked {
+		t.Fatal("explicit CPU fallback child remained eligible for hardware re-promotion")
+	}
 	if child.SelectedWorker != "" || !reflect.DeepEqual(child.RequiredCapabilities, []string{"cpu"}) {
 		t.Fatalf("child worker/capabilities = %q %v", child.SelectedWorker, child.RequiredCapabilities)
 	}
