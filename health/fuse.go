@@ -1224,6 +1224,19 @@ func (fm *FUSEManager) StartMonitor() {
 
 // Stop unmounts JuiceFS and stops the monitor.
 func (fm *FUSEManager) Stop() {
+	fm.stopWithBounds(10*time.Second, 2*time.Second, nil)
+}
+
+// stopWithBounds is the testable shutdown core. monitorWait bounds the
+// watchdog join and lockWait bounds acquisition of the lifecycle mutex. When
+// the mutex cannot be acquired, fallback runs without it; nil selects the
+// production lock-free unmount path.
+//
+// The lock deadline is essential. A filesystem syscall can leave the monitor
+// parked while it owns fm.mu. Waiting for that mutex after already timing out
+// the monitor join turns a nominally bounded Stop into an infinite one — the
+// exact failure seen when quitting with a wedged NFS/FUSE request.
+func (fm *FUSEManager) stopWithBounds(monitorWait, lockWait time.Duration, fallback func()) {
 	close(fm.stopCh)
 
 	// Kill juicefs FIRST — lock-free, before the monitor join and before
@@ -1251,14 +1264,51 @@ func (fm *FUSEManager) Stop() {
 	// rather than blocking the user-visible Stop button.
 	select {
 	case <-fm.done:
-	case <-time.After(10 * time.Second):
-		jmlog.Warn("FUSEManager.Stop: monitor goroutine didn't exit in 10s — proceeding with unmount anyway")
+	case <-time.After(monitorWait):
+		jmlog.Warn("FUSEManager.Stop: monitor goroutine did not exit before deadline — proceeding with unmount",
+			"deadline_ms", monitorWait.Milliseconds())
 	}
 
-	fm.mu.Lock()
-	defer fm.mu.Unlock()
-	fm.unmountLocked()
+	if fm.tryLockWithin(lockWait) {
+		fm.unmountLocked()
+		fm.mu.Unlock()
+	} else {
+		jmlog.Error("FUSEManager.Stop: lifecycle mutex remained held after monitor timeout — using lock-free bounded cleanup",
+			"lock_deadline_ms", lockWait.Milliseconds(),
+			"mountpoint", fm.cfg.MountPoint)
+		if fallback != nil {
+			fallback()
+		} else {
+			fm.unmountNow()
+		}
+	}
 	log.Printf("[fuse] stopped")
+}
+
+// tryLockWithin acquires fm.mu or returns when wait elapses. sync.Mutex.TryLock
+// keeps the caller itself out of the mutex wait queue, which matters when the
+// owner is parked in an uninterruptible filesystem syscall.
+func (fm *FUSEManager) tryLockWithin(wait time.Duration) bool {
+	if fm.mu.TryLock() {
+		return true
+	}
+	if wait <= 0 {
+		return false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if fm.mu.TryLock() {
+				return true
+			}
+		case <-timer.C:
+			return false
+		}
+	}
 }
 
 // IsMounted returns true if the FUSE mount is live and responsive.
@@ -1551,6 +1601,16 @@ func (fm *FUSEManager) killJuiceFSProcesses() int {
 // unmountLocked forcibly unmounts the FUSE mount. Must be called with fm.mu held.
 // Every shell-out is time-bounded so a wedged kernel state can't pin fm.mu.
 func (fm *FUSEManager) unmountLocked() {
+	fm.unmountNow()
+}
+
+// unmountNow performs the bounded, idempotent teardown without acquiring
+// fm.mu. Normal lifecycle transitions call it through unmountLocked. Stop may
+// call it directly only after the monitor join AND mutex acquisition have both
+// timed out; at that point refusing to clean up would strand the app forever.
+// The stop channel is already closed and the exact JuiceFS process is killed
+// before this path, so no new manager-owned mount can be started concurrently.
+func (fm *FUSEManager) unmountNow() {
 	// Kill any lingering JuiceFS mount processes for this mount point first.
 	// Killing the process lets the kernel release the mount.
 	fm.killJuiceFSProcesses()

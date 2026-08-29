@@ -3191,13 +3191,37 @@ func nfsMountOpts(port string) string {
 		port, port, ra, acOpts)
 }
 
+// runProcessBounded starts a cleanup process and returns at the deadline even
+// when the child is stuck in an uninterruptible kernel syscall. Go's
+// CommandContext(...).Run() is not sufficient here: after its context fires it
+// kills the child and then waits to reap it, and that Wait can remain blocked
+// behind a wedged diskutil/umount indefinitely.
+func runProcessBounded(timeout time.Duration, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		_ = cmd.Process.Kill()
+		// The waiter remains responsible for reaping the child if and when the
+		// kernel releases it. Shutdown must not wait for that event.
+		return fmt.Errorf("%s timed out after %s: %w", name, timeout, context.DeadlineExceeded)
+	}
+}
+
 // unmountNFS removes the NFS mount.
 //
-// Each strategy is bounded by a context timeout so a hung NFS operation
-// (kernel stuck talking to a dead server) doesn't wedge our shutdown path
-// for minutes. If every strategy fails, we log loudly and return false —
-// the caller (NFSServerShutdown) decides whether to kill the server
-// anyway.
+// Each strategy has a hard process deadline so a hung NFS operation (kernel
+// stuck talking to a dead server) cannot wedge our shutdown path. If every
+// strategy fails, we log loudly and return false — the caller
+// (NFSServerShutdown) decides whether to kill the server anyway.
 //
 // Strategy (cheapest first):
 //  1. `diskutil unmount` — works without sudo, doesn't pop a password
@@ -3213,9 +3237,7 @@ func unmountNFS(mountPoint string) bool {
 		return true
 	}
 	tryUnmount := func(name string, timeout time.Duration, argv ...string) bool {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
+		err := runProcessBounded(timeout, argv[0], argv[1:]...)
 		if err != nil {
 			jmlog.Debug("nfs unmount attempt failed",
 				"method", name, "mount_point", mountPoint, "error", err.Error())
@@ -3239,22 +3261,16 @@ func unmountNFS(mountPoint string) bool {
 	// Tier 2: AppleScript admin prompt (below). Skipping the prompt
 	// in dev workflows keeps automated test-cycles friction-free.
 	//
-	// Probe via a binary that's actually in the NOPASSWD list (sudoers
-	// usually scopes to specific binaries, so `sudo -n -- true` would
-	// fail even when the real umount would succeed).
-	umountProbe := exec.Command("sudo", "-n", "/sbin/umount")
-	umountProbeOut, _ := umountProbe.CombinedOutput()
-	if !strings.Contains(string(umountProbeOut), "password is required") {
-		if tryUnmount("sudo-umount-f-nfs", 15*time.Second,
-			"sudo", "-n", "/sbin/umount", "-f", "-t", "nfs", mountPoint) {
-			return true
-		}
-		if tryUnmount("sudo-umount-f", 15*time.Second,
-			"sudo", "-n", "/sbin/umount", "-f", mountPoint) {
-			return true
-		}
-		// Sudo paths failed — fall through to osascript-with-admin
-		// since maybe the sudoers rule doesn't cover unmount.
+	// Try the exact passwordless sudo operations directly. They fail quickly
+	// when no matching NOPASSWD rule exists, while avoiding an unbounded probe
+	// process during shutdown.
+	if tryUnmount("sudo-umount-f-nfs", 15*time.Second,
+		"sudo", "-n", "/sbin/umount", "-f", "-t", "nfs", mountPoint) {
+		return true
+	}
+	if tryUnmount("sudo-umount-f", 15*time.Second,
+		"sudo", "-n", "/sbin/umount", "-f", mountPoint) {
+		return true
 	}
 	// Last resort: AppleScript-prompted privileged umount, escalating.
 	// `-f` forces unmount of unresponsive mounts. We try -t nfs first
@@ -3285,9 +3301,7 @@ func unmountNFS(mountPoint string) bool {
 			mountPoint,
 			promptSuffix,
 		)
-		osaCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
-		if err := exec.CommandContext(osaCtx, "osascript", "-e", osaScript).Run(); err != nil {
+		if err := runProcessBounded(120*time.Second, "osascript", "-e", osaScript); err != nil {
 			jmlog.Debug("admin osascript failed", "method", label, "error", err.Error())
 			return false
 		}

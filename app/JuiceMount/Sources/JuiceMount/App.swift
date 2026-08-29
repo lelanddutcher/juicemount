@@ -31,6 +31,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var server: ServerController?
     /// Panel shown while "Wait for uploads" polls the spool down to zero.
     private var spoolQuitWaitPanel: NSPanel?
+    /// Visible progress while the blocking Go teardown runs off the AppKit
+    /// main thread. One terminateLater request owns this panel and reply.
+    private var shutdownQuitPanel: NSPanel?
+    private var quitShutdownInFlight = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Run as a status bar app (no dock icon, no main window)
@@ -119,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// drains — entries still QUEUED in the spool silently wait for a
     /// next launch that may never come, even though Finder already told
     /// the user "copied". If uploads are pending, make the user decide
-    /// before the teardown in applicationWillTerminate runs.
+    /// before the asynchronous hard teardown runs.
     ///
     /// The /spool fetch is blocking HTTP, so we answer `.terminateLater`,
     /// check off the main thread, and reply via
@@ -130,6 +134,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var quitCheckInFlight = false
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if quitShutdownInFlight {
+            shutdownQuitPanel?.makeKeyAndOrderFront(nil)
+            return .terminateCancel
+        }
         if let panel = spoolQuitWaitPanel {
             // A wait panel is already deciding this quit — re-front it.
             panel.makeKeyAndOrderFront(nil)
@@ -146,9 +154,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.presentQuitPendingAlert(sp, metricsAddr: addr)
             } else {
                 // Spool off, queue empty, or metrics server unreachable
-                // (server already stopped) — quit proceeds normally.
-                self.quitCheckInFlight = false
-                NSApp.reply(toApplicationShouldTerminate: true)
+                // (server already stopped) — begin the bounded hard teardown.
+                self.beginShutdownForQuit()
             }
         }
         return .terminateLater
@@ -171,8 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             quitCheckInFlight = false
             showQuitDrainWaitPanel(metricsAddr: metricsAddr)
         case .alertSecondButtonReturn:
-            quitCheckInFlight = false
-            NSApp.reply(toApplicationShouldTerminate: true)
+            beginShutdownForQuit()
         default:
             quitCheckInFlight = false
             NSApp.reply(toApplicationShouldTerminate: false)
@@ -203,7 +209,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func finishQuitWait(quit: Bool) {
         spoolQuitWaitPanel?.orderOut(nil)
         spoolQuitWaitPanel = nil
-        NSApp.reply(toApplicationShouldTerminate: quit)
+        if quit {
+            beginShutdownForQuit()
+        } else {
+            quitCheckInFlight = false
+            NSApp.reply(toApplicationShouldTerminate: false)
+        }
+    }
+
+    /// Completes the one outstanding terminateLater request only after the Go
+    /// core has attempted its hard teardown. Running the cgo call in a detached
+    /// task keeps AppKit responsive while macOS displays an administrator
+    /// prompt or a sick filesystem exhausts its bounded cleanup deadlines.
+    private func beginShutdownForQuit() {
+        guard !quitShutdownInFlight else {
+            shutdownQuitPanel?.makeKeyAndOrderFront(nil)
+            return
+        }
+        quitCheckInFlight = false
+        quitShutdownInFlight = true
+
+        let host = NSHostingController(rootView: QuitShutdownView())
+        let panel = NSPanel(contentViewController: host)
+        panel.title = "Disconnecting JuiceMount"
+        panel.styleMask = [.titled]
+        panel.isFloatingPanel = true
+        panel.center()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        shutdownQuitPanel = panel
+
+        Task { @MainActor in
+            await Task.detached { NFSBridge.shutdown() }.value
+            self.shutdownQuitPanel?.orderOut(nil)
+            self.shutdownQuitPanel = nil
+            self.quitShutdownInFlight = false
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
     }
 
     /// Repoints the app menu's "Settings…" item from SwiftUI's placeholder
@@ -254,12 +296,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Clean teardown — full unmount of FUSE + NFS (admin prompts).
-        // Routine Stop from the popover stays soft (mounts persist) so
-        // a Stop -> Start cycle is fast and prompt-free; only Quit does
-        // the full teardown.
+        // The full FUSE + NFS teardown is completed asynchronously in
+        // applicationShouldTerminate before AppKit accepts the quit. Never run
+        // that blocking cgo bridge on the main thread during termination.
         HotkeyManager.shared.unregister()
-        NFSBridge.shutdown()
     }
 
     /// Called by Preferences when the user toggles the hotkey on/off.
@@ -272,5 +312,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func unregisterSearchHotkey() {
         HotkeyManager.shared.unregister()
+    }
+}
+
+private struct QuitShutdownView: View {
+    var body: some View {
+        VStack(spacing: 14) {
+            ProgressView()
+                .controlSize(.large)
+            Text("Disconnecting JuiceMount")
+                .font(.headline)
+            Text("Finishing filesystem cleanup. Finder remains available while this completes.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(24)
+        .frame(width: 360)
     }
 }
