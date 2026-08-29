@@ -583,6 +583,28 @@ func stopLinkNode(node *jmnfs.LinkNode) {
 	node.Stop()
 }
 
+// proveLinkRedisReadiness is the first point where a Link test may claim that
+// the saved identity is authorized and online. WaitReady only proves that the
+// local tsnet backend once reached Running and has addresses; those values can
+// remain cached after an operator expires the node. A successful Redis PING
+// through Link proves a current encrypted route to the far side.
+func proveLinkRedisReadiness(result *linkTestResult, probe func() (time.Duration, error)) (time.Duration, error) {
+	if result == nil {
+		return 0, fmt.Errorf("Link test result is nil")
+	}
+	if probe == nil {
+		return 0, fmt.Errorf("Link Redis readiness probe is nil")
+	}
+	rtt, err := probe()
+	if err != nil {
+		return 0, err
+	}
+	result.Authorized = true
+	result.Online = true
+	result.RedisReachable = true
+	return rtt, nil
+}
+
 //export NFSServerLinkTest
 func NFSServerLinkTest(configJSON *C.char) *C.char {
 	result := linkTestResult{Addresses: []string{}}
@@ -647,14 +669,13 @@ func NFSServerLinkTest(configJSON *C.char) *C.char {
 	}
 	result.Addresses = readyAddrs
 
-	result.Authorized = true
-	result.Online = true
-	rtt, err := linkRedisPingRTT(node, cfg.RedisURL, 12*time.Second)
+	rtt, err := proveLinkRedisReadiness(&result, func() (time.Duration, error) {
+		return linkRedisPingRTT(node, cfg.RedisURL, 12*time.Second)
+	})
 	if err != nil {
-		result.Error = "paired, but Redis authentication/readiness failed through the NAS route: " + err.Error()
+		result.Error = "Link identity is saved, but current authorization/online status could not be verified through Redis on the NAS route: " + err.Error()
 		return encode()
 	}
-	result.RedisReachable = true
 	objectRTT, err := node.ProbeHTTP(cfg.BucketOverride, "/minio/health/live", 12*time.Second)
 	if err != nil {
 		result.RTTMS = rtt.Milliseconds()

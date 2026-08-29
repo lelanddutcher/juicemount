@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
 )
@@ -22,6 +24,30 @@ func TestLinkTestResultAlwaysCarriesRequiredFields(t *testing.T) {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("required Link test field %q omitted from %s", key, raw)
 		}
+	}
+}
+
+func TestLinkTestDoesNotClaimAuthorizationOrOnlineBeforeFarSideProof(t *testing.T) {
+	result := linkTestResult{Addresses: []string{"100.64.0.12"}}
+	wantErr := errors.New("revoked route")
+	if _, err := proveLinkRedisReadiness(&result, func() (time.Duration, error) {
+		return 0, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("failed readiness probe error = %v, want %v", err, wantErr)
+	}
+	if result.Authorized || result.Online || result.RedisReachable {
+		t.Fatalf("failed far-side proof published stale-positive state: %+v", result)
+	}
+
+	wantRTT := 37 * time.Millisecond
+	gotRTT, err := proveLinkRedisReadiness(&result, func() (time.Duration, error) {
+		return wantRTT, nil
+	})
+	if err != nil || gotRTT != wantRTT {
+		t.Fatalf("successful readiness proof = (%v, %v), want (%v, nil)", gotRTT, err, wantRTT)
+	}
+	if !result.Authorized || !result.Online || !result.RedisReachable {
+		t.Fatalf("successful far-side proof did not publish ready state: %+v", result)
 	}
 }
 
