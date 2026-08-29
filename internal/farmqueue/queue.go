@@ -187,7 +187,12 @@ type Job struct {
 	SelectedBackend      string   `json:"selected_backend,omitempty"`
 	SelectedWorker       string   `json:"selected_worker,omitempty"`
 	Attempts             int      `json:"attempts,omitempty"`
-	ParentID             string   `json:"parent_id,omitempty"`
+	// HardwareFailures counts completed render executions that failed on a
+	// verified accelerator. Attempts remains delivery/recovery telemetry and may
+	// increase when a claimed worker disappears; availability churn must never
+	// consume the separate hardware retry budget.
+	HardwareFailures int    `json:"hardware_failures,omitempty"`
+	ParentID         string `json:"parent_id,omitempty"`
 	// ProcessedOffset carries successful work across a narrowed retry. The
 	// terminal status adds the retry's results so partial GPU success is not
 	// erased when only failed targets move to another worker or the CPU lane.
@@ -235,24 +240,25 @@ type Job struct {
 // JobStatus is the worker-maintained record a producer reads back. Stored as a
 // flat Redis HASH (all string fields) so HGETALL round-trips without a codec.
 type JobStatus struct {
-	ID             string `json:"id"`
-	Status         string `json:"status"` // queued|running|dispatched|done|failed
-	Path           string `json:"path"`
-	Kinds          string `json:"kinds"` // comma-joined for display
-	Producer       string `json:"producer"`
-	EnqueuedAt     string `json:"enqueued_at"`
-	StartedAt      string `json:"started_at,omitempty"`
-	FinishedAt     string `json:"finished_at,omitempty"`
-	Processed      int    `json:"processed"`
-	Failed         int    `json:"failed"`
-	Error          string `json:"error,omitempty"`
-	Worker         string `json:"worker,omitempty"`
-	TargetWorker   string `json:"target_worker,omitempty"`
-	Backend        string `json:"backend,omitempty"`
-	QueueClass     string `json:"queue_class,omitempty"`
-	Attempts       int    `json:"attempts"`
-	ParentID       string `json:"parent_id,omitempty"`
-	DerivativePass string `json:"derivative_pass,omitempty"`
+	ID               string `json:"id"`
+	Status           string `json:"status"` // queued|running|dispatched|done|failed
+	Path             string `json:"path"`
+	Kinds            string `json:"kinds"` // comma-joined for display
+	Producer         string `json:"producer"`
+	EnqueuedAt       string `json:"enqueued_at"`
+	StartedAt        string `json:"started_at,omitempty"`
+	FinishedAt       string `json:"finished_at,omitempty"`
+	Processed        int    `json:"processed"`
+	Failed           int    `json:"failed"`
+	Error            string `json:"error,omitempty"`
+	Worker           string `json:"worker,omitempty"`
+	TargetWorker     string `json:"target_worker,omitempty"`
+	Backend          string `json:"backend,omitempty"`
+	QueueClass       string `json:"queue_class,omitempty"`
+	Attempts         int    `json:"attempts"`
+	HardwareFailures int    `json:"hardware_failures"`
+	ParentID         string `json:"parent_id,omitempty"`
+	DerivativePass   string `json:"derivative_pass,omitempty"`
 }
 
 // WorkerBenchmarks records observed rather than advertised capability. Startup
@@ -393,7 +399,8 @@ func (c *Client) Enqueue(ctx context.Context, j Job) error {
 	st := JobStatus{
 		ID: j.ID, Status: StatusQueued, Path: j.Path, Kinds: strings.Join(j.Kinds, ","),
 		Producer: j.Producer, EnqueuedAt: j.EnqueuedAt, Backend: j.SelectedBackend,
-		TargetWorker: j.SelectedWorker, QueueClass: j.QueueClass, Attempts: j.Attempts, ParentID: j.ParentID,
+		TargetWorker: j.SelectedWorker, QueueClass: j.QueueClass, Attempts: j.Attempts,
+		HardwareFailures: j.HardwareFailures, ParentID: j.ParentID,
 	}
 	pipe := c.rdb.TxPipeline()
 	pipe.LPush(ctx, QueueKeyFor(&j), raw)
@@ -639,7 +646,8 @@ func (s JobStatus) toMap() map[string]any {
 		"id": s.ID, "status": s.Status, "path": s.Path, "kinds": s.Kinds,
 		"producer": s.Producer, "enqueued_at": s.EnqueuedAt,
 		"processed": strconv.Itoa(s.Processed), "failed": strconv.Itoa(s.Failed),
-		"attempts": strconv.Itoa(s.Attempts),
+		"attempts":          strconv.Itoa(s.Attempts),
+		"hardware_failures": strconv.Itoa(s.HardwareFailures),
 	}
 	if s.DerivativePass != "" {
 		m["derivative_pass"] = s.DerivativePass
@@ -678,6 +686,6 @@ func jobStatusFromMap(m map[string]string) JobStatus {
 		Producer: m["producer"], EnqueuedAt: m["enqueued_at"],
 		StartedAt: m["started_at"], FinishedAt: m["finished_at"],
 		Processed: atoi(m["processed"]), Failed: atoi(m["failed"]), Error: m["error"],
-		Worker: m["worker"], TargetWorker: m["target_worker"], Backend: m["backend"], QueueClass: m["queue_class"], Attempts: atoi(m["attempts"]), ParentID: m["parent_id"], DerivativePass: m["derivative_pass"],
+		Worker: m["worker"], TargetWorker: m["target_worker"], Backend: m["backend"], QueueClass: m["queue_class"], Attempts: atoi(m["attempts"]), HardwareFailures: atoi(m["hardware_failures"]), ParentID: m["parent_id"], DerivativePass: m["derivative_pass"],
 	}
 }

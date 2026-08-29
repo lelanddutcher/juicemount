@@ -13,7 +13,8 @@ func TestNewTargetShardsBoundsAndUnpinsRenderWorker(t *testing.T) {
 	parent := Job{
 		ID: "directory-proxy", Path: "/jfs/incoming", Kinds: []string{KindProxy}, Producer: "manager",
 		VCodec: "hevc_qsv", QueueClass: QueueClassRender, SelectedBackend: "hevc_qsv", SelectedWorker: "gpu-a",
-		RequiredCapabilities: []string{"encoder:hevc_qsv", "worker:gpu-a"}, Attempts: 2, ProcessedOffset: 99,
+		RequiredCapabilities: []string{"encoder:hevc_qsv", "worker:gpu-a"}, Attempts: 2,
+		HardwareFailures: 1, ProcessedOffset: 99,
 	}
 	targets := []string{"a.mov", "b.mov", "c.mov", "d.mov", "e.mov"}
 	children, err := newTargetShards(parent, targets, 2)
@@ -33,7 +34,8 @@ func TestNewTargetShardsBoundsAndUnpinsRenderWorker(t *testing.T) {
 		if child.QueueClass != QueueClassRender || child.SelectedBackend != "hevc_qsv" || child.VCodec != "hevc_qsv" {
 			t.Fatalf("child %d lost verified render route: %+v", i, child)
 		}
-		if child.Attempts != parent.Attempts || child.ProcessedOffset != 0 || len(child.RetryTargets) > 2 {
+		if child.Attempts != parent.Attempts || child.HardwareFailures != parent.HardwareFailures ||
+			child.ProcessedOffset != 0 || len(child.RetryTargets) > 2 {
 			t.Fatalf("child %d retry state/size = %+v", i, child)
 		}
 	}

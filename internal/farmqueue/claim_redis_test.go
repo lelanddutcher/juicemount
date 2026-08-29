@@ -198,11 +198,26 @@ func TestRedisClaimRecoveryPrefersAnotherRenderWorker(t *testing.T) {
 	if recovered.Job.SelectedBackend != "hevc_vaapi" || recovered.Job.QueueClass != QueueClassRender {
 		t.Fatalf("recovered route = backend %q class %q", recovered.Job.SelectedBackend, recovered.Job.QueueClass)
 	}
-	if recovered.Job.SelectedWorker != renderB.Name || recovered.Job.Attempts != 1 {
-		t.Fatalf("recovered target = %q attempts=%d, want %q/1",
-			recovered.Job.SelectedWorker, recovered.Job.Attempts, renderB.Name)
+	if recovered.Job.SelectedWorker != renderB.Name || recovered.Job.Attempts != 1 || recovered.Job.HardwareFailures != 0 {
+		t.Fatalf("recovered target = %q attempts=%d hardware_failures=%d, want %q/1/0",
+			recovered.Job.SelectedWorker, recovered.Job.Attempts, recovered.Job.HardwareFailures, renderB.Name)
 	}
-	if err := q.AckClaim(ctx, recovered); err != nil {
+	if err := q.RequeueClaimAfterHardwareFailure(ctx, recovered, false, "verified hardware execution failed"); err != nil {
+		t.Fatal(err)
+	}
+	retry, ok, err := q.ClaimForWorker(ctx, time.Second, renderB)
+	if err != nil || !ok {
+		t.Fatalf("hardware retry claim: ok=%v err=%v", ok, err)
+	}
+	if retry.Job.Attempts != 2 || retry.Job.HardwareFailures != 1 {
+		t.Fatalf("hardware retry counters = attempts %d failures %d, want 2/1",
+			retry.Job.Attempts, retry.Job.HardwareFailures)
+	}
+	status, err := q.rdb.HGetAll(ctx, JobHashPrefix+job.ID).Result()
+	if err != nil || status["attempts"] != "2" || status["hardware_failures"] != "1" {
+		t.Fatalf("hardware retry status = %+v, %v", status, err)
+	}
+	if err := q.AckClaim(ctx, retry); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -569,6 +584,9 @@ func TestRedisClaimEnforcesMeasuredDecodeGeometry(t *testing.T) {
 	if cpuClaim.Job.QueueClass != QueueClassCPU || cpuClaim.Job.SelectedBackend != "libx264" ||
 		cpuClaim.Job.CPUFallbackLocked {
 		t.Fatalf("geometry fallback route=%+v", cpuClaim.Job)
+	}
+	if cpuClaim.Job.Attempts != 0 || cpuClaim.Job.HardwareFailures != 0 {
+		t.Fatalf("ready-lane availability reroute consumed retry budget: %+v", cpuClaim.Job)
 	}
 	if !temporaryAvailabilityFallback(cpuClaim.Job, "") {
 		t.Fatalf("geometry outage lost temporary provenance: %+v", cpuClaim.Job)

@@ -1432,6 +1432,12 @@
 			retry.textContent = 'attempt ' + (Number(j.attempts) + 1);
 			meta.appendChild(retry);
 		}
+		if (Number(j.hardware_failures || 0) > 0) {
+			const failures = document.createElement('span');
+			failures.className = 'farm-job-count failed';
+			failures.textContent = 'GPU failures ' + Number(j.hardware_failures);
+			meta.appendChild(failures);
+		}
 
       if (meta.childNodes.length) li.appendChild(meta);
 

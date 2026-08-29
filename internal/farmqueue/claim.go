@@ -217,9 +217,9 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 					continue
 				}
 			}
-			job.Attempts++
 			// Losing the selected worker before claim is an availability event,
-			// never proof that the source cannot use hardware. Clear any stale
+			// not an execution attempt and never proof that the source cannot use
+			// hardware. Preserve both retry counters. Clear any stale
 			// terminal bit carried by a previously promoted legacy child so the
 			// queued CPU fallback can be promoted again when hardware returns.
 			job.CPUFallbackLocked = false
@@ -239,14 +239,16 @@ func (c *Client) RecoverUnserviceableReady(ctx context.Context) (int, error) {
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[2])
   redis.call('HSET', KEYS[3], 'status', 'queued', 'backend', ARGV[3],
-    'target_worker', ARGV[4], 'queue_class', ARGV[5], 'attempts', ARGV[6], 'error', ARGV[7])
+	'target_worker', ARGV[4], 'queue_class', ARGV[5], 'attempts', ARGV[6],
+	'hardware_failures', ARGV[7], 'error', ARGV[8])
 	redis.call('HDEL', KEYS[3], 'unserviceable_since')
   return 1
 end
 return 0`
 			n, err := c.rdb.Eval(ctx, script, []string{
 				key, classQueue(kind, targetClass), JobHashPrefix + job.ID,
-			}, raw, string(nextRaw), job.SelectedBackend, job.SelectedWorker, targetClass, strconv.Itoa(job.Attempts), reason).Int()
+			}, raw, string(nextRaw), job.SelectedBackend, job.SelectedWorker, targetClass,
+				strconv.Itoa(job.Attempts), strconv.Itoa(job.HardwareFailures), reason).Int()
 			if err != nil {
 				return recovered, err
 			}
@@ -447,8 +449,9 @@ func (c *Client) MarkClaimRunning(ctx context.Context, claim Claim, worker Worke
 	pipe.HSet(ctx, JobHashPrefix+claim.Job.ID, map[string]any{
 		"status": StatusRunning, "started_at": nowISO(), "worker": worker.Name,
 		"backend": claim.Job.SelectedBackend, "queue_class": claim.Job.QueueClass,
-		"attempts":    strconv.Itoa(claim.Job.Attempts),
-		"lease_owner": worker.ID, "lease_expires_at": expires.UTC().Format(time.RFC3339),
+		"attempts":          strconv.Itoa(claim.Job.Attempts),
+		"hardware_failures": strconv.Itoa(claim.Job.HardwareFailures),
+		"lease_owner":       worker.ID, "lease_expires_at": expires.UTC().Format(time.RFC3339),
 	})
 	pipe.ZAdd(ctx, LeaseIndexKey, redis.Z{Score: float64(expires.Unix()), Member: claim.Job.ID})
 	_, err := pipe.Exec(ctx)
@@ -479,9 +482,11 @@ return 1`
 	}, claim.Raw, claim.Job.ID, claim.WorkerID).Err()
 }
 
-// RequeueClaim atomically acknowledges a failed claim and publishes its next
-// attempt. fallbackCPU is used after a render-node failure; the retry is routed
-// to server H.264/CPU instead of silently changing backend inside ffmpeg.
+// RequeueClaim atomically acknowledges a claim and publishes its next delivery.
+// fallbackCPU is used after a render-node failure; the retry is routed to server
+// H.264/CPU instead of silently changing backend inside ffmpeg. Callers must use
+// RequeueClaimAfterHardwareFailure when a completed accelerator execution, rather
+// than worker availability, caused the requeue.
 func (c *Client) RequeueClaim(ctx context.Context, claim Claim, fallbackCPU bool, reason string) error {
 	job := claim.Job
 	job.Attempts++
@@ -520,6 +525,15 @@ func (c *Client) RequeueClaim(ctx context.Context, claim Claim, fallbackCPU bool
 	return c.requeueClaimAs(ctx, claim, job, reason)
 }
 
+// RequeueClaimAfterHardwareFailure records exactly one completed accelerator
+// execution failure before releasing the durable claim. Keeping this counter
+// separate from delivery Attempts prevents restarts and ready-lane rerouting
+// from exhausting the hardware retry policy without any codec execution.
+func (c *Client) RequeueClaimAfterHardwareFailure(ctx context.Context, claim Claim, fallbackCPU bool, reason string) error {
+	claim.Job.HardwareFailures++
+	return c.RequeueClaim(ctx, claim, fallbackCPU, reason)
+}
+
 // RequeueClaimSameRoute releases a durable claim without consuming a hardware
 // retry or changing its proven backend. It is reserved for queue-orchestration
 // failures (for example, a transient Redis error while publishing target
@@ -543,17 +557,18 @@ redis.call('LPUSH', KEYS[2], ARGV[2])
 redis.call('ZREM', KEYS[3], ARGV[3])
 redis.call('HSET', KEYS[4],
   'status', 'queued', 'worker', '', 'backend', ARGV[4],
-  'target_worker', ARGV[5], 'queue_class', ARGV[6], 'attempts', ARGV[7], 'error', ARGV[8],
-  'processed', ARGV[10], 'failed', '0')
+  'target_worker', ARGV[5], 'queue_class', ARGV[6], 'attempts', ARGV[7],
+  'hardware_failures', ARGV[8], 'error', ARGV[9], 'processed', ARGV[11], 'failed', '0')
 redis.call('HDEL', KEYS[4], 'lease_owner', 'lease_expires_at', 'finished_at')
 if redis.call('LLEN', KEYS[1]) == 0 then
-  redis.call('SREM', KEYS[5], ARGV[9])
+  redis.call('SREM', KEYS[5], ARGV[10])
 end
 return 1`
 	n, err := c.rdb.Eval(ctx, script, []string{
 		processingKey, target, LeaseIndexKey, JobHashPrefix + job.ID, ProcessingIndexKey,
 	}, claim.Raw, string(raw), job.ID, job.SelectedBackend, job.SelectedWorker, job.QueueClass,
-		strconv.Itoa(job.Attempts), reason, claim.WorkerID, strconv.Itoa(job.ProcessedOffset)).Int()
+		strconv.Itoa(job.Attempts), strconv.Itoa(job.HardwareFailures), reason,
+		claim.WorkerID, strconv.Itoa(job.ProcessedOffset)).Int()
 	if err != nil {
 		return err
 	}

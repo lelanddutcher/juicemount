@@ -94,6 +94,7 @@ func newCPUFallbackSubset(parent Job, targets []string) (Job, error) {
 	child.SelectedWorker = ""
 	child.CPUFallbackLocked = true
 	child.Attempts = 0
+	child.HardwareFailures = 0
 	child.ProcessedOffset = 0
 	child.RetryTargets = append([]string(nil), targets...)
 	return child, nil

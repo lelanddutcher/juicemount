@@ -22,14 +22,14 @@ Usage:
       --preview-dir "/Volumes/zpool/.../Good Videos" --preview-slice 90 \
       [--bytes-heavy] [--skip-preview] [--thru-file PATH]
 
+Connection inputs are explicit: set JM_TEST_NAS_HOST and, unless visibility is
+skipped, JM_TEST_NAS_SSH_TARGET plus JM_TEST_SSH_KEY (or pass their CLI flags).
+
 State: coldpool usage is the caller's job (pass fresh --preview-slice offsets).
 """
 import argparse, json, os, subprocess, sys, time, urllib.request
 
 CP = "http://127.0.0.1:11050"
-NAS = "192.168.0.197"
-SSH = ["ssh", "-i", os.path.expanduser("~/.ssh/codex_truenas_tmp"),
-       "-o", "ConnectTimeout=10", f"root@{NAS}"]
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCOREBOARD = os.path.join(HERE, "scoreboard.jsonl")
 
@@ -50,15 +50,15 @@ def metrics():
         return {}
 
 
-def env_capture():
+def env_capture(nas_host):
     out = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
-    r = bounded(["route", "get", NAS], 6)
+    r = bounded(["route", "get", nas_host], 6)
     out["route_if"] = ""
     if r and r.returncode == 0:
         for ln in r.stdout.splitlines():
             if "interface:" in ln:
                 out["route_if"] = ln.split(":")[1].strip()
-    p = bounded(["ping", "-c", "3", "-t", "5", NAS], 20)
+    p = bounded(["ping", "-c", "3", "-t", "5", nas_host], 20)
     out["rtt_ms"] = None
     if p and "min/avg/max" in p.stdout:
         try:
@@ -88,7 +88,7 @@ def warm_and_cold_list(warm_dir):
     return res
 
 
-def server_content_visibility(n_files=20):
+def server_content_visibility(ssh, n_files=20):
     """B4': create a fresh dir + N files SERVER-SIDE, then poll the NFS mount
     until all N list. Measures push→mirror→serve latency end-to-end — the
     'new server content appears on the client' UX."""
@@ -100,7 +100,7 @@ def server_content_visibility(n_files=20):
         f"chown -R 501:20 /jfs/{rel.split('/')[0]}'"
     ])
     t0 = time.time()
-    r = bounded(SSH + [mk], 40)
+    r = bounded(ssh + [mk], 40)
     if not r or r.returncode != 0:
         return {"b4_visibility_err": (r.stderr[:120] if r else "ssh timeout")}
     created = time.time()
@@ -177,17 +177,29 @@ def main():
     ap.add_argument("--skip-visibility", action="store_true")
     ap.add_argument("--bytes-heavy", action="store_true")
     ap.add_argument("--thru-file")
+    ap.add_argument("--nas-host", default=os.environ.get("JM_TEST_NAS_HOST"))
+    ap.add_argument("--ssh-target", default=os.environ.get("JM_TEST_NAS_SSH_TARGET"))
+    ap.add_argument("--ssh-key", default=os.environ.get("JM_TEST_SSH_KEY"))
     a = ap.parse_args()
+    if not a.nas_host:
+        ap.error("--nas-host or JM_TEST_NAS_HOST is required")
+    ssh = None
+    if not a.skip_visibility:
+        if not a.ssh_target or not a.ssh_key:
+            ap.error("visibility testing requires --ssh-target/--ssh-key or "
+                     "JM_TEST_NAS_SSH_TARGET/JM_TEST_SSH_KEY")
+        ssh = ["ssh", "-i", os.path.expanduser(a.ssh_key),
+               "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", a.ssh_target]
 
     row = {"label": a.label}
-    row.update(env_capture())
+    row.update(env_capture(a.nas_host))
     print(f"[env] route={row['route_if']} rtt={row['rtt_ms']}ms health={row['health']}", flush=True)
 
     row.update(warm_and_cold_list(a.warm_dir))
     print(f"[B1/B2] warm={row.get('b1_warm_list_ms')}ms cold-list={row.get('b2_cold_list_ms')}ms", flush=True)
 
     if not a.skip_visibility:
-        row.update(server_content_visibility())
+        row.update(server_content_visibility(ssh))
         print(f"[B4'] server-content visibility={row.get('b4_visibility_s')}s", flush=True)
 
     if a.preview_dir and not a.skip_preview:

@@ -109,10 +109,11 @@ func newTargetShards(parent Job, targets []string, maxTargets int) ([]Job, error
 		child.ID = fmt.Sprintf("%s-shard-%04d", parent.ID, i+1)
 		child.ParentID = parent.ID
 		child.EnqueuedAt = enqueuedAt
-		// Preserve the parent's hardware-attempt budget. A recovered directory
-		// claim must not manufacture fresh render retries merely by becoming
-		// bounded children; an initial parent naturally carries zero attempts.
+		// Preserve both delivery history and the parent's hardware-failure budget.
+		// A recovered directory claim must not manufacture fresh render retries
+		// merely by becoming bounded children; an initial parent carries zero.
 		child.Attempts = parent.Attempts
+		child.HardwareFailures = parent.HardwareFailures
 		child.ProcessedOffset = 0
 		child.ShardIndex = i + 1
 		child.ShardCount = count
@@ -157,7 +158,8 @@ func (c *Client) enqueueTargetShardsAtomic(ctx context.Context, children []Job) 
 			ID: child.ID, Status: StatusQueued, Path: child.Path, Kinds: strings.Join(child.Kinds, ","),
 			Producer: child.Producer, EnqueuedAt: child.EnqueuedAt, Backend: child.SelectedBackend,
 			TargetWorker: child.SelectedWorker, QueueClass: child.QueueClass, Attempts: child.Attempts,
-			ParentID: child.ParentID, DerivativePass: child.DerivativePass, Error: child.RoutingReason,
+			HardwareFailures: child.HardwareFailures,
+			ParentID:         child.ParentID, DerivativePass: child.DerivativePass, Error: child.RoutingReason,
 		}
 	}
 	for attempt := 0; attempt < splitTransactionRetries; attempt++ {

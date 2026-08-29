@@ -1169,7 +1169,7 @@ func runQueue(cfg queueConfig) {
 				claim.Job.RetryTargets = failedTargets
 			}
 			claim.Job.ProcessedOffset += processed
-			if err := q.RequeueClaim(context.Background(), claim, fallbackCPU, reason); err != nil {
+			if err := q.RequeueClaimAfterHardwareFailure(context.Background(), claim, fallbackCPU, reason); err != nil {
 				// The durable receipt is still intact. Stop this worker so its
 				// heartbeat expires and another worker's reaper can recover it;
 				// continuing while we still own the claim would strand the job.
@@ -1560,7 +1560,7 @@ func renderFailureDisposition(worker farmqueue.Worker, job farmqueue.Job, runErr
 	if !errors.Is(runErr, errRenderExecution) {
 		return false, false, ""
 	}
-	if job.Attempts < renderHardwareRetries {
+	if job.HardwareFailures < renderHardwareRetries {
 		return true, false, fmt.Sprintf("render backend failed; retrying on a verified hardware worker: %v", runErr)
 	}
 	return true, true, fmt.Sprintf("render backend failed after %d hardware retries; queued explicit CPU/H.264 fallback: %v",

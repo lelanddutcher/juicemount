@@ -113,6 +113,7 @@ func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 		"Admin key verified",
 		"Authentication disabled",
 		"CPU H.264 fallback",
+		"GPU failures ",
 		"split from ",
 		"partial: 'Partial'",
 		"Recovery note: ",

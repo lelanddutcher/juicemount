@@ -23,7 +23,9 @@ func TestPassFailureRejectsPartialSuccess(t *testing.T) {
 
 func TestRenderFailureRetriesHardwareBeforeCPUFallback(t *testing.T) {
 	worker := farmqueue.Worker{Role: farmqueue.QueueClassRender}
-	job := farmqueue.Job{Kinds: []string{farmqueue.KindProxy}, Attempts: 0}
+	// Legacy RC jobs may have inflated delivery attempts from ready-lane
+	// rerouting. Those availability events must not spend the execution retry.
+	job := farmqueue.Job{Kinds: []string{farmqueue.KindProxy}, Attempts: 99, HardwareFailures: 0}
 	runErr := fmt.Errorf("%w: vaapi admission failed", errRenderExecution)
 
 	requeue, cpu, reason := renderFailureDisposition(worker, job, runErr)
@@ -31,7 +33,7 @@ func TestRenderFailureRetriesHardwareBeforeCPUFallback(t *testing.T) {
 		t.Fatalf("first failure = requeue %v cpu %v reason %q", requeue, cpu, reason)
 	}
 
-	job.Attempts = renderHardwareRetries
+	job.HardwareFailures = renderHardwareRetries
 	requeue, cpu, reason = renderFailureDisposition(worker, job, runErr)
 	if !requeue || !cpu || !strings.Contains(reason, "explicit CPU/H.264 fallback") {
 		t.Fatalf("repeated failure = requeue %v cpu %v reason %q", requeue, cpu, reason)
