@@ -87,5 +87,4 @@ ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/juicemount-manager \
     --vol-name=\"$JM_VOL_NAME\" \
     --meta=\"${JM_META:-}\" \
     --overview-meta=\"${JM_OVERVIEW_META:-}\" \
-    --admin-key=\"${JM_ADMIN_KEY:-}\" \
     \"$@\"", "--"]

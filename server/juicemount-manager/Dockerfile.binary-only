@@ -24,3 +24,16 @@ LABEL org.opencontainers.image.version="${JM_VERSION}" \
       org.opencontainers.image.revision="${JM_COMMIT}"
 COPY --from=gobuild /out/juicemount-manager /usr/local/bin/juicemount-manager
 RUN test "$(/usr/local/bin/juicemount-manager --build-info)" = "juicemount-manager ${JM_VERSION} (${JM_COMMIT})"
+
+# Override the base image entrypoint so an older proven runtime can be used
+# without inheriting an entrypoint that expands JM_ADMIN_KEY into argv. The Go
+# binary reads JM_ADMIN_KEY directly from the environment when --admin-key is
+# omitted.
+ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/juicemount-manager \
+    --listen=\"$JM_LISTEN\" \
+    --dest-mount=\"$JM_DEST_MOUNT\" \
+    --source-roots=\"$JM_SOURCE_ROOTS\" \
+    --vol-name=\"$JM_VOL_NAME\" \
+    --meta=\"${JM_META:-}\" \
+    --overview-meta=\"${JM_OVERVIEW_META:-}\" \
+    \"$@\"", "--"]
