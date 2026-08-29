@@ -73,7 +73,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS -H "X-JuiceMount-Admin-Key: $JM_ADMIN_KEY" http://localhost:8080/api/sources >/dev/null \
       && { [ "$JM_NET_HEADSCALE" != "on" ] \
         || curl -fsS -H "X-JuiceMount-Admin-Key: $JM_ADMIN_KEY" http://localhost:8080/api/net/link \
-          | grep -q '"data_plane_ready":true'; } \
+          | grep -Eq '"data_plane_ready"[[:space:]]*:[[:space:]]*true'; } \
       || exit 1
 
 # Default invocation: standalone mode. JM_META is REQUIRED at runtime
