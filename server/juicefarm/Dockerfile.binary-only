@@ -7,14 +7,16 @@
 # static CGO in particular, because the juicedata/mount runtime ships an older
 # glibc than the bookworm builder and a dynamically-linked binary will not run.
 ARG BASE_IMAGE=juicefarm:stream-exclusion
-ARG JM_VERSION=0.5.0
-ARG JM_COMMIT=unknown
+ARG JM_VERSION
+ARG JM_COMMIT
 FROM golang:1.26.6-bookworm AS gobuild
 ARG JM_VERSION
 ARG JM_COMMIT
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
+RUN test -n "$JM_VERSION" \
+    && echo "$JM_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .

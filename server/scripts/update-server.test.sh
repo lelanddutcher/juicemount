@@ -27,8 +27,16 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 REPO="$WORK/repo"
-mkdir -p "$REPO/server/juicefarm" "$REPO/server/juicemount-manager"
+mkdir -p "$REPO/internal/version" "$REPO/server/juicefarm" "$REPO/server/juicemount-manager"
 touch "$REPO/go.mod" "$REPO/server/juicefarm/Dockerfile" "$REPO/server/juicemount-manager/Dockerfile"
+printf 'package version\n\nvar Version = "0.5.0"\n' > "$REPO/internal/version/version.go"
+git -C "$REPO" init -q
+git -C "$REPO" config user.name test
+git -C "$REPO" config user.email test@example.invalid
+git -C "$REPO" add .
+git -C "$REPO" commit -qm fixture
+FAKE_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
+FAKE_SHORT="${FAKE_COMMIT:0:7}"
 
 SHIMS="$WORK/shims"
 mkdir -p "$SHIMS"
@@ -62,8 +70,8 @@ fi
 plan_pos() { printf '%s\n' "$OUT" | grep -n -- "$1" | head -1 | cut -d: -f1; }
 P_RSYNC="$(plan_pos "rsync")"
 P_SLASH="$(printf '%s\n' "$OUT" | grep -n -- "$REPO/" | head -1 | cut -d: -f1)"
-P_BUILD_FARM="$(plan_pos "juicefarm:local")"
-P_BUILD_MGR="$(plan_pos "juicemount-manager:local")"
+P_BUILD_FARM="$(plan_pos "juicefarm:rc-0.5-$FAKE_SHORT")"
+P_BUILD_MGR="$(plan_pos "juicemount-manager:rc-0.5-$FAKE_SHORT")"
 P_STOP="$(plan_pos "docker stop")"
 P_RUN="$(plan_pos "docker run")"
 P_VERIFY="$(plan_pos "/api/farm")"
@@ -133,12 +141,20 @@ fi
 
 # Remote script content assertions.
 rs() { grep -Fq -- "$1" "$SSH_STDIN"; }
-rs 'DOCKER_BUILDKIT=1 docker build -f server/juicefarm/Dockerfile -t "$FARM_IMAGE" .' \
+rs '--build-arg "JM_VERSION=$SOURCE_VERSION"' \
+  && rs '--build-arg "JM_COMMIT=$SOURCE_COMMIT"' \
+  && rs '-f server/juicefarm/Dockerfile -t "$FARM_IMAGE" .' \
   && pass "remote builds the farm image from server/juicefarm/Dockerfile" \
   || fail "remote farm build missing"
-rs 'docker build -f server/juicemount-manager/Dockerfile -t "$MANAGER_IMAGE" .' \
+rs '-f server/juicemount-manager/Dockerfile -t "$MANAGER_IMAGE" .' \
   && pass "remote builds the manager image" \
   || fail "remote manager build missing"
+rs 'SOURCE_VERSION=0.5.0' && rs "SOURCE_COMMIT=$FAKE_COMMIT" \
+  && pass "remote build is stamped with the exact clean source identity" \
+  || fail "remote exact source identity missing"
+rs 'docker run --rm --entrypoint "/usr/local/bin/$binary" "$image" --build-info' \
+  && pass "remote executes both built images to verify embedded identity" \
+  || fail "remote image identity verification missing"
 rs 'FARM_CONTAINER=juicefarm-worker' && rs 'MANAGER_CONTAINER=juicemount-manager' \
   && pass "remote targets exactly juicefarm-worker + juicemount-manager" \
   || fail "remote container targets wrong"
@@ -151,6 +167,10 @@ rs 'docker inspect' \
 rs '/api/farm' \
   && pass "remote verifies manager /api/farm" \
   || fail "remote manager verification missing"
+rs 'docker exec "$FARM_CONTAINER" /usr/local/bin/jmfarm --build-info' \
+  && rs 'docker exec "$MANAGER_CONTAINER" /usr/local/bin/juicemount-manager --build-info' \
+  && pass "remote verifies running container identities after recreation" \
+  || fail "running-container identity verification missing"
 rs 'HARD GUARD' \
   && pass "remote carries the infra hard guard" \
   || fail "remote infra guard missing"

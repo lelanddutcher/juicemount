@@ -12,15 +12,31 @@
 #
 # Output: build/JuiceMount.app
 #
-# Usage: ./scripts/build-app.sh [--release|--debug]
+# Usage: ./scripts/build-app.sh [--release|--debug|--distribution]
+#
+# --release selects Swift's optimized build configuration for local testing.
+# --distribution is the fail-closed shipping path: it requires explicit exact
+# source identity, Developer ID signing, notarization, stapling, Sparkle
+# appcast signing, and final artifact verification.
 
-set -e
+set -eo pipefail
 
-CONFIG="${1:---release}"
+CONFIG="--release"
 SWIFT_CONFIG="release"
-if [ "$CONFIG" = "--debug" ]; then
-    SWIFT_CONFIG="debug"
-fi
+DISTRIBUTION=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --release) CONFIG="--release"; SWIFT_CONFIG="release" ;;
+        --debug) CONFIG="--debug"; SWIFT_CONFIG="debug" ;;
+        --distribution) CONFIG="--distribution"; SWIFT_CONFIG="release"; DISTRIBUTION=1 ;;
+        -h|--help)
+            sed -n '1,24p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) echo "ERROR: unknown build mode: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -33,6 +49,27 @@ SWIFT_PKG="$PROJECT_ROOT/app/JuiceMount"
 PLISTBUDDY="/usr/libexec/PlistBuddy"
 JM_BUILD_VERSION="${JM_VERSION:-0.5.0}"
 GO_BUILD_VCS_ARGS=()
+if [ "$DISTRIBUTION" = 1 ]; then
+    if [ -z "${JM_VERSION:-}" ] || [ -z "${JM_COMMIT:-}" ]; then
+        echo "ERROR: --distribution requires explicit JM_VERSION and JM_COMMIT" >&2
+        exit 1
+    fi
+    if [[ ! "$JM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+        echo "ERROR: JM_VERSION is not a release version: $JM_VERSION" >&2
+        exit 1
+    fi
+    if [[ ! "$JM_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "ERROR: JM_COMMIT must be the full lowercase 40-character git SHA" >&2
+        exit 1
+    fi
+    if [ -n "${JM_ADHOC:-}" ] || [ -n "${JM_QUICK:-}" ]; then
+        echo "ERROR: --distribution forbids JM_ADHOC and JM_QUICK" >&2
+        exit 1
+    fi
+    # Appcast generation is mandatory for a distributable build, not an
+    # optional post-build suggestion.
+    JM_APPCAST=1
+fi
 if [ -n "${JM_COMMIT:-}" ]; then
     JM_BUILD_COMMIT="$JM_COMMIT"
     if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
@@ -66,6 +103,7 @@ echo "    config:    $SWIFT_CONFIG"
 echo "    project:   $PROJECT_ROOT"
 echo "    version:   $JM_BUILD_VERSION"
 echo "    commit:    $JM_BUILD_COMMIT"
+echo "    shipping:  $([ "$DISTRIBUTION" = 1 ] && echo yes || echo no)"
 echo ""
 
 # 1. Build the Go c-archive
@@ -290,6 +328,11 @@ if [ -n "${SPARKLE_FW_SRC:-}" ] && [ -d "$SPARKLE_FW_SRC" ]; then
     SPARKLE_EMBEDDED=1
     echo "    Embedded: Sparkle.framework -> Contents/Frameworks/ (from $SPARKLE_FW_SRC)"
 else
+    if [ "$DISTRIBUTION" = 1 ]; then
+        echo "ERROR: Sparkle.framework not found under .build/artifacts; refusing distribution build." >&2
+        echo "       Run 'swift package resolve' in $SWIFT_PKG and rebuild." >&2
+        exit 1
+    fi
     echo "    ${YELLOW}WARNING: Sparkle.framework not found under .build/artifacts — auto-updater will crash at launch.${RESET}"
     echo "    ${YELLOW}         Run 'swift package resolve' in $SWIFT_PKG and rebuild.${RESET}"
 fi
@@ -371,11 +414,19 @@ elif command -v security >/dev/null 2>&1; then
         fi
         echo "    Signing with Developer ID: $SIGN_IDENTITY_LABEL"
     else
+        if [ "$DISTRIBUTION" = 1 ]; then
+            echo "ERROR: no Developer ID Application certificate found; refusing distribution build." >&2
+            exit 1
+        fi
         SIGN_IDENTITY="-"
         SIGN_IDENTITY_LABEL="ad-hoc"
         echo "    ${YELLOW}WARNING: no Developer ID Application cert found; signing ad-hoc (not distributable)${RESET}"
     fi
 else
+    if [ "$DISTRIBUTION" = 1 ]; then
+        echo "ERROR: 'security' command not found; refusing distribution build." >&2
+        exit 1
+    fi
     SIGN_IDENTITY="-"
     SIGN_IDENTITY_LABEL="ad-hoc"
     echo "    ${YELLOW}WARNING: 'security' command not found; signing ad-hoc (not distributable)${RESET}"
@@ -448,7 +499,7 @@ if [ -n "$ENT_FILE" ]; then
 fi
 
 codesign "${CS_ARGS[@]}" "$APP_DIR"
-codesign --verify --deep --strict --verbose=2 "$APP_DIR" 2>&1 | head -5 || true
+codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 
 # Notarization, gated. Skipped on:
 #   - JM_QUICK=1  (dev iteration; notarization is slow, 1-5 minutes)
@@ -474,13 +525,25 @@ else
                 STAPLED="yes"
             else
                 STAPLED="no"
+                if [ "$DISTRIBUTION" = 1 ]; then
+                    echo "ERROR: stapling failed; refusing distribution build." >&2
+                    exit 1
+                fi
                 echo "    ${YELLOW}WARNING: stapling failed; the notarization ticket exists at Apple but is not embedded in the app.${RESET}"
             fi
         else
+            if [ "$DISTRIBUTION" = 1 ]; then
+                echo "ERROR: notarization failed; refusing distribution build." >&2
+                exit 1
+            fi
             echo "    ${YELLOW}WARNING: notarization failed (see output above). App will work locally but Gatekeeper will warn on other Macs.${RESET}"
         fi
         rm -f "$NOTARY_ZIP"
     else
+        if [ "$DISTRIBUTION" = 1 ]; then
+            echo "ERROR: no usable notary profile '$NOTARY_PROFILE'; refusing distribution build." >&2
+            exit 1
+        fi
         echo "    INFO: no notary profile '$NOTARY_PROFILE' found in keychain — skipping notarization."
         echo "          To set up: xcrun notarytool store-credentials JuiceMount \\"
         echo "                       --apple-id <email> --team-id <team> --password <app-specific-password>"
@@ -501,8 +564,16 @@ fi
 if [ -n "${JM_APPCAST:-}" ]; then
     GEN_APPCAST="$(find "$SWIFT_PKG/.build/artifacts" -type f -name 'generate_appcast' 2>/dev/null | head -1)"
     if [ "$NOTARIZED" != "yes" ]; then
+        if [ "$DISTRIBUTION" = 1 ]; then
+            echo "ERROR: distribution appcast requires a notarized build." >&2
+            exit 1
+        fi
         echo "    ${YELLOW}WARNING: JM_APPCAST=1 but build was not notarized — refusing to publish an un-notarized update.${RESET}"
     elif [ -z "$GEN_APPCAST" ]; then
+        if [ "$DISTRIBUTION" = 1 ]; then
+            echo "ERROR: generate_appcast is unavailable; refusing distribution build." >&2
+            exit 1
+        fi
         echo "    ${YELLOW}WARNING: generate_appcast not found under .build/artifacts — run 'swift package resolve'.${RESET}"
     else
         echo ""
@@ -516,13 +587,17 @@ if [ -n "${JM_APPCAST:-}" ]; then
         # --download-url-prefix makes the appcast's enclosure URL point at the
         # GitHub release asset path so clients fetch the zip from the right place.
         if "$GEN_APPCAST" \
-              --download-url-prefix "https://github.com/lelanddutcher/juicemount/releases/latest/download/" \
+              --download-url-prefix "https://github.com/lelanddutcher/juicemount/releases/download/v${JM_BUILD_VERSION}/" \
               -o "$REL_DIR/appcast.xml" \
               "$REL_DIR"; then
             echo "    Appcast: $REL_DIR/appcast.xml"
             echo "    Archive: $REL_DIR/JuiceMount.zip"
             echo "    Upload BOTH to the GitHub Release tagged for this version."
         else
+            if [ "$DISTRIBUTION" = 1 ]; then
+                echo "ERROR: generate_appcast failed; refusing distribution build." >&2
+                exit 1
+            fi
             echo "    ${YELLOW}WARNING: generate_appcast failed — see output above.${RESET}"
         fi
     fi
@@ -583,6 +658,34 @@ if [ -n "$PLUGINS_GUARD_FAIL" ]; then
     echo "  sanctioned; anything new needs an explicit guard change plus a"
     echo "  registration-lifecycle plan."
     exit 1
+fi
+
+# A shipping build is not complete until the artifact verifier independently
+# proves identity, signature, notarization, staple, archive, and appcast. The
+# resulting manifest is deliberately generated only after that gate passes.
+if [ "$DISTRIBUTION" = 1 ]; then
+    REL_DIR="$BUILD_DIR/sparkle-release"
+    ARCHIVE="$REL_DIR/JuiceMount.zip"
+    APPCAST="$REL_DIR/appcast.xml"
+    "$PROJECT_ROOT/scripts/verify-build.sh" \
+        --app "$APP_DIR" \
+        --version "$JM_BUILD_VERSION" \
+        --commit "$JM_BUILD_COMMIT" \
+        --release \
+        --archive "$ARCHIVE" \
+        --appcast "$APPCAST"
+
+    ARCHIVE_SHA="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+    APPCAST_SHA="$(shasum -a 256 "$APPCAST" | awk '{print $1}')"
+    printf '{\n  "version": "%s",\n  "commit": "%s",\n  "artifacts": {\n    "JuiceMount.zip": {"sha256": "%s"},\n    "appcast.xml": {"sha256": "%s"}\n  }\n}\n' \
+        "$JM_BUILD_VERSION" "$JM_BUILD_COMMIT" "$ARCHIVE_SHA" "$APPCAST_SHA" \
+        > "$REL_DIR/release-manifest.json"
+    (
+        cd "$REL_DIR"
+        shasum -a 256 JuiceMount.zip appcast.xml release-manifest.json > SHA256SUMS
+    )
+    echo "    Manifest: $REL_DIR/release-manifest.json"
+    echo "    Checksums: $REL_DIR/SHA256SUMS"
 fi
 
 echo ""

@@ -11,14 +11,16 @@
 # then run additively on the ix-juicemount network (see server/docker-compose.yml).
 
 # ----- Stage 1: jmfarm (Go, CGO for SQLite) -----
-ARG JM_VERSION=0.5.0
-ARG JM_COMMIT=unknown
+ARG JM_VERSION
+ARG JM_COMMIT
 FROM golang:1.26.6-bookworm AS gobuild
 ARG JM_VERSION
 ARG JM_COMMIT
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
+RUN test -n "$JM_VERSION" \
+    && echo "$JM_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
@@ -87,6 +89,7 @@ COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
 COPY --from=juicefs /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
 RUN ldconfig
 COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
+RUN test "$(/usr/local/bin/jmfarm --build-info)" = "jmfarm ${JM_VERSION} (${JM_COMMIT})"
 COPY --from=whisper /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
 COPY --from=whisper /ggml-${WHISPER_MODEL}.bin /models/ggml-${WHISPER_MODEL}.bin
 COPY --from=whisper /download-ggml-model.sh /usr/local/bin/download-ggml-model.sh

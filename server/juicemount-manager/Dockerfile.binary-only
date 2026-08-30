@@ -2,14 +2,16 @@
 # This keeps headscale, JuiceFS, curl, and the runtime entrypoint identical while
 # allowing a small control-plane fix to be promoted without re-fetching them.
 ARG BASE_IMAGE=jm-manager:rc-0.5
-ARG JM_VERSION=0.5.0
-ARG JM_COMMIT=unknown
+ARG JM_VERSION
+ARG JM_COMMIT
 FROM golang:1.26.6-alpine AS gobuild
 ARG JM_VERSION
 ARG JM_COMMIT
 
 WORKDIR /src
 RUN apk add --no-cache git build-base
+RUN test -n "$JM_VERSION" \
+    && echo "$JM_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .

@@ -30,3 +30,26 @@ func TestManagerDoesNotExposeAdminKeyInArgv(t *testing.T) {
 		})
 	}
 }
+
+func TestManagerImageRequiresExactMultiArchReleaseIdentity(t *testing.T) {
+	src, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	for _, forbidden := range []string{"ARG JM_COMMIT=unknown", "ARG JM_VERSION=0.5.0", "headscale_0.29.3_linux_amd64"} {
+		if strings.Contains(s, forbidden) {
+			t.Fatalf("manager image retains non-release or single-architecture value %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`grep -Eq '^[0-9a-f]{40}$'`,
+		`juicemount-manager --build-info`,
+		"ARG TARGETARCH",
+		"linux_${TARGETARCH}",
+	} {
+		if !strings.Contains(s, required) {
+			t.Fatalf("manager image is missing release contract %q", required)
+		}
+	}
+}

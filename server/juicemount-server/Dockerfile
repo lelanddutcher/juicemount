@@ -21,8 +21,8 @@
 #     -p 2049:2049 -p 11050:11050 jm-server:dev
 
 # ----- Stage 1: builder -----
-ARG JM_VERSION=0.5.0
-ARG JM_COMMIT=unknown
+ARG JM_VERSION
+ARG JM_COMMIT
 FROM golang:1.26.6-alpine AS builder
 ARG JM_VERSION
 ARG JM_COMMIT
@@ -32,6 +32,11 @@ WORKDIR /src
 # Tini for clean signal forwarding in stage 2 — easier to install in
 # the builder where apk works freely than to add it later.
 RUN apk add --no-cache git build-base
+
+# Release provenance is mandatory. An image that says "unknown" cannot be
+# admitted by Manager or correlated with an immutable source revision.
+RUN test -n "$JM_VERSION" \
+    && echo "$JM_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 
 # Module cache first for layer reuse on source-only changes.
 COPY go.mod go.sum ./

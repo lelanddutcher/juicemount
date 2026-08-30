@@ -27,3 +27,34 @@ func TestProductionComposeRequiresManagerAdminKeyAtRenderTime(t *testing.T) {
 		}
 	}
 }
+
+func TestProductionComposeUsesOnlyImmutableReleaseImages(t *testing.T) {
+	src, err := os.ReadFile("../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(src)
+
+	for _, forbidden := range []string{
+		"juicemount-manager:latest",
+		"juicefarm:local",
+		`JM_FARM_SERVER_IMAGE: "${JM_FARM_SERVER_IMAGE:-}"`,
+		`JM_FARM_RENDER_IMAGE: "${JM_FARM_RENDER_IMAGE:-}"`,
+	} {
+		if strings.Contains(compose, forbidden) {
+			t.Fatalf("production compose retains mutable image contract %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"juicemount-manager@${JM_MANAGER_DIGEST:?",
+		"juicefarm@${JM_FARM_DIGEST:?",
+		"juicefarm-gpu@${JM_FARM_RENDER_DIGEST:?",
+		"redis:7.4-alpine@sha256:",
+		"minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:",
+		"juicedata/mount:ce-v1.3.1@sha256:",
+	} {
+		if !strings.Contains(compose, required) {
+			t.Fatalf("production compose is missing immutable image contract %q", required)
+		}
+	}
+}

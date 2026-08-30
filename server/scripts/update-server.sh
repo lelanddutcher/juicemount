@@ -7,9 +7,10 @@
 #      (CONTENTS sync: "<repo>/ → <host>:<dest>/" — note the trailing slash on
 #      the SOURCE; without it rsync nests the repo a directory deeper and the
 #      remote docker build context breaks)
-#   2. docker-build the farm image  (server/juicefarm/Dockerfile   → juicefarm:local)
+#   2. docker-build the farm image  (server/juicefarm/Dockerfile   →
+#      juicefarm:rc-<series>-<commit>)
 #      and the manager image        (server/juicemount-manager/Dockerfile
-#                                                    → juicemount-manager:local)
+#                                      → juicemount-manager:rc-<series>-<commit>)
 #      ON the host (native x86_64 — no cross-compile, no registry)
 #   3. recreate ONLY the farm worker + manager containers, re-running each with
 #      the run-args it ALREADY has (introspected live via `docker inspect` —
@@ -47,8 +48,8 @@ DEST="/root/juicefarm-build"
 FARM_CONTAINER="juicefarm-worker"
 MANAGER_CONTAINER="juicemount-manager"
 SKIP_MANAGER=0
-FARM_IMAGE="juicefarm:local"
-MANAGER_IMAGE="juicemount-manager:local"
+FARM_IMAGE=""
+MANAGER_IMAGE=""
 DRY_RUN=0
 REPO=""
 
@@ -73,12 +74,39 @@ if [ -z "$REPO" ]; then
   # script lives at <repo>/server/scripts/update-server.sh
   REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 fi
-for f in go.mod server/juicefarm/Dockerfile server/juicemount-manager/Dockerfile; do
+for f in go.mod internal/version/version.go server/juicefarm/Dockerfile server/juicemount-manager/Dockerfile; do
   if [ ! -f "$REPO/$f" ]; then
     echo "update-server: $REPO does not look like the JuiceMount repo (missing $f)" >&2
     exit 1
   fi
 done
+
+# A deployment must identify the exact clean commit whose contents are synced.
+# Otherwise an uncommitted worktree can be stamped with HEAD and later appear
+# reproducible even though no corresponding source revision exists.
+if ! git -C "$REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
+  echo "update-server: $REPO has no verifiable git HEAD" >&2
+  exit 1
+fi
+if ! git -C "$REPO" diff --quiet --ignore-submodules -- \
+   || ! git -C "$REPO" diff --cached --quiet --ignore-submodules --; then
+  echo "update-server: refusing to deploy a dirty tracked source tree" >&2
+  exit 1
+fi
+SOURCE_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "update-server: git HEAD is not a full lowercase commit SHA" >&2
+  exit 1
+fi
+SOURCE_VERSION="$(awk -F'"' '/^var Version = / { print $2; exit }' "$REPO/internal/version/version.go")"
+if [[ ! "$SOURCE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+  echo "update-server: invalid or missing source version" >&2
+  exit 1
+fi
+SOURCE_SERIES="${SOURCE_VERSION%.*}"
+SOURCE_SHORT="${SOURCE_COMMIT:0:7}"
+FARM_IMAGE="juicefarm:rc-${SOURCE_SERIES}-${SOURCE_SHORT}"
+MANAGER_IMAGE="juicemount-manager:rc-${SOURCE_SERIES}-${SOURCE_SHORT}"
 
 # ---- guard: the two target names must never be infra containers ------------
 # (defense in depth: the remote script re-checks on the host too)
@@ -102,6 +130,8 @@ build_remote_script() {
   printf 'SKIP_MANAGER=%q\n' "$SKIP_MANAGER"
   printf 'FARM_IMAGE=%q\n'        "$FARM_IMAGE"
   printf 'MANAGER_IMAGE=%q\n'     "$MANAGER_IMAGE"
+  printf 'SOURCE_VERSION=%q\n'    "$SOURCE_VERSION"
+  printf 'SOURCE_COMMIT=%q\n'     "$SOURCE_COMMIT"
   cat <<'REMOTE_EOF'
 set -euo pipefail
 
@@ -151,9 +181,27 @@ preflight_manager_auth
 
 # ---- build both images on the host (BuildKit for the cache mounts) --------
 log "building $FARM_IMAGE"
-DOCKER_BUILDKIT=1 docker build -f server/juicefarm/Dockerfile -t "$FARM_IMAGE" .
+DOCKER_BUILDKIT=1 docker build \
+  --build-arg "JM_VERSION=$SOURCE_VERSION" \
+  --build-arg "JM_COMMIT=$SOURCE_COMMIT" \
+  -f server/juicefarm/Dockerfile -t "$FARM_IMAGE" .
 log "building $MANAGER_IMAGE"
-DOCKER_BUILDKIT=1 docker build -f server/juicemount-manager/Dockerfile -t "$MANAGER_IMAGE" .
+DOCKER_BUILDKIT=1 docker build \
+  --build-arg "JM_VERSION=$SOURCE_VERSION" \
+  --build-arg "JM_COMMIT=$SOURCE_COMMIT" \
+  -f server/juicemount-manager/Dockerfile -t "$MANAGER_IMAGE" .
+
+for spec in "$FARM_IMAGE|jmfarm" "$MANAGER_IMAGE|juicemount-manager"; do
+  image="${spec%%|*}"
+  binary="${spec#*|}"
+  actual="$(docker run --rm --entrypoint "/usr/local/bin/$binary" "$image" --build-info)"
+  expected="$binary $SOURCE_VERSION ($SOURCE_COMMIT)"
+  if [ "$actual" != "$expected" ]; then
+    log "ERROR: $image identity mismatch: got '$actual', expected '$expected'"
+    exit 1
+  fi
+done
+log "both images carry exact release identity $SOURCE_VERSION ($SOURCE_COMMIT)"
 
 # ---- helpers: reconstruct `docker run` args from a live container ----------
 
@@ -318,6 +366,11 @@ if [ "$(docker inspect -f '{{.State.Running}}' "$FARM_CONTAINER")" != "true" ]; 
   exit 1
 fi
 log "farm worker up"
+farm_identity="$(docker exec "$FARM_CONTAINER" /usr/local/bin/jmfarm --build-info)"
+if [ "$farm_identity" != "jmfarm $SOURCE_VERSION ($SOURCE_COMMIT)" ]; then
+  log "FAIL: running farm identity mismatch: $farm_identity"
+  exit 1
+fi
 
 if [ "$SKIP_MANAGER" = "1" ]; then
   log "manager verify skipped (--skip-manager)"
@@ -344,13 +397,21 @@ else
     exit 1
   fi
   log "manager /api/farm → 200"
+  manager_identity="$(docker exec "$MANAGER_CONTAINER" /usr/local/bin/juicemount-manager --build-info)"
+  if [ "$manager_identity" != "juicemount-manager $SOURCE_VERSION ($SOURCE_COMMIT)" ]; then
+    log "FAIL: running manager identity mismatch: $manager_identity"
+    exit 1
+  fi
 fi
 log "DONE: farm updated. redis/minio/juicefs untouched."
 REMOTE_EOF
 }
 
 # ---- plan -------------------------------------------------------------------
-RSYNC_CMD=(rsync -a --delete --exclude .git --exclude .claude "$REPO/" "$HOST:$DEST/")
+RSYNC_CMD=(rsync -a --delete \
+  --exclude .git --exclude .claude --exclude .codex \
+  --exclude build --exclude app/JuiceMount/.build \
+  "$REPO/" "$HOST:$DEST/")
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "== update-server DRY RUN — nothing will be executed =="

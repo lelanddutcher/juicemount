@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Unit and integration-safe tests
+        run: go test -count=1 ./...
+      - name: Static analysis
+        run: go vet ./...
+      - name: Reachable vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Shell, JavaScript, compose, and deployment tests
+        env:
+          JM_ADMIN_KEY: ci-only-placeholder-not-a-secret-value
+          JM_MANAGER_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          JM_FARM_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          JM_FARM_RENDER_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+        run: |
+          find scripts server/scripts test -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          node --check internal/manager/static/app.js
+          docker compose -f server/docker-compose.yml config --quiet
+          bash server/scripts/update-server.test.sh
+
+  mac-app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build signed-equivalent app
+        env:
+          JM_ADHOC: '1'
+          JM_QUICK: '1'
+        run: scripts/build-app.sh --release
+      - name: Verify exact linked identity and reject a stale expectation
+        run: |
+          commit="$(git rev-parse HEAD)"
+          version="$(awk -F'"' '/^var Version = / { print $2; exit }' internal/version/version.go)"
+          scripts/verify-build.sh --app build/JuiceMount.app --version "$version" --commit "$commit"
+          if scripts/verify-build.sh --app build/JuiceMount.app --version "$version" --commit 0000000000000000000000000000000000000000; then
+            echo 'stale-identity negative test unexpectedly passed' >&2
+            exit 1
+          fi

@@ -12,8 +12,8 @@
 # (see docs/INSTALL-TrueNAS.md for the YAML snippet).
 
 # ----- Stage 1: builder -----
-ARG JM_VERSION=0.5.0
-ARG JM_COMMIT=unknown
+ARG JM_VERSION
+ARG JM_COMMIT
 FROM golang:1.26.6-alpine AS builder
 ARG JM_VERSION
 ARG JM_COMMIT
@@ -21,6 +21,9 @@ ARG JM_COMMIT
 WORKDIR /src
 
 RUN apk add --no-cache git build-base
+
+RUN test -n "$JM_VERSION" \
+    && echo "$JM_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 
 COPY go.mod go.sum ./
 RUN go mod download
@@ -39,6 +42,7 @@ RUN CGO_ENABLED=0 GOOS=linux \
 FROM juicedata/mount:ce-v1.3.1
 ARG JM_VERSION
 ARG JM_COMMIT
+ARG TARGETARCH
 LABEL org.opencontainers.image.version="${JM_VERSION}" \
       org.opencontainers.image.revision="${JM_COMMIT}"
 
@@ -46,7 +50,8 @@ LABEL org.opencontainers.image.version="${JM_VERSION}" \
 # supervise it as a child process — one container, one deploy. Pinned
 # version; v0.29.x speaks the 2026-era tsnet client protocol (0.26 rejects
 # noise handshakes from tailscale v1.102 clients — live-verified).
-RUN curl -fsSL https://github.com/juanfont/headscale/releases/download/v0.29.3/headscale_0.29.3_linux_amd64 \
+RUN case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported Headscale architecture: $TARGETARCH" >&2; exit 1 ;; esac \
+    && curl -fsSL https://github.com/juanfont/headscale/releases/download/v0.29.3/headscale_0.29.3_linux_${TARGETARCH} \
       -o /usr/local/bin/headscale && chmod +x /usr/local/bin/headscale
 
 RUN apt-get update \
@@ -54,6 +59,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/juicemount-manager /usr/local/bin/juicemount-manager
+
+RUN test "$(/usr/local/bin/juicemount-manager --build-info)" = "juicemount-manager ${JM_VERSION} (${JM_COMMIT})"
 
 RUN mkdir -p /sources /data/headscale
 

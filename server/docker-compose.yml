@@ -23,7 +23,7 @@ services:
 
   # ── Redis: JuiceFS metadata authority ────────────────────────────
   redis:
-    image: redis:7.4-alpine
+    image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     restart: unless-stopped
     ports:
       - "30179:6379"                # Mac client connects here
@@ -62,7 +62,7 @@ services:
 
   # ── MinIO: S3 object store for chunks ────────────────────────────
   minio:
-    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z@sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -83,7 +83,7 @@ services:
 
   # ── juicefs-init: pre-flight checks + idempotent format ──────────
   juicefs-init:
-    image: juicedata/mount:ce-v1.3.1
+    image: juicedata/mount:ce-v1.3.1@sha256:ddba2917edee5af0e0dc367c79aae55f91de4666f8c13795d238b937d44e3b3c
     restart: "no"
     depends_on:
       minio:
@@ -131,7 +131,7 @@ services:
 
   # ── juicefs: live FUSE mount + WebDAV ────────────────────────────
   juicefs:
-    image: juicedata/mount:ce-v1.3.1
+    image: juicedata/mount:ce-v1.3.1@sha256:ddba2917edee5af0e0dc367c79aae55f91de4666f8c13795d238b937d44e3b3c
     restart: unless-stopped
     depends_on:
       juicefs-init:
@@ -176,9 +176,8 @@ services:
         wait
 
   # ── juicemount-manager: control-plane web UI for the JuiceFS volume ─
-  # Renamed from juicemount-migrator in SLICE 0. Today this tab is
-  # Migrations only — Overview, Trash, Destinations, Backups,
-  # Maintenance, Settings tabs ship across slices 1–8.
+  # Renamed from juicemount-migrator in SLICE 0. Overview, Trash,
+  # Destinations, Backups, Maintenance, Settings, Farm, and Link are live.
   #
   # Browse host paths under /sources, pick a destination under /jfs,
   # watch live progress via SSE. Set JM_ADMIN_KEY for HTTP auth (the
@@ -188,7 +187,9 @@ services:
   # container whose persisted YAML silently dropped its runtime credential.
   # Supply it through the deployment environment; never commit the value.
   juicemount-manager:
-    image: ghcr.io/lelanddutcher/juicemount-manager:latest
+    # A manifest-list digest is mandatory. This prevents a saved TrueNAS YAML
+    # from silently pulling a newer `latest` image with a different commit.
+    image: ghcr.io/lelanddutcher/juicemount-manager@${JM_MANAGER_DIGEST:?set JM_MANAGER_DIGEST to the release sha256 digest}
     pull_policy: always
     restart: unless-stopped
     depends_on:
@@ -215,8 +216,8 @@ services:
       # hostname here. The optional image overrides are useful with a registry;
       # when blank, Manager derives the exact rc-0.5-<commit> local image tag.
       JM_FARM_NODE_META_URL: "${JM_FARM_NODE_META_URL:-}"
-      JM_FARM_SERVER_IMAGE: "${JM_FARM_SERVER_IMAGE:-}"
-      JM_FARM_RENDER_IMAGE: "${JM_FARM_RENDER_IMAGE:-}"
+      JM_FARM_SERVER_IMAGE: "ghcr.io/lelanddutcher/juicefarm@${JM_FARM_DIGEST:?set JM_FARM_DIGEST to the release sha256 digest}"
+      JM_FARM_RENDER_IMAGE: "ghcr.io/lelanddutcher/juicefarm-gpu@${JM_FARM_RENDER_DIGEST:?set JM_FARM_RENDER_DIGEST to the release sha256 digest}"
       # JuiceMount Link is opt-in. To enable it, set all three values, then
       # redeploy: a stable external URL is mandatory because linked Macs must
       # reach Headscale when away from the NAS. JM_NET_NAS_ROUTE must be the
@@ -264,9 +265,8 @@ services:
   # local gen only when a derivative is absent. Apple-only AI (embeddings,
   # aesthetics) stays on-device and pushes back via POST /derivatives/register.
   #
-  # Built ON the host (native x86_64 — bundles ffmpeg + whisper.cpp + the
-  # ggml-base.en model + the CGO jmfarm binary):
-  #   docker build -f server/juicefarm/Dockerfile -t juicefarm:local .
+  # Published as an immutable multi-architecture release image. The digest is
+  # the same value supplied to Manager above for node enrollment.
   #
   # SAFE LIVE DEPLOY (no full-stack churn): the juicefs container runs its OWN
   # FUSE mount, so juicefarm can be started ADDITIVELY on the existing
@@ -277,12 +277,11 @@ services:
   #     -e JM_META=redis://redis:6379/1 -e JM_FARM_TARGET=/jfs/<project> \
   #     -e JM_FARM_MODE=all -e JM_FARM_ONCE=1 \
   #     -v /mnt/zSSD/juicemount/cache:/jfs-cache \
-  #     -v /mnt/zSSD/juicemount/juicefarm-state:/state juicefarm:local
+  #     -v /mnt/zSSD/juicemount/juicefarm-state:/state \
+  #     ghcr.io/lelanddutcher/juicefarm@sha256:<release-manifest-digest>
   juicefarm:
-    build:
-      context: ../..
-      dockerfile: server/juicefarm/Dockerfile
-    image: juicefarm:local
+    image: ghcr.io/lelanddutcher/juicefarm@${JM_FARM_DIGEST:?set JM_FARM_DIGEST to the release sha256 digest}
+    pull_policy: always
     restart: unless-stopped
     depends_on:
       juicefs-init:

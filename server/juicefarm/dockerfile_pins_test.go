@@ -73,3 +73,22 @@ func TestCPUWorkerUsesModernFFmpegRuntime(t *testing.T) {
 		t.Fatal("CPU worker regressed to the Debian 11 JuiceFS runtime with ffmpeg 4.3")
 	}
 }
+
+func TestWorkerImagesRequireAndVerifyExactReleaseIdentity(t *testing.T) {
+	for name, src := range map[string]string{
+		"CPU": dockerfile(t, "Dockerfile"),
+		"GPU": dockerfile(t, "../juicefarm-gpu/Dockerfile"),
+	} {
+		for _, forbidden := range []string{"ARG JM_COMMIT=unknown", "ARG JM_VERSION=0.5.0"} {
+			if strings.Contains(src, forbidden) {
+				t.Fatalf("%s worker still permits default release identity %q", name, forbidden)
+			}
+		}
+		if !strings.Contains(src, `grep -Eq '^[0-9a-f]{40}$'`) {
+			t.Fatalf("%s worker does not reject a missing or abbreviated commit", name)
+		}
+		if !strings.Contains(src, `jmfarm --build-info`) {
+			t.Fatalf("%s worker does not execute its final binary to verify embedded identity", name)
+		}
+	}
+}
