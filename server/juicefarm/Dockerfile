@@ -70,6 +70,11 @@ RUN cd /w && bash ./models/download-ggml-model.sh ${WHISPER_MODEL} \
 # affected derivative shard is marked failed. The GPU worker already uses this
 # copy-forward pattern successfully.
 FROM juicedata/mount:ce-v1.3.1 AS juicefs
+RUN mkdir -p /juicemount-runtime/usr/local/bin /juicemount-runtime/usr/lib \
+    && cp /usr/local/bin/juicefs /juicemount-runtime/usr/local/bin/juicefs \
+    && if [ -f /usr/lib/libfdb_c.so ]; then \
+         cp /usr/lib/libfdb_c.so /juicemount-runtime/usr/lib/libfdb_c.so; \
+       fi
 
 # ----- Stage 3: runtime (juicefs + ffmpeg + whisper.cpp + jmfarm) -----
 # Debian 13 carries ffmpeg 7.1+, which maps MOV/MP4 `ipcm` to pcm_s24be and can
@@ -83,10 +88,12 @@ LABEL org.opencontainers.image.version="${JM_VERSION}" \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates fuse3 libgomp1 util-linux librados2 libgfapi0 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
-# JuiceFS dlopens FoundationDB's client library at startup even when Redis is
-# the metadata backend. Carry it from the same pinned upstream image.
-COPY --from=juicefs /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
+# The pinned amd64 JuiceFS image carries FoundationDB's client library because
+# that binary can dlopen it at startup. The arm64 image intentionally does not
+# carry the library. The normalized stage above copies the library only where
+# upstream supplies it, while keeping the JuiceFS binary path identical on both
+# architectures.
+COPY --from=juicefs /juicemount-runtime/ /
 RUN ldconfig
 COPY --from=gobuild /out/jmfarm /usr/local/bin/jmfarm
 RUN test "$(/usr/local/bin/jmfarm --build-info)" = "jmfarm ${JM_VERSION} (${JM_COMMIT})"
