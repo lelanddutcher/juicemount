@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -82,6 +83,17 @@ func TestAdvanceStreamOrdersSyncPublishPunchRelease(t *testing.T) {
 	e, src, events := streamFixture(t, 256<<10)
 	dest := &recordingDest{data: map[int64][]byte{}, events: events}
 	rel := &recordingReleaser{events: events}
+
+	// This is an ordering test, not a platform syscall test. Linux CI builds
+	// the macOS client package with the unsupported punch stub, so make the
+	// reclaim deterministic through the seam that exists specifically for
+	// observing the punch step. The Darwin syscall and real APFS reclamation
+	// remain covered by punch_darwin_test.go and the macOS CI job.
+	orig := punchRangeFn
+	t.Cleanup(func() { punchRangeFn = orig })
+	punchRangeFn = func(_ *os.File, off, end int64) (int64, error) {
+		return end - off, nil
+	}
 
 	n, err := advanceStream(e, src, dest, rel, &fakeDurability{}, nil, 128<<10)
 	if err != nil {
@@ -300,6 +312,9 @@ func indexOfPrefix(ss []string, prefix string) int {
 // published punchedEnd and released capacity while reclaiming NOTHING — the
 // budget would drift above true occupancy until the disk filled for real.
 func TestAdvanceStreamRejectsAReadOnlySpoolHandle(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("read-only F_PUNCHHOLE access semantics are Darwin-specific")
+	}
 	e, _, events := streamFixture(t, 256<<10)
 	ro, err := e.OpenForRead()
 	if err != nil {

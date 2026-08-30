@@ -63,6 +63,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Unit and macOS platform tests
+        run: go test -count=1 ./...
       - name: Build signed-equivalent app
         env:
           JM_ADHOC: '1'
