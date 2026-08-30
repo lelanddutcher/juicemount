@@ -168,6 +168,90 @@ func TestRedisSafetyPauseIsAtomicAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestRedisRenderClaimRequiresFreshStoragePermit(t *testing.T) {
+	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
+	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {
+		t.Skip("set JM_FARM_TEST_REDIS_URL to an isolated Redis and JM_FARM_TEST_REDIS_FLUSH=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q, err := Open(metaURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	render := Worker{
+		ID: "permit-render", Name: "permit-render", Role: QueueClassRender,
+		Capabilities: []string{"encoder:hevc_vaapi"}, Encoders: []string{"hevc_vaapi"},
+		RequireStoragePermit: true,
+	}
+	enqueue := func() Job {
+		job := NewJob("/jfs/incoming/permit.mov", []string{KindProxy}, "manager")
+		job.QueueClass = QueueClassRender
+		job.RequiredCapabilities = []string{"encoder:hevc_vaapi"}
+		job.SelectedBackend = "hevc_vaapi"
+		job.ShardIndex, job.ShardCount = 1, 1
+		job.RetryTargets = []string{job.Path}
+		if err := q.Enqueue(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+		return job
+	}
+
+	first := enqueue()
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, render); err != nil || ok {
+		t.Fatalf("render claimed without storage permit: ok=%v err=%v", ok, err)
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{
+		Source: "test", TotalBytes: 1000, AvailableBytes: 99, RequiredBytes: 100,
+	}); err == nil {
+		t.Fatal("published unsafe storage permit")
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{
+		Source: "test", TotalBytes: 1000, AvailableBytes: 400, RequiredBytes: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	permit, err := q.GetStoragePermit(ctx)
+	if err != nil || permit.Source != "test" || permit.AvailableBytes != 400 {
+		t.Fatalf("permit=%+v err=%v", permit, err)
+	}
+	claim, ok, err := q.ClaimForWorker(ctx, time.Second, render)
+	if err != nil || !ok || claim.Job.ID != first.ID {
+		t.Fatalf("permitted render claim=%+v ok=%v err=%v", claim.Job, ok, err)
+	}
+	if err := q.AckClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	second := enqueue()
+	if err := q.RevokeStoragePermit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.GetStoragePermit(ctx); err == nil {
+		t.Fatal("revoked storage permit remained readable")
+	}
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, render); err != nil || ok {
+		t.Fatalf("render claimed %s after permit revocation: ok=%v err=%v", second.ID, ok, err)
+	}
+	if err := q.PublishStoragePermit(ctx, StoragePermit{
+		Source: "test", TotalBytes: 1000, AvailableBytes: 400, RequiredBytes: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.rdb.PExpire(ctx, StoragePermitKey, 20*time.Millisecond).Err(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if _, ok, err := q.ClaimForWorker(ctx, 100*time.Millisecond, render); err != nil || ok {
+		t.Fatalf("render claimed %s after permit expiry: ok=%v err=%v", second.ID, ok, err)
+	}
+}
+
 func TestRedisRecoveryOnlyAcknowledgesTerminalClaim(t *testing.T) {
 	metaURL := os.Getenv("JM_FARM_TEST_REDIS_URL")
 	if metaURL == "" || os.Getenv("JM_FARM_TEST_REDIS_FLUSH") != "1" {

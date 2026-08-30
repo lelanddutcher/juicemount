@@ -1218,8 +1218,8 @@
     try { res = await api('GET', '/api/farm/jobs'); } catch (e) { return; }
     if (!res) return;
 		if (res.control) renderFarmControl(res.control);
-		renderFarmActiveBanner(!!res.available, res.queue_depth || 0, farmControlState,
-			Array.isArray(res.workers) ? res.workers.length : 0);
+		const workers = Array.isArray(res.workers) ? res.workers : [];
+		renderFarmActiveBanner(!!res.available, res.queue_depth || 0, farmControlState, workers);
 		farmJobsSnapshot = Array.isArray(res.jobs) ? res.jobs : [];
 		farmJobsWorkersActive = !!res.available;
 		renderFarmJobsList(farmJobsSnapshot, farmJobsWorkersActive);
@@ -1280,18 +1280,26 @@
   // renderFarmActiveBanner shows worker presence: green + "draining the queue"
   // when ≥1 worker, muted "offline" otherwise. The queue depth ("N waiting")
   // rides along when there's anything queued so the user knows work is pending.
-	function renderFarmActiveBanner(available, depth, control, workerCount) {
+	function renderFarmActiveBanner(available, depth, control, workers) {
     const banner = $('#farm-active-banner');
     const text = $('#farm-active-text');
     const depthEl = $('#farm-active-depth');
     if (!banner) return;
+		const workerCount = workers.length;
+		const permitBlocked = workers.filter((worker) => worker && worker.state === 'waiting-storage-permit').length;
+		const eligibleCount = workers.filter((worker) => worker &&
+			!['paused', 'disabled', 'waiting-storage-permit'].includes(worker.state || 'idle')).length;
 		banner.classList.toggle('online', available);
 		banner.classList.toggle('offline', !available);
 		banner.classList.toggle('paused', !!control.paused);
+		banner.classList.toggle('waiting', !control.paused && available && eligibleCount === 0 && permitBlocked > 0);
 		if (control.paused) {
 			text.textContent = control.pause_reason
 				? 'Safety pause — ' + control.pause_reason
 				: 'Queue paused — ' + workerCount + ' node' + (workerCount === 1 ? '' : 's') + ' standing by';
+		} else if (available && eligibleCount === 0 && permitBlocked > 0) {
+			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') +
+				' online — waiting for fresh NAS storage proof';
 		} else if (available) {
 			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') + ' online — routing by measured capability';
     } else {
@@ -3943,7 +3951,9 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 			head.appendChild(role);
 			const state = document.createElement('span');
 			state.className = 'farm-worker-state ' + (w.state || 'idle');
-			state.textContent = w.state || (w.current_job ? 'working' : 'idle');
+			state.textContent = ({
+				'waiting-storage-permit': 'waiting for NAS capacity proof',
+			})[w.state] || w.state || (w.current_job ? 'working' : 'idle');
 			head.appendChild(state);
 			if (w.build_commit) {
 				const build = document.createElement('span');

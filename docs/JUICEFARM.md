@@ -320,9 +320,14 @@ remain available.
 The same read-only state mount is also the Manager's physical-pool headroom probe.
 Before admitting a manual sweep or farm-wide resume, Manager requires the larger of
 64 GiB and 1% of that filesystem to remain available. The server worker performs the
-same check before claiming output work. An unprobeable or undersized backend engages
-an atomic Redis safety pause for every worker; it never auto-resumes, and the Manager
-shows the reason until an operator restores space and explicitly presses Play.
+same check before claiming output work. Each safe server-side probe refreshes a
+20-second Redis storage permit. Render workers expose that they require the permit and
+verify it in the same Redis transaction that claims a job. If the Manager/server loses
+its pool view, Redis stops accepting permit refreshes, or the permit expires, render
+workers remain visible as `waiting-storage-permit` but cannot claim more write-heavy
+work. An unprobeable or undersized backend revokes the permit and engages an atomic
+Redis safety pause for every worker; it never auto-resumes, and the Manager shows the
+reason until an operator restores space and explicitly presses Play.
 `JM_FARM_STORAGE_PATH` may name a more representative server-side path and
 `JM_FARM_MIN_FREE_BYTES` may override the worker reserve for a deliberately sized
 deployment.
@@ -333,6 +338,13 @@ the worker loses its private index or the shared manifest write fails, any later
 worker validates the exact blob, repairs registration, and skips re-encoding. This
 keeps retries idempotent across nodes and prevents overwritten JuiceFS slices from
 multiplying physical storage during an outage.
+
+JuiceFS intentionally retains both deleted files and stale slices from overwrites for
+the configured trash period. JuiceMount therefore treats derivative idempotency and
+physical headroom as its own responsibilities. Selective `chattr +s` trash bypass is
+not used by this RC: it was added upstream in JuiceFS v1.4.0, while the deployed stack
+is pinned to v1.3.1. A coordinated all-client JuiceFS upgrade can add that optional
+defense later; it is not required for the receipt and storage-permit fixes above.
 
 ---
 

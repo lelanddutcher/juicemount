@@ -56,9 +56,10 @@ if controlRaw then
   local controlOK, control = pcall(cjson.decode, controlRaw)
   if controlOK and control and control.paused then return {} end
 end
+if ARGV[6] == '1' and redis.call('EXISTS', KEYS[2]) == 0 then return {} end
 local caps = cjson.decode(ARGV[2])
 local decodeLimits = cjson.decode(ARGV[3])
-for i = 4, #KEYS do
+for i = 5, #KEYS do
   local count = redis.call('LLEN', KEYS[i])
   for n = 1, count do
     local raw = redis.call('RPOP', KEYS[i])
@@ -116,8 +117,8 @@ for i = 4, #KEYS do
 					redis.call('HSET', 'juicefarm:job:' .. job.id, 'target_worker', ARGV[5])
 				end
 			end
-			redis.call('LPUSH', KEYS[3], raw)
-			redis.call('SADD', KEYS[2], ARGV[1])
+			redis.call('LPUSH', KEYS[4], raw)
+			redis.call('SADD', KEYS[3], ARGV[1])
         return {raw, KEYS[i]}
       end
       redis.call('LPUSH', KEYS[i], raw)
@@ -125,10 +126,14 @@ for i = 4, #KEYS do
   end
 end
 return {}`
-	scriptKeys := append([]string{ControlKey, ProcessingIndexKey, processingKey}, keys...)
+	scriptKeys := append([]string{ControlKey, StoragePermitKey, ProcessingIndexKey, processingKey}, keys...)
+	requireStoragePermit := "0"
+	if w.RequireStoragePermit {
+		requireStoragePermit = "1"
+	}
 	for {
 		res, err := c.rdb.Eval(ctx, script, scriptKeys, w.ID, string(capabilities), string(decodeLimits),
-			workerPinCapability(w), workerDisplayName(w)).StringSlice()
+			workerPinCapability(w), workerDisplayName(w), requireStoragePermit).StringSlice()
 		if err != nil && err != redis.Nil {
 			return Claim{}, false, err
 		}

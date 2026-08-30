@@ -843,20 +843,21 @@ func runQueue(cfg queueConfig) {
 		os.Exit(1)
 	}
 	worker := farmqueue.Worker{
-		ID:                 farmqueue.NewID(),
-		StartedAt:          time.Now().UTC().Format(time.RFC3339),
-		BuildVersion:       buildversion.Version,
-		BuildCommit:        buildversion.Commit,
-		Name:               cfg.name,
-		Kinds:              farmqueue.DrainKinds(cfg.kinds),
-		Capabilities:       profile.Capabilities,
-		Role:               profile.Role,
-		Encoders:           profile.Encoders,
-		Decoders:           profile.Decoders,
-		DecodeLimits:       profile.DecodeLimits,
-		TranscriptBackends: profile.TranscriptBackends,
-		Benchmarks:         profile.Benchmarks,
-		State:              "idle",
+		ID:                   farmqueue.NewID(),
+		StartedAt:            time.Now().UTC().Format(time.RFC3339),
+		BuildVersion:         buildversion.Version,
+		BuildCommit:          buildversion.Commit,
+		Name:                 cfg.name,
+		Kinds:                farmqueue.DrainKinds(cfg.kinds),
+		Capabilities:         profile.Capabilities,
+		Role:                 profile.Role,
+		Encoders:             profile.Encoders,
+		Decoders:             profile.Decoders,
+		DecodeLimits:         profile.DecodeLimits,
+		TranscriptBackends:   profile.TranscriptBackends,
+		Benchmarks:           profile.Benchmarks,
+		RequireStoragePermit: profile.Role == farmqueue.QueueClassRender,
+		State:                "idle",
 	}
 	fmt.Printf("jmfarm queue: worker %s (name=%q role=%s encoders=%v transcript=%v caps=%v) draining %s (db=%s mount=%s producer=%s)\n",
 		worker.ID, worker.Name, worker.Role, worker.Encoders, worker.TranscriptBackends,
@@ -1069,6 +1070,7 @@ func runQueue(cfg queueConfig) {
 	}
 
 	nextReap := time.Time{}
+	storagePermitBlocked := false
 	for {
 		if ctx.Err() != nil {
 			break
@@ -1084,27 +1086,51 @@ func runQueue(cfg queueConfig) {
 		}
 		// Only the server/control-plane worker probes physical backend
 		// headroom. A render node's /state and cache are local disks and cannot
-		// tell whether the NAS object/metadata pool is about to exhaust. The
-		// resulting Redis interlock is shared, so every remote worker stops
-		// atomically before claiming more output work.
-		if worker.Role == farmqueue.QueueClassServer && cfg.storagePath != "" && !ctl.Paused {
+		// tell whether the NAS object/metadata pool is about to exhaust. Safe
+		// probes refresh a short Redis permit; unsafe or missing probes revoke it.
+		// Render claim admission checks that permit in the same Lua transaction
+		// that moves a job into its durable processing list.
+		if worker.Role == farmqueue.QueueClassServer && cfg.storagePath != "" {
 			headroom, probeErr := checkWorkerStorageHeadroom(cfg.storagePath, cfg.storageMinFree)
 			unsafe := probeErr != nil || headroom.Available < headroom.Required
 			if unsafe {
+				if revokeErr := q.RevokeStoragePermit(ctx); revokeErr != nil {
+					fmt.Fprintf(os.Stderr, "jmfarm queue: storage permit revoke: %v\n", revokeErr)
+				}
 				code := "storage-pressure"
 				reason := "backend free space is below the farm safety reserve; reclaim storage before resuming"
 				if probeErr != nil {
 					code = "storage-probe-failed"
 					reason = "backend storage headroom could not be verified"
 				}
-				stored, pauseErr := q.PauseForSafety(ctx, code, reason)
-				if pauseErr != nil {
-					fmt.Fprintf(os.Stderr, "jmfarm queue: storage safety check: %v (pause failed: %v)\n", probeErr, pauseErr)
-				} else {
-					ctl = stored
-					fmt.Fprintf(os.Stderr, "jmfarm queue: safety pause: %s\n", reason)
+				if !ctl.Paused {
+					stored, pauseErr := q.PauseForSafety(ctx, code, reason)
+					if pauseErr != nil {
+						fmt.Fprintf(os.Stderr, "jmfarm queue: storage safety check: %v (pause failed: %v)\n", probeErr, pauseErr)
+					} else {
+						ctl = stored
+						fmt.Fprintf(os.Stderr, "jmfarm queue: safety pause: %s\n", reason)
+					}
 				}
+			} else if permitErr := q.PublishStoragePermit(ctx, farmqueue.StoragePermit{
+				Source: "server-worker", TotalBytes: headroom.Total,
+				AvailableBytes: headroom.Available, RequiredBytes: headroom.Required,
+			}); permitErr != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: storage permit refresh: %v\n", permitErr)
 			}
+		}
+
+		storagePermitReady := true
+		var storagePermitErr error
+		if worker.RequireStoragePermit {
+			_, storagePermitErr = q.GetStoragePermit(ctx)
+			storagePermitReady = storagePermitErr == nil
+			if !storagePermitReady && !storagePermitBlocked {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: render admission waiting for fresh backend storage permit: %v\n", storagePermitErr)
+			} else if storagePermitReady && storagePermitBlocked {
+				fmt.Fprintln(os.Stderr, "jmfarm queue: backend storage permit restored; render claiming eligible")
+			}
+			storagePermitBlocked = !storagePermitReady
 		}
 
 		// Heartbeat (idle/paused): publish presence so Manager can distinguish a
@@ -1115,6 +1141,8 @@ func runQueue(cfg queueConfig) {
 			worker.State = "disabled"
 		} else if ctl.Paused {
 			worker.State = "paused"
+		} else if !storagePermitReady {
+			worker.State = "waiting-storage-permit"
 		}
 		setHeartbeatExtras(&worker)
 		if err := q.Heartbeat(ctx, worker); err != nil && ctx.Err() == nil {
@@ -1144,7 +1172,7 @@ func runQueue(cfg queueConfig) {
 			}
 			nextReap = time.Now().Add(15 * time.Second)
 		}
-		if nodeDisabled.Load() || ctl.Paused {
+		if nodeDisabled.Load() || ctl.Paused || !storagePermitReady {
 			select {
 			case <-ctx.Done():
 			case <-time.After(time.Second):

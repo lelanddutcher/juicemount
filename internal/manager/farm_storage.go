@@ -36,6 +36,11 @@ type farmSafetyPauser interface {
 	PauseForSafety(context.Context, string, string) (farmqueueControl, error)
 }
 
+type farmStoragePermitter interface {
+	PublishStoragePermit(context.Context, farmqueue.StoragePermit) error
+	RevokeStoragePermit(context.Context) error
+}
+
 // Alias keeps the optional interface decoupled from the concrete queue client
 // while preserving its exact method signature.
 type farmqueueControl = farmqueue.FarmControl
@@ -108,7 +113,28 @@ func (a *API) inspectFarmStorage() farmStorageGate {
 // action eligible again, leaving the operator in control of restart timing.
 func (a *API) enforceFarmStorageGuard(ctx context.Context) farmStorageGate {
 	gate := a.inspectFarmStorage()
-	if gate.Safe || !gate.Configured || a.farmQ == nil {
+	if !gate.Configured || a.farmQ == nil {
+		return gate
+	}
+	if permitter, ok := a.farmQ.(farmStoragePermitter); ok {
+		if gate.Safe {
+			if err := permitter.PublishStoragePermit(ctx, farmqueue.StoragePermit{
+				Source: "manager", TotalBytes: gate.TotalBytes,
+				AvailableBytes: gate.AvailableBytes, RequiredBytes: gate.RequiredBytes,
+			}); err != nil {
+				// The permit TTL makes this fail closed for render nodes. Do not
+				// mislabel measured physical headroom as unsafe solely because the
+				// control plane is temporarily unreachable.
+				log.Printf("manager: farm storage permit refresh failed: %v", err)
+			}
+			return gate
+		}
+		if err := permitter.RevokeStoragePermit(ctx); err != nil {
+			// Expiry still closes admission if an overloaded Redis cannot accept
+			// the immediate revocation.
+			log.Printf("manager: farm storage permit revoke failed: %v", err)
+		}
+	} else if gate.Safe {
 		return gate
 	}
 	code := "storage-pressure"

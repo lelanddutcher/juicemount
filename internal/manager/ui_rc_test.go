@@ -182,6 +182,8 @@ func TestManagerRCFarmNodeLifecycleAndEnrollmentSurface(t *testing.T) {
 		"/api/farm/workers/control",
 		"Restart verified · fresh heartbeat online",
 		"no replacement heartbeat appeared within 45 seconds",
+		"waiting for fresh NAS storage proof",
+		"waiting for NAS capacity proof",
 		"navigator.clipboard.writeText",
 	} {
 		if !strings.Contains(app, marker) {
@@ -198,6 +200,8 @@ func TestManagerRCFarmNodeLifecycleAndEnrollmentSurface(t *testing.T) {
 		".farm-enrollment-card",
 		".farm-worker-actions",
 		".farm-worker-action-status.error",
+		".farm-worker-state.waiting-storage-permit",
+		".farm-active-banner.waiting",
 		".farm-command-block code",
 		"white-space: pre-wrap",
 	} {

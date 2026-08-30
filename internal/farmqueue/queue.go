@@ -42,6 +42,11 @@ const (
 	ControlKey     = "juicefarm:control"      // STRING: JSON FarmControl — global play/pause + discovery state
 	WatchLeaderKey = "juicefarm:watch:leader" // STRING: short lease held by one discovery watcher
 	WatchCursorKey = "juicefarm:watch:cursor" // STRING: recursive backstop's last completed scan time
+	// StoragePermitKey is a short-lived proof that a process with a local view
+	// of the backend pool recently measured enough write headroom. Remote render
+	// workers cannot infer NAS capacity from their own cache filesystem, so they
+	// require this lease before atomically claiming another output-producing job.
+	StoragePermitKey = "juicefarm:storage:permit"
 
 	ProcessingPrefix   = "juicefarm:processing:" // LIST per worker: atomically claimed raw jobs
 	ProcessingIndexKey = "juicefarm:processing"  // SET of worker ids with a processing list
@@ -53,6 +58,10 @@ const (
 	// WorkerTTL: a worker counts as alive only while its heartbeat key exists.
 	// The worker must refresh well within this window (we use ~1/3).
 	WorkerTTL = 30 * time.Second
+	// StoragePermitTTL is deliberately shorter than a worker heartbeat. The
+	// Manager/server refresh it every few seconds; if both lose their physical
+	// pool view, remote claim admission fails closed before liveness does.
+	StoragePermitTTL = 20 * time.Second
 )
 
 // ConfigKey is the manager-owned farm config document (STRING, JSON FarmConfig).
@@ -324,7 +333,11 @@ type Worker struct {
 	DecodeLimits       map[string]VideoDecodeLimit `json:"decode_limits,omitempty"`
 	TranscriptBackends []string                    `json:"transcript_backends,omitempty"`
 	Benchmarks         WorkerBenchmarks            `json:"benchmarks,omitempty"`
-	State              string                      `json:"state,omitempty"` // idle|working|paused|disabled
+	// RequireStoragePermit makes the Redis claim transaction reject work unless
+	// StoragePermitKey is fresh. Current render workers always set this; keeping
+	// it additive preserves protocol compatibility with older worker records.
+	RequireStoragePermit bool   `json:"storage_permit_required,omitempty"`
+	State                string `json:"state,omitempty"` // idle|working|paused|disabled|waiting-storage-permit
 }
 
 // FarmConfig is the manager-owned desired state published at ConfigKey. The
