@@ -158,6 +158,16 @@ func (c *Client) GetConfig(ctx context.Context) (*FarmConfig, error) {
 	if err := json.Unmarshal([]byte(raw), &fc); err != nil {
 		return nil, err
 	}
+	// Empty maps are omitted on the wire. Restore writable maps at the queue
+	// boundary so Manager callers can safely merge the next defaults or
+	// per-worker override without having to special-case a persisted empty
+	// configuration.
+	if fc.Defaults == nil {
+		fc.Defaults = map[string]any{}
+	}
+	if fc.Overrides == nil {
+		fc.Overrides = map[string]map[string]any{}
+	}
 	return &fc, nil
 }
 
