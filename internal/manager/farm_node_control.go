@@ -108,7 +108,7 @@ func (a *API) handleFarmWorkerControl(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "name": req.Name, "disabled": disabled,
-			"note": map[bool]string{true: "node is draining and will stop claiming work", false: "node is enabled and may claim compatible work"}[disabled],
+			"note": map[bool]string{true: "node disabled immediately; active work is returned to its durable lane", false: "node is enabled and may claim compatible work"}[disabled],
 		})
 
 	case "restart":

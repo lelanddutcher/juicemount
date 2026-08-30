@@ -63,10 +63,41 @@ the Link-enabled Manager correctly refuses to start. Do not use the live
 container's healthy state as proof that the stored app configuration is
 complete.
 
-## Paste this YAML
+## Render the exact release YAML
 
-Apps → Discover → kebab menu → **Install via YAML** → paste this and
-edit the four `CHANGEME_*` placeholders before submitting.
+The only supported 0.5 install input is the repository's canonical
+`server/docker-compose.yml` rendered with values from
+`server/release.env.example`. It digest-pins every image and refuses to render
+without the existing Manager key, MinIO password, all three first-party release
+digests, and the physical zpool capacity. This fail-closed render step is what
+prevents an edited TrueNAS form from silently dropping a credential or reverting
+to a mutable image.
+
+1. Copy `server/release.env.example` outside the repository and replace every
+   placeholder. Obtain `JM_FARM_STORAGE_CAPACITY_BYTES` from
+   `zpool list -Hp -o size <pool>`.
+2. Edit only the host bind paths and LAN route in the canonical compose for the
+   target NAS. Confirm the MinIO bucket dataset is excluded from recursive ZFS
+   snapshots before starting the farm.
+3. Render without touching the live app:
+
+   ```sh
+   docker compose --env-file /secure/path/juicemount-release.env \
+     -f server/docker-compose.yml config > /secure/path/juicemount-rendered.yml
+   ```
+
+4. Inspect the rendered file: first-party images must use `@sha256:…`, WebDAV
+   must remain bound to `127.0.0.1`, credentials must be non-placeholder, and
+   both Manager and the NAS worker must carry the same numeric physical capacity.
+5. Paste that rendered file into **Apps → Discover → ⋮ → Install via YAML**.
+
+Do not paste the historical example below into a 0.5 deployment. It is retained
+only to explain the old layout and intentionally lacks the immutable artifacts,
+Farm safety gates, Link persistence, and fail-closed inputs required by 0.5.
+
+## Historical layout example (not deployable)
+
+This pre-RC example is not a release manifest.
 
 ```yaml
 services:
@@ -254,12 +285,9 @@ services:
       - CHANGEME_STATE_PATH:/var/lib/manager
 ```
 
-The `CHANGEME_ADMIN_KEY` line is intentionally conspicuous because TrueNAS
-stores the submitted custom-app YAML. It must be replaced before the first
-install and must never be blanked on an update. For shell-driven Compose
-deployments, prefer the repository's `server/docker-compose.yml`, which uses
-required environment interpolation and makes `docker compose config --quiet`
-fail before any container is replaced when `JM_ADMIN_KEY` is missing.
+TrueNAS stores the submitted custom-app YAML. Always preserve the same Manager
+key and storage credentials across a render; never infer the stored values from a
+currently healthy container.
 
 ## Upgrading from --trash-days 0 (SLICE 3 trash retention)
 

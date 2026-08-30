@@ -20,6 +20,9 @@ type fakeFarmQ struct {
 	control  farmqueue.FarmControl
 	disabled map[string]bool
 	commands map[string]farmqueue.WorkerCommandStatus
+	canceled []string
+	requeued map[string]farmqueue.Job
+	logs     map[string][]farmqueue.WorkerLogLine
 }
 
 func (f *fakeFarmQ) Enqueue(ctx context.Context, j farmqueue.Job) error { return nil }
@@ -27,6 +30,9 @@ func (f *fakeFarmQ) ActiveWorkers(ctx context.Context) ([]farmqueue.Worker, erro
 	return f.workers, nil
 }
 func (f *fakeFarmQ) QueueDepth(ctx context.Context) (int64, error) { return 0, nil }
+func (f *fakeFarmQ) QueueDepths(ctx context.Context) (map[string]int64, error) {
+	return map[string]int64{}, nil
+}
 func (f *fakeFarmQ) ListJobs(ctx context.Context, n int) ([]farmqueue.JobStatus, error) {
 	return nil, nil
 }
@@ -98,6 +104,27 @@ func (f *fakeFarmQ) WorkerDisabled(_ context.Context, name string) (bool, error)
 	return f.disabled[name], nil
 }
 
+func (f *fakeFarmQ) RequestJobCancel(_ context.Context, id, _ string) error {
+	f.canceled = append(f.canceled, id)
+	return nil
+}
+
+func (f *fakeFarmQ) RequeueFailed(_ context.Context, id, _ string) (farmqueue.Job, bool, error) {
+	if f.requeued == nil {
+		f.requeued = map[string]farmqueue.Job{}
+	}
+	if job, ok := f.requeued[id]; ok {
+		return job, false, nil
+	}
+	job := farmqueue.Job{ID: "retry-" + id, RequeueOf: id}
+	f.requeued[id] = job
+	return job, true, nil
+}
+
+func (f *fakeFarmQ) WorkerLog(_ context.Context, workerID string, _ int64) ([]farmqueue.WorkerLogLine, error) {
+	return f.logs[workerID], nil
+}
+
 // Compile-time proof the fake satisfies the API's farmQueue seam.
 var _ farmQueue = (*fakeFarmQ)(nil)
 
@@ -118,6 +145,8 @@ func TestValidateFarmConfigRejectsBad(t *testing.T) {
 		{"good device", map[string]any{"transcript_device": "vulkan"}, false},
 		{"bad device", map[string]any{"transcript_device": "toaster"}, true},
 		{"good preset", map[string]any{"preset": "slow"}, false},
+		{"good node pause", map[string]any{"paused": true, "drain": false}, false},
+		{"bad node drain", map[string]any{"drain": "yes"}, true},
 		{"model injection", map[string]any{"model": "/etc/passwd; rm -rf /"}, true},
 	}
 	for _, tc := range cases {

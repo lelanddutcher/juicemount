@@ -3,12 +3,15 @@ package farmqueue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+var ErrFarmConfigConflict = errors.New("farm config changed; reload and retry")
 
 // Farm-config channel (FARM-NODE-CONFIG spec): the manager publishes a
 // FarmConfig document at ConfigKey; workers poll it every drain-loop tick and
@@ -29,6 +32,8 @@ var ValidFarmConfigKeys = map[string]bool{
 	"nice":              true, // int 0-19 (restart-class on workers)
 	"ionice":            true, // int 0-7 or -1 to disable (restart-class)
 	"watch_enabled":     true, // bool (hot-stoppable)
+	"paused":            true, // bool (per-node admission pause; active work completes)
+	"drain":             true, // bool (finish active work, then remain idle)
 }
 
 // RestartClassKeys cannot be applied by a running process; the worker reports
@@ -115,9 +120,9 @@ func ValidateFarmConfig(patch map[string]any) error {
 			if !ok || f < 0 || f > 7 {
 				bad = append(bad, fmt.Sprintf("ionice must be int 0-7 (omit to disable)"))
 			}
-		case "watch_enabled":
+		case "watch_enabled", "paused", "drain":
 			if _, ok := v.(bool); !ok {
-				bad = append(bad, "watch_enabled must be bool")
+				bad = append(bad, k+" must be bool")
 			}
 		}
 	}
@@ -164,7 +169,10 @@ func (c *Client) StoreConfig(ctx context.Context, cfg *FarmConfig, forceRevision
 }
 
 func (c *Client) storeConfigRetry(ctx context.Context, cfg *FarmConfig, forceRevision int64, attempts int) (int64, error) {
+	expectedRevision := cfg.Revision
 	for attempt := 0; attempt < attempts; attempt++ {
+		var writtenRevision int64
+		var writtenAt string
 		err := c.rdb.Watch(ctx, func(tx *redis.Tx) error {
 			raw, err := tx.Get(ctx, ConfigKey).Result()
 			var cur int64
@@ -177,13 +185,19 @@ func (c *Client) storeConfigRetry(ctx context.Context, cfg *FarmConfig, forceRev
 					cur = existing.Revision
 				}
 			}
-			if forceRevision >= 1 {
-				cfg.Revision = forceRevision
-			} else {
-				cfg.Revision = cur + 1
+			if forceRevision < 1 && expectedRevision != cur {
+				return fmt.Errorf("%w (expected revision %d, current %d)", ErrFarmConfigConflict, expectedRevision, cur)
 			}
-			cfg.UpdatedAt = nowISO()
-			blob, err := json.Marshal(cfg)
+			if forceRevision >= 1 {
+				writtenRevision = forceRevision
+			} else {
+				writtenRevision = cur + 1
+			}
+			writtenAt = nowISO()
+			next := *cfg
+			next.Revision = writtenRevision
+			next.UpdatedAt = writtenAt
+			blob, err := json.Marshal(&next)
 			if err != nil {
 				return err
 			}
@@ -196,7 +210,12 @@ func (c *Client) storeConfigRetry(ctx context.Context, cfg *FarmConfig, forceRev
 		if err == redis.TxFailedErr {
 			continue // optimistic-lock retry
 		}
-		return cfg.Revision, err
+		if err != nil {
+			return 0, err
+		}
+		cfg.Revision = writtenRevision
+		cfg.UpdatedAt = writtenAt
+		return writtenRevision, nil
 	}
 	return 0, fmt.Errorf("config store: contention after %d attempts", attempts)
 }

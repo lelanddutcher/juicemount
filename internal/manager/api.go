@@ -270,6 +270,9 @@ func Register(mux *http.ServeMux, prefix string, cfg Config) *JobManager {
 	// Exact path (registered before any subtree) — POST clears terminal
 	// job records from the Recent-jobs list + prunes the leaked index.
 	mux.HandleFunc(prefix+"/api/farm/jobs/clear", a.auth(a.handleFarmJobsClear))
+	mux.HandleFunc(prefix+"/api/farm/queues", a.auth(a.handleFarmQueues))
+	mux.HandleFunc(prefix+"/api/farm/job/", a.auth(a.handleFarmJobAction))
+	mux.HandleFunc(prefix+"/api/farm/node/", a.auth(a.handleFarmNodeAction))
 	mux.HandleFunc(prefix+"/api/farm/control", a.auth(a.handleFarmControl))
 	// Farm node config (FARM-NODE-CONFIG spec): manager-owned worker settings.
 	mux.HandleFunc(prefix+"/api/farm/config", a.auth(a.handleFarmConfig))

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -90,6 +91,36 @@ func TestRunPassesPreCanceledDoesNotLaunchTargets(t *testing.T) {
 	}
 	if processed != 0 || failed != 0 || len(failedTargets) != 0 || len(details) != 0 {
 		t.Fatalf("cancelled counts = %d/%d targets=%v details=%v", processed, failed, failedTargets, details)
+	}
+}
+
+func TestRunPassesPublishesBoundedActivityProgress(t *testing.T) {
+	var mu sync.Mutex
+	var updates []int
+	processed, failed, _, _, safetyErr := runPasses(passOpts{
+		mode: "proxy", effConc: 1,
+		process: func(_ *derivatives.Store, path string, _ farm.Options) farm.Result {
+			return farm.Result{Path: path}
+		},
+		progress: func(stage string, pct int) {
+			if stage != "proxy" {
+				t.Errorf("stage = %q", stage)
+			}
+			if pct < 0 || pct > 100 {
+				t.Errorf("pct = %d", pct)
+			}
+			mu.Lock()
+			updates = append(updates, pct)
+			mu.Unlock()
+		},
+	}, []string{"one.mov", "two.mov"})
+	if safetyErr != nil || processed != 2 || failed != 0 {
+		t.Fatalf("result processed=%d failed=%d safety=%v", processed, failed, safetyErr)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(updates) < 2 || updates[0] != 0 || updates[len(updates)-1] != 100 {
+		t.Fatalf("progress updates = %v, want 0 ... 100", updates)
 	}
 }
 

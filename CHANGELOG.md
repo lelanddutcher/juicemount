@@ -1,5 +1,55 @@
 # JuiceMount6 Changelog
 
+## 0.5.0 — release candidate — 2026-08-30
+
+### App and Link
+
+- The write spool is on by default, persists an explicit opt-out, protects
+  acknowledged writes with local durability and SHA-256-verified drain, and
+  exposes recovery controls for stalled or failed uploads.
+- JuiceMount Link persists pairing authorization, applies and tests remote
+  backend routes, and fails closed when coordination or saved credentials are
+  incomplete.
+- Update checks are manual-only. JuiceMount makes no background Sparkle network
+  request; choosing **Check for Updates…** starts the signed updater and contacts
+  the documented GitHub appcast.
+
+### JuiceFarm and Manager
+
+- Automatic recursive discovery has a durable catch-up cursor, bounded server
+  planning shards, renewable processing claims, measured GPU admission,
+  HEVC-first proxy routing, explicit hardware H.264 and CPU H.264 fallback, and
+  per-file incompatible-source isolation.
+- Durable proxy commit receipts and codec-agnostic automatic freshness prevent
+  retries or a returning HEVC worker from replacing valid proxies and amplifying
+  JuiceFS trash. Storage permits and an atomic safety pause stop new render
+  claims below physical-pool headroom.
+- Farm mission control now shows every queue lane and each node's current
+  `{job, kind, path, stage, percent}`; supports per-node pause, drain, resume and
+  verified restart; returns a bounded 200-line runtime log; cooperatively
+  cancels queued/running work; and requeues a failed job exactly once from its
+  stored immutable payload while preserving the original terminal record.
+- The TrueNAS release compose requires digest-pinned first-party artifacts, the
+  existing Manager and MinIO credentials, and exact physical zpool capacity at
+  render time. Installation guidance explicitly excludes the MinIO object
+  dataset from recursive ZFS snapshots.
+
+### Release integrity
+
+- Go dependency and reachable-vulnerability gates include the `go-billy` path.
+  Linux CI runs Redis-backed Farm durability tests; macOS CI builds and verifies
+  a signed-equivalent app and rejects stale source identity.
+- Container builds embed and execute exact version/commit identity, publish SBOM
+  and provenance, and production deployment references accepted manifest
+  digests rather than mutable tags. Distribution Mac builds fail closed unless
+  Developer ID signing, notarization, stapling, Sparkle signing, and a matching
+  appcast all succeed.
+
+### Explicitly gated from 0.5
+
+- The incomplete Teams/seats authorization surface remains fully feature-gated.
+  Camera catalog and public website work are outside this release.
+
 ## 0.4.0 — 2026-07-15 — Resilience & recovery, faster navigation on slow links
 
 ### Added

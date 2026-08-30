@@ -13,17 +13,13 @@ final class MenuBarController: NSObject {
     private let statusItem: NSStatusItem
     private let popover: NSPopover
 
-    /// Sparkle auto-updater. #87: constructed with `startingUpdater: false`
-    /// so nothing touches the network during the launch critical path — a
-    /// cold Sparkle feed fetch at launch competed with the core start and
-    /// worsened the first-launch hang. `startUpdater()` is called ~12 s after
-    /// launch (once the core is up) to kick off the background check loop
-    /// (SUEnableAutomaticChecks / SUScheduledCheckInterval in Info.plist drive
-    /// the cadence). Feed URL + EdDSA public key also come from Info.plist, so
-    /// no programmatic configuration is needed here. Retained for the process
-    /// lifetime via this controller (which the AppDelegate owns) so the
-    /// scheduled checks keep running.
+    /// Sparkle updater. It is deliberately not started at launch: JuiceMount's
+    /// privacy contract forbids silent update checks. The explicit "Check for
+    /// Updates…" action starts it immediately before the user-requested check.
+    /// Feed URL + EdDSA public key come from Info.plist. Retained for the
+    /// process lifetime via this controller (which the AppDelegate owns).
     private let updaterController: SPUStandardUpdaterController
+    private var updaterStarted = false
 
     private var searchWindow: NSWindow?
     private var preferencesWindow: NSWindow?
@@ -41,9 +37,9 @@ final class MenuBarController: NSObject {
 
         // Construct the Sparkle updater before super.init so it's a fully
         // initialized stored property. No custom delegate/driver — Info.plist
-        // carries the feed URL, public key, and check schedule.
-        // #87: startingUpdater:false keeps Sparkle off the launch critical
-        // path; startUpdater() is invoked below, deferred past the core start.
+        // carries the feed URL and public key. startingUpdater:false is both a
+        // launch-performance guard and the enforcement point for manual-only
+        // update checks.
         self.updaterController = SPUStandardUpdaterController(
             startingUpdater: false,
             updaterDelegate: nil,
@@ -58,13 +54,6 @@ final class MenuBarController: NSObject {
         // Re-render the icon whenever server state changes
         startStateObservation()
 
-        // #87: kick off Sparkle's background update loop only AFTER the core
-        // is up (~12 s), so no Sparkle feed fetch happens in the launch window.
-        // startUpdater() invokes -[SPUUpdater startUpdater:]; the scheduled
-        // checks then run on the Info.plist cadence.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
-            self?.updaterController.startUpdater()
-        }
     }
 
     deinit {
@@ -106,6 +95,10 @@ final class MenuBarController: NSObject {
             popover.performClose(nil)
         }
         NSApp.activate(ignoringOtherApps: true)
+        if !updaterStarted {
+            updaterController.startUpdater()
+            updaterStarted = true
+        }
         updaterController.checkForUpdates(nil)
     }
 

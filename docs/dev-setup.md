@@ -154,13 +154,15 @@ End users configure everything through the app's Preferences window
   floor is exposed as `capacity.cache_free_floor_bytes` in `/cache-status`.
 - **Memory buffer:** 2 GiB budget, files <128 MiB (tunable in
   Preferences since Phase 3b).
-- **Write spool:** enabled via Preferences → Cache & Storage in the app.
+- **Write spool:** on by default for safe contiguous-prefix reads; an explicit
+  user choice is persisted and can disable it in Preferences → Cache & Storage.
   The `JM_SPOOL_ENABLE=1` env var works **only for the `jm5` CLI** — the
   embedded c-archive snapshots its environment before Swift could set
   it, so the app passes the flag through its config JSON instead.
   Spool knobs (CLI: env; app: Preferences/config): `JM_SPOOL_DIR`
   (default `~/Library/Application Support/JuiceMount/spool/`),
-  `JM_SPOOL_SIZE_GB` (default 50). Live status: `127.0.0.1:11050/spool`.
+  `JM_SPOOL_SIZE_GB` (app default `0`, meaning automatic capacity with the
+  safety floors above). Live status: `127.0.0.1:11050/spool`.
 - **WAN tuning (env, read by the JuiceFS mount layer at start):**
   `JM_WAN_MODE=1` raises JuiceFS `--max-uploads` 20 → 64;
   `JM_MAX_UPLOADS=<n>` overrides directly.

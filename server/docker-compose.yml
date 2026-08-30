@@ -67,7 +67,7 @@ services:
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: juicemount
-      MINIO_ROOT_PASSWORD: CHANGEME_MINIO_PASSWORD    # EDIT — strong, no whitespace
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set a strong existing MinIO root password before deploying}"
       MINIO_API_REQUESTS_DEADLINE: 10m
     ports:
       - "30151:9000"                # Mac client connects here
@@ -92,7 +92,7 @@ services:
         condition: service_healthy
     environment:
       MINIO_ROOT_USER: juicemount
-      MINIO_ROOT_PASSWORD: CHANGEME_MINIO_PASSWORD    # EDIT — same as MinIO above
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?set the same existing MinIO root password before deploying}"
       JM_BUCKET_URL: "http://minio:9000/zpool"
       JM_META_URL: "redis://redis:6379/1"
       JM_VOL_NAME: "zpool"
@@ -210,7 +210,7 @@ services:
       # ZFS statfs is dataset-scoped and cannot report the parent zpool total.
       # Set this to `zpool list -Hp -o size <pool>` for exact total-capacity
       # reporting and a correctly scaled default 1% reserve.
-      JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:-0}"
+      JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:?set to the integer output of zpool list -Hp -o size <pool>}"
       # Processing-node enrollment fails closed until this is set to the Redis
       # endpoint a node can actually reach. Never use the docker-only `redis`
       # hostname here. The optional image overrides are useful with a registry;
@@ -314,7 +314,7 @@ services:
       JM_FARM_WORKERS: "4"
       # Same physical-pool total used by Manager's capacity proof. The worker
       # continues to take AVAILABLE bytes from statfs on /state.
-      JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:-0}"
+      JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:?set to the integer output of zpool list -Hp -o size <pool>}"
     volumes:
       - /mnt/zSSD/juicemount/cache:/jfs-cache         # shares the SSD cache dataset
       - /mnt/zSSD/juicemount/juicefarm-state:/state   # server-side derivatives index

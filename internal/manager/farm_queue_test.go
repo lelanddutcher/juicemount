@@ -158,6 +158,7 @@ type fakeFarmQueue struct {
 	enqueued   []farmqueue.Job
 	workers    []farmqueue.Worker
 	depth      int64
+	depths     map[string]int64
 	jobs       []farmqueue.JobStatus
 	clearErr   error
 	control    farmqueue.FarmControl
@@ -174,6 +175,12 @@ func (f *fakeFarmQueue) ActiveWorkers(context.Context) ([]farmqueue.Worker, erro
 	return f.workers, nil
 }
 func (f *fakeFarmQueue) QueueDepth(context.Context) (int64, error) { return f.depth, nil }
+func (f *fakeFarmQueue) QueueDepths(context.Context) (map[string]int64, error) {
+	if f.depths != nil {
+		return f.depths, nil
+	}
+	return map[string]int64{"catch_all": f.depth}, nil
+}
 func (f *fakeFarmQueue) ListJobs(context.Context, int) ([]farmqueue.JobStatus, error) {
 	return f.jobs, nil
 }
@@ -184,7 +191,7 @@ func (f *fakeFarmQueue) ClearFinished(context.Context) (int, error) {
 	kept := f.jobs[:0]
 	removed := 0
 	for _, j := range f.jobs {
-		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed {
+		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed || j.Status == farmqueue.StatusCanceled {
 			removed++
 			continue
 		}
@@ -423,16 +430,17 @@ func TestHandleFarmJobsFixtureConformance(t *testing.T) {
 	// The fixture parses through the SAME wire structs the worker maintains —
 	// field-name drift in farmqueue would fail here, not in production.
 	var fx struct {
-		Available  bool                  `json:"available"`
-		Workers    []farmqueue.Worker    `json:"workers"`
-		QueueDepth int64                 `json:"queue_depth"`
-		Jobs       []farmqueue.JobStatus `json:"jobs"`
+		Available   bool                  `json:"available"`
+		Workers     []farmqueue.Worker    `json:"workers"`
+		QueueDepth  int64                 `json:"queue_depth"`
+		QueueDepths map[string]int64      `json:"queue_depths"`
+		Jobs        []farmqueue.JobStatus `json:"jobs"`
 	}
 	if err := json.Unmarshal(raw, &fx); err != nil {
 		t.Fatalf("fixture does not fit the farmqueue wire structs: %v", err)
 	}
 
-	fake := &fakeFarmQueue{workers: fx.Workers, depth: fx.QueueDepth, jobs: fx.Jobs}
+	fake := &fakeFarmQueue{workers: fx.Workers, depth: fx.QueueDepth, depths: fx.QueueDepths, jobs: fx.Jobs}
 	a := &API{farmQ: fake}
 	req := httptest.NewRequest(http.MethodGet, "/api/farm/jobs", nil)
 	rec := httptest.NewRecorder()
@@ -484,7 +492,7 @@ func TestHandleFarmJobsEmptyNeverNull(t *testing.T) {
 }
 
 // TestHandleFarmJobsClear verifies POST /api/farm/jobs/clear removes ONLY
-// terminal (done/failed) records and returns the count — queued/running
+// terminal (done/failed/canceled) records and returns the count — queued/running
 // jobs must survive so an in-flight sweep is never orphaned. 503 when the
 // queue is unconfigured.
 func TestHandleFarmJobsClear(t *testing.T) {
@@ -493,6 +501,7 @@ func TestHandleFarmJobsClear(t *testing.T) {
 		{ID: "b", Status: farmqueue.StatusDone},
 		{ID: "c", Status: farmqueue.StatusQueued},
 		{ID: "d", Status: farmqueue.StatusFailed},
+		{ID: "e", Status: farmqueue.StatusCanceled},
 	}}
 	a := &API{farmQ: fake}
 	rec := httptest.NewRecorder()
@@ -506,14 +515,14 @@ func TestHandleFarmJobsClear(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("bad JSON: %v", err)
 	}
-	if body.Cleared != 2 {
-		t.Fatalf("cleared = %d, want 2 (done+failed)", body.Cleared)
+	if body.Cleared != 3 {
+		t.Fatalf("cleared = %d, want 3 (done+failed+canceled)", body.Cleared)
 	}
 	if len(fake.jobs) != 2 {
 		t.Fatalf("remaining jobs = %d, want 2 (running+queued kept)", len(fake.jobs))
 	}
 	for _, j := range fake.jobs {
-		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed {
+		if j.Status == farmqueue.StatusDone || j.Status == farmqueue.StatusFailed || j.Status == farmqueue.StatusCanceled {
 			t.Fatalf("terminal job %q survived clear", j.ID)
 		}
 	}

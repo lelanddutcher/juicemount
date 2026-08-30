@@ -168,6 +168,23 @@ own enable switch; dirty events remain pending while the farm is paused. One wor
 holds the short discovery-leader lease, and a 15-minute recursive modified-directory
 scan repairs events missed while Redis pub/sub or a worker was offline.
 
+Manager also exposes explicit per-node lifecycle controls. **Pause** stops that node
+from taking another claim while its current atomic work finishes. **Drain** does the
+same but reports `draining` immediately so planned maintenance is distinguishable
+from a general pause; **Resume** clears both flags. Heartbeats retain the legacy
+`current_job` ID and add `current_activity {id,kind,path,started_at,stage,pct}`.
+`GET /api/farm/queues` reports each physical execution lane, and
+`GET /api/farm/node/{name}/log` returns the live runtime's newest 200 bounded log
+lines. These routes, like every Manager API route, require the admin key.
+
+Queued or running work can be cooperatively canceled with
+`POST /api/farm/job/{id}/cancel`. The durable `juicefarm:cancel:{id}` flag is checked
+before work starts and once per second during execution; the worker commits terminal
+`canceled` before acknowledging its claim. A failed job can be retried with
+`POST /api/farm/job/{id}/requeue`. That creates exactly one new ID from the failed
+job's stored payload—including narrowed targets, backend, and explicit fallback
+lock—while the original terminal record remains immutable and links to the retry.
+
 ---
 
 ## Discovery (JM-15) — how the Mac learns about server-generated blobs
@@ -221,11 +238,11 @@ juicefarm:local
 
 Every standing worker should set a unique lowercase `JM_WORKER_NAME` and use a
 persistent `/state`, persistent `/jfs-cache`, and `--restart unless-stopped`. Those
-are the contracts behind Manager's disable/enable/restart controls. Disable is a
-durable admission gate: the worker returns active work to its original queue,
-releases discovery leadership, keeps heartbeating as `disabled`, and cannot claim
-again until enabled. Restart is one-shot and is reported as successful only after
-the command is acknowledged and a replacement runtime ID heartbeats.
+are the contracts behind Manager's pause/drain/resume/restart controls. The older
+emergency disable flag remains readable for rolling-upgrade compatibility, but the
+0.5 UI does not use it for planned maintenance. Restart is one-shot and is reported
+as successful only after the command is acknowledged and a replacement runtime ID
+heartbeats.
 
 Run render workers separately with `JM_WORKER_ROLE=render` and the GPU device(s)
 passed into the container. Render admission fails closed if the configured
@@ -300,9 +317,11 @@ the render node; a failed/offline render node produces a visible reroute instead
 ## Manager integration
 
 The `juicemount-manager` web UI exposes a **Farm tab** with play/pause, automatic
-discovery control, queue depth and history, live worker roles/capabilities, measured
-throughput, selected backend, attempts, node lifecycle, commit-pinned node enrollment,
-and advanced manual repair sweeps. Set `JM_FARM_NODE_META_URL` to the Redis URL that
+discovery control, per-lane queue depth and history, cooperative job cancel and
+exact-payload failed retry, live worker roles/capabilities/current stage, bounded
+worker logs, measured throughput, selected backend, attempts, explicit node
+pause/drain/resume/restart, commit-pinned node enrollment, and advanced manual
+repair sweeps. Set `JM_FARM_NODE_META_URL` to the Redis URL that
 new nodes can reach; Manager deliberately does not reuse a docker-internal Redis
 hostname for enrollment. Optional `JM_FARM_SERVER_IMAGE` and
 `JM_FARM_RENDER_IMAGE` values select registry images; otherwise the Manager derives
@@ -365,7 +384,8 @@ defense later; it is not required for the receipt and storage-permit fixes above
   that prevents a brief node restart from dumping the ready backlog onto CPU;
   portable-proxy preservation across worker codecs with explicit-only codec migration;
   backend-headroom safety pause; cross-worker proxy commit recovery;
-  live Manager control and node telemetry; tech/poster/filmstrip/waveform/proxy/
+  live Manager control, per-node drain/pause, cooperative cancellation,
+  exact-payload failed retry, and bounded node telemetry; tech/poster/filmstrip/waveform/proxy/
   transcript generation; JM-15 discovery; `/blob` byte ranges; and portable
   assertion sidecars.
 - **Not in this RC:** richer AI (faces/OCR/framing), historical benchmark models,

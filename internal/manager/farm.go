@@ -22,6 +22,7 @@ type farmQueue interface {
 	Enqueue(ctx context.Context, j farmqueue.Job) error
 	ActiveWorkers(ctx context.Context) ([]farmqueue.Worker, error)
 	QueueDepth(ctx context.Context) (int64, error)
+	QueueDepths(ctx context.Context) (map[string]int64, error)
 	ListJobs(ctx context.Context, n int) ([]farmqueue.JobStatus, error)
 	ClearFinished(ctx context.Context) (int, error)
 	GetControl(ctx context.Context) (farmqueue.FarmControl, error)
@@ -319,6 +320,7 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 	storage := a.enforceFarmStorageGuard(ctx)
 	workers, _ := a.farmQ.ActiveWorkers(ctx)
 	depth, _ := a.farmQ.QueueDepth(ctx)
+	depths, _ := a.farmQ.QueueDepths(ctx)
 	jobs, _ := a.farmQ.ListJobs(ctx, farmRecentJobsLimit)
 	control, controlErr := a.farmQ.GetControl(ctx)
 	if controlErr != nil {
@@ -333,18 +335,46 @@ func (a *API) handleFarmJobs(w http.ResponseWriter, r *http.Request) {
 	if jobs == nil {
 		jobs = []farmqueue.JobStatus{}
 	}
+	if depths == nil {
+		depths = map[string]int64{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"available":   len(workers) > 0,
-		"workers":     workers,
-		"queue_depth": depth,
-		"jobs":        jobs,
-		"control":     control,
-		"storage":     storage,
+		"available":    len(workers) > 0,
+		"workers":      workers,
+		"queue_depth":  depth,
+		"queue_depths": depths,
+		"jobs":         jobs,
+		"control":      control,
+		"storage":      storage,
 	})
 }
 
+// handleFarmQueues exposes per-lane backlog instead of forcing operators to
+// infer routing from one aggregate count.
+func (a *API) handleFarmQueues(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.farmQ == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"available": false, "error": "farm queue unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), farmQueueProbeTimeout)
+	defer cancel()
+	depths, err := a.farmQ.QueueDepths(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"available": false, "error": err.Error()})
+		return
+	}
+	if depths == nil {
+		depths = map[string]int64{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"available": true, "queues": depths})
+}
+
 // handleFarmJobsClear is POST /api/farm/jobs/clear. Clears terminal
-// (done/failed) records from the Recent-jobs list — and prunes any
+// (done/failed/canceled) records from the Recent-jobs list — and prunes any
 // leaked index entries — via farmqueue.ClearFinished. queued/running
 // jobs are preserved so an in-flight sweep is never orphaned. Returns
 // {"cleared": N}. 503 when the queue is unconfigured (no meta/redis URL).

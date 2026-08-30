@@ -47,6 +47,7 @@ const (
 	// workers cannot infer NAS capacity from their own cache filesystem, so they
 	// require this lease before atomically claiming another output-producing job.
 	StoragePermitKey = "juicefarm:storage:permit"
+	CancelPrefix     = "juicefarm:cancel:" // STRING per job: cooperative operator cancellation
 
 	ProcessingPrefix   = "juicefarm:processing:" // LIST per worker: atomically claimed raw jobs
 	ProcessingIndexKey = "juicefarm:processing"  // SET of worker ids with a processing list
@@ -98,6 +99,7 @@ const (
 	StatusDispatched = "dispatched"
 	StatusDone       = "done"
 	StatusFailed     = "failed"
+	StatusCanceled   = "canceled"
 )
 
 // Kinds the worker understands. "all" expands to the full pipeline.
@@ -244,30 +246,37 @@ type Job struct {
 	// selected only because no compatible accelerator was online. Maintenance may
 	// promote only the latter when verified hardware returns.
 	CPUFallbackLocked bool `json:"cpu_fallback_locked,omitempty"`
+	// RequeueOf links an operator-requested retry to the terminal job it copied.
+	// A new ID preserves immutable history while the payload retains exact route,
+	// narrowed targets, and codec decisions from the failed attempt.
+	RequeueOf string `json:"requeue_of,omitempty"`
 }
 
 // JobStatus is the worker-maintained record a producer reads back. Stored as a
 // flat Redis HASH (all string fields) so HGETALL round-trips without a codec.
 type JobStatus struct {
-	ID               string `json:"id"`
-	Status           string `json:"status"` // queued|running|dispatched|done|failed
-	Path             string `json:"path"`
-	Kinds            string `json:"kinds"` // comma-joined for display
-	Producer         string `json:"producer"`
-	EnqueuedAt       string `json:"enqueued_at"`
-	StartedAt        string `json:"started_at,omitempty"`
-	FinishedAt       string `json:"finished_at,omitempty"`
-	Processed        int    `json:"processed"`
-	Failed           int    `json:"failed"`
-	Error            string `json:"error,omitempty"`
-	Worker           string `json:"worker,omitempty"`
-	TargetWorker     string `json:"target_worker,omitempty"`
-	Backend          string `json:"backend,omitempty"`
-	QueueClass       string `json:"queue_class,omitempty"`
-	Attempts         int    `json:"attempts"`
-	HardwareFailures int    `json:"hardware_failures"`
-	ParentID         string `json:"parent_id,omitempty"`
-	DerivativePass   string `json:"derivative_pass,omitempty"`
+	ID                string `json:"id"`
+	Status            string `json:"status"` // queued|running|dispatched|done|failed|canceled
+	Path              string `json:"path"`
+	Kinds             string `json:"kinds"` // comma-joined for display
+	Producer          string `json:"producer"`
+	EnqueuedAt        string `json:"enqueued_at"`
+	StartedAt         string `json:"started_at,omitempty"`
+	FinishedAt        string `json:"finished_at,omitempty"`
+	Processed         int    `json:"processed"`
+	Failed            int    `json:"failed"`
+	Error             string `json:"error,omitempty"`
+	Worker            string `json:"worker,omitempty"`
+	TargetWorker      string `json:"target_worker,omitempty"`
+	Backend           string `json:"backend,omitempty"`
+	QueueClass        string `json:"queue_class,omitempty"`
+	Attempts          int    `json:"attempts"`
+	HardwareFailures  int    `json:"hardware_failures"`
+	ParentID          string `json:"parent_id,omitempty"`
+	DerivativePass    string `json:"derivative_pass,omitempty"`
+	RequeueOf         string `json:"requeue_of,omitempty"`
+	RequeuedAs        string `json:"requeued_as,omitempty"`
+	CancelRequestedAt string `json:"cancel_requested_at,omitempty"`
 }
 
 // WorkerBenchmarks records observed rather than advertised capability. Startup
@@ -302,6 +311,18 @@ type VideoDecodeLimit struct {
 	MaxHeight int `json:"max_height"`
 }
 
+// WorkerActivity is an additive detail record beside the legacy CurrentJob ID.
+// Keeping the ID field preserves old consumers while Manager can render useful
+// live work without scraping process output.
+type WorkerActivity struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind,omitempty"`
+	Path      string `json:"path,omitempty"`
+	StartedAt string `json:"started_at,omitempty"`
+	Stage     string `json:"stage,omitempty"`
+	Pct       int    `json:"pct,omitempty"`
+}
+
 // Worker is the heartbeat a draining worker publishes so producers can tell the
 // farm is alive + accepting work (the `farm-queue` capability signal).
 // Extra fields (all optional/omitted when empty) carry the manager-config
@@ -309,10 +330,11 @@ type VideoDecodeLimit struct {
 // settings, hardware capabilities, and anything it could NOT apply without a
 // restart. Additive only — older readers ignore unknown JSON keys.
 type Worker struct {
-	ID         string `json:"id"`
-	StartedAt  string `json:"started_at"`
-	LastSeen   string `json:"last_seen"`
-	CurrentJob string `json:"current_job,omitempty"`
+	ID              string          `json:"id"`
+	StartedAt       string          `json:"started_at"`
+	LastSeen        string          `json:"last_seen"`
+	CurrentJob      string          `json:"current_job,omitempty"`
+	CurrentActivity *WorkerActivity `json:"current_activity,omitempty"`
 	// BuildVersion/BuildCommit make release admission observable from Manager.
 	// A worker can report perfect benchmark numbers while still running an old
 	// scheduler or fallback implementation; exact provenance prevents that node
@@ -337,7 +359,7 @@ type Worker struct {
 	// StoragePermitKey is fresh. Current render workers always set this; keeping
 	// it additive preserves protocol compatibility with older worker records.
 	RequireStoragePermit bool   `json:"storage_permit_required,omitempty"`
-	State                string `json:"state,omitempty"` // idle|working|paused|disabled|waiting-storage-permit
+	State                string `json:"state,omitempty"` // idle|working|paused|draining|disabled|waiting-storage-permit
 }
 
 // FarmConfig is the manager-owned desired state published at ConfigKey. The
@@ -414,10 +436,12 @@ func (c *Client) Enqueue(ctx context.Context, j Job) error {
 		Producer: j.Producer, EnqueuedAt: j.EnqueuedAt, Backend: j.SelectedBackend,
 		TargetWorker: j.SelectedWorker, QueueClass: j.QueueClass, Attempts: j.Attempts,
 		HardwareFailures: j.HardwareFailures, ParentID: j.ParentID,
+		DerivativePass: j.DerivativePass, RequeueOf: j.RequeueOf,
 	}
 	pipe := c.rdb.TxPipeline()
 	pipe.LPush(ctx, QueueKeyFor(&j), raw)
 	pipe.HSet(ctx, JobHashPrefix+j.ID, st.toMap())
+	pipe.HSet(ctx, JobHashPrefix+j.ID, "payload", raw)
 	pipe.Expire(ctx, JobHashPrefix+j.ID, JobTTL)
 	// Unix-second scores make every burst of jobs tie. Redis is then free to
 	// return tied members lexicographically, so a just-completed job can be
@@ -520,6 +544,17 @@ func (c *Client) MarkFailedWithCounts(ctx context.Context, id string, processed,
 	}).Err()
 }
 
+// MarkCanceled is a terminal, non-failure outcome for an explicit cooperative
+// operator cancellation. The durable claim is acknowledged only after this
+// status write succeeds.
+func (c *Client) MarkCanceled(ctx context.Context, id string, processed, failed int) error {
+	return c.rdb.HSet(ctx, JobHashPrefix+id, map[string]any{
+		"status": StatusCanceled, "finished_at": nowISO(),
+		"processed": strconv.Itoa(processed), "failed": strconv.Itoa(failed),
+		"error": "canceled by operator",
+	}).Err()
+}
+
 // Heartbeat publishes/refreshes the worker's liveness key (TTL WorkerTTL) and
 // records its ID in a compact index. Using an index keeps worker discovery off
 // the full JuiceFS metadata keyspace: Redis SCAN with a MATCH pattern still
@@ -562,7 +597,7 @@ func (c *Client) ListJobs(ctx context.Context, n int) ([]JobStatus, error) {
 	return out, nil
 }
 
-// ClearFinished removes terminal (done/failed) job records — and any
+// ClearFinished removes terminal (done/failed/canceled) job records — and any
 // leaked index entries whose hash has already expired — from Redis, so
 // the Recent-jobs list can be cleared and the JobIndexKey ZSET does not
 // grow without bound over the lifetime of the shared metadata Redis.
@@ -584,7 +619,7 @@ func (c *Client) ClearFinished(ctx context.Context) (int, error) {
 		}
 		// len(m)==0 => the hash expired but the index entry leaked; prune
 		// it. Otherwise only prune terminal jobs. queued/running stay.
-		if st := m["status"]; len(m) == 0 || st == StatusDone || st == StatusFailed {
+		if st := m["status"]; len(m) == 0 || st == StatusDone || st == StatusFailed || st == StatusCanceled {
 			pipe.ZRem(ctx, JobIndexKey, id)
 			pipe.Del(ctx, JobHashPrefix+id)
 			removed++
@@ -652,6 +687,29 @@ func (c *Client) QueueDepth(ctx context.Context) (int64, error) {
 	return total, nil
 }
 
+// QueueDepths returns every physical lane using a stable short label. Keeping
+// catch_all visible prevents aggregate depth from hiding legacy/multi-kind work.
+func (c *Client) QueueDepths(ctx context.Context) (map[string]int64, error) {
+	keys := allQueueKeys()
+	pipe := c.rdb.Pipeline()
+	cmds := make(map[string]*redis.IntCmd, len(keys))
+	for _, key := range keys {
+		label := strings.TrimPrefix(key, QueueKey+":")
+		if key == QueueKey {
+			label = "catch_all"
+		}
+		cmds[label] = pipe.LLen(ctx, key)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(cmds))
+	for label, cmd := range cmds {
+		out[label] = cmd.Val()
+	}
+	return out, nil
+}
+
 // ---- HASH <-> struct helpers --------------------------------------------
 
 func (s JobStatus) toMap() map[string]any {
@@ -689,6 +747,15 @@ func (s JobStatus) toMap() map[string]any {
 	if s.ParentID != "" {
 		m["parent_id"] = s.ParentID
 	}
+	if s.RequeueOf != "" {
+		m["requeue_of"] = s.RequeueOf
+	}
+	if s.RequeuedAs != "" {
+		m["requeued_as"] = s.RequeuedAs
+	}
+	if s.CancelRequestedAt != "" {
+		m["cancel_requested_at"] = s.CancelRequestedAt
+	}
 	return m
 }
 
@@ -699,6 +766,6 @@ func jobStatusFromMap(m map[string]string) JobStatus {
 		Producer: m["producer"], EnqueuedAt: m["enqueued_at"],
 		StartedAt: m["started_at"], FinishedAt: m["finished_at"],
 		Processed: atoi(m["processed"]), Failed: atoi(m["failed"]), Error: m["error"],
-		Worker: m["worker"], TargetWorker: m["target_worker"], Backend: m["backend"], QueueClass: m["queue_class"], Attempts: atoi(m["attempts"]), HardwareFailures: atoi(m["hardware_failures"]), ParentID: m["parent_id"], DerivativePass: m["derivative_pass"],
+		Worker: m["worker"], TargetWorker: m["target_worker"], Backend: m["backend"], QueueClass: m["queue_class"], Attempts: atoi(m["attempts"]), HardwareFailures: atoi(m["hardware_failures"]), ParentID: m["parent_id"], DerivativePass: m["derivative_pass"], RequeueOf: m["requeue_of"], RequeuedAs: m["requeued_as"], CancelRequestedAt: m["cancel_requested_at"],
 	}
 }

@@ -58,3 +58,32 @@ func TestProductionComposeUsesOnlyImmutableReleaseImages(t *testing.T) {
 		}
 	}
 }
+
+func TestProductionComposeRequiresPhysicalFarmCapacity(t *testing.T) {
+	src, err := os.ReadFile("../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(src)
+	required := `JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:?set to the integer output of zpool list -Hp -o size <pool>}"`
+	if strings.Count(compose, required) != 2 {
+		t.Fatalf("production compose must require exact physical capacity for Manager and server worker")
+	}
+	if strings.Contains(compose, `JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:-0}"`) {
+		t.Fatal("production compose silently falls back to dataset-scoped capacity")
+	}
+}
+
+func TestProductionComposeRequiresMinIOCredentialAtRenderTime(t *testing.T) {
+	src, err := os.ReadFile("../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(src)
+	if strings.Count(compose, `${MINIO_ROOT_PASSWORD:?`) != 2 {
+		t.Fatal("production compose must require the same external MinIO credential for MinIO and JuiceFS format")
+	}
+	if strings.Contains(compose, "CHANGEME_MINIO_PASSWORD") {
+		t.Fatal("production compose embeds a deployable placeholder MinIO password")
+	}
+}

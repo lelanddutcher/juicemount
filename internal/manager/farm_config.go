@@ -20,9 +20,12 @@ package manager
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/lelanddutcher/juicemount/internal/farmqueue"
 )
 
 // farmConfigRequest is the PUT body. Defaults and/or per-worker overrides;
@@ -78,6 +81,7 @@ func (a *API) handleFarmConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		next := &farmQueueFarmConfig{Defaults: map[string]any{}, Overrides: map[string]map[string]any{}}
 		if cur != nil {
+			next.Revision = cur.Revision
 			next.Defaults = cur.Defaults
 			next.Overrides = cur.Overrides
 		}
@@ -105,6 +109,10 @@ func (a *API) handleFarmConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		rev, err := a.farmQStore(ctx, next)
 		if err != nil {
+			if errors.Is(err, farmqueue.ErrFarmConfigConflict) {
+				writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}

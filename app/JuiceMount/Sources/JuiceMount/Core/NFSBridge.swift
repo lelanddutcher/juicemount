@@ -676,8 +676,8 @@ public enum NFSBridge {
         /// Null/absence-tolerant decode. Same root cause as the long-standing
         /// CacheStatus.roots:null bug (see `CacheStatus.init(from:)`): the Go
         /// `/spool` handler returns `"entries": null` whenever the spool is
-        /// disabled — the COMMON case, since it is opt-in via JM_SPOOL_ENABLE=1
-        /// — or an early error path is taken, because a nil Go slice marshals
+        /// explicitly disabled (the app enables it by default) or an early
+        /// error path is taken, because a nil Go slice marshals
         /// to JSON `null`. Swift's *synthesized* Codable uses `decode` (not
         /// `decodeIfPresent`) for the non-optional `entries`, so that null
         /// throws valueNotFound and aborts the ENTIRE decode — silently

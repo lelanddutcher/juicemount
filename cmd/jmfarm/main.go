@@ -74,7 +74,8 @@ type passOpts struct {
 	store    *derivatives.Store
 	// process is an injectable seam for accounting tests. Production callers
 	// leave it nil and use farm.Process.
-	process func(*derivatives.Store, string, farm.Options) farm.Result
+	process  func(*derivatives.Store, string, farm.Options) farm.Result
+	progress func(stage string, pct int)
 }
 
 // runPasses dispatches one sweep over targets with the worker pool + live
@@ -131,6 +132,34 @@ func runPasses(po passOpts, targets []string) (processed, failed int, failedTarg
 	process := po.process
 	if process == nil {
 		process = farm.Process
+	}
+	if po.progress != nil {
+		po.progress(po.mode, 0)
+	}
+	stopHeartbeatProgress := make(chan struct{})
+	var heartbeatProgressWG sync.WaitGroup
+	if po.progress != nil {
+		heartbeatProgressWG.Add(1)
+		go func() {
+			defer heartbeatProgressWG.Done()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopHeartbeatProgress:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					done := atomic.LoadInt64(&ok) + atomic.LoadInt64(&fail)
+					pct := 0
+					if len(targets) > 0 {
+						pct = int(done * 100 / int64(len(targets)))
+					}
+					po.progress(po.mode, pct)
+				}
+			}
+		}()
 	}
 
 	// Live progress: while the sweep runs, write farm-status.json every ~3s with an
@@ -362,6 +391,16 @@ targetLoop:
 		}()
 	}
 	wg.Wait()
+	close(stopHeartbeatProgress)
+	heartbeatProgressWG.Wait()
+	if po.progress != nil {
+		done := atomic.LoadInt64(&ok) + atomic.LoadInt64(&fail)
+		pct := 0
+		if len(targets) > 0 {
+			pct = int(done * 100 / int64(len(targets)))
+		}
+		po.progress(po.mode, pct)
+	}
 
 	// Stop the live ticker before the final write so the final status (which clears
 	// in_progress + measures proxy_economics) is the last thing on disk.
@@ -769,10 +808,11 @@ type queueConfig struct {
 	postAlways      bool
 
 	// Manager-config integration (FARM-NODE-CONFIG spec):
-	name    string   // stable worker identity (JM_WORKER_NAME / -name)
-	kinds   []string // declared kinds → per-kind queue drain + watch filter
-	role    string   // auto|server|render; render is admitted only after live probes
-	tDevice string   // whisper compute device (cpu|vulkan|cuda|sycl)
+	name     string                      // stable worker identity (JM_WORKER_NAME / -name)
+	kinds    []string                    // declared kinds → per-kind queue drain + watch filter
+	role     string                      // auto|server|render; render is admitted only after live probes
+	tDevice  string                      // whisper compute device (cpu|vulkan|cuda|sycl)
+	progress func(stage string, pct int) // per-job heartbeat detail; nil outside queue execution
 }
 
 // restartConfigDrift keeps the Manager's restart badge honest. A config
@@ -864,6 +904,7 @@ func runQueue(cfg queueConfig) {
 	fmt.Printf("jmfarm queue: worker %s (name=%q role=%s encoders=%v transcript=%v caps=%v) draining %s (db=%s mount=%s producer=%s)\n",
 		worker.ID, worker.Name, worker.Role, worker.Encoders, worker.TranscriptBackends,
 		worker.Capabilities, cfg.meta, cfg.dbPath, cfg.mount, cfg.producer)
+	_ = q.AppendWorkerLog(ctx, worker.ID, fmt.Sprintf("worker online name=%s role=%s build=%s@%s", worker.Name, worker.Role, worker.BuildVersion, worker.BuildCommit))
 
 	// Stable-name lifecycle control is independent of quality/config updates.
 	// Disable is a durable admission gate: the worker stays visible with a
@@ -872,6 +913,8 @@ func runQueue(cfg queueConfig) {
 	// starts a fresh exact artifact. A job-specific cancel lets disable drain an
 	// active claim back to its same lane without killing the whole process.
 	var nodeDisabled atomic.Bool
+	var nodePaused atomic.Bool
+	var nodeDrain atomic.Bool
 	var restartRequested atomic.Bool
 	var currentJobMu sync.Mutex
 	var cancelCurrentJob context.CancelFunc
@@ -886,6 +929,16 @@ func runQueue(cfg queueConfig) {
 		go func() {
 			defer close(lifecycleDone)
 			for ctx.Err() == nil {
+				// Per-node pause/drain is Manager-owned hot config. Poll it here as
+				// well as in the main loop so a long transcode reports draining within
+				// one control interval rather than only after it completes.
+				if fc, configErr := q.GetConfig(ctx); configErr == nil && fc != nil {
+					eff, _ := fc.ResolveFor(cfg.name)
+					paused, _ := eff["paused"].(bool)
+					drain, _ := eff["drain"].(bool)
+					nodePaused.Store(paused)
+					nodeDrain.Store(drain)
+				}
 				disabled, err := q.WorkerDisabled(ctx, cfg.name)
 				if err != nil && ctx.Err() == nil {
 					fmt.Fprintf(os.Stderr, "jmfarm queue: lifecycle admission poll: %v\n", err)
@@ -945,6 +998,10 @@ func runQueue(cfg queueConfig) {
 
 	applyConfig := func(fc *farmqueue.FarmConfig) {
 		eff, restart := fc.ResolveFor(cfg.name)
+		paused, _ := eff["paused"].(bool)
+		drain, _ := eff["drain"].(bool)
+		nodePaused.Store(paused)
+		nodeDrain.Store(drain)
 		cfgMu.Lock()
 		defer cfgMu.Unlock()
 		appliedRev = fc.Revision
@@ -1025,7 +1082,7 @@ func runQueue(cfg queueConfig) {
 			defer ticker.Stop()
 			for {
 				ctl, ctlErr := q.GetControl(ctx)
-				if ctlErr == nil && !nodeDisabled.Load() && !ctl.Paused && ctl.WatchEnabled {
+				if ctlErr == nil && !nodeDisabled.Load() && !nodePaused.Load() && !nodeDrain.Load() && !ctl.Paused && ctl.WatchEnabled {
 					leader, leaderErr := q.AcquireWatchLeadership(ctx, worker.ID, 45*time.Second)
 					watchLeader.Store(leaderErr == nil && leader)
 				} else {
@@ -1139,10 +1196,15 @@ func runQueue(cfg queueConfig) {
 		// Heartbeat (idle/paused): publish presence so Manager can distinguish a
 		// healthy paused node from an offline one.
 		worker.CurrentJob = ""
+		worker.CurrentActivity = nil
 		worker.State = "idle"
 		if nodeDisabled.Load() {
 			worker.State = "disabled"
 		} else if ctl.Paused {
+			worker.State = "paused"
+		} else if nodeDrain.Load() {
+			worker.State = "draining"
+		} else if nodePaused.Load() {
 			worker.State = "paused"
 		} else if !storagePermitReady {
 			worker.State = "waiting-storage-permit"
@@ -1175,7 +1237,7 @@ func runQueue(cfg queueConfig) {
 			}
 			nextReap = time.Now().Add(15 * time.Second)
 		}
-		if nodeDisabled.Load() || ctl.Paused || !storagePermitReady {
+		if nodeDisabled.Load() || nodePaused.Load() || nodeDrain.Load() || ctl.Paused || !storagePermitReady {
 			select {
 			case <-ctx.Done():
 			case <-time.After(time.Second):
@@ -1204,6 +1266,30 @@ func runQueue(cfg queueConfig) {
 		// Claim the job: stamp current_job on the heartbeat, flip it to running.
 		worker.CurrentJob = job.ID
 		worker.State = "working"
+		activityMu := sync.RWMutex{}
+		activity := farmqueue.WorkerActivity{
+			ID: job.ID, Kind: strings.Join(job.Kinds, ","), Path: job.Path,
+			StartedAt: time.Now().UTC().Format(time.RFC3339), Stage: "claimed",
+		}
+		setActivity := func(stage string, pct int) {
+			if pct < 0 {
+				pct = 0
+			}
+			if pct > 100 {
+				pct = 100
+			}
+			activityMu.Lock()
+			activity.Stage = stage
+			activity.Pct = pct
+			activityMu.Unlock()
+		}
+		snapshotActivity := func() *farmqueue.WorkerActivity {
+			activityMu.RLock()
+			defer activityMu.RUnlock()
+			copy := activity
+			return &copy
+		}
+		worker.CurrentActivity = snapshotActivity()
 		setHeartbeatExtras(&worker)
 		if err := q.Heartbeat(ctx, worker); err != nil && ctx.Err() == nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: heartbeat(claim): %v\n", err)
@@ -1211,6 +1297,7 @@ func runQueue(cfg queueConfig) {
 		if err := q.MarkClaimRunning(ctx, claim, worker); err != nil && ctx.Err() == nil {
 			fmt.Fprintf(os.Stderr, "jmfarm queue: mark-running %s: %v\n", job.ID, err)
 		}
+		_ = q.AppendWorkerLog(ctx, worker.ID, fmt.Sprintf("claimed job %s kind=%s backend=%s", job.ID, strings.Join(job.Kinds, ","), job.SelectedBackend))
 
 		// Keep the heartbeat fresh DURING the job. A big sweep (1000s of files,
 		// proxy/transcript) runs for hours inside runJob; without this the 30s
@@ -1222,13 +1309,21 @@ func runQueue(cfg queueConfig) {
 		hbWorker := worker
 		go func() {
 			defer close(hbDone)
-			t := time.NewTicker(10 * time.Second)
+			t := time.NewTicker(3 * time.Second)
 			defer t.Stop()
 			for {
 				select {
 				case <-hbCtx.Done():
 					return
 				case <-t.C:
+					hbWorker.CurrentActivity = snapshotActivity()
+					if nodeDrain.Load() {
+						hbWorker.State = "draining"
+					} else if nodePaused.Load() {
+						hbWorker.State = "paused"
+					} else {
+						hbWorker.State = "working"
+					}
 					_ = q.Heartbeat(hbCtx, hbWorker)
 					_ = q.RenewClaim(hbCtx, claim)
 				}
@@ -1238,17 +1333,45 @@ func runQueue(cfg queueConfig) {
 		cfgMu.Lock()
 		jobCfg := cfg
 		cfgMu.Unlock()
+		jobCfg.progress = setActivity
 		jobCtx, jobCancel := context.WithCancel(ctx)
 		currentJobMu.Lock()
 		cancelCurrentJob = jobCancel
 		currentJobMu.Unlock()
 		jobStarted := time.Now()
+		var operatorCancel atomic.Bool
+		cancelPollCtx, cancelPollStop := context.WithCancel(ctx)
+		cancelPollDone := make(chan struct{})
+		if requested, cancelErr := q.JobCancellationRequested(cancelPollCtx, job.ID); cancelErr == nil && requested {
+			operatorCancel.Store(true)
+			jobCancel()
+		}
+		go func() {
+			defer close(cancelPollDone)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				requested, err := q.JobCancellationRequested(cancelPollCtx, job.ID)
+				if err == nil && requested {
+					operatorCancel.Store(true)
+					jobCancel()
+					return
+				}
+				select {
+				case <-cancelPollCtx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
 		processed, failed, failedTargets, runErr := runJob(jobCtx, q, store, jobCfg, worker, job)
 		currentJobMu.Lock()
 		cancelCurrentJob = nil
 		currentJobMu.Unlock()
 		jobWasCancelled := jobCtx.Err() != nil
 		jobCancel()
+		cancelPollStop()
+		<-cancelPollDone
 		hbStop()
 		<-hbDone
 		// Backend writeback failure says nothing about codec/device speed or
@@ -1261,6 +1384,19 @@ func runQueue(cfg queueConfig) {
 			// Leave the durable processing receipt intact. A live worker will
 			// recover it after this heartbeat expires.
 			break
+		}
+		if operatorCancel.Load() {
+			if err := q.MarkCanceled(context.Background(), job.ID, job.ProcessedOffset+processed, failed); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: mark-canceled %s: %v\n", job.ID, err)
+				return
+			}
+			if err := q.AckClaim(context.Background(), claim); err != nil {
+				fmt.Fprintf(os.Stderr, "jmfarm queue: ack canceled %s: %v\n", job.ID, err)
+				return
+			}
+			_ = q.ClearJobCancellation(context.Background(), job.ID)
+			_ = q.AppendWorkerLog(context.Background(), worker.ID, fmt.Sprintf("job %s canceled by operator after %d completed", job.ID, job.ProcessedOffset+processed))
+			continue
 		}
 		if nodeDisabled.Load() && jobWasCancelled {
 			if len(failedTargets) > 0 {
@@ -1360,6 +1496,12 @@ func runQueue(cfg queueConfig) {
 		if terminalWritten {
 			if err := q.AckClaim(context.Background(), claim); err != nil {
 				fmt.Fprintf(os.Stderr, "jmfarm queue: ack %s: %v\n", job.ID, err)
+			} else {
+				state := "done"
+				if runErr != nil {
+					state = "failed"
+				}
+				_ = q.AppendWorkerLog(context.Background(), worker.ID, fmt.Sprintf("job %s %s processed=%d failed=%d", job.ID, state, job.ProcessedOffset+processed, failed))
 			}
 		}
 	}
@@ -1416,6 +1558,12 @@ func recordCompletedJobBenchmark(worker *farmqueue.Worker, job farmqueue.Job, pr
 // the summed processed/failed across the selected passes; a non-nil error is a
 // HARD failure (couldn't collect targets / nothing usable) → MarkFailed.
 func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, cfg queueConfig, worker farmqueue.Worker, job farmqueue.Job) (processed, failed int, failedTargets []string, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, nil, err
+	}
+	if cfg.progress != nil {
+		cfg.progress("discovering", 0)
+	}
 	if !farmqueue.WorkerSupports(worker, job.RequiredCapabilities) {
 		return 0, 0, nil, fmt.Errorf("worker %s does not satisfy job capabilities %v", worker.Name, job.RequiredCapabilities)
 	}
@@ -1461,6 +1609,9 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 	}
 	if cErr != nil {
 		return 0, 0, nil, fmt.Errorf("collect %q: %w", job.Path, cErr)
+	}
+	if cfg.progress != nil {
+		cfg.progress("planning", 0)
 	}
 
 	// FARM-3: run the software-only decode classes first (HEVC Rext 4:2:2/4:4:4,
@@ -1647,6 +1798,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 			dryRun: false, verbose: cfg.verbose, effConc: p.effConc,
 			status: cfg.status, mount: cfg.mount, producer: cfg.producer,
 			target: job.Path, gov: gov, store: store,
+			progress: cfg.progress,
 		}, targets)
 		processed += pr
 		failed += pf

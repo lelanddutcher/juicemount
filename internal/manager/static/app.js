@@ -1033,6 +1033,7 @@
 	let farmJobsVisibleLimit = FARM_JOBS_PAGE_SIZE;
 	let farmJobsSnapshot = [];
 	let farmJobsWorkersActive = false;
+	const farmJobControlInFlight = new Set();
 
   function startFarmPolling() {
     initFarmExplainerOnce();
@@ -1220,6 +1221,7 @@
 		if (res.control) renderFarmControl(res.control);
 		const workers = Array.isArray(res.workers) ? res.workers : [];
 		renderFarmActiveBanner(!!res.available, res.queue_depth || 0, farmControlState, workers);
+		renderFarmQueueDepths(res.queue_depths || {});
 		farmJobsSnapshot = Array.isArray(res.jobs) ? res.jobs : [];
 		farmJobsWorkersActive = !!res.available;
 		renderFarmJobsList(farmJobsSnapshot, farmJobsWorkersActive);
@@ -1288,7 +1290,7 @@
 		const workerCount = workers.length;
 		const permitBlocked = workers.filter((worker) => worker && worker.state === 'waiting-storage-permit').length;
 		const eligibleCount = workers.filter((worker) => worker &&
-			!['paused', 'disabled', 'waiting-storage-permit'].includes(worker.state || 'idle')).length;
+			!['paused', 'draining', 'disabled', 'waiting-storage-permit'].includes(worker.state || 'idle')).length;
 		banner.classList.toggle('online', available);
 		banner.classList.toggle('offline', !available);
 		banner.classList.toggle('paused', !!control.paused);
@@ -1300,6 +1302,9 @@
 		} else if (available && eligibleCount === 0 && permitBlocked > 0) {
 			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') +
 				' online — waiting for fresh NAS storage proof';
+		} else if (available && eligibleCount === 0) {
+			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') +
+				' online — paused, draining, or disabled';
 		} else if (available) {
 			text.textContent = workerCount + ' farm node' + (workerCount === 1 ? '' : 's') + ' online — routing by measured capability';
     } else {
@@ -1313,9 +1318,33 @@
     }
   }
 
+	function renderFarmQueueDepths(depths) {
+		const root = $('#farm-queue-depths');
+		if (!root) return;
+		root.replaceChildren();
+		const labels = {
+			'derivatives:render': 'Derivatives · render', 'derivatives:cpu': 'Derivatives · CPU',
+			'proxy:render': 'Proxy · render', 'proxy:cpu': 'Proxy · CPU',
+			'transcript:render': 'Transcript · render', 'transcript:cpu': 'Transcript · CPU',
+			catch_all: 'Compatibility lane',
+		};
+		Object.keys(depths).sort().forEach((key) => {
+			const chip = document.createElement('span');
+			chip.className = 'farm-queue-lane' + (Number(depths[key] || 0) > 0 ? ' active' : '');
+			const name = document.createElement('span');
+			name.textContent = labels[key] || key.replace(':', ' · ');
+			const count = document.createElement('strong');
+			count.textContent = Number(depths[key] || 0).toLocaleString();
+			chip.appendChild(name);
+			chip.appendChild(count);
+			root.appendChild(chip);
+		});
+	}
+
   // FARM_JOB_STATUS_LABEL maps a queue status to readable chip copy.
   const FARM_JOB_STATUS_LABEL = {
     queued: 'Queued', running: 'Running', dispatched: 'Dispatched', done: 'Done', partial: 'Partial', failed: 'Failed',
+		canceled: 'Canceled', 'cancel-requested': 'Cancel pending',
   };
 
   // renderFarmJobsList renders one row per JobStatus, newest first (the backend
@@ -1349,9 +1378,10 @@
     visible.forEach((j) => {
 		const failed = j.failed != null && j.failed !== '' ? Number(j.failed) : null;
 		const rawStatus = j.status || 'queued';
-		const status = rawStatus === 'done' && failed != null && !Number.isNaN(failed) && failed > 0
+		let status = rawStatus === 'done' && failed != null && !Number.isNaN(failed) && failed > 0
 			? 'partial'
 			: rawStatus;
+		if (j.cancel_requested_at && (rawStatus === 'queued' || rawStatus === 'running')) status = 'cancel-requested';
       const li = document.createElement('li');
       li.className = 'farm-job-row';
 
@@ -1431,6 +1461,18 @@
 			parent.textContent = 'split from ' + j.parent_id;
 			meta.appendChild(parent);
 		}
+		if (j.requeue_of) {
+			const origin = document.createElement('span');
+			origin.className = 'farm-job-count telemetry';
+			origin.textContent = 'retry of ' + j.requeue_of;
+			meta.appendChild(origin);
+		}
+		if (j.requeued_as) {
+			const retried = document.createElement('span');
+			retried.className = 'farm-job-count telemetry';
+			retried.textContent = 'requeued as ' + j.requeued_as;
+			meta.appendChild(retried);
+		}
 		for (const [label, value] of [['backend', j.backend], ['target', j.target_worker], ['running on', j.worker]]) {
 			if (!value || (label === 'target' && value === j.worker)) continue;
 			const detail = document.createElement('span');
@@ -1462,6 +1504,35 @@
         li.appendChild(errEl);
       }
 
+		const action = document.createElement('div');
+		action.className = 'farm-job-actions';
+		const actionStatus = document.createElement('span');
+		actionStatus.className = 'farm-job-action-status';
+		actionStatus.setAttribute('role', 'status');
+		const busy = farmJobControlInFlight.has(j.id);
+		if ((rawStatus === 'queued' || rawStatus === 'running') && !j.cancel_requested_at) {
+			const cancel = document.createElement('button');
+			cancel.type = 'button';
+			cancel.className = 'btn btn-sm';
+			cancel.textContent = 'Cancel job';
+			cancel.disabled = busy;
+			cancel.addEventListener('click', () => controlFarmJob(j.id, 'cancel', actionStatus, cancel));
+			action.appendChild(cancel);
+		} else if (rawStatus === 'failed' && !j.requeued_as) {
+			const requeue = document.createElement('button');
+			requeue.type = 'button';
+			requeue.className = 'btn btn-sm';
+			requeue.textContent = 'Requeue failed job';
+			requeue.disabled = busy;
+			requeue.title = 'Creates one new job from the exact failed payload; the original remains terminal.';
+			requeue.addEventListener('click', () => controlFarmJob(j.id, 'requeue', actionStatus, requeue));
+			action.appendChild(requeue);
+		}
+		if (action.childNodes.length) {
+			action.appendChild(actionStatus);
+			li.appendChild(action);
+		}
+
       list.appendChild(li);
     });
 	renderFarmJobsPagination(ordered.length, visible.length);
@@ -1480,6 +1551,31 @@
 				: 'Show older';
 		}
 		if (collapse) collapse.hidden = shown <= FARM_JOBS_PAGE_SIZE;
+	}
+
+	async function controlFarmJob(id, action, status, button) {
+		const prompt = action === 'cancel'
+			? `Cancel job ${id}? The worker will stop cooperatively and preserve completed outputs.`
+			: `Requeue failed job ${id} from its exact durable payload?`;
+		if (!confirm(prompt)) return;
+		farmJobControlInFlight.add(id);
+		button.disabled = true;
+		status.classList.remove('ok', 'error');
+		status.textContent = action === 'cancel' ? 'Requesting cooperative cancel…' : 'Creating exact retry…';
+		try {
+			const result = await api('POST', '/api/farm/job/' + encodeURIComponent(id) + '/' + action);
+			status.classList.add('ok');
+			status.textContent = action === 'cancel'
+				? 'Cancellation requested; waiting for terminal acknowledgment.'
+				: ('Queued as ' + result.id + (result.created === false ? ' (already created)' : ''));
+			await loadFarmJobs();
+		} catch (error) {
+			status.classList.add('error');
+			status.textContent = error && error.message ? error.message : String(error);
+		} finally {
+			farmJobControlInFlight.delete(id);
+			button.disabled = false;
+		}
 	}
 
   // farmRelativeTime renders an RFC3339 timestamp as a calm "just now / 5 min
@@ -4002,11 +4098,22 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 			if (Number(bench.transcript_x_realtime) > 0) metric('AI × realtime', Number(bench.transcript_x_realtime).toFixed(2));
 			if (Number(bench.jobs_completed) > 0) metric('jobs observed', Number(bench.jobs_completed).toLocaleString());
 			if (metrics.childNodes.length) row.appendChild(metrics);
-			if (w.current_job) {
+			if (w.current_activity || w.current_job) {
 				const current = document.createElement('p');
 				current.className = 'farm-worker-current';
-				current.textContent = 'Current job ' + w.current_job;
+				const activity = w.current_activity || { id: w.current_job };
+				const parts = ['Current job ' + (activity.id || w.current_job)];
+				if (activity.kind) parts.push(activity.kind);
+				if (activity.stage) parts.push(activity.stage);
+				if (Number.isFinite(Number(activity.pct))) parts.push(Math.max(0, Math.min(100, Number(activity.pct))) + '%');
+				current.textContent = parts.join(' · ');
 				row.appendChild(current);
+				if (activity.path) {
+					const currentPath = document.createElement('p');
+					currentPath.className = 'farm-worker-current-path';
+					currentPath.textContent = activity.path;
+					row.appendChild(currentPath);
+				}
 			}
 			if (w.config_revision) {
         const rev = document.createElement('span');
@@ -4035,13 +4142,27 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 			actionStatus.setAttribute('role', 'status');
 			if (nodeName) {
 				const disabled = w.state === 'disabled';
-				const admission = document.createElement('button');
-				admission.type = 'button';
-				admission.className = 'btn btn-sm';
-				admission.textContent = disabled ? 'Enable node' : 'Disable node';
-				admission.setAttribute('aria-label', `${disabled ? 'Enable' : 'Disable'} farm node ${nodeName}`);
-				admission.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', disabled ? 'enable' : 'disable', actionStatus, [admission]));
-				actions.appendChild(admission);
+				const lifecycleButtons = [];
+				if (disabled) {
+					const legacyEnable = document.createElement('button');
+					legacyEnable.type = 'button';
+					legacyEnable.className = 'btn btn-sm';
+					legacyEnable.textContent = 'Enable legacy node';
+					legacyEnable.title = 'Clears the pre-0.5 emergency-disable flag.';
+					legacyEnable.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', 'enable', actionStatus, [legacyEnable]));
+					lifecycleButtons.push(legacyEnable);
+					actions.appendChild(legacyEnable);
+				} else if (w.state === 'paused' || w.state === 'draining') {
+					const resume = farmNodeActionButton(nodeName, 'resume', 'Resume node', actionStatus, lifecycleButtons);
+					lifecycleButtons.push(resume);
+					actions.appendChild(resume);
+				} else {
+					const pause = farmNodeActionButton(nodeName, 'pause', 'Pause node', actionStatus, lifecycleButtons);
+					const drain = farmNodeActionButton(nodeName, 'drain', 'Drain node', actionStatus, lifecycleButtons);
+					lifecycleButtons.push(pause, drain);
+					actions.appendChild(pause);
+					actions.appendChild(drain);
+				}
 
 				const restart = document.createElement('button');
 				restart.type = 'button';
@@ -4050,16 +4171,77 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 				restart.setAttribute('aria-label', `Restart farm node ${nodeName}`);
 				restart.disabled = disabled;
 				restart.title = disabled ? 'Enable the node before requesting a restart' : 'Acknowledged by the worker before its durable claim is released';
-				restart.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', 'restart', actionStatus, [admission, restart]));
+				restart.addEventListener('click', () => controlFarmWorker(nodeName, w.id || '', 'restart', actionStatus, [...lifecycleButtons, restart]));
 				actions.appendChild(restart);
 			} else {
 				actionStatus.textContent = 'Set a stable worker name to enable lifecycle controls.';
 			}
 			actions.appendChild(actionStatus);
 			row.appendChild(actions);
+			if (nodeName) row.appendChild(farmWorkerLogDetails(nodeName));
 			list.appendChild(row);
     }
   }
+
+	function farmNodeActionButton(name, action, label, status, buttonGroup) {
+		const button = document.createElement('button');
+		button.type = 'button';
+		button.className = 'btn btn-sm';
+		button.textContent = label;
+		button.title = action === 'drain'
+			? 'Finish current work, then stop claiming new jobs.'
+			: action === 'pause' ? 'Stop claiming new jobs immediately; current work continues.' : 'Allow this node to claim work again.';
+		button.addEventListener('click', () => controlFarmNode(name, action, status, buttonGroup));
+		return button;
+	}
+
+	async function controlFarmNode(name, action, status, buttons) {
+		farmWorkerControlInFlight = true;
+		buttons.forEach((button) => { button.disabled = true; });
+		status.classList.remove('ok', 'error');
+		status.textContent = action === 'drain' ? 'Requesting drain…' : `${action === 'pause' ? 'Pausing' : 'Resuming'}…`;
+		try {
+			const result = await api('POST', '/api/farm/node/' + encodeURIComponent(name) + '/' + action);
+			status.classList.add('ok');
+			status.textContent = action === 'drain'
+				? 'Drain requested; active work may finish before the node stands by.'
+				: `${action === 'pause' ? 'Pause' : 'Resume'} applied in config r${result.revision}.`;
+		} catch (error) {
+			status.classList.add('error');
+			status.textContent = error && error.message ? error.message : String(error);
+		} finally {
+			buttons.forEach((button) => { button.disabled = false; });
+			farmWorkerControlInFlight = false;
+			setTimeout(loadFarmWorkers, 600);
+		}
+	}
+
+	function farmWorkerLogDetails(name) {
+		const details = document.createElement('details');
+		details.className = 'farm-worker-log';
+		const summary = document.createElement('summary');
+		summary.textContent = 'Worker log · latest 200 lines';
+		const pre = document.createElement('pre');
+		pre.textContent = 'Open to load the live bounded tail.';
+		details.appendChild(summary);
+		details.appendChild(pre);
+		let loaded = false;
+		details.addEventListener('toggle', async () => {
+			if (!details.open || loaded) return;
+			pre.textContent = 'Loading…';
+			try {
+				const result = await api('GET', '/api/farm/node/' + encodeURIComponent(name) + '/log');
+				const lines = Array.isArray(result.lines) ? result.lines : [];
+				pre.textContent = lines.length
+					? lines.map((entry) => `${entry.at || ''} ${entry.line || ''}`.trim()).join('\n')
+					: 'No worker log lines have been published yet.';
+				loaded = true;
+			} catch (error) {
+				pre.textContent = 'Log unavailable: ' + (error && error.message ? error.message : String(error));
+			}
+		});
+		return details;
+	}
 
 	async function controlFarmWorker(name, previousID, action, status, buttons) {
 		const prompt = action === 'restart'

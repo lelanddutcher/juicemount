@@ -2090,9 +2090,10 @@ struct MenuPopoverView: View {
                 action: { forceEjectMount() }
             )
 
-            // Sparkle auto-updater. Manual trigger; background checks run on
-            // their own schedule (SUScheduledCheckInterval). The handler
-            // brings the accessory app forward so the update sheet is visible.
+            // Sparkle updater. Manual-only by privacy policy: the controller is
+            // not started until this action, and Info.plist disables automatic
+            // checks. The handler brings the accessory app forward so the
+            // update sheet is visible.
             ActionButton(
                 title: "Check for Updates…",
                 systemImage: "arrow.down.circle",

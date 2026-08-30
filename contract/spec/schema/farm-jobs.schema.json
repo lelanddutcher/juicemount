@@ -4,7 +4,7 @@
   "title": "GET /farm/jobs — farm worker presence + recent jobs (response)",
   "description": "The producer's read-back view. `available` = at least one heartbeating worker, including a deliberately paused farm. Counts are typed JSON ints even though the worker keeps a stringified Redis HASH internally. Capability, benchmark, routing, and control properties are additive RC fields.",
   "type": "object",
-  "required": ["available", "workers", "queue_depth", "jobs"],
+  "required": ["available", "workers", "queue_depth", "queue_depths", "jobs"],
   "properties": {
     "available": { "type": "boolean" },
     "queue_depth": { "type": "integer" },
@@ -18,11 +18,23 @@
           "started_at": { "type": "string" },
           "last_seen": { "type": "string" },
           "current_job": { "type": ["string", "null"] }
+          ,"current_activity": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": { "type": "string" },
+              "kind": { "type": "string" },
+              "path": { "type": "string" },
+              "started_at": { "type": "string" },
+              "stage": { "type": "string" },
+              "pct": { "type": "integer", "minimum": 0, "maximum": 100 }
+            }
+          }
           ,"build_version": { "type": "string" }
           ,"build_commit": { "type": "string" }
           ,"name": { "type": "string" }
           ,"role": { "type": "string", "enum": ["server", "render"] }
-          ,"state": { "type": "string", "enum": ["idle", "working", "paused", "disabled"] }
+          ,"state": { "type": "string", "enum": ["idle", "working", "paused", "draining", "disabled", "waiting-storage-permit"] }
           ,"kinds": { "type": "array", "items": { "type": "string" } }
           ,"capabilities": { "type": "array", "items": { "type": "string" } }
           ,"encoders": { "type": "array", "items": { "type": "string" } }
@@ -63,7 +75,7 @@
         "required": ["id", "status", "path", "kinds", "producer"],
         "properties": {
           "id": { "type": "string" },
-          "status": { "type": "string", "enum": ["queued", "running", "dispatched", "done", "failed"] },
+          "status": { "type": "string", "enum": ["queued", "running", "dispatched", "done", "failed", "canceled"] },
           "path": { "type": "string" },
           "kinds": { "type": "string", "description": "Comma-joined request set." },
           "producer": { "type": "string", "enum": ["openloupe", "manager", "farm-watch", "farm-watch-backstop"] },
@@ -77,9 +89,19 @@
           "target_worker": { "type": "string" },
           "backend": { "type": "string" },
           "queue_class": { "type": "string", "enum": ["server", "render", "cpu"] },
-          "attempts": { "type": "integer" }
+          "attempts": { "type": "integer" },
+          "hardware_failures": { "type": "integer" },
+          "parent_id": { "type": "string" },
+          "derivative_pass": { "type": "string" },
+          "requeue_of": { "type": "string" },
+          "requeued_as": { "type": "string" },
+          "cancel_requested_at": { "type": "string" }
         }
       }
+    },
+    "queue_depths": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
     },
     "control": {
       "type": "object",

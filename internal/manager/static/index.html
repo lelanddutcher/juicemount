@@ -22,9 +22,7 @@
   <div class="layout">
     <!-- Sidebar nav. Hash-route driven: clicking an entry sets
          location.hash to "#/<name>" and app.js swaps the visible
-         <section data-tab>. SLICE 0 ships Migrations functional;
-         every other entry is a "Coming soon" placeholder so the
-         routing skeleton is testable before later slices land. -->
+         <section data-tab>. -->
     <nav id="sidebar" class="sidebar" aria-label="Manager sections">
       <ul class="sidebar-list">
         <li class="sidebar-heading" aria-hidden="true">Monitor</li>
@@ -185,6 +183,7 @@
             <span id="farm-active-text" class="farm-active-text">Checking the farm…</span>
             <span id="farm-active-depth" class="farm-active-depth" hidden></span>
           </div>
+          <div id="farm-queue-depths" class="farm-queue-depths" aria-label="Queue depth by processing lane"></div>
 
           <div class="farm-control-deck" aria-label="Farm queue controls">
             <button id="farm-queue-toggle" class="farm-transport" type="button" disabled>
@@ -365,7 +364,7 @@
               <h4 class="farm-jobs-title">Recent jobs</h4>
               <div class="farm-jobs-toolbar">
                 <span id="farm-jobs-summary" class="farm-jobs-summary" role="status"></span>
-                <button id="farm-jobs-clear" class="farm-jobs-clear" type="button" title="Remove finished (done/failed) jobs from this list. Running and queued jobs are kept.">Clear finished</button>
+                <button id="farm-jobs-clear" class="farm-jobs-clear" type="button" title="Remove terminal (done/failed/canceled) jobs from this list. Running and queued jobs are kept.">Clear finished</button>
               </div>
             </div>
             <span id="farm-jobs-clear-flash" class="farm-jobs-flash" hidden></span>

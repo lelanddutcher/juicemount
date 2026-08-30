@@ -114,7 +114,8 @@ for i = 5, #KEYS do
 				job.selected_worker = ARGV[5]
 				raw = cjson.encode(job)
 				if job.id then
-					redis.call('HSET', 'juicefarm:job:' .. job.id, 'target_worker', ARGV[5])
+					redis.call('HSET', 'juicefarm:job:' .. job.id,
+						'target_worker', ARGV[5], 'payload', raw)
 				end
 			end
 			redis.call('LPUSH', KEYS[4], raw)
@@ -282,7 +283,7 @@ if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[2])
   redis.call('HSET', KEYS[3], 'status', 'queued', 'backend', ARGV[3],
 	'target_worker', ARGV[4], 'queue_class', ARGV[5], 'attempts', ARGV[6],
-	'hardware_failures', ARGV[7], 'error', ARGV[8])
+	'hardware_failures', ARGV[7], 'error', ARGV[8], 'payload', ARGV[2])
 	redis.call('HDEL', KEYS[3], 'unserviceable_since')
   return 1
 end
@@ -400,7 +401,8 @@ func (c *Client) PromoteServiceableReady(ctx context.Context) (int, error) {
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[2])
   redis.call('HSET', KEYS[3], 'status', 'queued', 'worker', '',
-    'backend', ARGV[3], 'target_worker', ARGV[4], 'queue_class', ARGV[5], 'error', ARGV[6])
+	'backend', ARGV[3], 'target_worker', ARGV[4], 'queue_class', ARGV[5],
+	'error', ARGV[6], 'payload', ARGV[2])
   redis.call('HDEL', KEYS[3], 'lease_owner', 'lease_expires_at', 'finished_at')
   return 1
 end
@@ -600,7 +602,8 @@ redis.call('ZREM', KEYS[3], ARGV[3])
 redis.call('HSET', KEYS[4],
   'status', 'queued', 'worker', '', 'backend', ARGV[4],
   'target_worker', ARGV[5], 'queue_class', ARGV[6], 'attempts', ARGV[7],
-  'hardware_failures', ARGV[8], 'error', ARGV[9], 'processed', ARGV[11], 'failed', '0')
+  'hardware_failures', ARGV[8], 'error', ARGV[9], 'processed', ARGV[11], 'failed', '0',
+  'payload', ARGV[12])
 redis.call('HDEL', KEYS[4], 'lease_owner', 'lease_expires_at', 'finished_at')
 if redis.call('LLEN', KEYS[1]) == 0 then
   redis.call('SREM', KEYS[5], ARGV[10])
@@ -610,7 +613,7 @@ return 1`
 		processingKey, target, LeaseIndexKey, JobHashPrefix + job.ID, ProcessingIndexKey,
 	}, claim.Raw, string(raw), job.ID, job.SelectedBackend, job.SelectedWorker, job.QueueClass,
 		strconv.Itoa(job.Attempts), strconv.Itoa(job.HardwareFailures), reason,
-		claim.WorkerID, strconv.Itoa(job.ProcessedOffset)).Int()
+		claim.WorkerID, strconv.Itoa(job.ProcessedOffset), string(raw)).Int()
 	if err != nil {
 		return err
 	}
@@ -662,7 +665,7 @@ func (c *Client) RecoverAbandonedWorkers(ctx context.Context) (int, error) {
 				_ = c.rdb.Del(ctx, lock).Err()
 				return total, statusErr
 			}
-			if status == StatusDone || status == StatusFailed || status == StatusDispatched {
+			if status == StatusDone || status == StatusFailed || status == StatusCanceled || status == StatusDispatched {
 				// Terminal/dispatched status was committed before the original
 				// worker lost its ACK response or heartbeat. The status is the
 				// durable execution proof; requeueing this receipt would run or

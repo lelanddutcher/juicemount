@@ -8,7 +8,7 @@ JuiceMount is pre-1.0 (currently the `v0.1.x` beta line). Security fixes land on
 
 | Version | Supported |
 |---|---|
-| latest `v0.1.x` release / `main` | yes |
+| latest release / `main` | yes |
 | anything older | no — please update first |
 
 ## Reporting a vulnerability
@@ -38,5 +38,5 @@ Out of scope, and worth knowing before you deploy:
 
 ## What JuiceMount does not do
 
-- **No telemetry.** The app talks only to the Redis and S3 endpoints you configure plus a loopback control plane on `127.0.0.1`; JuiceFS's own usage reporting is disabled with `--no-usage-report`. No analytics, crash reporting, or update checks. ("No telemetry without opt-in" is a stated project non-negotiable.)
+- **No silent telemetry or update checks.** Automatic app traffic is limited to the Redis and S3 endpoints you configure plus a loopback control plane on `127.0.0.1`; JuiceFS usage reporting is disabled with `--no-usage-report`. There is no analytics or crash reporting. The app contacts its signed GitHub release feed only when the user explicitly chooses **Check for Updates…**.
 - **No data leaves your hardware** unless you point the object store at a cloud bucket yourself.

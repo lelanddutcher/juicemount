@@ -143,7 +143,7 @@ The editor-facing half is simple: a Finder volume. The half that makes it fast i
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/arch-diagram-dark.svg">
-  <img src="assets/readme/arch-diagram-light.svg" alt="Architecture: Finder, Resolve, and Premiere open files on /Volumes/(name) through the macOS NFS client, served by the JuiceMount app's localhost-only NFS server. An SQLite mirror, an SSD cache with pins, and an opt-in write spool keep the hot path local. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your server, where MinIO or any S3-compatible store holds file data in JuiceFS's open chunk format and Redis holds file metadata" width="100%">
+  <img src="assets/readme/arch-diagram-light.svg" alt="Architecture: Finder, Resolve, and Premiere open files on /Volumes/(name) through the macOS NFS client, served by the JuiceMount app's localhost-only NFS server. An SQLite mirror, an SSD cache with pins, and a default-on write spool keep the hot path local. Behind the app, a hidden JuiceFS FUSE mount crosses your LAN or WAN to your server, where MinIO or any S3-compatible store holds file data in JuiceFS's open chunk format and Redis holds file metadata" width="100%">
 </picture>
 
 Your NLE talks to a normal Finder volume: an **NFS share served from `127.0.0.1`, tuned for the way Finder hammers metadata.** Behind it, the hot path stays on your Mac:
@@ -225,7 +225,7 @@ Pin what you need first (popover → *Pin Folder for Offline…*, or Finder righ
 
 **What happens to my writes if the network drops or the server dies mid-copy?**
 
-With the write spool enabled (Preferences → Cache & Storage), a write is acknowledged the moment it's durable on local SSD; a background drainer uploads it once the server is reachable, SHA-256-verified at every hop. The popover shows pending / in-flight / stalled / failed uploads with per-entry age and last error, offers *Retry failed* and *Recover stalled*, and the app guards quit and spool-disable while uploads are pending so spooled data isn't stranded. With the spool off (the default), writes go through to the server synchronously — if the backend is unreachable, the write fails the way it would on any network drive. Note that offline-files mode gates *reads*; it doesn't make un-spooled writes safe. <!-- sources: docs/dev-setup.md (write path), MENU_BAR_APP.md (spool UI); the offline open gate in nfs/handler.go applies to reads only -->
+The write spool is on by default and can be changed in Preferences → Cache & Storage. A write is acknowledged the moment it's durable on local SSD; a background drainer uploads it once the server is reachable, SHA-256-verified at every hop. The popover shows pending / in-flight / stalled / failed uploads with per-entry age and last error, offers *Retry failed* and *Recover stalled*, and the app guards quit and spool-disable while uploads are pending so spooled data isn't stranded. If you explicitly turn the spool off, writes go through to the server synchronously — if the backend is unreachable, the write fails the way it would on any network drive. Note that offline-files mode gates *reads*; it doesn't make un-spooled writes safe. <!-- sources: Preferences.swift default and persistence semantics; docs/dev-setup.md (write path); MENU_BAR_APP.md (spool UI); the offline open gate in nfs/handler.go applies to reads only -->
 
 **Can two Macs mount the same volume?**
 
@@ -256,7 +256,7 @@ JuiceMount is built on JuiceFS and says so loudly (see the credit section below 
 <details>
 <summary><strong>Does it phone home?</strong></summary>
 
-No. The app's network connections are the Redis and S3 endpoints you configure, plus a loopback control plane on `127.0.0.1`. JuiceFS's own anonymous usage reporting is explicitly disabled — the app passes `--no-usage-report` when mounting. There's no crash reporting, no update check, no analytics; "no telemetry without opt-in" is a stated non-negotiable (see [Contributing](#contributing)). Diagnostics exist only as a local zip you create yourself with Export Diagnostics and choose to share. <!-- verified: health/fuse.go passes the no-usage-report flag to juicefs mount; the app's only URLSession targets are loopback control-plane routes -->
+No background connection phones home. The app's automatic network activity is limited to the Redis and S3 endpoints you configure plus a loopback control plane on `127.0.0.1`. JuiceFS's anonymous usage reporting is explicitly disabled with `--no-usage-report`; there is no crash reporting or analytics. The only exception is the explicit **Check for Updates…** command, which contacts the signed GitHub release feed when you click it. Diagnostics remain a local zip you create and choose whether to share. <!-- verified: health/fuse.go; Info.plist SUEnableAutomaticChecks=false; MenuBarController starts Sparkle only in checkForUpdates() -->
 
 </details>
 

@@ -88,12 +88,10 @@
 		</dict>
 	</array>
 	<key>SUEnableAutomaticChecks</key>
-	<true/>
+	<false/>
 	<key>SUFeedURL</key>
 	<string>https://github.com/lelanddutcher/juicemount/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>/YW+9b1o9nmwtEFTaUxMCCTZliWp0wmgMmxTwp0Zg/Y=</string>
-	<key>SUScheduledCheckInterval</key>
-	<integer>86400</integer>
 </dict>
 </plist>

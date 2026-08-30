@@ -14,6 +14,16 @@ permissions:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -22,6 +32,11 @@ jobs:
           cache: true
       - name: Unit and integration-safe tests
         run: go test -count=1 ./...
+      - name: Redis-backed farm durability tests
+        env:
+          JM_FARM_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+          JM_FARM_TEST_REDIS_FLUSH: '1'
+        run: go test -count=1 ./internal/farmqueue
       - name: Static analysis
         run: go vet ./...
       - name: Reachable vulnerability scan
@@ -29,6 +44,8 @@ jobs:
       - name: Shell, JavaScript, compose, and deployment tests
         env:
           JM_ADMIN_KEY: ci-only-placeholder-not-a-secret-value
+          MINIO_ROOT_PASSWORD: ci-only-placeholder-not-a-secret-value
+          JM_FARM_STORAGE_CAPACITY_BYTES: '1099511627776'
           JM_MANAGER_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
           JM_FARM_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
           JM_FARM_RENDER_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
