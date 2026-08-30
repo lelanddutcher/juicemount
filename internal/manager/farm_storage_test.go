@@ -135,3 +135,22 @@ func TestFarmRequiredHeadroomScalesWithPool(t *testing.T) {
 		t.Fatalf("configured required = %d, want 1234", got)
 	}
 }
+
+func TestFarmStorageGuardUsesConfiguredPhysicalCapacity(t *testing.T) {
+	q := &storageGuardFarmQueue{}
+	a := &API{
+		farmQ: q, farmStoragePath: "/backend", farmStorageCapacity: 100000,
+		farmMinFree: 100,
+		farmStorageStat: func(string) (farmStorageSnapshot, error) {
+			return farmStorageSnapshot{TotalBytes: 2000, AvailableBytes: 5000}, nil
+		},
+	}
+	gate := a.enforceFarmStorageGuard(context.Background())
+	if !gate.Safe || gate.TotalBytes != 100000 || gate.FilesystemTotalBytes != 2000 ||
+		gate.AvailableBytes != 5000 || gate.CapacitySource != "configured" {
+		t.Fatalf("gate = %+v", gate)
+	}
+	if q.lastPermit.TotalBytes != 100000 {
+		t.Fatalf("permit = %+v", q.lastPermit)
+	}
+}

@@ -204,6 +204,10 @@ services:
       JM_FARM_STATUS: "/farmstate/farm-status.json"
       # Optional explicit override; zero keeps max(64 GiB, 1% of filesystem).
       JM_FARM_MIN_FREE_BYTES: "0"
+      # ZFS statfs is dataset-scoped and cannot report the parent zpool total.
+      # Set this to `zpool list -Hp -o size <pool>` for exact total-capacity
+      # reporting and a correctly scaled default 1% reserve.
+      JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:-0}"
       # Processing-node enrollment fails closed until this is set to the Redis
       # endpoint a node can actually reach. Never use the docker-only `redis`
       # hostname here. The optional image overrides are useful with a registry;
@@ -307,6 +311,9 @@ services:
       # -root sweep every JM_FARM_INTERVAL seconds (the pre-JM-16 behavior).
       JM_FARM_INTERVAL: "900"
       JM_FARM_WORKERS: "4"
+      # Same physical-pool total used by Manager's capacity proof. The worker
+      # continues to take AVAILABLE bytes from statfs on /state.
+      JM_FARM_STORAGE_CAPACITY_BYTES: "${JM_FARM_STORAGE_CAPACITY_BYTES:-0}"
     volumes:
       - /mnt/zSSD/juicemount/cache:/jfs-cache         # shares the SSD cache dataset
       - /mnt/zSSD/juicemount/juicefarm-state:/state   # server-side derivatives index

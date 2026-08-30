@@ -193,7 +193,23 @@ func TestProxyFreshDoesNotTreatH264AsHEVC(t *testing.T) {
 	if proxyFresh(store, inode, hash, size, Options{
 		Mount: mount, ProxyVCodec: "hevc_vaapi", PreserveHEVCOnFallback: true,
 	}) {
-		t.Fatal("H.264 must not satisfy an HEVC job; the returning GPU should upgrade it")
+		t.Fatal("an explicit HEVC run must retain exact-codec semantics")
+	}
+}
+
+func TestProxyFreshQueuePreservesCurrentH264InsteadOfPromoting(t *testing.T) {
+	store, mount, inode, hash, size := seedFreshProxy(t, "h264")
+	if !proxyFresh(store, inode, hash, size, Options{
+		Mount: mount, ProxyVCodec: "hevc_vaapi", PreserveExistingProxy: true,
+		FFprobeBin: fakeFFprobeCodec(t, "h264"),
+	}) {
+		t.Fatal("automatic HEVC sweep must preserve a current, proven H.264 proxy")
+	}
+	if proxyFresh(store, inode, hash, size, Options{
+		Mount: mount, ProxyVCodec: "hevc_vaapi", PreserveExistingProxy: true,
+		FFprobeBin: fakeFFprobeCodec(t, "hevc"),
+	}) {
+		t.Fatal("cross-codec preservation trusted a row whose bytes probe differently")
 	}
 }
 

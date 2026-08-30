@@ -8,6 +8,19 @@ takes a Docker Compose YAML and runs it as a native TrueNAS app.
 
 ## Before you start
 
+If this installation uses ZFS periodic snapshots, exclude the MinIO bucket dataset
+from recursive snapshots of the parent pool (for the default layout,
+`zSSD/juicemount/bucket`). JuiceFS already owns file/trash history in metadata; ZFS
+snapshots of the object bucket retain deleted slice blocks after GC and can consume
+the pool without increasing visible JuiceFS usage. Back up JuiceFS using a coordinated
+metadata-and-object procedure instead of treating an isolated bucket snapshot as a
+filesystem rollback.
+
+Set `JM_FARM_STORAGE_CAPACITY_BYTES` to the numeric result of
+`zpool list -Hp -o size <pool>` for exact Farm total-capacity reporting. ZFS `statfs`
+is dataset-scoped, although its available-byte value still reflects shared pool
+headroom.
+
 Create three datasets in TrueNAS (Datasets → Add Dataset):
 
 | Dataset | What it holds | Sized for |

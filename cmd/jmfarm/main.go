@@ -623,28 +623,29 @@ func main() {
 				}
 				return ""
 			}(),
-			storageMinFree: farmEnvUint64("JM_FARM_MIN_FREE_BYTES", 0),
-			verbose:        *verbose,
-			conc:           *conc,
-			pConc:          *pConc,
-			vcodec:         *vcodec,
-			crf:            *pCRF,
-			preset:         *pPreset,
-			wModel:         *wModel,
-			wBin:           *wBin,
-			thumbDim:       *thumbDim,
-			filmCell:       *filmCell,
-			waveSPP:        *waveSPP,
-			minSize:        minSizeBytes,
-			gNice:          *gNice,
-			gIONice:        *gIONice,
-			qlMaxDim:       *qlDim,
-			qlSecs:         *qlSecs,
-			postAlways:     *postAlways,
-			name:           *wName,
-			kinds:          splitKinds(*wKinds),
-			role:           strings.ToLower(strings.TrimSpace(*wRole)),
-			tDevice:        *wDevice,
+			storageMinFree:  farmEnvUint64("JM_FARM_MIN_FREE_BYTES", 0),
+			storageCapacity: farmEnvUint64("JM_FARM_STORAGE_CAPACITY_BYTES", 0),
+			verbose:         *verbose,
+			conc:            *conc,
+			pConc:           *pConc,
+			vcodec:          *vcodec,
+			crf:             *pCRF,
+			preset:          *pPreset,
+			wModel:          *wModel,
+			wBin:            *wBin,
+			thumbDim:        *thumbDim,
+			filmCell:        *filmCell,
+			waveSPP:         *waveSPP,
+			minSize:         minSizeBytes,
+			gNice:           *gNice,
+			gIONice:         *gIONice,
+			qlMaxDim:        *qlDim,
+			qlSecs:          *qlSecs,
+			postAlways:      *postAlways,
+			name:            *wName,
+			kinds:           splitKinds(*wKinds),
+			role:            strings.ToLower(strings.TrimSpace(*wRole)),
+			tDevice:         *wDevice,
 		})
 		return
 	}
@@ -740,31 +741,32 @@ func main() {
 // queueConfig carries the run-default flags into the standing worker loop. A
 // drained job's options override the matching field where it is non-zero.
 type queueConfig struct {
-	meta           string
-	dbPath         string
-	mount          string
-	producer       string
-	version        int
-	status         string
-	storagePath    string
-	storageMinFree uint64
-	verbose        bool
-	conc           int
-	pConc          int
-	vcodec         string
-	crf            int
-	preset         string
-	wModel         string
-	wBin           string
-	thumbDim       int
-	filmCell       int
-	waveSPP        int
-	minSize        int64 // skip media smaller than this (bytes); 0 = no minimum
-	gNice          int
-	gIONice        int
-	qlMaxDim       int // QL preview fit box px (T1.1/F4)
-	qlSecs         int // QL preview duration cap s (<=0 → default 20)
-	postAlways     bool
+	meta            string
+	dbPath          string
+	mount           string
+	producer        string
+	version         int
+	status          string
+	storagePath     string
+	storageMinFree  uint64
+	storageCapacity uint64
+	verbose         bool
+	conc            int
+	pConc           int
+	vcodec          string
+	crf             int
+	preset          string
+	wModel          string
+	wBin            string
+	thumbDim        int
+	filmCell        int
+	waveSPP         int
+	minSize         int64 // skip media smaller than this (bytes); 0 = no minimum
+	gNice           int
+	gIONice         int
+	qlMaxDim        int // QL preview fit box px (T1.1/F4)
+	qlSecs          int // QL preview duration cap s (<=0 → default 20)
+	postAlways      bool
 
 	// Manager-config integration (FARM-NODE-CONFIG spec):
 	name    string   // stable worker identity (JM_WORKER_NAME / -name)
@@ -1091,7 +1093,8 @@ func runQueue(cfg queueConfig) {
 		// Render claim admission checks that permit in the same Lua transaction
 		// that moves a job into its durable processing list.
 		if worker.Role == farmqueue.QueueClassServer && cfg.storagePath != "" {
-			headroom, probeErr := checkWorkerStorageHeadroom(cfg.storagePath, cfg.storageMinFree)
+			headroom, probeErr := checkWorkerStorageHeadroom(
+				cfg.storagePath, cfg.storageMinFree, cfg.storageCapacity)
 			unsafe := probeErr != nil || headroom.Available < headroom.Required
 			if unsafe {
 				if revokeErr := q.RevokeStoragePermit(ctx); revokeErr != nil {
@@ -1605,9 +1608,13 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 		// directory retry must fill only the files hardware could not publish;
 		// existing HEVC results are already better and must not be downgraded.
 		PreserveHEVCOnFallback: job.QueueClass == farmqueue.QueueClassCPU && vcodec == "libx264",
-		MinBlobSizeBytes:       cfg.minSize,
-		PosterAlways:           cfg.postAlways,
-		QLMaxDim:               cfg.qlMaxDim, QLSeconds: cfg.qlSecs,
+		// Automatic sweeps fill missing output; they do not silently migrate a
+		// current proxy between codecs. On JuiceFS, every such replacement keeps
+		// the old slices for the trash-retention window and can consume terabytes.
+		PreserveExistingProxy: true,
+		MinBlobSizeBytes:      cfg.minSize,
+		PosterAlways:          cfg.postAlways,
+		QLMaxDim:              cfg.qlMaxDim, QLSeconds: cfg.qlSecs,
 	}
 	if len(job.Kinds) == 1 && job.Kinds[0] == farmqueue.KindDerivatives {
 		switch job.DerivativePass {

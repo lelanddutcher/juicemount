@@ -27,11 +27,22 @@ func TestIsFarmStoragePressure(t *testing.T) {
 }
 
 func TestCheckWorkerStorageHeadroomUsesConfiguredReserve(t *testing.T) {
-	headroom, err := checkWorkerStorageHeadroom(t.TempDir(), 1)
+	headroom, err := checkWorkerStorageHeadroom(t.TempDir(), 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if headroom.Total == 0 || headroom.Required != 1 || headroom.Available == 0 {
 		t.Fatalf("headroom = %+v", headroom)
+	}
+}
+
+func TestCheckWorkerStorageHeadroomUsesPhysicalCapacityOverride(t *testing.T) {
+	const capacity = uint64(100 << 40)
+	headroom, err := checkWorkerStorageHeadroom(t.TempDir(), 0, capacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headroom.Total != capacity || headroom.Required != capacity/100 {
+		t.Fatalf("headroom = %+v, want total=%d required=%d", headroom, capacity, capacity/100)
 	}
 }

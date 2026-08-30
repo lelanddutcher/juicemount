@@ -319,7 +319,10 @@ remain available.
 
 The same read-only state mount is also the Manager's physical-pool headroom probe.
 Before admitting a manual sweep or farm-wide resume, Manager requires the larger of
-64 GiB and 1% of that filesystem to remain available. The server worker performs the
+64 GiB and 1% of the configured physical pool capacity to remain available. Set
+`JM_FARM_STORAGE_CAPACITY_BYTES` to `zpool list -Hp -o size <pool>` on ZFS: `statfs`
+available bytes reflect shared pool headroom, but its total is dataset-scoped and
+must not be presented as the zpool capacity. The server worker performs the
 same check before claiming output work. Each safe server-side probe refreshes a
 20-second Redis storage permit. Render workers expose that they require the permit and
 verify it in the same Redis transaction that claims a job. If the Manager/server loses
@@ -340,8 +343,13 @@ keeps retries idempotent across nodes and prevents overwritten JuiceFS slices fr
 multiplying physical storage during an outage.
 
 JuiceFS intentionally retains both deleted files and stale slices from overwrites for
-the configured trash period. JuiceMount therefore treats derivative idempotency and
-physical headroom as its own responsibilities. Selective `chattr +s` trash bypass is
+the configured trash period. Automatic farm sweeps therefore preserve any current,
+source-matched, byte-validated portable proxy regardless of whether it is H.264,
+HEVC, or AV1; codec migration requires explicit regeneration. JuiceMount treats
+derivative idempotency and physical headroom as its own responsibilities. Do not put
+the MinIO object dataset under a high-retention recursive ZFS snapshot policy: those
+snapshots retain blocks after JuiceFS GC deletes the objects and make logical cleanup
+appear ineffective. Selective `chattr +s` trash bypass is
 not used by this RC: it was added upstream in JuiceFS v1.4.0, while the deployed stack
 is pinned to v1.3.1. A coordinated all-client JuiceFS upgrade can add that optional
 defense later; it is not required for the receipt and storage-permit fixes above.
@@ -355,8 +363,7 @@ defense later; it is not required for the receipt and storage-permit fixes above
   hardware-decoded poster/filmstrip routing with per-file CPU fallback; HEVC-first
   proxy routing with explicit H.264 fallback; a two-heartbeat render-outage grace
   that prevents a brief node restart from dumping the ready backlog onto CPU;
-  automatic promotion of availability-only CPU fallbacks when compatible hardware
-  returns while source-incompatible and exhausted-hardware fallbacks stay locked;
+  portable-proxy preservation across worker codecs with explicit-only codec migration;
   backend-headroom safety pause; cross-worker proxy commit recovery;
   live Manager control and node telemetry; tech/poster/filmstrip/waveform/proxy/
   transcript generation; JM-15 discovery; `/blob` byte ranges; and portable

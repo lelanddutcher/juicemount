@@ -17,7 +17,7 @@ type workerStorageHeadroom struct {
 	Required  uint64
 }
 
-func checkWorkerStorageHeadroom(path string, configured uint64) (workerStorageHeadroom, error) {
+func checkWorkerStorageHeadroom(path string, configuredReserve, configuredCapacity uint64) (workerStorageHeadroom, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
 		return workerStorageHeadroom{}, err
@@ -29,7 +29,15 @@ func checkWorkerStorageHeadroom(path string, configured uint64) (workerStorageHe
 	headroom := workerStorageHeadroom{
 		Total: uint64(st.Blocks) * bsize, Available: uint64(st.Bavail) * bsize,
 	}
-	headroom.Required = configured
+	if configuredCapacity > 0 {
+		if configuredCapacity < headroom.Available {
+			return workerStorageHeadroom{}, fmt.Errorf(
+				"configured backend capacity %d is smaller than available space %d",
+				configuredCapacity, headroom.Available)
+		}
+		headroom.Total = configuredCapacity
+	}
+	headroom.Required = configuredReserve
 	if headroom.Required == 0 {
 		headroom.Required = headroom.Total / 100
 		if headroom.Required < defaultWorkerStorageReserve {

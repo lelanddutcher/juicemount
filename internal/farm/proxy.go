@@ -163,11 +163,12 @@ type ProxyResult struct {
 	Err          error
 }
 
-// proxyFresh reports whether the current proxy is already the exact class this
-// pass would produce. A generic source-hash gate is not enough here: a CPU
-// fallback may have left a perfectly current H.264 proxy that must be upgraded
-// when an HEVC worker returns. Conversely, a repeated HEVC watcher job must not
-// spend the accelerator re-encoding identical bytes.
+// proxyFresh reports whether the current proxy already satisfies this pass.
+// One-shot/explicit codec runs retain exact-codec semantics. Automatic queue
+// sweeps set PreserveExistingProxy, because replacing a current portable proxy
+// merely to promote H.264 to HEVC creates no new derivative and retains the old
+// JuiceFS slices for TrashDays. Operators can still request a codec migration
+// deliberately with RegenerateFresh.
 //
 // Fail closed. The source record, derivative vouch, codec label, and actual
 // regular blob must all agree. Missing/legacy fields regenerate once and become
@@ -202,14 +203,7 @@ func proxyFreshIndexed(store *derivatives.Store, inode uint64, hash string, size
 	}
 	desiredCodec, _ := proxyCodecStrings(opt.ProxyVCodec, nil)
 	for _, row := range rows {
-		codecSatisfied := row.Codec != nil && *row.Codec == desiredCodec
-		if opt.PreserveHEVCOnFallback && desiredCodec == "h264" &&
-			row.Codec != nil && *row.Codec == "hevc" {
-			// HEVC is the preferred farm result. A CPU fallback exists to keep
-			// an unserviceable source moving, not to downgrade successful files
-			// from the same directory-shaped retry.
-			codecSatisfied = true
-		}
+		codecSatisfied, verifyCodec := proxyCodecSatisfied(row.Codec, desiredCodec, opt)
 		if row.Kind != "proxy" || row.Status != "ready" ||
 			row.Hash == nil || *row.Hash != hash ||
 			row.SourceSize == nil || *row.SourceSize != size ||
@@ -228,18 +222,44 @@ func proxyFreshIndexed(store *derivatives.Store, inode uint64, hash string, size
 		if row.BlobSize != nil && *row.BlobSize != blobInfo.Size() {
 			continue
 		}
-		if opt.PreserveHEVCOnFallback && row.Codec != nil && *row.Codec == "hevc" {
-			// The preservation exception must validate the bytes, not merely trust
-			// the sidecar's label. manifest.json is consumer-writable; an ffprobe
-			// of the held regular file proves the shared blob is actually HEVC.
+		if verifyCodec {
+			// A cross-codec preservation exception must validate the bytes, not
+			// merely trust the sidecar's label. manifest.json is consumer-writable;
+			// ffprobe of the held regular file proves the shared blob really is the
+			// codec the row advertises.
 			actual, err := probeProxyBlobCodecContext(optionContext(opt), opt.FFprobeBin, opt.Mount, blobRel)
-			if err != nil || actual != "hevc" {
+			if err != nil || row.Codec == nil || actual != *row.Codec {
 				continue
 			}
 		}
 		return true
 	}
 	return false
+}
+
+func proxyCodecSatisfied(existing *string, desired string, opt Options) (satisfied, verify bool) {
+	if existing == nil {
+		return false, false
+	}
+	if *existing == desired {
+		return true, false
+	}
+	if opt.PreserveHEVCOnFallback && desired == "h264" && *existing == "hevc" {
+		return true, true
+	}
+	if opt.PreserveExistingProxy && supportedProxyCodec(*existing) {
+		return true, true
+	}
+	return false, false
+}
+
+func supportedProxyCodec(codec string) bool {
+	switch codec {
+	case "h264", "hevc", "av1":
+		return true
+	default:
+		return false
+	}
 }
 
 func probeProxyBlobCodec(ffprobeBin, mount, rel string) (string, error) {

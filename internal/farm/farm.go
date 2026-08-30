@@ -49,6 +49,14 @@ type Options struct {
 	// the explicit fallback lane; ordinary one-shot/explicit codec runs retain
 	// exact-codec semantics.
 	PreserveHEVCOnFallback bool
+	// PreserveExistingProxy makes automatic queue sweeps codec-idempotent. A
+	// current, byte-validated H.264/HEVC/AV1 proxy already satisfies the portable
+	// proxy contract even when this worker would choose a different encoder.
+	// Codec promotion is therefore an explicit RegenerateFresh operation, not a
+	// side effect of worker availability. This matters on JuiceFS: atomically
+	// replacing proxy.mp4 retains the old slices for TrashDays and can multiply
+	// physical storage without adding a visible derivative.
+	PreserveExistingProxy bool
 
 	// PosterAlways lifts MinBlobSizeBytes for the POSTER only (T1.1: "poster
 	// always" for media UTIs). A pinned/recently-browsed folder must show real

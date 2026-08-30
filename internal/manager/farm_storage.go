@@ -23,13 +23,15 @@ type farmStorageSnapshot struct {
 }
 
 type farmStorageGate struct {
-	Configured     bool   `json:"configured"`
-	Safe           bool   `json:"safe"`
-	Path           string `json:"-"`
-	TotalBytes     uint64 `json:"total_bytes,omitempty"`
-	AvailableBytes uint64 `json:"available_bytes,omitempty"`
-	RequiredBytes  uint64 `json:"required_bytes,omitempty"`
-	Reason         string `json:"reason,omitempty"`
+	Configured           bool   `json:"configured"`
+	Safe                 bool   `json:"safe"`
+	Path                 string `json:"-"`
+	TotalBytes           uint64 `json:"total_bytes,omitempty"`
+	FilesystemTotalBytes uint64 `json:"filesystem_total_bytes,omitempty"`
+	AvailableBytes       uint64 `json:"available_bytes,omitempty"`
+	RequiredBytes        uint64 `json:"required_bytes,omitempty"`
+	CapacitySource       string `json:"capacity_source,omitempty"`
+	Reason               string `json:"reason,omitempty"`
 }
 
 type farmSafetyPauser interface {
@@ -96,11 +98,28 @@ func (a *API) inspectFarmStorage() farmStorageGate {
 			Reason: "backend storage headroom could not be verified",
 		}
 	}
-	required := farmRequiredHeadroom(snapshot.TotalBytes, a.farmMinFree)
+	total := snapshot.TotalBytes
+	capacitySource := "statfs"
+	if a.farmStorageCapacity > 0 {
+		if a.farmStorageCapacity < snapshot.AvailableBytes {
+			return farmStorageGate{
+				Configured: true, Safe: false, Path: a.farmStoragePath,
+				FilesystemTotalBytes: snapshot.TotalBytes,
+				AvailableBytes:       snapshot.AvailableBytes,
+				CapacitySource:       "configured",
+				Reason:               "configured backend capacity is smaller than reported available space",
+			}
+		}
+		total = a.farmStorageCapacity
+		capacitySource = "configured"
+	}
+	required := farmRequiredHeadroom(total, a.farmMinFree)
 	gate := farmStorageGate{
 		Configured: true, Safe: snapshot.AvailableBytes >= required,
-		Path: a.farmStoragePath, TotalBytes: snapshot.TotalBytes,
-		AvailableBytes: snapshot.AvailableBytes, RequiredBytes: required,
+		Path: a.farmStoragePath, TotalBytes: total,
+		FilesystemTotalBytes: snapshot.TotalBytes,
+		AvailableBytes:       snapshot.AvailableBytes, RequiredBytes: required,
+		CapacitySource: capacitySource,
 	}
 	if !gate.Safe {
 		gate.Reason = "backend free space is below the farm safety reserve; reclaim storage before resuming"

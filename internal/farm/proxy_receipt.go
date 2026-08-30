@@ -149,8 +149,7 @@ func recoverProxyCommitReceipt(store *derivatives.Store, fi os.FileInfo, inode u
 		return false, nil
 	}
 	desiredCodec, _ := proxyCodecStrings(opt.ProxyVCodec, nil)
-	codecAllowed := receipt.Codec == desiredCodec ||
-		(opt.PreserveHEVCOnFallback && desiredCodec == "h264" && receipt.Codec == "hevc")
+	codecAllowed, _ := proxyCodecSatisfied(&receipt.Codec, desiredCodec, opt)
 	if receipt.Version != proxyReceiptVersion || receipt.Inode != inode ||
 		receipt.SourceHash != sourceHash || receipt.SourceSize != fi.Size() ||
 		receipt.BlobSize <= 0 || !isHashHex(receipt.BlobHash) || !codecAllowed ||

@@ -56,6 +56,7 @@ func main() {
 	farmStatus := flag.String("farm-status", envOr("JM_FARM_STATUS", ""), "Path to the juicefarm rollup (farm-status.json) for the Farm tab. Empty = Farm tab shows an empty state. Mount the juicefarm-state volume read-only to enable.")
 	farmStorage := flag.String("farm-storage-path", envOr("JM_FARM_STORAGE_PATH", ""), "Local path on the JuiceFS backend pool used for the farm headroom safety interlock. Empty derives the parent of --farm-status.")
 	farmMinFree := flag.Uint64("farm-min-free-bytes", envUint64Or("JM_FARM_MIN_FREE_BYTES", 0), "Minimum backend bytes required before farm enqueue/resume. Zero uses max(64 GiB, 1% of the probed filesystem).")
+	farmStorageCapacity := flag.Uint64("farm-storage-capacity-bytes", envUint64Or("JM_FARM_STORAGE_CAPACITY_BYTES", 0), "Physical backend-pool capacity for correct reporting and the default 1% reserve. Set this on ZFS because statfs is dataset-scoped; zero falls back to statfs.")
 	mountOwner := flag.String("mount-owner", envOr("JM_MOUNT_OWNER", ""), "POSIX owner (uid[:gid], e.g. 501:20) that migrated data is chowned to after an embedded-mode sync, so the CLIENT mounting the volume can WRITE it — not just read it. The manager runs as root on the NAS, so without this, `juicefs sync` leaves migrated files root:wheel and a uid-501 Mac client can only read them. Empty = leave raw sync ownership. Set to the uid your Mac client mounts as (usually 501:20).")
 	overviewMeta := flag.String("overview-meta", envOr("JM_OVERVIEW_META", ""), "Redis URL for the Overview tab's `juicefs status` + Redis INFO probes. Use this in EMBEDDED mode (--fuse-mount), where --meta is unavailable (mutually exclusive), so Overview still works. In standalone mode --meta already serves both and this can stay empty.")
 	flag.Parse()
@@ -97,6 +98,7 @@ func main() {
 		FarmStatusPath:   *farmStatus,
 		FarmStoragePath:  *farmStorage,
 		FarmMinFreeBytes: *farmMinFree,
+		FarmStorageCapacityBytes: *farmStorageCapacity,
 		MountOwnerUID:    ownerUID,
 		MountOwnerGID:    ownerGID,
 		OverviewMetaURL:  *overviewMeta,
