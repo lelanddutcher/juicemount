@@ -84,6 +84,14 @@ type ffStream struct {
 	Duration         string            `json:"duration"`
 	BitRate          string            `json:"bit_rate"`
 	Tags             map[string]string `json:"tags"`
+	Disposition      ffDisposition     `json:"disposition"`
+}
+
+type ffDisposition struct {
+	// ffprobe reports embedded album artwork as a video stream with
+	// disposition.attached_pic=1. It is still-image metadata, not a motion-video
+	// track, and must never make an audio asset eligible for proxy encoding.
+	AttachedPic int `json:"attached_pic"`
 }
 
 type ffFormat struct {
@@ -130,7 +138,10 @@ func mapTech(p *ffProbe, fallbackSize int64) *Tech {
 		s := &p.Streams[i]
 		switch s.CodecType {
 		case "video":
-			if t.Video == nil { // first video stream wins
+			if s.Disposition.AttachedPic != 0 {
+				continue
+			}
+			if t.Video == nil { // first non-attached-picture video stream wins
 				t.Video = mapVideo(s)
 			}
 		case "audio":

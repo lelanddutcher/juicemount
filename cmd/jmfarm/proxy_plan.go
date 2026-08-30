@@ -30,12 +30,11 @@ func dispatchProxyPlan(ctx context.Context, q *farmqueue.Client, store *derivati
 	if err != nil {
 		return 0, 0, fmt.Errorf("snapshot live worker routes: %w", err)
 	}
-	planned, err := buildProxyPlan(ctx, func(_ context.Context, job *farmqueue.Job) { route(job) }, parent, targets, maxTargets, func(path string) (*farm.VideoTrack, error) {
-		if track := knownVideoTrack(store, path); track != nil && strings.TrimSpace(track.Codec) != "" && strings.TrimSpace(track.Profile) != "" {
-			return track, nil
-		}
-		return probeRenderVideoTrack(path)
-	})
+	// Admission is always based on the current source bytes. Stored tech may
+	// predate a classifier correction (for example, old metadata represented
+	// attached album artwork as motion video) or a same-inode replacement. It is
+	// useful for ordering, but cannot safely decide whether a proxy child exists.
+	planned, err := buildProxyPlan(ctx, func(_ context.Context, job *farmqueue.Job) { route(job) }, parent, targets, maxTargets, probeRenderVideoTrack)
 	if err != nil || len(planned) == 0 {
 		return len(planned), 0, err
 	}

@@ -153,6 +153,34 @@ func TestMapTechDiverse(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "audio_with_attached_cover_art",
+			probe: `{"streams":[
+				{"codec_type":"video","codec_name":"mjpeg","width":1200,"height":1200,"pix_fmt":"yuvj420p","disposition":{"attached_pic":1}},
+				{"codec_type":"audio","codec_name":"mp3","channels":2,"sample_rate":"44100","sample_fmt":"fltp"}
+			],"format":{"format_name":"mp3","duration":"180.0","size":"5000000"}}`,
+			check: func(t *testing.T, tech *Tech) {
+				if tech.Video != nil {
+					t.Errorf("attached cover art must not map as motion video, got %+v", tech.Video)
+				}
+				if len(tech.Audio) != 1 || tech.Audio[0].Codec != "mp3" {
+					t.Errorf("audio = %+v, want one MP3 track", tech.Audio)
+				}
+			},
+		},
+		{
+			name: "cover_art_before_real_video",
+			probe: `{"streams":[
+				{"codec_type":"video","codec_name":"mjpeg","width":1200,"height":1200,"pix_fmt":"yuvj420p","disposition":{"attached_pic":1}},
+				{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"pix_fmt":"yuv420p","r_frame_rate":"24/1","disposition":{"attached_pic":0}},
+				{"codec_type":"audio","codec_name":"aac","channels":2,"sample_rate":"48000"}
+			],"format":{"format_name":"mov","duration":"15.0","size":"1000000"}}`,
+			check: func(t *testing.T, tech *Tech) {
+				if tech.Video == nil || tech.Video.Codec != "h264" || tech.Video.Width != 1920 {
+					t.Errorf("real video after attached cover art was not selected: %+v", tech.Video)
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {

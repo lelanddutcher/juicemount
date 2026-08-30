@@ -89,8 +89,12 @@ source and retain the dataset-scoped filesystem total for diagnostics.
 5. Started `juicefs gc --delete` without compaction and confirmed the trash slices
    moved into deletion processing.
 6. Restored `TrashDays=7` immediately after metadata cleanup.
-7. Verified `zSSD` ONLINE with about 7.46 TB free while pending object deletion
-   continued.
+7. The guarded GC completed without MinIO delete errors. It deleted 345,086
+   trash files and 2,012,258 pending slices, representing about 12.02 TB of
+   logical stale-slice records.
+8. Restored the normal seven-day JuiceFS trash setting and `spa_slop_shift=5`.
+   The pool remained ONLINE. A later read-only release audit measured about
+   10.92 TB free at the pool and 10.76 TB available to the JuiceMount dataset.
 
 ## JuiceFS upstream disposition
 
@@ -104,4 +108,3 @@ metadata/trash explanation, MinIO deletion errors, or a persistent object/metada
 gap after pending deletions drain. Attach the JuiceFS version, redacted GC summary,
 object counts/bytes, and `status --more` before/after figures; do not attach media
 paths or storage credentials.
-

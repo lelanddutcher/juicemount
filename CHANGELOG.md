@@ -24,6 +24,8 @@
   retries or a returning HEVC worker from replacing valid proxies and amplifying
   JuiceFS trash. Storage permits and an atomic safety pause stop new render
   claims below physical-pool headroom.
+- Embedded audio cover artwork is excluded from motion-video classification, so
+  audio-only assets cannot be routed into the MP4 proxy encoder.
 - Farm mission control now shows every queue lane and each node's current
   `{job, kind, path, stage, percent}`; supports per-node pause, drain, resume and
   verified restart; returns a bounded 200-line runtime log; cooperatively

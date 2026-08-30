@@ -28,19 +28,10 @@ func dispatchDerivativePlan(ctx context.Context, q *farmqueue.Client, store *der
 	if err != nil {
 		return 0, 0, fmt.Errorf("snapshot live worker routes: %w", err)
 	}
-	planned, err := buildDerivativePlan(ctx, func(_ context.Context, job *farmqueue.Job) { snapshotRoute(job) }, parent, targets, func(path string) (*farm.VideoTrack, error) {
-		// Existing tech is sufficient only when it includes the source profile.
-		// Rows written before profile-aware admission must be refreshed from the
-		// live bytes here, otherwise Baseline/Main/High collapse into the same
-		// H.264 queue and the render node discovers the mismatch too late.
-		if track := knownVideoTrack(store, path); track != nil {
-			codec := normalizedDecodeCodec(track.Codec)
-			if codec == "" || strings.TrimSpace(track.Profile) != "" {
-				return track, nil
-			}
-		}
-		return probeRenderVideoTrack(path)
-	})
+	// Preview admission is always based on current bytes. Cached tech remains an
+	// ordering hint only: it can predate profile-aware or attached-picture-aware
+	// classification and must not create a stale video child forever.
+	planned, err := buildDerivativePlan(ctx, func(_ context.Context, job *farmqueue.Job) { snapshotRoute(job) }, parent, targets, probeRenderVideoTrack)
 	if err != nil {
 		return 0, 0, err
 	}

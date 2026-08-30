@@ -226,3 +226,33 @@ func TestGenerateProxySkipsBeforeProbeWhenCurrent(t *testing.T) {
 		t.Fatalf("skip result = %+v, want inode=%d skipped=true wrote=false", res, inode)
 	}
 }
+
+func TestGenerateProxySkipsAudioWithAttachedCoverArt(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "audio-with-cover-art")
+	if err := os.WriteFile(source, []byte("representative audio bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	probe := filepath.Join(dir, "ffprobe")
+	probeScript := `#!/bin/sh
+printf '%s\n' '{"streams":[{"codec_type":"video","codec_name":"mjpeg","width":1200,"height":1200,"disposition":{"attached_pic":1}},{"codec_type":"audio","codec_name":"mp3","channels":2,"sample_rate":"44100"}],"format":{"format_name":"mp3","duration":"180","size":"26"}}'
+`
+	if err := os.WriteFile(probe, []byte(probeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "ffmpeg-invoked")
+	ffmpeg := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\nprintf invoked > '"+marker+"'\nexit 99\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res := GenerateProxy(nil, source, Options{
+		Mount: dir, FFprobeBin: probe, FFmpegBin: ffmpeg,
+	})
+	if res.Err != nil || res.Wrote || res.SkippedFresh {
+		t.Fatalf("cover-art audio proxy result = %+v, want clean no-op", res)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("cover-art audio reached ffmpeg; marker stat error = %v", err)
+	}
+}
