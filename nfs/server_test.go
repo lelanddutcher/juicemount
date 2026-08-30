@@ -28,6 +28,13 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
+func requireLiveTestVolume(t *testing.T) {
+	t.Helper()
+	if os.Getenv("JM_TEST_VOLUME_REDIS") == "" || os.Getenv("JM_TEST_FUSE_PATH") == "" {
+		t.Skip("requires JM_TEST_VOLUME_REDIS and JM_TEST_FUSE_PATH for a populated live volume")
+	}
+}
+
 func resolveTestFUSEPath() string {
 	if path := os.Getenv("JM_TEST_FUSE_PATH"); path != "" {
 		return filepath.Clean(path)

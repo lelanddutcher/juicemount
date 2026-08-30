@@ -2,11 +2,24 @@ package metadata
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 )
 
-const testRedisURL = "redis://127.0.0.1:6379/1"
+func redisTestURL() string {
+	if value := os.Getenv("JM_TEST_VOLUME_REDIS"); value != "" {
+		return value
+	}
+	return "redis://127.0.0.1:6379/1"
+}
+
+func requireLiveTestVolume(t *testing.T) {
+	t.Helper()
+	if os.Getenv("JM_TEST_VOLUME_REDIS") == "" {
+		t.Skip("requires JM_TEST_VOLUME_REDIS pointing at a populated JuiceFS metadata database")
+	}
+}
 
 func newTestRedisClient(t *testing.T) *RedisClient {
 	t.Helper()
@@ -16,7 +29,7 @@ func newTestRedisClient(t *testing.T) *RedisClient {
 	}
 	t.Cleanup(func() { store.Close() })
 
-	rc, err := NewRedisClient(testRedisURL, store)
+	rc, err := NewRedisClient(redisTestURL(), store)
 	if err != nil {
 		t.Skipf("Redis not reachable, skipping: %v", err)
 	}
@@ -56,6 +69,7 @@ func TestRedisConnect(t *testing.T) {
 }
 
 func TestRedisSyncMetadata(t *testing.T) {
+	requireLiveTestVolume(t)
 	rc := newTestRedisClient(t)
 
 	if err := rc.SyncOnce(); err != nil {

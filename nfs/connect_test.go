@@ -77,6 +77,7 @@ func TestNFSHandlerPathResolution(t *testing.T) {
 }
 
 func TestJuiceFSStatAndReadDir(t *testing.T) {
+	requireLiveTestVolume(t)
 	_, store := setupTestServer(t)
 
 	handler := NewHandler(store, testFUSEPath)
