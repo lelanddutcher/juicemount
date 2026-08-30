@@ -71,6 +71,25 @@ func TestManagerRCUIKeepsAccessibilityAndBoundedErrors(t *testing.T) {
 	}
 }
 
+func TestManagerRCAssetsShareCurrentCacheBuster(t *testing.T) {
+	indexRaw, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := string(indexRaw)
+	style := regexp.MustCompile(`style\.css\?v=([^"']+)`).FindStringSubmatch(index)
+	app := regexp.MustCompile(`app\.js\?v=([^"']+)`).FindStringSubmatch(index)
+	if len(style) != 2 || len(app) != 2 {
+		t.Fatalf("Manager release assets must carry explicit cache-busting versions")
+	}
+	if style[1] != app[1] {
+		t.Fatalf("Manager asset cache busters differ: style=%q app=%q", style[1], app[1])
+	}
+	if style[1] != "0.5.0-rc5" {
+		t.Fatalf("Manager asset cache buster = %q, want current RC", style[1])
+	}
+}
+
 func TestManagerRCFarmHistoryAndAuthStayTruthful(t *testing.T) {
 	indexRaw, err := staticFS.ReadFile("static/index.html")
 	if err != nil {
