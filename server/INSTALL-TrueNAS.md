@@ -54,6 +54,15 @@ openssl rand -hex 32      # for JM_ADMIN_KEY (used to gate /manager UI)
 Note your TrueNAS LAN IP — your Mac will need to reach this address
 on the published ports below.
 
+Treat the Manager key as durable deployment state. Reuse the same value on
+every upgrade. Before applying an edited or rendered compose, verify that its
+`JM_ADMIN_KEY` is neither empty nor a `CHANGEME_*` placeholder. A live
+container may have received a key at runtime even when the persisted TrueNAS
+custom-app YAML is empty; recreating from that drifted YAML drops the key and
+the Link-enabled Manager correctly refuses to start. Do not use the live
+container's healthy state as proof that the stored app configuration is
+complete.
+
 ## Paste this YAML
 
 Apps → Discover → kebab menu → **Install via YAML** → paste this and
@@ -231,7 +240,7 @@ services:
       JM_META: "redis://redis:6379/1"
       JM_VOL_NAME: "zpool"
       JM_SOURCE_ROOTS: "/sources"
-      JM_ADMIN_KEY: CHANGEME_ADMIN_KEY        # !!! EDIT — 32+ random chars; empty = LAN-only
+      JM_ADMIN_KEY: CHANGEME_ADMIN_KEY        # !!! EDIT — preserve the same 32+ character value on every upgrade
       JM_STATE_FILE: "/var/lib/manager/state.json"   # state persists across restart
     ports:
       - "30190:8080"                          # web UI
@@ -244,6 +253,13 @@ services:
       # available for canceled jobs after a redeploy).
       - CHANGEME_STATE_PATH:/var/lib/manager
 ```
+
+The `CHANGEME_ADMIN_KEY` line is intentionally conspicuous because TrueNAS
+stores the submitted custom-app YAML. It must be replaced before the first
+install and must never be blanked on an update. For shell-driven Compose
+deployments, prefer the repository's `server/docker-compose.yml`, which uses
+required environment interpolation and makes `docker compose config --quiet`
+fail before any container is replaced when `JM_ADMIN_KEY` is missing.
 
 ## Upgrading from --trash-days 0 (SLICE 3 trash retention)
 
@@ -357,3 +373,8 @@ Each exit code names the failure:
 
 Each precheck logs `[precheck-N]` prefix lines you can grep for in
 the TrueNAS UI Apps → Logs view.
+
+If Manager refuses to start with an admin-key error, the persisted
+`JM_ADMIN_KEY` is empty, shorter than 32 characters, or still a placeholder.
+Restore the same durable key used by the prior deployment before recreating the
+service.

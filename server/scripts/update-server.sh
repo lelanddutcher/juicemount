@@ -120,6 +120,35 @@ done
 
 cd "$DEST"
 
+# A compose/app recreation can silently discard a credential that exists only
+# in the live container's runtime environment. Refuse the entire update before
+# touching either workload unless the Manager we are about to preserve has a
+# non-placeholder 32+ character key. The value stays in shell memory only: it
+# is never logged, written to a backup helper file, or placed in argv.
+preflight_manager_auth() {
+  [ "$SKIP_MANAGER" = "1" ] && return 0
+  if ! docker inspect "$MANAGER_CONTAINER" >/dev/null 2>&1; then
+    log "ERROR: manager '$MANAGER_CONTAINER' not found — cannot preserve its runtime authentication"
+    exit 1
+  fi
+  local key
+  key="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MANAGER_CONTAINER" |
+    sed -n 's/^JM_ADMIN_KEY=//p' | head -1)"
+  case "$key" in
+    CHANGEME*|CHANGE*|REPLACE*|replaceme*)
+      log "ERROR: manager runtime JM_ADMIN_KEY is still a placeholder; refusing recreation"
+      exit 1 ;;
+  esac
+  if [ "${#key}" -lt 32 ]; then
+    log "ERROR: manager runtime JM_ADMIN_KEY is missing or shorter than 32 characters; refusing recreation"
+    exit 1
+  fi
+  unset key
+  log "manager authentication preflight passed"
+}
+
+preflight_manager_auth
+
 # ---- build both images on the host (BuildKit for the cache mounts) --------
 log "building $FARM_IMAGE"
 DOCKER_BUILDKIT=1 docker build -f server/juicefarm/Dockerfile -t "$FARM_IMAGE" .
@@ -165,11 +194,21 @@ recreate() {
 
   mkdir -p "$DEST/.update-backups"
   local backup="$DEST/.update-backups/${name}-$(date +%Y%m%d-%H%M%S).json"
-  docker inspect "$name" > "$backup"
-  log "captured $name config → $backup"
+  if ! command -v jq >/dev/null 2>&1; then
+    log "ERROR: jq is required to create a credential-redacted config backup"
+    exit 1
+  fi
+  # Preserve container topology for incident recovery, but retain only
+  # environment variable names. Raw docker-inspect backups persist admin keys,
+  # object-store credentials, and authenticated URLs in plaintext.
+  docker inspect "$name" |
+    jq 'map(.Config.Env = ((.Config.Env // []) | map((split("=")[0]) + "=<redacted>")))' > "$backup"
+  chmod 600 "$backup"
+  log "captured credential-redacted $name config → $backup"
 
   # -------- reconstruct run args (never hardcoded) --------
   local -a args=(-d --name "$name")
+  local -a env_assignments=()
 
   # restart policy
   local rp rc
@@ -185,8 +224,25 @@ recreate() {
   netmode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$name")"
   [ -n "$netmode" ] && [ "$netmode" != "default" ] && args+=(--network "$netmode")
 
-  # env (runtime-provided only)
-  while IFS= read -r e; do [ -n "$e" ] && args+=(-e "$e"); done < <(runtime_env "$name")
+  # env (runtime-provided only). Pass only each variable NAME in docker's
+  # argv; export its captured value inside the short-lived launch subshell so
+  # credentials never appear in `ps`, shell history, or deployment logs.
+  local e key
+  while IFS= read -r e; do
+    [ -z "$e" ] && continue
+    key="${e%%=*}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      log "ERROR: refusing malformed runtime environment name while recreating $name"
+      exit 1
+    fi
+    case "$key" in
+      HOME|PATH|SHELL|USER|LOGNAME)
+        log "ERROR: refusing to repurpose host process variable '$key' while recreating $name"
+        exit 1 ;;
+    esac
+    env_assignments+=("$e")
+    args+=(-e "$key")
+  done < <(runtime_env "$name")
 
   # mounts: named volumes + binds, preserving ro
   while IFS='|' read -r mtype msrc mdst mrw; do
@@ -239,13 +295,16 @@ recreate() {
   log "recreating $name → $image"
   docker stop "$name" >/dev/null
   docker rm "$name" >/dev/null
-  docker run "${args[@]}" "$image" "${cmd[@]}"
+  (
+    for e in "${env_assignments[@]}"; do export "$e"; done
+    docker run "${args[@]}" "$image" "${cmd[@]}"
+  )
   for n in "${extra_nets[@]}"; do docker network connect "$n" "$name" || true; done
 }
 
 recreate "$FARM_CONTAINER" "$FARM_IMAGE"
 if [ "$SKIP_MANAGER" = "1" ]; then
-  log "skipping manager recreate (--skip-manager: compose-managed manager — retag its compose image + docker compose up -d instead; introspective recreate DROPS compose-set entrypoint overrides, live-proven 2026-07-13)"
+  log "skipping manager recreate (--skip-manager). Before any separate compose/app recreation, supply the existing JM_ADMIN_KEY through the deployment environment and require 'docker compose config --quiet' to pass; never recreate from persisted YAML with an empty key."
 else
   recreate "$MANAGER_CONTAINER" "$MANAGER_IMAGE"
 fi
@@ -264,15 +323,14 @@ if [ "$SKIP_MANAGER" = "1" ]; then
   log "manager verify skipped (--skip-manager)"
 else
   log "verifying manager /api/farm returns 200"
-  ADMIN_KEY="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$MANAGER_CONTAINER" | sed -n 's/^JM_ADMIN_KEY=//p' | head -1)"
-  MGR_PORT="$(docker inspect -f '{{range $port, $binds := .HostConfig.PortBindings}}{{range $binds}}{{.HostPort}}{{println}}{{end}}{{end}}' "$MANAGER_CONTAINER" | sed '/^$/d' | head -1)"
   verify_mgr() {
-    if [ -n "$MGR_PORT" ]; then
-      curl -fsS -o /dev/null -w '%{http_code}' ${ADMIN_KEY:+-H "X-JuiceMount-Admin-Key: $ADMIN_KEY"} "http://127.0.0.1:${MGR_PORT}/api/farm"
-    else
-      # no published port → probe from inside the container (image ships curl)
-      docker exec "$MANAGER_CONTAINER" curl -fsS -o /dev/null -w '%{http_code}' ${ADMIN_KEY:+-H "X-JuiceMount-Admin-Key: $ADMIN_KEY"} "http://127.0.0.1:8080/api/farm"
-    fi
+    # Expand JM_ADMIN_KEY only inside the container and stream curl's header
+    # config over stdin. The credential is absent from host/container argv.
+    docker exec "$MANAGER_CONTAINER" sh -ec '
+      [ "${#JM_ADMIN_KEY}" -ge 32 ] || exit 22
+      printf '\''header = "X-JuiceMount-Admin-Key: %s"\n'\'' "$JM_ADMIN_KEY" |
+        curl --config - -fsS -o /dev/null -w '\''%{http_code}'\'' http://127.0.0.1:8080/api/farm
+    '
   }
   ok=0
   for i in $(seq 1 12); do

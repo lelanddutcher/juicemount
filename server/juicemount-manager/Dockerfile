@@ -70,9 +70,11 @@ EXPOSE 8080
 # could not forward Redis or object-store traffic. Keep Link optional, but
 # require its complete control/route/data plane in opted-in deployments.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS -H "X-JuiceMount-Admin-Key: $JM_ADMIN_KEY" http://localhost:8080/api/sources >/dev/null \
+    CMD printf 'header = "X-JuiceMount-Admin-Key: %s"\n' "$JM_ADMIN_KEY" \
+          | curl --config - -fsS http://localhost:8080/api/sources >/dev/null \
       && { [ "$JM_NET_HEADSCALE" != "on" ] \
-        || curl -fsS -H "X-JuiceMount-Admin-Key: $JM_ADMIN_KEY" http://localhost:8080/api/net/link \
+        || printf 'header = "X-JuiceMount-Admin-Key: %s"\n' "$JM_ADMIN_KEY" \
+          | curl --config - -fsS http://localhost:8080/api/net/link \
           | grep -Eq '"data_plane_ready"[[:space:]]*:[[:space:]]*true'; } \
       || exit 1
 

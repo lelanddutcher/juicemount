@@ -78,7 +78,7 @@ func main() {
 	if *metaURL != "" && *volName == "" {
 		log.Fatal("--vol-name is required with --meta (standalone mode)")
 	}
-	if err := validateLinkAdminKey(headscaleEnabled(), *adminKey); err != nil {
+	if err := validateAdminKey(headscaleEnabled(), *adminKey); err != nil {
 		log.Fatal(err)
 	}
 
@@ -86,22 +86,22 @@ func main() {
 
 	mux := http.NewServeMux()
 	cfg := manager.Config{
-		JuiceFSBin:       *juicefsBin,
-		FUSEMount:        *fuseMount, // embedded mode if non-empty
-		MetaURL:          *metaURL,   // standalone mode if non-empty
-		VolName:          *volName,
-		SourceRoots:      roots,
-		DestMount:        *destMount,
-		AdminKey:         *adminKey,
-		StateFile:        *stateFile,
-		MinIOURL:         *minioURL,
-		FarmStatusPath:   *farmStatus,
-		FarmStoragePath:  *farmStorage,
-		FarmMinFreeBytes: *farmMinFree,
+		JuiceFSBin:               *juicefsBin,
+		FUSEMount:                *fuseMount, // embedded mode if non-empty
+		MetaURL:                  *metaURL,   // standalone mode if non-empty
+		VolName:                  *volName,
+		SourceRoots:              roots,
+		DestMount:                *destMount,
+		AdminKey:                 *adminKey,
+		StateFile:                *stateFile,
+		MinIOURL:                 *minioURL,
+		FarmStatusPath:           *farmStatus,
+		FarmStoragePath:          *farmStorage,
+		FarmMinFreeBytes:         *farmMinFree,
 		FarmStorageCapacityBytes: *farmStorageCapacity,
-		MountOwnerUID:    ownerUID,
-		MountOwnerGID:    ownerGID,
-		OverviewMetaURL:  *overviewMeta,
+		MountOwnerUID:            ownerUID,
+		MountOwnerGID:            ownerGID,
+		OverviewMetaURL:          *overviewMeta,
 	}
 	mgr := manager.Register(mux, "", cfg)
 
@@ -170,22 +170,31 @@ func main() {
 	_ = srv.Close()
 }
 
-// validateLinkAdminKey enforces the minimum authentication boundary for a
-// remotely reachable Manager. Link enrollment grants network reachability to
-// Redis, object storage, and the Manager itself; starting it while Manager auth
-// is disabled turns a pairing feature into an unauthenticated administrative
-// plane. Local/LAN-only development may still run without an admin key while
-// JM_NET_HEADSCALE is off.
-func validateLinkAdminKey(linkEnabled bool, adminKey string) error {
-	if !linkEnabled {
-		return nil
-	}
+// validateAdminKey enforces the Manager deployment authentication boundary.
+// Link enrollment grants network reachability to Redis, object storage, and the
+// Manager itself, so Link always requires authentication. Local development may
+// deliberately run without auth while Link is disabled, but a supplied key must
+// never be a short/placeholder value: accepting one would let an unedited
+// TrueNAS YAML appear healthy with a publicly known credential.
+func validateAdminKey(linkEnabled bool, adminKey string) error {
 	key := strings.TrimSpace(adminKey)
 	if key == "" {
+		if !linkEnabled && adminKey == "" {
+			return nil
+		}
+		if !linkEnabled {
+			return fmt.Errorf("JM_ADMIN_KEY must not contain only whitespace")
+		}
 		return fmt.Errorf("JuiceMount Link requires JM_ADMIN_KEY; refusing to start an unauthenticated remote control plane")
 	}
+	upper := strings.ToUpper(key)
+	for _, prefix := range []string{"CHANGEME", "CHANGE", "REPLACE", "REPLACEME"} {
+		if strings.HasPrefix(upper, prefix) {
+			return fmt.Errorf("JM_ADMIN_KEY is still a placeholder; edit the deployment configuration")
+		}
+	}
 	if len(key) < 32 {
-		return fmt.Errorf("JuiceMount Link requires JM_ADMIN_KEY to contain at least 32 characters")
+		return fmt.Errorf("JM_ADMIN_KEY must contain at least 32 characters")
 	}
 	return nil
 }

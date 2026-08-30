@@ -32,10 +32,13 @@ fields are documented in the app's Preferences → Connection pane.)
 
 Same compose file works. Edit the bind-mount paths at the top of
 `docker-compose.yml` (the defaults are TrueNAS-flavored `/mnt/zSSD/...`)
-to wherever you want the data to live, then:
+to wherever you want the data to live. Generate a Manager key, export it in
+the deployment shell, then render the compose before changing containers:
 
 ```sh
 cd server
+export JM_ADMIN_KEY="$(openssl rand -hex 32)"
+docker compose config --quiet
 docker compose up -d
 docker compose ps          # all services healthy
 docker compose logs juicefs-init   # confirms first-time format
@@ -81,6 +84,7 @@ upgrade:
 cd server
 git pull
 docker compose pull       # pull newer service images
+docker compose config --quiet  # fails before recreation if JM_ADMIN_KEY is absent
 docker compose up -d      # restart with no data loss
 ```
 
@@ -107,9 +111,11 @@ Take a backup first.
   `openssl rand -base64 24`. Anyone with this password can read every
   byte in the volume.
 - **Manager admin key (`JM_ADMIN_KEY`)** gates write access to the
-  manager's HTTP API. Empty = LAN-only / no auth (fine for a home
-  TrueNAS). Generate via `openssl rand -hex 32` for anything internet-
-  reachable.
+  manager's HTTP API. The production compose requires a 32+ character value
+  in the deployment environment and refuses to render without it. Generate
+  one via `openssl rand -hex 32`; preserve the same value across upgrades and
+  never commit it to the repository. The binary still permits an empty key for
+  explicit local-development runs while JuiceMount Link is disabled.
 
 ## Troubleshooting
 
@@ -119,6 +125,7 @@ Take a backup first.
 | `juicefs-init` exited 4               | MinIO credentials empty, whitespace, or placeholder |
 | `juicefs-init` exited 5               | `JM_BUCKET_URL` missing `http://` |
 | `juicefs-init` exited 6               | `juicefs format` errored — read the log for the JuiceFS-side reason |
+| Manager refuses to start with an admin-key error | Restore the prior durable `JM_ADMIN_KEY`; the persisted value is absent, short, or still a placeholder. |
 | Manager copy reports "0 files / 0 B" | Stale image — pull `ghcr.io/lelanddutcher/juicemount-manager:latest` and redeploy |
 | Mac can't open copied files           | Source had restrictive perms; either un-tick Preserve permissions before migrating, or `chmod -R u+rwX,g+rwX,o+rX` on the destination |
 

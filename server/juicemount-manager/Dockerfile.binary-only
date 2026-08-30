@@ -25,6 +25,18 @@ LABEL org.opencontainers.image.version="${JM_VERSION}" \
 COPY --from=gobuild /out/juicemount-manager /usr/local/bin/juicemount-manager
 RUN test "$(/usr/local/bin/juicemount-manager --build-info)" = "juicemount-manager ${JM_VERSION} (${JM_COMMIT})"
 
+# Override any older base-image probe that placed the expanded admin key in
+# curl argv. Stream curl configuration over stdin so the credential stays out
+# of process listings while retaining full Link-readiness validation.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD printf 'header = "X-JuiceMount-Admin-Key: %s"\n' "$JM_ADMIN_KEY" \
+          | curl --config - -fsS http://localhost:8080/api/sources >/dev/null \
+      && { [ "$JM_NET_HEADSCALE" != "on" ] \
+        || printf 'header = "X-JuiceMount-Admin-Key: %s"\n' "$JM_ADMIN_KEY" \
+          | curl --config - -fsS http://localhost:8080/api/net/link \
+          | grep -Eq '"data_plane_ready"[[:space:]]*:[[:space:]]*true'; } \
+      || exit 1
+
 # Override the base image entrypoint so an older proven runtime can be used
 # without inheriting an entrypoint that expands JM_ADMIN_KEY into argv. The Go
 # binary reads JM_ADMIN_KEY directly from the environment when --admin-key is

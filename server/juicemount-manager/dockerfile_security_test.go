@@ -21,6 +21,12 @@ func TestManagerDoesNotExposeAdminKeyInArgv(t *testing.T) {
 			if strings.Contains(string(src), "--admin-key=") {
 				t.Fatalf("%s must keep JM_ADMIN_KEY out of process arguments", name)
 			}
+			if strings.Contains(string(src), `-H "X-JuiceMount-Admin-Key: $JM_ADMIN_KEY"`) {
+				t.Fatalf("%s must stream the healthcheck auth header over stdin instead of placing JM_ADMIN_KEY in curl argv", name)
+			}
+			if !strings.Contains(string(src), "curl --config -") {
+				t.Fatalf("%s healthcheck must read its auth header from stdin", name)
+			}
 		})
 	}
 }

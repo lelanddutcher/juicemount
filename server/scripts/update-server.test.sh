@@ -132,7 +132,7 @@ else
 fi
 
 # Remote script content assertions.
-rs() { grep -q -- "$1" "$SSH_STDIN"; }
+rs() { grep -Fq -- "$1" "$SSH_STDIN"; }
 rs 'DOCKER_BUILDKIT=1 docker build -f server/juicefarm/Dockerfile -t "$FARM_IMAGE" .' \
   && pass "remote builds the farm image from server/juicefarm/Dockerfile" \
   || fail "remote farm build missing"
@@ -154,6 +154,46 @@ rs '/api/farm' \
 rs 'HARD GUARD' \
   && pass "remote carries the infra hard guard" \
   || fail "remote infra guard missing"
+
+# Manager authentication must be validated before either workload is touched.
+P_AUTH="$(grep -nF 'preflight_manager_auth' "$SSH_STDIN" | tail -1 | cut -d: -f1)"
+P_FARM_RECREATE="$(grep -nF 'recreate "$FARM_CONTAINER" "$FARM_IMAGE"' "$SSH_STDIN" | head -1 | cut -d: -f1)"
+if [ -n "$P_AUTH" ] && [ -n "$P_FARM_RECREATE" ] && [ "$P_AUTH" -lt "$P_FARM_RECREATE" ]; then
+  pass "manager auth preflight runs before any workload recreation"
+else
+  fail "manager auth preflight is absent or too late"
+fi
+rs 'manager runtime JM_ADMIN_KEY is missing or shorter than 32 characters' \
+  && pass "remote refuses a missing/short Manager key" \
+  || fail "remote Manager-key refusal missing"
+
+# Runtime credential values must be inherited by name, never copied into argv.
+rs 'env_assignments+=("$e")' && rs 'args+=(-e "$key")' && rs 'export "$e"' \
+  && pass "runtime environment values stay out of docker argv" \
+  || fail "safe runtime environment forwarding missing"
+if grep -F 'args+=(-e "$e")' "$SSH_STDIN" >/dev/null; then
+  fail "remote still copies full KEY=value entries into docker argv"
+else
+  pass "remote docker argv contains environment names only"
+fi
+
+# Verification must not extract the secret onto the host or place it in curl argv.
+if grep -F 'ADMIN_KEY="$(docker inspect' "$SSH_STDIN" >/dev/null; then
+  fail "remote verifier extracts Manager key into a host command"
+else
+  pass "remote verifier does not extract Manager key on the host"
+fi
+rs 'curl --config -' \
+  && pass "Manager verification streams the auth header over stdin" \
+  || fail "Manager verification does not use stdin curl config"
+rs 'map((split("=")[0]) + "=<redacted>")' \
+  && pass "container config backups redact every environment value" \
+  || fail "credential-redacted container config backup missing"
+if grep -F 'docker inspect "$name" > "$backup"' "$SSH_STDIN" >/dev/null; then
+  fail "remote still writes raw docker-inspect credentials to backup files"
+else
+  pass "remote never writes raw docker-inspect environment values to backups"
+fi
 
 # The remote script must never name an infra container in a mutating command.
 if grep -E 'docker (stop|rm|restart|kill) .*(redis|minio|juicefs)' "$SSH_STDIN" >/dev/null; then
