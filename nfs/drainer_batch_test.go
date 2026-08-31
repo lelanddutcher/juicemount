@@ -1,12 +1,15 @@
 package nfs
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
 
@@ -69,6 +72,7 @@ func newBatchWiredHandlerNoDispatch(t *testing.T, maxOps int) (*juiceFS, *SpoolS
 	// would, so the batched commit path is exercised end to end.
 	handler.SetSpool(spool, nil)
 	drainer.SetOnSizeReady(handler.publishDrainedSize)
+	drainer.SetOnDrainMetadataReady(handler.cacheDrainedMetadata)
 	drainer.SetOnDrainComplete(handler.onSpoolDrained)
 	drainer.SetOnBatchDrainComplete(store.BatchDrainComplete)
 	t.Cleanup(func() {
@@ -269,5 +273,53 @@ func TestDrainBatchSizePublishBeforeEviction(t *testing.T) {
 	// Capacity released.
 	if used, _ := spool.Capacity(); used != 0 {
 		t.Errorf("capacity not released: used=%d, want 0", used)
+	}
+}
+
+// TestDrainBatchCachesMetadataBeforeEviction locks the new offline-continuation
+// guarantee to the batching path production may enable: the transaction must
+// commit the real size, then the callback must capture the whole sidecar before
+// BatchCompleteDrainCleanup removes its spool file.
+func TestDrainBatchCachesMetadataBeforeEviction(t *testing.T) {
+	wasOffline := pin.IsOffline()
+	pin.SetOffline(false)
+	t.Cleanup(func() { pin.SetOffline(wasOffline) })
+
+	jfs, spool, drainer, _ := newBatchWiredHandlerNoDispatch(t, 1)
+	const name = "bundle/._folder"
+	payload := patternedPayload(4096, 89)
+	simulateNFSCreateThenWrite(t, jfs, name, payload, 1024)
+	spool.sweepOnce(0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if got := drainer.DrainOnceForTest(ctx); got != 1 {
+		t.Fatalf("DrainOnceForTest processed %d rows, want 1", got)
+	}
+	if _, ok := spool.LookupActive(name); ok {
+		t.Fatal("batched drain did not evict metadata spool entry")
+	}
+
+	pin.SetOffline(true)
+	wf, err := jfs.OpenFile(name, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("batched drain did not retain metadata for offline continuation: %v", err)
+	}
+	defer wf.Close()
+	seeded, ok := spool.LookupActive(name)
+	if !ok {
+		t.Fatal("offline continuation after batched drain has no spool shadow")
+	}
+	rf, err := seeded.OpenForRead()
+	if err != nil {
+		t.Fatalf("open batched seeded image: %v", err)
+	}
+	got, err := io.ReadAll(rf)
+	_ = rf.Close()
+	if err != nil {
+		t.Fatalf("read batched seeded image: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("batched drain retained the wrong metadata image")
 	}
 }

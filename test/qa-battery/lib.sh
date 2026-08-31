@@ -698,10 +698,10 @@ qa_error_scan() {
     e48=$(_qa_grep_count     "$out.window" "-i" 'already an item' 'error -48' 'errAEItemAlreadyExists')
     e36=$(_qa_grep_count     "$out.window" ""   'error -36' 'ioErr')
     e5000=$(_qa_grep_count   "$out.window" ""   '-5000' 'afpAccessDenied')
-    perm=$(_qa_grep_count    "$out.window" "-i" "you don't have permission" 'Operation not permitted' 'permission denied')
+    perm=$(_qa_grep_count    "$out.window" "-i" "you don't have permission" 'Operation not permitted' 'permission denied' 'NFS3ERR_ACCES' 'media not available offline' 'refusing unsafe in-place write')
 
     # Keep only the matching lines in the artifact for path attribution.
-    grep -nE 'FromHandle STALE|purging phantom|100070|100060|already an item|error -48|error -36|ioErr|-5000|permission' \
+    grep -niE 'FromHandle STALE|purging phantom|100070|100060|already an item|error -48|error -36|ioErr|-5000|permission|NFS3ERR_ACCES|media not available offline|refusing unsafe in-place write' \
         "$out.window" > "$out" 2>/dev/null
     rm -f "$out.window" 2>/dev/null
 

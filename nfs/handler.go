@@ -1068,6 +1068,10 @@ func (h *JuiceMountHandler) SetSpool(spool *SpoolStore, drainer *Drainer) {
 		// the eviction-before-publish window that made fresh reads of a just-drained
 		// file clamp to a stale 0/partial size during an offline->online drain burst.
 		drainer.SetOnSizeReady(h.publishDrainedSize)
+		// Preserve a verified bounded Finder-metadata body until the next
+		// rewrite. The callback runs after size publication and before spool
+		// cleanup on both per-file and batched drain paths.
+		drainer.SetOnDrainMetadataReady(h.cacheDrainedMetadata)
 		// Empty-`._`-sidecar elision (2026-08-18): lets the drainer complete a
 		// metadata-free AppleDouble row without a backend create, removing its
 		// mirror entry so the path honestly reads as absent. See
@@ -3435,6 +3439,28 @@ func (jfs *juiceFS) OpenFile(filename string, flag int, perm os.FileMode) (billy
 		// SETATTR{size=0} for a whole-file replacement creates the spool shadow
 		// through TruncateFile before its WRITE RPCs reach this branch.
 		if pin.IsOffline() {
+			// Finder can revisit an already-drained `._` sidecar (or .DS_Store)
+			// after the route flips offline. If we retained its COMPLETE previous
+			// body, atomically seed a new spool image and apply the in-place WRITE
+			// there. This preserves untouched ranges and keeps the whole Finder
+			// copy alive. No complete image means no safe copy-up: fail closed.
+			if seed, ok := jfs.handler.offlineMetadataSeed(filename); ok {
+				spool := jfs.handler.spool.Load()
+				if spool == nil {
+					return nil, pin.ErrOfflineNotAvailable
+				}
+				sentry, err := spool.OpenWriteSeeded(filename, seed)
+				if err != nil {
+					return nil, err
+				}
+				inode := jfs.handler.nextSyntheticInode()
+				if e != nil {
+					inode = e.Inode
+				}
+				sentry.SetInode(inode)
+				jfs.handler.incActiveWriter(filename)
+				return &spoolWriteFile{name: filename, entry: sentry, handler: jfs.handler}, nil
+			}
 			jmlog.Warn("offline: refusing unsafe in-place write without spool shadow",
 				"in_mount", filename)
 			return nil, pin.ErrOfflineNotAvailable

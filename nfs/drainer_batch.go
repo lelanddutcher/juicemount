@@ -222,6 +222,9 @@ func (b *drainBatcher) commitAndDispose(batch []pendingDrain) {
 			log.Printf("drainer: row %d (%s) cancelled mid-drain (deleted) — undid FUSE write (batched)", p.row.ID, p.row.NFSPath)
 			continue
 		}
+		if d.onDrainMetadataReady != nil {
+			d.onDrainMetadataReady(p.row.NFSPath, p.row.Size)
+		}
 		// Committed: run the identical post-commit eviction cleanup + success
 		// tail the per-file path runs after MarkDrainComplete.
 		d.spool.BatchCompleteDrainCleanup(p.row.ID, p.row.NFSPath, p.row.SpoolFile, p.row.Size)
@@ -241,6 +244,9 @@ func (b *drainBatcher) disposePerFile(p pendingDrain) {
 	d := b.d
 	if d.onSizeReady != nil {
 		d.onSizeReady(p.row.NFSPath, p.row.Size)
+	}
+	if d.onDrainMetadataReady != nil {
+		d.onDrainMetadataReady(p.row.NFSPath, p.row.Size)
 	}
 	done, err := d.spool.MarkDrainComplete(p.row.ID, p.row.NFSPath, p.row.SpoolFile, p.row.Size)
 	if err != nil {

@@ -130,6 +130,11 @@ type Drainer struct {
 	// n == row.Size.
 	onSizeReady func(nfsPath string, size int64)
 
+	// onDrainMetadataReady captures a bounded Finder-metadata spool image after
+	// its authoritative size is published but before spool cleanup removes the
+	// local file. It is set once before Start.
+	onDrainMetadataReady func(nfsPath string, size int64)
+
 	// onSymlinkMaterialized, if set, is invoked after a deferred offline
 	// symlink is os.Symlink'd onto FUSE at reconnect. Set once via
 	// SetOnSymlinkMaterialized BEFORE Start; the handler uses it to
@@ -442,6 +447,12 @@ func (d *Drainer) SetOnDrainComplete(fn func(nfsPath string, size int64)) {
 // once before Start.
 func (d *Drainer) SetOnSizeReady(fn func(nfsPath string, size int64)) {
 	d.onSizeReady = fn
+}
+
+// SetOnDrainMetadataReady registers the pre-cleanup Finder-metadata snapshot
+// hook. Call once before Start.
+func (d *Drainer) SetOnDrainMetadataReady(fn func(nfsPath string, size int64)) {
+	d.onDrainMetadataReady = fn
 }
 
 // SetOnBatchDrainComplete registers the batched metadata-commit hook used when
@@ -1247,6 +1258,9 @@ func (d *Drainer) drainOne(row *metadata.SpoolRow) {
 	// a queued callback), so it stays correct under a burst.
 	if d.onSizeReady != nil {
 		d.onSizeReady(row.NFSPath, row.Size)
+	}
+	if d.onDrainMetadataReady != nil {
+		d.onDrainMetadataReady(row.NFSPath, row.Size)
 	}
 
 	done, err := d.spool.MarkDrainComplete(row.ID, row.NFSPath, row.SpoolFile, row.Size)

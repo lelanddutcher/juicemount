@@ -330,6 +330,56 @@ func (h *JuiceMountHandler) sidecarMaybePopulate(name string, off int64, data []
 	h.sidecar.put(name, data, mtime, size)
 }
 
+// offlineMetadataSeed returns a private copy of a complete, mirror-validated
+// Finder metadata body. It is the only safe basis for an offline in-place
+// rewrite: without every untouched byte locally available, the write must keep
+// failing closed just like an in-place edit of ordinary media.
+func (h *JuiceMountHandler) offlineMetadataSeed(name string) ([]byte, bool) {
+	if h == nil || h.sidecar == nil || !cacheableMetaName(path.Base(name)) {
+		return nil, false
+	}
+	mtime, size, ok := h.sidecarCurrentMeta(name)
+	if !ok || size <= 0 || size > sidecarMaxFile {
+		return nil, false
+	}
+	data, ok := h.sidecar.get(name, mtime, size)
+	if !ok || int64(len(data)) != size {
+		return nil, false
+	}
+	return append([]byte(nil), data...), true
+}
+
+// cacheDrainedMetadata captures the authoritative whole spool image before the
+// drainer evicts it. Finder commonly revisits a directory's `._` sidecar after
+// its first row has already drained; retaining this bounded verified body lets
+// that continuation be copied up safely if connectivity changes in between.
+func (h *JuiceMountHandler) cacheDrainedMetadata(nfsPath string, size int64) {
+	if h == nil || h.sidecar == nil || size <= 0 || size > sidecarMaxFile {
+		return
+	}
+	nfsPath = strings.TrimPrefix(nfsPath, "/")
+	if !cacheableMetaName(path.Base(nfsPath)) {
+		return
+	}
+	spool := h.spool.Load()
+	if spool == nil {
+		return
+	}
+	entry, ok := spool.LookupActive(nfsPath)
+	if !ok || entry.WrittenEnd() != size {
+		return
+	}
+	body, err := os.ReadFile(entry.SpoolFilePath())
+	if err != nil || int64(len(body)) != size {
+		return
+	}
+	mtime, currentSize, ok := h.sidecarCurrentMeta(nfsPath)
+	if !ok || currentSize != size {
+		return
+	}
+	h.sidecar.put(nfsPath, body, mtime, size)
+}
+
 // warmSidecar reads a `._` file fully from FUSE and caches it (the warmer's
 // per-file worker). Bounded open; complete-read-only.
 func (h *JuiceMountHandler) warmSidecar(name, fusePath string) bool {

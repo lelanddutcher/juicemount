@@ -441,6 +441,118 @@ func TestOfflinePartialExistingWriteFailsFast(t *testing.T) {
 	}
 }
 
+// TestOfflineCachedMetadataRewriteSeedsWholeSpoolImage reproduces the Finder
+// sequence that aborted the release battery: a directory `._` sidecar drains
+// online, the route flips offline, then Finder revisits only a byte range of the
+// existing sidecar. A complete cached body makes that partial rewrite safe; the
+// untouched bytes must survive the new spool drain exactly.
+func TestOfflineCachedMetadataRewriteSeedsWholeSpoolImage(t *testing.T) {
+	wasOffline := pin.IsOffline()
+	pin.SetOffline(false)
+	t.Cleanup(func() { pin.SetOffline(wasOffline) })
+
+	jfs, spool, drainer, fuseRoot := newSpoolWiredHandlerNoDrain(t)
+	const name = "tree/._dir2"
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(fuseRoot, name)), 0o755); err != nil {
+		t.Fatalf("mkdir backend parent: %v", err)
+	}
+	original := patternedPayload(4096, 79)
+	if err := os.WriteFile(filepath.Join(fuseRoot, name), original, 0o644); err != nil {
+		t.Fatalf("seed backend sidecar: %v", err)
+	}
+	mtime := time.Now().Add(-time.Minute)
+	const inode = uint64(717171)
+	meta := metadata.MakeEntry(name, false, int64(len(original)), mtime, inode)
+	if err := jfs.handler.store.Insert(meta); err != nil {
+		t.Fatalf("seed sidecar metadata: %v", err)
+	}
+	jfs.handler.sidecar.put(name, original, meta.Mtime.Unix(), int64(len(original)))
+
+	pin.SetOffline(true)
+	wf, err := jfs.OpenFile(name, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("cached offline sidecar rewrite was rejected: %v", err)
+	}
+	patch := []byte("offline-finder-metadata-continuation")
+	const off = int64(152)
+	if _, err := wf.(io.WriterAt).WriteAt(patch, off); err != nil {
+		t.Fatalf("offline sidecar continuation write: %v", err)
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatalf("close offline sidecar continuation: %v", err)
+	}
+	sentry, ok := spool.LookupActive(name)
+	if !ok {
+		t.Fatal("offline sidecar continuation has no spool shadow")
+	}
+	if got := sentry.Inode(); got != inode {
+		t.Fatalf("seeded sidecar inode=%d, want existing inode %d", got, inode)
+	}
+
+	pin.SetOffline(false)
+	if n := spool.sweepOnce(0); n != 1 {
+		t.Fatalf("finalized %d seeded sidecar entries, want 1", n)
+	}
+	drainAllForTest(t, drainer)
+
+	want := append([]byte(nil), original...)
+	copy(want[off:], patch)
+	got, err := os.ReadFile(filepath.Join(fuseRoot, name))
+	if err != nil {
+		t.Fatalf("read rewritten backend sidecar: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("offline sidecar rewrite did not preserve untouched cached ranges")
+	}
+}
+
+// TestDrainCachesMetadataBeforeSpoolCleanup proves the prior whole image is
+// captured from the spool before MarkDrainComplete unlinks it. This is what
+// makes a later offline Finder continuation eligible for the safe seeded path.
+func TestDrainCachesMetadataBeforeSpoolCleanup(t *testing.T) {
+	wasOffline := pin.IsOffline()
+	pin.SetOffline(false)
+	t.Cleanup(func() { pin.SetOffline(wasOffline) })
+
+	jfs, spool, drainer, _ := newSpoolWiredHandlerNoDrain(t)
+	drainer.SetOnSizeReady(jfs.handler.publishDrainedSize)
+	drainer.SetOnDrainMetadataReady(jfs.handler.cacheDrainedMetadata)
+
+	const name = "tree/._dir3"
+	payload := patternedPayload(4096, 83)
+	simulateNFSCreateThenWrite(t, jfs, name, payload, 1024)
+	if n := spool.sweepOnce(0); n != 1 {
+		t.Fatalf("finalized %d metadata entries, want 1", n)
+	}
+	drainAllForTest(t, drainer)
+	if _, ok := spool.LookupActive(name); ok {
+		t.Fatal("drained metadata entry still active; precondition for offline reopen not met")
+	}
+
+	pin.SetOffline(true)
+	wf, err := jfs.OpenFile(name, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("drained metadata body was not retained for offline rewrite: %v", err)
+	}
+	defer wf.Close()
+	seeded, ok := spool.LookupActive(name)
+	if !ok {
+		t.Fatal("offline reopen did not create a seeded spool entry")
+	}
+	rf, err := seeded.OpenForRead()
+	if err != nil {
+		t.Fatalf("open seeded spool body: %v", err)
+	}
+	got, err := io.ReadAll(rf)
+	_ = rf.Close()
+	if err != nil {
+		t.Fatalf("read seeded spool body: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("drain-time cached metadata did not seed the exact prior image")
+	}
+}
+
 func fiSize(fi os.FileInfo) int64 {
 	if fi == nil {
 		return -1

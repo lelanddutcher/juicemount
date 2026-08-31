@@ -774,6 +774,105 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	}
 }
 
+// OpenWriteSeeded creates a new writing entry whose initial whole-file image is
+// seed. The path shard is held until the seed is durable and the entry is
+// published in the index, so a concurrent NFS WRITE can never race ahead of the
+// initializer and then be overwritten by it.
+//
+// This is intentionally narrower than a generic backend-file copy-up. Its
+// caller uses it only for small Finder metadata files whose complete previous
+// body was verified in the sidecar cache before the machine went offline. Real
+// media and any metadata file without a complete cached image continue to fail
+// closed rather than manufacture zero-filled untouched ranges.
+func (s *SpoolStore) OpenWriteSeeded(nfsPath string, seed []byte) (*SpoolEntry, error) {
+	if len(seed) == 0 {
+		return s.OpenWrite(nfsPath)
+	}
+
+	shard := s.pathShard(nfsPath)
+	reserved := false
+	for {
+		if s.closed.Load() {
+			if reserved {
+				s.releaseCapacity(int64(len(seed)))
+			}
+			return nil, fmt.Errorf("spool: store is closed")
+		}
+
+		shard.Lock()
+		if _, exists := s.index.Lookup(nfsPath); exists {
+			shard.Unlock()
+			if reserved {
+				s.releaseCapacity(int64(len(seed)))
+			}
+			// The winner published only after its seed was durable. Reuse that
+			// authoritative entry through the normal refcount/reopen path.
+			return s.OpenWrite(nfsPath)
+		}
+
+		if !reserved {
+			if !s.tryReserveCapacity(int64(len(seed))) {
+				shard.Unlock()
+				if !s.reserveCapacityOrWait(int64(len(seed)), nil) {
+					return nil, ErrSpoolFull
+				}
+				reserved = true
+				continue
+			}
+			reserved = true
+		}
+
+		h := sha256.Sum256([]byte(nfsPath))
+		basename := hex.EncodeToString(h[:8]) + fmt.Sprintf("-%d", time.Now().UnixMicro())
+		spoolFile := filepath.Join(s.root, SpoolFilesSubdir, basename)
+
+		id, err := s.meta.Insert(nfsPath, spoolFile)
+		if err != nil {
+			shard.Unlock()
+			s.releaseCapacity(int64(len(seed)))
+			return nil, err
+		}
+		f, err := os.OpenFile(spoolFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			_ = s.meta.Delete(id)
+			shard.Unlock()
+			s.releaseCapacity(int64(len(seed)))
+			return nil, fmt.Errorf("spool: open seeded file: %w", err)
+		}
+		n, writeErr := f.WriteAt(seed, 0)
+		if writeErr != nil || n != len(seed) {
+			_ = f.Close()
+			_ = os.Remove(spoolFile)
+			_ = s.meta.Delete(id)
+			shard.Unlock()
+			s.releaseCapacity(int64(len(seed)))
+			if writeErr == nil {
+				writeErr = fmt.Errorf("short write: %d of %d", n, len(seed))
+			}
+			return nil, fmt.Errorf("spool: seed whole-file image: %w", writeErr)
+		}
+
+		hasher := sha256.New()
+		_, _ = hasher.Write(seed)
+		entry := &SpoolEntry{
+			id:            id,
+			nfsPath:       nfsPath,
+			spoolFile:     spoolFile,
+			file:          f,
+			writtenEnd:    int64(len(seed)),
+			contiguousEnd: int64(len(seed)),
+			hasher:        hasher,
+			hashValid:     true,
+			store:         s,
+			refcount:      1,
+		}
+		entry.lastWrite.Store(time.Now().UnixNano())
+		s.index.Insert(nfsPath, entry)
+		shard.Unlock()
+		return entry, nil
+	}
+}
+
 // sweepOnce finalizes every active `writing` entry that has no open write
 // handles and has been quiescent for at least `idle`. Returns the number
 // finalized. This is the NFS-compatible replacement for "finalize on Close":

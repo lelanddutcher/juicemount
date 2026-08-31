@@ -11,6 +11,9 @@
   spool image instead of waiting behind the drain queue and surfacing repeated
   retry errors. Rows already claimed by the drainer or partially streamed stay
   on the corruption-safe defer path.
+- A verified bounded Finder-metadata image is retained across spool drain so an
+  already-drained `._` sidecar or `.DS_Store` can be rewritten safely after an
+  offline transition; ordinary partial file edits still fail closed.
 - Large Finder directories keep each AppleDouble sidecar beside its principal
   at the final NFS protocol ordering layer with a linear merge, eliminating the
   redundant lookup storm and second full sort seen with 5,000-file folders.

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"database/sql"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -583,6 +585,51 @@ func TestSpoolStopRefusesOpenWrite(t *testing.T) {
 	s.Stop()
 	if _, err := s.OpenWrite("/post-stop.bin"); err == nil {
 		t.Fatalf("expected OpenWrite to error after Stop()")
+	}
+}
+
+func TestOpenWriteSeededPublishesWholeImageAtomically(t *testing.T) {
+	s := newTestSpoolStore(t, 1<<20)
+	seed := bytes.Repeat([]byte{0x6d}, 128<<10)
+	const writers = 16
+	start := make(chan struct{})
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			e, err := s.OpenWriteSeeded("._folder", seed)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer e.ReleaseHandle()
+			rf, err := e.OpenForRead()
+			if err != nil {
+				errs <- err
+				return
+			}
+			got, err := io.ReadAll(rf)
+			_ = rf.Close()
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !bytes.Equal(got, seed) {
+				errs <- fmt.Errorf("observed partially published seed: got=%d want=%d", len(got), len(seed))
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if used, _ := s.Capacity(); used != int64(len(seed)) {
+		t.Fatalf("seed capacity charged %d bytes, want exactly %d", used, len(seed))
 	}
 }
 
