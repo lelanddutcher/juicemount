@@ -1,6 +1,7 @@
 package farm
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -12,8 +13,7 @@ import (
 
 // TestBuildQLArgs pins the QL-preview ffmpeg argument contract: bounded
 // duration, aspect-preserving fit box, yuv420p decode floor, +faststart for
-// byte-range playback, forced MP4 muxer (the staged output name has no .mp4
-// extension to infer from).
+// byte-range playback, and a forced MP4 muxer independent of the scratch name.
 func TestBuildQLArgs(t *testing.T) {
 	args := buildQLArgs("/src/clip.braw", "/out/staged", 960, 20)
 	joined := strings.Join(args, " ")
@@ -47,6 +47,7 @@ func TestGenerateQLPreviewEndToEnd(t *testing.T) {
 	}
 
 	dir := t.TempDir()
+	scratch := t.TempDir()
 	src := filepath.Join(dir, "clip.mov")
 	gen := exec.Command(ffmpeg, "-v", "error", "-y",
 		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=3",
@@ -62,7 +63,8 @@ func TestGenerateQLPreviewEndToEnd(t *testing.T) {
 	}
 	defer store.Close()
 	opt := Options{Producer: "macos-node", Version: 1, Mount: dir,
-		FFmpegBin: ffmpeg, QLMaxDim: 320, QLSeconds: 2}
+		FFmpegBin: ffmpeg, QLMaxDim: 320, QLSeconds: 2,
+		EncodeScratchDir: scratch}
 
 	res := GenerateQLPreview(store, src, opt)
 	if res.Err != nil {
@@ -80,6 +82,11 @@ func TestGenerateQLPreviewEndToEnd(t *testing.T) {
 	}
 	if fi.Size() == 0 {
 		t.Fatal("qlpreview blob is empty")
+	}
+	if entries, err := os.ReadDir(scratch); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("qlpreview leaked node-local scratch files: %v", entries)
 	}
 
 	rows, err := store.Manifest(res.Inode)

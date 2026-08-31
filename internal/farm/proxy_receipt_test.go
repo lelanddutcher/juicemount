@@ -117,3 +117,89 @@ func TestProxyReceiptCannotVouchForDifferentFinalBytes(t *testing.T) {
 		t.Fatal("receipt for different bytes vouched for the old final blob")
 	}
 }
+
+func TestGenerateProxyEncodesOnLocalScratchThenPublishesOnce(t *testing.T) {
+	root := t.TempDir()
+	mount := filepath.Join(root, "mount")
+	scratch := filepath.Join(root, "scratch")
+	tools := filepath.Join(root, "tools")
+	for _, dir := range []string{mount, scratch, tools} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source := filepath.Join(mount, "source.mov")
+	if err := os.WriteFile(source, make([]byte, 64<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	probe := filepath.Join(tools, "ffprobe")
+	probeScript := `#!/bin/sh
+printf '%s\n' '{"streams":[{"codec_type":"video","codec_name":"prores","width":1920,"height":1080,"r_frame_rate":"24/1"}],"format":{"format_name":"mov","duration":"10","size":"65536"}}'
+`
+	if err := os.WriteFile(probe, []byte(probeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ffmpeg := filepath.Join(tools, "ffmpeg")
+	ffmpegScript := `#!/bin/sh
+for last do :; done
+printf '%s' "$last" > "$(dirname "$0")/ffmpeg-output-path"
+printf 'first-' > "$last"
+printf 'rewrite-' >> "$last"
+printf 'complete' >> "$last"
+`
+	if err := os.WriteFile(ffmpeg, []byte(ffmpegScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := derivatives.Open(filepath.Join(root, "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	res := GenerateProxy(store, source, Options{
+		Mount: mount, EncodeScratchDir: scratch,
+		FFprobeBin: probe, FFmpegBin: ffmpeg,
+		ProxyVCodec: "libx264", Producer: "linux-farm", Version: 1,
+	})
+	if res.Err != nil || !res.Wrote || res.SkippedFresh {
+		t.Fatalf("proxy result = %+v", res)
+	}
+	encodedAt, err := os.ReadFile(filepath.Join(tools, "ffmpeg-output-path"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedScratch, err := filepath.EvalSymlinks(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(encodedAt), resolvedScratch+string(os.PathSeparator)) {
+		t.Fatalf("ffmpeg output %q was not node-local scratch %q", encodedAt, scratch)
+	}
+	final, err := os.ReadFile(filepath.Join(mount, derivatives.DerivBlobRel(res.Inode, "proxy.mp4")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(final) != "first-rewrite-complete" {
+		t.Fatalf("published proxy = %q", final)
+	}
+	entries, err := os.ReadDir(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("local scratch leaked files: %v", entries)
+	}
+}
+
+func TestCreateEncodeScratchRejectsSharedMount(t *testing.T) {
+	mount := t.TempDir()
+	scratch := filepath.Join(mount, "scratch")
+	if err := os.Mkdir(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := createEncodeScratch(Options{Mount: mount, EncodeScratchDir: scratch}, "proxy"); err == nil {
+		f.Close()
+		os.Remove(f.Name())
+		t.Fatal("accepted proxy scratch inside shared mount")
+	}
+}

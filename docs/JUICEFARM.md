@@ -231,6 +231,7 @@ docker run -d --name juicefarm-worker \
   -e JM_WORKER_ROLE=server \
   -e JM_FARM_PRODUCER=linux-farm \
   -e JM_FARM_MODEL=/models/ggml-medium.en.bin \
+  -e JM_FARM_ENCODE_SCRATCH=/tmp \
   -v /path/to/juicefarm-cache:/jfs-cache \
   -v /path/to/juicefarm-state:/state \
 juicefarm:local
@@ -271,6 +272,7 @@ docker run -d --name juicefarm-gpu-worker \
   -e JM_WORKER_ROLE=render \
   -e JM_FARM_TRANSCRIPT_DEVICE=vulkan \
   -e JM_FARM_VCODEC=hevc_vaapi \
+  -e JM_FARM_ENCODE_SCRATCH=/tmp \
   juicefarm-gpu:local
 ```
 
@@ -294,6 +296,11 @@ Build gotchas (baked into the Dockerfile):
   container writable layer. `JM_FARM_CACHE_DIR` selects the in-container path and
   `JM_FARM_CACHE_SIZE` sets its MiB budget (default `20000`). Keep the budget below
   the node's actual free space.
+- Keep `JM_FARM_ENCODE_SCRATCH` on node-local storage (the shipped default is
+  `/tmp`) and never under `/jfs`. FFmpeg closes its seek/rewrite-heavy MP4 there;
+  the worker then copies the completed immutable file into JuiceFS in one
+  sequential pass. A custom path must exist in the container and have room for
+  the largest single proxy or Quick Look preview each concurrent worker can emit.
 
 Modes: `JM_FARM_QUEUE=1` (standing queue drain) or `JM_FARM_MODE=all|transcript|…`
 with `JM_FARM_ONCE=1` (one-shot sweep). Throttling knobs: `JM_FARM_PROXY_WORKERS`
@@ -355,7 +362,9 @@ reason until an operator restores space and explicitly presses Play.
 deployment.
 
 Proxy publication uses a durable, byte-bound receipt next to `proxy.mp4`. The worker
-writes and fsyncs that receipt before the final blob rename. If the blob commits but
+writes the completed MP4 on node-local scratch, copies it into a descriptor-relative
+staged file in one sequential pass, and fsyncs the byte-bound receipt before the
+final blob rename. If the blob commits but
 the worker loses its private index or the shared manifest write fails, any later
 worker validates the exact blob, repairs registration, and skips re-encoding. This
 keeps retries idempotent across nodes and prevents overwritten JuiceFS slices from

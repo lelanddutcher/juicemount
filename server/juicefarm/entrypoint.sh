@@ -26,6 +26,9 @@
 #                      job's options override (CRF/preset/model/vcodec/workers).
 #   JM_FARM_CACHE_DIR  persistent local JuiceFS cache path (default: /jfs-cache)
 #   JM_FARM_CACHE_SIZE cache budget in MiB (default: 20000)
+#   JM_FARM_ENCODE_SCRATCH node-local MP4 encode/faststart scratch (default: /tmp).
+#                      NEVER place this under /jfs: completed MP4 bytes cross the
+#                      JuiceFS mount exactly once after ffmpeg closes the file.
 #   JM_FARM_FREE_SPACE_RATIO minimum host-disk reserve before cache writes stop
 #                      (default: 0.05; JuiceFS default 0.10 disabled the GPU
 #                      cache on the RC node while 12 GiB was still available)
@@ -58,6 +61,7 @@ PROXY_WORKERS="${JM_FARM_PROXY_WORKERS:-2}"
 STATUS="${JM_FARM_STATUS:-/state/farm-status.json}"
 CACHE_DIR="${JM_FARM_CACHE_DIR:-/jfs-cache}"
 CACHE_SIZE="${JM_FARM_CACHE_SIZE:-20000}"
+ENCODE_SCRATCH="${JM_FARM_ENCODE_SCRATCH:-/tmp}"
 CACHE_FREE_RATIO="${JM_FARM_FREE_SPACE_RATIO:-0.05}"
 # Yield CPU + IO to interactive load so a sweep never starves the live mount.
 # JM_FARM_NICE: niceness 0-19 (higher = nicer). JM_FARM_IONICE: best-effort IO
@@ -110,7 +114,7 @@ do_pass() {
   ion="${IONICE:-0}"
   # shellcheck disable=SC2086
   $wrap jmfarm -mount "$MNT" -db "$DB" -producer "$PRODUCER" -concurrency "$WORKERS" -ffmpeg-threads "$FFMPEG_THREADS" -status "$STATUS" \
-    -nice "$NICE" -ionice "$ion" -interval "$INTERVAL" "$@" -root "$TARGET" || true
+    -nice "$NICE" -ionice "$ion" -interval "$INTERVAL" -encode-scratch "$ENCODE_SCRATCH" "$@" -root "$TARGET" || true
 }
 
 run_sweep() {
@@ -146,7 +150,7 @@ if [ "${JM_FARM_QUEUE:-0}" = "1" ] || [ "$MODE" = "queue" ]; then
     -status "$STATUS" -nice "$NICE" -ionice "$ion" \
     -name "${JM_WORKER_NAME:-}" -kinds "${JM_FARM_KINDS:-}" -transcript-device "${JM_FARM_TRANSCRIPT_DEVICE:-cpu}" \
     -concurrency "$WORKERS" -ffmpeg-threads "$FFMPEG_THREADS" -proxy-concurrency "$PROXY_WORKERS" \
-    -vcodec "$VCODEC" -crf "$CRF" -preset "$PRESET" -whisper-model "$MODEL"
+    -vcodec "$VCODEC" -crf "$CRF" -preset "$PRESET" -encode-scratch "$ENCODE_SCRATCH" -whisper-model "$MODEL"
 fi
 
 if [ "${JM_FARM_ONCE:-0}" = "1" ]; then

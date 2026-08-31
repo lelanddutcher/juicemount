@@ -2,6 +2,7 @@ package derivatives
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -121,6 +122,62 @@ func StageNameAt(dir *os.File, name string) (stagedName, absPath string, err err
 	}
 	unix.Close(fd)
 	return staged, filepath.Join(dir.Name(), staged), nil
+}
+
+// StageReaderAt copies an already-complete local artifact into a new staged
+// file under dir in one sequential pass. Large generators should finish their
+// seek/rewrite-heavy work on node-local storage, then call this helper exactly
+// once: streaming ffmpeg output directly into an object-backed FUSE mount can
+// create many superseded slices even though only one small final blob remains.
+//
+// The destination is created and addressed exclusively through dir's held
+// descriptor. Unlike StageNameAt, no subprocess ever resolves the shared
+// derivative tree by path.
+func StageReaderAt(dir *os.File, name string, src io.Reader, perm os.FileMode) (stagedName string, err error) {
+	if dir == nil {
+		return "", fmt.Errorf("derivatives: nil staging directory")
+	}
+	if src == nil {
+		return "", fmt.Errorf("derivatives: nil staging source")
+	}
+	if err := validLeaf(name); err != nil {
+		return "", err
+	}
+	dfd := int(dir.Fd())
+	staged := fmt.Sprintf(".stage-%d-%d-%s", os.Getpid(), atomic.AddUint64(&tmpSeq, 1), name)
+	fd, err := unix.Openat(dfd, staged,
+		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm))
+	if err != nil {
+		return "", fmt.Errorf("derivatives: stage reader %q: %w", staged, err)
+	}
+	f := os.NewFile(uintptr(fd), staged)
+	ok := false
+	defer func() {
+		if !ok {
+			_ = f.Close()
+			_ = unix.Unlinkat(dfd, staged, 0)
+		}
+	}()
+	// A multi-megabyte buffer keeps the FUSE boundary coarse and predictable;
+	// the source is a completed local file, so there is no reason to expose the
+	// object store to ffmpeg's small appends or faststart rewrite pass.
+	buf := make([]byte, 4<<20)
+	// Hide optional ReaderFrom/WriterTo methods from io.CopyBuffer. Those fast
+	// paths may ignore buf and choose platform-dependent syscall or chunk sizes;
+	// these wrappers make the 4 MiB sequential write shape part of the contract.
+	dst := struct{ io.Writer }{Writer: f}
+	input := struct{ io.Reader }{Reader: src}
+	if _, err := io.CopyBuffer(dst, input, buf); err != nil {
+		return "", fmt.Errorf("derivatives: copy staged %q: %w", staged, err)
+	}
+	if err := f.Sync(); err != nil {
+		return "", fmt.Errorf("derivatives: sync staged %q: %w", staged, err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("derivatives: close staged %q: %w", staged, err)
+	}
+	ok = true
+	return staged, nil
 }
 
 // CommitStagedAt renames a staged name onto its final name through dir's

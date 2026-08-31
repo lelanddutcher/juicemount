@@ -117,6 +117,7 @@ COPY --from=whisper /download-ggml-model.sh /usr/local/bin/download-ggml-model.s
 COPY server/juicefarm/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh /usr/local/bin/download-ggml-model.sh
 ENV JM_FARM_MODEL=/models/ggml-medium.en.bin
+ENV JM_FARM_ENCODE_SCRATCH=/tmp
 # GPU defaults — overridable. The manager's farm config can flip these live
 # per-node anyway (hot knobs); these ENVs are just sane cold-start values.
 ENV JM_FARM_TRANSCRIPT_DEVICE=vulkan

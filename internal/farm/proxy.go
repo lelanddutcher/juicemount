@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -129,17 +130,16 @@ func ProxyContext(ctx context.Context, ffmpegBin, vcodec string, crf int, preset
 	// prefixed and is never the blob's real name, so a reader only ever sees the
 	// final name appear atomically at the caller's renameat.
 	// proxyEncodeArgs selects the correct quality and device wiring for the
-	// configured encoder. The staged output path is intentionally still passed
-	// directly: its descriptor-anchored creation and final rename are owned by
-	// GenerateProxy, not this function.
+	// configured encoder. GenerateProxy supplies a node-local output path and
+	// owns the later descriptor-anchored one-pass publish and final rename.
 	args := append([]string{"-y", "-loglevel", "error"}, proxyThreadArgs()...)
 	args = append(args, proxyDecodeArgs(vcodec)...)
 	args = append(args,
 		"-i", srcPath,
 		"-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
 		"-movflags", "+faststart",
-		// Force the MP4 muxer: the temp path lacks the .mp4 extension ffmpeg
-		// would otherwise infer the container from.
+		// Force the MP4 muxer so container selection never depends on the caller's
+		// scratch filename.
 		"-f", "mp4")
 	args = append(args, proxyEncodeArgs(vcodec, crf, preset)...)
 	if strings.Contains(vcodec, "hevc") || strings.Contains(vcodec, "h265") || strings.Contains(vcodec, "265") {
@@ -359,12 +359,6 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		return res
 	}
 	defer derivDir.Close()
-	staged, out, err := derivatives.StageNameAt(derivDir, rel)
-	stErr := err
-	if stErr != nil {
-		res.Err = fmt.Errorf("stage proxy: %w", stErr)
-		return res
-	}
 	// PROXY-CODEC (#50): stamp which codec THIS blob is + its exact
 	// canPlayType/isTypeSupported token so OL/web can gate without re-probing.
 	// The codec is derived from the configured encoder (libx264 ⇒ h264 floor;
@@ -377,11 +371,41 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		Codec: &codec, CodecString: &codecString,
 	}
 	stampSource(&row, fi)
-	err = ProxyContext(ctx, opt.FFmpegBin, opt.ProxyVCodec, opt.ProxyCRF, opt.ProxyPreset, path, out)
+	scratch, err := createEncodeScratch(opt, "proxy")
+	if err != nil {
+		res.Err = fmt.Errorf("create local proxy scratch: %w", err)
+		return res
+	}
+	scratchPath := scratch.Name()
+	if err := scratch.Close(); err != nil {
+		_ = os.Remove(scratchPath)
+		res.Err = fmt.Errorf("close local proxy scratch: %w", err)
+		return res
+	}
+	defer os.Remove(scratchPath)
+
+	// ffmpeg's MP4 muxer appends, seeks, and performs a +faststart rewrite. Do
+	// all of that on node-local storage. Sending those mutations directly into
+	// JuiceFS creates superseded object slices that TrashDays deliberately keeps,
+	// amplifying a few gigabytes of visible proxies into tens of gigabytes of
+	// physical MinIO writes. Only the completed immutable bytes cross FUSE.
+	err = ProxyContext(ctx, opt.FFmpegBin, opt.ProxyVCodec, opt.ProxyCRF, opt.ProxyPreset, path, scratchPath)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		derivatives.DiscardStagedAt(derivDir, staged)
 		res.Err = ctxErr
 		return res
+	}
+	staged := ""
+	if err == nil {
+		local, openErr := os.Open(scratchPath)
+		if openErr != nil {
+			err = fmt.Errorf("open completed local proxy: %w", openErr)
+		} else {
+			staged, err = derivatives.StageReaderAt(derivDir, rel, local, 0o644)
+			_ = local.Close()
+			if err != nil {
+				err = fmt.Errorf("copy completed proxy into shared storage: %w", err)
+			}
+		}
 	}
 	if err == nil {
 		// Persist a byte-bound recovery receipt before the final rename. If any
@@ -399,7 +423,9 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		err = derivatives.CommitStagedAt(derivDir, staged, rel)
 	}
 	if err != nil {
-		derivatives.DiscardStagedAt(derivDir, staged)
+		if staged != "" {
+			derivatives.DiscardStagedAt(derivDir, staged)
+		}
 		// Non-fatal: publish a failed row so the consumer regenerates locally.
 		res.Err = err
 		row.Status = "failed"
@@ -433,6 +459,38 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		}
 	}
 	return res
+}
+
+func createEncodeScratch(opt Options, kind string) (*os.File, error) {
+	dir := strings.TrimSpace(opt.EncodeScratchDir)
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve scratch directory %q: %w", dir, err)
+	}
+	if strings.TrimSpace(opt.Mount) != "" {
+		resolvedMount, mountErr := filepath.EvalSymlinks(opt.Mount)
+		if mountErr != nil {
+			return nil, fmt.Errorf("resolve mount %q: %w", opt.Mount, mountErr)
+		}
+		rel, relErr := filepath.Rel(resolvedMount, resolvedDir)
+		if relErr != nil {
+			return nil, fmt.Errorf("compare scratch and mount: %w", relErr)
+		}
+		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))) {
+			return nil, fmt.Errorf("proxy scratch %q resolves inside shared mount %q", dir, opt.Mount)
+		}
+	}
+	if kind == "" {
+		kind = "media"
+	}
+	f, err := os.CreateTemp(resolvedDir, "jmfarm-"+kind+"-*.mp4")
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 // proxyCodecStrings derives the PROXY-CODEC `codec` label and the exact

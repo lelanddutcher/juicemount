@@ -1,6 +1,7 @@
 package derivatives
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,5 +87,34 @@ func TestStageNamePreservesExtension(t *testing.T) {
 			t.Errorf("staged path %q lost the extension of %q", abs, name)
 		}
 		DiscardStagedAt(dir, staged)
+	}
+}
+
+func TestStageReaderCopiesCompletedArtifactOnce(t *testing.T) {
+	mount := t.TempDir()
+	rel := DerivDirRel(880003)
+	if err := EnsureDirUnder(mount, rel); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := OpenDirUnder(mount, rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+
+	want := bytes.Repeat([]byte("completed-local-proxy"), 300000)
+	staged, err := StageReaderAt(dir, "proxy.mp4", bytes.NewReader(want), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CommitStagedAt(dir, staged, "proxy.mp4"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(mount, DerivBlobRel(880003, "proxy.mp4")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("staged bytes differ: got %d bytes, want %d", len(got), len(want))
 	}
 }

@@ -45,6 +45,10 @@
   retries or a returning HEVC worker from replacing valid proxies and amplifying
   JuiceFS trash. Storage permits and an atomic safety pause stop new render
   claims below physical-pool headroom.
+- Proxy and Quick Look MP4 muxing now completes on node-local scratch before a
+  single sequential publish into JuiceFS. This prevents FFmpeg append/seek and
+  `+faststart` rewrites from creating tens of gigabytes of retained object slices
+  for only a few gigabytes of visible output.
 - Embedded audio cover artwork is excluded from motion-video classification, so
   audio-only assets cannot be routed into the MP4 proxy encoder.
 - Farm mission control now shows every queue lane and each node's current

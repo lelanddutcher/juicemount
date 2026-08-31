@@ -74,6 +74,25 @@ func TestProductionComposeRequiresPhysicalFarmCapacity(t *testing.T) {
 	}
 }
 
+func TestProductionComposePinsFarmEncodeScratchOffJuiceFS(t *testing.T) {
+	src, err := os.ReadFile("../docker-compose.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(src)
+	if strings.Count(compose, `JM_FARM_ENCODE_SCRATCH: "/tmp"`) != 1 {
+		t.Fatal("production compose must pin the server worker's encode scratch to node-local /tmp")
+	}
+	for _, forbidden := range []string{
+		`JM_FARM_ENCODE_SCRATCH: "/jfs"`,
+		`JM_FARM_ENCODE_SCRATCH: "/jfs/`,
+	} {
+		if strings.Contains(compose, forbidden) {
+			t.Fatalf("production compose points seek-heavy MP4 scratch at JuiceFS: %q", forbidden)
+		}
+	}
+}
+
 func TestProductionComposeRequiresMinIOCredentialAtRenderTime(t *testing.T) {
 	src, err := os.ReadFile("../docker-compose.yml")
 	if err != nil {

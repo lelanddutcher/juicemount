@@ -75,8 +75,8 @@ func buildQLArgs(srcPath, outPath string, maxDim, maxSeconds int) []string {
 	args := append([]string{"-y", "-loglevel", "error"}, proxyThreadArgs()...)
 	// Duration cap before output; scale keeps aspect; yuv420p is the decode
 	// floor (10-bit/HDR/422 originals included); +faststart so AVPlayer can
-	// start playback from a byte-range fetch of the head of the file. -f mp4
-	// because the staged output name lacks the .mp4 extension.
+	// start playback from a byte-range fetch of the head of the file. Force MP4
+	// so container selection never depends on the caller's scratch filename.
 	return append(args,
 		"-t", strconv.Itoa(maxSeconds),
 		"-i", srcPath,
@@ -197,11 +197,18 @@ func GenerateQLPreview(store *derivatives.Store, path string, opt Options) QLRes
 		return res
 	}
 	defer derivDir.Close()
-	staged, out, stErr := derivatives.StageNameAt(derivDir, qlPreviewBlobName)
-	if stErr != nil {
-		res.Err = fmt.Errorf("stage qlpreview: %w", stErr)
+	scratch, err := createEncodeScratch(opt, "qlpreview")
+	if err != nil {
+		res.Err = fmt.Errorf("create local qlpreview scratch: %w", err)
 		return res
 	}
+	scratchPath := scratch.Name()
+	if err := scratch.Close(); err != nil {
+		_ = os.Remove(scratchPath)
+		res.Err = fmt.Errorf("close local qlpreview scratch: %w", err)
+		return res
+	}
+	defer os.Remove(scratchPath)
 
 	rel := qlPreviewBlobName
 	mt := qlPreviewMedia
@@ -211,17 +218,31 @@ func GenerateQLPreview(store *derivatives.Store, path string, opt Options) QLRes
 	}
 	stampSource(&row, fi)
 
-	err = QLPreviewContext(ctx, opt.FFmpegBin, path, out, maxDim, maxSec)
+	err = QLPreviewContext(ctx, opt.FFmpegBin, path, scratchPath, maxDim, maxSec)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		derivatives.DiscardStagedAt(derivDir, staged)
 		res.Err = ctxErr
 		return res
+	}
+	staged := ""
+	if err == nil {
+		local, openErr := os.Open(scratchPath)
+		if openErr != nil {
+			err = fmt.Errorf("open completed local qlpreview: %w", openErr)
+		} else {
+			staged, err = derivatives.StageReaderAt(derivDir, qlPreviewBlobName, local, 0o644)
+			_ = local.Close()
+			if err != nil {
+				err = fmt.Errorf("copy completed qlpreview into shared storage: %w", err)
+			}
+		}
 	}
 	if err == nil {
 		err = derivatives.CommitStagedAt(derivDir, staged, qlPreviewBlobName)
 	}
 	if err != nil {
-		derivatives.DiscardStagedAt(derivDir, staged)
+		if staged != "" {
+			derivatives.DiscardStagedAt(derivDir, staged)
+		}
 		// Non-fatal: publish a failed row so consumers know the artifact will
 		// never appear (BRAW under stock ffmpeg lands here, deliberately).
 		res.Err = err

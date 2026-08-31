@@ -473,31 +473,32 @@ targetLoop:
 
 func main() {
 	var (
-		buildInfo  = flag.Bool("build-info", false, "print release version and source commit, then exit")
-		dbPath     = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
-		root       = flag.String("root", "", "directory to walk for media (required unless -files)")
-		files      = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
-		mount      = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
-		blobs      = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
-		thumbDim   = flag.Int("thumb-dim", 720, "poster fit box in px")
-		filmstr    = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
-		filmCell   = flag.Int("filmstrip-cell", 320, "filmstrip cell width in px")
-		wave       = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
-		regen      = flag.Bool("regenerate", false, "re-derive assets the freshness gate would skip (the ONLY way to force work on an asset whose derivatives already exist — use after a generator or codec fix)")
-		waveSPP    = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
-		transcr    = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.logger.json (instead of basic derivatives)")
-		proxyGen   = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
-		qlGen      = flag.Bool("ql-preview", false, "QL-preview mode: generate short spacebar-playable H.264 previews (T1.1/F4), separate from basic derivatives")
-		qlDim      = flag.Int("ql-dim", 960, "QL preview fit box in px")
-		qlSecs     = flag.Int("ql-seconds", 20, "QL preview duration cap in seconds (<=0 → 20)")
-		postAlways = flag.Bool("poster-always", false, "poster-always policy (T1.1): generate posters for every video clip even below -min-size-mb")
-		vcodec     = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
-		pCRF       = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")
-		pPreset    = flag.String("preset", "slow", "proxy x264 preset (faster preset = quicker, larger)")
-		pConc      = flag.Int("proxy-concurrency", 0, "separate (lower) worker count for proxy mode; 0 = use -concurrency (proxy transcode is the CPU hog)")
-		wModel     = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
-		wBin       = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
-		limit      = flag.Int("limit", 0, "max files to process (0 = no limit)")
+		buildInfo     = flag.Bool("build-info", false, "print release version and source commit, then exit")
+		dbPath        = flag.String("db", defaultDBPath(), "derivatives.db path (the one the app serves)")
+		root          = flag.String("root", "", "directory to walk for media (required unless -files)")
+		files         = flag.String("files", "", "comma-separated explicit file list (alternative to -root)")
+		mount         = flag.String("mount", "/Volumes/zpool", "mount point (for Tier-A blob dir)")
+		blobs         = flag.Bool("blobs", false, "also generate poster thumbnails into Tier-A")
+		thumbDim      = flag.Int("thumb-dim", 720, "poster fit box in px")
+		filmstr       = flag.Bool("filmstrip", false, "also generate filmstrip sprite-sheets into Tier-A (JM-16)")
+		filmCell      = flag.Int("filmstrip-cell", 320, "filmstrip cell width in px")
+		wave          = flag.Bool("waveform", false, "also generate audio waveform overviews into Tier-A (JM-18)")
+		regen         = flag.Bool("regenerate", false, "re-derive assets the freshness gate would skip (the ONLY way to force work on an asset whose derivatives already exist — use after a generator or codec fix)")
+		waveSPP       = flag.Int("waveform-spp", 1024, "waveform samples per pixel")
+		transcr       = flag.Bool("transcript", false, "AI mode: generate whisper transcripts → ai.logger.json (instead of basic derivatives)")
+		proxyGen      = flag.Bool("proxy", false, "proxy mode: generate faststart MP4 proxies (OL-3), separate from basic derivatives")
+		qlGen         = flag.Bool("ql-preview", false, "QL-preview mode: generate short spacebar-playable H.264 previews (T1.1/F4), separate from basic derivatives")
+		qlDim         = flag.Int("ql-dim", 960, "QL preview fit box in px")
+		qlSecs        = flag.Int("ql-seconds", 20, "QL preview duration cap in seconds (<=0 → 20)")
+		postAlways    = flag.Bool("poster-always", false, "poster-always policy (T1.1): generate posters for every video clip even below -min-size-mb")
+		vcodec        = flag.String("vcodec", "libx264", "proxy video encoder (GPU: h264_nvenc/h264_qsv/h264_vaapi)")
+		pCRF          = flag.Int("crf", 21, "proxy CRF quality (lower = sharper/bigger)")
+		pPreset       = flag.String("preset", "slow", "proxy x264 preset (faster preset = quicker, larger)")
+		encodeScratch = flag.String("encode-scratch", defaultStr(os.Getenv("JM_FARM_ENCODE_SCRATCH"), os.TempDir()), "node-local directory for MP4 encode/faststart before one-pass JuiceFS publish")
+		pConc         = flag.Int("proxy-concurrency", 0, "separate (lower) worker count for proxy mode; 0 = use -concurrency (proxy transcode is the CPU hog)")
+		wModel        = flag.String("whisper-model", "", "path to a ggml whisper model (required with -transcript)")
+		wBin          = flag.String("whisper-bin", "whisper-cli", "whisper.cpp CLI binary")
+		limit         = flag.Int("limit", 0, "max files to process (0 = no limit)")
 		// Throughput audit (2026-07-14): ffmpeg default -threads 0 spawns one
 		// decode thread per core PLUS filter threads (~61 on a 22-core box), so
 		// N parallel workers oversubscribed the box (load 33-45, CPU pinned but
@@ -670,6 +671,7 @@ func main() {
 			vcodec:          *vcodec,
 			crf:             *pCRF,
 			preset:          *pPreset,
+			encodeScratch:   *encodeScratch,
 			wModel:          *wModel,
 			wBin:            *wBin,
 			thumbDim:        *thumbDim,
@@ -725,6 +727,7 @@ func main() {
 		Waveform: *wave, WaveformSPP: *waveSPP,
 		WhisperBin: *wBin, WhisperModel: *wModel,
 		ProxyVCodec: *vcodec, ProxyCRF: *pCRF, ProxyPreset: *pPreset,
+		EncodeScratchDir: *encodeScratch,
 		MinBlobSizeBytes: minSizeBytes,
 		PosterAlways:     *postAlways,
 		QLMaxDim:         *qlDim, QLSeconds: *qlSecs,
@@ -795,6 +798,7 @@ type queueConfig struct {
 	vcodec          string
 	crf             int
 	preset          string
+	encodeScratch   string
 	wModel          string
 	wBin            string
 	thumbDim        int
@@ -1755,6 +1759,7 @@ func runJob(ctx context.Context, q *farmqueue.Client, store *derivatives.Store, 
 		WhisperBin: cfg.wBin, WhisperModel: wModel,
 		TranscriptDevice: tDevice,
 		ProxyVCodec:      vcodec, ProxyCRF: crf, ProxyPreset: preset,
+		EncodeScratchDir: cfg.encodeScratch,
 		// A CPU lane selected by the scheduler is an explicit fallback. Its
 		// directory retry must fill only the files hardware could not publish;
 		// existing HEVC results are already better and must not be downgraded.

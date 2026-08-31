@@ -105,4 +105,5 @@ RUN chmod +x /entrypoint.sh /usr/local/bin/download-ggml-model.sh
 # Manager-overridable: JM_FARM_MODEL = a baked path (default) OR a bare model name
 # (e.g. "large-v3") which the entrypoint fetches into /state/models on first use.
 ENV JM_FARM_MODEL=/models/ggml-medium.en.bin
+ENV JM_FARM_ENCODE_SCRATCH=/tmp
 ENTRYPOINT ["/entrypoint.sh"]

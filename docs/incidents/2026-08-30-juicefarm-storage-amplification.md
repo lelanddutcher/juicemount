@@ -4,18 +4,20 @@
 
 The resumed RC validation batch filled `zSSD` a second time and correctly engaged
 the farm storage interlock. The pool remained ONLINE and the farm retained its
-durable queue state, but two independent retention layers made logical cleanup look
-ineffective:
+durable queue state, but three independent effects amplified or retained physical
+storage while the visible derivative tree looked small:
 
-1. JuiceFS retained stale slices from proxy replacements for the configured
+1. FFmpeg wrote append/seek/`+faststart` MP4 output directly into JuiceFS,
+   producing superseded object slices even for otherwise successful jobs.
+2. JuiceFS retained stale slices from proxy replacements for the configured
    seven-day trash period.
-2. A recursive TrueNAS ZFS snapshot task included the MinIO bucket dataset, so a
+3. A recursive TrueNAS ZFS snapshot task included the MinIO bucket dataset, so a
    successful JuiceFS/MinIO deletion still left the underlying blocks referenced by
    ZFS snapshots.
 
-The evidence does **not** currently indicate a JuiceFS object leak or failed MinIO
-delete. This was a JuiceMount write-policy defect combined with expected JuiceFS
-trash semantics and an unsuitable ZFS snapshot scope.
+The evidence does **not** indicate a JuiceFS object leak or failed MinIO delete.
+This was a JuiceMount application I/O and replacement-policy defect combined with
+expected JuiceFS trash semantics and an unsuitable ZFS snapshot scope.
 
 ## Impact
 
@@ -42,10 +44,30 @@ At the second pause:
   totaling about 76 GB of current proxy bytes. Current receipts cannot reconstruct
   the size or codec of blobs that were already replaced, so the exact byte split
   between codec promotion and earlier replacement attempts is not recoverable.
+- A later controlled RC run completed 70 visible `proxy.mp4` files totaling only
+  2,340,868,142 bytes, yet worker/MinIO counters moved by tens of gigabytes and
+  `zpool iostat` observed write bursts near 1.7 GB/s. Pausing new claims stopped
+  the writes immediately. There were no new job failures, retry loops, temp files,
+  missing hardware flags, or registration errors to explain that ratio.
 
 ## Root cause
 
-### 1. Automatic codec promotion was not storage-idempotent
+### 1. Seek-heavy MP4 muxing targeted the object-backed FUSE mount
+
+The farm handed FFmpeg a staged path inside JuiceFS. MP4 muxing appends and seeks,
+and `-movflags +faststart` rewrites container metadata after encoding. JuiceFS
+correctly translated those mutations into new object slices and retained the
+superseded slices according to `TrashDays`. Atomic final rename protected namespace
+correctness, but it did not make the preceding byte-level write pattern physically
+idempotent.
+
+The fix encodes both full proxies and Quick Look previews on node-local scratch,
+closes the completed MP4, and copies it into a descriptor-relative JuiceFS stage in
+one sequential pass before the existing receipt and atomic commit. The shipped
+worker images and compose pin `JM_FARM_ENCODE_SCRATCH=/tmp`; runtime validation
+rejects a scratch path that resolves inside the shared mount.
+
+### 2. Automatic codec promotion was not storage-idempotent
 
 Queue sweeps required the existing proxy codec to match the worker's selected codec.
 A valid H.264 fallback therefore became "stale" when a compatible HEVC worker was
@@ -57,7 +79,7 @@ The fix makes automatic queue sweeps accept a current, source-matched, byte-vali
 H.264, HEVC, or AV1 proxy. Codec migration now requires explicit regeneration.
 One-shot codec-specific commands retain exact-codec behavior.
 
-### 2. ZFS retained blocks after JuiceFS deleted the objects
+### 3. ZFS retained blocks after JuiceFS deleted the objects
 
 The TrueNAS periodic snapshot task recursively snapshotted `zSSD`, including the
 MinIO bucket. JuiceFS GC successfully deleted stale objects, but ZFS snapshots still
@@ -68,7 +90,7 @@ The live task now excludes `zSSD/juicemount/bucket`. The large 2026-08-30 bucket
 snapshot was removed; older, much smaller bucket snapshots were left intact to age
 out under the existing policy.
 
-### 3. ZFS `statfs` total was mislabeled as physical pool capacity
+### 4. ZFS `statfs` total was mislabeled as physical pool capacity
 
 Available bytes from `statfs` were accurate enough to trigger the safety pause, but
 ZFS reports `f_blocks` for the mounted dataset, not the parent zpool including child
@@ -100,8 +122,10 @@ source and retain the dataset-scoped filesystem total for diagnostics.
 
 No upstream issue should be filed from the current evidence. JuiceFS documents that
 file overwrites create invisible stale slices, that those slices follow trash
-retention, and that `gc --delete` is the supported cleanup path. ZFS snapshot block
-retention is below JuiceFS and cannot be released by JuiceFS GC.
+retention, and that `gc --delete` is the supported cleanup path. Directly exposing
+an object-backed filesystem to an append/seek/faststart writer was our I/O pattern,
+not an upstream deletion failure. ZFS snapshot block retention is below JuiceFS and
+cannot be released by JuiceFS GC.
 
 Open a JuiceFS issue only if the completed GC reports leaked objects that have no
 metadata/trash explanation, MinIO deletion errors, or a persistent object/metadata
