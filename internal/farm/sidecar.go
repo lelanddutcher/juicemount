@@ -173,10 +173,14 @@ func sanitizeSidecarRow(row derivatives.DerivRow) (derivatives.DerivRow, bool) {
 		return row, false
 	}
 
-	// "failed" is legitimate state the farm writes (farm.go:139/:159) — it tells
-	// readers the artifact will never appear, so dropping it would make a known
-	// failure look merely ungenerated.
-	if row.Status != "ready" && row.Status != "failed" {
+	// "failed" is a negative result from a producer generation. "absent" is the
+	// tombstone a newer probe writes when it proves that kind is not applicable;
+	// carrying it through the cross-worker union prevents stale failures from
+	// being resurrected. `pending` remains local/transient and is not mirrored.
+	if row.Status != "ready" && row.Status != "failed" && row.Status != "absent" {
+		return row, false
+	}
+	if row.Status == "absent" && row.BlobRelPath != nil {
 		return row, false
 	}
 

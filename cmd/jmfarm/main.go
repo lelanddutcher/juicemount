@@ -525,7 +525,7 @@ func main() {
 		minSizeMB = flag.Int("min-size-mb", farmEnvInt("JM_FARM_MIN_SIZE_MB", 20),
 			"skip media smaller than this many MB entirely — no derivatives at all (0 = no minimum)")
 		producer  = flag.String("producer", "macos-node", "producer tag")
-		version   = flag.Int("version", 1, "producer version")
+		version   = flag.Int("version", defaultProducerVersion(buildversion.Commit), "producer generation (default: exact release build; override only for controlled repair/migration)")
 		dryRun    = flag.Bool("dry-run", false, "probe + report, do not write")
 		verbose   = flag.Bool("verbose", false, "per-file logging")
 		status    = flag.String("status", "", "after the sweep, write a rollup status JSON here (manager Farm tab)")

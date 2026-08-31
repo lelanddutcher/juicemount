@@ -345,6 +345,27 @@ func GenerateProxy(store *derivatives.Store, path string, opt Options) ProxyResu
 		return res
 	}
 	if tech.Video == nil {
+		// A previous ffprobe could mistake attached cover art for video and leave
+		// a failed proxy row. Omission cannot remove it from the cross-worker
+		// sidecar union, so replace only that failed row with an explicit absent
+		// tombstone. A ready contributed proxy is never touched.
+		if row, stale := absentIfPreviouslyFailed(store, inode, "proxy", opt.Producer, opt.Version, hash); stale {
+			stampSource(&row, fi)
+			if err := store.PutSource(inode, &hash); err != nil {
+				res.Err = fmt.Errorf("put source for absent proxy: %w", err)
+				return res
+			}
+			if err := store.PutDeriv(inode, row); err != nil {
+				res.Err = fmt.Errorf("put absent proxy: %w", err)
+				return res
+			}
+			if opt.Mount != "" {
+				if err := WriteManifestSidecar(store, opt.Mount, inode); err != nil {
+					res.Err = fmt.Errorf("publish absent proxy manifest: %w", err)
+					return res
+				}
+			}
+		}
 		return res // audio-only / no video stream → no proxy (Wrote stays false)
 	}
 

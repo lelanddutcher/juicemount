@@ -293,11 +293,15 @@ func skipIfFresh(store *derivatives.Store, path string, inode uint64, hash strin
 // resolves the same way every other uncertainty in skipIfFresh does: do the
 // work.
 //
-// A kind is satisfied by a row with status "ready" OR "failed". "failed" is
-// deliberate and is not a loosening: it is the state that says the artifact
-// will never appear (see sidecar.go sanitize), and treating it as unsatisfied
-// would retry a permanently-undecodable source on every single sweep. It also
-// keeps this change behaviour-neutral for failures, which already skip today.
+// A kind is satisfied by a ready row from any producer. A failed row is narrower:
+// it is terminal only for the SAME producer generation. A permanently unsupported
+// source is therefore attempted once per deployed build, while a codec/runtime
+// upgrade gets one automatic chance to repair failures written by an older build.
+//
+// This distinction is required in production. The CPU worker moved from ffmpeg
+// 4.3 to 7.1 and gained Sony ipcm decoding, but 852 version-1 waveform failures
+// remained skipped forever because the old gate treated every historical failure
+// as a timeless fact. The media was decodable; only the negative cache was stale.
 func kindsComplete(store *derivatives.Store, inode uint64, rows []derivatives.DerivRow, size int64, opt Options) bool {
 	meta, err := store.Metadata(inode, "tech")
 	if err != nil || meta == nil {
@@ -309,7 +313,8 @@ func kindsComplete(store *derivatives.Store, inode uint64, rows []derivatives.De
 	}
 	have := make(map[string]bool, len(rows))
 	for _, r := range rows {
-		if r.Status == "ready" || r.Status == "failed" {
+		if r.Status == "ready" ||
+			(r.Status == "failed" && r.Producer == opt.Producer && r.Version == opt.Version) {
 			have[r.Kind] = true
 		}
 	}
@@ -347,6 +352,29 @@ func expectedKinds(tech *Tech, size int64, opt Options) []string {
 		kinds = append(kinds, "waveform")
 	}
 	return kinds
+}
+
+// absentIfPreviouslyFailed returns an explicit tombstone only when an older
+// probe/generator left a failed row for a kind the current probe proves is not
+// applicable. The tombstone matters because manifest sidecars are a cross-host
+// union: merely omitting the row would let another worker carry the stale
+// failure forward forever. Ready contributor data is never replaced.
+func absentIfPreviouslyFailed(store *derivatives.Store, inode uint64, kind, producer string, version int, hash string) (derivatives.DerivRow, bool) {
+	if store == nil {
+		return derivatives.DerivRow{}, false
+	}
+	rows, err := store.Manifest(inode)
+	if err != nil {
+		return derivatives.DerivRow{}, false
+	}
+	for _, row := range rows {
+		if row.Kind == kind && row.Status == "failed" {
+			return derivatives.DerivRow{
+				Kind: kind, Status: "absent", Producer: producer, Version: version, Hash: &hash,
+			}, true
+		}
+	}
+	return derivatives.DerivRow{}, false
 }
 
 // blobsPresent reports whether every ready row that CLAIMS a blob actually has
@@ -460,6 +488,28 @@ func Process(store *derivatives.Store, path string, opt Options) Result {
 	// never appears half-written to the serving side.
 	rows := []derivatives.DerivRow{
 		{Kind: "tech", Status: "ready", Producer: opt.Producer, Version: opt.Version, Hash: &hash},
+	}
+	// A current probe can disprove historical failures. ffprobe 4.3 exposed MP3
+	// cover art as a motion-video candidate in the old mapper, leaving failed
+	// poster/filmstrip rows. The current mapper excludes attached_pic. Publish an
+	// explicit `absent` tombstone for those FAILED rows so the cross-worker union
+	// does not resurrect them; never overwrite a ready contributor artifact.
+	if tech.Video == nil {
+		if opt.Blobs {
+			if row, ok := absentIfPreviouslyFailed(store, inode, "thumbnail", opt.Producer, opt.Version, hash); ok {
+				rows = append(rows, row)
+			}
+		}
+		if opt.Filmstrip {
+			if row, ok := absentIfPreviouslyFailed(store, inode, "filmstrip", opt.Producer, opt.Version, hash); ok {
+				rows = append(rows, row)
+			}
+		}
+	}
+	if opt.Waveform && len(tech.Audio) == 0 {
+		if row, ok := absentIfPreviouslyFailed(store, inode, "waveform", opt.Producer, opt.Version, hash); ok {
+			rows = append(rows, row)
+		}
 	}
 	var blobErrs []error
 	// Blob size gate: a sub-threshold clip keeps its tech row above but skips

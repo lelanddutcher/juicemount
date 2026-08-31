@@ -7,6 +7,9 @@
 #   JM_FARM_TARGET     path UNDER the volume to process    (default: whole volume)
 #   JM_FARM_DB         server-side derivatives index path  (default: /state/derivatives.db)
 #   JM_FARM_PRODUCER   producer tag stamped on rows        (default: linux-farm)
+#                      The producer generation is compiled from the exact release
+#                      commit. Do not pin -version in deployment configuration:
+#                      a new build must retry failures cached by an older build.
 #   JM_FARM_MODEL      ggml whisper model: a PATH (baked default) or a bare model
 #                      NAME (e.g. "large-v3") fetched into /state/models on first
 #                      use — so the manager can switch models without a rebuild.

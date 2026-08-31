@@ -245,6 +245,12 @@ emergency disable flag remains readable for rolling-upgrade compatibility, but t
 as successful only after the command is acknowledged and a replacement runtime ID
 heartbeats.
 
+Do not pin `jmfarm -version` in Compose, TrueNAS custom-app YAML, or enrollment
+scripts. Release builds derive the producer generation from their required exact
+commit. A `failed` derivative is terminal only for that producer generation, so a
+new image retries an older build's negative result once (for example, after an
+FFmpeg decoder upgrade) without retrying permanently unsupported media every sweep.
+
 Run render workers separately with `JM_WORKER_ROLE=render` and the GPU device(s)
 passed into the container. Render admission fails closed if the configured
 accelerator cannot complete its live probe. `auto` chooses render only when the

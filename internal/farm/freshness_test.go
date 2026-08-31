@@ -370,10 +370,44 @@ func TestFailedRowAccountsForItsKind(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("PutDeriv: %v", err)
 	}
-	opt := Options{Blobs: true, Filmstrip: true, Waveform: true}
+	opt := Options{Producer: "linux-farm", Version: 1, Blobs: true, Filmstrip: true, Waveform: true}
 	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, opt); !fresh {
 		t.Error("a failed waveform did not account for its kind — the source will be " +
 			"re-decoded on every sweep for an artifact that can never appear")
+	}
+}
+
+// A failure is a negative capability result from one exact producer build, not
+// a fact about the media forever. Codec/runtime upgrades must get one repair
+// attempt; otherwise old failures remain stranded even after the source becomes
+// decodable.
+func TestFailedRowFromOlderProducerGenerationIsRetried(t *testing.T) {
+	s := freshStore(t)
+	hash, size := "abc123", int64(1000)
+	seed(t, s, 4242, hash, size, "ready")
+	seedTech(t, s, 4242, hash, `{"container":"mov","video":{"codec":"h264"},"audio":[{"codec":"ipcm"}]}`)
+	sz := size
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "filmstrip", Status: "ready", Producer: "linux-farm", Version: 1,
+		Hash: &hash, SourceSize: &sz,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutDeriv(4242, derivatives.DerivRow{
+		Kind: "waveform", Status: "failed", Producer: "linux-farm", Version: 1,
+		Hash: &hash, SourceSize: &sz,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current := Options{Producer: "linux-farm", Version: 2, Blobs: true, Filmstrip: true, Waveform: true}
+	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, current); fresh {
+		t.Fatal("an older producer generation's failure suppressed the current build's repair attempt")
+	}
+	otherProducer := current
+	otherProducer.Version = 1
+	otherProducer.Producer = "macos-node"
+	if fresh, _ := skipIfFresh(s, "/jfs/a/clip.mov", 4242, hash, size, otherProducer); fresh {
+		t.Fatal("another producer's failure suppressed this producer's repair attempt")
 	}
 }
 

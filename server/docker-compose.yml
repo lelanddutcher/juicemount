@@ -298,6 +298,9 @@ services:
       JM_FARM_TARGET: "/jfs"          # EDIT — a subpath to limit each sweep
       JM_FARM_MODE: "all"             # all | derivatives | transcript
       JM_FARM_PRODUCER: "linux-farm"
+      # Producer generation is derived from the exact commit embedded in jmfarm.
+      # Do not pin -version/JM_FARM_PRODUCER_VERSION here: each new build must
+      # retry failures negatively cached by an older codec/runtime.
       JM_FARM_DB: "/state/derivatives.db"
       # ffmpeg must finish seek-heavy MP4/faststart work on node-local storage;
       # the worker then copies the immutable result into JuiceFS once. Never set

@@ -96,3 +96,13 @@ func TestWorkerImagesRequireAndVerifyExactReleaseIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestDeploymentDoesNotPinProducerGeneration(t *testing.T) {
+	entrypoint := dockerfile(t, "entrypoint.sh")
+	compose := dockerfile(t, "../docker-compose.yml")
+	for name, src := range map[string]string{"entrypoint": entrypoint, "compose": compose} {
+		if strings.Contains(src, "JM_FARM_PRODUCER_VERSION=") || strings.Contains(src, `-version "$`) {
+			t.Fatalf("%s pins the producer generation; release builds must derive it from their exact embedded commit", name)
+		}
+	}
+}
