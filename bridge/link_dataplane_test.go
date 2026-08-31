@@ -11,9 +11,11 @@ import (
 )
 
 func TestLinkRedisDataPlaneBenchmarkRoundTrip(t *testing.T) {
-	redisURL := os.Getenv("JM_TEST_REDIS")
+	redisURL := os.Getenv("JM_TEST_LINK_REDIS")
 	if redisURL == "" {
-		redisURL = "redis://127.0.0.1:6379/15"
+		// Keep the benchmark isolated from metadata (DB 14) and farm (DB 15)
+		// integration tests, which legitimately FlushDB in parallel packages.
+		redisURL = "redis://127.0.0.1:6379/13"
 	}
 	dialer := (&net.Dialer{Timeout: time.Second}).DialContext
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), time.Second)

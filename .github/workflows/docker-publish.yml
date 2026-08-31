@@ -54,6 +54,10 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Go tests
+        env:
+          JM_TEST_LINK_REDIS: redis://127.0.0.1:6379/13
+          JM_TEST_METADATA_REDIS: redis://127.0.0.1:6379/14
+          JM_TEST_REDIS: redis://127.0.0.1:6379/15
         run: go test -count=1 ./...
       - name: Redis-backed farm durability tests
         env:

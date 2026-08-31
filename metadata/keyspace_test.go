@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -729,11 +730,19 @@ func TestScopedPrunePreservesLocalCreateUntilRedisDirectoryConfirmation(t *testi
 // state MUST equal a fresh full-SCAN store state over the same Redis data.
 // ===========================================================================
 
-const liveTestRedisURL = "redis://127.0.0.1:6379/15" // db 15: throwaway test db
+func metadataLiveTestRedisURL() string {
+	if value := os.Getenv("JM_TEST_METADATA_REDIS"); value != "" {
+		return value
+	}
+	// DB 14 is reserved for metadata integration tests. The farm keyspace-event
+	// tests use DB 15 and run in another package process during `go test ./...`;
+	// sharing DB 15 made either package's FlushDB race the other's assertions.
+	return "redis://127.0.0.1:6379/14"
+}
 
 func liveRedisOrSkip(t *testing.T) *redis.Client {
 	t.Helper()
-	addr, db, _ := ParseRedisURL(liveTestRedisURL)
+	addr, db, _ := ParseRedisURL(metadataLiveTestRedisURL())
 	rdb := redis.NewClient(&redis.Options{Addr: addr, DB: db, DialTimeout: 1 * time.Second})
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -830,7 +839,7 @@ func newLiveRC(t *testing.T, rdb *redis.Client) *RedisClient {
 		t.Fatalf("Open store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	rc, err := NewRedisClient(liveTestRedisURL, store)
+	rc, err := NewRedisClient(metadataLiveTestRedisURL(), store)
 	if err != nil {
 		t.Skipf("Redis not reachable: %v", err)
 	}
