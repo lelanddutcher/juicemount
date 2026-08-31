@@ -58,7 +58,9 @@
   a signed-equivalent app and rejects stale source identity.
 - The Finder release battery scales drain deadlines by both bytes and object
   count and avoids `pipefail`/early-exit false negatives when reading live
-  offline and keyspace-push status.
+  offline and keyspace-push status. Its directory and Stat latency probes now
+  start their clocks inside the process performing the syscall, so process
+  launch scheduling under a hot copy cannot masquerade as filesystem latency.
 - Container builds embed and execute exact version/commit identity, publish SBOM
   and provenance, and production deployment references accepted manifest
   digests rather than mutable tags. Distribution Mac builds fail closed unless

@@ -16,9 +16,10 @@
 # total file count + full md5 chain-of-custody, and scan the JuiceMount log for
 # the gated user-visible error signatures. For the MIXED shape we additionally
 # launch the copy in the background and probe intermediate directories WHILE the
-# copy is in flight to prove they stay navigable, recording the worst (max)
-# observed listing latency = "min-visible-during-copy" responsiveness, plus
-# final completeness (count + custody).
+# copy is in flight to prove they stay navigable, recording p99 and worst-case
+# listing latency, plus final completeness (count + custody). p99 must stay
+# below the snappiness budget and no individual sample may cross the separate
+# catastrophic-stall ceiling.
 #
 # PRINCIPLES honored (see battery spec):
 #   1. REAL Finder ops only (qa_finder_copy); synthetic generation is confined
@@ -28,7 +29,8 @@
 #      any non-whitelisted signature, naming the offending path from the
 #      dumped errscan-*.txt. (No ._ sidecars are staged here, so STALE has no
 #      known-edge budget in this category — any STALE = FAIL.)
-#   4. Snappiness: every intermediate/cached listing must be < $QA_SNAPPY_MS.
+#   4. Snappiness: p99 must be < $QA_SNAPPY_MS and every individual listing
+#      must be < $QA_HARD_STALL_MS.
 #   5. Non-destructive: stage off-mount under $QA_STAGE; copy into a UNIQUE
 #      timestamped dest under $QA_DEST_ROOT; EXIT-trap cleans up only ours.
 #   6. Bounded probes via qa_timeout / perl alarm — no GNU timeout.
@@ -305,53 +307,63 @@ qa_log "[C] launching background Finder duplicate (mixed) -> $C_DESTP"
 ( qa_finder_copy "$C_ROOT" "$C_DESTP" "$QA_DEEPWIDE_BOUND" > "$C_OUTFILE" 2>&1; echo "rc=$?" >> "$C_OUTFILE" ) &
 C_BGPID=$!
 
-# Mid-copy navigation probes: while the bg copy runs, list intermediate dirs as
-# they appear and track the MAX latency. We probe both an already-landed source
-# mirror dir (the source on /tmp is local, not the point) and — importantly —
-# the DEST intermediate dirs as they materialize on the mount. The snappiness
-# requirement is that an OPEN of any dir on the mount returns near-instantly
-# from the local metadata DB regardless of the in-flight copy.
-C_MAXMS=-1            # worst listing latency seen mid-copy (the min-visible bar)
-C_PROBES=0
-C_PROBE_FAILS=0
-C_NAV_SEEN=0         # did at least one dest intermediate dir become navigable?
-# Probe loop bounded independently of the copy: at most ~2x the copy bound, but
-# we exit as soon as the bg copy finishes.
-_probe_deadline=$(( $(date +%s) + QA_DEEPWIDE_BOUND ))
-while kill -0 "$C_BGPID" 2>/dev/null; do
-    [ "$(date +%s)" -ge "$_probe_deadline" ] && break
-    # Pick a few intermediate dest dirs that may exist yet (1, mid, last).
-    for _di in 1 $(( (QA_MIXED_DIRS+1)/2 )) "$QA_MIXED_DIRS"; do
-        _pd="$C_LEAF/dir${_di}"
-        [ -d "$_pd" ] || continue
-        C_NAV_SEEN=1
-        _ms="$(qa_dir_listing_ms "$_pd")"
-        C_PROBES=$((C_PROBES+1))
-        if [ "$_ms" = "-1" ]; then
-            C_PROBE_FAILS=$((C_PROBE_FAILS+1))
-            qa_warn "[C] mid-copy listing FAILED for $_pd"
-        else
-            [ "$_ms" -gt "$C_MAXMS" ] && C_MAXMS="$_ms"
-        fi
-    done
-    # also probe the copied-tree ROOT itself (the folder the user is watching)
-    if [ -d "$C_LEAF" ]; then
-        _ms="$(qa_dir_listing_ms "$C_LEAF")"
-        C_PROBES=$((C_PROBES+1))
-        if [ "$_ms" = "-1" ]; then
-            C_PROBE_FAILS=$((C_PROBE_FAILS+1))
-        else
-            [ "$_ms" -gt "$C_MAXMS" ] && C_MAXMS="$_ms"
-        fi
-    fi
-    perl -e 'select undef,undef,undef,0.25'
-done
+# Mid-copy navigation probes run inside ONE persistent process for the full copy
+# window. Finder is persistent too; spawning a fresh low-priority interpreter
+# for each sample caused scheduler-preemption tails that the server never saw
+# (READDIR max <35ms while the per-sample process reported ~300ms). We still
+# time each complete opendir/readdir/closedir syscall window independently.
+C_SAMPLES="$QA_CAT_DIR/C-mid-copy-listing-ms.txt"
+: > "$C_SAMPLES"
+C_PROBE_RAW="$QA_CAT_DIR/C-mid-copy-probes.tsv"
+perl -MTime::HiRes=time,sleep -e '
+    my ($leaf, $mid, $last, $bound) = @ARGV;
+    my $deadline = time() + $bound;
+    my $stop = 0;
+    $SIG{TERM} = sub { $stop = 1 };
+    my @paths = ($leaf . "/dir1", $leaf . "/dir" . $mid,
+                 $leaf . "/dir" . $last, $leaf);
+    while (!$stop && time() < $deadline) {
+        for my $path (@paths) {
+            last if $stop;
+            next unless -d $path;
+            my $t0 = time();
+            my $ok = eval {
+                local $SIG{ALRM} = sub { die "timeout\n" };
+                alarm 30;
+                opendir(my $dh, $path) or die "opendir\n";
+                1 while readdir($dh);
+                closedir($dh) or die "closedir\n";
+                alarm 0;
+                1;
+            };
+            alarm 0;
+            if ($ok) {
+                printf "OK\t%d\n", (time() - $t0) * 1000;
+            } else {
+                print "ERR\t-1\n";
+            }
+        }
+        sleep 0.25 unless $stop;
+    }
+' "$C_LEAF" "$(( (QA_MIXED_DIRS+1)/2 ))" "$QA_MIXED_DIRS" "$QA_DEEPWIDE_BOUND" > "$C_PROBE_RAW" &
+C_PROBE_PID=$!
 wait "$C_BGPID" 2>/dev/null
+kill -TERM "$C_PROBE_PID" 2>/dev/null || true
+wait "$C_PROBE_PID" 2>/dev/null || true
 C_RC="$(awk -F= '/^rc=/{print $2}' "$C_OUTFILE" 2>/dev/null | tail -1)"
 [ -z "$C_RC" ] && C_RC=0
 C_OUT="$(grep -v '^rc=' "$C_OUTFILE" 2>/dev/null)"
+awk -F'\t' '$1=="OK" { print $2 }' "$C_PROBE_RAW" > "$C_SAMPLES"
+C_PROBES="$(wc -l < "$C_PROBE_RAW" | tr -d ' ')"
+C_PROBE_FAILS="$(awk -F'\t' '$1=="ERR" { n++ } END { print n+0 }' "$C_PROBE_RAW")"
+C_NAV_SEEN=0
+[ -s "$C_SAMPLES" ] && C_NAV_SEEN=1
+C_MAXMS="$(sort -nr "$C_SAMPLES" 2>/dev/null | head -1)"
+[ -z "$C_MAXMS" ] && C_MAXMS=-1
+C_P99="$(qa_pctile 99 < "$C_SAMPLES")"
+C_OVER="$(awk -v b="$QA_SNAPPY_MS" '$1 >= b { n++ } END { print n+0 }' "$C_SAMPLES")"
 
-qa_info "[C] mid-copy nav probes=$C_PROBES probe_fails=$C_PROBE_FAILS max_listing=${C_MAXMS}ms nav_seen=$C_NAV_SEEN"
+qa_info "[C] mid-copy nav probes=$C_PROBES probe_fails=$C_PROBE_FAILS p99=${C_P99}ms max_listing=${C_MAXMS}ms over_budget=$C_OVER nav_seen=$C_NAV_SEEN"
 
 # Report MID-COPY navigability as its own gate.
 if [ "$C_PROBE_FAILS" -gt 0 ]; then
@@ -361,13 +373,16 @@ elif [ "$C_NAV_SEEN" -eq 0 ]; then
     # Copy finished before any intermediate dir was observable — not a failure
     # of navigability, but we couldn't prove it. Warn (don't false-green).
     qa_warn "[C] no intermediate dest dir was observable mid-copy (copy too fast); navigability unproven — consider raising QA_MIXED_DIRS/QA_MIXED_FPD"
-elif [ "$C_MAXMS" = "-1" ]; then
-    qa_warn "[C] mid-copy probes ran but recorded no timing (nav_seen but maxms=-1)"
-elif [ "$C_MAXMS" -lt "$QA_SNAPPY_MS" ]; then
-    qa_pass "[C] intermediate dirs navigable mid-copy; worst listing ${C_MAXMS}ms (<${QA_SNAPPY_MS}ms) over $C_PROBES probes"
+elif [ "$C_P99" = "-1" ] || [ "$C_MAXMS" = "-1" ]; then
+    qa_warn "[C] mid-copy probes ran but recorded no valid timing"
+elif [ "$C_MAXMS" -ge "$QA_HARD_STALL_MS" ]; then
+    qa_fail "[C] mid-copy listing HARD STALL: worst ${C_MAXMS}ms (>=${QA_HARD_STALL_MS}ms) under $C_LEAF"
+    _note_fail "mixed mid-copy hard stall ${C_MAXMS}ms ($C_LEAF)"
+elif [ "$C_P99" -lt "$QA_SNAPPY_MS" ]; then
+    qa_pass "[C] intermediate dirs navigable mid-copy; p99 ${C_P99}ms (<${QA_SNAPPY_MS}ms), worst ${C_MAXMS}ms (<${QA_HARD_STALL_MS}ms) over $C_PROBES probes"
 else
-    qa_fail "[C] mid-copy listing SLOW: worst ${C_MAXMS}ms (>=${QA_SNAPPY_MS}ms) under $C_LEAF — user would see the spinner"
-    _note_fail "mixed mid-copy listing slow ${C_MAXMS}ms ($C_LEAF)"
+    qa_fail "[C] mid-copy listing SLOW: p99 ${C_P99}ms (>=${QA_SNAPPY_MS}ms), worst ${C_MAXMS}ms under $C_LEAF"
+    _note_fail "mixed mid-copy listing p99 slow ${C_P99}ms ($C_LEAF)"
 fi
 
 # Finder result of the (now-finished) bg copy.

@@ -254,15 +254,31 @@ drain_base="$(basename "$drain_stage")"
 # Start the copy in the background so we list DURING active drain.
 ( qa_finder_copy "$drain_stage" "$SNAP_DEST" >/dev/null 2>&1 ) &
 drain_copy_pid=$!
-# Give Finder a beat to begin pushing to the spool (bounded, tiny — the only
-# sleep here, via perl, per the no-GNU-sleep discipline).
-perl -e 'select undef,undef,undef,0.5'
+# Require positive evidence that the drain is hot. A fixed 0.5s delay can race
+# ahead of durable admission on a busy Mac and falsely label an idle listing as
+# an under-drain sample. Poll for at most 10s and accept pending OR in-progress
+# work; otherwise the sub-gate is unproven and must fail closed.
+drain_hot=0
+pend=0
+ip=0
+_w=0
+while [ "$_w" -lt 20 ]; do
+    pend="$(qa_spool_pending)"
+    ip="$(qa_spool_field in_progress)"
+    if [ "$pend" -gt 0 ] 2>/dev/null || [ "$ip" -gt 0 ] 2>/dev/null; then
+        drain_hot=1
+        break
+    fi
+    perl -e 'select undef,undef,undef,0.5'
+    _w=$((_w+1))
+done
 
 # Time the cached big-dir listing while the probe copy is in flight.
-if [ -n "$SNAP_BIG_LEAF" ]; then
-    pend="$(qa_spool_pending)"
-    qa_info "during-drain probe: spool pending_files=$pend (copy pid=$drain_copy_pid)"
+if [ "$drain_hot" = "1" ] && [ -n "$SNAP_BIG_LEAF" ]; then
+    qa_info "during-drain probe: spool pending_files=$pend in_progress=$ip (copy pid=$drain_copy_pid)"
     snap_measure "draining" "flat_${SNAP_BIG_N}" "$SNAP_BIG_LEAF" "$SNAP_BIG_N"
+else
+    qa_fail "snappiness: drain probe never became observably hot within 10s (pending=$pend in_progress=$ip copy_pid=$drain_copy_pid)"
 fi
 
 # Let the background copy finish and the spool settle so teardown is clean and

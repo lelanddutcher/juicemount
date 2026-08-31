@@ -10,8 +10,9 @@
 #     (2) the cross-cutting error tally across the whole run is 0
 #         (FromHandle STALE / purging phantom / 100070 / 100060 / -48 / -36 /
 #          -5000 / permission), AND
-#     (3) the snappiness thresholds held (no listing exceeded $QA_SNAPPY_MS,
-#         derived from category 09's latency table + any [FAIL] snappiness rows).
+#     (3) every category-specific snappiness contract held (category 09 gates
+#         every listing; distribution-based categories gate p99 plus their
+#         catastrophic-stall ceiling), derived from artifacts and [FAIL] rows.
 #
 # WHY A SINGLE ORCHESTRATOR (read before "simplifying"):
 #   The per-category errscan windows overlap and each script only scans its OWN
@@ -246,8 +247,9 @@ $cat|$status|$metric"
 }
 
 # ---------------------------------------------------------------------------
-# Snappiness gate across the run: any [FAIL] snappiness row in any category, or
-# any latency-table MS >= budget, fails the snappiness gate independently.
+# Snappiness gate across the run: any category-emitted [FAIL] latency row fails
+# independently. Category 09 additionally has a strict every-sample contract, so
+# its latency table is cross-checked directly against the budget.
 
 snappiness_held() {
     local bad=0 f
@@ -360,9 +362,9 @@ MISSING_SELECTED=0
     printf '  TOTAL gated errors = %s   (gate requires 0)\n' "$XTOTAL"
     echo ""
     if [ "$SNAPPY_OK" -eq 1 ]; then
-        echo "SNAPPINESS: held (no listing >= ${QA_SNAPPY_MS}ms)"
+        echo "SNAPPINESS: held (all category-specific latency contracts passed)"
     else
-        echo "SNAPPINESS: VIOLATED (a listing met/exceeded ${QA_SNAPPY_MS}ms — see 09 latency table / [FAIL] rows)"
+        echo "SNAPPINESS: VIOLATED (a category-specific latency gate failed — see latency artifacts / [FAIL] rows)"
     fi
     if [ "$MISSING_SELECTED" -eq 1 ]; then
         echo "COVERAGE:   INCOMPLETE — missing selected script(s):$SKIPPED"

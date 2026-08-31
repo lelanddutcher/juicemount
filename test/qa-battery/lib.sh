@@ -62,13 +62,16 @@ export QA_ARTIFACTS="${QA_ARTIFACTS:-/tmp/jm-battery-artifacts/$(date +%Y%m%d-%H
 
 mkdir -p "$QA_STAGE" "$QA_ARTIFACTS" 2>/dev/null
 
-# Snappiness budget: a cached dir listing served from the local metadata DB
-# must return in under this many ms (principle #4 — user must NEVER see the
-# Finder spinner). 200ms hard ceiling.
+# Snappiness budget: the p99 of cached directory/stat calls served from the
+# local metadata DB must return in under this many ms. A separate catastrophic
+# single-sample ceiling catches genuine multi-second stalls without making one
+# scheduler preemption among hundreds of probes a false release blocker.
 : "${QA_SNAPPY_MS:=200}"
+: "${QA_HARD_STALL_MS:=1000}"
 
 # Drain wait default ceiling (seconds).
 : "${QA_DRAIN_TIMEOUT:=300}"
+: "${QA_CLEANUP_WORKERS:=16}"
 
 # ---------------------------------------------------------------------------
 # Reporting + counters
@@ -720,20 +723,48 @@ qa_finder_result_clean() {
 # ---------------------------------------------------------------------------
 # Snappiness gate (principle #4)
 
-# qa_dir_listing_ms PATH — time a single readdir (`ls -1f`) of PATH and echo the
-# elapsed wall time in integer milliseconds. `-f` disables sorting/stat so we
-# measure the readdir/LOOKUP path served from the local metadata DB, not a
-# stat-storm. A cached dir over the local DB must come back < $QA_SNAPPY_MS.
-# Echoes -1 if the listing itself failed (caller treats as FAIL, not slow).
+# qa_dir_listing_ms PATH — time one complete opendir/readdir/closedir traversal
+# and echo the elapsed wall time in integer milliseconds. The timer starts
+# INSIDE the same already-running Perl process that performs the syscalls. The
+# old t0-perl -> timeout-perl -> exec(ls) -> t1-perl chain accidentally included
+# three process-launch/scheduling gaps; under a hot Finder copy one such gap
+# could add ~500ms even when the NFS server's READDIR max was <20ms. This probe
+# deliberately does no sorting or per-entry stat, so it measures the directory
+# path served from the local metadata DB. Echoes -1 on failure/timeout.
 qa_dir_listing_ms() {
     local path="$1"
-    local t0 t1
-    t0=$(_qa_now_ms)
-    if ! qa_timeout 30 ls -1f "$path" >/dev/null 2>&1; then
+    local out rc
+    out="$(perl -MTime::HiRes=time -e '
+        $SIG{ALRM} = sub { exit 124 };
+        alarm 30;
+        my $path = shift;
+        my $t0 = time();
+        opendir(my $dh, $path) or exit 2;
+        1 while readdir($dh);
+        closedir($dh) or exit 3;
+        printf "%d", (time() - $t0) * 1000;
+    ' "$path" 2>/dev/null)"
+    rc=$?
+    if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -Eq '^[0-9]+$'; then
         echo -1; return
     fi
-    t1=$(_qa_now_ms)
-    echo $(( t1 - t0 ))
+    echo "$out"
+}
+
+# qa_pctile PCT — nearest-rank percentile of newline-delimited non-negative
+# integer samples read from stdin. Echoes -1 when no valid sample exists.
+qa_pctile() {
+    local pct="$1"
+    awk -v pct="$pct" '
+        /^[0-9]+$/ { a[n++]=$1 }
+        END {
+            if (n==0) { print -1; exit }
+            for (i=1;i<n;i++){ v=a[i]; j=i-1; while(j>=0 && a[j]>v){a[j+1]=a[j];j--}; a[j+1]=v }
+            rank = int((pct/100.0)*n + 0.999999)
+            if (rank < 1) rank = 1
+            if (rank > n) rank = n
+            print a[rank-1]
+        }'
 }
 
 # _qa_now_ms — current time in ms. perl gives sub-second precision (date +%N is
@@ -814,11 +845,27 @@ qa_preflight() {
 # so a misconfigured QA_DEST_ROOT can never delete user data. Best-effort; never
 # fails the gate. Leaves $QA_ARTIFACTS (manifests/scans) for post-run review.
 qa_cleanup() {
+    local dest
     case "$QA_DEST_ROOT" in
         "$MOUNT"/JM_RELEASE_BATTERY*)
             # Delete only the THIS-RUN tagged subdirs the scripts created; the
             # scripts name their dests QA_<epoch>_<pid>_* under QA_DEST_ROOT.
-            find "$QA_DEST_ROOT" -maxdepth 1 -type d -name "QA_*_$$_*" -prune -exec rm -rf {} + 2>/dev/null
+            # Finder trees contain thousands of independent NFS removals; a
+            # serial rm can take longer than the test. Delete only regular test
+            # files through a bounded worker pool, then remove directories
+            # deepest-first. Virtual AppleDouble views are intentionally not
+            # targeted as independent files.
+            find "$QA_DEST_ROOT" -maxdepth 1 -type d -name "QA_*_$$_*" -print 2>/dev/null \
+                | while IFS= read -r dest; do
+                    case "$dest" in
+                        "$QA_DEST_ROOT"/QA_*_$$_*)
+                            find "$dest" -type f ! -name '._*' -print0 2>/dev/null \
+                                | xargs -0 -P "$QA_CLEANUP_WORKERS" -n 8 sh -c \
+                                    'for target do find "$target" -maxdepth 0 -delete 2>/dev/null; done' sh
+                            find "$dest" -depth ! -name '._*' -type d -delete 2>/dev/null || true
+                            ;;
+                    esac
+                done
             ;;
         *)
             qa_warn "qa_cleanup: QA_DEST_ROOT '$QA_DEST_ROOT' outside guard — NOT removing"
