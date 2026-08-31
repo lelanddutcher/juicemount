@@ -120,6 +120,32 @@ func (s *SpoolStore) MarkReady(id int64, size int64, sha []byte) error {
 	return nil
 }
 
+// ReopenReady transitions an unclaimed, self-contained row from ready back to
+// writing. It is the inverse of MarkReady for a continuation WRITE that arrives
+// after the idle sweeper finalized a file but before the drainer claimed it.
+//
+// The punched_end predicate is part of the CAS, not a caller-side check. A row
+// with a streamed/punched prefix is no longer self-contained in its spool file;
+// reopening that file as an ordinary writer could replace already-drained bytes
+// with holes. Such rows keep the normal ready->draining path and return false.
+// A concurrent drainer wins by changing ready->draining first, in which case
+// this CAS also returns false and the caller waits/defers to the backend path.
+func (s *SpoolStore) ReopenReady(id int64) (bool, error) {
+	now := time.Now().Unix()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.db.Exec(
+		`UPDATE spool_entries SET drain_state=?, updated_at=?
+		 WHERE id=? AND drain_state=? AND punched_end=0`,
+		DrainWriting, now, id, DrainReady,
+	)
+	if err != nil {
+		return false, fmt.Errorf("spool reopen ready %d: %w", id, err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // MarkDraining transitions ready→draining. Used by the drainer to claim
 // an entry. Returns false if the row was not in ready state (e.g. another
 // drainer worker already claimed it).

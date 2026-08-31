@@ -7,6 +7,14 @@
 - The write spool is on by default, persists an explicit opt-out, protects
   acknowledged writes with local durability and SHA-256-verified drain, and
   exposes recovery controls for stalled or failed uploads.
+- A late Finder continuation write now atomically reopens the same unclaimed
+  spool image instead of waiting behind the drain queue and surfacing repeated
+  retry errors. Rows already claimed by the drainer or partially streamed stay
+  on the corruption-safe defer path.
+- Large Finder directories keep each AppleDouble sidecar beside its principal
+  at the final NFS protocol ordering layer, eliminating the redundant lookup
+  storm seen with 5,000-file folders. Renames of new spool-only files no longer
+  issue a remote FUSE rename solely to discover that the source is absent.
 - JuiceMount Link persists pairing authorization, applies and tests remote
   backend routes, and fails closed when coordination or saved credentials are
   incomplete.
@@ -41,6 +49,9 @@
 - Go dependency and reachable-vulnerability gates include the `go-billy` path.
   Linux CI runs Redis-backed Farm durability tests; macOS CI builds and verifies
   a signed-equivalent app and rejects stale source identity.
+- The Finder release battery scales drain deadlines by both bytes and object
+  count and avoids `pipefail`/early-exit false negatives when reading live
+  offline and keyspace-push status.
 - Container builds embed and execute exact version/commit identity, publish SBOM
   and provenance, and production deployment references accepted manifest
   digests rather than mutable tags. Distribution Mac builds fail closed unless

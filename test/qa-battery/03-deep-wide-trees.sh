@@ -168,7 +168,7 @@ fi
 
 qa_log "[A] waiting for spool to drain (MANDATORY pre-verify gate)"
 # Payload-scaled drain ceiling: the full deep tree must drain before custody.
-A_CEIL="$(qa_drain_ceiling $(( A_EXPECT * QA_DEEP_FILE_SIZE )))"
+A_CEIL="$(qa_drain_ceiling $(( A_EXPECT * QA_DEEP_FILE_SIZE )) $(( A_EXPECT * 2 )))"
 if qa_wait_drain "$A_CEIL"; then qa_pass "[A] spool drained"; else
     qa_fail "[A] spool did NOT drain for $A_LEAF"; _note_fail "deep spool drain timeout ($A_LEAF)"
 fi
@@ -240,7 +240,7 @@ fi
 
 qa_log "[B] waiting for spool to drain"
 # Payload-scaled drain ceiling for the full wide folder.
-B_CEIL="$(qa_drain_ceiling $(( B_EXPECT * QA_WIDE_FILE_SIZE )))"
+B_CEIL="$(qa_drain_ceiling $(( B_EXPECT * QA_WIDE_FILE_SIZE )) $(( B_EXPECT * 2 )))"
 if qa_wait_drain "$B_CEIL"; then qa_pass "[B] spool drained"; else
     qa_fail "[B] spool did NOT drain for $B_LEAF"; _note_fail "wide spool drain timeout ($B_LEAF)"
 fi
@@ -384,7 +384,7 @@ fi
 
 qa_log "[C] waiting for spool to drain (MANDATORY pre-verify gate)"
 # Payload-scaled drain ceiling for the full mixed tree.
-C_CEIL="$(qa_drain_ceiling $(( C_EXPECT * QA_MIXED_FILE_SIZE )))"
+C_CEIL="$(qa_drain_ceiling $(( C_EXPECT * QA_MIXED_FILE_SIZE )) $(( C_EXPECT * 2 )))"
 if qa_wait_drain "$C_CEIL"; then qa_pass "[C] spool drained"; else
     qa_fail "[C] spool did NOT drain for $C_LEAF"; _note_fail "mixed spool drain timeout ($C_LEAF)"
 fi

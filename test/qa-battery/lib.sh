@@ -481,40 +481,42 @@ qa_spool_actionable_failed() {
     qa_spool_field failed_files
 }
 
-# qa_spool_pending_bytes — echo the total bytes still in flight (pending_bytes +
-# in_progress) from GET /spool, used to scale the drain timeout to the real
+# qa_spool_pending_bytes — echo the total bytes still in flight (pending_bytes)
+# from GET /spool, used to scale the drain timeout to the real
 # payload. Echoes 0 when the field is absent or the control plane is unreachable
 # (callers then fall back to the static $QA_DRAIN_TIMEOUT / $QA_DRAIN_MIN floor).
 qa_spool_pending_bytes() {
-    local pb ip total
+    local pb
     pb="$(qa_spool_field pending_bytes)"
-    ip="$(qa_spool_field in_progress)"
     case "$pb" in ''|*[!0-9-]*) pb=0 ;; esac
-    case "$ip" in ''|*[!0-9-]*) ip=0 ;; esac
     [ "$pb" -lt 0 ] 2>/dev/null && pb=0
-    [ "$ip" -lt 0 ] 2>/dev/null && ip=0
-    total=$(( pb + ip ))
-    printf '%s' "$total"
+    printf '%s' "$pb"
 }
 
-# qa_drain_ceiling PAYLOAD_BYTES
+# qa_drain_ceiling PAYLOAD_BYTES [PAYLOAD_FILES]
 #   Echo a payload-SCALED drain ceiling (seconds) for a known in-flight payload.
 #   A multi-GB Finder copy drains single-threaded at a conservatively-assumed
 #   floor of ~5 MB/s to the backend (proven: 2.3GB drains in ~5min ≈ 7.8MB/s, so
 #   5MB/s is a safe under-estimate that never cuts a real drain short). We derive
-#   ceil(bytes / 5MiB), clamp to a generous [min,max] band, and round so a tree
-#   that's still legitimately draining is never timed out. Callers that know how
-#   many bytes they staged pass that total here and feed the result to
-#   qa_wait_drain instead of a hand-picked short timeout.
+#   BOTH ceil(bytes / 5MiB) and ceil(files / 5 files/s), take the larger, then
+#   clamp to a generous [min,max] band. The file floor matters for tiny-file
+#   trees: each object has backend create/mtime/metadata costs even when its byte
+#   count is negligible, and a 10,000-entry Finder corpus legitimately takes far
+#   longer than the old bytes-only 600s minimum.
 #     floor:  $QA_DRAIN_MIN  (default 600s)   — never wait LESS than this
 #     cap:    $QA_DRAIN_MAX  (default 3600s)  — never wait MORE than this
 : "${QA_DRAIN_FLOOR_BPS:=5242880}"   # 5 MiB/s assumed drain floor
+: "${QA_DRAIN_FLOOR_FILES_PER_SEC:=5}"
 : "${QA_DRAIN_MIN:=600}"
 : "${QA_DRAIN_MAX:=3600}"
 qa_drain_ceiling() {
-    local bytes="${1:-0}" secs
+    local bytes="${1:-0}" files="${2:-0}" byte_secs file_secs secs
     case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
-    secs=$(( (bytes + QA_DRAIN_FLOOR_BPS - 1) / QA_DRAIN_FLOOR_BPS ))
+    case "$files" in ''|*[!0-9]*) files=0 ;; esac
+    byte_secs=$(( (bytes + QA_DRAIN_FLOOR_BPS - 1) / QA_DRAIN_FLOOR_BPS ))
+    file_secs=$(( (files + QA_DRAIN_FLOOR_FILES_PER_SEC - 1) / QA_DRAIN_FLOOR_FILES_PER_SEC ))
+    secs="$byte_secs"
+    [ "$file_secs" -gt "$secs" ] && secs="$file_secs"
     [ "$secs" -lt "$QA_DRAIN_MIN" ] && secs="$QA_DRAIN_MIN"
     [ "$secs" -gt "$QA_DRAIN_MAX" ] && secs="$QA_DRAIN_MAX"
     printf '%s' "$secs"
@@ -539,9 +541,16 @@ qa_wait_drain() {
     if [ -n "${1:-}" ]; then
         timeout="$1"
     else
-        local pb; pb="$(qa_spool_pending_bytes)"
-        if [ "$pb" -gt 0 ] 2>/dev/null; then
-            timeout="$(qa_drain_ceiling "$pb")"
+        local pb pf; pb="$(qa_spool_pending_bytes)"
+        p="$(qa_spool_pending)"
+        ip="$(qa_spool_field in_progress)"
+        case "$p" in ''|*[!0-9-]*) p=0 ;; esac
+        case "$ip" in ''|*[!0-9-]*) ip=0 ;; esac
+        [ "$p" -lt 0 ] 2>/dev/null && p=0
+        [ "$ip" -lt 0 ] 2>/dev/null && ip=0
+        pf=$(( p + ip ))
+        if [ "$pb" -gt 0 ] 2>/dev/null || [ "$pf" -gt 0 ] 2>/dev/null; then
+            timeout="$(qa_drain_ceiling "$pb" "$pf")"
         else
             timeout="$QA_DRAIN_TIMEOUT"
             [ "$timeout" -lt "$QA_DRAIN_MIN" ] 2>/dev/null && timeout="$QA_DRAIN_MIN"

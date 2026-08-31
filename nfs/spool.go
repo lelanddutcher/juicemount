@@ -575,7 +575,9 @@ func (s *SpoolStore) Index() *SpoolIndex { return s.index }
 // the index already has an entry for this path, that entry is returned
 // directly (same-path-reopen). This matches the FDPool same-path-dedupe
 // semantics so a single Finder copy's multi-RPC write lifecycle reuses
-// one spool file.
+// one spool file. A finalized but still-unclaimed, non-streaming entry is
+// atomically reopened in place; a row the drainer already claimed is never
+// reopened and keeps the bounded wait/defer path below.
 func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 	// reopenPoll/reopenMaxWait bound the rare wait for the case where a
 	// PREVIOUS entry for this exact path was finalized but the drainer
@@ -618,9 +620,62 @@ func (s *SpoolStore) OpenWrite(nfsPath string) (*SpoolEntry, error) {
 				shard.Unlock()
 				return existing, nil
 			}
+
+			// Finder and copyfile can revisit a small file tens of seconds after a
+			// COMMIT (notably a directory's `._` sidecar). The five-second small-
+			// file idle finalizer used to put that continuation behind the entire
+			// ready queue: OpenWrite waited 30s for drain eviction and returned
+			// JUKEBOX repeatedly. If the row is still READY, it has not been
+			// claimed and its unpunched spool file is still the authoritative whole
+			// image. Reopen that SAME file and row in place. ReopenReady is the CAS
+			// against a concurrent drainer; if the drainer won, it returns false and
+			// we retain the corruption-safe wait/defer behavior.
+			//
+			// Keep streamed entries out even before the durable CAS. A streaming
+			// row can have bytes only in streamDest after punching, so an ordinary
+			// reopen of its sparse spool image is never safe. The metadata CAS also
+			// requires punched_end=0 so this in-memory check is not the safety gate.
+			canReopenReady := existing.punchedEnd == 0 && existing.streamDest == "" && existing.writtenEnd < spoolStreamMinSize
+			if canReopenReady {
+				f, openErr := os.OpenFile(existing.spoolFile, os.O_RDWR, 0)
+				if openErr == nil {
+					reopened, reopenErr := s.meta.ReopenReady(existing.id)
+					if reopenErr != nil {
+						_ = f.Close()
+						existing.mu.Unlock()
+						shard.Unlock()
+						return nil, reopenErr
+					}
+					if reopened {
+						existing.file = f
+						existing.closed = false
+						existing.refcount = 1
+						existing.committed = false
+						// The prior streaming hash describes the pre-continuation
+						// image. Force finalizeLocked to re-hash the complete disk
+						// image after the continuation, including seek-back rewrites.
+						existing.hasher = nil
+						existing.hashValid = false
+						existing.sha256 = nil
+						// Finalize already established that the old image is fully
+						// contiguous. Any historical out-of-order extents are now
+						// subsumed by contiguousEnd and must not survive the reopen.
+						existing.writtenExtents = nil
+						existing.lastWrite.Store(time.Now().UnixNano())
+						id := existing.id
+						existing.mu.Unlock()
+						shard.Unlock()
+						jmlog.Info("spool: reopened finalized ready entry for continuation write",
+							"path", nfsPath, "entry_id", id)
+						return existing, nil
+					}
+					_ = f.Close()
+				}
+			}
 			// Finalized-but-not-yet-drained entry holds this path. Don't
-			// reuse (writes would fail) and don't create a competing entry
-			// (dup drain). Wait for the drainer to evict it.
+			// reuse after the drainer has claimed it (writes would race the
+			// copy) and don't create a competing entry (dup drain). Wait for
+			// the drainer to evict it.
 			sawClosed = true
 			busyID := existing.id
 			existing.mu.Unlock()

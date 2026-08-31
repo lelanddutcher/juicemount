@@ -117,7 +117,10 @@ _spool_offline_flag() {
     local body
     body="$(qa_timeout 5 curl -s "$CP_BASE/spool" 2>/dev/null)"
     [ -z "$body" ] && { echo 0; return; }
-    if printf '%s' "$body" | tr ',{}' '\n\n\n' | grep -qE '"offline"[[:space:]]*:[[:space:]]*true'; then
+    # Do not use grep -q at the end of a pipe under pipefail: once grep finds
+    # the field it exits early, tr receives SIGPIPE, and the whole pipeline is
+    # reported false even though the JSON flag was present.
+    if printf '%s' "$body" | tr ',{}' '\n\n\n' | grep -E '"offline"[[:space:]]*:[[:space:]]*true' >/dev/null; then
         echo 1
     else
         echo 0
@@ -129,7 +132,7 @@ _spool_buffer_full_flag() {
     local body
     body="$(qa_timeout 5 curl -s "$CP_BASE/spool" 2>/dev/null)"
     [ -z "$body" ] && { echo 0; return; }
-    if printf '%s' "$body" | tr ',{}' '\n\n\n' | grep -qE '"offline_buffer_full"[[:space:]]*:[[:space:]]*true'; then
+    if printf '%s' "$body" | tr ',{}' '\n\n\n' | grep -E '"offline_buffer_full"[[:space:]]*:[[:space:]]*true' >/dev/null; then
         echo 1
     else
         echo 0

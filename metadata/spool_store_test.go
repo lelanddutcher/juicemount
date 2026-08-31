@@ -114,6 +114,40 @@ func TestSpoolStoreMarkReadyRefusesNonWriting(t *testing.T) {
 	}
 }
 
+func TestSpoolStoreReopenReadyCAS(t *testing.T) {
+	db := openTestDB(t)
+	s := NewSpoolStore(db)
+
+	id, _ := s.Insert("/late-write", "/spool/files/late")
+	if ok, err := s.ReopenReady(id); err != nil || ok {
+		t.Fatalf("writing row reopened: ok=%v err=%v, want false nil", ok, err)
+	}
+	if err := s.MarkReady(id, 123, []byte("old-sha")); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if ok, err := s.ReopenReady(id); err != nil || !ok {
+		t.Fatalf("ready row reopen: ok=%v err=%v, want true nil", ok, err)
+	}
+	row, _ := s.Get(id)
+	if row.DrainState != DrainWriting || row.Size != 123 || string(row.SHA256) != "old-sha" {
+		t.Fatalf("reopen changed durable payload metadata: %+v", row)
+	}
+	if ok, err := s.ReopenReady(id); err != nil || ok {
+		t.Fatalf("second reopen was not a CAS miss: ok=%v err=%v", ok, err)
+	}
+
+	// A punched/streamed row is not self-contained and must never reopen.
+	if err := s.MarkReady(id, 123, []byte("old-sha")); err != nil {
+		t.Fatalf("mark ready after reopen: %v", err)
+	}
+	if err := s.SetPunchedEnd(id, 64); err != nil {
+		t.Fatalf("set punched end: %v", err)
+	}
+	if ok, err := s.ReopenReady(id); err != nil || ok {
+		t.Fatalf("punched row reopened: ok=%v err=%v, want false nil", ok, err)
+	}
+}
+
 func TestSpoolStoreLookupByPathReturnsLatest(t *testing.T) {
 	db := openTestDB(t)
 	s := NewSpoolStore(db)

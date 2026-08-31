@@ -139,12 +139,12 @@ _idx_activity_state() {
     # Reconcile op active?  ...{"kind":"reconcile","active":true,...}
     if printf '%s' "$body" \
         | tr '{}' '\n\n' \
-        | grep -q '"kind":"reconcile"' \
-        && printf '%s' "$body" | grep -Eq '"kind":"reconcile","active":true|"reconcile".*"active":true'; then
+        | grep '"kind":"reconcile"' >/dev/null \
+        && printf '%s' "$body" | grep -E '"kind":"reconcile","active":true|"reconcile".*"active":true' >/dev/null; then
         echo "busy"; return
     fi
     # Or any background work (drain/prefetch) — the system-wide load condition.
-    if printf '%s' "$body" | grep -Eq '"busy"[[:space:]]*:[[:space:]]*true'; then
+    if printf '%s' "$body" | grep -E '"busy"[[:space:]]*:[[:space:]]*true' >/dev/null; then
         echo "busy"; return
     fi
     echo "idle"
@@ -157,20 +157,22 @@ qa_sec "C1 build-uses-keyspace-push"
 c1_mark=$(qa_log_mark)
 echo "[CASE] C1 build-uses-keyspace-push — inspecting log for push subscription + SCAN frequency"
 
-# Look back over the existing log (push loop logs once at startup) for the
-# enable markers, then we re-check the live window after driving churn in C2.
+# Look back over the existing log for either the one-time startup markers OR a
+# live reconcileDir event. The log rotates on long release batteries, so an
+# active incremental event is stronger evidence than a startup line that may
+# have aged out.
 push_enabled=0
 if [ -f "$JM_LOG" ]; then
-    if grep -qE 'metadata keyspace push: (loop starting|subscribed)' "$JM_LOG" 2>/dev/null; then
+    if grep -qE 'metadata keyspace push: (loop starting|subscribed|reconcileDir)' "$JM_LOG" 2>/dev/null; then
         push_enabled=1
     fi
 fi
 if [ "$push_enabled" -eq 1 ]; then
-    qa_pass "C1: build has metadata keyspace-PUSH enabled (loop starting/subscribed in log)"
+    qa_pass "C1: build has metadata keyspace-PUSH enabled (startup or live reconcileDir marker in log)"
 else
     # Not fatal to the stability gate, but it IS the configuration that prevents
     # the 30s re-pulls. Warn loudly so the release owner notices a non-push build.
-    qa_warn "C1: no 'metadata keyspace push: loop starting/subscribed' in $JM_LOG — build may NOT be using keyspace-push (JM_METADATA_KEYSPACE_PUSH unset?). Stability cases still run."
+    qa_warn "C1: no metadata keyspace-push startup/live marker in $JM_LOG — build may NOT be using keyspace-push (JM_METADATA_KEYSPACE_PUSH unset?). Stability cases still run."
 fi
 
 # Frequency check is done AFTER C2 drives churn (so we have push events to
@@ -226,7 +228,7 @@ done
 log_recon=0
 if [ -f "$JM_LOG" ]; then
     tail -n +$(( c2_mark + 1 )) "$JM_LOG" 2>/dev/null \
-        | grep -qE 'metadata keyspace push: reconcileDir|metadata sync complete|metadata keyspace push: burst over ceiling' \
+        | grep -E 'metadata keyspace push: reconcileDir|metadata sync complete|metadata keyspace push: burst over ceiling' >/dev/null \
         && log_recon=1
 fi
 

@@ -341,7 +341,7 @@ DRAIN_COPY_PID=""
 # full multi-GB LOAD payload must FINISH draining before we can verify its
 # custody, so give it a payload-SCALED ceiling (ceil(bytes/5MiB), floor 600s) so
 # a 2-3GB load is never cut short and false-flagged as "did not settle".
-LOAD_CEIL="$(qa_drain_ceiling $(( DRAIN_DIRS * DRAIN_FILES_PER_DIR * DRAIN_FILE_BYTES )))"
+LOAD_CEIL="$(qa_drain_ceiling $(( DRAIN_DIRS * DRAIN_FILES_PER_DIR * DRAIN_FILE_BYTES )) $(( DRAIN_DIRS * DRAIN_FILES_PER_DIR * 2 )))"
 if ! qa_wait_drain "$LOAD_CEIL"; then
     qa_warn "drain-latency: load spool did not fully settle within ${LOAD_CEIL}s (dest=$DRAIN_DEST)"
 fi

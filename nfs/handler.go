@@ -3571,6 +3571,15 @@ func (jfs *juiceFS) Create(filename string) (billy.File, error) {
 func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	oldpath = strings.TrimPrefix(oldpath, "/")
 	newpath = strings.TrimPrefix(newpath, "/")
+	// Snapshot the source type/locality before the spool migration re-keys it.
+	// A new LocalOnly regular file exists solely in the SSD spool; probing its
+	// nonexistent source with os.Rename forces a synchronous remote FUSE lookup
+	// just to receive ENOENT. Under drain load that measured 223ms and delayed an
+	// otherwise-cached Stat on the same NFS connection past the 200ms release
+	// ceiling. We use this snapshot for the safe no-source fast path below and
+	// later for exact-vs-tree FD invalidation.
+	oldEntry := jfs.handler.store.LookupByPath(oldpath)
+	destEntry := jfs.handler.store.LookupByPath(newpath)
 
 	// Spool-aware rename (Phase-1 BUG 1). Order matters:
 	//
@@ -3643,23 +3652,36 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	//      drained data. 6/8 still failed (-48/-47).
 	// The real fix is mutual exclusion between a directory rename and drains
 	// targeting that subtree.
-	if err := os.Rename(jfs.fullPath(oldpath), jfs.fullPath(newpath)); err != nil {
-		if !(migrated > 0 && os.IsNotExist(err)) {
-			return err
-		}
-		// migrated>0 && ENOENT: the SOURCE was purely spooled (not yet on FUSE),
-		// so the migration re-keyed its spool entry to newpath and the rename
-		// itself is a no-op on FUSE. But if newpath ALREADY had drained content
-		// on FUSE, that OLD content still sits there and would be served if the
-		// migrated entry's drain later FAILS (quarantine / retry-exhaust) —
-		// silent stale-content corruption (a relink/atomic-save reading the
-		// pre-rename bytes). Remove the stale FUSE dest now so a failed drain
-		// yields a clean ENOENT instead. In-flight readers keep their open fd
-		// (open-then-unlink); new reads hit the migrated spool entry's fresh
-		// content during the drain, then FUSE after it lands.
-		if rmErr := os.Remove(jfs.fullPath(newpath)); rmErr != nil && !os.IsNotExist(rmErr) {
-			jmlog.Warn("rename: remove stale FUSE dest after spooled-source migration",
-				"newpath", newpath, "error", rmErr.Error())
+	// Fast path for a purely-spooled new regular file and an actually-absent
+	// destination: the spool migration above IS the rename. There is no source
+	// inode in FUSE to move. The metadata mirror is the NFS namespace authority;
+	// require it to show no destination so POSIX replacement/type-check semantics
+	// still take the legacy path. This check is deliberately local: replacing a
+	// known-nonexistent remote probe with another remote Lstat would preserve the
+	// very head-of-line delay this fast path removes.
+	skipFUSERename := false
+	if migrated > 0 && oldEntry != nil && !oldEntry.IsDir && oldEntry.LocalOnly && destEntry == nil {
+		skipFUSERename = true
+	}
+	if !skipFUSERename {
+		if err := os.Rename(jfs.fullPath(oldpath), jfs.fullPath(newpath)); err != nil {
+			if !(migrated > 0 && os.IsNotExist(err)) {
+				return err
+			}
+			// migrated>0 && ENOENT: the SOURCE was purely spooled (not yet on FUSE),
+			// so the migration re-keyed its spool entry to newpath and the rename
+			// itself is a no-op on FUSE. But if newpath ALREADY had drained content
+			// on FUSE, that OLD content still sits there and would be served if the
+			// migrated entry's drain later FAILS (quarantine / retry-exhaust) —
+			// silent stale-content corruption (a relink/atomic-save reading the
+			// pre-rename bytes). Remove the stale FUSE dest now so a failed drain
+			// yields a clean ENOENT instead. In-flight readers keep their open fd
+			// (open-then-unlink); new reads hit the migrated spool entry's fresh
+			// content during the drain, then FUSE after it lands.
+			if rmErr := os.Remove(jfs.fullPath(newpath)); rmErr != nil && !os.IsNotExist(rmErr) {
+				jmlog.Warn("rename: remove stale FUSE dest after spooled-source migration",
+					"newpath", newpath, "error", rmErr.Error())
+			}
 		}
 	}
 
@@ -3697,7 +3719,6 @@ func (jfs *juiceFS) Rename(oldpath, newpath string) error {
 	// BOTH ends: POSIX rename cannot change it (file→dir is EISDIR, dir→file is
 	// ENOTDIR), so a successful rename of a file has a file at both names. An
 	// unmirrored source (oldEntry nil) falls back to the tree scan.
-	oldEntry := jfs.handler.store.LookupByPath(oldpath)
 	if oldEntry != nil && !oldEntry.IsDir {
 		jfs.handler.invalidatePooledFDs(oldpath)
 		jfs.handler.invalidatePooledFDs(newpath)

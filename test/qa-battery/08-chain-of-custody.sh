@@ -100,7 +100,7 @@ main() {
     # COC_DRAIN_CEIL as a generous lower bound. A 2-3GB corpus thus gets the full
     # qa_drain_ceiling band (floor 600s, scaled at the 5MB/s drain floor).
     local _coc_bytes; _coc_bytes="$(du -sk "$SRC" 2>/dev/null | awk '{print $1*1024; f=1} END{if(!f) print 0}')"
-    local _coc_scaled; _coc_scaled="$(qa_drain_ceiling "$_coc_bytes")"
+    local _coc_scaled; _coc_scaled="$(qa_drain_ceiling "$_coc_bytes" $(( NF * 2 )))"
     [ "$_coc_scaled" -gt "$COC_DRAIN_CEIL" ] 2>/dev/null && COC_DRAIN_CEIL="$_coc_scaled"
     qa_info "drain ceiling = ${COC_DRAIN_CEIL}s (corpus ~$(( _coc_bytes / 1048576 ))MB, payload-scaled)"
     qa_assert $([ "$NF" -gt 0 ] && echo 0 || echo 1) \

@@ -142,7 +142,7 @@ run_size_case() {
     # Use a payload-SCALED ceiling so a multi-GB drain is never cut short. We take
     # the GREATER of the caller-supplied dtimeout and the size-derived ceiling
     # (ceil(size/5MiB), floor 600s) — the static value stays a lower bound.
-    local dceil; dceil="$(qa_drain_ceiling "$size")"
+    local dceil; dceil="$(qa_drain_ceiling "$size" 2)"
     [ "$dtimeout" -gt "$dceil" ] 2>/dev/null && dceil="$dtimeout"
     if ! qa_wait_drain "$dceil"; then
         qa_fail "spool did not drain within ${dceil}s for $label ($casedir/$srcname)"

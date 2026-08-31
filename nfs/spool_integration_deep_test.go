@@ -274,6 +274,10 @@ func TestSpoolReopenWhileDrainingBlocksThenDefers(t *testing.T) {
 	e1, _ := s.OpenWrite("/reopen.bin")
 	_, _ = e1.WriteAt([]byte("first"), 0)
 	_ = e1.Close() // finalized → ready, still in the index (no drainer running)
+	claimed, err := s.Meta().MarkDraining(e1.ID())
+	if err != nil || !claimed {
+		t.Fatalf("claim prior row for drain: claimed=%v err=%v", claimed, err)
+	}
 
 	type res struct {
 		e   *SpoolEntry
@@ -304,6 +308,65 @@ func TestSpoolReopenWhileDrainingBlocksThenDefers(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("blocked OpenWrite did not return after the prior entry drained")
+	}
+}
+
+// A finalized READY row has not been claimed by the drainer and still owns a
+// complete, unpunched spool image. A late continuation must reopen that exact
+// row immediately, merge the bytes, and drain one complete file. This is the
+// real Finder directory-sidecar pattern that previously parked every WRITE for
+// 30s behind a thousands-row ready queue and surfaced as error 100060.
+func TestSpoolReopenReadyMergesLateContinuation(t *testing.T) {
+	spool, d := newTestDrainer(t, DrainerConfig{})
+	first := []byte("first-burst-")
+	second := []byte("late-continuation")
+
+	e1, err := spool.OpenWrite("/late.bin")
+	if err != nil {
+		t.Fatalf("OpenWrite first: %v", err)
+	}
+	if _, err := e1.WriteAt(first, 0); err != nil {
+		t.Fatalf("write first: %v", err)
+	}
+	if err := e1.Close(); err != nil {
+		t.Fatalf("finalize first: %v", err)
+	}
+
+	t0 := time.Now()
+	e2, err := spool.OpenWrite("/late.bin")
+	if err != nil {
+		t.Fatalf("reopen ready: %v", err)
+	}
+	if elapsed := time.Since(t0); elapsed > time.Second {
+		t.Fatalf("ready reopen blocked for %v; must be immediate", elapsed)
+	}
+	if e2 != e1 || e2.ID() != e1.ID() {
+		t.Fatalf("ready reopen created a competing entry: same_ptr=%v ids=%d/%d", e2 == e1, e1.ID(), e2.ID())
+	}
+	if _, err := e2.WriteAt(second, int64(len(first))); err != nil {
+		t.Fatalf("write continuation: %v", err)
+	}
+	if err := e2.Close(); err != nil {
+		t.Fatalf("finalize continuation: %v", err)
+	}
+
+	want := append(append([]byte(nil), first...), second...)
+	if got, err := os.ReadFile(e2.SpoolFilePath()); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("merged spool image mismatch: len=%d err=%v want=%d", len(got), err, len(want))
+	}
+	row, err := spool.Meta().Get(e2.ID())
+	if err != nil || row.DrainState != metadata.DrainReady || row.Size != int64(len(want)) {
+		t.Fatalf("refinalized row incorrect: row=%+v err=%v", row, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if n := d.DrainOnceForTest(ctx); n != 1 {
+		t.Fatalf("drained rows=%d, want 1", n)
+	}
+	got, err := os.ReadFile(filepath.Join(d.fuseRoot, "late.bin"))
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("drained merged image mismatch: len=%d err=%v want=%d", len(got), err, len(want))
 	}
 }
 

@@ -40,6 +40,12 @@ func TestReopenDuringDrainDefersToFuse(t *testing.T) {
 	if err := e1.Close(); err != nil { // finalize — NOT drained yet
 		t.Fatalf("close1: %v", err)
 	}
+	// Claim the row exactly as the dispatcher does. A merely-ready row is now
+	// safe to reopen in place; this test specifically covers a TRUE drain claim.
+	claimed, err := spool.Meta().MarkDraining(e1.ID())
+	if err != nil || !claimed {
+		t.Fatalf("claim row for drain: claimed=%v err=%v", claimed, err)
+	}
 	// Entry is closed but still index-resident (the during-drain window).
 	if _, active := spool.LookupActive("/cont.bin"); !active {
 		t.Skip("entry not index-resident after Close (already drained) — window not reproducible on this harness")
@@ -55,9 +61,19 @@ func TestReopenDuringDrainDefersToFuse(t *testing.T) {
 		ch <- res{e2, err}
 	}()
 
-	// Let the goroutine enter the reopen-wait loop, then drain (which evicts).
+	// Let the goroutine enter the reopen-wait loop, then simulate the already-
+	// claimed drain landing and completing (which evicts). DrainOnceForTest only
+	// scans ready rows, so it intentionally cannot pick this pre-claimed row.
 	time.Sleep(80 * time.Millisecond)
-	drainer.DrainOnceForTest(ctx)
+	dest := filepath.Join(fuseRoot, "cont.bin")
+	if err := os.WriteFile(dest, part1, 0o644); err != nil {
+		t.Fatalf("simulate claimed drain write: %v", err)
+	}
+	if done, err := spool.MarkDrainComplete(e1.ID(), e1.NFSPath(), e1.SpoolFilePath(), e1.WrittenEnd()); err != nil || !done {
+		t.Fatalf("complete claimed drain: done=%v err=%v", done, err)
+	}
+	_ = drainer // wiring remains part of the integration fixture
+	_ = ctx
 
 	select {
 	case r := <-ch:
@@ -69,7 +85,7 @@ func TestReopenDuringDrainDefersToFuse(t *testing.T) {
 	}
 
 	// The drained backend file must be intact part1 — never clobbered.
-	got, err := os.ReadFile(filepath.Join(fuseRoot, "cont.bin"))
+	got, err := os.ReadFile(dest)
 	if err != nil {
 		t.Fatalf("read dest: %v", err)
 	}
