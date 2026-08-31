@@ -50,6 +50,14 @@ var responseBufferPool = sync.Pool{
 // cap: small RPCs keep small buffers, READs get one already big enough.
 const largeResponseBufferCap = 1 << 20
 
+// maxSerializedResponseBatch bounds how many ready RPC replies the single TCP
+// writer may collect before it must flush.  The response queue is continuously
+// refilled during a large Finder copy; draining it "until empty" can therefore
+// postpone a flush indefinitely even though READDIR/GETATTR handlers completed
+// promptly.  A small fixed batch preserves syscall coalescing while putting a
+// hard bound on response-egress head-of-line latency.
+const maxSerializedResponseBatch = 32
+
 var largeResponseBufferPool = sync.Pool{
 	New: func() interface{} {
 		return bytes.NewBuffer(make([]byte, 0, largeResponseBufferCap+4096))
@@ -419,13 +427,15 @@ func (c *conn) serializeWrites(ctx context.Context) {
 			if err := writeMsg(msg); err != nil {
 				return
 			}
-			// [JM5] Batch-drain: collect all queued responses before flushing.
-			// This prevents TCP send buffer deadlock under concurrent load
-			// (e.g., Finder copying 20 files simultaneously) and reduces
-			// the number of TCP write syscalls.
+			// [JM5/JM6] Batch ready responses before flushing, but never drain
+			// an unbounded continuously-refilled queue. Under a large Finder
+			// copy the old "until empty" loop could run for hundreds of
+			// milliseconds, leaving an already-completed READDIR reply stranded
+			// in the userspace buffer. The fixed cap preserves coalescing while
+			// guaranteeing regular progress onto the wire.
 			batchCount := int64(1)
 		drain:
-			for {
+			for batchCount < maxSerializedResponseBatch {
 				select {
 				case msg, ok = <-c.writeSerializer:
 					if !ok {
