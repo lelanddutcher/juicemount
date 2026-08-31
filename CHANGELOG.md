@@ -12,9 +12,14 @@
   retry errors. Rows already claimed by the drainer or partially streamed stay
   on the corruption-safe defer path.
 - Large Finder directories keep each AppleDouble sidecar beside its principal
-  at the final NFS protocol ordering layer, eliminating the redundant lookup
-  storm seen with 5,000-file folders. Renames of new spool-only files no longer
-  issue a remote FUSE rename solely to discover that the source is absent.
+  at the final NFS protocol ordering layer with a linear merge, eliminating the
+  redundant lookup storm and second full sort seen with 5,000-file folders.
+  Bounded metadata mutations no longer share navigation's RPC admission pool,
+  so a burst of slow sidecar removes cannot block READDIR/GETATTR. Late metadata
+  updates on an already-unlinked sidecar retain handle semantics without
+  resurrecting the deleted name or returning a stale-handle error. Renames of
+  new spool-only files no longer issue a remote FUSE rename solely to discover
+  that the source is absent.
 - JuiceMount Link persists pairing authorization, applies and tests remote
   backend routes, and fails closed when coordination or saved credentials are
   incomplete.

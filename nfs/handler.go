@@ -1791,6 +1791,14 @@ func (h *JuiceMountHandler) Mount(ctx context.Context, conn net.Conn, req nfslib
 
 // Change returns the change interface (for write ops).
 func (h *JuiceMountHandler) Change(fs billy.Filesystem) billy.Change {
+	// macOS can issue a final SETATTR after unlinking an AppleDouble sidecar.
+	// FromHandle represents that still-valid open-but-unlinked handle with a
+	// handle-only filesystem. The name must stay absent from the live mirror,
+	// while the late metadata operation succeeds against the old handle just as
+	// it would against an unlinked Unix fd.
+	if _, ok := fs.(*deletedSidecarHandleFS); ok {
+		return deletedHandleChange{}
+	}
 	return &juiceChange{handler: h}
 }
 
@@ -1910,9 +1918,39 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 		// stale-storm. Atomic-only, no new syscall (the Lstat, if any, is
 		// inside tryRecoverEvicted and already existed).
 		metrics.Default().IncRecoverLstat()
-		if recovered := h.tryRecoverEvicted(inode); recovered != nil {
+		recovered, confirmedGone := h.tryRecoverEvicted(inode)
+		if recovered != nil {
 			parts := splitPath(recovered.Path)
 			return &juiceFS{handler: h}, parts, nil
+		}
+
+		// Finder writes AppleDouble metadata through a normal NFS handle, then
+		// may unlink the `._` file and send a late SETATTR/COMMIT on that handle.
+		// A confirmed FUSE ENOENT means the unlink won; returning ESTALE here is
+		// wrong for the still-open handle and caused the two residual RC stalls.
+		// Serve a handle-only tombstone instead: Stat/Lstat expose the shadowed
+		// attributes and Change is a no-op, but the entry is NOT promoted back
+		// into pathCache/childrenIdx, so READDIR and LOOKUP continue to see the
+		// name as deleted. Principal files retain normal ESTALE behavior.
+		if confirmedGone {
+			if shadow, ok := h.store.LookupRecentlyEvicted(inode); ok &&
+				strings.HasPrefix(path.Base(shadow.Path), "._") {
+				entry := &metadata.Entry{
+					Path:       shadow.Path,
+					Name:       shadow.Name,
+					ParentPath: shadow.ParentPath,
+					Mode:       shadow.Mode,
+					Size:       shadow.Size,
+					Mtime:      shadow.Mtime,
+					IsDir:      shadow.IsDir,
+					Inode:      inode,
+				}
+				return &deletedSidecarHandleFS{
+					juiceFS:     &juiceFS{handler: h},
+					deletedPath: strings.TrimLeft(shadow.Path, "/"),
+					info:        entry.FileInfo(),
+				}, splitPath(shadow.Path), nil
+			}
 		}
 
 		// Synthetic-handle recovery (2026-06-14). A synthetic inode (high bit)
@@ -1994,18 +2032,18 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 // gone handles. Default TTL 5s — long enough to absorb a typical retry
 // burst, short enough that a real "file came back" recovery isn't
 // blocked forever.
-func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
+func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) (*metadata.Entry, bool) {
 	// Synthetic inodes (high bit set) have no shadow entry — they're
 	// counter-based ToHandle fallbacks, not real juicefs inodes.
 	if inode&(1<<63) != 0 {
-		return nil
+		return nil, false
 	}
 	// Negative cache check.
 	h.recoveryMu.Lock()
 	if exp, ok := h.recoveryNegative[inode]; ok {
 		if time.Now().Before(exp) {
 			h.recoveryMu.Unlock()
-			return nil
+			return nil, true
 		}
 		delete(h.recoveryNegative, inode)
 	}
@@ -2016,7 +2054,13 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 		<-done
 		// Whoever ran the recovery has either populated the cache or
 		// installed a negative entry. Re-lookup.
-		return h.store.LookupByInode(inode)
+		if recovered := h.store.LookupByInode(inode); recovered != nil {
+			return recovered, false
+		}
+		h.recoveryMu.Lock()
+		exp, confirmedGone := h.recoveryNegative[inode]
+		h.recoveryMu.Unlock()
+		return nil, confirmedGone && time.Now().Before(exp)
 	}
 	// Become the owner.
 	if h.recoveryInFlight == nil {
@@ -2045,7 +2089,7 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 		h.recoveryMu.Lock()
 		h.recoveryNegative[inode] = time.Now().Add(5 * time.Second)
 		h.recoveryMu.Unlock()
-		return nil
+		return nil, false
 	}
 
 	// Task #92: a spool-resident (not-yet-drained) write logically EXISTS even
@@ -2068,7 +2112,7 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 			"inode", fmt.Sprintf("%x", inode),
 			"path", shadow.Path,
 		)
-		return recovered
+		return recovered, false
 	}
 
 	// Verify the path actually exists in FUSE before recovering.
@@ -2077,14 +2121,14 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 	if !fok {
 		// Lstat timed out — FUSE is degraded. Don't recover, don't
 		// cache negative (might succeed next time).
-		return nil
+		return nil, false
 	}
 	if fi == nil {
 		// File is genuinely gone. Cache negative so burst retries skip.
 		h.recoveryMu.Lock()
 		h.recoveryNegative[inode] = time.Now().Add(5 * time.Second)
 		h.recoveryMu.Unlock()
-		return nil
+		return nil, true
 	}
 
 	// File exists. Promote the shadow back to live cache.
@@ -2098,7 +2142,7 @@ func (h *JuiceMountHandler) tryRecoverEvicted(inode uint64) *metadata.Entry {
 		"inode", fmt.Sprintf("%x", inode),
 		"path", shadow.Path,
 	)
-	return recovered
+	return recovered, false
 }
 
 func (h *JuiceMountHandler) InvalidateHandle(f billy.Filesystem, handle []byte) error {
@@ -2114,11 +2158,11 @@ func (h *JuiceMountHandler) HandleLimit() int {
 func (h *JuiceMountHandler) VerifierFor(path string, contents []os.FileInfo) uint64 {
 	hash := fnv.New64a()
 	hash.Write([]byte(path))
+	var b [8]byte
 	for _, fi := range contents {
 		hash.Write([]byte(fi.Name()))
-		b := make([]byte, 8)
-		binary.BigEndian.PutUint64(b, uint64(fi.ModTime().Unix()))
-		hash.Write(b)
+		binary.BigEndian.PutUint64(b[:], uint64(fi.ModTime().Unix()))
+		hash.Write(b[:])
 	}
 	v := hash.Sum64()
 
@@ -2153,6 +2197,35 @@ func splitPath(p string) []string {
 // and proxying file I/O to the JuiceFS FUSE mount.
 type juiceFS struct {
 	handler *JuiceMountHandler
+}
+
+// deletedSidecarHandleFS represents a recently-unlinked AppleDouble file for
+// operations arriving through its already-issued NFS handle. It deliberately
+// embeds the ordinary filesystem for capability/join behavior but overrides
+// only metadata lookup for the exact deleted path. It is never inserted into
+// the metadata store, so it cannot resurrect the name in a directory listing.
+type deletedSidecarHandleFS struct {
+	*juiceFS
+	deletedPath string
+	info        os.FileInfo
+}
+
+func (fs *deletedSidecarHandleFS) isDeletedPath(name string) bool {
+	return strings.TrimLeft(path.Clean(name), "/") == fs.deletedPath
+}
+
+func (fs *deletedSidecarHandleFS) Stat(name string) (os.FileInfo, error) {
+	if fs.isDeletedPath(name) {
+		return fs.info, nil
+	}
+	return fs.juiceFS.Stat(name)
+}
+
+func (fs *deletedSidecarHandleFS) Lstat(name string) (os.FileInfo, error) {
+	if fs.isDeletedPath(name) {
+		return fs.info, nil
+	}
+	return fs.juiceFS.Lstat(name)
 }
 
 func (jfs *juiceFS) fullPath(filename string) string {
@@ -4108,6 +4181,15 @@ func (jfs *juiceFS) Root() string { return "/" }
 type juiceChange struct {
 	handler *JuiceMountHandler
 }
+
+// deletedHandleChange accepts late metadata updates on an already-unlinked
+// AppleDouble handle without recreating the deleted path in the live mirror.
+type deletedHandleChange struct{}
+
+func (deletedHandleChange) Chmod(string, os.FileMode) error            { return nil }
+func (deletedHandleChange) Chown(string, int, int) error               { return nil }
+func (deletedHandleChange) Lchown(string, int, int) error              { return nil }
+func (deletedHandleChange) Chtimes(string, time.Time, time.Time) error { return nil }
 
 // Chmod applies an NFS SETATTR{mode} so a copied file keeps its source perms
 // (the read-only bit in particular: a `chmod 444` source that Finder copies

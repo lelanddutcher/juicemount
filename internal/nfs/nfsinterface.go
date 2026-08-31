@@ -3,6 +3,14 @@ package nfs
 // NFSProcedure is the valid RPC calls for the nfs service.
 type NFSProcedure uint32
 
+type rpcAdmissionClass uint8
+
+const (
+	rpcAdmissionRead rpcAdmissionClass = iota
+	rpcAdmissionWrite
+	rpcAdmissionMutation
+)
+
 // NfsProcedure Codes
 const (
 	NFSProcedureNull NFSProcedure = iota
@@ -28,6 +36,33 @@ const (
 	NFSProcedurePathConf
 	NFSProcedureCommit
 )
+
+// classifyRPCAdmission keeps navigation isolated from operations that may
+// synchronously wait on the spool, SQLite, or JuiceFS/FUSE. macOS multiplexes
+// all NFSv3 calls over one TCP connection, so admission itself must never park
+// the connection reader behind a full pool of slow mutations.
+func classifyRPCAdmission(prog, proc uint32) rpcAdmissionClass {
+	if prog != nfsServiceID {
+		return rpcAdmissionRead
+	}
+	switch NFSProcedure(proc) {
+	case NFSProcedureWrite:
+		return rpcAdmissionWrite
+	case NFSProcedureSetAttr,
+		NFSProcedureCreate,
+		NFSProcedureMkDir,
+		NFSProcedureSymlink,
+		NFSProcedureMkNod,
+		NFSProcedureRemove,
+		NFSProcedureRmDir,
+		NFSProcedureRename,
+		NFSProcedureLink,
+		NFSProcedureCommit:
+		return rpcAdmissionMutation
+	default:
+		return rpcAdmissionRead
+	}
+}
 
 func (n NFSProcedure) String() string {
 	switch n {

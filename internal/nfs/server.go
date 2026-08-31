@@ -17,7 +17,8 @@ const (
 	// WriteRPCReserve sizes the SEPARATE WRITE admission pool (writeSem) relative
 	// to rpcSem: writeSem cap = DefaultRPCSemaphoreSize - WriteRPCReserve. WRITE
 	// RPCs use writeSem ONLY (acquired inside the dispatch goroutine, off the
-	// reader path); non-WRITE RPCs use rpcSem ONLY (acquired in the serve loop).
+	// reader path); read/navigation RPCs use rpcSem (acquired in the serve loop),
+	// while metadata mutations use their own mutationSem below.
 	// Because the two pools are independent, a write parked indefinitely in the
 	// spool capacity stall (offline buffer full / slow drain) can never consume a
 	// read's rpcSem slot nor block the single per-connection reader — so the mount
@@ -26,6 +27,15 @@ const (
 	// (not-yet-admitted) writes are cheap goroutines bounded by the client's own
 	// outstanding-write window.
 	WriteRPCReserve = 32
+
+	// MutationRPCSemaphoreSize bounds metadata-mutating RPCs independently of
+	// reads and writes. Finder can issue a large burst of REMOVE/SETATTR/COMMIT
+	// calls while it is ingesting AppleDouble metadata. Some of those calls must
+	// wait on JuiceFS/FUSE, but they must not occupy every rpcSem slot and
+	// head-of-line-block a following READDIR/GETATTR on the mount's single TCP
+	// connection. The separate pool keeps that work bounded without coupling its
+	// latency to navigation.
+	MutationRPCSemaphoreSize = 32
 )
 
 // Server is a handle to the listening NFS server.
@@ -47,6 +57,13 @@ type Server struct {
 	// never blocks on it, and reads/metadata keep their full rpcSem pool: the
 	// mount stays navigable even when every write is stalled. See conn.go.
 	writeSem chan struct{}
+
+	// [JM6] Metadata-mutation admission semaphore. Mutating RPCs acquire this
+	// inside their dispatch goroutine, so a slow burst of REMOVE/SETATTR/COMMIT
+	// cannot fill rpcSem or park the per-connection reader ahead of READDIR.
+	// This is intentionally independent of writeSem: a capacity-stalled WRITE
+	// must not prevent REMOVE from cancelling/freeing that path.
+	mutationSem chan struct{}
 
 	// [JM5] Active connection tracking for health monitoring.
 	activeConns atomic.Int64
@@ -109,13 +126,16 @@ func (s *Server) Serve(l net.Listener) error {
 	if s.rpcSem == nil {
 		s.rpcSem = make(chan struct{}, DefaultRPCSemaphoreSize)
 	}
-	// [JM6] WRITE admission semaphore — reserves slots for non-WRITE RPCs.
+	// [JM6] WRITE admission semaphore — independent from navigation RPCs.
 	if s.writeSem == nil {
 		n := DefaultRPCSemaphoreSize - WriteRPCReserve
 		if n < 1 {
 			n = 1
 		}
 		s.writeSem = make(chan struct{}, n)
+	}
+	if s.mutationSem == nil {
+		s.mutationSem = make(chan struct{}, MutationRPCSemaphoreSize)
 	}
 
 	// [JM6] Hold a macOS power assertion while the NFS mount is in active use

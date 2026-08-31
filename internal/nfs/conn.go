@@ -245,14 +245,13 @@ func (c *conn) serve(ctx context.Context) {
 		//      over-cap write head-of-line-blocks every following read/LOOKUP/
 		//      GETATTR on the same TCP mount — the whole mount goes unnavigable.
 		//   2. A parked write must NOT hold an rpcSem slot that reads need.
-		// So: NON-WRITE RPCs acquire the shared rpcSem HERE (reader back-pressure,
-		// bounds read goroutines). WRITE RPCs are dispatched immediately and
-		// acquire the SEPARATE writeSem INSIDE their goroutine — the reader never
-		// parks on a write, and reads keep their full rpcSem pool even when every
-		// write is stalled. The two pools are independent.
-		isWrite := w.req.Header.Prog == nfsServiceID &&
-			w.req.Header.Proc == uint32(NFSProcedureWrite)
-		if !isWrite && c.Server.rpcSem != nil {
+		// So: read/navigation RPCs acquire the shared rpcSem HERE (reader
+		// back-pressure, bounds read goroutines). WRITE and metadata-mutation RPCs
+		// are dispatched immediately and acquire their independent semaphores
+		// INSIDE their goroutine. Slow JuiceFS REMOVE/SETATTR/COMMIT bursts therefore
+		// cannot consume every reader slot or park this loop ahead of READDIR.
+		admission := classifyRPCAdmission(w.req.Header.Prog, w.req.Header.Proc)
+		if admission == rpcAdmissionRead && c.Server.rpcSem != nil {
 			// [S6 / H1 grader] Admission is the read head-of-line point: when the
 			// shared rpcSem is saturated the reader parks HERE, blocking every
 			// following LOOKUP/GETATTR/READ on this single TCP mount. Grade the
@@ -312,7 +311,7 @@ func (c *conn) serve(ctx context.Context) {
 					Log.Errorf("handler panic: %v", r)
 					c.Close()
 				}
-				if !isWrite && c.Server.rpcSem != nil {
+				if admission == rpcAdmissionRead && c.Server.rpcSem != nil {
 					<-c.Server.rpcSem
 				}
 			}()
@@ -321,13 +320,21 @@ func (c *conn) serve(ctx context.Context) {
 			// parked on a full writeSem is a cheap goroutine holding NO rpcSem
 			// slot, so reads stay live. connCtx.Done() lets an abandoned /
 			// disconnected write unwind before it ever runs the handler.
-			if isWrite && c.Server.writeSem != nil {
+			if admission == rpcAdmissionWrite && c.Server.writeSem != nil {
 				select {
 				case c.Server.writeSem <- struct{}{}:
 				case <-connCtx.Done():
 					return
 				}
 				defer func() { <-c.Server.writeSem }()
+			}
+			if admission == rpcAdmissionMutation && c.Server.mutationSem != nil {
+				select {
+				case c.Server.mutationSem <- struct{}{}:
+				case <-connCtx.Done():
+					return
+				}
+				defer func() { <-c.Server.mutationSem }()
 			}
 
 			start := time.Now()

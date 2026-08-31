@@ -50,6 +50,43 @@ func TestRPCSemaphoreBackpressure(t *testing.T) {
 	}
 }
 
+func TestRPCAdmissionClassification(t *testing.T) {
+	for _, proc := range []NFSProcedure{
+		NFSProcedureGetAttr,
+		NFSProcedureLookup,
+		NFSProcedureRead,
+		NFSProcedureReadDir,
+		NFSProcedureReadDirPlus,
+		NFSProcedureFSStat,
+	} {
+		if got := classifyRPCAdmission(nfsServiceID, uint32(proc)); got != rpcAdmissionRead {
+			t.Errorf("%s admission=%v, want read", proc, got)
+		}
+	}
+	if got := classifyRPCAdmission(nfsServiceID, uint32(NFSProcedureWrite)); got != rpcAdmissionWrite {
+		t.Errorf("Write admission=%v, want write", got)
+	}
+	for _, proc := range []NFSProcedure{
+		NFSProcedureSetAttr,
+		NFSProcedureCreate,
+		NFSProcedureMkDir,
+		NFSProcedureSymlink,
+		NFSProcedureMkNod,
+		NFSProcedureRemove,
+		NFSProcedureRmDir,
+		NFSProcedureRename,
+		NFSProcedureLink,
+		NFSProcedureCommit,
+	} {
+		if got := classifyRPCAdmission(nfsServiceID, uint32(proc)); got != rpcAdmissionMutation {
+			t.Errorf("%s admission=%v, want mutation", proc, got)
+		}
+	}
+	if got := classifyRPCAdmission(mountServiceID, 1); got != rpcAdmissionRead {
+		t.Errorf("non-NFS admission=%v, want read", got)
+	}
+}
+
 func TestActiveConnectionTracking(t *testing.T) {
 	s := &Server{}
 

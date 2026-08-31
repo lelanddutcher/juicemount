@@ -168,9 +168,7 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 		return nil, 0, &NFSStatusError{NFSStatusNotDir, err}
 	}
 
-	sort.Slice(contents, func(i, j int) bool {
-		return readdirEntryLess(contents[i].Name(), contents[j].Name())
-	})
+	orderReadDirEntries(contents)
 
 	if vh, ok := userHandle.(CachingHandler); ok {
 		// let the user handler make a verifier if it can.
@@ -214,6 +212,65 @@ func appleDoubleSortKey(name string) (key string, sidecar bool) {
 		return name[2:], true
 	}
 	return name, false
+}
+
+// orderReadDirEntries applies the AppleDouble pairing order in linear time.
+// billy.Filesystem.ReadDir's contract already requires lexical filename order;
+// JuiceMount's RAM and SQLite paths both honor it. The previous protocol layer
+// sorted the full listing a second time with readdirEntryLess, adding another
+// O(n log n) pass to every first READDIR page (10,000 entries for the 5,000-file
+// Finder fixture). Split the already-lexical input into two already-sorted runs
+// and merge them by principal key instead. The defensive IsSorted check keeps
+// third-party/test handlers correct without charging the normal path more than
+// one O(n) scan.
+func orderReadDirEntries(contents []fs.FileInfo) {
+	if len(contents) < 2 {
+		return
+	}
+	lexical := func(i, j int) bool { return contents[i].Name() < contents[j].Name() }
+	if !sort.SliceIsSorted(contents, lexical) {
+		sort.Slice(contents, lexical)
+	}
+	if os.Getenv("JM_READDIR_PAIR_APPLEDOUBLE") == "0" {
+		return
+	}
+
+	principals := make([]fs.FileInfo, 0, len(contents))
+	sidecars := make([]fs.FileInfo, 0, len(contents)/2)
+	for _, entry := range contents {
+		if _, sidecar := appleDoubleSortKey(entry.Name()); sidecar {
+			sidecars = append(sidecars, entry)
+		} else {
+			principals = append(principals, entry)
+		}
+	}
+
+	ordered := make([]fs.FileInfo, 0, len(contents))
+	for pi, si := 0, 0; pi < len(principals) || si < len(sidecars); {
+		if pi == len(principals) {
+			ordered = append(ordered, sidecars[si:]...)
+			break
+		}
+		if si == len(sidecars) {
+			ordered = append(ordered, principals[pi:]...)
+			break
+		}
+		principalKey := principals[pi].Name()
+		sidecarKey, _ := appleDoubleSortKey(sidecars[si].Name())
+		switch {
+		case principalKey < sidecarKey:
+			ordered = append(ordered, principals[pi])
+			pi++
+		case sidecarKey < principalKey:
+			ordered = append(ordered, sidecars[si])
+			si++
+		default:
+			ordered = append(ordered, principals[pi], sidecars[si])
+			pi++
+			si++
+		}
+	}
+	copy(contents, ordered)
 }
 
 // readDirStartIndex converts the last cookie acknowledged by the client into
