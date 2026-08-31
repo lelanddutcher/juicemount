@@ -33,8 +33,8 @@ func TestFromHandleKeepsDeletedAppleDoubleHandleWithoutRelisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FromHandle deleted sidecar: %v", err)
 	}
-	if _, ok := fs.(*deletedSidecarHandleFS); !ok {
-		t.Fatalf("filesystem type = %T, want *deletedSidecarHandleFS", fs)
+	if _, ok := fs.(*deletedHandleFS); !ok {
+		t.Fatalf("filesystem type = %T, want *deletedHandleFS", fs)
 	}
 	fullPath := fs.Join(parts...)
 	info, err := fs.Lstat(fullPath)
@@ -49,6 +49,44 @@ func TestFromHandleKeepsDeletedAppleDoubleHandleWithoutRelisting(t *testing.T) {
 	}
 	if got := store.LookupByPath(sidecarPath); got != nil {
 		t.Fatalf("deleted sidecar was relisted in live mirror: %+v", got)
+	}
+}
+
+func TestFromHandleKeepsDeletedDirectoryHandleWithoutRelisting(t *testing.T) {
+	store, err := metadata.OpenWithMaxCacheSize(":memory:", 100)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	h := NewHandler(store, t.TempDir())
+	defer h.StopHandler()
+
+	const inode = uint64(0xabc125)
+	const dirPath = "tree/finished-copy"
+	entry := metadata.MakeEntry(dirPath, true, 0, time.Now(), inode)
+	store.InsertToCache(entry)
+	store.DeleteFromCache(dirPath)
+
+	handle := make([]byte, 8)
+	binary.BigEndian.PutUint64(handle, inode)
+	fs, parts, err := h.FromHandle(handle)
+	if err != nil {
+		t.Fatalf("FromHandle deleted directory: %v", err)
+	}
+	if _, ok := fs.(*deletedHandleFS); !ok {
+		t.Fatalf("filesystem type = %T, want *deletedHandleFS", fs)
+	}
+	fullPath := fs.Join(parts...)
+	info, err := fs.Lstat(fullPath)
+	if err != nil {
+		t.Fatalf("Lstat directory tombstone: %v", err)
+	}
+	if !info.IsDir() || info.Name() != "finished-copy" {
+		t.Fatalf("tombstone info = %q dir=%v, want finished-copy dir", info.Name(), info.IsDir())
+	}
+	if got := store.LookupByPath(dirPath); got != nil {
+		t.Fatalf("deleted directory was relisted in live mirror: %+v", got)
 	}
 }
 

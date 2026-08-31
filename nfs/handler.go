@@ -1791,12 +1791,13 @@ func (h *JuiceMountHandler) Mount(ctx context.Context, conn net.Conn, req nfslib
 
 // Change returns the change interface (for write ops).
 func (h *JuiceMountHandler) Change(fs billy.Filesystem) billy.Change {
-	// macOS can issue a final SETATTR after unlinking an AppleDouble sidecar.
+	// macOS can issue a final metadata operation after unlinking an AppleDouble
+	// sidecar or removing a directory whose NFS handle it still holds.
 	// FromHandle represents that still-valid open-but-unlinked handle with a
 	// handle-only filesystem. The name must stay absent from the live mirror,
-	// while the late metadata operation succeeds against the old handle just as
-	// it would against an unlinked Unix fd.
-	if _, ok := fs.(*deletedSidecarHandleFS); ok {
+	// while the late operation succeeds against the old handle just as it would
+	// against an unlinked Unix fd.
+	if _, ok := fs.(*deletedHandleFS); ok {
 		return deletedHandleChange{}
 	}
 	return &juiceChange{handler: h}
@@ -1926,15 +1927,17 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 
 		// Finder writes AppleDouble metadata through a normal NFS handle, then
 		// may unlink the `._` file and send a late SETATTR/COMMIT on that handle.
-		// A confirmed FUSE ENOENT means the unlink won; returning ESTALE here is
-		// wrong for the still-open handle and caused the two residual RC stalls.
-		// Serve a handle-only tombstone instead: Stat/Lstat expose the shadowed
-		// attributes and Change is a no-op, but the entry is NOT promoted back
-		// into pathCache/childrenIdx, so READDIR and LOOKUP continue to see the
-		// name as deleted. Principal files retain normal ESTALE behavior.
+		// macOS also sends a late GETATTR after RMDIR while walking a tree it is
+		// deleting. A confirmed FUSE ENOENT means the unlink/rmdir won; returning
+		// ESTALE for either still-held handle turns a successful delete into a
+		// user-visible Finder error. Serve a handle-only tombstone instead:
+		// Stat/Lstat expose the shadowed attributes and Change is a no-op, but the
+		// entry is NOT promoted back into pathCache/childrenIdx, so READDIR and
+		// LOOKUP continue to see the name as deleted. Deleted principal files
+		// retain normal ESTALE behavior.
 		if confirmedGone {
 			if shadow, ok := h.store.LookupRecentlyEvicted(inode); ok &&
-				strings.HasPrefix(path.Base(shadow.Path), "._") {
+				(shadow.IsDir || strings.HasPrefix(path.Base(shadow.Path), "._")) {
 				entry := &metadata.Entry{
 					Path:       shadow.Path,
 					Name:       shadow.Name,
@@ -1945,7 +1948,7 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 					IsDir:      shadow.IsDir,
 					Inode:      inode,
 				}
-				return &deletedSidecarHandleFS{
+				return &deletedHandleFS{
 					juiceFS:     &juiceFS{handler: h},
 					deletedPath: strings.TrimLeft(shadow.Path, "/"),
 					info:        entry.FileInfo(),
@@ -2199,29 +2202,30 @@ type juiceFS struct {
 	handler *JuiceMountHandler
 }
 
-// deletedSidecarHandleFS represents a recently-unlinked AppleDouble file for
-// operations arriving through its already-issued NFS handle. It deliberately
-// embeds the ordinary filesystem for capability/join behavior but overrides
-// only metadata lookup for the exact deleted path. It is never inserted into
-// the metadata store, so it cannot resurrect the name in a directory listing.
-type deletedSidecarHandleFS struct {
+// deletedHandleFS represents a recently-unlinked AppleDouble file or removed
+// directory for operations arriving through its already-issued NFS handle. It
+// deliberately embeds the ordinary filesystem for capability/join behavior but
+// overrides only metadata lookup for the exact deleted path. It is never
+// inserted into the metadata store, so it cannot resurrect the name in a
+// directory listing.
+type deletedHandleFS struct {
 	*juiceFS
 	deletedPath string
 	info        os.FileInfo
 }
 
-func (fs *deletedSidecarHandleFS) isDeletedPath(name string) bool {
+func (fs *deletedHandleFS) isDeletedPath(name string) bool {
 	return strings.TrimLeft(path.Clean(name), "/") == fs.deletedPath
 }
 
-func (fs *deletedSidecarHandleFS) Stat(name string) (os.FileInfo, error) {
+func (fs *deletedHandleFS) Stat(name string) (os.FileInfo, error) {
 	if fs.isDeletedPath(name) {
 		return fs.info, nil
 	}
 	return fs.juiceFS.Stat(name)
 }
 
-func (fs *deletedSidecarHandleFS) Lstat(name string) (os.FileInfo, error) {
+func (fs *deletedHandleFS) Lstat(name string) (os.FileInfo, error) {
 	if fs.isDeletedPath(name) {
 		return fs.info, nil
 	}

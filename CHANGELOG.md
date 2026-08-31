@@ -17,11 +17,14 @@
   Bounded metadata mutations no longer share navigation's RPC admission pool,
   so a burst of slow sidecar removes cannot block READDIR/GETATTR. Late metadata
   updates on an already-unlinked sidecar retain handle semantics without
-  resurrecting the deleted name or returning a stale-handle error. Renames of
-  new spool-only files no longer issue a remote FUSE rename solely to discover
-  that the source is absent. The NFS response writer also flushes continuously
-  refilled Finder traffic in bounded batches, preventing a ready navigation
-  reply from waiting indefinitely for the response queue to become empty.
+  resurrecting the deleted name or returning a stale-handle error. A directory
+  removed while macOS still holds its NFS handle now does the same for late
+  metadata requests, preventing a successful Finder tree deletion from ending
+  in a stale-handle warning. Renames of new spool-only files no longer issue a
+  remote FUSE rename solely to discover that the source is absent. The NFS
+  response writer also flushes continuously refilled Finder traffic in bounded
+  batches, preventing a ready navigation reply from waiting indefinitely for
+  the response queue to become empty.
 - JuiceMount Link persists pairing authorization, applies and tests remote
   backend routes, and fails closed when coordination or saved credentials are
   incomplete.
