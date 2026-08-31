@@ -13,18 +13,19 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/farmqueue"
 )
 
-// TestManagerDefaultFarmJobDrainsOnServerWorker exercises the current
-// production Redis path end to end: the Manager's default [derivatives] job is
-// routed to the server lane, capability-checked, durably claimed, completed,
-// and acknowledged by the worker profile shipped in cmd/jmfarm.
+// TestManagerDefaultFarmJobReachesServerDispatcher exercises the current
+// production Redis path end to end: the Manager's directory-sized derivatives
+// request is routed to the server planning lane, capability-checked, durably
+// claimed, completed, and acknowledged. cmd/jmfarm's separate plan tests prove
+// this short parent expands into bounded executable children.
 //
-// Set JM_TEST_REDIS to an isolated redis:// URL. The test creates one terminal
-// job record with the normal seven-day TTL, so it must never target production
-// metadata Redis.
-func TestManagerDefaultFarmJobDrainsOnServerWorker(t *testing.T) {
-	metaURL := os.Getenv("JM_TEST_REDIS")
+// Set JM_TEST_MANAGER_REDIS to an isolated redis:// URL. The test creates one
+// terminal job record with the normal seven-day TTL, so it must never target
+// production metadata Redis.
+func TestManagerDefaultFarmJobReachesServerDispatcher(t *testing.T) {
+	metaURL := os.Getenv("JM_TEST_MANAGER_REDIS")
 	if metaURL == "" {
-		t.Skip("set JM_TEST_REDIS to run the Manager → Redis → server-worker integration test")
+		t.Skip("set JM_TEST_MANAGER_REDIS to run the Manager → Redis → server-dispatch integration test")
 	}
 
 	q, err := farmqueue.Open(metaURL)
@@ -36,7 +37,7 @@ func TestManagerDefaultFarmJobDrainsOnServerWorker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := q.Ping(ctx); err != nil {
-		t.Fatalf("ping JM_TEST_REDIS: %v", err)
+		t.Fatalf("ping JM_TEST_MANAGER_REDIS: %v", err)
 	}
 
 	a := &API{farmQ: q}
@@ -74,8 +75,10 @@ func TestManagerDefaultFarmJobDrainsOnServerWorker(t *testing.T) {
 	if job.ID != response.ID || len(job.Kinds) != 1 || job.Kinds[0] != farmqueue.KindDerivatives {
 		t.Fatalf("dequeued job = %+v, want Manager derivatives job %q", job, response.ID)
 	}
-	if job.QueueClass != farmqueue.QueueClassServer || job.SelectedBackend != "server-cpu" {
-		t.Fatalf("routing = class %q backend %q, want server/server-cpu", job.QueueClass, job.SelectedBackend)
+	if job.QueueClass != farmqueue.QueueClassServer || job.SelectedBackend != "server-dispatch" || !job.PlanOnly ||
+		len(job.RequiredCapabilities) != 1 || job.RequiredCapabilities[0] != "metadata" {
+		t.Fatalf("routing = class %q backend %q plan_only=%v capabilities=%v, want server/server-dispatch planning parent",
+			job.QueueClass, job.SelectedBackend, job.PlanOnly, job.RequiredCapabilities)
 	}
 
 	if err := q.MarkClaimRunning(ctx, claim, worker); err != nil {
