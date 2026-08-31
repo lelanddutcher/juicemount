@@ -34,6 +34,15 @@ LOG(){ echo "[deploy $(date +%H:%M:%S)] $*"; }
 bounded(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
 proc_count(){ pgrep -f "$1" 2>/dev/null | wc -l | tr -d ' '; }
 
+product_mount_count(){
+  local count
+  count="$(mount | grep -c -e ' on /Volumes/zpool ' -e " on $FI " || true)"
+  if [ -n "${ALT_MOUNT:-}" ]; then
+    count=$(( count + $(mount | grep -c " on $ALT_MOUNT " || true) ))
+  fi
+  echo "$count"
+}
+
 # Match the product executable rather than one bundle name. Release validation
 # deliberately launches versioned copies (for example "JuiceMount RC abc.app")
 # next to the installed app; matching only "JuiceMount.app" leaves those copies
@@ -42,7 +51,7 @@ product_app_pids(){
   local pid command
   while read -r pid command; do
     case "$command" in
-      */Contents/MacOS/JuiceMount) echo "$pid" ;;
+      */Contents/MacOS/JuiceMount|*/Contents/MacOS/JuiceMount\ *) echo "$pid" ;;
     esac
   done < <(ps -axo pid=,command=)
 }
@@ -57,8 +66,20 @@ product_app_count(){
 app_pids_for(){
   local app="$1" want="$1/Contents/MacOS/JuiceMount" pid command
   while read -r pid command; do
-    [ "$command" = "$want" ] && echo "$pid"
+    case "$command" in
+      "$want"|"$want "*) echo "$pid" ;;
+    esac
   done < <(ps -axo pid=,command=)
+}
+
+unmount_path(){
+  local target="$1"
+  bounded 10 umount "$target" 2>/dev/null && return 0
+  bounded 10 umount -f "$target" 2>/dev/null && return 0
+  # A GUI-launched app's NFS mount may require Disk Arbitration even for the
+  # same logged-in user (plain umount returns EPERM). diskutil performs that
+  # authenticated user-session unmount without requiring sudo.
+  bounded 15 diskutil unmount force "$target" >/dev/null 2>&1
 }
 
 clean_stop(){
@@ -82,14 +103,16 @@ clean_stop(){
   fi
   # juicefs must die too or the next launch hangs on a stale FUSE session
   pgrep -f 'juicefs.*mount' >/dev/null && { LOG "kill juicefs"; pkill -f 'juicefs.*mount'; sleep 2; }
-  mount | grep -q 'zpool on /Volumes' && { LOG "umount NFS"; bounded 10 umount /Volumes/zpool 2>/dev/null || bounded 10 umount -f /Volumes/zpool 2>/dev/null; }
-  [ -n "${ALT_MOUNT:-}" ] && mount | grep -q "$ALT_MOUNT" && { LOG "umount ALT $ALT_MOUNT"; bounded 10 umount "$ALT_MOUNT" 2>/dev/null || bounded 10 umount -f "$ALT_MOUNT" 2>/dev/null; }
-  mount | grep -q "$FI" && { LOG "umount FUSE"; bounded 10 umount "$FI" 2>/dev/null || bounded 10 umount -f "$FI" 2>/dev/null; }
+  mount | grep -q ' on /Volumes/zpool ' && { LOG "umount NFS"; unmount_path /Volumes/zpool || true; }
+  [ -n "${ALT_MOUNT:-}" ] && mount | grep -q " on $ALT_MOUNT " && { LOG "umount ALT $ALT_MOUNT"; unmount_path "$ALT_MOUNT" || true; }
+  mount | grep -q " on $FI " && { LOG "umount FUSE"; unmount_path "$FI" || true; }
   sleep 1
-  local remaining_apps
+  local remaining_apps remaining_juicefs remaining_mounts
   remaining_apps="$(product_app_count)"
-  LOG "stopped: app=$remaining_apps juicefs=$(proc_count 'juicefs.*mount') mounts=$(mount | grep -c -e 'zpool on /Volumes' -e "$FI")"
-  [ "$remaining_apps" -eq 0 ]
+  remaining_juicefs="$(proc_count 'juicefs.*mount')"
+  remaining_mounts="$(product_mount_count)"
+  LOG "stopped: app=$remaining_apps juicefs=$remaining_juicefs mounts=$remaining_mounts"
+  [ "$remaining_apps" -eq 0 ] && [ "$remaining_juicefs" -eq 0 ] && [ "$remaining_mounts" -eq 0 ]
 }
 
 verify(){ # verify <budget-seconds> → 0 ok / 1 fail

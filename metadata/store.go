@@ -459,7 +459,12 @@ type evictedShadow struct {
 	Size       int64
 	Mtime      time.Time
 	IsDir      bool
-	ExpiresAt  time.Time
+	// Deleted distinguishes an authoritative local unlink from ordinary cache
+	// eviction/pruning. NFS clients may keep using the unlinked inode's handle;
+	// the serving layer must preserve that handle without recovering the name
+	// back into pathCache/childrenIdx.
+	Deleted   bool
+	ExpiresAt time.Time
 }
 
 // shadowEvictedLocked parks a scalar copy of an entry being removed from
@@ -1270,6 +1275,18 @@ func (s *Store) InsertToCache(e *Entry) {
 
 // DeleteFromCache removes an entry from the in-memory cache without touching SQLite.
 func (s *Store) DeleteFromCache(entryPath string) {
+	s.deleteFromCache(entryPath, false)
+}
+
+// DeleteFromCacheForUnlink removes an entry from the live namespace and marks
+// its bounded shadow as authoritatively unlinked. The distinction matters for
+// an NFS handle retained across REMOVE: ordinary eviction may be recovered if
+// the path still exists, while an unlink must never relist the old generation.
+func (s *Store) DeleteFromCacheForUnlink(entryPath string) {
+	s.deleteFromCache(entryPath, true)
+}
+
+func (s *Store) deleteFromCache(entryPath string, unlinked bool) {
 	s.mu.Lock()
 	if e, ok := s.pathCache[entryPath]; ok {
 		// QA-25: see Delete.
@@ -1279,6 +1296,11 @@ func (s *Store) DeleteFromCache(entryPath string) {
 		s.removeFromChildrenIdx(e)
 		// QA-30 Layer B: shadow for possible recovery (see Delete).
 		s.shadowEvictedLocked(e)
+		if unlinked {
+			rec := s.recentlyEvicted[e.Inode]
+			rec.Deleted = true
+			s.recentlyEvicted[e.Inode] = rec
+		}
 		s.subtreeRemoveLocked(e) // INSTANT-NAV #2
 		delete(s.pathCache, entryPath)
 	}

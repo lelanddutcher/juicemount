@@ -3,13 +3,76 @@ package nfs
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/lelanddutcher/juicemount/internal/cache/pin"
 	nfslib "github.com/lelanddutcher/juicemount/internal/nfs"
 	"github.com/lelanddutcher/juicemount/metadata"
 )
+
+func TestDeletedSyntheticAppleDoubleHandleAcceptsLateOfflineWrite(t *testing.T) {
+	store, err := metadata.OpenWithMaxCacheSize(":memory:", 100)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	h := NewHandler(store, t.TempDir())
+	defer h.StopHandler()
+	jfs := &juiceFS{handler: h}
+
+	wasOffline := pin.IsOffline()
+	pin.SetOffline(true)
+	t.Cleanup(func() { pin.SetOffline(wasOffline) })
+
+	// Offline-created entries use synthetic inodes. Finder can unlink the
+	// AppleDouble name, keep its NFS handle, then send continuation WRITEs on
+	// that old handle. The unlink must win in the namespace while the still-open
+	// handle retains Unix-style write semantics.
+	const inode = uint64(1<<63 | 0xabc126)
+	const sidecarPath = "tree/._dir2"
+	entry := metadata.MakeEntry(sidecarPath, false, 4096, time.Now(), inode)
+	store.InsertToCache(entry)
+	handle := h.ToHandle(jfs, splitPath(sidecarPath))
+
+	if err := jfs.Remove(sidecarPath); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	fs, parts, err := h.FromHandle(handle)
+	if err != nil {
+		t.Fatalf("FromHandle after unlink: %v", err)
+	}
+	if _, ok := fs.(*deletedHandleFS); !ok {
+		t.Fatalf("filesystem type = %T, want *deletedHandleFS", fs)
+	}
+	fullPath := fs.Join(parts...)
+	f, err := fs.OpenFile(fullPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("late offline OpenFile: %v", err)
+	}
+	wa, ok := f.(io.WriterAt)
+	if !ok {
+		t.Fatalf("late-write file %T does not implement io.WriterAt", f)
+	}
+	if n, err := wa.WriteAt([]byte("finder-metadata"), 152); err != nil || n != len("finder-metadata") {
+		t.Fatalf("late WriteAt = %d, %v", n, err)
+	}
+	if n, err := wa.WriteAt([]byte("cleanup"), 0); err != nil || n != len("cleanup") {
+		t.Fatalf("cleanup WriteAt = %d, %v", n, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("late Close: %v", err)
+	}
+	if got := store.LookupByPath(sidecarPath); got != nil {
+		t.Fatalf("late write resurrected deleted sidecar: %+v", got)
+	}
+	if _, err := os.Lstat(h.fusePath + "/" + sidecarPath); !os.IsNotExist(err) {
+		t.Fatalf("late write recreated deleted sidecar: %v", err)
+	}
+}
 
 func TestFromHandleKeepsDeletedAppleDoubleHandleWithoutRelisting(t *testing.T) {
 	store, err := metadata.OpenWithMaxCacheSize(":memory:", 100)

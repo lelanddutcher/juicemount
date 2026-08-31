@@ -1910,6 +1910,18 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 	// Look up by inode
 	e := h.store.LookupByInode(inode)
 	if e == nil {
+		// REMOVE is authoritative even when the entry was born offline with a
+		// synthetic inode. Finder legitimately keeps that old handle and can send
+		// continuation WRITEs after unlinking an AppleDouble name. Consult the
+		// explicitly-deleted shadow before either eviction recovery or the
+		// synthetic path fallback: recovering the latter as an ordinary juiceFS
+		// path would route the late WRITE through offline in-place safety, see no
+		// spool image (REMOVE cancelled it), and return NFS3ERR_ACCES.
+		if shadow, ok := h.store.LookupRecentlyEvicted(inode); ok && shadow.Deleted &&
+			(shadow.IsDir || isSidecarName(path.Base(shadow.Path))) {
+			return h.deletedHandleFromShadow(inode, shadow)
+		}
+
 		// QA-30 Layer B (2026-05-25): before returning STALE, try one-shot
 		// recovery from the recently-evicted shadow map. If the entry was
 		// removed by a prune/eviction within the last ShadowTTL (5 min)
@@ -1941,22 +1953,8 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 		// retain normal ESTALE behavior.
 		if confirmedGone {
 			if shadow, ok := h.store.LookupRecentlyEvicted(inode); ok &&
-				(shadow.IsDir || strings.HasPrefix(path.Base(shadow.Path), "._")) {
-				entry := &metadata.Entry{
-					Path:       shadow.Path,
-					Name:       shadow.Name,
-					ParentPath: shadow.ParentPath,
-					Mode:       shadow.Mode,
-					Size:       shadow.Size,
-					Mtime:      shadow.Mtime,
-					IsDir:      shadow.IsDir,
-					Inode:      inode,
-				}
-				return &deletedHandleFS{
-					juiceFS:     &juiceFS{handler: h},
-					deletedPath: strings.TrimLeft(shadow.Path, "/"),
-					info:        entry.FileInfo(),
-				}, splitPath(shadow.Path), nil
+				(shadow.IsDir || isSidecarName(path.Base(shadow.Path))) {
+				return h.deletedHandleFromShadow(inode, shadow)
 			}
 		}
 
@@ -2020,6 +2018,24 @@ func (h *JuiceMountHandler) FromHandle(handle []byte) (billy.Filesystem, []strin
 
 	parts := splitPath(e.Path)
 	return &juiceFS{handler: h}, parts, nil
+}
+
+func (h *JuiceMountHandler) deletedHandleFromShadow(inode uint64, shadow metadata.EvictedShadow) (billy.Filesystem, []string, error) {
+	entry := &metadata.Entry{
+		Path:       shadow.Path,
+		Name:       shadow.Name,
+		ParentPath: shadow.ParentPath,
+		Mode:       shadow.Mode,
+		Size:       shadow.Size,
+		Mtime:      shadow.Mtime,
+		IsDir:      shadow.IsDir,
+		Inode:      inode,
+	}
+	return &deletedHandleFS{
+		juiceFS:     &juiceFS{handler: h},
+		deletedPath: strings.TrimLeft(shadow.Path, "/"),
+		info:        entry.FileInfo(),
+	}, splitPath(shadow.Path), nil
 }
 
 // tryRecoverEvicted is QA-30 Layer B's recovery path. Called by FromHandle
@@ -2235,6 +2251,68 @@ func (fs *deletedHandleFS) Lstat(name string) (os.FileInfo, error) {
 	}
 	return fs.juiceFS.Lstat(name)
 }
+
+func (fs *deletedHandleFS) Open(name string) (billy.File, error) {
+	return fs.OpenFile(name, os.O_RDONLY, 0)
+}
+
+func (fs *deletedHandleFS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, error) {
+	if !fs.isDeletedPath(name) {
+		return fs.juiceFS.OpenFile(name, flag, perm)
+	}
+	if fs.info.IsDir() {
+		return nil, &os.PathError{Op: "open", Path: name, Err: syscall.EISDIR}
+	}
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_TRUNC) == 0 {
+		return nil, os.ErrNotExist
+	}
+	// The namespace entry is gone, but Unix/NFS handle semantics keep the old
+	// generation usable until the client releases its handle. The AppleDouble
+	// bytes are disposable after unlink: acknowledge positioned continuation
+	// writes without recreating a spool/FUSE name. This is deliberately scoped
+	// to a deletedHandleFS, which FromHandle creates only for an explicitly
+	// removed sidecar (or a confirmed-gone legacy sidecar).
+	return &deletedHandleFile{name: path.Base(name)}, nil
+}
+
+// deletedHandleFile is a handle-only sink for an already-unlinked AppleDouble
+// generation. It implements billy.File and io.WriterAt; no operation can
+// recreate the deleted pathname or consume spool capacity.
+type deletedHandleFile struct {
+	name   string
+	offset int64
+}
+
+func (f *deletedHandleFile) Name() string                      { return f.name }
+func (f *deletedHandleFile) Read([]byte) (int, error)          { return 0, io.EOF }
+func (f *deletedHandleFile) ReadAt([]byte, int64) (int, error) { return 0, io.EOF }
+func (f *deletedHandleFile) Write(p []byte) (int, error) {
+	f.offset += int64(len(p))
+	return len(p), nil
+}
+func (f *deletedHandleFile) WriteAt(p []byte, _ int64) (int, error) { return len(p), nil }
+func (f *deletedHandleFile) Seek(offset int64, whence int) (int64, error) {
+	var next int64
+	switch whence {
+	case io.SeekStart:
+		next = offset
+	case io.SeekCurrent:
+		next = f.offset + offset
+	case io.SeekEnd:
+		next = offset
+	default:
+		return 0, syscall.EINVAL
+	}
+	if next < 0 {
+		return 0, syscall.EINVAL
+	}
+	f.offset = next
+	return next, nil
+}
+func (f *deletedHandleFile) Close() error         { return nil }
+func (f *deletedHandleFile) Lock() error          { return nil }
+func (f *deletedHandleFile) Unlock() error        { return nil }
+func (f *deletedHandleFile) Truncate(int64) error { return nil }
 
 func (jfs *juiceFS) fullPath(filename string) string {
 	return path.Join(jfs.handler.fusePath, filename)
@@ -3955,7 +4033,7 @@ func (jfs *juiceFS) Remove(filename string) error {
 	// entry for FromHandle Layer-B recovery, so an in-flight NFS handle does NOT
 	// go STALE — the sync delete is correct, not just faster). store.Delete below
 	// then makes it durable; its own cache-removal is now a no-op (already gone).
-	jfs.handler.store.DeleteFromCache(filename)
+	jfs.handler.store.DeleteFromCacheForUnlink(filename)
 
 	// Delete from SQLite (durable). Safe even though the cache is already evicted.
 	jfs.handler.store.Delete(filename)
