@@ -44,6 +44,7 @@ func TestManagerRCUIKeepsAccessibilityAndBoundedErrors(t *testing.T) {
 		`<caption class="sr-only">Paired JuiceMount Link devices</caption>`,
 		`<th scope="col">Hostname</th>`,
 		`<span class="sr-only">Actions</span>`,
+		`data-field="path" aria-label="Warmup path"`,
 	} {
 		if !strings.Contains(index, marker) {
 			t.Errorf("Manager markup lost RC accessibility contract %q", marker)
