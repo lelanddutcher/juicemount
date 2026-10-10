@@ -121,6 +121,10 @@ func TestNamespaceRenameRetainsBothTreesThroughPublication(t *testing.T) {
 	if err := <-done; !errors.Is(err, errFUSETimeout) {
 		t.Fatalf("Rename = %v", err)
 	}
+	// Only the held Rename needs the short deadline. Conflicting creates must
+	// still refuse admission, while post-publication creates use the normal
+	// durable-operation budget instead of an unrelated 20 ms latency bound.
+	t.Setenv("JM_MUTATION_OP_TIMEOUT_MS", "")
 	for _, name := range []string{"original", "original/take.mov", "renamed/take.mov"} {
 		if f, err := jfs.Create(name); !errors.Is(err, errFUSETimeout) {
 			_ = closeNamespaceFile(f)

@@ -88,6 +88,28 @@ func newKeydRig(t *testing.T) *keydRig {
 	return r
 }
 
+// CI can select a private interpreter after verifying its source archive.
+// An explicit override must be valid; silently falling back would hide a
+// broken CI setup and rerun the known Bash 5.2 parser defect.
+func keydBash(t *testing.T) string {
+	t.Helper()
+	path, set := os.LookupEnv("JM_TEST_KEYD_BASH")
+	if !set {
+		return "/bin/bash"
+	}
+	if !filepath.IsAbs(path) {
+		t.Fatalf("JM_TEST_KEYD_BASH must be an absolute executable path, got %q", path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("JM_TEST_KEYD_BASH: %v", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
+		t.Fatalf("JM_TEST_KEYD_BASH is not an executable regular file: %q", path)
+	}
+	return path
+}
+
 // key creates a service account in the fake MinIO.
 func (r *keydRig) key(name, parent string) {
 	r.t.Helper()
@@ -113,7 +135,7 @@ func (r *keydRig) desired(body string) {
 
 func (r *keydRig) run(env ...string) (string, error) {
 	r.t.Helper()
-	cmd := exec.Command("/bin/bash", "keyd.sh")
+	cmd := exec.Command(keydBash(r.t), "keyd.sh")
 	cmd.Env = append([]string{
 		"PATH=/usr/bin:/bin", "TMPDIR=" + r.state, "MC=" + filepath.Join(r.state, "mc"),
 		"FAKE_MC_STATE=" + r.state, "JM_OBJ_PER_MAC_SERVER=1", "JM_KEYD_ONCE=1",
@@ -632,7 +654,7 @@ func TestKeydTermDuringAddKeepsSecret(t *testing.T) {
 	r := newKeydRig(t)
 	name := macName(1, 1)
 	r.desired(desiredJSON(1, "", name))
-	cmd := exec.Command("/bin/bash", "keyd.sh")
+	cmd := exec.Command(keydBash(t), "keyd.sh")
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
 	cmd.Env = []string{
@@ -870,7 +892,7 @@ type keydLoop struct {
 func (r *keydRig) startLoop(env ...string) *keydLoop {
 	r.t.Helper()
 	l := &keydLoop{r: r, out: &strings.Builder{}, done: make(chan error, 1)}
-	l.cmd = exec.Command("/bin/bash", "keyd.sh")
+	l.cmd = exec.Command(keydBash(r.t), "keyd.sh")
 	l.cmd.Stdout, l.cmd.Stderr = l.out, l.out
 	l.cmd.Env = append([]string{
 		"PATH=/usr/bin:/bin", "TMPDIR=" + r.state, "MC=" + filepath.Join(r.state, "mc"),

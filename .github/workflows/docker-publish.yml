@@ -67,6 +67,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Prepare private Bash for keyd tests
+        run: bash scripts/prepare-ci-bash.sh
       - name: Go tests
         env:
           JM_REQUIRE_GATE_HISTORY: '1'

@@ -26,6 +26,7 @@ The repository's `scripts/install.sh` replaces `/Applications/JuiceMount.app` an
 ## Current limits
 
 - Full Finder acceptance, including final UI responsiveness, slow network behavior, and the complete release QA battery, remains open. Earlier latency and throughput figures describe specific workloads and machines.
+- Fresh 0.5 server installation has not been qualified. During the release check, anonymous access to the compose-pinned MinIO image returned 401 at Docker Hub and Quay. That does not establish whether an authenticated account can pull it or whether a cached image can run. Verify access to the exact MinIO image and all matching server and base image digests before a fresh setup or replacing a working stack; preserve the existing deployment and data until then.
 - Fresh installation and upgrade on other Macs have not passed final acceptance. Keep the previous app and backups until your own volume and pending-upload state are verified after upgrading.
 - Offline reads depend on metadata and ranges already present locally. The complete pin, disconnect, edit, reconnect, and power-loss workflows remain under test. Preserve every pending save until canonical publication is confirmed.
 - Two-physical-Mac leases and simultaneous project editing remain under test.

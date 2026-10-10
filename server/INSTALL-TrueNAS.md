@@ -83,6 +83,17 @@ digests from the published release manifest. This render step prevents an
 edited TrueNAS form from silently dropping a credential or reverting to a
 mutable image.
 
+Fresh 0.5 stack installation has not been qualified. During the release check,
+an anonymous pull of the compose-pinned MinIO image
+(`sha256:ed9be66eb5f2636c18289c34c3b725ddf57815f2777c77b5938543b78a44f144`)
+was unavailable: Docker Hub returned 401 for its manifest after issuing a token
+without pull scope, and Quay's anonymous request also returned 401. This does
+not establish whether authenticated accounts can pull it or whether an existing
+image cache works. Before a fresh install or replacing a working stack, verify
+that the deployment host can access that exact MinIO image and every matching
+server and base image digest. Keep the working stack and its data in place until
+the image access and rendered configuration are verified.
+
 1. Copy `server/release.env.example` outside the repository and replace every
    placeholder. Obtain `JM_FARM_STORAGE_CAPACITY_BYTES` from
    `zpool list -Hp -o size <pool>`.
