@@ -93,12 +93,21 @@ esac
 	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(ssh), 0755); err != nil {
 		t.Fatal(err)
 	}
+	key := filepath.Join(bin, "fixture-only-key")
+	if err := os.WriteFile(key, []byte("not a real SSH key\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	digest := "sha256:" + strings.Repeat("a", 64)
 	run := func(imageCommit string, extraEnv ...string) (string, error) {
 		t.Helper()
 		cmd := exec.Command("bash", script)
 		cmd.Env = append(os.Environ(),
 			"PATH="+bin+":"+os.Getenv("PATH"),
+			"JM_TRUENAS_HOST=truenas.test.invalid",
+			"JM_RENDER_HOST=render.test.invalid",
+			"JM_SSH_USER=fixture-user",
+			"JM_RENDER_SSH_USER=fixture-render-user",
+			"JM_SSH_KEY="+key,
 			"JM_EXPECTED_MANAGER="+digest,
 			"JM_EXPECTED_CPU="+digest,
 			"JM_EXPECTED_GPU="+digest,

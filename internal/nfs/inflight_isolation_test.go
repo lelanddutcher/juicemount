@@ -73,7 +73,26 @@ func TestIsolatedStallDumpPrivateProcess(t *testing.T) {
 	if err != nil || os.Getenv("HOME") != account.HomeDir {
 		t.Fatal("account HOME must remain unchanged")
 	}
-	root, err := os.MkdirTemp(filepath.Join(account.HomeDir, "Developer", ".state"), "jm-dump-")
+	base, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Isolation forbids generic temporary storage and mounted volumes. Use
+	// the checkout when the runner's temp directory is one of those paths.
+	if base == "/tmp" || strings.HasPrefix(base, "/tmp/") ||
+		base == "/private/tmp" || strings.HasPrefix(base, "/private/tmp/") ||
+		base == "/var/tmp" || strings.HasPrefix(base, "/var/tmp/") ||
+		base == "/Volumes" || strings.HasPrefix(base, "/Volumes/") {
+		base, err = os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		base, err = filepath.EvalSymlinks(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.MkdirTemp(base, "jm-dump-")
 	if err != nil {
 		t.Fatal(err)
 	}

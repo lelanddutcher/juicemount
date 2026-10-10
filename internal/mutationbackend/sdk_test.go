@@ -20,10 +20,21 @@ import (
 )
 
 func TestSDKPrivateConfiguration(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "private")
-	if err := os.Mkdir(dir, 0700); err != nil {
+	// The config reader checks every ancestor. A shared system temp parent
+	// would make the otherwise private fixture invalid on CI runners.
+	base, err := os.Getwd()
+	if err != nil {
 		t.Fatal(err)
 	}
+	base, err = filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(base, "jm-sdk-private-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	path := filepath.Join(dir, "sdk.json")
 	valid := `{"redis":{"socket":"/private/socket","acl_file":"/private/acl","control_secret_file":"/private/secret"},"format_sha256":"` + strings.Repeat("a", 64) + `"}`
 	for _, data := range []string{valid, valid + ` {}`, strings.Replace(valid, "format_sha256", "unknown", 1), `null`} {

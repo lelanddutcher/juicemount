@@ -305,8 +305,18 @@ func TestStoreRefusesForeignOwnedRoot(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("needs a non-root runner")
 	}
-	// /Library exists and is root-owned; Mkdir returns EEXIST, nothing is written.
-	if _, err := OpenStore("/Library", 0); err == nil || !strings.Contains(err.Error(), "owned by uid 0") {
+	// The filesystem root exists and is root-owned on both macOS and Linux.
+	// OpenStore returns at the ownership check before reading any contents.
+	root := string(filepath.Separator)
+	fi, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != 0 {
+		t.Fatalf("fixture %s must be root-owned: %v", root, fi.Sys())
+	}
+	if _, err := OpenStore(root, 0); err == nil || !strings.Contains(err.Error(), "owned by uid 0") {
 		t.Fatalf("root-owned dir accepted by a uid %d store: %v", os.Geteuid(), err)
 	}
 }

@@ -6,12 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/lelanddutcher/juicemount/internal/appisolation"
 	"github.com/lelanddutcher/juicemount/internal/servicecontrol"
 	"github.com/lelanddutcher/juicemount/internal/version"
 	jmnfs "github.com/lelanddutcher/juicemount/nfs"
@@ -22,17 +20,7 @@ import (
 // successful mount/config consumption or engine-crash recovery. The local Link
 // guard also keeps a disabled owner-routing negative from creating resources.
 func TestServingStartRetainsSelectedOwnerBeforeLocalResources(t *testing.T) {
-	root, err := os.MkdirTemp(os.TempDir(), "vor-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	if err := os.Mkdir(filepath.Join(root, "tmp"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, appisolation.Marker), []byte("JuiceMount isolated state v1\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	root := privateIsolationTestRoot(t, "vor-")
 	t.Setenv("TMPDIR", filepath.Join(root, "tmp"))
 	t.Setenv("JM_APP_ISOLATION", "1")
 	t.Setenv("JM_APP_ISOLATION_ROOT", root)

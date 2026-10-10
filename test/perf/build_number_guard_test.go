@@ -10,6 +10,8 @@ import (
 
 func TestDistributionBuildNumberPreflight(t *testing.T) {
 	bin := t.TempDir()
+	repo := t.TempDir()
+	script := writeBuildGuardFixture(t, repo, bin)
 	git := filepath.Join(bin, "git")
 	if err := os.WriteFile(git, []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
 		t.Fatal(err)
@@ -48,7 +50,8 @@ func TestDistributionBuildNumberPreflight(t *testing.T) {
 		{"above published", "15", published14, "", pastPreflight},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cmd := exec.Command("bash", "../../scripts/build-app.sh", "--distribution")
+			cmd := exec.Command("bash", script, "--distribution")
+			cmd.Dir = repo
 			cmd.Env = append(os.Environ(),
 				"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"JM_VERSION=0.5.0",
@@ -67,17 +70,8 @@ func TestDistributionBuildNumberPreflight(t *testing.T) {
 
 func TestDistributionBuildRejectsUntrackedSource(t *testing.T) {
 	repo := t.TempDir()
-	scriptDir := filepath.Join(repo, "scripts")
-	if err := os.MkdirAll(scriptDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	script, err := os.ReadFile("../../scripts/build-app.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(scriptDir, "build-app.sh"), script, 0755); err != nil {
-		t.Fatal(err)
-	}
+	stubs := t.TempDir()
+	script := writeBuildGuardFixture(t, repo, stubs)
 	git := func(args ...string) string {
 		t.Helper()
 		cmd := exec.Command("git", args...)
@@ -88,21 +82,9 @@ func TestDistributionBuildRejectsUntrackedSource(t *testing.T) {
 		}
 		return strings.TrimSpace(string(out))
 	}
-	plistDir := filepath.Join(repo, "app", "JuiceMount", "Resources")
-	if err := os.MkdirAll(plistDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	plist, err := os.ReadFile("../../app/JuiceMount/Resources/Info.plist")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(plistDir, "Info.plist"), plist, 0644); err != nil {
-		t.Fatal(err)
-	}
-	stubs := t.TempDir()
 	writeFakeCurl(t, stubs)
 	git("init", "-q")
-	git("add", "scripts/build-app.sh", "app/JuiceMount/Resources/Info.plist")
+	git("add", "scripts/build-app.sh", "scripts/verify-juicefs-sdk.py", "app/JuiceMount/Resources/Info.plist")
 	git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base")
 	if err := os.MkdirAll(filepath.Join(repo, "app", "JuiceMount", "Sources"), 0755); err != nil {
 		t.Fatal(err)
@@ -110,7 +92,7 @@ func TestDistributionBuildRejectsUntrackedSource(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "app", "JuiceMount", "Sources", "Untracked.swift"), []byte("struct Untracked {}\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("bash", filepath.Join(scriptDir, "build-app.sh"), "--distribution")
+	cmd := exec.Command("bash", script, "--distribution")
 	cmd.Dir = repo
 	cmd.Env = append(os.Environ(),
 		"JM_VERSION=0.5.0",
@@ -137,6 +119,61 @@ func writeFakeCurl(t *testing.T, dir string) {
 	}
 }
 
+// The guard tests stop before compilation. Copy the real build script and
+// Info.plist, satisfy only the unrelated SDK provenance preflight, and route
+// its absolute macOS PlistBuddy call to a strict plist reader on Linux CI.
+func writeBuildGuardFixture(t *testing.T, repo, bin string) string {
+	t.Helper()
+	scriptDir := filepath.Join(repo, "scripts")
+	plistDir := filepath.Join(repo, "app", "JuiceMount", "Resources")
+	for _, dir := range []string{scriptDir, plistDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script, err := os.ReadFile("../../scripts/build-app.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const original = `PLISTBUDDY="/usr/libexec/PlistBuddy"`
+	if strings.Count(string(script), original) != 1 {
+		t.Fatal("build script changed its PlistBuddy assignment")
+	}
+	plistBuddy := filepath.Join(bin, "PlistBuddy")
+	script = []byte(strings.Replace(string(script), original, `PLISTBUDDY="`+plistBuddy+`"`, 1))
+	scriptPath := filepath.Join(scriptDir, "build-app.sh")
+	if err := os.WriteFile(scriptPath, script, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// The preflight is a separate contract; this fixture exercises the later
+	// release guards without copying an SDK checkout or invoking a build.
+	if err := os.WriteFile(filepath.Join(scriptDir, "verify-juicefs-sdk.py"), []byte("# preflight fixture\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	plist, err := os.ReadFile("../../app/JuiceMount/Resources/Info.plist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plistDir, "Info.plist"), plist, 0644); err != nil {
+		t.Fatal(err)
+	}
+	const reader = `#!/usr/bin/env python3
+import plistlib
+import sys
+if len(sys.argv) != 4 or sys.argv[1:3] != ["-c", "Print :SUFeedURL"]:
+    sys.exit(2)
+with open(sys.argv[3], "rb") as source:
+    value = plistlib.load(source).get("SUFeedURL", "")
+if not isinstance(value, str):
+    sys.exit(2)
+print(value)
+`
+	if err := os.WriteFile(plistBuddy, []byte(reader), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return scriptPath
+}
+
 func writeAppcast(t *testing.T, dir, name, items string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
@@ -155,20 +192,8 @@ func writeAppcast(t *testing.T, dir, name, items string) string {
 // instead of building the real tree.
 func TestDevBuildRefusesAppcast(t *testing.T) {
 	repo := t.TempDir()
-	scriptDir := filepath.Join(repo, "scripts")
-	stubs := filepath.Join(repo, "stubs")
-	for _, dir := range []string{scriptDir, stubs} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	script, err := os.ReadFile("../../scripts/build-app.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(scriptDir, "build-app.sh"), script, 0755); err != nil {
-		t.Fatal(err)
-	}
+	stubs := t.TempDir()
+	script := writeBuildGuardFixture(t, repo, stubs)
 	for _, tool := range []string{"go", "swift", "git"} {
 		if err := os.WriteFile(filepath.Join(stubs, tool), []byte("#!/bin/sh\necho STUB-$0-RAN >&2\nexit 1\n"), 0755); err != nil {
 			t.Fatal(err)
@@ -176,7 +201,7 @@ func TestDevBuildRefusesAppcast(t *testing.T) {
 	}
 	for _, mode := range []string{"--release", "--debug"} {
 		t.Run(mode, func(t *testing.T) {
-			cmd := exec.Command("bash", filepath.Join(scriptDir, "build-app.sh"), mode)
+			cmd := exec.Command("bash", script, mode)
 			cmd.Dir = repo
 			cmd.Env = append(os.Environ(),
 				"PATH="+stubs+string(os.PathListSeparator)+os.Getenv("PATH"),

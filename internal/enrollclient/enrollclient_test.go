@@ -3,6 +3,8 @@ package enrollclient
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -60,28 +62,46 @@ func realManagerMux(t *testing.T) (*http.ServeMux, string) {
 	return mux, proxyDir
 }
 
-// startFakeProxyAck answers the Manager's reload requests the way the
-// respproxy entrypoint does (reload.ack repeats the whole reload.request
-// line), so the Manager sees a live proxy and allows Approve.
+// startFakeProxyAck models the applied-credential handshake: a request is
+// acknowledged only after its digest matches the current principals file.
+// The Manager requires reload.applied and a current heartbeat for approval.
 func startFakeProxyAck(t *testing.T, dir string) {
 	t.Helper()
 	stop, done := make(chan struct{}), make(chan struct{})
+	last := ""
+	if b, err := os.ReadFile(filepath.Join(dir, "reload.request")); err == nil {
+		last = string(b) // a newly started proxy cannot attest an earlier request
+	}
 	go func() {
 		defer close(done)
-		last := ""
 		for {
 			select {
 			case <-stop:
 				return
 			case <-time.After(5 * time.Millisecond):
 			}
-			_ = os.WriteFile(filepath.Join(dir, "reload.heartbeat"), []byte("1\n"), 0o600)
 			req, err := os.ReadFile(filepath.Join(dir, "reload.request"))
-			if err != nil || string(req) == last || len(strings.Fields(string(req))) == 0 {
+			if err != nil || string(req) == last {
+				_ = os.WriteFile(filepath.Join(dir, "reload.heartbeat"), []byte("1\n"), 0o600)
 				continue
 			}
-			_ = os.WriteFile(filepath.Join(dir, "reload.ack"), req, 0o600)
-			last = string(req)
+			fields := strings.Fields(string(req))
+			body, err := os.ReadFile(filepath.Join(dir, "principals.json"))
+			if len(fields) != 3 || err != nil {
+				_ = os.WriteFile(filepath.Join(dir, "reload.heartbeat"), []byte("1\n"), 0o600)
+				continue
+			}
+			digest := sha256.Sum256(body)
+			if hex.EncodeToString(digest[:]) != fields[0] {
+				_ = os.WriteFile(filepath.Join(dir, "reload.heartbeat"), []byte("1\n"), 0o600)
+				continue
+			}
+			applied := []byte(strings.Join(fields, " ") + "\n")
+			if os.WriteFile(filepath.Join(dir, "reload.applied"), applied, 0o600) == nil {
+				_ = os.WriteFile(filepath.Join(dir, "reload.ack"), applied, 0o600)
+				last = string(req)
+			}
+			_ = os.WriteFile(filepath.Join(dir, "reload.heartbeat"), []byte("1\n"), 0o600)
 		}
 	}()
 	t.Cleanup(func() { close(stop); <-done })

@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lelanddutcher/juicemount/internal/appisolation"
 	"github.com/lelanddutcher/juicemount/internal/servicecontrol"
 	"github.com/lelanddutcher/juicemount/internal/version"
 )
@@ -30,17 +29,7 @@ func TestVolumeOwnerProcessFixture(t *testing.T) {
 }
 
 func TestVolumeOwnerBootstrapProcessExitsThroughAuthenticatedShutdown(t *testing.T) {
-	root, err := os.MkdirTemp(os.TempDir(), "vop-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(root)
-	if err := os.Mkdir(filepath.Join(root, "tmp"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, appisolation.Marker), []byte("JuiceMount isolated state v1\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	root := privateIsolationTestRoot(t, "vop-")
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)

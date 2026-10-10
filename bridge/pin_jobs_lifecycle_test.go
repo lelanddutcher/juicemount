@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -270,6 +271,27 @@ func TestCacheClearReverifyReportsAdmissionTruthfully(t *testing.T) {
 
 func TestScheduledReverifyAppliesRealPendingStatus(t *testing.T) {
 	ps, pf := pinJobFixture(t)
+	cacheRoot := t.TempDir()
+	var identity syscall.Stat_t
+	if err := syscall.Stat(cacheRoot, &identity); err != nil {
+		t.Fatal(err)
+	}
+	var disk syscall.Statfs_t
+	if err := syscall.Statfs(cacheRoot, &disk); err != nil {
+		t.Fatal(err)
+	}
+	free := int64(disk.Bsize) * int64(disk.Bavail)
+	if free < 64 {
+		t.Fatal("fixture cache volume has insufficient free space")
+	}
+	// Reverification must use an admitted, measured cache policy. A made-up
+	// capacity verdict would bypass the real download-admission contract.
+	pin.SetCachePolicy(32, free/2, cacheRoot, uint64(identity.Dev), true)
+	t.Cleanup(func() { pin.SetCachePolicy(0, 0, "", 0, false) })
+	capacity := pin.ComputeCapacity(ps, cacheRoot)
+	if !capacity.PolicyKnown || capacity.CacheCapacityBytes < 9 {
+		t.Fatalf("fixture cache policy was not admitted: %+v", capacity)
+	}
 	path := "/Volumes/zpool/ready-for-repair.mov"
 	if err := ps.Pin(path, 9, "/Volumes/zpool"); err != nil {
 		t.Fatal(err)

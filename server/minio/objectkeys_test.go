@@ -140,6 +140,10 @@ case "$1 $2 $3" in
 esac
 `
 
+// Keep the root user distinct from repository path components: argv may
+// legitimately contain absolute policy paths under a juicemount checkout.
+const fixtureRootUser = "root-fixture-7c42"
+
 func runProvision(t *testing.T, state string, env ...string) (string, error) {
 	t.Helper()
 	mc := filepath.Join(state, "mc")
@@ -150,7 +154,7 @@ func runProvision(t *testing.T, state string, env ...string) (string, error) {
 	cmd := exec.Command("/bin/bash", "provision-object-keys.sh")
 	cmd.Env = append([]string{
 		"PATH=/usr/bin:/bin", "TMPDIR=" + state, "MC=" + mc, "FAKE_MC_STATE=" + state,
-		"MINIO_ROOT_USER=juicemount", "MINIO_ROOT_PASSWORD=root/pass@word",
+		"MINIO_ROOT_USER=" + fixtureRootUser, "MINIO_ROOT_PASSWORD=root/pass@word",
 		"JM_MINIO_POLICY_DIR=" + cwd,
 		"JM_OBJ_CLIENT_SECRET_KEY=" + strings.Repeat("c", 40),
 		"JM_OBJ_GC_SECRET_KEY=" + strings.Repeat("g", 40),
@@ -191,7 +195,7 @@ func TestProvisionCreatesExactlyTwoUsersIdempotently(t *testing.T) {
 		t.Error("the policy given to jm-client grants a Delete action")
 	}
 	argv := read("argv")
-	for _, secret := range []string{"root/pass@word", "juicemount", strings.Repeat("c", 40), strings.Repeat("g", 40)} {
+	for _, secret := range []string{"root/pass@word", fixtureRootUser, strings.Repeat("c", 40), strings.Repeat("g", 40)} {
 		if strings.Contains(argv, secret) {
 			t.Errorf("a credential (%.6s...) reached mc argv:\n%s", secret, argv)
 		}
@@ -199,7 +203,7 @@ func TestProvisionCreatesExactlyTwoUsersIdempotently(t *testing.T) {
 	if read("user.jm-client") != strings.Repeat("c", 40) || read("user.jm-gc") != strings.Repeat("g", 40) {
 		t.Error("user secrets did not reach mc through stdin")
 	}
-	if !strings.Contains(read("hosts"), "http://juicemount:root%2fpass%40word@127.0.0.1:9000") {
+	if !strings.Contains(read("hosts"), "http://"+fixtureRootUser+":root%2fpass%40word@127.0.0.1:9000") {
 		t.Errorf("MC_HOST alias not percent-encoded as expected:\n%s", read("hosts"))
 	}
 	if strings.Contains(argv, "juicefs") || strings.Contains(argv, "config") {
@@ -210,7 +214,7 @@ func TestProvisionCreatesExactlyTwoUsersIdempotently(t *testing.T) {
 func TestProvisionRefusesUnsafeInputs(t *testing.T) {
 	cases := map[string][]string{
 		"gc key equals client key": {"JM_OBJ_GC_ACCESS_KEY=jm-client"},
-		"key is root user":         {"JM_OBJ_CLIENT_ACCESS_KEY=juicemount"},
+		"key is root user":         {"JM_OBJ_CLIENT_ACCESS_KEY=" + fixtureRootUser},
 		"short secret":             {"JM_OBJ_CLIENT_SECRET_KEY=abc"},
 		"same secrets":             {"JM_OBJ_GC_SECRET_KEY=" + strings.Repeat("c", 40)},
 		"no root password":         {"MINIO_ROOT_PASSWORD="},
@@ -372,7 +376,7 @@ func TestProvisionPerMacRefusesUnsafeInputs(t *testing.T) {
 		"no key admin secret":    {[]string{"JM_OBJ_KEYADMIN_SECRET_KEY="}, "JM_OBJ_KEYADMIN_SECRET_KEY must be 32-40"},
 		"key admin is jm-client": {[]string{"JM_OBJ_KEYADMIN_ACCESS_KEY=jm-client"}, "the key admin must not be 'jm-client'"},
 		"key admin is jm-macs":   {[]string{"JM_OBJ_KEYADMIN_ACCESS_KEY=jm-macs"}, "the key admin must not be 'jm-macs'"},
-		"key admin is root":      {[]string{"JM_OBJ_KEYADMIN_ACCESS_KEY=juicemount"}, "the key admin must not be 'juicemount'"},
+		"key admin is root":      {[]string{"JM_OBJ_KEYADMIN_ACCESS_KEY=" + fixtureRootUser}, "the key admin must not be '" + fixtureRootUser + "'"},
 		"key admin reuses gc":    {[]string{"JM_OBJ_KEYADMIN_SECRET_KEY=" + strings.Repeat("g", 40)}, "must differ from the client and gc secrets"},
 		"flag true":              {[]string{"JM_OBJ_PER_MAC_SERVER=true"}, "JM_OBJ_PER_MAC_SERVER='true' is not 1 or 0"},
 		"flag yes":               {[]string{"JM_OBJ_PER_MAC_SERVER=yes"}, "JM_OBJ_PER_MAC_SERVER='yes' is not 1 or 0"},

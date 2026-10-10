@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"net/http/httptest"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,17 +17,31 @@ import (
 	"github.com/lelanddutcher/juicemount/internal/mounttable"
 )
 
-func controlIsolationFixture(t *testing.T) string {
+// privateIsolationTestRoot creates the same 0700, marked namespace used by the
+// real isolation gate. Resolve macOS's /var -> /private/var alias before the
+// root is created so the value passed to the child is its canonical path.
+func privateIsolationTestRoot(t *testing.T, prefix string) string {
 	t.Helper()
-	account, err := user.Current()
+	base, err := filepath.EvalSymlinks(os.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := filepath.Join(account.HomeDir, "Developer", ".state")
-	if st, err := os.Stat(base); err != nil || !st.IsDir() {
-		t.Fatal("private test state directory unavailable")
+	// appisolation deliberately rejects the generic /tmp paths. On hosts
+	// whose temp directory is one of those paths, keep this disposable fixture
+	// inside the checkout instead of weakening that production restriction.
+	if base == "/tmp" || strings.HasPrefix(base, "/tmp/") ||
+		base == "/private/tmp" || strings.HasPrefix(base, "/private/tmp/") ||
+		base == "/var/tmp" || strings.HasPrefix(base, "/var/tmp/") {
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		base, err = filepath.EvalSymlinks(cwd)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	root, err := os.MkdirTemp(base, "jm-control-")
+	root, err := os.MkdirTemp(base, prefix)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,6 +52,12 @@ func controlIsolationFixture(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(root, appisolation.Marker), []byte("JuiceMount isolated state v1\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	return root
+}
+
+func controlIsolationFixture(t *testing.T) string {
+	t.Helper()
+	root := privateIsolationTestRoot(t, "jm-control-")
 	t.Setenv("JM_APP_ISOLATION", "1")
 	t.Setenv("JM_APP_ISOLATION_ROOT", root)
 	t.Setenv("TMPDIR", filepath.Join(root, "tmp"))

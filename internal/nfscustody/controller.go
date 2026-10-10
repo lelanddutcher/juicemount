@@ -295,8 +295,7 @@ func openOwnedTarget(path string) (*targetGuard, error) {
 	if err := unix.Fstatfs(leaf, &leafFS); err != nil {
 		return nil, err
 	}
-	fsType := unix.ByteSliceToString(leafFS.Fstypename[:])
-	if leafFS.Fsid != parentFS.Fsid || fsType != "apfs" && fsType != "hfs" {
+	if !localTargetFilesystem(parentFS, leafFS) {
 		return nil, errors.New("NFS target must be an empty directory on the local parent filesystem")
 	}
 	if g.stat.Uid != uint32(os.Getuid()) {

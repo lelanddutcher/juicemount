@@ -48,6 +48,15 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      respproxy-redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     permissions:
       contents: read
     steps:
@@ -65,6 +74,7 @@ jobs:
           JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
           JM_TEST_METADATA_REDIS: redis://127.0.0.1:6379/14
           JM_TEST_REDIS: redis://127.0.0.1:6379/15
+          JM_RESPPROXY_TEST_REDIS: 127.0.0.1:6380
         run: go test -count=1 ./...
       - name: Redis-backed farm durability tests
         env:

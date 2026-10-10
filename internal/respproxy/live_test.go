@@ -36,10 +36,12 @@ func TestLivePassThrough(t *testing.T) {
 	}
 
 	cmds, err := mac.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		// x5 is an xattr hash with opaque values. A dentry hash needs
+		// JuiceFS's nine-byte encoded inode, which this protocol test lacks.
 		for i := 0; i < 100; i++ {
-			pipe.HSet(ctx, "d1", "f", i)
+			pipe.HSet(ctx, "x5", "user.fixture", i)
 		}
-		pipe.HGet(ctx, "d1", "f")
+		pipe.HGet(ctx, "x5", "user.fixture")
 		return nil
 	})
 	if err != nil || cmds[100].(*redis.StringCmd).Val() != "99" {

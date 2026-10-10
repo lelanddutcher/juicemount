@@ -24,6 +24,15 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      respproxy-redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,6 +48,7 @@ jobs:
           JM_TEST_MANAGER_REDIS: redis://127.0.0.1:6379/12
           JM_TEST_METADATA_REDIS: redis://127.0.0.1:6379/14
           JM_TEST_REDIS: redis://127.0.0.1:6379/15
+          JM_RESPPROXY_TEST_REDIS: 127.0.0.1:6380
         run: go test -count=1 ./...
       - name: Redis-backed farm durability tests
         env:
@@ -83,7 +93,38 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Unit and macOS platform tests
-        run: go test -count=1 ./...
+        run: |
+          brew install redis
+          export JM_CI_REDIS_BIN="$(brew --prefix redis)/bin"
+          python3 - <<'PYTHON'
+          import os, pathlib, subprocess, tempfile, time
+
+          root = pathlib.Path(tempfile.mkdtemp(prefix="jm-respproxy-redis-", dir=os.environ["RUNNER_TEMP"])).resolve()
+          binary = pathlib.Path(os.environ["JM_CI_REDIS_BIN"])
+          with (root / "server.log").open("wb") as log:
+              child = subprocess.Popen([str(binary / "redis-server"), "--bind", "127.0.0.1", "--port", "6380", "--save", "", "--appendonly", "no", "--dir", str(root)], stdout=log, stderr=subprocess.STDOUT)
+              try:
+                  for attempt in range(30):
+                      if child.poll() is not None:
+                          raise RuntimeError("owned Redis exited before readiness")
+                      info = subprocess.run([str(binary / "redis-cli"), "-h", "127.0.0.1", "-p", "6380", "INFO", "server"], capture_output=True, text=True, timeout=2)
+                      fields = dict(line.split(":", 1) for line in info.stdout.splitlines() if ":" in line)
+                      if info.returncode == 0 and fields.get("process_id") == str(child.pid) and child.poll() is None:
+                          break
+                      time.sleep(1)
+                  else:
+                      raise RuntimeError("Redis readiness did not match owned child")
+                  env = dict(os.environ, JM_RESPPROXY_TEST_REDIS="127.0.0.1:6380")
+                  subprocess.run(["go", "test", "-count=1", "./..."], env=env, check=True)
+              finally:
+                  if child.poll() is None:
+                      child.terminate()
+                  try:
+                      child.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      child.kill()
+                      child.wait()
+          PYTHON
       - name: Build signed-equivalent app
         env:
           JM_ADHOC: '1'

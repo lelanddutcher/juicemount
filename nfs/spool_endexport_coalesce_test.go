@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"syscall"
 	"testing"
 
 	"github.com/lelanddutcher/juicemount/internal/cache/pin"
@@ -155,31 +156,60 @@ func TestSpoolAppleDoubleReadBypassesHole(t *testing.T) {
 	}
 }
 
-// TestSpoolDrainEvictReadReturnsSpoolDrained is the cause-#4 regression: when
-// the spool file is unlinked (drain completed + evicted) before a reader opens
-// its fd, OpenForRead fails with a %w-WRAPPED ENOENT. The read path must map it
-// to ErrSpoolDrained (→ NFS3ERR_NOENT → client reopens onto the drained FUSE
-// copy), NOT a terminal I/O error. Pre-fix os.IsNotExist did not unwrap the %w,
-// so the wrapped ENOENT fell through to NFS3ERR_IO and aborted the copy.
+// A reader acquired before completed drain cleanup must reopen the published
+// backend copy. An active source that merely disappears must never take that path.
 func TestSpoolDrainEvictReadReturnsSpoolDrained(t *testing.T) {
 	s := newTestSpoolStore(t, 0)
 	e, err := s.OpenWrite("/evict.bin")
 	if err != nil {
-		t.Fatalf("OpenWrite: %v", err)
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0x5A}, 4096)
+	if _, err := e.WriteAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+	rf := &spoolReadFile{name: "/evict.bin", entry: e}
+	defer rf.Close()
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := s.Meta().MarkDraining(e.ID()); err != nil || !claimed {
+		t.Fatalf("claim drain: claimed=%v err=%v", claimed, err)
+	}
+	if done, err := s.MarkDrainComplete(e.ID(), e.nfsPath, e.SpoolFilePath(), int64(len(payload))); err != nil || !done {
+		t.Fatalf("complete drain: done=%v err=%v", done, err)
+	}
+	if !e.retired.Load() {
+		t.Fatal("completed drain did not retire entry")
+	}
+	if _, err := os.Stat(e.SpoolFilePath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("drained source still present: %v", err)
+	}
+	n, rerr := rf.ReadAt(make([]byte, 16), 0)
+	if n != 0 || !pin.IsSpoolDrained(rerr) {
+		t.Fatalf("drain-evict read: n=%d err=%v, want n=0 ErrSpoolDrained", n, rerr)
+	}
+}
+
+func TestSpoolMissingActiveSourceDoesNotReopenBackend(t *testing.T) {
+	s := newTestSpoolStore(t, 0)
+	e, err := s.OpenWrite("/missing-active.bin")
+	if err != nil {
+		t.Fatal(err)
 	}
 	if _, err := e.WriteAt(bytes.Repeat([]byte{0x5A}, 4096), 0); err != nil {
-		t.Fatalf("WriteAt: %v", err)
+		t.Fatal(err)
 	}
-	// Unlink the spool file NAME (the writer's fd keeps the inode alive) so a
-	// fresh OpenForRead sees ENOENT — the drain-evict race.
-	if err := os.Remove(e.spoolFile); err != nil {
-		t.Fatalf("unlink spool file: %v", err)
+	if e.retired.Load() {
+		t.Fatal("active entry already retired")
 	}
-	rf := &spoolReadFile{name: "/evict.bin", entry: e} // fd not yet opened
+	if err := os.Remove(e.SpoolFilePath()); err != nil {
+		t.Fatal(err)
+	}
+	rf := &spoolReadFile{name: e.nfsPath, entry: e}
 	defer rf.Close()
-	buf := make([]byte, 16)
-	n, rerr := rf.ReadAt(buf, 0)
-	if n != 0 || !pin.IsSpoolDrained(rerr) {
-		t.Fatalf("drain-evict read: n=%d err=%v, want n=0 ErrSpoolDrained (via errors.Is unwrap)", n, rerr)
+	n, err := rf.ReadAt(make([]byte, 16), 0)
+	if n != 0 || !errors.Is(err, syscall.EIO) || pin.IsSpoolDrained(err) {
+		t.Fatalf("missing active source: n=%d err=%v, want EIO without backend fallback", n, err)
 	}
 }

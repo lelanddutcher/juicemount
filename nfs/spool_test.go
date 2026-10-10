@@ -377,28 +377,58 @@ func TestSpoolCloseAndDeleteAfterCloseIsNoop(t *testing.T) {
 // B that was inserted at the same nfs path.
 func TestSpoolCloseAndDeleteIdentityCheckedIndex(t *testing.T) {
 	s := newTestSpoolStore(t, 0)
-
-	eA, _ := s.OpenWrite("/replaced.bin")
-	_, _ = eA.WriteAt([]byte("first"), 0)
+	eA, err := s.OpenWrite("/replaced.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := []byte("first")
+	if _, err := eA.WriteAt(first, 0); err != nil {
+		t.Fatal(err)
+	}
 	if err := eA.Close(); err != nil {
-		t.Fatalf("close A: %v", err)
+		t.Fatal(err)
 	}
-	// Manually evict A from the index so we can simulate B taking the slot.
-	// (In production this happens when the drainer finishes copying A.)
-	s.Index().Delete("/replaced.bin")
-
-	eB, _ := s.OpenWrite("/replaced.bin")
-	if eB == eA {
-		t.Fatal("expected a new entry for the second OpenWrite")
+	// The successor is legitimate only after A's durable completion. Removing
+	// just the index leaves a READY row and must refuse a second writer.
+	if claimed, err := s.Meta().MarkDraining(eA.ID()); err != nil || !claimed {
+		t.Fatalf("claim A: claimed=%v err=%v", claimed, err)
 	}
-
-	// Now a late scrubber calls CloseAndDelete on the stale eA. It must
-	// NOT evict eB from the index.
-	_ = eA.CloseAndDelete("late scrubber")
-
-	got, ok := s.LookupActive("/replaced.bin")
-	if !ok || got != eB {
-		t.Fatalf("CloseAndDelete on stale entry evicted the live entry: ok=%v got=%v", ok, got)
+	if done, err := s.MarkDrainComplete(eA.ID(), eA.nfsPath, eA.SpoolFilePath(), int64(len(first))); err != nil || !done {
+		t.Fatalf("complete A: done=%v err=%v", done, err)
+	}
+	if row, err := s.Meta().Get(eA.ID()); err != nil || row == nil || row.DrainState != metadata.DrainDone {
+		t.Fatalf("A is not durably done: row=%+v err=%v", row, err)
+	}
+	eB, err := s.OpenWrite("/replaced.bin")
+	if err != nil || eB == nil {
+		t.Fatalf("open successor: entry=%v err=%v", eB, err)
+	}
+	if eB == eA || eB.ID() == eA.ID() {
+		t.Fatal("expected distinct successor identity")
+	}
+	second := []byte("second saved edit")
+	if _, err := eB.WriteAt(second, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.LookupActive("/replaced.bin"); !ok || got != eB {
+		t.Fatal("successor was not indexed before cleanup")
+	}
+	if err := eA.CloseAndDelete("late scrubber"); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.LookupActive("/replaced.bin"); !ok || got != eB {
+		t.Fatalf("stale cleanup evicted successor: ok=%v got=%v", ok, got)
+	}
+	if row, err := s.Meta().Get(eB.ID()); err != nil || row == nil || row.DrainState != metadata.DrainWriting {
+		t.Fatalf("successor state changed: row=%+v err=%v", row, err)
+	}
+	f, err := eB.OpenForRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if got, err := io.ReadAll(f); err != nil || !bytes.Equal(got, second) {
+		t.Fatalf("successor bytes changed: got=%q err=%v", got, err)
 	}
 }
 

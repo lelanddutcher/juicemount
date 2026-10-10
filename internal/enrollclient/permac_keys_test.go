@@ -203,7 +203,30 @@ func TestInUseReportedOnlyForOwnPerMacKey(t *testing.T) {
 // The Mac must keep polling: the next step omits the field and succeeds.
 func TestManagerWithoutInUseFieldKeepsPolling(t *testing.T) {
 	t.Cleanup(inUseRefused.Clear)
-	_, srv, id, st := boundApprovedMac(t)
+	rec, srv, id, st := boundApprovedMac(t)
+	current := *rec.cur.Load()
+	var mu sync.Mutex
+	var sentField []bool
+	rec.set(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err == nil {
+			_, present := fields["object_key_in_use"]
+			mu.Lock()
+			sentField = append(sentField, present)
+			mu.Unlock()
+			if present {
+				w.WriteHeader(http.StatusBadRequest) // old Manager's strict decoder
+				return
+			}
+		}
+		r.Body = io.NopCloser(strings.NewReader(string(body)))
+		current.ServeHTTP(w, r)
+	}))
 	id.ObjectKeyInUse = perMacAK1 // e.g. a Manager image rolled back after M3
 	first := Step(context.Background(), http.DefaultClient, srv.URL, id, st)
 	if first.Phase != Failed || first.Persist || first.State.Secret != st.Secret || first.State.ManagerID != st.ManagerID {
@@ -212,6 +235,11 @@ func TestManagerWithoutInUseFieldKeepsPolling(t *testing.T) {
 	second := Step(context.Background(), http.DefaultClient, srv.URL, id, first.State)
 	if second.Phase != Approved || second.ObjectAccessKey != clientAK {
 		t.Fatalf("second step still refused: phase=%s %q", second.Phase, second.Message)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sentField) != 2 || !sentField[0] || sentField[1] {
+		t.Fatalf("in-use field presence across retry = %v, want [true false]", sentField)
 	}
 }
 

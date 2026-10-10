@@ -28,17 +28,7 @@ func TestVolumeOwnerSelectedProcessReceivesOriginalBootstrap(t *testing.T) {
 }
 
 func testSelectedOwnerTerminalProcess(t *testing.T, dropReply bool) {
-	root, err := os.MkdirTemp(os.TempDir(), "voi-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(root)
-	if err := os.Mkdir(filepath.Join(root, "tmp"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, appisolation.Marker), []byte("JuiceMount isolated state v1\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	root := privateIsolationTestRoot(t, "voi-")
 	scope := appisolation.Scope{Root: root}
 	intent, created, err := createOwnerIntent(scope, ServerConfig{RedisURL: "redis://never-contacted.invalid:6379"})
 	if err != nil || !created {
