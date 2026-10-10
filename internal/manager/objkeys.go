@@ -882,11 +882,13 @@ func (s *PrincipalStore) reconcileObjKeysLocked(forceDesired bool) error {
 			case next.ObjKeySecret != "" && app.ready(next.ObjKeyName):
 				next.ObjKeyState = ObjKeyActive
 				changed = true
-			case next.ObjKeySecret == "" && !next.ObjKeyNeedsSecret && next.ObjKeyMintSeq > 0 &&
+			case next.ObjKeySecret == "" && next.ObjKeyMintSeq > 0 &&
 				app != nil && app.Seq >= next.ObjKeyMintSeq && app.exists(next.ObjKeyName) && resultsOK && !resultFor[next.ObjKeyName]:
 				// keyd created the key but its secret never arrived (keyd
 				// stopped between create and result). It was never delivered:
-				// ask keyd to re-create it, at a new seq.
+				// ask keyd to re-create it at a new seq, even if an earlier
+				// re-create also lost its result. MintSeq gates the next retry
+				// until keyd applies that new seq.
 				log.Printf("manager: objkeys: %s exists but no secret arrived; asking minio-keyd to re-create it", next.ObjKeyName)
 				next.ObjKeyNeedsSecret = true
 				next.ObjKeyMintSeq = 0

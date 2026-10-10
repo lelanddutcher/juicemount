@@ -27,6 +27,8 @@ PATCH_FILES = {
         "pkg/chunk/cached_store.go", "pkg/chunk/disk_cache.go", "pkg/meta/redis.go"],
     "patches/0011-stage-birth-create-watch.patch": ["pkg/meta/redis.go"],
     "patches/0012-born-stage-upload-watch.patch": ["pkg/meta/redis.go"],
+    "patches/0013-security-dependencies-and-etcd-transport.patch": [
+        "go.mod", "go.sum", "pkg/meta/tkv_etcd.go", "pkg/object/etcd.go"],
 }
 VERSION_PACKAGE = "github.com/juicedata/juicefs/pkg/version"
 

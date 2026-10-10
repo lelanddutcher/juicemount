@@ -1091,6 +1091,84 @@ func TestObjKeysCrashBeforeResultRecreates(t *testing.T) {
 	}
 }
 
+// A second crash during a needs_secret re-create also loses the result.
+// Each fully applied request without a result needs a new seq; an older
+// applied.json must not cause the Manager to keep issuing requests.
+func TestObjKeysRepeatedCrashBeforeResultReissues(t *testing.T) {
+	r := newObjRig(t)
+	name, tok := r.enroll(9)
+	key := name + "-1"
+	if err := r.s.Approve(name); !errors.Is(err, ErrObjectKeyNotReady) {
+		t.Fatalf("approve with keyd silent: %v", err)
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		requested := r.desired()
+		r.kd.mu.Lock()
+		r.kd.crashNextCreate = true
+		r.kd.mu.Unlock()
+		r.kd.step() // MinIO made the key, but keyd died before the result
+		if fileExists(filepath.Join(r.objDir, "results", key+".json")) {
+			t.Fatalf("attempt %d unexpectedly wrote a result", attempt)
+		}
+		if _, ok := r.kd.minio(key); !ok {
+			t.Fatalf("attempt %d did not create the key", attempt)
+		}
+		r.kd.restart()
+		r.kd.step() // applied.json reports the key, still without a result
+		applied, _ := r.s.objk.readApplied()
+		if applied == nil || applied.Seq != requested.Seq || !applied.exists(key) {
+			t.Fatalf("attempt %d did not apply request %d with the key present: %+v", attempt, requested.Seq, applied)
+		}
+		if err := r.s.ReconcileObjKeys(); err != nil {
+			t.Fatal(err)
+		}
+		retry := r.desired()
+		if needs, ok := retry.has(key); !ok || !needs || retry.Seq <= requested.Seq {
+			t.Fatalf("attempt %d did not request a new re-create: before=%+v after=%+v", attempt, requested, retry)
+		}
+		if p := r.rec(name); p.ObjKeyMintSeq != retry.Seq || p.ObjKeySecret != "" || p.Status == PrincipalApproved {
+			t.Fatalf("attempt %d committed an unready key: %+v", attempt, p)
+		}
+		for i := 0; i < 3; i++ {
+			if err := r.s.ReconcileObjKeys(); err != nil {
+				t.Fatal(err)
+			}
+			if got := r.desired().Seq; got != retry.Seq {
+				t.Fatalf("stale applied seq raised request %d from %d to %d", attempt, retry.Seq, got)
+			}
+		}
+	}
+
+	r.kd.step() // third create succeeds and writes its result first
+	if err := r.s.ReconcileObjKeys(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.s.Approve(name); err != nil {
+		t.Fatalf("approve after repeated crash recovery: %v", err)
+	}
+	if needs, _ := r.desired().has(key); needs {
+		t.Fatal("delivered secret left needs_secret set")
+	}
+	if got := r.kd.createCount(key); got != 3 {
+		t.Fatalf("keyd created %s %d times, want two crashes and one delivery", key, got)
+	}
+	r.checkInvariant("after repeated crash recovery")
+	secret := r.rec(name).ObjKeySecret
+	if got := r.poll(9, tok); got.ObjectSecretKey != secret {
+		t.Fatal("poll did not deliver the recovered secret")
+	}
+
+	// A later, unrelated desired rewrite must not re-create a delivered key.
+	if err := r.s.syncObjKeys(); err != nil {
+		t.Fatal(err)
+	}
+	r.kd.step()
+	if got := r.kd.createCount(key); got != 3 || r.rec(name).ObjKeySecret != secret {
+		t.Fatalf("delivered key was re-created after a later seq: creates=%d", got)
+	}
+	r.checkInvariant("after later seq")
+}
+
 // U6c: a result read whose persist fails is not lost: the file stays and
 // the next cycle delivers the same secret.
 func TestObjKeysResultKeptUntilPersisted(t *testing.T) {

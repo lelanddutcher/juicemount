@@ -243,11 +243,11 @@
       "upstream_sha256": "f3917760c69e88f4b958998500d08a958f5d708a798900ee8a4b32ece1c9b1bb"
     },
     "go.mod": {
-      "sha256": "ad4015469cb99c85fc6305bd8afacb352170ee459eb8205114bf657775773da8",
+      "sha256": "3d1705f7f3db3d38d8b553a4aa339fce8b326ffc3d36976d057abe5ebdf4f117",
       "upstream_sha256": "ad4015469cb99c85fc6305bd8afacb352170ee459eb8205114bf657775773da8"
     },
     "go.sum": {
-      "sha256": "584598cd0a595f99adc850ffa085dfa5f3b9a0490c7c1d94a0582470738c4bad",
+      "sha256": "2ab515a75930ec1b4423de92d8efe43d93f91acdd09a91974b6965e4b36cd940",
       "upstream_sha256": "584598cd0a595f99adc850ffa085dfa5f3b9a0490c7c1d94a0582470738c4bad"
     },
     "main.go": {
@@ -567,7 +567,7 @@
       "upstream_sha256": "752811f5be5649474d45c5b5e161ac9e8b97ecaf32f59caba406502401ba9bea"
     },
     "pkg/meta/tkv_etcd.go": {
-      "sha256": "001dd30c0a8ff3b2ce02df47749cb11fbc9fb26a4666004f7fd9b887710dd846",
+      "sha256": "e80369192a136ee4a94f50e47c5880c3eacad4c0c7c671c247af984a8fb41a31",
       "upstream_sha256": "001dd30c0a8ff3b2ce02df47749cb11fbc9fb26a4666004f7fd9b887710dd846"
     },
     "pkg/meta/tkv_fdb.go": {
@@ -671,7 +671,7 @@
       "upstream_sha256": "21b8f61d785e9de46b77628e9921a39890ae7512734aa7fdb99885f3d93963db"
     },
     "pkg/object/etcd.go": {
-      "sha256": "d6ba9251e0b79cf4decc3f07149d27eb75ee716af6a31712f167710b5880eb9d",
+      "sha256": "e6fabafad59a5dea70ab64b8874d88a7f99dee1c1f33439bbe15f6fd105f1ad5",
       "upstream_sha256": "d6ba9251e0b79cf4decc3f07149d27eb75ee716af6a31712f167710b5880eb9d"
     },
     "pkg/object/file.go": {
@@ -1118,6 +1118,8 @@
     "pkg/meta/redis_birth_test.go": "0b14d67d11963426e82ddb1812e4e14206ff4413b1b0d4b02cceff020c68c2b6",
     "pkg/meta/redis_replace.go": "e5448c51d27fc74581b6cef09a41e2d189863b0e4deaa0b12a7244f4987ec6f5",
     "pkg/meta/redis_replace_test.go": "ccbc7af2182cc73932ee5b3a07471ab029c511e5373d07433d41f7b4d06672de",
+    "pkg/meta/tkv_etcd_test.go": "b37a3790ed25bea1c475d31942eea29e30ce3628b531120141ced181d24fe38e",
+    "pkg/object/etcd_test.go": "4e4c9772c7a559a556cff71fbf988262a704e83d844216251c42f5e364776cb1",
     "pkg/replaceguard/birth.go": "5de9a31975c4c706276f036f47e7d24b33abc60b587793c0f23b199014b7e17a",
     "pkg/replaceguard/birth_test.go": "0945903fc2cb8dba42dfcf0ed9f54eeca54f78d972bcd445b4172bb5eeab0c5d",
     "pkg/replaceguard/record.go": "5732bc2f69fdfa959023942c7eb5320f940bd28dba154c5c75138603a2a81113",
@@ -1139,7 +1141,8 @@
     "patches/0009-darwin-exclusive-rename.patch": "50f43715ff11b730f969119d964269b0f59ef50a8ffea3ddfb431eabf55ffb6a",
     "patches/0010-replacement-guards-and-cache-ownership.patch": "a48405225adbab1023e77ce49b02f0899add02f9810925a1ccc993a1d565640a",
     "patches/0011-stage-birth-create-watch.patch": "9848480d00a6cde1fb0eccd3bd9bb3c29d4e052b32f379dead83fd245a7dbfbc",
-    "patches/0012-born-stage-upload-watch.patch": "d8dc17b58bbee31cec0bb2522c15477b7721c67e89f263ab0ff086407fb2cb5f"
+    "patches/0012-born-stage-upload-watch.patch": "d8dc17b58bbee31cec0bb2522c15477b7721c67e89f263ab0ff086407fb2cb5f",
+    "patches/0013-security-dependencies-and-etcd-transport.patch": "de7b2dfc19c7bdb1b69e7efb1af689a9b0190afd28117927e78e3393ae6486de"
   },
   "scope": "All pkg/ and cmd/ files plus main.go, LICENSE, go.mod and go.sum from the verified module ZIP. Documentation, integration tests and SDK examples are not included. local_files are JuiceMount-owned source with no upstream counterpart.",
   "upstream_url": "https://github.com/juicedata/juicefs/tree/v1.3.1",

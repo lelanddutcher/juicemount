@@ -13,7 +13,7 @@
 # ----- Stage 1: jmfarm (Go, CGO for SQLite) -----
 ARG JM_VERSION
 ARG JM_COMMIT
-FROM golang:1.26.6-bookworm AS gobuild
+FROM golang:1.26.9-bookworm AS gobuild
 ARG JM_VERSION
 ARG JM_COMMIT
 WORKDIR /src

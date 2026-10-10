@@ -9,8 +9,8 @@
 # 1. scripts/verify-juicefs-sdk.py proves third_party/juicefs matches
 #    SOURCE.json and its recorded patches (against the upstream module ZIP
 #    when it is in the module cache).
-# 2. Build from the nested module, so upstream's go.mod/go.sum choose the
-#    dependencies; tags and ldflags come from SOURCE.json "binary".
+# 2. Build from the nested module, so its reviewed go.mod/go.sum choose the
+#    security-patched dependencies; tags and ldflags come from SOURCE.json "binary".
 # 3. Refuse a binary whose --version is not SOURCE.json binary.version_output.
 #
 # Fails closed: there is no fallback binary. Signing is the caller's job.

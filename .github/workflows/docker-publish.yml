@@ -85,8 +85,10 @@ jobs:
         run: go test -count=1 ./internal/farmqueue
       - name: Go vet
         run: go vet ./...
-      - name: Reachable vulnerability scan
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Scan both shipped Go module graphs
+        run: bash scripts/check-go-security.sh
+      - name: Recovery and TLS regression controls
+        run: python3 scripts/test-release-security-regressions.py
       - name: Static release configuration checks
         env:
           JM_ADMIN_KEY: ci-only-placeholder-not-a-secret-value
@@ -122,6 +124,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Scan macOS Go module graphs
+        run: bash scripts/check-go-security.sh
       - name: Build signed-equivalent app
         env:
           JM_ADHOC: '1'
